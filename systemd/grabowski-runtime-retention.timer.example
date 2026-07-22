@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically apply bounded Grabowski runtime retention
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Persistent=true
+Unit=grabowski-runtime-retention.service
+
+[Install]
+WantedBy=timers.target

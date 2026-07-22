@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -68,6 +69,34 @@ class UpgradeAccessProfilesTests(unittest.TestCase):
         self.assertEqual(result["profiles"]["trusted-owner"], self.trusted_owner)
         self.assertIsNot(result["profiles"]["trusted-owner"], self.trusted_owner)
         self.assertEqual(self.policy["profiles"], {"trusted-owner": self.trusted_owner})
+
+    def test_upgrade_adds_new_capability_definitions_without_rewriting_existing_ones(self) -> None:
+        policy = copy.deepcopy(self.policy)
+        policy["capability_definitions"] = {
+            "file_read": "Existing local wording.",
+            "terminal_execute": "Existing terminal wording.",
+        }
+        template = copy.deepcopy(self.template)
+        template["profiles"]["observe"]["capabilities"].append("audit_read")
+        template["profiles"]["maintain"]["capabilities"].append("audit_read")
+        template["capability_definitions"] = {
+            "file_read": "New template wording must not rewrite local metadata.",
+            "audit_read": "Read bounded safe fields from the verified audit chain.",
+        }
+
+        result = upgrader.upgraded(policy, template)
+
+        self.assertEqual(
+            result["capability_definitions"]["file_read"],
+            "Existing local wording.",
+        )
+        self.assertEqual(
+            result["capability_definitions"]["audit_read"],
+            "Read bounded safe fields from the verified audit chain.",
+        )
+        self.assertNotIn("audit_read", result["profiles"]["trusted-owner"]["capabilities"])
+        self.assertIn("audit_read", result["profiles"]["observe"]["capabilities"])
+        self.assertIn("audit_read", result["profiles"]["maintain"]["capabilities"])
 
     def test_dry_run_does_not_mutate_policy(self) -> None:
         before = self.policy_path.read_bytes()

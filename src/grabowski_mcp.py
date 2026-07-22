@@ -39,6 +39,7 @@ from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
+import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
@@ -212,8 +213,10 @@ RESERVED_DISABLED_CAPABILITIES = (
     "chown",
     "secret_read",
 )
+AUDIT_READ_CAPABILITIES = ("audit_read",)
 ALL_CAPABILITIES = (
     BASE_CAPABILITIES
+    + AUDIT_READ_CAPABILITIES
     + SECRET_CAPABILITIES
     + OPERATOR_CAPABILITIES
     + RESERVED_DISABLED_CAPABILITIES
@@ -239,6 +242,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_destroy_path": ("file_destroy",),
     "grabowski_rollback_text": ("rollback_text",),
     "grabowski_verify_audit": ("audit_verify",),
+    "grabowski_audit_query": ("audit_read",),
+    "grabowski_audit_trace": ("audit_read",),
+    "grabowski_audit_analyze": ("audit_read",),
     "latest_complete_bundles": ("bundle_registry",),
     "repoground_bundle_discover": ("bundle_registry",),
     "repoground_bundle_status": ("bundle_registry",),
@@ -257,6 +263,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_deployment_identity": (),
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),
+    "grabowski_current_work": (),
     "grabowski_git_status": (),
     "grabowski_git_diff": (),
     "grabowski_git_log": (),
@@ -291,6 +298,12 @@ TOOL_CAPABILITY_REQUIREMENTS = {
         "tmux_interaction",
     ),
     "grabowski_agent_workspace_reconcile_stale": (
+        "durable_job",
+        "git_cli",
+        "resource_lease",
+        "tmux_interaction",
+    ),
+    "grabowski_agent_workspace_reconcile_idle_tmux": (
         "durable_job",
         "git_cli",
         "resource_lease",
@@ -350,6 +363,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_task_cancel": ("durable_job",),
     "grabowski_task_resume": ("durable_job",),
     "grabowski_task_list": ("durable_job",),
+    "grabowski_task_archive_list": ("file_read",),
+    "grabowski_task_archive_read": ("file_read",),
     "grabowski_task_reconcile_check": ("durable_job",),
     "grabowski_task_reconcile_refresh": ("durable_job",),
     "grabowski_task_reconcile_resume": ("durable_job",),
@@ -418,6 +433,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_agent_workspace_optimize",
     "grabowski_agent_workspace_cleanup_plan",
     "grabowski_agent_workspace_reconcile_stale",
+    "grabowski_agent_workspace_reconcile_idle_tmux",
     "grabowski_agent_workspace_cleanup",
     "grabowski_agent_competition_start",
     "grabowski_agent_competition_status",
@@ -3005,15 +3021,20 @@ def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
     return _verify_audit_bytes(path, data, exists=True)
 
 
-def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
+    """Read one audit file through the hardened descriptor contract without parsing it."""
     descriptor = _open_audit_read_target(path)
     if descriptor is None:
-        return b"", _verify_audit_bytes(path, b"", exists=False)
+        return b"", False
     try:
-        data = _read_audit_descriptor(descriptor, path)
-        return data, _verify_audit_bytes(path, data, exists=True)
+        return _read_audit_descriptor(descriptor, path), True
     finally:
         _close_audit_descriptor(descriptor)
+
+
+def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+    data, exists = _read_audit_file_bytes(path)
+    return data, _verify_audit_bytes(path, data, exists=exists)
 
 
 def _first_audit_record(data: bytes) -> dict[str, Any] | None:
@@ -3299,6 +3320,7 @@ def _read_audit_chain_unlocked(
     path: Path,
     *,
     use_segment_cache: bool = True,
+    retain_verified_segment_data: bool = True,
 ) -> tuple[list[tuple[Path, bytes, dict[str, Any]]], bool]:
     components: list[tuple[Path, bytes, dict[str, Any]]] = []
     seen: set[Path] = set()
@@ -3365,7 +3387,12 @@ def _read_audit_chain_unlocked(
             compatibility_evidence = compatibility_evidence or bool(
                 expected.get("compatibility")
             )
-        components.append((current, data, status))
+        component_status = dict(status)
+        component_status["segment_sha256"] = observed_sha
+        component_data = data
+        if expected is not None and not retain_verified_segment_data:
+            component_data = b""
+        components.append((current, component_data, component_status))
         binding = _audit_predecessor_binding(path, first_record)
         if binding is None:
             return components, compatibility_evidence
@@ -3973,11 +4000,13 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         return False
     schema_version = contract.get("schema_version")
     expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
-    if schema_version in {2, 3}:
+    if schema_version in {2, 3, 4}:
         expected_keys.add("supporting_sources")
-    if schema_version == 3:
+    if schema_version in {3, 4}:
         expected_keys.add("runtime_assets")
-    if schema_version not in {1, 2, 3} or set(contract) != expected_keys:
+    if schema_version == 4:
+        expected_keys.add("spawn_dependencies")
+    if schema_version not in {1, 2, 3, 4} or set(contract) != expected_keys:
         return False
     module = contract.get("module")
     source = contract.get("source")
@@ -4018,6 +4047,32 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
         modules.add(item_module)
         supporting_modules.add(item_module)
         sources.add(item_source)
+
+    spawn_dependencies = contract.get("spawn_dependencies", [])
+    if not isinstance(spawn_dependencies, list):
+        return False
+    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
+    for item in spawn_dependencies:
+        if not isinstance(item, dict) or set(item) != {
+            "kind",
+            "launcher_module",
+            "spawned_module",
+        }:
+            return False
+        kind = item.get("kind")
+        launcher_module = item.get("launcher_module")
+        spawned_module = item.get("spawned_module")
+        identity = (kind, launcher_module, spawned_module)
+        if (
+            kind != "python_module"
+            or not isinstance(launcher_module, str)
+            or launcher_module not in modules
+            or not isinstance(spawned_module, str)
+            or spawned_module not in modules
+            or identity in seen_spawn_dependencies
+        ):
+            return False
+        seen_spawn_dependencies.add(identity)
 
     runtime_asset_destinations: set[str] = set()
     runtime_asset_sources: set[str] = set()
@@ -8684,6 +8739,24 @@ def _repoground_budget_context(
     return context, counts, exact_used_bytes
 
 
+_REPOGROUND_PYTHON_CALL_GRAPH_SOURCE = "python_call_graph_json"
+
+
+def _repoground_relation_uses_coherent_source(value: Any, source: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    provenance = value.get("provenance")
+    candidates = [value.get("freshness")]
+    if isinstance(provenance, dict):
+        candidates.append(provenance.get("relation"))
+    return any(
+        isinstance(candidate, dict)
+        and candidate.get("source") == source
+        and candidate.get("status") == "coherent"
+        for candidate in candidates
+    )
+
+
 @mcp.tool(name="repoground_context_compose", annotations=READ_ANNOTATIONS)
 def repoground_context_compose(
     repo: str,
@@ -8803,9 +8876,7 @@ def repoground_context_compose(
     authority_rules = _repoground_authority_rules(preflight)
     gate_evidence = _repoground_gate_evidence(preflight, bundle_status)
     impact_status = str(impact.get("status", "unknown"))
-    source_statuses = _repoground_dict_items(impact.get("source_statuses")) if isinstance(impact, dict) else []
-    symbol_available = any(item.get("source") == "python_symbol_index_json" and item.get("status") == "available" for item in source_statuses)
-    call_graph_available = bool(impact.get("relations")) if isinstance(impact, dict) else False
+    causal_relations = _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else []
 
     edit_context = impact.get("edit_context") if isinstance(impact, dict) and isinstance(impact.get("edit_context"), dict) else {}
     lane_values: dict[str, list[Any]] = {
@@ -8816,7 +8887,7 @@ def repoground_context_compose(
         "entry_manifest": [surfaces["agent_entry_manifest"]] if "agent_entry_manifest" in surfaces else [],
         "pr_delta_cards": [surfaces["pr_delta_cards_jsonl"]] if "pr_delta_cards_jsonl" in surfaces else [],
         "target_symbols": _repoground_dict_items(impact.get("target_symbols")) if isinstance(impact, dict) else [],
-        "causal_relations": _repoground_dict_items(impact.get("relations")) if isinstance(impact, dict) else [],
+        "causal_relations": causal_relations,
         "live_ranges": _repoground_dict_items(evidence.get("ranges")),
         "citations": [{"citation_id": item} for item in evidence.get("citation_ids", []) if isinstance(item, str)] if isinstance(evidence.get("citation_ids"), list) else [],
         "gaps": _repoground_dict_items(impact.get("gaps")) if isinstance(impact, dict) else [],
@@ -8838,17 +8909,23 @@ def repoground_context_compose(
         used.append("agent_impact")
     if effective_query and baseline.get("available"):
         used.append("query_context")
-    if symbol_available:
+    if context.get("target_symbols"):
         used.append("symbol_navigation")
-    if call_graph_available:
+    call_graph_used = any(
+        _repoground_relation_uses_coherent_source(
+            relation, _REPOGROUND_PYTHON_CALL_GRAPH_SOURCE
+        )
+        for relation in _repoground_dict_items(context.get("causal_relations"))
+    )
+    if call_graph_used:
         used.append("call_graph")
-    if "citation_map_jsonl" in surfaces or context.get("citations"):
+    if context.get("citations"):
         used.append("citation")
     if context.get("live_ranges"):
         used.append("live_evidence")
-    if "agent_entry_manifest" in surfaces:
+    if context.get("entry_manifest"):
         used.append("entry_manifest")
-    if "pr_delta_cards_jsonl" in surfaces:
+    if context.get("pr_delta_cards"):
         used.append("pr_delta_cards")
     all_lanes = ["direct_changes", "agent_impact", "query_context", "entry_manifest", "pr_delta_cards", "symbol_navigation", "call_graph", "citation", "live_evidence"]
     skipped = [name for name in all_lanes if name not in used]
@@ -9258,6 +9335,42 @@ def grip_run(
         dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
+    )
+
+
+@mcp.tool(name="grabowski_task_archive_list", annotations=READ_ANNOTATIONS)
+def grabowski_task_archive_list(
+    limit: int = 20,
+    cursor: str | None = None,
+    view: str = "minimal",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """List immutable task archive segments through a bounded verified catalog."""
+    _require_capability("file_read")
+    return lifecycle_read_surface.task_archive_list(
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        fields=fields,
+    )
+
+
+@mcp.tool(name="grabowski_task_archive_read", annotations=READ_ANNOTATIONS)
+def grabowski_task_archive_read(
+    segment_id: str,
+    limit: int = 20,
+    cursor: str | None = None,
+    view: str = "standard",
+    fields: list[str] | None = None,
+) -> dict[str, Any]:
+    """Read one fully verified immutable task archive segment with pagination."""
+    _require_capability("file_read")
+    return lifecycle_read_surface.task_archive_read(
+        segment_id,
+        limit=limit,
+        cursor=cursor,
+        view=view,
+        fields=fields,
     )
 
 

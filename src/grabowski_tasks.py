@@ -23,6 +23,7 @@ import grabowski_resources as resources
 import grabowski_nonconflict as nonconflict
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
+import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
 try:
     import grabowski_operator_core as operator
@@ -40,6 +41,24 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+TASK_LIST_SCAN_BATCH = 100
+GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
+GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
+MANAGED_BUILD_RESOLVER = (
+    operator.HOME / ".local/lib/heim-pc/managed-build/scripts/managed_build.py"
+)
+MANAGED_BUILD_PYTHON = Path("/usr/bin/python3")
+MANAGED_CARGO_CACHE_ROOT = operator.HOME / ".cache/heim-pc/managed-builds/cargo"
+MANAGED_BUILD_STATE_ROOT = operator.HOME / ".local/state/heim-pc/managed-builds"
+MANAGED_CARGO_LOCK_ROOT = MANAGED_BUILD_STATE_ROOT / "cache-locks" / "cargo"
+MANAGED_CARGO_PROFILE = "operator-task"
+SYSTEMD_ENV_EXECUTABLE = "/usr/bin/env"
+FLOCK_EXECUTABLE = "/usr/bin/flock"
+SCRIPT_EXECUTABLES = frozenset({"bash", "sh", "zsh", "fish", "python", "python3"})
+CARGO_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])cargo(?:$|[^A-Za-z0-9_])")
+JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
+MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
+MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 DEFAULT_TASK_LIST_LIMIT = 20
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
@@ -957,6 +976,444 @@ def _validate_cwd(host: str, raw: str | None) -> str:
     return candidate
 
 
+def _normalized_github_repository_slug(remote_url: str) -> str | None:
+    value = remote_url.strip()
+    prefixes = (
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    )
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            slug = value[len(prefix):].rstrip("/")
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            return slug or None
+    return None
+
+
+def _is_local_grabowski_checkout(cwd: str) -> bool:
+    result = operator._run(
+        ["git", "-C", cwd, "config", "--get", "remote.origin.url"],
+        cwd=operator.HOME,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+    )
+    if result.get("returncode") != 0:
+        return False
+    return (
+        _normalized_github_repository_slug(str(result.get("stdout", "")))
+        == GRABOWSKI_REPOSITORY_SLUG
+    )
+
+
+def _unqualified_python_index(command: list[str]) -> int | None:
+    if command[0] in {"python", "python3"}:
+        return 0
+    if command[0] not in {"env", "/bin/env", "/usr/bin/env"}:
+        return None
+    for index, item in enumerate(command[1:], start=1):
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+            continue
+        return index if item in {"python", "python3"} else None
+    return None
+
+
+def _bind_grabowski_runtime_python(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    enabled: bool,
+) -> list[str]:
+    if not isinstance(enabled, bool):
+        raise ValueError("runtime_python must be boolean")
+    if not enabled:
+        return command
+    python_index = _unqualified_python_index(command)
+    if python_index is None or target["transport"] != "local":
+        return command
+    if not _is_local_grabowski_checkout(cwd):
+        return command
+    if not GRABOWSKI_RUNTIME_PYTHON.is_file() or not os.access(
+        GRABOWSKI_RUNTIME_PYTHON, os.X_OK
+    ):
+        raise RuntimeError("Grabowski runtime Python is unavailable")
+    bound = list(command)
+    bound[python_index] = str(GRABOWSKI_RUNTIME_PYTHON)
+    return bound
+
+
+def _explicit_cargo_target_dir(command: list[str]) -> bool:
+    # Conservative by design: shell snippets can override an inherited target.
+    return any("CARGO_TARGET_DIR=" in item for item in command)
+
+
+def _direct_cargo_target_dir_values(command: list[str]) -> list[str]:
+    if not command or Path(command[0]).name != "env":
+        return []
+    values: list[str] = []
+    for item in command[1:]:
+        if item == "--" or (item.startswith("-") and "=" not in item):
+            continue
+        if "=" not in item:
+            break
+        if item.startswith("CARGO_TARGET_DIR="):
+            values.append(item.removeprefix("CARGO_TARGET_DIR="))
+    return values
+
+
+def _ambiguous_managed_cargo_target_override(command: list[str]) -> bool:
+    occurrences = sum("CARGO_TARGET_DIR=" in item for item in command)
+    if occurrences == 0:
+        return False
+    values = _direct_cargo_target_dir_values(command)
+    if occurrences != 1 or len(values) != 1:
+        return True
+    path = Path(values[0])
+    if not path.is_absolute() or ".." in path.parts:
+        return True
+    try:
+        relative = path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError:
+        return False
+    return not (
+        len(relative.parts) == 2
+        and relative.parts[1] == "target"
+        and SHA256.fullmatch(relative.parts[0]) is not None
+    )
+
+def _explicit_managed_cargo_target_dir(command: list[str]) -> str | None:
+    values = sorted(set(_direct_cargo_target_dir_values(command)))
+    if len(values) != 1:
+        return None
+    path = Path(values[0])
+    if not path.is_absolute() or ".." in path.parts:
+        return None
+    try:
+        relative = path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError:
+        return None
+    if (
+        len(relative.parts) != 2
+        or relative.parts[1] != "target"
+        or SHA256.fullmatch(relative.parts[0]) is None
+    ):
+        return None
+    return str(path)
+
+
+def _local_git_root(cwd: str) -> Path | None:
+    result = operator._run(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+        cwd=operator.HOME,
+        timeout_seconds=5,
+        max_output_bytes=4096,
+    )
+    if result.get("returncode") != 0:
+        return None
+    value = str(result.get("stdout", "")).strip()
+    if not value or not value.startswith("/") or "\x00" in value:
+        return None
+    root = Path(value)
+    try:
+        resolved = root.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _regular_cargo_lock(root: Path) -> bool:
+    path = root / "Cargo.lock"
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+
+
+def _bounded_regular_text(candidate: Path, root: Path) -> str | None:
+    try:
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+        info = resolved.lstat()
+    except (OSError, ValueError):
+        return None
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return None
+    if info.st_size > MAX_BUILD_SCRIPT_INSPECTION_BYTES:
+        return None
+    try:
+        return resolved.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _wrapper_definition_mentions_cargo(executable: str, root: Path) -> bool:
+    names = (
+        ("Justfile", "justfile", ".justfile")
+        if executable == "just"
+        else ("GNUmakefile", "makefile", "Makefile")
+    )
+    for name in names:
+        text = _bounded_regular_text(root / name, root)
+        if text is not None and CARGO_TOKEN.search(text) is not None:
+            return True
+    return False
+
+
+def _text_may_invoke_cargo(text: str, root: Path) -> bool:
+    if CARGO_TOKEN.search(text) is not None:
+        return True
+    if JUST_TOKEN.search(text) is not None and _wrapper_definition_mentions_cargo("just", root):
+        return True
+    if MAKE_TOKEN.search(text) is not None and _wrapper_definition_mentions_cargo("make", root):
+        return True
+    return False
+
+
+def _bounded_script_mentions_cargo(candidate: Path, root: Path) -> bool:
+    text = _bounded_regular_text(candidate, root)
+    return text is not None and _text_may_invoke_cargo(text, root)
+
+def _command_may_invoke_cargo(command: list[str], *, cwd: str, root: Path) -> bool:
+    executable = Path(command[0]).name
+    if executable == "cargo":
+        return True
+    if executable in {"just", "make"}:
+        return _wrapper_definition_mentions_cargo(executable, root)
+    if executable in {"env", "command"}:
+        for index, item in enumerate(command[1:], start=1):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+                continue
+            return _command_may_invoke_cargo(command[index:], cwd=cwd, root=root)
+        return False
+    if executable in SCRIPT_EXECUTABLES:
+        if _text_may_invoke_cargo(" ".join(command[1:]), root):
+            return True
+        for item in command[1:]:
+            if item.startswith("-"):
+                continue
+            candidate = Path(item)
+            if not candidate.is_absolute():
+                candidate = Path(cwd) / candidate
+            if _bounded_script_mentions_cargo(candidate, root):
+                return True
+        return False
+    executable_path = Path(command[0])
+    if "/" in command[0]:
+        if not executable_path.is_absolute():
+            executable_path = Path(cwd) / executable_path
+        return _bounded_script_mentions_cargo(executable_path, root)
+    return False
+
+
+def _managed_cargo_profile(command: list[str]) -> str:
+    current = command
+    if Path(current[0]).name in {"env", "command"}:
+        for index, item in enumerate(current[1:], start=1):
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", item):
+                continue
+            return _managed_cargo_profile(current[index:])
+        return MANAGED_CARGO_PROFILE
+    if Path(current[0]).name != "cargo":
+        return MANAGED_CARGO_PROFILE
+    args = current[1:]
+    if "--profile" in args:
+        index = args.index("--profile")
+        if index + 1 < len(args):
+            value = args[index + 1]
+            if value.replace("-", "").replace("_", "").isalnum():
+                return value
+    if "--release" in args:
+        return "release"
+    for candidate in ("test", "bench", "check", "doc"):
+        if candidate in args:
+            return candidate
+    return "dev"
+
+
+def _resolve_managed_cargo_target_dir(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+) -> str | None:
+    if target["transport"] != "local" or execution_backend != "systemd-user":
+        return None
+    if _explicit_cargo_target_dir(command):
+        return None
+    root = _local_git_root(cwd)
+    if root is None or not _regular_cargo_lock(root):
+        return None
+    if not _command_may_invoke_cargo(command, cwd=cwd, root=root):
+        return None
+    try:
+        resolver_info = MANAGED_BUILD_RESOLVER.lstat()
+        python_resolved = MANAGED_BUILD_PYTHON.resolve(strict=True)
+        python_info = python_resolved.stat()
+    except OSError as exc:
+        raise RuntimeError("Managed-build resolver runtime is unavailable") from exc
+    if (
+        stat.S_ISLNK(resolver_info.st_mode)
+        or not stat.S_ISREG(resolver_info.st_mode)
+        or not stat.S_ISREG(python_info.st_mode)
+        or python_resolved.parent != Path("/usr/bin")
+    ):
+        raise RuntimeError("Managed-build resolver runtime is unsafe")
+    profile = _managed_cargo_profile(command)
+    result = operator._run(
+        [
+            str(MANAGED_BUILD_PYTHON),
+            str(MANAGED_BUILD_RESOLVER),
+            "prepare-environment",
+            "--repo",
+            str(root),
+            "--tool",
+            "cargo",
+            "--profile",
+            profile,
+            "--executable",
+            "cargo",
+        ],
+        cwd=operator.HOME,
+        timeout_seconds=10,
+        max_output_bytes=16 * 1024,
+    )
+    if result.get("returncode") != 0:
+        raise RuntimeError("Managed-build resolver failed for Cargo task")
+    try:
+        payload = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Managed-build resolver returned invalid JSON") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "heim_pc.managed_build_environment_prepared"
+        or payload.get("tool") != "cargo"
+        or payload.get("profile") != profile
+        or payload.get("repository_root") != str(root)
+    ):
+        raise RuntimeError("Managed-build resolver returned an incompatible contract")
+    environment = payload.get("environment")
+    if not isinstance(environment, dict) or set(environment) != {"CARGO_TARGET_DIR"}:
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo environment")
+    raw_target = environment.get("CARGO_TARGET_DIR")
+    raw_cache = payload.get("cache_path")
+    raw_lifecycle_lock = payload.get("lifecycle_lock_path")
+    prepared_paths = payload.get("prepared_paths")
+    if (
+        not isinstance(raw_target, str)
+        or not raw_target.startswith("/")
+        or "\x00" in raw_target
+        or not isinstance(raw_cache, str)
+        or not raw_cache.startswith("/")
+        or "\x00" in raw_cache
+        or not isinstance(raw_lifecycle_lock, str)
+        or not raw_lifecycle_lock.startswith("/")
+        or "\x00" in raw_lifecycle_lock
+        or not isinstance(prepared_paths, list)
+        or any(not isinstance(item, str) for item in prepared_paths)
+    ):
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo target path")
+    target_dir = Path(raw_target)
+    cache_path = Path(raw_cache)
+    try:
+        relative_cache = cache_path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError as exc:
+        raise RuntimeError("Managed-build resolver Cargo cache escapes the managed cache") from exc
+    if len(relative_cache.parts) != 1 or target_dir != cache_path / "target":
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo cache binding")
+    expected_lock = MANAGED_CARGO_LOCK_ROOT / f"{relative_cache.parts[0]}.lock"
+    if raw_lifecycle_lock != str(expected_lock):
+        raise RuntimeError("Managed-build resolver returned an invalid Cargo lifecycle lock binding")
+    if (
+        str(cache_path) not in prepared_paths
+        or str(target_dir) not in prepared_paths
+        or str(expected_lock.parent) not in prepared_paths
+    ):
+        raise RuntimeError("Managed-build resolver did not prepare the Cargo cache binding")
+    if target_dir == root or root in target_dir.parents:
+        raise RuntimeError("Managed-build resolver Cargo target points into the worktree")
+    return str(target_dir)
+
+
+def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
+    target_dir = Path(cargo_target_dir)
+    cache_path = target_dir.parent
+    try:
+        relative = cache_path.relative_to(MANAGED_CARGO_CACHE_ROOT)
+    except ValueError as exc:
+        raise RuntimeError("managed Cargo target escapes the managed cache") from exc
+    if len(relative.parts) != 1 or target_dir != cache_path / "target":
+        raise RuntimeError("managed Cargo target has an invalid lifecycle lock binding")
+    cache_key = relative.parts[0]
+    if SHA256.fullmatch(cache_key) is None:
+        raise RuntimeError("managed Cargo cache key is invalid for lifecycle lock")
+    try:
+        MANAGED_CARGO_LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+        resolved_lock_root = MANAGED_CARGO_LOCK_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError("managed Cargo lifecycle lock root is unavailable") from exc
+    if (
+        resolved_lock_root != MANAGED_CARGO_LOCK_ROOT
+        or MANAGED_CARGO_LOCK_ROOT.is_symlink()
+        or not MANAGED_CARGO_LOCK_ROOT.is_dir()
+    ):
+        raise RuntimeError("managed Cargo lifecycle lock root is unsafe")
+    if not Path(FLOCK_EXECUTABLE).is_file() or not os.access(FLOCK_EXECUTABLE, os.X_OK):
+        raise RuntimeError("managed Cargo lifecycle lock executable is unavailable")
+    return MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+
+
+def _bind_managed_cargo_environment(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+) -> list[str]:
+    local_systemd = target["transport"] == "local" and execution_backend == "systemd-user"
+    explicit_managed_target = (
+        _explicit_managed_cargo_target_dir(command) if local_systemd else None
+    )
+    if (
+        local_systemd
+        and explicit_managed_target is None
+        and _ambiguous_managed_cargo_target_override(command)
+    ):
+        raise RuntimeError(
+            "ambiguous managed Cargo target override cannot be lifecycle-fenced"
+        )
+    if explicit_managed_target is not None:
+        lifecycle_lock = _managed_cargo_lifecycle_lock(explicit_managed_target)
+        return [
+            FLOCK_EXECUTABLE,
+            "--shared",
+            str(lifecycle_lock),
+            *command,
+        ]
+    cargo_target_dir = _resolve_managed_cargo_target_dir(
+        command,
+        target=target,
+        cwd=cwd,
+        execution_backend=execution_backend,
+    )
+    if cargo_target_dir is None:
+        return command
+    lifecycle_lock = _managed_cargo_lifecycle_lock(cargo_target_dir)
+    return [
+        FLOCK_EXECUTABLE,
+        "--shared",
+        str(lifecycle_lock),
+        SYSTEMD_ENV_EXECUTABLE,
+        f"CARGO_TARGET_DIR={cargo_target_dir}",
+        *command,
+    ]
+
+
 def _validate_weights(cpu_weight: int, io_weight: int) -> tuple[int, int]:
     if not isinstance(cpu_weight, int) or not 1 <= cpu_weight <= 10_000:
         raise ValueError("cpu_weight must be between 1 and 10000")
@@ -1760,6 +2217,345 @@ def _task_state_counts(
     return exact, projections, unknown_state_count
 
 
+def _task_archive_payload_sha256(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise RuntimeError("Stored task archive payload is not text")
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _task_archive_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the stable, redaction-independent record bound into task archives."""
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_task_archive_record",
+        "task_id": record["task_id"],
+        "host": record["host"],
+        "unit": record["unit"],
+        "authoritative_unit": record.get("authoritative_unit") or record["unit"],
+        "execution_backend": record.get("execution_backend") or "systemd-user",
+        "systemd_scope": record.get("systemd_scope") or "user",
+        "attempt": int(record["attempt"]),
+        "state": record["state"],
+        "resume_policy": record["resume_policy"],
+        "argv_sha256": record["argv_sha256"],
+        "cwd": record["cwd"],
+        "runtime_seconds": int(record["runtime_seconds"]),
+        "cpu_weight": int(record["cpu_weight"]),
+        "io_weight": int(record["io_weight"]),
+        "memory_max_bytes": record.get("memory_max_bytes"),
+        "created_at_unix": int(record["created_at_unix"]),
+        "updated_at_unix": int(record["updated_at_unix"]),
+        "launcher_sha256": _task_archive_payload_sha256(record["launcher_json"]),
+        "last_observation_sha256": _task_archive_payload_sha256(
+            record.get("last_observation_json")
+        ),
+        "resource_keys_sha256": _task_archive_payload_sha256(
+            record.get("resource_keys_json") or "[]"
+        ),
+        "lease_owner_id": record.get("lease_owner_id"),
+        "request_id": record.get("request_id"),
+        "origin_ref": record.get("origin_ref"),
+        "external_run_id": record.get("external_run_id"),
+        "execution_envelope_sha256": record.get("execution_envelope_sha256"),
+        "acceptance_sha256": _task_archive_payload_sha256(
+            record.get("acceptance_json") or "[]"
+        ),
+        "request_sha256": record.get("request_sha256"),
+        "chronik_outbox_enabled": bool(record.get("chronik_outbox_enabled")),
+        "chronik_outbox_state_root": record.get("chronik_outbox_state_root"),
+        "chronik_context_sha256": _task_archive_payload_sha256(
+            record.get("chronik_context_json")
+        ),
+        "terminalization_sha256": record.get("terminalization_sha256"),
+        "terminalized_at_unix": record.get("terminalized_at_unix"),
+        "lifecycle_receipt_sha256": record.get("lifecycle_receipt_sha256"),
+        "repository_scope_manifest_sha256": _task_archive_payload_sha256(
+            record.get("repository_scope_manifest_json")
+        ),
+    }
+
+
+def _task_archive_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_TASK_ARCHIVE_ROOT")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else TASK_DB.parent / "task-archives"
+    )
+
+
+def _task_projection_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_TASK_PROJECTION_ROOT")
+    return (
+        Path(configured).expanduser()
+        if configured
+        else TASK_DB.parent / "task-projection"
+    )
+
+
+def _task_current_projection() -> dict[str, Any]:
+    return lifecycle_projection.load_task_archive_projection(
+        projection_root=_task_projection_root(),
+        archive_root=_task_archive_root(),
+    )
+
+
+def _projected_task_state_counts(
+    connection: sqlite3.Connection,
+    projection: dict[str, Any],
+) -> tuple[dict[str, int], int]:
+    bindings = projection.get("archived_task_bindings")
+    if not isinstance(bindings, dict):
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "current task projection bindings are invalid"
+        )
+    exact = {state: 0 for state in sorted(TASK_STATES)}
+    unknown_state_count = 0
+    for task_id in sorted(bindings):
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                f"projected task row is missing from current store: {task_id}"
+            )
+        raw = dict(row)
+        archive_record = _task_archive_record(raw)
+        if lifecycle_projection.bounded_current_task_projection(
+            [archive_record],
+            projection=projection,
+        ):
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                f"projected task unexpectedly remains current: {task_id}"
+            )
+        state = str(raw["state"])
+        if state in exact:
+            exact[state] += 1
+        else:
+            unknown_state_count += 1
+    return exact, unknown_state_count
+
+
+def _subtract_projected_task_counts(
+    exact: dict[str, int],
+    unknown_state_count: int,
+    projected_exact: dict[str, int],
+    projected_unknown_state_count: int,
+) -> tuple[dict[str, int], dict[str, int], int]:
+    current_exact: dict[str, int] = {}
+    for state in sorted(TASK_STATES):
+        remaining = exact[state] - projected_exact[state]
+        if remaining < 0:
+            raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                f"projected task count exceeds stored state count: {state}"
+            )
+        current_exact[state] = remaining
+    current_unknown = unknown_state_count - projected_unknown_state_count
+    if current_unknown < 0:
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "projected unknown task count exceeds stored unknown state count"
+        )
+    current_projections = {
+        name: sum(current_exact[state] for state in states)
+        for name, states in sorted(TASK_STATE_PROJECTIONS.items())
+    }
+    return current_exact, current_projections, current_unknown
+
+
+def _task_current_records_for_states(
+    connection: sqlite3.Connection,
+    *,
+    states: tuple[str, ...],
+    projection: dict[str, Any],
+) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in states)
+    rows = connection.execute(
+        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+        "ORDER BY created_at_unix DESC, task_id DESC",
+        states,
+    ).fetchall()
+    raw_records = [dict(row) for row in rows]
+    archive_records = [_task_archive_record(record) for record in raw_records]
+    current_archive_records = lifecycle_projection.bounded_current_task_projection(
+        archive_records,
+        projection=projection,
+    )
+    current_task_ids = {str(record["task_id"]) for record in current_archive_records}
+    return [
+        record
+        for record in raw_records
+        if str(record["task_id"]) in current_task_ids
+    ]
+
+
+def _task_attention_projection(
+    connection: sqlite3.Connection,
+    projection: dict[str, Any],
+    *,
+    decision_snapshot: dict[str, str | None] | None = None,
+) -> tuple[dict[str, Any], set[str]]:
+    import grabowski_task_attention as task_attention
+
+    records = _task_current_records_for_states(
+        connection,
+        states=TASK_STATE_PROJECTIONS["attention"],
+        projection=projection,
+    )
+
+    def degraded(error_name: str) -> tuple[dict[str, Any], set[str]]:
+        raw_bindings = [
+            {
+                "task_id": str(record["task_id"]),
+                "attempt": int(record["attempt"]),
+                "state": str(record["state"]),
+                "updated_at_unix": int(record["updated_at_unix"]),
+            }
+            for record in records
+        ]
+        return (
+            {
+                "status": "degraded",
+                "evidence_error": error_name,
+                "projection_sha256": _sha256_json(
+                    {
+                        "schema_version": 1,
+                        "status": "degraded",
+                        "evidence_error": error_name,
+                        "task_bindings": raw_bindings,
+                    }
+                ),
+                "raw_attention_count": len(records),
+                "current_attention_count": len(records),
+                "excluded_attention_count": 0,
+                "excluded_classification_counts": {},
+                "decision_candidate_count": None,
+                "decision_classification_counts": {},
+                "scope": "current_task_projection_after_valid_attention_decisions",
+                "raw_scope": "current_task_projection_before_attention_decisions",
+            },
+            set(),
+        )
+
+    snapshot_status = (decision_snapshot or {}).get("status", "locked")
+    snapshot_error = (decision_snapshot or {}).get("evidence_error")
+    if snapshot_status == "degraded":
+        return degraded(str(snapshot_error or "TaskAttentionDecisionSnapshotError"))
+    if snapshot_status == "absent":
+        task_bindings = [
+            {
+                "task_id": str(record["task_id"]),
+                "attempt": int(record["attempt"]),
+                "unit": str(record["unit"]),
+                "authoritative_unit": str(record["authoritative_unit"]),
+                "argv_sha256": str(record["argv_sha256"]),
+                "execution_envelope_sha256": record["execution_envelope_sha256"],
+                "state": str(record["state"]),
+            }
+            for record in records
+        ]
+        return (
+            {
+                "status": "verified",
+                "evidence_error": None,
+                "projection_sha256": _sha256_json(
+                    {
+                        "schema_version": 1,
+                        "task_bindings": sorted(
+                            task_bindings,
+                            key=lambda item: str(item["task_id"]),
+                        ),
+                        "excluded_task_ids": [],
+                        "decision_classification_counts": {},
+                    }
+                ),
+                "raw_attention_count": len(records),
+                "current_attention_count": len(records),
+                "excluded_attention_count": 0,
+                "excluded_classification_counts": {
+                    classification: 0
+                    for classification in sorted(
+                        task_attention.CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
+                    )
+                },
+                "decision_candidate_count": 0,
+                "decision_classification_counts": {},
+                "scope": "current_task_projection_after_valid_attention_decisions",
+                "raw_scope": "current_task_projection_before_attention_decisions",
+            },
+            set(),
+        )
+    try:
+        projected = task_attention.current_attention_projection(records)
+    except (
+        task_attention.TaskAttentionError,
+        task_attention.TaskAttentionInputError,
+        OSError,
+    ) as exc:
+        return degraded(type(exc).__name__)
+    excluded_task_ids = set(projected["excluded_task_ids"])
+    public_projection = {
+        key: value
+        for key, value in projected.items()
+        if key != "excluded_task_ids"
+    }
+    return public_projection, excluded_task_ids
+
+
+def _task_list_current_rows(
+    connection: sqlite3.Connection,
+    *,
+    where: list[str],
+    parameters: list[Any],
+    cursor_created_at: int | None,
+    cursor_task_id: str | None,
+    limit: int,
+    projection: dict[str, Any],
+    excluded_task_ids: set[str] | None = None,
+) -> list[sqlite3.Row]:
+    selected: list[sqlite3.Row] = []
+    scan_created_at = cursor_created_at
+    scan_task_id = cursor_task_id
+    batch_limit = max(TASK_LIST_SCAN_BATCH, limit + 1)
+    while len(selected) < limit + 1:
+        scan_where = list(where)
+        scan_parameters = list(parameters)
+        if scan_created_at is not None and scan_task_id is not None:
+            scan_where.append(
+                "(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))"
+            )
+            scan_parameters.extend([scan_created_at, scan_created_at, scan_task_id])
+        where_sql = f" WHERE {' AND '.join(scan_where)}" if scan_where else ""
+        rows = connection.execute(
+            f"SELECT * FROM tasks{where_sql} "
+            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+            (*scan_parameters, batch_limit),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            archive_record = _task_archive_record(dict(row))
+            current = lifecycle_projection.bounded_current_task_projection(
+                [archive_record],
+                projection=projection,
+            )
+            if current and (
+                excluded_task_ids is None
+                or str(row["task_id"]) not in excluded_task_ids
+            ):
+                selected.append(row)
+                if len(selected) >= limit + 1:
+                    break
+        if len(selected) >= limit + 1 or len(rows) < batch_limit:
+            break
+        last = rows[-1]
+        scan_created_at = int(last["created_at_unix"])
+        scan_task_id = str(last["task_id"])
+    return selected
+
+
 def _task_recommended_next_action(state: str) -> str:
     if state in {"launching", "running"}:
         return "read grabowski_task_status before deciding the next action"
@@ -2041,6 +2837,7 @@ def grabowski_task_start(
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
     chronik_operation: str = "other",
+    runtime_python: bool = False,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -2052,6 +2849,12 @@ def grabowski_task_start(
     command = _validate_command(argv)
     recovery_gate = _require_recovery_gate(command)
     working_directory = _validate_cwd(host, cwd)
+    command = _bind_grabowski_runtime_python(
+        command,
+        target=target,
+        cwd=working_directory,
+        enabled=runtime_python,
+    )
     runtime = operator._job_runtime(runtime_seconds)
     policy = _validate_resume_policy(resume_policy)
     cpu, io = _validate_weights(cpu_weight, io_weight)
@@ -2099,6 +2902,12 @@ def grabowski_task_start(
         owner_id=lease_owner,
         host=host,
         opaque_command=True,
+    )
+    command = _bind_managed_cargo_environment(
+        command,
+        target=target,
+        cwd=working_directory,
+        execution_backend=execution_backend,
     )
     attempt = 1
     unit = _task_unit(task_id, attempt)
@@ -2779,47 +3588,130 @@ def grabowski_task_list(
                 "schema_only cannot be combined with task-list filters or projections"
             )
         return _task_schema_inventory()
+    if view == "managed_cargo_evidence":
+        if state is not None or cursor is not None or fields is not None:
+            raise ValueError(
+                "managed_cargo_evidence view cannot be combined with state, cursor or fields"
+            )
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        _recover_pending_task_terminalizations()
+        return _managed_cargo_evidence_from_task_store(limit)
     selected_view = consumer_surface.normalize_view(view)
     _recover_pending_task_terminalizations()
+    current_projection = _task_current_projection()
+    projection_sha256 = current_projection.get("projection_sha256")
+    archived_task_bindings = current_projection.get("archived_task_bindings")
+    projection_switches = current_projection.get("switches")
+    if (
+        not isinstance(projection_sha256, str)
+        or SHA256.fullmatch(projection_sha256) is None
+        or not isinstance(archived_task_bindings, dict)
+        or not isinstance(projection_switches, list)
+    ):
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "current task projection metadata is invalid"
+        )
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     filter_states = _task_filter_states(state)
-    scope = f"task-list:{selected_view}:{state or 'all'}"
-    position = consumer_surface.decode_cursor(cursor, scope)
-    cursor_created_at: int | None = None
-    cursor_task_id: str | None = None
-    if position is not None:
-        cursor_created_at = position.get("created_at_unix")
-        cursor_task_id = position.get("task_id")
-        if (
-            isinstance(cursor_created_at, bool)
-            or not isinstance(cursor_created_at, int)
-            or cursor_created_at < 0
-            or not isinstance(cursor_task_id, str)
-            or not TASK_ID.fullmatch(cursor_task_id)
-        ):
-            raise ValueError("cursor position is invalid")
+    snapshot_scope = f"task-list:{selected_view}:{state or 'all'}"
     where: list[str] = []
     parameters: list[Any] = []
     if filter_states is not None:
         placeholders = ",".join("?" for _ in filter_states)
         where.append(f"state IN ({placeholders})")
         parameters.extend(filter_states)
-    if cursor_created_at is not None and cursor_task_id is not None:
-        where.append("(created_at_unix < ? OR (created_at_unix = ? AND task_id < ?))")
-        parameters.extend([cursor_created_at, cursor_created_at, cursor_task_id])
-    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     with _task_read_snapshot() as connection:
-        rows = connection.execute(
-            f"SELECT * FROM tasks{where_sql} "
-            "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
-            (*parameters, limit + 1),
-        ).fetchall()
-        state_counts, projection_counts, unknown_state_count = _task_state_counts(connection)
-        if filter_states is None:
-            total_matching = sum(state_counts.values()) + unknown_state_count
-        else:
-            total_matching = sum(state_counts[item] for item in filter_states)
+        # BEGIN DEFERRED does not pin a SQLite snapshot until the first read.
+        # Pin it before helper calls so row pages, counts and attention decisions
+        # are all derived against one task-store view even if a concurrent writer
+        # commits while the list operation is in progress.
+        connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        retained_state_counts, _, retained_unknown_state_count = _task_state_counts(connection)
+        projected_state_counts, projected_unknown_state_count = _projected_task_state_counts(
+            connection,
+            current_projection,
+        )
+        state_counts, raw_projection_counts, unknown_state_count = _subtract_projected_task_counts(
+            retained_state_counts,
+            retained_unknown_state_count,
+            projected_state_counts,
+            projected_unknown_state_count,
+        )
+        import grabowski_task_attention as task_attention
+
+        # Decision files live outside SQLite. Hold the shared decision lock from
+        # projection through cursor validation and row materialization so a
+        # create-only closeout write cannot split one attention read across two
+        # decision-store generations. Writers use the same lock exclusively.
+        with task_attention.decision_snapshot_guard() as decision_snapshot:
+            attention_projection, attention_excluded_task_ids = _task_attention_projection(
+                connection,
+                current_projection,
+                decision_snapshot=decision_snapshot,
+            )
+            if (
+                attention_projection["raw_attention_count"]
+                != raw_projection_counts["attention"]
+            ):
+                raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                    "decision-aware attention projection does not match current raw attention count"
+                )
+            projection_counts = dict(raw_projection_counts)
+            projection_counts["attention"] = attention_projection["current_attention_count"]
+            list_snapshot_sha256 = projection_sha256
+            if state == "attention":
+                list_snapshot_sha256 = _sha256_json(
+                    {
+                        "archive_projection_sha256": projection_sha256,
+                        "attention_projection_sha256": attention_projection[
+                            "projection_sha256"
+                        ],
+                    }
+                )
+            scope = f"{snapshot_scope}:{list_snapshot_sha256}"
+            position = consumer_surface.decode_cursor(
+                cursor,
+                scope,
+                snapshot_scope=snapshot_scope,
+            )
+            cursor_created_at: int | None = None
+            cursor_task_id: str | None = None
+            if position is not None:
+                cursor_created_at = position.get("created_at_unix")
+                cursor_task_id = position.get("task_id")
+                if (
+                    isinstance(cursor_created_at, bool)
+                    or not isinstance(cursor_created_at, int)
+                    or cursor_created_at < 0
+                    or not isinstance(cursor_task_id, str)
+                    or not TASK_ID.fullmatch(cursor_task_id)
+                ):
+                    raise ValueError("cursor position is invalid")
+            rows = _task_list_current_rows(
+                connection,
+                where=where,
+                parameters=parameters,
+                cursor_created_at=cursor_created_at,
+                cursor_task_id=cursor_task_id,
+                limit=limit,
+                projection=current_projection,
+                excluded_task_ids=(
+                    attention_excluded_task_ids if state == "attention" else None
+                ),
+            )
+            if filter_states is None:
+                total_matching = sum(state_counts.values()) + unknown_state_count
+            elif state == "attention":
+                total_matching = projection_counts["attention"]
+            else:
+                total_matching = sum(state_counts[item] for item in filter_states)
+    projection_readback = _task_current_projection()
+    if projection_readback.get("projection_sha256") != projection_sha256:
+        raise lifecycle_projection.LifecycleProjectionIntegrityError(
+            "current task projection changed during list read"
+        )
     has_more = len(rows) > limit
     page_rows = rows[:limit]
     tasks = [_public_for_view(dict(row), selected_view) for row in page_rows]
@@ -2846,6 +3738,12 @@ def grabowski_task_list(
             "code": "unknown_task_states",
             "count": unknown_state_count,
         })
+    if attention_projection["status"] != "verified":
+        warnings.append({
+            "code": "attention_projection_degraded",
+            "evidence_error": attention_projection["evidence_error"],
+            "raw_attention_count": attention_projection["raw_attention_count"],
+        })
     warnings.extend(
         {
             "code": "task_requires_attention",
@@ -2854,6 +3752,7 @@ def grabowski_task_list(
         }
         for task in tasks
         if task.get("state") in warning_states
+        and task.get("task_id") not in attention_excluded_task_ids
     )
     payload: dict[str, Any] = {
         "schema_version": 2,
@@ -2866,12 +3765,25 @@ def grabowski_task_list(
         ),
         "state_filter_states": list(filter_states or ()),
         "state_counts": state_counts,
-        "state_counts_scope": "all_tasks",
+        "state_counts_scope": "current_projection",
         "state_counts_complete": unknown_state_count == 0,
         "unknown_state_count": unknown_state_count,
         "projection_counts": projection_counts,
-        "projection_counts_scope": "all_tasks",
+        "raw_projection_counts": raw_projection_counts,
+        "projection_counts_scope": "current_projection",
+        "projection_counts_semantics": {
+            "active": "current_task_states",
+            "attention": "current_task_projection_after_valid_attention_decisions",
+            "terminal": "current_task_states",
+        },
         "projection_counts_overlap": True,
+        "attention_projection": attention_projection,
+        "current_projection": {
+            "status": "verified",
+            "projection_sha256": projection_sha256,
+            "switch_count": len(projection_switches),
+            "projected_task_count": len(archived_task_bindings),
+        },
         "tasks": tasks,
         "pagination": {
             "limit": limit,
@@ -2879,29 +3791,73 @@ def grabowski_task_list(
             "has_more": has_more,
             "next_cursor": next_cursor,
             "ordering": "created_at_unix_desc_task_id_desc",
+            "snapshot_sha256": list_snapshot_sha256,
         },
         "warnings": warnings,
         "recommended_next_action": (
             "inspect unknown task states before relying on projections"
             if unknown_state_count
-            else "inspect attention tasks before retry" if warnings else "none"
+            else "repair attention projection evidence before relying on closeout filtering"
+            if attention_projection["status"] != "verified"
+            else "inspect current attention tasks before retry"
+            if projection_counts["attention"]
+            else "none"
         ),
         "does_not_establish": [
             "task_output_correctness",
             "safe_unchanged_retry",
             "resource_release_complete",
+            "physical_archive_pruning",
         ],
     }
     if selected_view == "evidence":
         payload["database"] = str(TASK_DB)
+        payload["current_projection"].update(
+            {
+                "projection_root": str(_task_projection_root()),
+                "archive_root": str(_task_archive_root()),
+            }
+        )
     return consumer_surface.project_fields(
         payload,
         fields=fields,
         required=(
             "schema_version",
             "view",
+            "current_projection",
             "warnings",
             "recommended_next_action",
             "does_not_establish",
         ),
+    )
+
+
+# Managed Cargo cache evidence is a read-only projection of the canonical task database.
+import grabowski_managed_cargo as managed_cargo
+
+
+def _managed_cargo_evidence_from_task_store(max_entries: int) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    with _task_read_snapshot() as connection:
+        rows = connection.execute(
+            "SELECT task_id, state, argv_json, updated_at_unix "
+            "FROM tasks ORDER BY task_id"
+        ).fetchall()
+        for row in rows:
+            try:
+                argv = json.loads(str(row["argv_json"]))
+            except json.JSONDecodeError:
+                argv = None
+            records.append(
+                {
+                    "task_id": str(row["task_id"]),
+                    "state": str(row["state"]),
+                    "argv": argv,
+                    "updated_at_unix": int(row["updated_at_unix"]),
+                }
+            )
+    return managed_cargo.build_evidence(
+        records,
+        cache_root=MANAGED_CARGO_CACHE_ROOT,
+        max_entries=max_entries,
     )

@@ -175,6 +175,39 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     workers * records_per_worker,
                 )
 
+    def test_metadata_only_chain_read_retains_verified_segment_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._patches(state)
+            with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+                for index in range(25):
+                    grabowski_mcp._append_audit(
+                        {"operation": "metadata-only-test", "index": index, "payload": "s" * 120}
+                    )
+                grabowski_mcp.AUDIT_SEGMENT_VERIFICATION_CACHE.clear()
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    warm, _compatibility = grabowski_mcp._read_audit_chain_unlocked(
+                        audit,
+                        use_segment_cache=True,
+                    )
+                self.assertGreater(len(warm), 1)
+                with grabowski_mcp._audit_coordination_lock(audit, exclusive=False):
+                    metadata_only, _compatibility = grabowski_mcp._read_audit_chain_unlocked(
+                        audit,
+                        use_segment_cache=True,
+                        retain_verified_segment_data=False,
+                    )
+                self.assertTrue(metadata_only[0][1])
+                for segment_path, data, status in metadata_only[1:]:
+                    self.assertEqual(data, b"")
+                    self.assertEqual(len(status["segment_sha256"]), 64)
+                    archived_data = segment_path.read_bytes()
+                    self.assertEqual(
+                        hashlib.sha256(archived_data).hexdigest(),
+                        status["segment_sha256"],
+                    )
+
     def test_unchanged_sealed_segment_uses_identity_bound_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"

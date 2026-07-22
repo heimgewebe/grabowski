@@ -112,7 +112,20 @@ def upgraded(policy: dict[str, Any], template: dict[str, Any]) -> dict[str, Any]
     if not isinstance(active_profile, str):
         raise ValueError("active profile is invalid")
 
+    policy_definitions = policy.get("capability_definitions")
+    template_definitions = template.get("capability_definitions")
+    if policy_definitions is not None and not isinstance(policy_definitions, dict):
+        raise ValueError("policy capability definitions are invalid")
+    if template_definitions is not None and not isinstance(template_definitions, dict):
+        raise ValueError("template capability definitions are invalid")
+
     result = copy.deepcopy(policy)
+    if isinstance(template_definitions, dict):
+        merged_definitions = copy.deepcopy(policy_definitions or {})
+        for capability, description in template_definitions.items():
+            if capability not in merged_definitions:
+                merged_definitions[capability] = copy.deepcopy(description)
+        result["capability_definitions"] = merged_definitions
     result["profiles"] = {
         "observe": copy.deepcopy(observe),
         "maintain": copy.deepcopy(maintain),

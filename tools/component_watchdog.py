@@ -5,8 +5,10 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
+import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -27,13 +29,26 @@ DEFAULT_PROFILE = "grabowski"
 DEFAULT_MODULE = "grabowski_operator"
 DEFAULT_OPERATOR_SERVICE = "grabowski-operator.service"
 DEFAULT_TUNNEL_SERVICE = "tunnel-client-grabowski.service"
-DEFAULT_MCP_URL = "http://127.0.0.1:18181/mcp"
+DEFAULT_MCP_URL = "http://127.0.0.1:18181/_grabowski/mcp-liveness"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:18080/healthz"
 DEFAULT_READY_URL = "http://127.0.0.1:18080/readyz"
+DEFAULT_METRICS_URL = "http://127.0.0.1:18080/metrics"
+DEFAULT_CONTROL_PLANE_POLL_MAX_AGE = 90.0
+TUNNEL_METRICS_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+CONTROL_PLANE_POLL_METRIC = "commands_poll_last_successful_timestamp_seconds"
 PROTOCOL_VERSION = "2025-06-18"
 MCP_HEALTH_TOOL = "grabowski_runtime_health"
 MCP_MAX_RESPONSE_BYTES = 65536
 MCP_STDIO_SHUTDOWN_TIMEOUT = 2.0
+CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES = 64 * 1024
+CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = 8.0
+SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS = 5.0
+SERVICE_RESTART_ERROR_MAX_CHARS = 512
+DEFAULT_RECOVERY_TIMEOUT_SECONDS = 60.0
+STACK_DUMP_DIRECTORY_NAME = "operator-stackdumps-v1"
+STACK_DUMP_SLOT_COUNT = 8
+STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
+STACK_DUMP_MAX_BYTES = 1_048_576
 DEFAULT_BACKOFF_BASE = 60
 DEFAULT_BACKOFF_MAX = 900
 BACKOFF_MAX_LEVEL = 32
@@ -54,6 +69,7 @@ class ProbeResult:
     reasons: tuple[str, ...] = ()
     pid: int | None = None
     age_seconds: float | None = None
+    start_ticks: int | None = None
 
 
 @dataclass
@@ -122,7 +138,7 @@ def read_cmdline(proc_root: Path, pid: int) -> list[str]:
     ]
 
 
-def process_age_seconds(proc_root: Path, pid: int) -> float:
+def process_start_ticks(proc_root: Path, pid: int) -> int:
     stat_text = (proc_root / str(pid) / "stat").read_text(
         encoding="utf-8", errors="replace"
     )
@@ -132,7 +148,23 @@ def process_age_seconds(proc_root: Path, pid: int) -> float:
     fields = stat_text[closing + 2 :].split()
     if len(fields) <= 19:
         raise WatchdogError("proc-stat-incomplete")
-    start_ticks = int(fields[19])
+    try:
+        start_ticks = int(fields[19])
+    except ValueError as exc:
+        raise WatchdogError("proc-stat-invalid-start-time") from exc
+    if start_ticks < 0:
+        raise WatchdogError("proc-stat-invalid-start-time")
+    return start_ticks
+
+
+def process_age_seconds(
+    proc_root: Path,
+    pid: int,
+    *,
+    start_ticks: int | None = None,
+) -> float:
+    if start_ticks is None:
+        start_ticks = process_start_ticks(proc_root, pid)
     uptime = float((proc_root / "uptime").read_text(encoding="ascii").split()[0])
     ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
     return max(0.0, uptime - (start_ticks / ticks))
@@ -206,6 +238,74 @@ def get_probe(url: str, expected_body: str, timeout: float) -> bool:
         return False
     finally:
         connection.close()
+
+
+def get_bounded_text(url: str, timeout: float, max_bytes: int) -> str | None:
+    if max_bytes < 1:
+        raise WatchdogError("invalid-http-response-limit")
+    host, port, path = loopback_http_url(url)
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers={"Connection": "close"})
+        response = connection.getresponse()
+        body = response.read(max_bytes + 1)
+        if response.status != 200 or len(body) > max_bytes:
+            return None
+        return body.decode("utf-8", errors="strict")
+    except (OSError, UnicodeDecodeError, http.client.HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def prometheus_metric_samples(text: str, metric_name: str) -> tuple[float, ...]:
+    if not metric_name or any(char.isspace() for char in metric_name):
+        raise WatchdogError("invalid-prometheus-metric-name")
+    values: list[float] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        token = parts[0]
+        if token != metric_name and not token.startswith(metric_name + "{"):
+            continue
+        try:
+            value = float(parts[1])
+        except ValueError:
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return tuple(values)
+
+
+def control_plane_poll_probe(
+    metrics_url: str,
+    timeout: float,
+    max_age_seconds: float,
+    *,
+    now: float | None = None,
+) -> str | None:
+    if max_age_seconds <= 0:
+        raise WatchdogError("invalid-control-plane-poll-max-age")
+    text = get_bounded_text(
+        metrics_url, timeout, TUNNEL_METRICS_MAX_RESPONSE_BYTES
+    )
+    if text is None:
+        return "control-plane-metrics-unavailable"
+    samples = prometheus_metric_samples(text, CONTROL_PLANE_POLL_METRIC)
+    if not samples:
+        return "control-plane-poll-missing"
+    observed = max(samples)
+    current = time.time() if now is None else now
+    age = current - observed
+    if age < -max_age_seconds:
+        return "control-plane-poll-timestamp-invalid"
+    if age > max_age_seconds:
+        return "control-plane-poll-stale"
+    return None
 
 
 class McpProbeFailure(Exception):
@@ -326,6 +426,69 @@ def tool_health_payload(result: dict) -> dict | None:
             except json.JSONDecodeError:
                 return None
             return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _mcp_http_request(
+    *,
+    host: str,
+    port: int,
+    path: str,
+    timeout: float,
+) -> tuple[int, dict[str, str], bytes]:
+    headers = {
+        "Accept": "application/json",
+        "Connection": "close",
+    }
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        response_body = response.read(MCP_MAX_RESPONSE_BYTES + 1)
+        response_headers = {
+            key.lower(): value for key, value in response.getheaders()
+        }
+        return response.status, response_headers, response_body
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        raise McpProbeFailure("mcp-http-request-failed") from exc
+    finally:
+        connection.close()
+
+
+def mcp_http_probe(url: str, timeout: float) -> str | None:
+    # Probe the live event loop and session-creation lock without creating a session.
+    if timeout <= 0:
+        raise WatchdogError("invalid-mcp-timeout")
+    host, port, path = loopback_http_url(url)
+    try:
+        status, headers, body = _mcp_http_request(
+            host=host,
+            port=port,
+            path=path,
+            timeout=timeout,
+        )
+    except McpProbeFailure as failure:
+        return failure.reason
+    if status == 503:
+        return "mcp-session-creation-lock-busy"
+    if status != 200:
+        return "mcp-http-liveness-status"
+    if len(body) > MCP_MAX_RESPONSE_BYTES:
+        return "mcp-http-response-too-large"
+    content_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/json":
+        return "mcp-http-content-type-invalid"
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return "mcp-http-json-invalid"
+    if not isinstance(payload, dict):
+        return "mcp-http-liveness-shape-invalid"
+    if (
+        payload.get("healthy") is not True
+        or payload.get("session_creation_lock_available") is not True
+    ):
+        return "mcp-session-creation-lock-busy"
     return None
 
 
@@ -471,6 +634,9 @@ def probe_component(
     ready_url: str,
     startup_grace: float,
     http_timeout: float,
+    mcp_url: str = DEFAULT_MCP_URL,
+    metrics_url: str = DEFAULT_METRICS_URL,
+    control_plane_poll_max_age: float = DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
     proc_root: Path = Path("/proc"),
 ) -> ProbeResult:
     try:
@@ -490,7 +656,8 @@ def probe_component(
         return ProbeResult("unhealthy", ("service-inactive",), pid or None)
 
     try:
-        age = process_age_seconds(proc_root, pid)
+        start_ticks = process_start_ticks(proc_root, pid)
+        age = process_age_seconds(proc_root, pid, start_ticks=start_ticks)
     except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, WatchdogError):
         return ProbeResult("indeterminate", ("process-age-unavailable",), pid)
 
@@ -499,15 +666,30 @@ def probe_component(
         if not operator_identity_ok(proc_root, pid, runtime_root, module, host, port):
             reasons.append("operator-identity-mismatch")
         try:
-            mcp_failure = mcp_stdio_probe_from_runtime(
+            live_failure = mcp_http_probe(mcp_url, http_timeout)
+            isolated_failure = mcp_stdio_probe_from_runtime(
                 runtime_root, module, http_timeout
             )
         except WatchdogError as exc:
-            return ProbeResult("indeterminate", (str(exc),), pid, age)
-        if mcp_failure == "mcp-runtime-unhealthy" and not reasons:
-            return ProbeResult("indeterminate", (mcp_failure,), pid, age)
-        if mcp_failure is not None:
-            reasons.append(mcp_failure)
+            return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
+        failures = tuple(
+            failure
+            for failure in (live_failure, isolated_failure)
+            if failure is not None
+        )
+        concrete_failures = tuple(
+            failure
+            for failure in failures
+            if failure != "mcp-runtime-unhealthy"
+        )
+        if concrete_failures:
+            reasons.extend(concrete_failures)
+        elif "mcp-runtime-unhealthy" in failures:
+            if not reasons:
+                return ProbeResult(
+                    "indeterminate", ("mcp-runtime-unhealthy",), pid, age, start_ticks
+                )
+            reasons.append("mcp-runtime-unhealthy")
     elif component == "tunnel":
         if not tunnel_identity_ok(proc_root, pid, profile):
             reasons.append("tunnel-identity-mismatch")
@@ -516,16 +698,34 @@ def probe_component(
                 reasons.append("health-failed")
             if not get_probe(ready_url, "ready", http_timeout):
                 reasons.append("readiness-failed")
+            poll_failure = control_plane_poll_probe(
+                metrics_url, http_timeout, control_plane_poll_max_age
+            )
+            if poll_failure in {
+                "control-plane-metrics-unavailable",
+                "control-plane-poll-missing",
+                "control-plane-poll-stale",
+                "control-plane-poll-timestamp-invalid",
+            } and not reasons:
+                return ProbeResult(
+                    "indeterminate", (poll_failure,), pid, age, start_ticks
+                )
+            if poll_failure is not None:
+                reasons.append(poll_failure)
         except WatchdogError as exc:
-            return ProbeResult("indeterminate", (str(exc),), pid, age)
+            return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
     else:
         raise WatchdogError("invalid-component")
 
     if not reasons:
-        return ProbeResult("healthy", pid=pid, age_seconds=age)
+        return ProbeResult(
+            "healthy", pid=pid, age_seconds=age, start_ticks=start_ticks
+        )
     if age < startup_grace:
-        return ProbeResult("startup-grace", tuple(reasons), pid, age)
-    return ProbeResult("unhealthy", tuple(reasons), pid, age)
+        return ProbeResult(
+            "startup-grace", tuple(reasons), pid, age, start_ticks
+        )
+    return ProbeResult("unhealthy", tuple(reasons), pid, age, start_ticks)
 
 
 def ensure_state_dir(path: Path) -> Path:
@@ -724,17 +924,528 @@ def decide(
     )
 
 
+def _process_start_ticks(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    if pid <= 0:
+        return None
+    try:
+        return process_start_ticks(proc_root, pid)
+    except (OSError, ValueError, WatchdogError):
+        return None
+
+
+def _stack_dump_pidfd(pid: int) -> int | None:
+    if (
+        pid <= 0
+        or not hasattr(os, "pidfd_open")
+        or not hasattr(signal, "pidfd_send_signal")
+    ):
+        return None
+    try:
+        return os.pidfd_open(pid, 0)
+    except (OSError, ValueError):
+        return None
+
+
+def _stack_dump_memfd(
+    pid: int,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    if pid <= 0:
+        return None
+    directory = proc_root / str(pid) / "fd"
+    try:
+        entries = sorted(directory.iterdir(), key=lambda item: item.name)
+    except OSError:
+        return None
+    expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
+    matches: list[int] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            target = os.readlink(entry).lstrip("/")
+        except OSError:
+            continue
+        if target in {expected, f"{expected} (deleted)"}:
+            matches.append(int(entry.name))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _stack_dump_memfd_is_bounded(
+    pid: int,
+    descriptor: int,
+    max_bytes: int,
+    proc_root: Path = Path("/proc"),
+) -> bool:
+    if pid <= 0 or descriptor < 0 or max_bytes <= 0:
+        return False
+    seal_names = ("F_GET_SEALS", "F_SEAL_GROW", "F_SEAL_SHRINK")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        return False
+    path = proc_root / str(pid) / "fd" / str(descriptor)
+    expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
+    try:
+        target = os.readlink(path).lstrip("/")
+    except OSError:
+        return False
+    if target not in {expected, f"{expected} (deleted)"}:
+        return False
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    source = -1
+    try:
+        source = os.open(path, flags)
+        metadata = os.fstat(source)
+        required_seals = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK
+        seals = fcntl.fcntl(source, fcntl.F_GET_SEALS)
+        return (
+            statmod.S_ISREG(metadata.st_mode)
+            and metadata.st_size == max_bytes
+            and seals & required_seals == required_seals
+        )
+    except OSError:
+        return False
+    finally:
+        if source >= 0:
+            os.close(source)
+
+
+def _stack_dump_memfd_position(
+    pid: int,
+    descriptor: int,
+    max_bytes: int,
+    proc_root: Path = Path("/proc"),
+) -> int | None:
+    if pid <= 0 or descriptor < 0 or max_bytes <= 0:
+        return None
+    path = proc_root / str(pid) / "fdinfo" / str(descriptor)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    if len(text.encode("utf-8")) > 4096:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("pos:"):
+            continue
+        try:
+            position = int(line.split(":", 1)[1].strip(), 10)
+        except ValueError:
+            return None
+        if not 0 <= position <= max_bytes:
+            return None
+        return position
+    return None
+
+
+def _read_stack_dump_memfd(
+    pid: int,
+    descriptor: int,
+    start: int,
+    end: int,
+    max_bytes: int,
+    proc_root: Path = Path("/proc"),
+) -> bytes | None:
+    if (
+        pid <= 0
+        or descriptor < 0
+        or start < 0
+        or end <= start
+        or end > max_bytes
+    ):
+        return None
+    seal_names = ("F_GET_SEALS", "F_SEAL_GROW", "F_SEAL_SHRINK")
+    if any(not hasattr(fcntl, name) for name in seal_names):
+        return None
+    path = proc_root / str(pid) / "fd" / str(descriptor)
+    expected = f"memfd:{STACK_DUMP_MEMFD_NAME}"
+    try:
+        target = os.readlink(path).lstrip("/")
+    except OSError:
+        return None
+    if target not in {expected, f"{expected} (deleted)"}:
+        return None
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    try:
+        source = os.open(path, flags)
+        try:
+            metadata = os.fstat(source)
+            if (
+                not statmod.S_ISREG(metadata.st_mode)
+                or metadata.st_size != max_bytes
+            ):
+                return None
+            required_seals = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK
+            seals = fcntl.fcntl(source, fcntl.F_GET_SEALS)
+            if seals & required_seals != required_seals:
+                return None
+            payload = os.pread(source, end - start, start)
+        finally:
+            os.close(source)
+    except OSError:
+        return None
+    return payload if len(payload) == end - start else None
+
+
+def _stack_dump_slot_path(
+    state_dir: Path,
+    restart_generation: int,
+) -> Path:
+    if restart_generation < 1:
+        raise ValueError("restart_generation must be positive")
+    slot = restart_generation % STACK_DUMP_SLOT_COUNT
+    return state_dir / STACK_DUMP_DIRECTORY_NAME / f"slot-{slot}.dump"
+
+
+def _stack_dump_evidence_bytes(
+    payload: bytes,
+    *,
+    pid: int,
+    restart_generation: int,
+    captured_at_unix: int,
+    process_start_ticks: int,
+    max_bytes: int,
+) -> tuple[bytes, dict[str, object]] | None:
+    if (
+        not payload
+        or pid <= 0
+        or restart_generation < 1
+        or captured_at_unix <= 0
+        or process_start_ticks < 0
+        or max_bytes <= 0
+    ):
+        return None
+    payload_sha256 = hashlib.sha256(payload).hexdigest()
+    header = {
+        "captured_at_unix": captured_at_unix,
+        "kind": "grabowski_operator_stack_dump",
+        "payload_bytes": len(payload),
+        "payload_sha256": payload_sha256,
+        "pid": pid,
+        "process_start_ticks": process_start_ticks,
+        "restart_generation": restart_generation,
+        "schema_version": 1,
+    }
+    encoded_header = json.dumps(
+        header,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    evidence = encoded_header + b"\n" + payload
+    if len(evidence) > max_bytes:
+        return None
+    return evidence, header
+
+
+def _write_stack_dump_target(
+    path: Path,
+    payload: bytes,
+    max_bytes: int,
+) -> bool:
+    if not payload or max_bytes <= 0 or len(payload) > max_bytes:
+        return False
+    temporary_path: Path | None = None
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent_metadata = path.parent.lstat()
+        if (
+            not statmod.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.getuid()
+        ):
+            return False
+        os.chmod(path.parent, 0o700)
+        temporary_path = path.parent / ".stackdump.pending.tmp"
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            return False
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(temporary_path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.getuid()
+        ):
+            return False
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                return False
+            written += count
+        os.fsync(descriptor)
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_DIRECTORY"):
+            directory_flags |= os.O_DIRECTORY
+        directory_descriptor = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError:
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        statmod.S_ISREG(metadata.st_mode)
+        and metadata.st_nlink == 1
+        and metadata.st_uid == os.getuid()
+        and statmod.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_size == len(payload)
+    )
+
+
+def request_python_stack_dump(
+    pid: int,
+    *,
+    state_dir: Path,
+    restart_generation: int,
+    captured_at_unix: int,
+    expected_start_ticks: int | None = None,
+    max_bytes: int = STACK_DUMP_MAX_BYTES,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, object] | None:
+    if (
+        pid <= 0
+        or restart_generation < 1
+        or captured_at_unix <= 0
+        or expected_start_ticks is None
+        or expected_start_ticks < 0
+        or max_bytes <= 0
+        or not hasattr(signal, "SIGUSR1")
+    ):
+        return None
+    pidfd = _stack_dump_pidfd(pid)
+    if pidfd is None:
+        return None
+    try:
+        if _process_start_ticks(pid, proc_root) != expected_start_ticks:
+            return None
+        descriptor = _stack_dump_memfd(pid, proc_root)
+        if descriptor is None or not _stack_dump_memfd_is_bounded(
+            pid, descriptor, max_bytes, proc_root
+        ):
+            return None
+        before = _stack_dump_memfd_position(
+            pid, descriptor, max_bytes, proc_root
+        )
+        if before is None or before >= max_bytes:
+            return None
+        if _process_start_ticks(pid, proc_root) != expected_start_ticks:
+            return None
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGUSR1)
+        except OSError:
+            return None
+        time.sleep(0.25)
+        if _process_start_ticks(pid, proc_root) != expected_start_ticks:
+            return None
+        after = _stack_dump_memfd_position(pid, descriptor, max_bytes, proc_root)
+        if after is None or after <= before:
+            return None
+        payload = _read_stack_dump_memfd(
+            pid, descriptor, before, after, max_bytes, proc_root
+        )
+        if payload is None:
+            return None
+        packaged = _stack_dump_evidence_bytes(
+            payload,
+            pid=pid,
+            restart_generation=restart_generation,
+            captured_at_unix=captured_at_unix,
+            process_start_ticks=expected_start_ticks,
+            max_bytes=max_bytes,
+        )
+        if packaged is None:
+            return None
+        evidence, header = packaged
+        path = _stack_dump_slot_path(state_dir, restart_generation)
+        if not _write_stack_dump_target(path, evidence, max_bytes):
+            return None
+        receipt: dict[str, object] = {
+            **header,
+            "evidence_bytes": len(evidence),
+            "evidence_sha256": hashlib.sha256(evidence).hexdigest(),
+            "relative_path": str(path.relative_to(state_dir)),
+            "slot": restart_generation % STACK_DUMP_SLOT_COUNT,
+        }
+        return receipt
+    finally:
+        os.close(pidfd)
+
+
+def refresh_connector_snapshot_from_runtime(
+    *,
+    runtime_root: Path,
+    host: str,
+    port: int,
+    connector_pid: int,
+    connector_start_ticks: int,
+    timeout_seconds: float = CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Refresh snapshot evidence without making snapshot failure a tunnel restart signal."""
+    try:
+        root = runtime_root.expanduser().resolve(strict=True)
+    except OSError:
+        return {"state": "error", "reason": "runtime-root-unavailable"}
+    executable = root / ".venv/bin/python"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return {"state": "error", "reason": "runtime-python-unavailable"}
+    if connector_pid <= 0 or connector_start_ticks < 0:
+        return {"state": "error", "reason": "connector-process-identity-unavailable"}
+    mcp_url = f"http://{host}:{port}/mcp"
+    child_environment = os.environ.copy()
+    child_environment.pop("PYTHONHOME", None)
+    child_environment.pop("PYTHONPATH", None)
+    child_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    child_environment["PYTHONNOUSERSITE"] = "1"
+    command = [
+        str(executable),
+        "-I",
+        "-m",
+        "grabowski_client_snapshot",
+        "refresh-if-needed",
+        "--runtime-root",
+        str(root),
+        "--mcp-url",
+        mcp_url,
+        "--connector-pid",
+        str(connector_pid),
+        "--connector-start-ticks",
+        str(connector_start_ticks),
+        "--timeout-seconds",
+        str(timeout_seconds),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(root),
+            env=child_environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=max(1.0, timeout_seconds + 2.0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"state": "error", "reason": "snapshot-refresh-process-failed"}
+    encoded = completed.stdout.encode("utf-8", errors="replace")
+    if len(encoded) > CONNECTOR_SNAPSHOT_REFRESH_MAX_OUTPUT_BYTES:
+        return {"state": "error", "reason": "snapshot-refresh-output-too-large"}
+    lines = [line for line in completed.stdout.splitlines() if line.strip()]
+    if not lines:
+        return {"state": "error", "reason": "snapshot-refresh-output-missing"}
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return {"state": "error", "reason": "snapshot-refresh-output-invalid"}
+    if not isinstance(payload, dict):
+        return {"state": "error", "reason": "snapshot-refresh-output-invalid"}
+    state = payload.get("state")
+    if completed.returncode != 0 or state not in {"not_due", "renewed"}:
+        reason = payload.get("reason")
+        return {
+            "state": "error",
+            "reason": reason if isinstance(reason, str) and len(reason) <= 256 else "snapshot-refresh-failed",
+        }
+    allowed = {
+        key: payload[key]
+        for key in (
+            "state",
+            "reason",
+            "tool_count",
+            "names_sha256",
+            "release_id",
+            "receipt_sha256",
+            "session_id_sha256",
+        )
+        if key in payload
+    }
+    return allowed
+
+
+def _emit_connector_snapshot_refresh(
+    args: argparse.Namespace,
+    probe: ProbeResult,
+) -> None:
+    if (
+        args.component != "tunnel"
+        or args.check_only
+        or probe.pid is None
+        or probe.start_ticks is None
+    ):
+        return
+    result = refresh_connector_snapshot_from_runtime(
+        runtime_root=args.runtime_root,
+        host=args.host,
+        port=args.port,
+        connector_pid=probe.pid,
+        connector_start_ticks=probe.start_ticks,
+    )
+    emit(
+        "grabowski.connector_snapshot.refresh",
+        component=args.component,
+        service=args.service,
+        **result,
+    )
+
+
+def _bounded_restart_stderr(stderr: str | None) -> str:
+    if not stderr:
+        return ""
+    return " ".join(stderr.split())[:SERVICE_RESTART_ERROR_MAX_CHARS]
+
+
 def restart_service(service: str) -> None:
     try:
         subprocess.run(
-            ["systemctl", "--user", "restart", service],
+            ["systemctl", "--user", "--no-block", "restart", service],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=20,
+            text=True,
+            timeout=SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise WatchdogError("service-restart-failed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WatchdogError("service-restart-timeout") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = _bounded_restart_stderr(exc.stderr)
+        if detail:
+            raise WatchdogError(f"service-restart-failed: {detail}") from exc
+        raise WatchdogError(f"service-restart-failed: exit-{exc.returncode}") from exc
+    except OSError as exc:
+        raise WatchdogError("service-restart-exec-failed") from exc
+
+
+def _is_new_process_instance(previous: ProbeResult, current: ProbeResult) -> bool:
+    if current.pid is None:
+        return False
+    if previous.pid is None:
+        return True
+    if current.pid != previous.pid:
+        return True
+    if previous.start_ticks is None or current.start_ticks is None:
+        return False
+    return current.start_ticks != previous.start_ticks
 
 
 def run_watchdog(args: argparse.Namespace) -> int:
@@ -774,6 +1485,9 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 ready_url=args.ready_url,
                 startup_grace=args.startup_grace,
                 http_timeout=args.http_timeout,
+                mcp_url=args.mcp_url,
+                metrics_url=args.metrics_url,
+                control_plane_poll_max_age=args.control_plane_poll_max_age,
             )
             state = load_state(state_path)
             common = {
@@ -785,6 +1499,7 @@ def run_watchdog(args: argparse.Namespace) -> int:
             }
 
             if probe.status == "healthy":
+                _emit_connector_snapshot_refresh(args, probe)
                 state = reset_after_healthy(
                     state,
                     now=int(time.time()),
@@ -807,9 +1522,10 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 emit("grabowski.component_watchdog.unhealthy", **common)
                 return 1
 
+            decision_now = int(time.time())
             action, next_state = decide(
                 state,
-                now=int(time.time()),
+                now=decision_now,
                 failure_threshold=args.failure_threshold,
                 max_restarts=args.max_restarts,
                 restart_window=args.restart_window,
@@ -843,14 +1559,35 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 )
                 return 1
 
+            stack_dump_receipt = None
+            if args.component == "operator" and probe.pid is not None:
+                stack_dump_receipt = request_python_stack_dump(
+                    probe.pid,
+                    state_dir=state_dir,
+                    restart_generation=next_state.restart_generation,
+                    captured_at_unix=decision_now,
+                    expected_start_ticks=probe.start_ticks,
+                )
+            stack_dump_requested = stack_dump_receipt is not None
             emit(
                 "grabowski.component_watchdog.restarting",
                 **common,
+                stack_dump_requested=stack_dump_requested,
+                stack_dump_receipt=stack_dump_receipt,
                 backoff_level=next_state.backoff_level,
                 next_restart_not_before=next_state.next_restart_not_before,
                 restart_generation=next_state.restart_generation,
             )
             restart_service(args.service)
+            if stack_dump_requested:
+                emit(
+                    "grabowski.component_watchdog.stack_dump_finalized",
+                    component=args.component,
+                    service=args.service,
+                    persisted=True,
+                    receipt=stack_dump_receipt,
+                    max_bytes=STACK_DUMP_MAX_BYTES,
+                )
             deadline = time.monotonic() + args.recovery_timeout
             final_probe = probe
             while time.monotonic() < deadline:
@@ -867,8 +1604,14 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     ready_url=args.ready_url,
                     startup_grace=0,
                     http_timeout=args.http_timeout,
+                    mcp_url=args.mcp_url,
+                    metrics_url=args.metrics_url,
+                    control_plane_poll_max_age=args.control_plane_poll_max_age,
                 )
-                if final_probe.status == "healthy":
+                if final_probe.status == "healthy" and _is_new_process_instance(
+                    probe, final_probe
+                ):
+                    _emit_connector_snapshot_refresh(args, final_probe)
                     recovered_state = reset_after_healthy(
                         next_state,
                         now=int(time.time()),
@@ -911,11 +1654,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--host", default="127.0.0.1")
     result.add_argument("--port", type=int, default=18181)
     # Retained as a hidden compatibility argument for older installed units.
-    # The safe probe uses an isolated stdio MCP subprocess, never a competing
-    # session against the stateful live HTTP endpoint.
-    result.add_argument("--mcp-url", default=DEFAULT_MCP_URL, help=argparse.SUPPRESS)
+    # When omitted, normalize_args binds it to the exact loopback listener.
+    result.add_argument("--mcp-url", default=None, help=argparse.SUPPRESS)
     result.add_argument("--health-url", default=DEFAULT_HEALTH_URL)
     result.add_argument("--ready-url", default=DEFAULT_READY_URL)
+    result.add_argument("--metrics-url", default=DEFAULT_METRICS_URL)
+    result.add_argument(
+        "--control-plane-poll-max-age",
+        type=float,
+        default=DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
+    )
     result.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     result.add_argument("--failure-threshold", type=int, default=3)
     result.add_argument("--max-restarts", type=int, default=3)
@@ -924,7 +1672,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--backoff-max", type=int, default=DEFAULT_BACKOFF_MAX)
     result.add_argument("--startup-grace", type=float, default=20)
     result.add_argument("--http-timeout", type=float, default=2)
-    result.add_argument("--recovery-timeout", type=float, default=20)
+    result.add_argument(
+        "--recovery-timeout", type=float, default=DEFAULT_RECOVERY_TIMEOUT_SECONDS
+    )
     result.add_argument("--check-only", action="store_true")
     return result
 
@@ -938,6 +1688,20 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         )
     if args.host != "127.0.0.1" or not 1024 <= args.port <= 65535:
         raise WatchdogError("invalid-operator-listener")
+    if args.control_plane_poll_max_age <= 0:
+        raise WatchdogError("invalid-control-plane-poll-max-age")
+    loopback_http_url(args.metrics_url)
+    if args.mcp_url is None:
+        args.mcp_url = (
+            f"http://{args.host}:{args.port}/_grabowski/mcp-liveness"
+        )
+    mcp_host, mcp_port, mcp_path = loopback_http_url(args.mcp_url)
+    if (
+        mcp_host != args.host
+        or mcp_port != args.port
+        or mcp_path != "/_grabowski/mcp-liveness"
+    ):
+        raise WatchdogError("mcp-url-listener-mismatch")
     return args
 
 

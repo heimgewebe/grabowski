@@ -97,6 +97,8 @@ class TaskTests(unittest.TestCase):
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
         )
+        self.task_archive_root = self.root / "state" / "task-archives"
+        self.task_projection_root = self.root / "state" / "task-projection"
         self.db_patch.start()
         self.outcomes_patch.start()
         self.resource_patch.start()
@@ -106,6 +108,76 @@ class TaskTests(unittest.TestCase):
         self.outcomes_patch.stop()
         self.db_patch.stop()
         self.temporary.cleanup()
+
+    def _archive_and_project_tasks(self, task_ids: list[str]) -> dict[str, object]:
+        lifecycle_evidence = tasks.lifecycle_projection.effect_plan.lifecycle_evidence
+        records: list[dict[str, object]] = []
+        for task_id in task_ids:
+            current = tasks._row_raw(task_id)
+            if current["state"] not in tasks.TASK_STATE_PROJECTIONS["terminal"]:
+                tasks._set_state(
+                    task_id,
+                    "completed",
+                    observation={"state": "completed", "source": "archive-test"},
+                )
+            records.append(tasks._task_archive_record(tasks._row_raw(task_id)))
+        archived = tasks.lifecycle_projection.lifecycle.write_task_archive_segment(
+            records,
+            archive_root=self.task_archive_root,
+            source_store_sha256="c" * 64,
+            source_schema_version="5",
+            plan_sha256="d" * 64,
+        )
+        all_sources = frozenset(lifecycle_evidence.REQUIRED_SOURCES)
+        source_sha256s = {
+            source: format(index + 1, "x") * 64
+            for index, source in enumerate(sorted(all_sources))
+        }
+        classifications = [
+            lifecycle_evidence.classify_observation_bundle(
+                lifecycle_evidence.LifecycleObservationBundle(
+                    identity=task_id,
+                    kind="task",
+                    observed_sources=all_sources,
+                    source_sha256s=source_sha256s,
+                    state="completed",
+                    archived=True,
+                    receipt_integrity_valid=True,
+                )
+            )
+            for task_id in task_ids
+        ]
+        now_unix = tasks._now()
+        projection_resource = tasks.lifecycle_projection._projection_resource_key(
+            self.task_projection_root
+        )
+        plan = tasks.lifecycle_projection.effect_plan.build_effect_plan(
+            classifications,
+            effect_kind="current_projection_switch",
+            lease_owner_id="operator:test-current-task-projection",
+            required_resource_keys=[projection_resource],
+            created_at_unix=now_unix,
+        )
+        revalidation = tasks.lifecycle_projection.effect_plan.revalidate_effect_plan(
+            plan,
+            {item["identity"]: item for item in classifications},
+            [
+                tasks.lifecycle_projection.effect_plan.LeaseObservation(
+                    resource_key=projection_resource,
+                    owner_id="operator:test-current-task-projection",
+                    expires_at_unix=now_unix + 1000,
+                    metadata_sha256="a" * 64,
+                )
+            ],
+            now_unix=now_unix,
+        )
+        return tasks.lifecycle_projection.apply_task_archive_projection_switch(
+            Path(str(archived["segment_dir"])),
+            projection_root=self.task_projection_root,
+            plan=plan,
+            revalidation=revalidation,
+            applied_at_unix=now_unix + 1,
+        )
 
     def _start(
         self,
@@ -453,9 +525,9 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(attention["total_matching"], 1)
         self.assertEqual(attention["tasks"][0]["state"], "failed")
         self.assertEqual(attention["state_counts"]["failed"], 1)
-        self.assertEqual(attention["state_counts_scope"], "all_tasks")
+        self.assertEqual(attention["state_counts_scope"], "current_projection")
         self.assertEqual(attention["projection_counts"]["attention"], 1)
-        self.assertEqual(attention["projection_counts_scope"], "all_tasks")
+        self.assertEqual(attention["projection_counts_scope"], "current_projection")
         self.assertEqual(attention["projection_counts"]["terminal"], 1)
         self.assertEqual(attention["projection_counts"]["active"], 0)
         self.assertTrue(attention["projection_counts_overlap"])
@@ -499,6 +571,98 @@ class TaskTests(unittest.TestCase):
             unknown["recommended_next_action"],
             "inspect unknown task states before relying on projections",
         )
+
+    def test_task_list_hides_hash_bound_archived_tasks_and_projects_counts(self) -> None:
+        archived_task = self._start()["task"]
+        current_task = self._start()["task"]
+        self._archive_and_project_tasks([archived_task["task_id"]])
+        listed = tasks.grabowski_task_list(limit=100, view="evidence")
+        self.assertEqual([item["task_id"] for item in listed["tasks"]], [current_task["task_id"]])
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["total_matching"], 1)
+        self.assertEqual(listed["state_counts"]["completed"], 0)
+        self.assertEqual(listed["state_counts"]["running"], 1)
+        self.assertEqual(listed["projection_counts"]["terminal"], 0)
+        self.assertEqual(listed["projection_counts"]["active"], 1)
+        self.assertEqual(listed["current_projection"]["projected_task_count"], 1)
+        self.assertEqual(listed["current_projection"]["switch_count"], 1)
+        self.assertEqual(listed["pagination"]["snapshot_sha256"], listed["current_projection"]["projection_sha256"])
+        self.assertEqual(tasks.grabowski_task_list(state="completed")["count"], 0)
+        with sqlite3.connect(self.database) as connection:
+            retained = connection.execute("SELECT state FROM tasks WHERE task_id=?", (archived_task["task_id"],)).fetchone()
+        self.assertEqual(retained[0], "completed")
+
+    def test_task_list_pagination_skips_archived_rows(self) -> None:
+        first = self._start()["task"]
+        archived = self._start()["task"]
+        last = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET created_at_unix=300 WHERE task_id=?", (first["task_id"],))
+            connection.execute("UPDATE tasks SET created_at_unix=200 WHERE task_id=?", (archived["task_id"],))
+            connection.execute("UPDATE tasks SET created_at_unix=100 WHERE task_id=?", (last["task_id"],))
+            connection.commit()
+        self._archive_and_project_tasks([archived["task_id"]])
+        page_one = tasks.grabowski_task_list(limit=1)
+        self.assertEqual(page_one["tasks"][0]["task_id"], first["task_id"])
+        self.assertTrue(page_one["pagination"]["has_more"])
+        page_two = tasks.grabowski_task_list(limit=1, cursor=page_one["pagination"]["next_cursor"])
+        self.assertEqual(page_two["tasks"][0]["task_id"], last["task_id"])
+        self.assertFalse(page_two["pagination"]["has_more"])
+        self.assertEqual(page_two["total_matching"], 2)
+
+    def test_task_list_fails_closed_when_projection_changes_during_read(self) -> None:
+        self._start()
+        first_projection = tasks._task_current_projection()
+        changed_projection = {**first_projection, "projection_sha256": "f" * 64}
+        with patch.object(
+            tasks,
+            "_task_current_projection",
+            side_effect=[first_projection, changed_projection],
+        ):
+            with self.assertRaisesRegex(
+                tasks.lifecycle_projection.LifecycleProjectionIntegrityError,
+                "projection changed during list read",
+            ):
+                tasks.grabowski_task_list()
+
+    def test_task_list_cursor_is_invalidated_when_projection_changes(self) -> None:
+        first = self._start()["task"]
+        second = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET created_at_unix=200 WHERE task_id=?", (first["task_id"],))
+            connection.execute("UPDATE tasks SET created_at_unix=100 WHERE task_id=?", (second["task_id"],))
+            connection.commit()
+        page = tasks.grabowski_task_list(limit=1)
+        self.assertIsNotNone(page["pagination"]["next_cursor"])
+        self._archive_and_project_tasks([second["task_id"]])
+        with self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.grabowski_task_list(limit=1, cursor=page["pagination"]["next_cursor"])
+
+    def test_task_projection_binding_is_independent_of_later_redaction_policy(self) -> None:
+        projected = self._start()["task"]
+        self._archive_and_project_tasks([projected["task_id"]])
+        with patch.object(tasks.operator, "_redact_argv", return_value=["<changed-policy>"]):
+            listed = tasks.grabowski_task_list()
+        self.assertEqual(listed["count"], 0)
+        self.assertEqual(listed["current_projection"]["projected_task_count"], 1)
+
+    def test_task_list_fails_closed_on_projected_record_drift(self) -> None:
+        projected = self._start()["task"]
+        self._archive_and_project_tasks([projected["task_id"]])
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET updated_at_unix=updated_at_unix+1 WHERE task_id=?", (projected["task_id"],))
+            connection.commit()
+        with self.assertRaises(tasks.lifecycle_projection.LifecycleProjectionIntegrityError):
+            tasks.grabowski_task_list()
+
+    def test_task_list_fails_closed_when_projected_row_is_missing(self) -> None:
+        projected = self._start()["task"]
+        self._archive_and_project_tasks([projected["task_id"]])
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DELETE FROM tasks WHERE task_id=?", (projected["task_id"],))
+            connection.commit()
+        with self.assertRaisesRegex(tasks.lifecycle_projection.LifecycleProjectionIntegrityError, "projected task row is missing"):
+            tasks.grabowski_task_list()
 
     def test_database_connection_closes_after_success_and_failure(self) -> None:
         with tasks._database_connection() as connection:

@@ -129,6 +129,29 @@ class JobFinalizerTests(unittest.TestCase):
         self.assertIn("external_push_delivery", receipt["does_not_establish"])
         self.assertEqual(list(self.directory.glob(".notification.json.*.tmp")), [])
 
+    def test_ntfy_dispatch_is_rescheduled_on_idempotent_finalizer_retry(self) -> None:
+        self.metadata["notify_on_done"]["channels"] = ["ntfy"]
+        self._write_metadata(self.metadata)
+
+        with mock.patch.object(
+            finalizer, "_schedule_ntfy_dispatch", return_value=False
+        ) as schedule:
+            first = finalizer.finalize(self.directory, self._environment())
+            second = finalizer.finalize(self.directory, self._environment())
+
+        notification_id = first["receipt"]["notification_id"]
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(first["ntfy_dispatch_scheduled"], False)
+        self.assertEqual(second["ntfy_dispatch_scheduled"], False)
+        self.assertEqual(
+            schedule.call_args_list,
+            [
+                mock.call(notification_id, ["ntfy"]),
+                mock.call(notification_id, ["ntfy"]),
+            ],
+        )
+
     def test_no_receipt_when_notification_not_requested(self) -> None:
         self.metadata["notify_on_done"]["requested"] = False
         self._write_metadata(self.metadata)

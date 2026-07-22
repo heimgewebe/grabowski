@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -20,6 +21,7 @@ CONFIG_TARGET = Path("/etc/grabowski/privileged-actions.json")
 BLOCKADES_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockades.py")
 BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_store.py")
 BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
+COMMAND_IDENTITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_command_identity.py")
 BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broker.py")
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
@@ -39,6 +41,15 @@ POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
+PROCESS_OBSERVER_BIND_PATHS = (
+    "/home/alex/repos/.weltgewebe-worktrees",
+    "/home/alex/worktrees",
+    "/home/alex/repos/.semantah-worktrees",
+    "/home/alex/repos/.heimlern-worktrees",
+    "/home/alex/repos/.operator-redundancy-worktrees",
+    "/home/alex/repos/.hauski-worktrees",
+    "/home/alex/repos/.worktree-target-quarantine",
+)
 
 
 class CutoverError(RuntimeError):
@@ -69,6 +80,12 @@ ARTIFACTS = (
     Artifact(
         "src/grabowski_blockade_authority.py",
         BLOCKADE_AUTHORITY_MODULE_TARGET,
+        0o644,
+        True,
+    ),
+    Artifact(
+        "src/grabowski_command_identity.py",
+        COMMAND_IDENTITY_MODULE_TARGET,
         0o644,
         True,
     ),
@@ -401,6 +418,7 @@ def _validate_source_artifacts(
     *,
     python_targets: set[Path],
 ) -> None:
+    parsed_python: dict[Path, ast.AST] = {}
     for target, (data, _mode, expected_sha256) in artifacts.items():
         if _sha256(data) != expected_sha256:
             raise CutoverError(f"source artifact digest mismatch: {target}")
@@ -408,9 +426,31 @@ def _validate_source_artifacts(
             continue
         try:
             source = data.decode("utf-8")
-            compile(source, str(target), "exec", dont_inherit=True)
+            tree = ast.parse(source, filename=str(target))
+            compile(tree, str(target), "exec", dont_inherit=True)
         except (UnicodeDecodeError, SyntaxError) as exc:
             raise CutoverError(f"source artifact is not valid Python: {target}") from exc
+        parsed_python[target] = tree
+
+    installed_modules = {target.stem for target in python_targets}
+    for target, tree in parsed_python.items():
+        dependencies: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                dependencies.update(alias.name.split(".", 1)[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                dependencies.add(node.module.split(".", 1)[0])
+        missing = sorted(
+            dependency
+            for dependency in dependencies
+            if dependency.startswith("grabowski_")
+            and dependency not in installed_modules
+        )
+        if missing:
+            raise CutoverError(
+                f"source artifact local dependency is missing: {target}: "
+                + ", ".join(missing)
+            )
 
 
 def _expected_recovery_source_dropin(publisher: dict[str, Any]) -> bytes:
@@ -433,13 +473,17 @@ def _expected_recovery_source_dropin(publisher: dict[str, Any]) -> bytes:
         for character in "\n\r "
     ):
         raise CutoverError("recovery sandbox paths contain forbidden whitespace")
-    return (
-        "[Service]\n"
-        "ProtectHome=tmpfs\n"
-        "BindReadOnlyPaths=\n"
-        f"BindReadOnlyPaths={source_path}\n"
-        f"BindReadOnlyPaths=-{legacy_kill_switch_path}\n"
-    ).encode("utf-8")
+    lines = [
+        "[Service]",
+        "ProtectHome=tmpfs",
+        "BindReadOnlyPaths=",
+        f"BindReadOnlyPaths={source_path}",
+        f"BindReadOnlyPaths=-{legacy_kill_switch_path}",
+    ]
+    lines.extend(
+        f"BindReadOnlyPaths=-{path}" for path in PROCESS_OBSERVER_BIND_PATHS
+    )
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def _validate_recovery_source_dropin(

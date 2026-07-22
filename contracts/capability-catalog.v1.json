@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "30d57b3c64a63ee0b2d46f08549b76d7f52b5bacbcc2ac908fabe4acf9d8888b",
+  "capability_source_sha256": "9a0dc42bc0e5e0cba9040f2572e1562dd5649b82606d1c6c01aa40a25c4c347f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "c6934dbd9d4ee12f9a9409a5d144893cd45a231a0e3b1995d9510a4b04f1a173",
+  "contract_sha256": "352b5c9043149b6c59ba4e0b49b0d18cbb609b7396345ad686c372bc84264ad7",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -253,6 +253,39 @@
       "tool": "grabowski_verify_audit"
     },
     {
+      "category": "audit",
+      "description": "Query the verified audit chain through a bounded evidence projection.",
+      "effects": [],
+      "id": "grabowski_audit_query",
+      "purpose": "Query bounded safe fields from a verified audit snapshot with explicit scan completeness.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_query"
+    },
+    {
+      "category": "audit",
+      "description": "Trace one audit anchor through bounded one-hop correlations.",
+      "effects": [],
+      "id": "grabowski_audit_trace",
+      "purpose": "Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_trace"
+    },
+    {
+      "category": "audit",
+      "description": "Compute bounded descriptive statistics from the verified audit chain.",
+      "effects": [],
+      "id": "grabowski_audit_analyze",
+      "purpose": "Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_analyze"
+    },
+    {
       "category": "knowledge",
       "description": "Return latest healthy RepoGround publications from one catalog resolution.",
       "effects": [],
@@ -449,6 +482,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_checkout_summary"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Project bounded current operator work without creating a second lifecycle truth.",
+      "effects": [],
+      "id": "grabowski_current_work",
+      "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_current_work"
     },
     {
       "category": "version-control",
@@ -1890,6 +1934,22 @@
     },
     {
       "category": "agent-workspace",
+      "description": "Remove one exact non-authoritative idle tmux session, then stale-reconcile the workspace.",
+      "effects": [
+        "audit-append",
+        "receipt-create",
+        "tmux-session-remove",
+        "workspace-event-append"
+      ],
+      "id": "grabowski_agent_workspace_reconcile_idle_tmux",
+      "purpose": "Remove only the exact non-authoritative idle tmux session from one provably inactive stale workspace, then invoke the existing non-destructive stale reconciliation.",
+      "read_only": false,
+      "reversibility": "historical-evidence-retained",
+      "risk_class": "high",
+      "tool": "grabowski_agent_workspace_reconcile_idle_tmux"
+    },
+    {
+      "category": "agent-workspace",
       "description": "Archive and remove one eligible closed writer checkout while preserving all workspace evidence.",
       "effects": [
         "checkout-archive",
@@ -1997,6 +2057,28 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_call_shape_check"
+    },
+    {
+      "category": "task-archive",
+      "description": "List immutable task archive segments through a bounded verified catalog.",
+      "effects": [],
+      "id": "grabowski_task_archive_list",
+      "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_archive_list"
+    },
+    {
+      "category": "task-archive",
+      "description": "Read one fully verified immutable task archive segment with pagination.",
+      "effects": [],
+      "id": "grabowski_task_archive_read",
+      "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_task_archive_read"
     }
   ]
 }

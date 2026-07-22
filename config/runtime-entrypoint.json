@@ -19,6 +19,9 @@
     "grabowski_destroy_path",
     "grabowski_rollback_text",
     "grabowski_verify_audit",
+    "grabowski_audit_query",
+    "grabowski_audit_trace",
+    "grabowski_audit_analyze",
     "latest_complete_bundles",
     "repoground_bundle_discover",
     "repoground_bundle_status",
@@ -37,6 +40,7 @@
     "grabowski_deployment_identity",
     "grabowski_contract_drift",
     "grabowski_checkout_summary",
+    "grabowski_current_work",
     "grabowski_git_status",
     "grabowski_git_diff",
     "grabowski_git_log",
@@ -147,6 +151,7 @@
     "grabowski_agent_workspace_optimize",
     "grabowski_agent_workspace_cleanup_plan",
     "grabowski_agent_workspace_reconcile_stale",
+    "grabowski_agent_workspace_reconcile_idle_tmux",
     "grabowski_agent_workspace_cleanup",
     "grabowski_agent_execution_route",
     "grabowski_coding_agent_catalog",
@@ -155,11 +160,13 @@
     "grabowski_agent_competition_status",
     "grabowski_agent_competition_compare",
     "grabowski_agent_bootstrap",
-    "grabowski_call_shape_check"
+    "grabowski_call_shape_check",
+    "grabowski_task_archive_list",
+    "grabowski_task_archive_read"
   ],
   "mode": "module",
   "module": "grabowski_operator",
-  "schema_version": 3,
+  "schema_version": 4,
   "source": "src/grabowski_runtime.py",
   "supporting_sources": [
     {
@@ -239,8 +246,24 @@
       "source": "src/grabowski_runtime_extensions.py"
     },
     {
+      "module": "grabowski_audit_query",
+      "source": "src/grabowski_audit_query.py"
+    },
+    {
       "module": "grabowski_checkouts",
       "source": "src/grabowski_checkouts.py"
+    },
+    {
+      "module": "grabowski_current_work",
+      "source": "src/grabowski_current_work.py"
+    },
+    {
+      "module": "grabowski_managed_cargo",
+      "source": "src/grabowski_managed_cargo.py"
+    },
+    {
+      "module": "grabowski_current_work_surface",
+      "source": "src/grabowski_current_work_surface.py"
     },
     {
       "module": "grabowski_fleet",
@@ -371,18 +394,77 @@
       "source": "src/grabowski_job_finalizer.py"
     },
     {
+      "module": "grabowski_ntfy_dispatch",
+      "source": "src/grabowski_ntfy_dispatch.py"
+    },
+    {
       "module": "grabowski_juno",
       "source": "src/grabowski_juno.py"
     },
     {
       "module": "grabowski_juno_storage",
       "source": "src/grabowski_juno_storage.py"
+    },
+    {
+      "module": "grabowski_lifecycle_archive",
+      "source": "src/grabowski_lifecycle_archive.py"
+    },
+    {
+      "module": "grabowski_lifecycle_collectors",
+      "source": "src/grabowski_lifecycle_collectors.py"
+    },
+    {
+      "module": "grabowski_lifecycle_evidence",
+      "source": "src/grabowski_lifecycle_evidence.py"
+    },
+    {
+      "module": "grabowski_lifecycle_effect_plan",
+      "source": "src/grabowski_lifecycle_effect_plan.py"
+    },
+    {
+      "module": "grabowski_lifecycle_projection",
+      "source": "src/grabowski_lifecycle_projection.py"
+    },
+    {
+      "module": "grabowski_lifecycle_read_surface",
+      "source": "src/grabowski_lifecycle_read_surface.py"
     }
   ],
   "runtime_assets": [
     {
       "source": "config/coding-agent-catalog.json",
       "destination": "config/coding-agent-catalog.json"
+    },
+    {
+      "source": "tools/maintain_runtime_state.py",
+      "destination": "tools/maintain_runtime_state.py"
+    }
+  ],
+  "spawn_dependencies": [
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_workspace"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_writer"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_agent_workspace",
+      "spawned_module": "grabowski_agent_role"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_workers",
+      "spawned_module": "grabowski_worker_process"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_job_finalizer",
+      "spawned_module": "grabowski_ntfy_dispatch"
     }
   ]
 }

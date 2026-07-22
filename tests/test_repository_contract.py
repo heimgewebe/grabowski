@@ -13,6 +13,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_client_snapshot.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_operator.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime_extensions.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_audit_query.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_checkouts.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
@@ -43,6 +44,16 @@ class RepositoryContractTests(unittest.TestCase):
         for tool_name in expected:
             self.assertIn(tool_name, source)
         self.assertNotIn("heim_assi_status", source)
+
+    def test_audit_query_tool_names_are_present(self) -> None:
+        source = (ROOT / "src" / "grabowski_audit_query.py").read_text(encoding="utf-8")
+        for tool_name in (
+            "grabowski_audit_query",
+            "grabowski_audit_trace",
+            "grabowski_audit_analyze",
+        ):
+            self.assertIn(f'name="{tool_name}"', source)
+        self.assertIn("annotations=READ_ONLY", source)
 
     def test_extension_tool_names_are_present(self) -> None:
         source = (ROOT / "src" / "grabowski_runtime_extensions.py").read_text(
@@ -126,8 +137,16 @@ class RepositoryContractTests(unittest.TestCase):
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(contract["schema_version"], 3)
+        self.assertEqual(contract["schema_version"], 4)
         self.assertEqual(contract["mode"], "module")
+        self.assertIn(
+            {
+                "kind": "python_module",
+                "launcher_module": "grabowski_job_finalizer",
+                "spawned_module": "grabowski_ntfy_dispatch",
+            },
+            contract["spawn_dependencies"],
+        )
         self.assertEqual(contract["module"], "grabowski_operator")
         self.assertNotIn("script", contract)
         self.assertEqual(contract["source"], "src/grabowski_runtime.py")
@@ -137,11 +156,15 @@ class RepositoryContractTests(unittest.TestCase):
                 {
                     "source": "config/coding-agent-catalog.json",
                     "destination": "config/coding-agent-catalog.json",
+                },
+                {
+                    "source": "tools/maintain_runtime_state.py",
+                    "destination": "tools/maintain_runtime_state.py",
                 }
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 156)
+        self.assertEqual(len(tools), 163)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -199,6 +222,13 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_execution_governor_summary", tools)
         self.assertIn("grabowski_connector_transport_diagnostics", tools)
         self.assertIn("grabowski_operator_recall_export", tools)
+        self.assertTrue(
+            {
+                "grabowski_audit_query",
+                "grabowski_audit_trace",
+                "grabowski_audit_analyze",
+            }.issubset(tools)
+        )
         supporting = {
             item["module"]: item["source"] for item in contract["supporting_sources"]
         }
@@ -235,6 +265,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_operator_obligation",
             "grabowski_capabilities",
             "grabowski_runtime_extensions",
+            "grabowski_audit_query",
             "grabowski_read_surface",
             "grabowski_self_deploy",
             "grabowski_checkouts",
@@ -252,6 +283,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_private_io",
             "grabowski_job_origin",
             "grabowski_job_finalizer",
+            "grabowski_ntfy_dispatch",
         ):
             self.assertIn(module, supporting)
             self.assertTrue((ROOT / supporting[module]).is_file())
@@ -292,8 +324,12 @@ class RepositoryContractTests(unittest.TestCase):
             contract["module"],
             *(item["module"] for item in contract["supporting_sources"]),
         }
+        runtime_sources = [
+            {"module": contract["module"], "source": contract["source"]},
+            *contract["supporting_sources"],
+        ]
         missing: dict[str, list[str]] = {}
-        for item in contract["supporting_sources"]:
+        for item in runtime_sources:
             module = item["module"]
             tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
             imports: set[str] = set()
@@ -314,11 +350,60 @@ class RepositoryContractTests(unittest.TestCase):
                 missing[module] = absent
         self.assertEqual({}, missing)
 
+    def test_runtime_python_module_spawns_are_explicitly_declared(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        declared = {
+            (item["launcher_module"], item["spawned_module"])
+            for item in contract["spawn_dependencies"]
+            if item.get("kind") == "python_module"
+        }
+        self.assertEqual(len(declared), len(contract["spawn_dependencies"]))
+        self.assertEqual(
+            {module for edge in declared for module in edge} - deployed_modules,
+            set(),
+        )
+        runtime_sources = [
+            {"module": contract["module"], "source": contract["source"]},
+            *contract["supporting_sources"],
+        ]
+        literal_spawns: set[tuple[str, str]] = set()
+        for item in runtime_sources:
+            launcher_module = item["module"]
+            tree = ast.parse((ROOT / item["source"]).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)):
+                    continue
+                literal_values = [
+                    element.value
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                    else None
+                    for element in node.elts
+                ]
+                for index, value in enumerate(literal_values[:-1]):
+                    candidate = literal_values[index + 1]
+                    if (
+                        value == "-m"
+                        and isinstance(candidate, str)
+                        and candidate.startswith("grabowski_")
+                    ):
+                        literal_spawns.add((launcher_module, candidate))
+        self.assertEqual(literal_spawns - declared, set())
+
     def test_bureau_intake_adapter_is_loaded_and_packaged(self) -> None:
         runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn("import grabowski_bureau_intake", runtime)
         self.assertIn('"grabowski_bureau_intake"', pyproject)
+
+    def test_audit_query_is_packaged_as_a_python_module(self) -> None:
+        pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        self.assertIn('"grabowski_audit_query"', pyproject)
 
     def test_task_attention_is_packaged_as_a_python_module(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -386,7 +471,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertEqual(policy["profiles"]["break-glass"]["max_risk_level"], "high")
         self.assertIn("repo-orient", policy["profiles"]["observe"]["allowed_grips"])
         self.assertNotIn("captain-run", policy["profiles"]["mutate"]["allowed_grips"])
-        for capability in ("file_read", "audit_verify", "bundle_registry"):
+        for capability in ("file_read", "audit_verify", "audit_read", "bundle_registry"):
             self.assertIn(capability, observe_caps)
             self.assertIn(capability, maintain_caps)
         for capability in (

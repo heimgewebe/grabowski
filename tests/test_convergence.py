@@ -16,10 +16,18 @@ import grabowski_grips as grips
 
 
 class FakeRunner:
-    def __init__(self, *, head: str, status: str = "terminally_closed", dirty: bool = False):
+    def __init__(
+        self,
+        *,
+        head: str,
+        status: str = "terminally_closed",
+        dirty: bool = False,
+        schema_version: int = 1,
+    ):
         self.head = head
         self.status = status
         self.dirty = dirty
+        self.schema_version = schema_version
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, cwd: Path, argv: list[str]) -> dict[str, object]:
@@ -38,15 +46,25 @@ class FakeRunner:
                 "blocked": 6,
             }
             assessment = {
-                "assessment_id": "assessment-test-v1",
+                "assessment_id": f"assessment-test-v{self.schema_version}",
                 "blocked_by": [],
                 "conflicts": ["effect:deployment:subject_sha256"] if self.status == "conflicting_evidence" else [],
                 "missing_evidence": [],
                 "profile_sha256": "b" * 64,
-                "risk_level": "R2",
-                "schema_version": 1,
+                "schema_version": self.schema_version,
                 "status": self.status,
             }
+            if self.schema_version == 1:
+                assessment["risk_level"] = "R2"
+            elif self.schema_version == 2:
+                assessment.update(
+                    {
+                        "change_risk": "R2",
+                        "target_criticality": "foundational",
+                        "profile_id": "resilience-matrix-v2",
+                        "profile_cell_id": "R2-foundational",
+                    }
+                )
             return {
                 "returncode": exit_codes[self.status],
                 "stdout": json.dumps(assessment, sort_keys=True) + "\n",
@@ -96,6 +114,50 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(result["assessment"]["status"], "terminally_closed")
         self.assertEqual(result["protocol_head"], head)
         self.assertEqual(result["request_sha256"], digest)
+
+    def test_v2_terminal_assessment_allows_closure(self):
+        temporary, repo, executable, request, digest = self._fixture()
+        self.addCleanup(temporary.cleanup)
+        head = "a" * 40
+        runner = FakeRunner(head=head, schema_version=2)
+        with patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CONVERGENCE_PROTOCOL_REPO": str(repo),
+                "GRABOWSKI_CONVERGENCE_EXECUTABLE": str(executable),
+            },
+            clear=False,
+        ):
+            result = convergence.assess(
+                {
+                    "request_path": str(request),
+                    "expected_request_sha256": digest,
+                    "expected_protocol_head": head,
+                },
+                runner,
+                runner,
+            )
+        self.assertTrue(result["closure_allowed"])
+        self.assertEqual(result["decision"], "allow_closure")
+        self.assertEqual(result["assessment"]["schema_version"], 2)
+        self.assertEqual(result["assessment"]["change_risk"], "R2")
+        self.assertEqual(result["assessment"]["target_criticality"], "foundational")
+
+    def test_v2_assessment_rejects_v1_shape(self):
+        assessment = {
+            "assessment_id": "assessment-test-v2",
+            "blocked_by": [],
+            "conflicts": [],
+            "missing_evidence": [],
+            "profile_sha256": "b" * 64,
+            "risk_level": "R2",
+            "schema_version": 2,
+            "status": "terminally_closed",
+        }
+        with self.assertRaisesRegex(
+            convergence.ConvergenceExecutionError, "unexpected assessment shape"
+        ):
+            convergence._validate_assessment(assessment, 0)
 
     def test_conflict_blocks_closure_without_execution_error(self):
         temporary, repo, executable, request, digest = self._fixture()
