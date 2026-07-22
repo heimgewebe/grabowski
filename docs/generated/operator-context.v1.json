@@ -241,6 +241,39 @@
       "tool": "grabowski_verify_audit"
     },
     {
+      "category": "audit",
+      "description": "Query the verified audit chain through a bounded evidence projection.",
+      "effects": [],
+      "id": "grabowski_audit_query",
+      "purpose": "Query bounded safe fields from the fully verified audit segment chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_query"
+    },
+    {
+      "category": "audit",
+      "description": "Trace one audit anchor through bounded one-hop correlations.",
+      "effects": [],
+      "id": "grabowski_audit_trace",
+      "purpose": "Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_trace"
+    },
+    {
+      "category": "audit",
+      "description": "Compute bounded descriptive statistics from the verified audit chain.",
+      "effects": [],
+      "id": "grabowski_audit_analyze",
+      "purpose": "Compute bounded descriptive statistics from the fully verified audit segment chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_analyze"
+    },
+    {
       "category": "knowledge",
       "description": "Return latest healthy RepoGround publications from one catalog resolution.",
       "effects": [],
@@ -2167,6 +2200,9 @@
       "grabowski_destroy_path",
       "grabowski_rollback_text",
       "grabowski_verify_audit",
+      "grabowski_audit_query",
+      "grabowski_audit_trace",
+      "grabowski_audit_analyze",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -2387,6 +2423,10 @@
         "source": "src/grabowski_runtime_extensions.py"
       },
       {
+        "module": "grabowski_audit_query",
+        "source": "src/grabowski_audit_query.py"
+      },
+      {
         "module": "grabowski_checkouts",
         "source": "src/grabowski_checkouts.py"
       },
@@ -2544,7 +2584,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "03101b30953fab1c719712cbceca180459f71adc2ef5c958f991f01f9a74a752"
+      "sha256": "1404ee91b23fb5d4877d2b9a6ea16f4e6a5d7b1488c70115376e9055f72121d0"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2552,7 +2592,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "ff98ed9e2ad26ee21cce59f41ed2ccab09a0034df17fd5a81003b6a2accf03aa"
+      "sha256": "c629dbef7cd29e4a84112a55fcd95a85cadae2840477597af9f43990a7355f84"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2563,13 +2603,14 @@
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
+      "src/grabowski_audit_query.py": "9ba44554c1ed988ad1c31a24a8e209efd0e97e03ade98ef98f70340940bcc988",
       "src/grabowski_blockade_authority.py": "f4f5d5260b8f88a01eb176b25427de4726c57a926982cb446b54ccb6e1dbadcd",
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "03101b30953fab1c719712cbceca180459f71adc2ef5c958f991f01f9a74a752",
+      "src/grabowski_capabilities.py": "1404ee91b23fb5d4877d2b9a6ea16f4e6a5d7b1488c70115376e9055f72121d0",
       "src/grabowski_checkouts.py": "50c1ac7ea8d0a9e04136db4c815ae13626a5d4a6e34da2ef3c3e4c1a5b7f7ecb",
       "src/grabowski_chronik.py": "e44d25d955ab35efbfe3ec381f84395f070d37fcd8726a0488269a47137ade8f",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
@@ -2587,7 +2628,7 @@
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
       "src/grabowski_lifecycle_archive.py": "2dcddcd320047f4f14d260aa4127826b5f942a2645446f55919135846c07ae50",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
-      "src/grabowski_mcp.py": "03dafb5775d0e0d539e3bdeda4c91eeae0cd85de7c7c2ad0eec9d46ca95e3809",
+      "src/grabowski_mcp.py": "9fa90e553b5eb7f313878e998a0269e3c42d69fb1f0e581623815f4967f1a034",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
@@ -2602,7 +2643,7 @@
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "4981ef23c7cdada7d96d51803c63c8702effb095193271dbf51294bd199fd851",
       "src/grabowski_resources.py": "cd6b68aabe44ad53dcded80104637c188e404e24b9393469b7f048beb8554fc0",
-      "src/grabowski_runtime.py": "cf83bd1d3578fbd94f6b447e8862d15ca656adc54eaf32e66e255b1115f842da",
+      "src/grabowski_runtime.py": "11d5bf1a2c427bc8708ed16916e19cba5d8f776d0212ef175da301938d269665",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "b8d92b82b762b763941735ef6c1b87ecad78ab60166eeaf5dbd8ac66f4325258",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",

@@ -48,6 +48,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_destroy_path` | filesystem | no | high | Irreversibly remove one regular file or empty directory with a separate explicit capability. |
 | `grabowski_rollback_text` | audit | no | medium | Restore a quarantined preimage from an audited replace transaction. |
 | `grabowski_verify_audit` | audit | yes | low | Verify the tamper-evident write audit hash chain. |
+| `grabowski_audit_query` | audit | yes | low | Query bounded safe fields from the fully verified audit segment chain. |
+| `grabowski_audit_trace` | audit | yes | low | Trace one exact audit anchor through bounded one-hop evidence correlations without claiming causality. |
+| `grabowski_audit_analyze` | audit | yes | low | Compute bounded descriptive statistics from the fully verified audit segment chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read latest RepoGround publications with canonical catalog precedence. |
 | `repoground_bundle_discover` | knowledge | yes | low | Discover current RepoGround bundles from the canonical publication catalog. |
 | `repoground_bundle_status` | knowledge | yes | low | Read bounded manifest, health, and sidecar status for one RepoGround bundle. |
