@@ -44,6 +44,9 @@ READ_ONLY = "read_only"
 MUTATING = "mutating"
 INTRINSIC_PROTECTED_BRANCHES = frozenset({"main", "master"})
 REMOTE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+WORKTREE_HYGIENE_CONFIRMATION = "reconcile-terminal-worktrees"
+WORKTREE_HYGIENE_MAX_ACTIONS = 8
+WORKTREE_HYGIENE_MAX_CANDIDATES = 32
 
 SITUATION_ACCEPTANCE_IDS = (
     "situation-readonly",
@@ -119,6 +122,23 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "durable-receipt",
         ),
         runner="worktree_ensure",
+    ),
+    "worktree-hygiene-reconcile": GripSpec(
+        name="worktree-hygiene-reconcile",
+        version="1.0",
+        summary="Reconcile owned or exactly merge-proven terminal worktrees through recovery-first archival and typed cleanup.",
+        effect=MUTATING,
+        required_parameters=("repo", "owner_id", "apply_cleanup", "confirmation"),
+        acceptance_ids=(
+            "owner-or-exact-merge-proof-bound",
+            "merged-pr-head-bound",
+            "dirty-and-coordinated-fail-closed",
+            "recovery-before-cleanup",
+            "typed-dry-run-before-apply",
+            "bounded-actions",
+        ),
+        runner="worktree_hygiene_reconcile",
+        uses_github=True,
     ),
     "post-merge-sync": GripSpec(
         name="post-merge-sync",
@@ -366,6 +386,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "repo-orient",
         "worktree-orient",
         "worktree-ensure",
+        "worktree-hygiene-reconcile",
         "situation",
         "scout",
         "runtime-deploy-check",
@@ -394,6 +415,7 @@ GRIP_SURFACE_TARGETS = {
     "repo-orient": "repository checkout",
     "worktree-orient": "repository worktree inventory",
     "worktree-ensure": "one exact repository worktree",
+    "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
@@ -450,7 +472,7 @@ MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-
 GRIP_RISK_LEVELS = {
     name: (
         "high"
-        if name in GRIP_SURFACE_CAPTAIN_ONLY
+        if name in GRIP_SURFACE_CAPTAIN_ONLY or name == "worktree-hygiene-reconcile"
         else "medium"
         if spec.effect == MUTATING
         else "low"
@@ -2558,6 +2580,411 @@ def _run_worktree_ensure(
         str(output.get("durable_receipt_path") or "missing"),
     )
     return output
+
+def _lookup_default_branch(
+    repo: Path,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    result = github_runner(repo, ["repo", "view", "--json", "defaultBranchRef"])
+    if int(result.get("returncode", 1)) != 0:
+        return {
+            "status": "unavailable",
+            "reason": _truncate_reason(
+                result.get("stderr")
+                or result.get("stdout")
+                or "default branch lookup unavailable"
+            ),
+        }
+    raw = str(result.get("stdout", "")).strip()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return {
+            "status": "unavailable",
+            "reason": "default branch lookup returned invalid JSON",
+        }
+    default_ref = parsed.get("defaultBranchRef") if isinstance(parsed, dict) else None
+    name = default_ref.get("name") if isinstance(default_ref, dict) else None
+    if not isinstance(name, str) or not name:
+        return {
+            "status": "unavailable",
+            "reason": "default branch lookup returned no branch name",
+        }
+    return {"status": "available", "name": name}
+
+
+def _lookup_merged_pr_for_checkout(
+    repo: Path,
+    *,
+    branch: str,
+    head: str,
+    default_branch: str,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    result = github_runner(
+        repo,
+        [
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "merged",
+            "--limit",
+            "20",
+            "--json",
+            "number,url,state,baseRefName,headRefName,headRefOid,mergedAt",
+        ],
+    )
+    if int(result.get("returncode", 1)) != 0:
+        return {
+            "status": "unavailable",
+            "reason": _truncate_reason(
+                result.get("stderr") or result.get("stdout") or "merged PR lookup unavailable"
+            ),
+        }
+    raw = str(result.get("stdout", "")).strip()
+    try:
+        parsed = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        return {"status": "unavailable", "reason": "merged PR lookup returned invalid JSON"}
+    if not isinstance(parsed, list):
+        return {"status": "unavailable", "reason": "merged PR lookup returned non-list JSON"}
+    exact = [
+        item
+        for item in parsed
+        if isinstance(item, dict)
+        and item.get("state") == "MERGED"
+        and item.get("headRefName") == branch
+        and item.get("headRefOid") == head
+        and item.get("baseRefName") == default_branch
+        and isinstance(item.get("number"), int)
+        and isinstance(item.get("url"), str)
+        and isinstance(item.get("mergedAt"), str)
+        and item.get("mergedAt")
+    ]
+    if len(exact) == 1:
+        item = exact[0]
+        return {
+            "status": "exact_merged",
+            "number": item["number"],
+            "url": item["url"],
+            "base_ref": item.get("baseRefName"),
+            "head_ref": branch,
+            "head_oid": head,
+            "merged_at": item["mergedAt"],
+        }
+    if len(exact) > 1:
+        return {
+            "status": "ambiguous",
+            "reason": "multiple merged PRs match the exact branch and head",
+            "numbers": sorted(item["number"] for item in exact),
+        }
+    return {
+        "status": "not_terminal",
+        "reason": (
+            "no merged PR matches the checkout branch, exact checkout head, "
+            "and repository default branch"
+        ),
+    }
+
+
+def _worktree_hygiene_owner(
+    item: dict[str, Any],
+    *,
+    now: int,
+) -> tuple[str | None, bool]:
+    lifecycle = item.get("lifecycle") if isinstance(item.get("lifecycle"), dict) else {}
+    owners: set[str] = set()
+    retention = lifecycle.get("retention")
+    if (
+        isinstance(retention, dict)
+        and isinstance(retention.get("owner_id"), str)
+        and isinstance(retention.get("retention_until_unix"), int)
+        and retention["retention_until_unix"] > now
+    ):
+        owners.add(retention["owner_id"])
+    for key in ("binding", "latest_archive"):
+        record = lifecycle.get(key)
+        if isinstance(record, dict) and isinstance(record.get("owner_id"), str):
+            owners.add(record["owner_id"])
+    if len(owners) > 1:
+        return None, True
+    return (next(iter(owners)) if owners else None), False
+
+
+def _run_worktree_hygiene_reconcile(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+    github_runner: GithubRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    repo = _repo_path(parameters)
+    owner_id = _string_parameter(parameters, "owner_id")
+    confirmation = _string_parameter(parameters, "confirmation")
+    apply_cleanup = parameters.get("apply_cleanup")
+    if not isinstance(apply_cleanup, bool):
+        raise GripPreflightError("apply_cleanup must be boolean")
+    if confirmation != WORKTREE_HYGIENE_CONFIRMATION:
+        raise GripPreflightError(
+            f"confirmation must be exactly {WORKTREE_HYGIENE_CONFIRMATION!r}"
+        )
+    max_actions = parameters.get("max_actions", WORKTREE_HYGIENE_MAX_ACTIONS)
+    if (
+        isinstance(max_actions, bool)
+        or not isinstance(max_actions, int)
+        or not 1 <= max_actions <= WORKTREE_HYGIENE_MAX_ACTIONS
+    ):
+        raise GripPreflightError(
+            f"max_actions must be an integer between 1 and {WORKTREE_HYGIENE_MAX_ACTIONS}"
+        )
+
+    inventory = grabowski_checkouts.checkout_inventory(
+        repo, include_processes=True, include_tasks=True, include_resources=True
+    )
+    candidates: list[dict[str, Any]] = []
+    ownership_conflicts: list[str] = []
+    foreign_owned_count = 0
+    adopted_unowned_count = 0
+    now = int(time.time())
+    for item in inventory.get("worktrees", []):
+        if not isinstance(item, dict):
+            continue
+        observed_owner, conflict = _worktree_hygiene_owner(item, now=now)
+        if conflict:
+            ownership_conflicts.append(str(item.get("path")))
+            continue
+        if observed_owner == owner_id:
+            candidates.append({**item, "_hygiene_owner_mode": "owned"})
+            continue
+        if observed_owner is None and item.get("lifecycle_state") == "unclassified_clean":
+            candidates.append({**item, "_hygiene_owner_mode": "adopt_unowned_after_terminal_proof"})
+            continue
+        if observed_owner is not None:
+            foreign_owned_count += 1
+    candidates.sort(key=lambda item: str(item.get("path")))
+
+    archived: list[dict[str, Any]] = []
+    cleanup_plans: list[dict[str, Any]] = []
+    cleaned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    github_queries = 0
+    candidate_pr_queries = 0
+    default_branch: str | None = None
+    default_branch_error: dict[str, Any] | None = None
+    actions = 0
+
+    for item in candidates:
+        path = str(item.get("path"))
+        state = str(item.get("lifecycle_state"))
+        owner_mode = str(item.get("_hygiene_owner_mode"))
+        head = item.get("head")
+        branch = item.get("branch")
+        lifecycle = item.get("lifecycle") if isinstance(item.get("lifecycle"), dict) else {}
+        archive = lifecycle.get("latest_archive") if isinstance(lifecycle.get("latest_archive"), dict) else None
+
+        if actions >= max_actions:
+            skipped.append({"path": path, "reason": "max_actions_reached", "state": state})
+            continue
+        if item.get("is_main"):
+            skipped.append({"path": path, "reason": "main_worktree", "state": state})
+            continue
+        if item.get("status", {}).get("dirty") is not False:
+            skipped.append({"path": path, "reason": "dirty_or_unobservable", "state": state})
+            continue
+        if item.get("coordination", {}).get("blocking"):
+            skipped.append({"path": path, "reason": "active_coordination", "state": state})
+            continue
+
+        if state == "cleanup_candidate" and archive is not None:
+            retention = (
+                lifecycle.get("retention")
+                if isinstance(lifecycle.get("retention"), dict)
+                else None
+            )
+            retention_until_unix = (
+                retention.get("retention_until_unix")
+                if isinstance(retention, dict)
+                else None
+            )
+            if (
+                isinstance(retention_until_unix, int)
+                and retention_until_unix > now
+            ):
+                skipped.append({
+                    "path": path,
+                    "reason": "active_retention_not_elapsed",
+                    "state": state,
+                    "retention_until_unix": retention_until_unix,
+                })
+                continue
+            dry = grabowski_checkouts.grabowski_checkout_cleanup(
+                repo=str(repo),
+                checkout_path=path,
+                owner_id=owner_id,
+                dry_run=True,
+                archive_id=archive.get("archive_id"),
+                expected_head=head,
+                expected_branch=branch,
+            )
+            plan = dry["plan"]
+            actions += 1
+            cleanup_plans.append({
+                "path": path,
+                "plan_id": dry["dry_run_record"]["plan_id"],
+                "plan_sha256": plan["plan_sha256"],
+                "safe_to_apply": plan["safe_to_apply"],
+            })
+            if apply_cleanup and plan["safe_to_apply"] is True:
+                if actions >= max_actions:
+                    skipped.append({
+                        "path": path,
+                        "reason": "cleanup_apply_deferred_by_action_bound",
+                        "state": state,
+                    })
+                    continue
+                applied = grabowski_checkouts.grabowski_checkout_cleanup(
+                    repo=str(repo),
+                    checkout_path=path,
+                    owner_id=owner_id,
+                    dry_run=False,
+                    plan_id=dry["dry_run_record"]["plan_id"],
+                    expected_plan_sha256=plan["plan_sha256"],
+                    confirmation="remove-linked-checkout",
+                )
+                cleaned.append({
+                    "path": path,
+                    "archive_id": plan["archive_id"],
+                    "plan_id": dry["dry_run_record"]["plan_id"],
+                    "plan_sha256": plan["plan_sha256"],
+                    "applied_at_unix": applied["applied_at_unix"],
+                })
+                actions += 1
+            continue
+
+        if state not in {"retained", "unclassified_clean"}:
+            skipped.append({"path": path, "reason": "state_not_archive_candidate", "state": state})
+            continue
+        if not isinstance(branch, str) or not branch or not isinstance(head, str):
+            skipped.append({"path": path, "reason": "branch_or_head_unavailable", "state": state})
+            continue
+        if candidate_pr_queries >= WORKTREE_HYGIENE_MAX_CANDIDATES:
+            skipped.append({
+                "path": path,
+                "reason": "github_query_bound_reached",
+                "state": state,
+            })
+            continue
+        if default_branch is None and default_branch_error is None:
+            default_branch_evidence = _lookup_default_branch(repo, github_runner)
+            github_queries += 1
+            if default_branch_evidence.get("status") == "available":
+                default_branch = str(default_branch_evidence["name"])
+            else:
+                default_branch_error = default_branch_evidence
+        if default_branch is None:
+            skipped.append({
+                "path": path,
+                "reason": "default_branch_not_proven",
+                "state": state,
+                "terminal_evidence": default_branch_error,
+            })
+            continue
+        candidate_pr_queries += 1
+        github_queries += 1
+        terminal = _lookup_merged_pr_for_checkout(
+            repo,
+            branch=branch,
+            head=head,
+            default_branch=default_branch,
+            github_runner=github_runner,
+        )
+        if terminal.get("status") != "exact_merged":
+            skipped.append({
+                "path": path,
+                "reason": "terminality_not_proven",
+                "state": state,
+                "terminal_evidence": terminal,
+            })
+            continue
+        if owner_mode == "adopt_unowned_after_terminal_proof":
+            adopted_unowned_count += 1
+        retention = lifecycle.get("retention") if isinstance(lifecycle.get("retention"), dict) else {}
+        existing_until = retention.get("retention_until_unix")
+        retention_until = max(
+            now + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS + 3600,
+            existing_until if isinstance(existing_until, int) else 0,
+        )
+        result = grabowski_checkouts.grabowski_checkout_archive(
+            repo=str(repo),
+            checkout_path=path,
+            owner_id=owner_id,
+            purpose=(
+                "terminal worktree hygiene: exact merged PR "
+                f"#{terminal['number']} head {head}"
+            ),
+            retention_until_unix=retention_until,
+            expected_head=head,
+            expected_branch=branch,
+        )
+        archived.append({
+            "path": path,
+            "archive_id": result["archive"]["archive_id"],
+            "head": head,
+            "branch": branch,
+            "merged_pr": terminal,
+            "ownership_mode": owner_mode,
+            "cleanup_not_before_unix": (
+                result["archive"]["created_at_unix"]
+                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            ),
+        })
+        actions += 1
+
+    _check(
+        receipt,
+        "owner_bound",
+        "pass",
+        (
+            f"candidates={len(candidates)} adopted_unowned={adopted_unowned_count} "
+            f"foreign_owned={foreign_owned_count} conflicts={len(ownership_conflicts)}"
+        ),
+    )
+    _check(receipt, "bounded_actions", "pass", f"actions={actions} max={max_actions}")
+    _check(
+        receipt,
+        "fail_closed_skips",
+        "pass",
+        f"skipped={len(skipped)} ownership_conflicts={len(ownership_conflicts)}",
+    )
+    return {
+        "owner_id": owner_id,
+        "repository": str(repo),
+        "apply_cleanup": apply_cleanup,
+        "actions": actions,
+        "github_queries": github_queries,
+        "candidate_pr_queries": candidate_pr_queries,
+        "default_branch": default_branch,
+        "archived": archived,
+        "cleanup_plans": cleanup_plans,
+        "cleaned": cleaned,
+        "skipped": skipped,
+        "ownership_conflicts": sorted(ownership_conflicts),
+        "adopted_unowned_count": adopted_unowned_count,
+        "foreign_owned_count": foreign_owned_count,
+        "inventory_sha256": inventory.get("inventory_sha256"),
+        "does_not_establish": [
+            "permission_to_delete_branches",
+            "terminality_without_exact_merged_pr_or_existing_archive",
+            "cleanup_before_24_hour_archive_grace",
+            "authority_over_foreign_owners",
+        ],
+    }
+
 
 def _run_post_merge_sync(
     spec: GripSpec,
@@ -5806,6 +6233,7 @@ _RUNNERS = {
     "pr_check_readiness": _run_pr_check_readiness,
     "worktree_orient": _run_worktree_orient,
     "worktree_ensure": _run_worktree_ensure,
+    "worktree_hygiene_reconcile": _run_worktree_hygiene_reconcile,
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
     "scout": _run_scout,
