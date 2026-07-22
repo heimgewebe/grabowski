@@ -31,11 +31,11 @@ class NtfyDispatchTests(TestCase):
         }
         publisher = mock.Mock(return_value=200)
         with mock.patch.object(
-            ntfy.operator,
-            "grabowski_job_notification_list",
+            ntfy,
+            "_notification_list",
             return_value={"invalid_receipts": [], "notifications": [row]},
         ), mock.patch.object(
-            ntfy.operator, "grabowski_job_notification_ack"
+            ntfy, "_notification_ack"
         ) as ack:
             result = ntfy.dispatch(topic="x" * 32, publisher=publisher)
 
@@ -52,11 +52,11 @@ class NtfyDispatchTests(TestCase):
             "receipt_sha256": "a" * 64,
         }
         with mock.patch.object(
-            ntfy.operator,
-            "grabowski_job_notification_list",
+            ntfy,
+            "_notification_list",
             return_value={"invalid_receipts": [], "notifications": [row]},
         ), mock.patch.object(
-            ntfy.operator, "grabowski_job_notification_ack"
+            ntfy, "_notification_ack"
         ) as ack:
             result = ntfy.dispatch(topic="x" * 32, publisher=lambda _topic, _row: 503)
 
@@ -77,11 +77,11 @@ class NtfyDispatchTests(TestCase):
             raise OSError("offline")
 
         with mock.patch.object(
-            ntfy.operator,
-            "grabowski_job_notification_list",
+            ntfy,
+            "_notification_list",
             return_value={"invalid_receipts": [], "notifications": [row]},
         ), mock.patch.object(
-            ntfy.operator, "grabowski_job_notification_ack"
+            ntfy, "_notification_ack"
         ) as ack:
             result = ntfy.dispatch(topic="x" * 32, publisher=fail)
 
@@ -98,11 +98,11 @@ class NtfyDispatchTests(TestCase):
         }
         publisher = mock.Mock(return_value=200)
         with mock.patch.object(
-            ntfy.operator,
-            "grabowski_job_notification_list",
+            ntfy,
+            "_notification_list",
             return_value={"invalid_receipts": [], "notifications": [row]},
         ), mock.patch.object(
-            ntfy.operator, "grabowski_job_notification_ack"
+            ntfy, "_notification_ack"
         ) as ack:
             result = ntfy.dispatch(topic="x" * 32, publisher=publisher)
 
@@ -112,16 +112,48 @@ class NtfyDispatchTests(TestCase):
 
     def test_invalid_outbox_receipts_block_fail_closed(self) -> None:
         with mock.patch.object(
-            ntfy.operator,
-            "grabowski_job_notification_list",
+            ntfy,
+            "_notification_list",
             return_value={"invalid_receipts": [{"unit": "bad"}], "notifications": []},
         ), mock.patch.object(
-            ntfy.operator, "grabowski_job_notification_ack"
+            ntfy, "_notification_ack"
         ) as ack:
             result = ntfy.dispatch(topic="x" * 32, publisher=mock.Mock(return_value=200))
 
         self.assertEqual(result, {"status": "blocked", "reason": "invalid_outbox_receipts"})
         ack.assert_not_called()
+
+    def test_failed_receipt_does_not_block_later_delivery(self) -> None:
+        failed = {
+            "unit": "grabowski-job-failed.service",
+            "job_id": "1111111111111111",
+            "terminal_status": "failed",
+            "requested_channels": ["ntfy"],
+            "receipt_sha256": "a" * 64,
+        }
+        healthy = {
+            "unit": "grabowski-job-healthy.service",
+            "job_id": "2222222222222222",
+            "terminal_status": "succeeded",
+            "requested_channels": ["ntfy"],
+            "receipt_sha256": "b" * 64,
+        }
+
+        def publisher(_topic: str, row: dict[str, object]) -> int:
+            return 503 if row["unit"] == failed["unit"] else 200
+
+        with mock.patch.object(
+            ntfy,
+            "_notification_list",
+            return_value={"invalid_receipts": [], "notifications": [failed, healthy]},
+        ), mock.patch.object(ntfy, "_notification_ack") as ack:
+            result = ntfy.dispatch(topic="x" * 32, publisher=publisher)
+
+        self.assertEqual(result["status"], "delivery_failed")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(result["unit"], failed["unit"])
+        ack.assert_called_once_with(healthy["unit"], healthy["receipt_sha256"])
 
     def test_publish_payload_excludes_sensitive_fields(self) -> None:
         row = {

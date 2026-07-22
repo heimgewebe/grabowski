@@ -49,18 +49,27 @@ def publish(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
         return int(response.status)
 
 
+def _notification_list(*, limit: int, state: str) -> dict[str, Any]:
+    return operator.grabowski_job_notification_list(limit=limit, state=state)
+
+
+def _notification_ack(unit: str, receipt_sha256: str) -> Any:
+    return operator.grabowski_job_notification_ack(unit, receipt_sha256)
+
+
 def dispatch(
     *,
     topic: str,
     publisher: Callable[[str, dict[str, Any]], int] = publish,
     limit: int = 50,
 ) -> dict[str, Any]:
-    listed = operator.grabowski_job_notification_list(limit=limit, state="queued")
+    listed = _notification_list(limit=limit, state="queued")
     if listed.get("invalid_receipts"):
         return {"status": "blocked", "reason": "invalid_outbox_receipts"}
 
     delivered = 0
     skipped = 0
+    failures: list[dict[str, Any]] = []
     for row in listed.get("notifications", []):
         channels = row.get("requested_channels") or []
         if CHANNEL not in channels:
@@ -72,17 +81,27 @@ def dispatch(
         try:
             status = publisher(topic, row)
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-            return {
-                "status": "delivery_failed",
+            failures.append({
                 "unit": unit,
                 "error_type": type(exc).__name__,
-            }
+            })
+            continue
         if status < 200 or status >= 300:
-            return {"status": "delivery_failed", "unit": unit, "http_status": status}
+            failures.append({"unit": unit, "http_status": status})
+            continue
 
-        operator.grabowski_job_notification_ack(unit, receipt_sha256)
+        _notification_ack(unit, receipt_sha256)
         delivered += 1
 
+    if failures:
+        result: dict[str, Any] = {
+            "status": "delivery_failed",
+            "delivered": delivered,
+            "skipped": skipped,
+            "failed": len(failures),
+        }
+        result.update(failures[0])
+        return result
     return {"status": "ok", "delivered": delivered, "skipped": skipped}
 
 

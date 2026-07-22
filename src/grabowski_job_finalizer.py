@@ -523,9 +523,10 @@ def finalize(directory: Path, environment: dict[str, str] | None = None) -> dict
         "reason": "queued" if created else "already_exists",
         "receipt": receipt,
     }
-    if created:
+    requested_channels = list(receipt.get("requested_channels", []))
+    if "ntfy" in requested_channels:
         result["ntfy_dispatch_scheduled"] = _schedule_ntfy_dispatch(
-            payload["notification_id"], list(payload["requested_channels"])
+            str(receipt["notification_id"]), requested_channels
         )
     if finalization_result is not None:
         result["finalization"] = finalization_result
