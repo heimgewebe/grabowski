@@ -3019,15 +3019,20 @@ def _verify_audit_descriptor(path: Path, descriptor: int) -> dict[str, Any]:
     return _verify_audit_bytes(path, data, exists=True)
 
 
-def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+def _read_audit_file_bytes(path: Path) -> tuple[bytes, bool]:
+    """Read one audit file through the hardened descriptor contract without parsing it."""
     descriptor = _open_audit_read_target(path)
     if descriptor is None:
-        return b"", _verify_audit_bytes(path, b"", exists=False)
+        return b"", False
     try:
-        data = _read_audit_descriptor(descriptor, path)
-        return data, _verify_audit_bytes(path, data, exists=True)
+        return _read_audit_descriptor(descriptor, path), True
     finally:
         _close_audit_descriptor(descriptor)
+
+
+def _read_audit_file(path: Path) -> tuple[bytes, dict[str, Any]]:
+    data, exists = _read_audit_file_bytes(path)
+    return data, _verify_audit_bytes(path, data, exists=exists)
 
 
 def _first_audit_record(data: bytes) -> dict[str, Any] | None:

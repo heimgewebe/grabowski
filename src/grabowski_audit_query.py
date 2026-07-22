@@ -391,16 +391,12 @@ def _source_payload(snapshot: VerifiedAuditSnapshot) -> dict[str, Any]:
 def _load_snapshot_segment(segment: AuditSegmentSnapshot) -> bytes:
     if segment.captured_data is not None:
         return segment.captured_data
-    data, status = base._read_audit_file(segment.path)
-    if not status.get("valid"):
-        raise ValueError(f"audit-segment-invalid:{status.get('error')}")
+    data, exists = base._read_audit_file_bytes(segment.path)
+    if not exists:
+        raise ValueError("audit-segment-missing-after-snapshot")
     observed_sha = hashlib.sha256(data).hexdigest()
     if observed_sha != segment.segment_sha256:
         raise ValueError("audit-segment-sha256-mismatch-after-snapshot")
-    if int(status.get("records") or 0) != segment.records:
-        raise ValueError("audit-segment-record-count-mismatch-after-snapshot")
-    if status.get("last_record_sha256") != segment.last_record_sha256:
-        raise ValueError("audit-segment-last-hash-mismatch-after-snapshot")
     return data
 
 

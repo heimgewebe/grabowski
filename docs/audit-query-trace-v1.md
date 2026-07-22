@@ -23,7 +23,7 @@ Legacy policy fallback does not implicitly grant `audit_read`; modern profiles m
 5. Record parsing, projection, filtering, tracing and analysis happen outside the shared coordination lock.
 6. No second persistent index or database is written.
 
-A cold verification cache can still require a complete historical verification pass while the shared lock is held. Warm verified segments avoid repeated historical verification work. Lazy archived reads never trust cache metadata alone: content is re-bound to the snapshot digest before use.
+A cold verification cache can still require a complete historical verification pass while the shared lock is held. Warm verified segments avoid repeated historical verification work. Lazy archived reads never trust cache metadata alone: bytes are read through the hardened descriptor contract and re-bound to the snapshot digest before parsing, without redundantly re-running the already verified record hash chain.
 
 ## Evidence identity
 

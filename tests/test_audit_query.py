@@ -105,14 +105,14 @@ class AuditQueryTests(unittest.TestCase):
                 return returned, False
             fake_base._read_audit_chain_unlocked = read_chain
 
-        def read_audit_file(path):
+        def read_audit_file_bytes(path):
             try:
-                data, status = lazy_files[Path(path)]
+                data, _status = lazy_files[Path(path)]
             except KeyError as exc:
                 raise AssertionError(f"unexpected lazy audit read: {path}") from exc
-            return data, dict(status)
+            return data, True
 
-        fake_base._read_audit_file = read_audit_file
+        fake_base._read_audit_file_bytes = read_audit_file_bytes
 
         previous = sys.modules.get("grabowski_mcp")
         previous_operator = sys.modules.get("grabowski_operator_core")
