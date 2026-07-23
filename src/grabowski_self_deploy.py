@@ -44,6 +44,7 @@ SourceRepository = Annotated[str, Field(min_length=1, max_length=4096)]
 SourceLeaseOwner = Annotated[str, Field(min_length=1, max_length=128, pattern=r"[A-Za-z0-9._:@-]{1,128}")]
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
 CANONICAL_REPOSITORY = Path.home() / "repos/grabowski"
+REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 RUNNER_RELATIVE_PATH = Path("tools/run_scheduled_deploy.py")
 DEPLOY_SCHEDULE_LOCK = Path.home() / ".local/state/grabowski/runtime-deploy-schedule.lock"
 DEPLOY_JOB_PREFIX = operator.JOB_PREFIX
@@ -557,6 +558,30 @@ def _validated_repository_path(raw: Path, *, label: str) -> Path:
     return resolved
 
 
+def _repoground_managed_source_roots() -> tuple[Path, ...]:
+    roots = [REPOGROUND_MANAGED_SOURCE_ROOT]
+    configured = os.environ.get("REPOGROUND_SOURCE_ROOT")
+    if configured:
+        configured_root = Path(configured)
+        if not configured_root.is_absolute():
+            raise RuntimeError("RepoGround managed source root must be an absolute path")
+        roots.append(configured_root)
+    return tuple(dict.fromkeys(root.resolve(strict=False) for root in roots))
+
+
+def _assert_not_repoground_managed_source(repository: Path) -> None:
+    resolved_repository = repository.resolve(strict=False)
+    for resolved_root in _repoground_managed_source_roots():
+        try:
+            resolved_repository.relative_to(resolved_root)
+        except ValueError:
+            continue
+        raise RuntimeError(
+            "RepoGround-managed source repository cannot be used as a deploy source: "
+            f"{repository}"
+        )
+
+
 def _git_common_directory(repository: Path) -> Path:
     raw = _required_stdout(
         _git_result(repository, "rev-parse", "--git-common-dir"),
@@ -651,6 +676,7 @@ def _deployment_source_preflight(
             Path(source_repository).expanduser(),
             label="source repository",
         )
+    _assert_not_repoground_managed_source(repository)
 
     canonical_common = _git_common_directory(canonical)
     source_common = (
