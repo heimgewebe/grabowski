@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "task_id": "REPOGROUND-AGENT-UTILITY-V1-T010",
+  "captured_at": "2026-07-23T21:02:10Z",
+  "base_main_commit": "5c66abff38ee1d2f015b31d9824fb63984d2c5f6",
+  "finding": {
+    "root_cause": "repoground_context_pack emits context_ref.generated_at from the current UTC clock on every successful read, so two cold reads separated by at least one second are never byte-identical",
+    "classification": "declared volatile metadata",
+    "contract": "stable_except_declared_volatile_fields",
+    "volatile_fields": [
+      "context_ref.generated_at"
+    ],
+    "other_volatile_fields_found": [],
+    "volatility_scope": {
+      "lane": "context pack read without a query argument",
+      "covered": "context_ref, freshness, bundle_status, preflight, bounded_evidence with empty snippets and ranges, access_wrappers, agent_handoff",
+      "not_covered": "the retrieval lane (query argument set), which delegates snippet and range ordering to the external repoground index; no cold-start determinism claim is made for it"
+    },
+    "preserved_evidence": true,
+    "semantic_equality_claimed": false,
+    "hash_scope": {
+      "algorithm": "sha256",
+      "input": "json_sort_keys_compact_utf8",
+      "excluded_fields": [
+        "context_ref.generated_at",
+        "determinism"
+      ],
+      "exclusion_of_determinism_reason": "the envelope carries the hash of the rest of the payload; including it would be circular",
+      "comparability_scope": "same_host_same_publication_paths",
+      "known_scope_limit": "freshness.bundle.manifest_path and freshness.live_repo.repo_path are absolute paths, so content_sha256 is comparable only within one host and path layout; this limit is declared in the payload as comparability_scope and byte_equality_across_hosts_or_paths"
+    }
+  },
+  "fresh_process_observations": {
+    "method": "two separate Python interpreter processes per repository, started with different PYTHONHASHSEED values and separated past one whole UTC second",
+    "reproduction_entrypoint": "tests/repoground_context_pack_fresh_process_probe.py",
+    "reproduction_note": "The probe reads live publication roots when the config binds them to the real HOME; it neutralises _require_capability, so it establishes payload determinism only, not capability authority.",
+    "live_bundles_were_stale": true,
+    "observations": [
+      {
+        "repo": "bureau",
+        "stem": "heimgewebe__bureau__main-max-260723-1701",
+        "bundle_commit": "1aa71b15b889318ffd45401ff2b2e66db3c81f30",
+        "live_commit_at_claim": "221648f39bbf00b9e7e8eca0861888ba92f0d8b5",
+        "manifest_sha256": "5b5e8186f8b5a571f24fb28337937bd23585162f6929b2db23f31b59fa3f031b",
+        "freshness_status": "stale",
+        "preflight_status": "pass",
+        "process_count": 2,
+        "pythonhashseeds": [
+          "0",
+          "12345"
+        ],
+        "generated_at_values": [
+          "2026-07-23T21:02:09Z",
+          "2026-07-23T21:02:10Z"
+        ],
+        "generated_at_differed": true,
+        "content_sha256": "c54d359e84d7c38838727b8d80377f7f33345b75c358a21b15ce1ca86d0a85c3",
+        "content_sha256_equal": true,
+        "payload_equal_after_removing_declared_volatile_fields": true
+      },
+      {
+        "repo": "weltgewebe",
+        "stem": "heimgewebe__weltgewebe__main-max-260723-1700",
+        "bundle_commit": "8a327d8cf59028021b4a277232f21afa1df48423",
+        "live_commit_at_claim": "c9727a600fe7340978a93fe2b8b829c96417b058",
+        "manifest_sha256": "61f58bf220626f1e5f079d3b16b829a6ec343c014421b5a77b5a4810186fd7a1",
+        "freshness_status": "stale",
+        "preflight_status": "pass",
+        "process_count": 2,
+        "pythonhashseeds": [
+          "0",
+          "12345"
+        ],
+        "generated_at_values": [
+          "2026-07-23T21:02:09Z",
+          "2026-07-23T21:02:10Z"
+        ],
+        "generated_at_differed": true,
+        "content_sha256": "404848052a5e8e5e79b1833871c464d293db776530501cf39bd705469705c7d4",
+        "content_sha256_equal": true,
+        "payload_equal_after_removing_declared_volatile_fields": true
+      }
+    ]
+  },
+  "test_evidence": {
+    "focused_tests": {
+      "file": "tests/test_repoground_bundles.py",
+      "class": "RepoGroundBundleToolTests",
+      "result": "5 passed",
+      "names": [
+        "test_context_pack_declares_timestamp_volatility_and_stable_content_hash",
+        "test_context_pack_determinism_contract_holds_for_two_repository_bundles",
+        "test_context_pack_content_hash_is_stable_across_fresh_processes",
+        "test_context_pack_declares_hash_scope_and_withheld_authority",
+        "test_context_pack_content_hash_tracks_nonvolatile_semantic_drift"
+      ]
+    },
+    "cold_start_coverage": {
+      "test": "test_context_pack_content_hash_is_stable_across_fresh_processes",
+      "kind": "real_subprocess",
+      "process_count_per_bundle": 2,
+      "in_process_repetition_used_as_cold_start": false,
+      "fresh_repository_bundle_count": 2,
+      "fresh_repository_bundles_are_test_fixtures": true,
+      "distinct_pythonhashseeds_used": true,
+      "asserts_generated_at_differs": true,
+      "asserts_content_sha256_equal": true,
+      "asserts_payload_equal_after_removing_declared_volatile_fields": true
+    },
+    "warm_start_coverage": {
+      "test": "test_context_pack_determinism_contract_holds_for_two_repository_bundles",
+      "kind": "repeated_in_process_calls",
+      "fresh_repository_bundle_count": 2
+    },
+    "nonvolatile_drift_coverage": {
+      "test": "test_context_pack_content_hash_tracks_nonvolatile_semantic_drift",
+      "drift": "live repository HEAD advances, freshness_status moves fresh -> stale",
+      "asserts_content_sha256_changes": true
+    },
+    "normalisation_width_binding": {
+      "helper": "tests/test_repoground_bundles.py::_recomputed_content_sha256",
+      "claim": "content_sha256 is recomputed in the test from the returned payload minus exactly the payload's own declared hash_excluded_fields, so any wider silent normalisation is detected"
+    },
+    "mutation_checks": {
+      "method": "temporary local edits to src/grabowski_mcp.py, reverted before commit; run against the five focused tests",
+      "results": [
+        {
+          "mutant": "stop excluding context_ref.generated_at from the hash input",
+          "detected": true
+        },
+        {
+          "mutant": "additionally drop freshness and bounded_evidence from the hash input",
+          "detected": true
+        },
+        {
+          "mutant": "declare an exclusion (snippets) that the hash input does not actually apply",
+          "detected": true
+        }
+      ]
+    },
+    "repoground_bundle_tests": "65 tests, ok",
+    "full_repository_suite": "make test: 3260 tests, ok, 4 skipped",
+    "ruff_check_changed_files": "no new findings; one pre-existing E402 in tests/test_repoground_bundles.py that is also present on the base commit",
+    "ruff_format_changed_lines": "clean for the added lines and for tests/repoground_context_pack_fresh_process_probe.py; the repository as a whole is not ruff-formatted",
+    "git_diff_check": "pass",
+    "make_validate_targets": "catalog-data-check, syntax, test, policy, tool-surface-budget, context-check, profiles-check, runtime-lock, deploy-tooling-check, secrets all pass"
+  },
+  "does_not_establish": [
+    "live_bundle_freshness",
+    "semantic_equivalence_from_hash_equality",
+    "semantic_completeness",
+    "truth",
+    "automatic_default_routing",
+    "repoground_write_authority",
+    "byte_equality_across_hosts_or_paths",
+    "retrieval_lane_determinism",
+    "retrieval_quality_improvement",
+    "test_sufficiency"
+  ]
+}

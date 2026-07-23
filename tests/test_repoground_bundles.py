@@ -1,17 +1,57 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
 import json
+import os
 import re
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+
+
+def _utc_second_stamp() -> str:
+    """Render the current UTC clock exactly like repoground_context_pack does."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _recomputed_content_sha256(pack: dict) -> str:
+    """Recompute the pack hash from the pack's own declared canonical form.
+
+    Independent of the runtime implementation, so a hash input that silently
+    normalises away more than the declared exclusions is detected.
+    """
+    hashed = json.loads(json.dumps(pack))
+    for path in pack["determinism"]["hash_excluded_fields"]:
+        parent, _, leaf = path.rpartition(".")
+        (hashed[parent] if parent else hashed).pop(leaf)
+    return hashlib.sha256(
+        json.dumps(
+            hashed, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _without_volatile_fields(pack: dict) -> dict:
+    """Drop only the fields the pack itself declares as volatile."""
+    stripped = json.loads(json.dumps(pack))
+    for path in stripped["determinism"]["volatile_fields"]:
+        parent, _, leaf = path.rpartition(".")
+        stripped[parent].pop(leaf)
+    return stripped
 
 
 class _FakeFastMCP:
@@ -645,6 +685,185 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(ref["live_commit_at_claim"], head)
         self.assertEqual(ref["freshness_status"], "fresh")
         self.assertEqual(ref["preflight_status"], "pass")
+
+    def test_context_pack_declares_timestamp_volatility_and_stable_content_hash(self) -> None:
+        dt = __import__("datetime")
+        first_time = dt.datetime(2026, 7, 23, 10, 0, 0, tzinfo=dt.timezone.utc)
+        second_time = dt.datetime(2026, 7, 23, 10, 5, 0, tzinfo=dt.timezone.utc)
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+        with patch.object(mcp, "_repoground_agent_preflight", return_value=preflight):
+            with patch.object(mcp, "datetime") as mocked_datetime:
+                mocked_datetime.now.return_value = first_time
+                first = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+                mocked_datetime.now.return_value = second_time
+                second = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+
+        self.assertNotEqual(
+            first["context_ref"]["generated_at"], second["context_ref"]["generated_at"]
+        )
+        self.assertEqual(
+            first["determinism"]["content_sha256"],
+            second["determinism"]["content_sha256"],
+        )
+        self.assertEqual(
+            first["determinism"]["volatile_fields"], ["context_ref.generated_at"]
+        )
+
+    def test_context_pack_determinism_contract_holds_for_two_repository_bundles(self) -> None:
+        """Repeated warm in-process reads; cold starts are covered by the probe test."""
+        hashes = []
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+        for repo_name, stem in (
+            ("first-repo", "first-repo-max-260701-1200"),
+            ("second-repo", "second-repo-max-260701-1200"),
+        ):
+            _repo, head = self._git_repo(repo_name)
+            self._write_bundle(stem, commit=head)
+            with patch.object(mcp, "_repoground_agent_preflight", return_value=preflight):
+                first = mcp.repoground_context_pack(repo_name, "basic_repo_question")
+                second = mcp.repoground_context_pack(repo_name, "basic_repo_question")
+            self.assertEqual(
+                first["determinism"]["content_sha256"],
+                second["determinism"]["content_sha256"],
+            )
+            hashes.append(first["determinism"]["content_sha256"])
+        self.assertNotEqual(hashes[0], hashes[1])
+
+    def _fresh_process_context_pack(
+        self, repo: str, *, hashseed: str
+    ) -> dict[str, object]:
+        config = {
+            "src_root": str(ROOT / "src"),
+            "home": str(self.home),
+            "merges": str(self.merges),
+            "publications": str(self.publications),
+            "registry": str(self.state / "repoground-latest-complete-bundles.tsv"),
+            "repo": repo,
+            "task_profile": "basic_repo_question",
+            "preflight": {"status": "pass", "answer_compliance_template": {}},
+        }
+        env = dict(os.environ, PYTHONHASHSEED=hashseed)
+        env.pop("PYTHONPATH", None)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tests" / "repoground_context_pack_fresh_process_probe.py"),
+                json.dumps(config),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def _wait_for_next_utc_second(self, after: str) -> None:
+        deadline = time.monotonic() + 5.0
+        while _utc_second_stamp() <= after:
+            self.assertLess(time.monotonic(), deadline, "UTC second never advanced")
+            time.sleep(0.02)
+
+    def test_context_pack_content_hash_is_stable_across_fresh_processes(self) -> None:
+        bundles = (
+            ("first-repo", "first-repo-max-260701-1200"),
+            ("second-repo", "second-repo-max-260701-1200"),
+        )
+        for repo_name, stem in bundles:
+            _repo, head = self._git_repo(repo_name)
+            self._write_bundle(stem, commit=head)
+
+        cold = {
+            repo_name: self._fresh_process_context_pack(repo_name, hashseed="0")
+            for repo_name, _stem in bundles
+        }
+        self._wait_for_next_utc_second(
+            max(pack["context_ref"]["generated_at"] for pack in cold.values())
+        )
+        second_cold = {
+            repo_name: self._fresh_process_context_pack(repo_name, hashseed="12345")
+            for repo_name, _stem in bundles
+        }
+
+        hashes = []
+        for repo_name, _stem in bundles:
+            first, second = cold[repo_name], second_cold[repo_name]
+            with self.subTest(repo=repo_name):
+                self.assertNotEqual(
+                    first["context_ref"]["generated_at"],
+                    second["context_ref"]["generated_at"],
+                )
+                self.assertEqual(
+                    first["determinism"]["content_sha256"],
+                    second["determinism"]["content_sha256"],
+                )
+                self.assertEqual(
+                    _without_volatile_fields(first), _without_volatile_fields(second)
+                )
+            hashes.append(first["determinism"]["content_sha256"])
+        self.assertNotEqual(hashes[0], hashes[1])
+
+    def test_context_pack_declares_hash_scope_and_withheld_authority(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+
+        with patch.object(mcp, "_repoground_agent_preflight", return_value=preflight):
+            result = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+
+        determinism = result["determinism"]
+        self.assertEqual(
+            determinism["contract"], "stable_except_declared_volatile_fields"
+        )
+        self.assertEqual(determinism["hash_algorithm"], "sha256")
+        self.assertEqual(
+            determinism["hash_excluded_fields"],
+            ["context_ref.generated_at", "determinism"],
+        )
+        self.assertEqual(
+            determinism["comparability_scope"], "same_host_same_publication_paths"
+        )
+        self.assertEqual(
+            determinism["content_sha256"], _recomputed_content_sha256(result)
+        )
+        for withheld in (
+            "semantic_equivalence_from_hash_equality",
+            "semantic_completeness",
+            "truth",
+            "default_routing_authority",
+            "byte_equality_across_hosts_or_paths",
+        ):
+            self.assertIn(withheld, determinism["does_not_establish"])
+
+    def test_context_pack_content_hash_tracks_nonvolatile_semantic_drift(self) -> None:
+        repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+
+        with patch.object(mcp, "_repoground_agent_preflight", return_value=preflight):
+            before = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+            (repo / "NOTES.md").write_text("drift\n", encoding="utf-8")
+            subprocess.run(["git", "add", "NOTES.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "drift"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            after = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+
+        self.assertEqual(before["context_ref"]["freshness_status"], "fresh")
+        self.assertEqual(after["context_ref"]["freshness_status"], "stale")
+        self.assertNotEqual(
+            before["determinism"]["content_sha256"],
+            after["determinism"]["content_sha256"],
+        )
+        for pack in (before, after):
+            self.assertEqual(
+                pack["determinism"]["content_sha256"], _recomputed_content_sha256(pack)
+            )
 
     def test_context_pack_rejects_cross_repo_stem(self) -> None:
         _repo, head = self._git_repo("demo-repo")
