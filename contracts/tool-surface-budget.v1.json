@@ -957,6 +957,29 @@
         "tool": "repoground_context_compose"
       }
     },
+    "repoground_agent_handoff": {
+      "evidence_refs": [
+        "bureau:REPOGROUND-AGENT-UTILITY-V1-T004",
+        "tests:tests/test_repoground_bundles.py",
+        "proof:docs/proofs/repoground-agent-utility-v1-t004-paired-baseline-20260723.json"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds one caller-explicit read-only handoff boundary for exactly three proven agent operations without default routing or mutation authority.",
+        "evidence": "Tests enforce the exact operation and retrieval-mode sets, no automatic/default promotion, no write path, delegated bounded RepoGround evidence, separate live-read authority, and paired baseline preservation across RepoGround/Lenskit and Bureau."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Requiring every agent to compose native live reads and RepoGround context client-side was rejected because it would duplicate routing semantics and blur authority boundaries; automatic global routing was rejected because T004 has evidence only for three bounded operations.",
+      "rationale": "The three proven agent operations need one narrow caller-selected handoff contract that preserves explicit choice among native live tools, RepoGround context, combined use, or no additional retrieval while keeping all execution and write authority outside RepoGround.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "repoground_agent_handoff"
+      }
+    },
     "repoground_context_pack": {
       "evidence_refs": [
         "bureau:heimgewebe/bureau#673",

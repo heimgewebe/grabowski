@@ -57,6 +57,11 @@ class LifecycleCollectorTests(unittest.TestCase):
         self.assertEqual(result["classification"], "terminal_archivable")
         self.assertTrue(result["safe_to_archive"])
         self.assertEqual(set(result["evidence"]["source_sha256s"]), collectors.REQUIRED_SOURCES)
+        applicability = result["evidence"]["source_applicability"]
+        self.assertEqual("observed", applicability["task"])
+        self.assertEqual("observed", applicability["receipt"])
+        self.assertEqual("explicit_absence", applicability["workspace"])
+        self.assertEqual("explicit_absence", applicability["checkout"])
         self.assertFalse(result["mutation_performed"])
 
     def test_running_task_remains_active(self):
@@ -73,6 +78,11 @@ class LifecycleCollectorTests(unittest.TestCase):
         )
         self.assertEqual(result["classification"], "ambiguous")
         self.assertIn("observation_error:source_unobserved:process", result["reason_codes"])
+        self.assertIn(
+            "observation_error:source_applicability_missing:process",
+            result["reason_codes"],
+        )
+        self.assertNotIn("process", result["evidence"]["source_applicability"])
 
     def test_invalid_terminal_receipt_requires_recovery(self):
         result = collectors.collect_lifecycle_classification(

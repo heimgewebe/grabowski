@@ -28,6 +28,7 @@ class LifecycleEffectPlanTests(unittest.TestCase):
             "kind": "task",
             "observed_sources": ALL_SOURCES,
             "source_sha256s": SOURCE_SHA256S,
+            "source_applicability": {source: "observed" for source in ALL_SOURCES},
             "state": "completed",
             "closed": None,
             "receipt_integrity_valid": True,
@@ -97,6 +98,10 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         self.assertEqual(plan["lease_owner_id"], OWNER)
         self.assertEqual(plan["required_resource_keys"], sorted(RESOURCE_KEYS))
         self.assertEqual(plan["entries"][0]["evidence_sha256"], classification["evidence_sha256"])
+        self.assertEqual(
+            plan["entries"][0]["source_applicability"],
+            classification["evidence"]["source_applicability"],
+        )
         self.assertEqual(
             plan["entries"][0]["source_sha256s"],
             classification["evidence"]["source_sha256s"],
@@ -272,6 +277,30 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         self.assertFalse(result["ready_for_effect"])
         self.assertIn("evidence_drift:task-a", result["errors"])
         self.assertIn("source_digest_drift:task-a", result["errors"])
+
+    def test_revalidation_fails_on_source_applicability_drift(self) -> None:
+        original = self.classification()
+        plan = self.build_plan([original])
+        applicability = {source: "observed" for source in ALL_SOURCES}
+        applicability["checkout"] = "explicit_absence"
+        changed = self.classification(source_applicability=applicability)
+        result = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": changed},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+        self.assertFalse(result["ready_for_effect"])
+        self.assertIn("evidence_drift:task-a", result["errors"])
+        self.assertIn("source_applicability_drift:task-a", result["errors"])
+
+    def test_effect_plan_rejects_evidence_without_applicability(self) -> None:
+        classification = self.classification()
+        snapshot = dict(classification["evidence"])
+        snapshot.pop("source_applicability")
+        forged = {**classification, "evidence": snapshot}
+        with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+            self.build_plan([forged])
 
     def test_revalidation_fails_when_object_becomes_active(self) -> None:
         original = self.classification()

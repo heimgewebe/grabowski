@@ -61,6 +61,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `repoground_range_get` | knowledge | yes | low | Resolve one bounded RepoGround range reference without refreshing source artifacts. |
 | `repoground_context_pack` | knowledge | yes | low | Build a bounded RepoGround context pack for agent handoff and Bureau receipts. |
 | `repoground_context_compose` | knowledge | yes | low | Compose deterministic diff-bound RepoGround change context under a hard context budget. |
+| `repoground_agent_handoff` | knowledge | yes | low | Route one bounded caller-selected agent handoff explicitly between native live reads and RepoGround context. |
 | `repoground_find_symbol` | knowledge | yes | low | Find bounded Python symbol definitions in an existing RepoGround bundle. |
 | `repoground_get_callers` | knowledge | yes | low | Read S1 callers while preserving unresolved references separately. |
 | `repoground_get_callees` | knowledge | yes | low | Read S1 callees while preserving S0 call sites separately. |

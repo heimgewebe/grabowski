@@ -325,8 +325,8 @@ def _validate_features(features: Any, *, route_schema_version: int) -> None:
     if (
         not isinstance(flags, list)
         or len(flags) > 32
-        or len(set(flags)) != len(flags)
         or any(not isinstance(item, str) or not 1 <= len(item) <= 32 for item in flags)
+        or len(set(flags)) != len(flags)
     ):
         raise ShadowCaptureError("features.risk_flags is invalid")
     for field in ("connector_instability", "user_requested_external"):
@@ -627,7 +627,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def main() -> int:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -643,7 +643,11 @@ def main() -> int:
         help="JSON file containing outcome and primary_evidence_refs",
     )
     seal.add_argument("--output", required=True)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
 
     if args.command == "freeze":
         manifest = _read_regular_json(Path(args.manifest), label="manifest")

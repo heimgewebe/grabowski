@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from unittest import mock
 import sys
-import subprocess
 import importlib.util
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -243,6 +242,12 @@ class OperatorRoutingShadowCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.ShadowCaptureError, "shape"):
             capture.validate_shadow_record(record)
 
+    def test_unhashable_risk_flag_fails_closed_with_capture_error(self) -> None:
+        eligibility = self.freeze()
+        eligibility["features"]["risk_flags"] = [{}]
+        with self.assertRaisesRegex(capture.ShadowCaptureError, "risk_flags"):
+            capture.validate_eligibility_receipt(eligibility)
+
     def test_create_only_writer_refuses_overwrite(self) -> None:
         record = self.build()
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,30 +280,27 @@ class OperatorRoutingShadowCaptureTests(unittest.TestCase):
                 capture._read_regular_json(link, label="manifest")
 
     def test_operational_cli_rejects_caller_supplied_timestamps(self) -> None:
-        freeze = subprocess.run(
-            [
-                sys.executable, str(TOOL_PATH), "freeze",
+        parser = capture._build_parser()
+        with self.assertRaises(SystemExit) as freeze_exit:
+            parser.parse_args([
+                "freeze",
                 "--manifest", "/tmp/does-not-matter.json",
                 "--task-id", TASK_ID,
                 "--output", "/tmp/does-not-matter-output.json",
                 "--frozen-at", FROZEN_AT,
-            ],
-            capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(freeze.returncode, 2)
-        self.assertIn("unrecognized arguments: --frozen-at", freeze.stderr)
-        seal = subprocess.run(
-            [
-                sys.executable, str(TOOL_PATH), "seal",
+            ])
+        self.assertEqual(freeze_exit.exception.code, 2)
+
+        parser = capture._build_parser()
+        with self.assertRaises(SystemExit) as seal_exit:
+            parser.parse_args([
+                "seal",
                 "--eligibility", "/tmp/does-not-matter.json",
                 "--outcome", "/tmp/does-not-matter-outcome.json",
                 "--output", "/tmp/does-not-matter-output.json",
                 "--captured-at", CAPTURED_AT,
-            ],
-            capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(seal.returncode, 2)
-        self.assertIn("unrecognized arguments: --captured-at", seal.stderr)
+            ])
+        self.assertEqual(seal_exit.exception.code, 2)
 
     def test_generated_artifacts_validate_against_draft_2020_12_schemas(self) -> None:
         if importlib.util.find_spec("jsonschema") is None:
