@@ -139,6 +139,8 @@ class ConvergenceBackfillTests(unittest.TestCase):
         self.assertTrue(records["bureau-attention:stale_running:stale"]["bureau_current_attention"])
         self.assertTrue(records["bureau-attention:recent_failed:recent-failed"]["bureau_current_attention"])
         self.assertFalse(records["bureau-attention:historical_failed:historical-failed"]["bureau_current_attention"])
+        self.assertEqual(100, records["bureau-attention:recent_failed:recent-failed"]["source_observed_at_unix"])
+        self.assertEqual(30, records["bureau-attention:recent_failed:recent-failed"]["source_recorded_at_unix"])
         counts = projection["classifier_output"]["counts"]
         self.assertEqual(1, counts["blocked"])
         self.assertEqual(2, counts["defect"])
