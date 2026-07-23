@@ -139,8 +139,8 @@ def _runtime_binding(manifest_path: Path) -> dict[str, str]:
     }
 
 
-def _obligation_candidates() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    inventory = list_obligations({"state": "attention", "limit": 100})
+def _obligation_candidates(limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    inventory = list_obligations({"state": "attention", "limit": limit})
     integrity_errors = inventory.get("integrity_errors")
     if integrity_errors:
         raise ConvergenceBackfillError(f"operator obligation inventory has integrity errors: {integrity_errors}")
@@ -484,12 +484,12 @@ def build_projection(
         if runtime_binding is not None
         else _runtime_binding(Path(deployment_manifest))
     )
-    obligations, obligation_bounds = _obligation_candidates()
+    obligations, obligation_bounds = _obligation_candidates(max_records)
     bureau, bureau_bounds = _bureau_attention_candidates(
         Path(task_db),
         observation_unix=selected_observation_unix,
         horizon_seconds=attention_horizon_seconds,
-        load_limit=min(200, max_records + 1),
+        load_limit=max_records,
         bureau_executable=Path(bureau_executable),
         provider=bureau_attention_provider,
     )
