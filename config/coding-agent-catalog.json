@@ -575,8 +575,6 @@
       "secrets"
     ],
     "controller_route": "grabowski-primary",
-    "critical_review_requires_independent_family": true,
-    "critical_review_requires_independent_provider": true,
     "direct_work_policy": {
       "applies_to_all_implementation_sizes": true,
       "canonical_primary": "grabowski-primary",
@@ -725,7 +723,9 @@
     "single_mutating_writer": true,
     "unknown_cost_action": "block",
     "unknown_quota_execution": "advisory-only",
-    "zero_marginal_cost_only": true
+    "zero_marginal_cost_only": true,
+    "critical_external_review_target_independent_family": true,
+    "critical_external_review_target_independent_provider": true
   },
   "quota_pools": {
     "agy-account": {

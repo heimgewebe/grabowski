@@ -136,6 +136,7 @@ if sys.argv[1] == "probe":
         "harnesses",
         "providers",
         "verified_quota_pools",
+        "api_key_environment_scrubbed",
         "model_invocations",
         "paid_api_requests_authorized",
     )
@@ -248,11 +249,8 @@ else:
         digest = SCHEDULER.probe_digest(probe)
         probe["catalog_probe_sha256"] = digest
         probe["api_key_environment_scrubbed"] = ["ROUTER_AUTH_ENV_A"]
-        self.assertEqual(digest, SCHEDULER.probe_digest(probe))
-        with self.assertRaisesRegex(
-            SCHEDULER.ProbeSchedulerError,
-            "api_key_environment_scrubbed is invalid",
-        ):
+        self.assertNotEqual(digest, SCHEDULER.probe_digest(probe))
+        with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, "digest does not match"):
             SCHEDULER.validate_probe(probe)
 
     def test_probe_validation_rejects_invalid_verified_pool_claims(self) -> None:
@@ -276,6 +274,28 @@ else:
                 with self.assertRaisesRegex(
                     SCHEDULER.ProbeSchedulerError, "verified_quota_pools"
                 ):
+                    SCHEDULER.validate_probe(probe)
+
+    def test_probe_validation_rejects_unknown_fields_and_nonzero_execution_claims(self) -> None:
+        base = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        unknown = {**base, "password": "must-not-be-stored"}
+        unknown["catalog_probe_sha256"] = SCHEDULER.probe_digest(base)
+        with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, "exact metadata-only schema"):
+            SCHEDULER.validate_probe(unknown)
+        for field in ("model_invocations", "paid_api_requests_authorized"):
+            with self.subTest(field=field):
+                probe = {**base, field: 1}
+                probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+                with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, f"{field} must be integer zero"):
                     SCHEDULER.validate_probe(probe)
 
     def test_state_validation_preserves_same_catalog_and_adds_only_verified_time(self) -> None:

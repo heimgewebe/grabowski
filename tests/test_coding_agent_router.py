@@ -237,6 +237,18 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertFalse(result["provider_peer_balance"]["enabled"])
         self.assertEqual(result["provider_peer_balance"]["selection_effect"], 0)
         self.assertFalse(result["automatic_execution_authorized"])
+        self.assertTrue(
+            self.catalog["policy"]["critical_external_review_target_independent_family"]
+        )
+        self.assertTrue(
+            self.catalog["policy"]["critical_external_review_target_independent_provider"]
+        )
+        self.assertNotIn(
+            "critical_review_requires_independent_family", self.catalog["policy"]
+        )
+        self.assertNotIn(
+            "critical_review_requires_independent_provider", self.catalog["policy"]
+        )
 
         fable_routes = {
             route["route"]: route
@@ -695,7 +707,9 @@ class CodingAgentRouterTests(unittest.TestCase):
         review = self._route("independent-review")
         self.assertEqual(review["decision"], "controller")
         self.assertEqual(review["primary_role"], "direct-reviewer")
-        self.assertNotEqual(review["reviewers"][0]["provider_family"], "anthropic")
+        self.assertEqual(review["reviewers"], [])
+        self.assertEqual(review["review_status"], "no-independent-review-route")
+        self.assertEqual(review["review_gap"], 1)
 
         cline = router._pool_gate("cline-account", self.catalog, self.state, critical=False)
         openrouter = router._pool_gate("openrouter-paid", self.catalog, self.state, critical=True)

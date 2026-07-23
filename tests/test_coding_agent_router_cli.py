@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import contextlib
 import io
 import json
 import os
@@ -195,6 +196,36 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         digest_input = dict(probe)
         digest = digest_input.pop("catalog_probe_sha256")
         self.assertEqual(digest, cli._probe_digest(digest_input))
+
+    def test_state_write_lock_is_private_and_wraps_mutation(self) -> None:
+        lock = self.state.parent / ".coding-agent-router-state.lock"
+        self.assertFalse(lock.exists())
+        with cli._exclusive_state_write_lock(self.state):
+            self.assertTrue(lock.is_file())
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
+
+        active = {"value": False}
+
+        @contextlib.contextmanager
+        def tracked_lock(_path: Path):
+            active["value"] = True
+            try:
+                yield
+            finally:
+                active["value"] = False
+
+        def observed(_arguments, _catalog, _validation):
+            self.assertTrue(active["value"])
+            return {"recorded": True}
+
+        arguments = mock.Mock()
+        with (
+            mock.patch.object(cli, "_exclusive_state_write_lock", tracked_lock),
+            mock.patch.object(cli, "_observe_locked", side_effect=observed),
+        ):
+            result = cli._observe(arguments, {}, {})
+        self.assertEqual(result, {"recorded": True})
+        self.assertFalse(active["value"])
 
     def test_state_target_symlink_is_rejected(self) -> None:
         real = self.root / "real-state.json"
@@ -498,6 +529,32 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             versions = cli._binary_versions(catalog)
         self.assertTrue(versions["codex"]["version_ok"])
         run.assert_called_once_with(["/opt/tools/codex", "--version"], catalog)
+
+    def test_probe_digest_binds_scrub_claim(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": cli._iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": ["OPENAI_API_KEY"],
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        digest = cli._probe_digest(probe)
+        probe["api_key_environment_scrubbed"] = []
+        self.assertNotEqual(digest, cli._probe_digest(probe))
+
+    def test_metadata_output_limit_is_enforced_while_child_is_running(self) -> None:
+        catalog, _ = router._load_catalog()
+        with mock.patch.object(cli, "MAX_COMMAND_OUTPUT_BYTES", 1024):
+            result = cli._run_metadata(
+                [sys.executable, "-c", "import sys; sys.stdout.write('x' * 1000000)"],
+                catalog,
+                timeout=5,
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "output_limit")
 
     def test_metadata_rejects_non_absolute_executable(self) -> None:
         catalog, _ = router._load_catalog()

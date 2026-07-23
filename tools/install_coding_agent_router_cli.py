@@ -9,10 +9,14 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import selectors
+import shlex
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +30,7 @@ DEFAULT_PIN = (
 )
 DEFAULT_RUNTIME_PYTHON = Path.home() / ".local/share/grabowski-mcp/.venv/bin/python"
 MAX_INSTALL_FILE_BYTES = 1024 * 1024
+MAX_VERIFY_OUTPUT_BYTES = 256 * 1024
 
 
 class InstallError(RuntimeError):
@@ -237,22 +242,84 @@ def _restore_owned_publication(
         os.close(directory_fd)
 
 
+def _kill_verification_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
 def _run_json(argv: list[str], *, timeout: int = 30) -> dict[str, Any]:
+    if not argv or not Path(argv[0]).is_absolute():
+        raise InstallError("router verification executable must be absolute")
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             argv,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise InstallError("router verification command failed to execute") from exc
-    if result.returncode != 0:
-        raise InstallError("router verification command returned nonzero")
+    if process.stdout is None or process.stderr is None:
+        _kill_verification_process(process)
+        raise InstallError("router verification output pipes are unavailable")
+    selector = selectors.DefaultSelector()
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    for stream in streams:
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    failure: str | None = None
     try:
-        value = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "router verification command timed out"
+                break
+            events = selector.select(min(remaining, 0.2))
+            for key, _mask in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer = streams[stream]
+                remaining_capacity = MAX_VERIFY_OUTPUT_BYTES - len(buffer)
+                if remaining_capacity > 0:
+                    buffer.extend(chunk[:remaining_capacity])
+                if len(chunk) > remaining_capacity:
+                    failure = "router verification output exceeds byte limit"
+                    break
+            if failure is not None:
+                break
+        if failure is not None:
+            _kill_verification_process(process)
+            raise InstallError(failure)
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            _kill_verification_process(process)
+            raise InstallError("router verification command timed out") from exc
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    stdout = bytes(streams[process.stdout])
+    if returncode != 0:
+        raise InstallError(
+            f"router verification command returned nonzero ({returncode})"
+        )
+    try:
+        value = json.loads(stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InstallError("router verification command returned invalid JSON") from exc
     if not isinstance(value, dict):
         raise InstallError("router verification JSON root is not an object")
@@ -299,14 +366,23 @@ def _verify_installed(target: Path) -> dict[str, Any]:
     return recommendation
 
 
-def _expected() -> tuple[bytes, bytes, str]:
-    wrapper = SOURCE.read_bytes()
+def _expected(runtime_python: Path) -> tuple[bytes, bytes, str]:
+    if not runtime_python.is_absolute():
+        raise InstallError("runtime Python path must be absolute")
+    template = SOURCE.read_text(encoding="utf-8")
+    marker = 'runtime_python="$HOME/.local/share/grabowski-mcp/.venv/bin/python"'
+    if template.count(marker) != 1:
+        raise InstallError("versioned router wrapper runtime marker is invalid")
+    rendered = template.replace(
+        marker, f"runtime_python={shlex.quote(str(runtime_python))}", 1
+    )
+    wrapper = rendered.encode("utf-8")
     digest = _sha256(wrapper)
     return wrapper, f"{digest}\n".encode("ascii"), digest
 
 
 def check(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
-    wrapper, pin_bytes, digest = _expected()
+    wrapper, pin_bytes, digest = _expected(runtime_python)
     try:
         _validate_parent(target.parent)
     except FileNotFoundError:
@@ -340,7 +416,7 @@ def check(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
 
 
 def apply(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
-    wrapper, pin_bytes, digest = _expected()
+    wrapper, pin_bytes, digest = _expected(runtime_python)
     runtime = _verify_runtime(runtime_python)
     with _exclusive_install_lock(pin):
         _safe_parent(target, 0o700)
@@ -351,6 +427,10 @@ def apply(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
             _atomic_write(target, wrapper, 0o755)
             _atomic_write(pin, pin_bytes, 0o600)
             recommendation = _verify_installed(target)
+            if recommendation.get("catalog_sha256") != runtime.get("catalog_sha256"):
+                raise InstallError(
+                    "installed router catalog identity differs from verified runtime"
+                )
         except BaseException:
             errors: list[str] = []
             rollback_items = (
@@ -379,10 +459,12 @@ def apply(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
         "wrapper_sha256": digest,
         "runtime_catalog_sha256": runtime.get("catalog_sha256"),
         "runtime_catalog_source": runtime.get("catalog_source"),
+        "runtime_python": str(runtime_python),
         "readback": {
             "decision": recommendation.get("decision"),
             "controller": recommendation.get("controller"),
             "primary_role": recommendation.get("primary_role"),
+            "catalog_sha256": recommendation.get("catalog_sha256"),
             "automatic_execution_authorized": recommendation.get(
                 "automatic_execution_authorized"
             ),

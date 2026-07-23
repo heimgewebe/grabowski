@@ -51,6 +51,7 @@ PROBE_DIGEST_FIELDS = (
     "harnesses",
     "providers",
     "verified_quota_pools",
+    "api_key_environment_scrubbed",
     "model_invocations",
     "paid_api_requests_authorized",
 )
@@ -589,6 +590,14 @@ def validate_probe(probe: dict[str, Any]) -> None:
     digest_input.pop("catalog_probe_sha256", None)
     if digest != probe_digest(digest_input):
         raise ProbeSchedulerError("probe digest does not match its payload")
+    expected_fields = set(PROBE_DIGEST_FIELDS) | {"catalog_probe_sha256"}
+    if set(probe) != expected_fields:
+        raise ProbeSchedulerError("probe fields do not match the exact metadata-only schema")
+    assert_probe_digest_safe(digest_input)
+    for field in ("model_invocations", "paid_api_requests_authorized"):
+        value = probe.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            raise ProbeSchedulerError(f"probe {field} must be integer zero")
     scrubbed_environment = probe.get("api_key_environment_scrubbed")
     if (
         not isinstance(scrubbed_environment, list)

@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import hmac
 import json
 import math
 import os
+import selectors
+import signal
 from pathlib import Path
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
 
 import grabowski_coding_agent_router as router
@@ -26,6 +31,7 @@ PROBE_DIGEST_FIELDS = (
     "harnesses",
     "providers",
     "verified_quota_pools",
+    "api_key_environment_scrubbed",
     "model_invocations",
     "paid_api_requests_authorized",
 )
@@ -108,28 +114,80 @@ def _clean_environment(catalog: dict[str, Any]) -> dict[str, str]:
     return environment
 
 
+def _terminate_metadata_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=2)
+
+
 def _run_metadata(
     argv: list[str], catalog: dict[str, Any], *, timeout: int = COMMAND_TIMEOUT_SECONDS
 ) -> dict[str, Any]:
     if not argv or not Path(argv[0]).is_absolute():
         return {"ok": False, "error_type": "non_absolute_executable"}
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             argv,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=_clean_environment(catalog),
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         return {"ok": False, "error_type": type(exc).__name__}
-    stdout = result.stdout[: MAX_COMMAND_OUTPUT_BYTES + 1]
-    stderr = result.stderr[: MAX_COMMAND_OUTPUT_BYTES + 1]
-    if len(stdout) > MAX_COMMAND_OUTPUT_BYTES or len(stderr) > MAX_COMMAND_OUTPUT_BYTES:
-        return {"ok": False, "error_type": "output_limit"}
+    assert process.stdout is not None and process.stderr is not None
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        selector.register(stream, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout
+    error_type: str | None = None
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                error_type = "TimeoutExpired"
+                break
+            events = selector.select(min(remaining, 0.2))
+            for key, _mask in events:
+                stream = key.fileobj
+                chunk = os.read(stream.fileno(), 64 * 1024)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer = streams[stream]
+                buffer.extend(chunk)
+                if len(buffer) > MAX_COMMAND_OUTPUT_BYTES:
+                    error_type = "output_limit"
+                    break
+            if error_type is not None:
+                break
+        if error_type is not None:
+            _terminate_metadata_process(process)
+            return {"ok": False, "error_type": error_type}
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _terminate_metadata_process(process)
+            return {"ok": False, "error_type": "TimeoutExpired"}
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+    stdout = bytes(streams[process.stdout])
+    stderr = bytes(streams[process.stderr])
     return {
-        "ok": result.returncode == 0,
-        "returncode": result.returncode,
+        "ok": returncode == 0,
+        "returncode": returncode,
         "stdout": stdout.decode("utf-8", errors="replace"),
         "stderr": stderr.decode("utf-8", errors="replace"),
     }
@@ -380,6 +438,53 @@ def _load_mutable_state(catalog_sha256: str) -> dict[str, Any]:
     return value
 
 
+@contextmanager
+def _exclusive_state_write_lock(path: Path):
+    path = path.expanduser()
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_metadata = parent.lstat()
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o077
+    ):
+        raise CodingAgentRouterCliError(
+            "router state parent is not a private user-owned directory"
+        )
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    directory_fd = os.open(
+        parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        descriptor = os.open(
+            ".coding-agent-router-state.lock",
+            flags,
+            0o600,
+            dir_fd=directory_fd,
+        )
+    finally:
+        os.close(directory_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise CodingAgentRouterCliError("router state lock is unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _state_target_identity(path: Path) -> tuple[int, int] | None:
     try:
         metadata = path.lstat()
@@ -448,7 +553,7 @@ def _atomic_write_private_json(path: Path, value: dict[str, Any]) -> None:
             pass
 
 
-def _write_probe(probe: dict[str, Any], validation: dict[str, Any]) -> None:
+def _write_probe_locked(probe: dict[str, Any], validation: dict[str, Any]) -> None:
     observed_at = probe.get("observed_at")
     if router._parse_time(observed_at) is None:
         raise CodingAgentRouterCliError("probe observed_at must be timezone-aware")
@@ -474,6 +579,12 @@ def _write_probe(probe: dict[str, Any], validation: dict[str, Any]) -> None:
             pool.pop("verified_at", None)
     state["updated_at"] = _iso_now()
     _atomic_write_private_json(router._state_path(), state)
+
+
+def _write_probe(probe: dict[str, Any], validation: dict[str, Any]) -> None:
+    state_path = router._state_path()
+    with _exclusive_state_write_lock(state_path):
+        _write_probe_locked(probe, validation)
 
 
 def _status(catalog: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
@@ -512,7 +623,7 @@ def _bounded_nonnegative_number(value: Any, label: str) -> float | None:
     return float(value)
 
 
-def _observe(
+def _observe_locked(
     arguments: argparse.Namespace,
     catalog: dict[str, Any],
     validation: dict[str, Any],
@@ -616,7 +727,16 @@ def _observe(
     return {"recorded": True, "route": arguments.route, "route_state": record}
 
 
-def _set_quota(
+def _observe(
+    arguments: argparse.Namespace,
+    catalog: dict[str, Any],
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    with _exclusive_state_write_lock(router._state_path()):
+        return _observe_locked(arguments, catalog, validation)
+
+
+def _set_quota_locked(
     arguments: argparse.Namespace,
     catalog: dict[str, Any],
     validation: dict[str, Any],
@@ -672,6 +792,15 @@ def _set_quota(
     state["updated_at"] = _iso_now()
     _atomic_write_private_json(router._state_path(), state)
     return {"updated": True, "pool": arguments.pool, "pool_state": pool}
+
+
+def _set_quota(
+    arguments: argparse.Namespace,
+    catalog: dict[str, Any],
+    validation: dict[str, Any],
+) -> dict[str, Any]:
+    with _exclusive_state_write_lock(router._state_path()):
+        return _set_quota_locked(arguments, catalog, validation)
 
 
 def parser() -> argparse.ArgumentParser:

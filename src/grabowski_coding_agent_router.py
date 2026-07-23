@@ -283,7 +283,12 @@ def _route_capabilities_from_partitions(
     review_only = route.get("review_only") is True
     direct_capable = controller
     contrast_capable = bool(contrast_capabilities) and not controller and not review_only
-    review_capable = bool(review_capabilities) and not controller and not contrast_only
+    review_capable = (
+        bool(review_capabilities)
+        and not controller
+        and review_only
+        and not contrast_only
+    )
     if direct_capable:
         route_role = "direct-operator"
     elif contrast_capable and review_capable:

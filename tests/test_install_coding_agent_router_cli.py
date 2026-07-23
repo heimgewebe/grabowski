@@ -38,6 +38,7 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             "primary_role": "direct-writer",
             "external_primary_writer_forbidden": True,
             "automatic_execution_authorized": False,
+            "catalog_sha256": "a" * 64,
         }
 
     def tearDown(self) -> None:
@@ -51,12 +52,14 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             ),
         ):
             receipt = INSTALLER.apply(self.target, self.pin, self.runtime)
-        self.assertEqual(self.target.read_bytes(), INSTALLER.SOURCE.read_bytes())
+        wrapper, _pin_bytes, _digest = INSTALLER._expected(self.runtime)
+        self.assertEqual(self.target.read_bytes(), wrapper)
+        self.assertIn(str(self.runtime), self.target.read_text(encoding="utf-8"))
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o755)
         self.assertEqual(stat.S_IMODE(self.pin.stat().st_mode), 0o600)
         self.assertEqual(
             self.pin.read_text(encoding="ascii"),
-            INSTALLER._sha256(INSTALLER.SOURCE.read_bytes()) + "\n",
+            INSTALLER._sha256(wrapper) + "\n",
         )
         self.assertEqual(receipt["status"], "installed")
         self.assertEqual(receipt["readback"]["controller"], "grabowski-primary")
@@ -124,11 +127,12 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
         self.assertFalse(self.target.parent.exists())
         self.assertFalse(self.pin.parent.exists())
         self.target.parent.mkdir(parents=True)
-        self.target.write_bytes(INSTALLER.SOURCE.read_bytes())
+        wrapper, _pin_bytes, _digest = INSTALLER._expected(self.runtime)
+        self.target.write_bytes(wrapper)
         self.target.chmod(0o755)
         self.pin.parent.mkdir(parents=True)
         self.pin.write_text(
-            INSTALLER._sha256(INSTALLER.SOURCE.read_bytes()) + "\n",
+            INSTALLER._sha256(wrapper) + "\n",
             encoding="ascii",
         )
         self.pin.chmod(0o600)
@@ -171,6 +175,41 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             with self.assertRaisesRegex(INSTALLER.InstallError, "unsafe parent"):
                 INSTALLER.apply(self.target, self.pin, self.runtime)
         self.assertFalse((real_parent / "agent-route").exists())
+
+    def test_apply_rolls_back_when_installed_catalog_identity_differs(self) -> None:
+        previous_target = b"old-target"
+        previous_pin = b"old-pin\n"
+        self.target.parent.mkdir(parents=True)
+        self.target.write_bytes(previous_target)
+        self.target.chmod(0o700)
+        self.pin.parent.mkdir(parents=True)
+        self.pin.write_bytes(previous_pin)
+        self.pin.chmod(0o600)
+        mismatched = {**self.recommendation, "catalog_sha256": "b" * 64}
+        with (
+            mock.patch.object(INSTALLER, "_verify_runtime", return_value=self.validation),
+            mock.patch.object(INSTALLER, "_verify_installed", return_value=mismatched),
+        ):
+            with self.assertRaisesRegex(INSTALLER.InstallError, "catalog identity differs"):
+                INSTALLER.apply(self.target, self.pin, self.runtime)
+        self.assertEqual(self.target.read_bytes(), previous_target)
+        self.assertEqual(self.pin.read_bytes(), previous_pin)
+
+    def test_verification_output_limit_is_enforced_while_child_is_running(self) -> None:
+        with mock.patch.object(INSTALLER, "MAX_VERIFY_OUTPUT_BYTES", 1024):
+            with self.assertRaisesRegex(INSTALLER.InstallError, "exceeds byte limit"):
+                INSTALLER._run_json(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import sys; sys.stdout.write('x' * 1000000)",
+                    ],
+                    timeout=5,
+                )
+
+    def test_verification_requires_absolute_executable(self) -> None:
+        with self.assertRaisesRegex(INSTALLER.InstallError, "must be absolute"):
+            INSTALLER._run_json(["python3", "-c", "print('{}')"])
 
     def test_wrapper_only_executes_current_runtime_cli(self) -> None:
         wrapper = INSTALLER.SOURCE.read_text(encoding="utf-8")
