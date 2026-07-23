@@ -195,8 +195,9 @@ class ConvergenceBackfillTests(unittest.TestCase):
         self.assertEqual(2, bounds["selected_count"])
         self.assertTrue(bounds["selection_truncated"])
         self.assertTrue(bounds["operator_obligations"]["scan_truncated"])
+        self.assertEqual(0, bounds["operator_obligations"]["known_omitted_count_lower_bound"])
         self.assertTrue(bounds["bureau_attention"]["scan_truncated"])
-        self.assertGreaterEqual(bounds["known_omitted_count_lower_bound"], 4)
+        self.assertEqual(3, bounds["known_omitted_count_lower_bound"])
 
     def test_runtime_binding_accepts_sha1_and_rejects_invalid_git_oid(self) -> None:
         inventory = {"records": [{"obligation_id": "goo-test-open", "state": "open"}], "integrity_errors": [], "scan_truncated": False}
