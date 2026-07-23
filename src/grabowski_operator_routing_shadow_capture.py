@@ -104,6 +104,14 @@ class ShadowCaptureError(RuntimeError):
     pass
 
 
+class ShadowRecordExistsError(ShadowCaptureError):
+    """The final create-only slot is already claimed by an on-disk record.
+
+    Carried as a dedicated type so idempotent callers can branch on identity
+    instead of matching human-readable exception text.
+    """
+
+
 def _json_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
@@ -124,7 +132,10 @@ def _parse_timestamp(value: Any, field: str) -> str:
         raise ShadowCaptureError(f"{field} must be a valid RFC3339 timestamp") from exc
     if parsed.tzinfo is None:
         raise ShadowCaptureError(f"{field} must include a timezone")
-    return parsed.isoformat().replace("+00:00", "Z")
+    # Project every equivalent offset onto a single canonical UTC-Z instant so
+    # two spellings of the same moment always normalize to the same string.
+    normalized = parsed.astimezone(timezone.utc)
+    return normalized.isoformat().replace("+00:00", "Z")
 
 
 def _absolute_unresolved(path: Path) -> Path:
@@ -217,18 +228,35 @@ def _task_references(manifest: dict[str, Any]) -> set[str]:
     return refs
 
 
-def _normalize_evidence_refs(value: Any, *, reviewed: bool) -> list[str]:
+def _writer_task_reference(manifest: dict[str, Any]) -> str | None:
+    """Return the bound writer task id, the sole routing-relevant task.
+
+    The workspace contract makes ``writer`` the task whose execution the route
+    decision governs; ``tests`` and ``review`` are not routing-relevant.
+    """
+    tasks = manifest.get("tasks")
+    if not isinstance(tasks, dict):
+        return None
+    writer = tasks.get("writer")
+    if isinstance(writer, str) and TASK_ID_RE.fullmatch(writer):
+        return writer
+    return None
+
+
+def _normalize_evidence_refs(value: Any, *, reviewed: bool, sort: bool) -> list[str]:
     if not isinstance(value, list) or len(value) > 16:
         raise ShadowCaptureError(
             "primary_evidence_refs must be a list with at most 16 entries"
         )
     refs: list[str] = []
     for item in value:
-        if (
-            not isinstance(item, str)
-            or not 1 <= len(item) <= 300
-            or not item.startswith(EVIDENCE_PREFIXES)
-        ):
+        if not isinstance(item, str) or not 1 <= len(item) <= 300:
+            raise ShadowCaptureError(
+                "primary_evidence_refs contains an invalid reference"
+            )
+        prefix = next((p for p in EVIDENCE_PREFIXES if item.startswith(p)), None)
+        if prefix is None or len(item) <= len(prefix):
+            # A bare prefix such as "github-ci:" carries no evidence identity.
             raise ShadowCaptureError(
                 "primary_evidence_refs contains an invalid reference"
             )
@@ -239,6 +267,13 @@ def _normalize_evidence_refs(value: Any, *, reviewed: bool) -> list[str]:
         raise ShadowCaptureError(
             "reviewed outcomes require at least one primary evidence reference"
         )
+    if sort:
+        # V2 evidence order carries no semantics: sort so identical evidence sets
+        # yield one canonical, order-independent record identity regardless of
+        # caller ordering. V1 records predate this rule (PR #410 froze caller
+        # order into record_id), so the v1 builder/validator pass sort=False to
+        # keep those historical, unsorted-but-valid records provable unchanged.
+        return sorted(refs)
     return refs
 
 
@@ -427,7 +462,44 @@ def _route_reference(route: dict[str, Any], manifest: dict[str, Any]) -> dict[st
     }
 
 
-def _validate_case_and_route(eligible: Any, route_ref: Any) -> tuple[str, str, int]:
+def _manifest_identity_sha256(
+    workspace_id: str, plan_sha256: str, route_evidence_sha256: str
+) -> str:
+    """Stable allowlisted manifest identity.
+
+    Binds only workspace, plan and canonical route evidence. It deliberately
+    excludes private_note, commands, prompts and mutating lifecycle fields
+    (created_at/updated_at/tasks/...), so the digest is identical between the
+    prospective freeze and the later task binding of the same workspace case.
+    """
+    return _sha256_json(
+        {
+            "schema_version": "operator-routing-shadow-manifest-identity.v1",
+            "workspace_id": workspace_id,
+            "plan_sha256": plan_sha256,
+            "route_evidence_sha256": route_evidence_sha256,
+        }
+    )
+
+
+def _cohort_route_reference(
+    route: dict[str, Any], workspace_id: str, plan_sha256: str
+) -> dict[str, Any]:
+    route_evidence_sha256 = _sha256_json(route)
+    return {
+        "source": "agent-workspace-manifest",
+        "schema_version": route["schema_version"],
+        "recommendation_id": route["recommendation_id"],
+        "route_evidence_sha256": route_evidence_sha256,
+        "manifest_identity_sha256": _manifest_identity_sha256(
+            workspace_id, plan_sha256, route_evidence_sha256
+        ),
+    }
+
+
+def _validate_case_and_route(
+    eligible: Any, route_ref: Any, *, manifest_field: str = "manifest_sha256"
+) -> tuple[str, str, int]:
     if not isinstance(eligible, dict) or set(eligible) != {"task_id", "case_id"}:
         raise ShadowCaptureError("eligible_case shape is invalid")
     task_id = eligible.get("task_id")
@@ -436,12 +508,24 @@ def _validate_case_and_route(eligible: Any, route_ref: Any) -> tuple[str, str, i
         raise ShadowCaptureError("eligible_case.task_id is invalid")
     if not isinstance(case_id, str) or SHA256_RE.fullmatch(case_id) is None:
         raise ShadowCaptureError("eligible_case.case_id is invalid")
+    route_schema_version = _validate_route_reference(
+        route_ref, manifest_field=manifest_field
+    )
+    expected_case_id = _case_id(task_id, route_ref["recommendation_id"])
+    if case_id != expected_case_id:
+        raise ShadowCaptureError(
+            "eligible_case.case_id is not bound to task and route evidence"
+        )
+    return task_id, case_id, route_schema_version
+
+
+def _validate_route_reference(route_ref: Any, *, manifest_field: str) -> int:
     if not isinstance(route_ref, dict) or set(route_ref) != {
         "source",
         "schema_version",
         "recommendation_id",
         "route_evidence_sha256",
-        "manifest_sha256",
+        manifest_field,
     }:
         raise ShadowCaptureError("canonical_route_evidence shape is invalid")
     route_schema_version = route_ref.get("schema_version")
@@ -451,16 +535,11 @@ def _validate_case_and_route(eligible: Any, route_ref: Any) -> tuple[str, str, i
         raise ShadowCaptureError(
             "canonical_route_evidence source or schema_version is invalid"
         )
-    for field in ("recommendation_id", "route_evidence_sha256", "manifest_sha256"):
+    for field in ("recommendation_id", "route_evidence_sha256", manifest_field):
         value = route_ref.get(field)
         if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
             raise ShadowCaptureError(f"canonical_route_evidence.{field} is invalid")
-    expected_case_id = _case_id(task_id, route_ref["recommendation_id"])
-    if case_id != expected_case_id:
-        raise ShadowCaptureError(
-            "eligible_case.case_id is not bound to task and route evidence"
-        )
-    return task_id, case_id, route_schema_version
+    return route_schema_version
 
 
 def build_eligibility_receipt(
@@ -545,6 +624,7 @@ def build_shadow_record(
     refs = _normalize_evidence_refs(
         primary_evidence_refs,
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=False,
     )
     normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
     frozen_at = eligibility["frozen_at"]
@@ -617,6 +697,7 @@ def validate_shadow_record(record: Any) -> dict[str, Any]:
     refs = _normalize_evidence_refs(
         record.get("primary_evidence_refs"),
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=False,
     )
     if refs != record.get("primary_evidence_refs"):
         raise ShadowCaptureError("primary_evidence_refs is not normalized")
@@ -657,6 +738,66 @@ def validate_shadow_record(record: Any) -> dict[str, Any]:
     return record
 
 
+def _publish_create_only(
+    parent_descriptor: int, name: str, data: bytes, *, conflict_message: str
+) -> None:
+    """Crash-safe create-only publication into ``name`` within an open directory.
+
+    Writes a fully materialized owner-private temp file (fsync'd), then claims
+    the final name atomically with a no-replace hard link. A crash before the
+    link leaves only a stray temp file, never a half-written final slot. An
+    already-present final name is surfaced as ``ShadowRecordExistsError``.
+    """
+    tmp_name = f".tmp-{os.getpid()}-{os.urandom(8).hex()}"
+    try:
+        tmp_descriptor = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as exc:
+        raise ShadowCaptureError(
+            "create-only publication could not open a private temp file"
+        ) from exc
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(tmp_descriptor, view)
+            view = view[written:]
+        os.fsync(tmp_descriptor)
+    except OSError:
+        os.close(tmp_descriptor)
+        _silent_unlink(parent_descriptor, tmp_name)
+        raise
+    else:
+        os.close(tmp_descriptor)
+    try:
+        os.link(
+            tmp_name,
+            name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+    except FileExistsError as exc:
+        _silent_unlink(parent_descriptor, tmp_name)
+        raise ShadowRecordExistsError(conflict_message) from exc
+    except OSError as exc:
+        _silent_unlink(parent_descriptor, tmp_name)
+        raise ShadowCaptureError(
+            "output path must resolve to a new regular non-symlink file"
+        ) from exc
+    _silent_unlink(parent_descriptor, tmp_name)
+    os.fsync(parent_descriptor)
+
+
+def _silent_unlink(parent_descriptor: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=parent_descriptor)
+    except OSError:
+        pass
+
+
 def write_create_only(path: Path, record: dict[str, Any]) -> None:
     schema_version = record.get("schema_version") if isinstance(record, dict) else None
     if schema_version == ELIGIBILITY_SCHEMA_VERSION:
@@ -667,32 +808,15 @@ def write_create_only(path: Path, record: dict[str, Any]) -> None:
         raise ShadowCaptureError("unsupported create-only record schema")
     candidate = _absolute_unresolved(path)
     parent_descriptor = _open_directory_fd(candidate.parent)
-    descriptor: int | None = None
     data = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        try:
-            descriptor = os.open(
-                candidate.name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=parent_descriptor,
-            )
-        except FileExistsError as exc:
-            raise ShadowCaptureError(
-                "refusing to overwrite an existing shadow record"
-            ) from exc
-        except OSError as exc:
-            raise ShadowCaptureError(
-                "output path must resolve to a new regular non-symlink file"
-            ) from exc
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-        os.fsync(descriptor)
+        _publish_create_only(
+            parent_descriptor,
+            candidate.name,
+            data,
+            conflict_message="refusing to overwrite an existing shadow record",
+        )
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         os.close(parent_descriptor)
 
 
@@ -749,6 +873,61 @@ def _workspace_case_id(
     )
 
 
+def _prove_prospective_binding(
+    *,
+    workspace_id: str,
+    plan_sha256: str,
+    workspace_case_id: str,
+    prospective_eligibility_id: str,
+    route_ref: dict[str, Any],
+    features: dict[str, Any],
+    frozen_at: str,
+    no_effect: dict[str, Any],
+) -> None:
+    """Reconstruct the full prospective payload and prove its self-consistency.
+
+    Because the manifest identity digest is stable across the freeze and the
+    later binding, the prospective ``canonical_route_evidence`` is identical to
+    the bound one, so the entire prospective receipt can be rebuilt from the v2
+    lineage fields and its ``prospective_eligibility_id`` re-derived here.
+    """
+    # Re-derive the manifest identity digest from workspace, plan and route so an
+    # isolated eligibility-v2/record-v2 cannot substitute a foreign digest and
+    # then re-hash prospective_eligibility_id, eligibility_id and record_id into
+    # a self-consistent but forged lineage. The digest is a pure function of the
+    # bound (workspace_id, plan_sha256, route_evidence_sha256), never free input.
+    if route_ref["manifest_identity_sha256"] != _manifest_identity_sha256(
+        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+    ):
+        raise ShadowCaptureError(
+            "canonical_route_evidence.manifest_identity_sha256 is not bound to "
+            "workspace, plan and route"
+        )
+    if workspace_case_id != _workspace_case_id(
+        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+    ):
+        raise ShadowCaptureError(
+            "workspace_case_id is not bound to workspace, plan and route"
+        )
+    reconstructed = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+        "workspace_case": {
+            "workspace_id": workspace_id,
+            "plan_sha256": plan_sha256,
+            "case_id": workspace_case_id,
+        },
+        "canonical_route_evidence": route_ref,
+        "features": features,
+        "frozen_at": frozen_at,
+        "no_effect": no_effect,
+    }
+    if _sha256_json(reconstructed) != prospective_eligibility_id:
+        raise ShadowCaptureError(
+            "prospective_eligibility_id does not match the reconstructed "
+            "prospective payload"
+        )
+
+
 def build_prospective_eligibility(
     manifest: dict[str, Any],
     *,
@@ -775,7 +954,7 @@ def build_prospective_eligibility(
         )
     route = _validated_route_evidence(manifest.get("route_evidence"))
     normalized_frozen_at = _parse_timestamp(frozen_at, "frozen_at")
-    route_ref = _route_reference(route, manifest)
+    route_ref = _cohort_route_reference(route, workspace_id, plan_sha256)
     case_id = _workspace_case_id(
         workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
     )
@@ -786,7 +965,7 @@ def build_prospective_eligibility(
             "plan_sha256": plan_sha256,
             "case_id": case_id,
         },
-        "canonical_route_evidence": _route_reference(route, manifest),
+        "canonical_route_evidence": route_ref,
         "features": _bounded_features(route),
         "frozen_at": normalized_frozen_at,
         "no_effect": dict(NO_EFFECT),
@@ -827,25 +1006,16 @@ def validate_prospective_eligibility(receipt: Any) -> dict[str, Any]:
     ):
         raise ShadowCaptureError("workspace_case identity is invalid")
     route_ref = receipt.get("canonical_route_evidence")
-    if not isinstance(route_ref, dict) or set(route_ref) != {
-        "source",
-        "schema_version",
-        "recommendation_id",
-        "route_evidence_sha256",
-        "manifest_sha256",
-    }:
-        raise ShadowCaptureError("canonical_route_evidence shape is invalid")
-    route_schema_version = route_ref.get("schema_version")
-    if route_ref.get(
-        "source"
-    ) != "agent-workspace-manifest" or route_schema_version not in {1, 2}:
+    route_schema_version = _validate_route_reference(
+        route_ref, manifest_field="manifest_identity_sha256"
+    )
+    if route_ref["manifest_identity_sha256"] != _manifest_identity_sha256(
+        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+    ):
         raise ShadowCaptureError(
-            "canonical_route_evidence source or schema_version is invalid"
+            "canonical_route_evidence.manifest_identity_sha256 is not bound to "
+            "workspace, plan and route"
         )
-    for field in ("recommendation_id", "route_evidence_sha256", "manifest_sha256"):
-        value = route_ref.get(field)
-        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
-            raise ShadowCaptureError(f"canonical_route_evidence.{field} is invalid")
     if case_id != _workspace_case_id(
         workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
     ):
@@ -892,18 +1062,21 @@ def build_bound_eligibility_v2(
         or TASK_ID_RE.fullmatch(eligible_task_id) is None
     ):
         raise ShadowCaptureError("eligible_task_id must be a Grabowski task id")
-    if eligible_task_id not in _task_references(manifest):
+    if eligible_task_id != _writer_task_reference(manifest):
+        # The prospective route freeze describes the writer decision; v2 binds
+        # only that routing-relevant task, never an arbitrary test/review id.
         raise ShadowCaptureError(
-            "eligible_task_id is not referenced by the workspace manifest"
+            "eligible_task_id must be the workspace writer task"
         )
     route = _validated_route_evidence(manifest.get("route_evidence"))
-    current_route_ref = _route_reference(route, manifest)
+    current_route_ref = _cohort_route_reference(
+        route, workspace_case["workspace_id"], workspace_case["plan_sha256"]
+    )
     frozen_route_ref = prospective["canonical_route_evidence"]
-    for field in ("schema_version", "recommendation_id", "route_evidence_sha256"):
-        if current_route_ref[field] != frozen_route_ref[field]:
-            raise ShadowCaptureError(
-                "canonical route evidence changed after prospective freeze"
-            )
+    if current_route_ref != frozen_route_ref:
+        raise ShadowCaptureError(
+            "canonical route evidence changed after prospective freeze"
+        )
     features = _bounded_features(route)
     if features != prospective["features"]:
         raise ShadowCaptureError(
@@ -945,7 +1118,9 @@ def validate_bound_eligibility_v2(receipt: Any) -> dict[str, Any]:
     ):
         raise ShadowCaptureError("eligibility_id is invalid")
     _, _, route_schema_version = _validate_case_and_route(
-        receipt.get("eligible_case"), receipt.get("canonical_route_evidence")
+        receipt.get("eligible_case"),
+        receipt.get("canonical_route_evidence"),
+        manifest_field="manifest_identity_sha256",
     )
     prospective = receipt.get("prospective_eligibility")
     if not isinstance(prospective, dict) or set(prospective) != {
@@ -986,6 +1161,16 @@ def validate_bound_eligibility_v2(receipt: Any) -> dict[str, Any]:
     )
     if receipt.get("no_effect") != NO_EFFECT:
         raise ShadowCaptureError("no_effect boundary is invalid")
+    _prove_prospective_binding(
+        workspace_id=workspace_id,
+        plan_sha256=prospective["plan_sha256"],
+        workspace_case_id=prospective["workspace_case_id"],
+        prospective_eligibility_id=prospective["prospective_eligibility_id"],
+        route_ref=receipt["canonical_route_evidence"],
+        features=receipt["features"],
+        frozen_at=frozen_at,
+        no_effect=receipt["no_effect"],
+    )
     payload = {key: receipt[key] for key in receipt if key != "eligibility_id"}
     if _sha256_json(payload) != eligibility_id:
         raise ShadowCaptureError(
@@ -1006,6 +1191,7 @@ def build_shadow_record_v2(
     refs = _normalize_evidence_refs(
         primary_evidence_refs,
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
     )
     normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
     frozen_at = eligibility["frozen_at"]
@@ -1025,6 +1211,9 @@ def build_shadow_record_v2(
             "schema_version": ELIGIBILITY_V2_SCHEMA_VERSION,
             "eligibility_id": eligibility["eligibility_id"],
             "prospective_eligibility_id": prospective["prospective_eligibility_id"],
+            "workspace_id": prospective["workspace_id"],
+            "plan_sha256": prospective["plan_sha256"],
+            "workspace_case_id": prospective["workspace_case_id"],
             "frozen_at": frozen_at,
         },
         "eligible_case": dict(eligibility["eligible_case"]),
@@ -1049,7 +1238,9 @@ def validate_shadow_record_v2(record: Any) -> dict[str, Any]:
     if not isinstance(record_id, str) or SHA256_RE.fullmatch(record_id) is None:
         raise ShadowCaptureError("record_id is invalid")
     _, _, route_schema_version = _validate_case_and_route(
-        record.get("eligible_case"), record.get("canonical_route_evidence")
+        record.get("eligible_case"),
+        record.get("canonical_route_evidence"),
+        manifest_field="manifest_identity_sha256",
     )
     _validate_features(
         record.get("features"), route_schema_version=route_schema_version
@@ -1059,26 +1250,45 @@ def validate_shadow_record_v2(record: Any) -> dict[str, Any]:
         "schema_version",
         "eligibility_id",
         "prospective_eligibility_id",
+        "workspace_id",
+        "plan_sha256",
+        "workspace_case_id",
         "frozen_at",
     }:
         raise ShadowCaptureError("eligibility v2 reference shape is invalid")
     if eligibility.get("schema_version") != ELIGIBILITY_V2_SCHEMA_VERSION:
         raise ShadowCaptureError("eligibility v2 reference schema is invalid")
-    for field in ("eligibility_id", "prospective_eligibility_id"):
+    for field in (
+        "eligibility_id",
+        "prospective_eligibility_id",
+        "plan_sha256",
+        "workspace_case_id",
+    ):
         value = eligibility.get(field)
         if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
             raise ShadowCaptureError(f"eligibility v2 reference {field} is invalid")
+    workspace_id = eligibility.get("workspace_id")
+    if (
+        not isinstance(workspace_id, str)
+        or workspace.WORKSPACE_ID_RE.fullmatch(workspace_id) is None
+    ):
+        raise ShadowCaptureError("eligibility v2 reference workspace_id is invalid")
     frozen_at = _parse_timestamp(eligibility.get("frozen_at"), "eligibility.frozen_at")
+    if frozen_at != eligibility.get("frozen_at"):
+        raise ShadowCaptureError("eligibility.frozen_at is not normalized")
     normalized_outcome = _normalize_outcome(record.get("outcome"))
     if normalized_outcome != record.get("outcome"):
         raise ShadowCaptureError("outcome is not normalized")
     refs = _normalize_evidence_refs(
         record.get("primary_evidence_refs"),
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
     )
     if refs != record.get("primary_evidence_refs"):
         raise ShadowCaptureError("primary_evidence_refs is not normalized")
     captured_at = _parse_timestamp(record.get("captured_at"), "captured_at")
+    if captured_at != record.get("captured_at"):
+        raise ShadowCaptureError("captured_at is not normalized")
     if _timestamp_value(frozen_at) > _timestamp_value(
         normalized_outcome["observed_at"]
     ):
@@ -1093,6 +1303,40 @@ def validate_shadow_record_v2(record: Any) -> dict[str, Any]:
         )
     if record.get("no_effect") != NO_EFFECT:
         raise ShadowCaptureError("no_effect boundary is invalid")
+    # Prove the full prospective -> eligibility-v2 -> record lineage: the record
+    # carries the stable prospective identity fields, so both the eligibility v2
+    # payload and the prospective payload can be reconstructed and re-hashed.
+    _prove_prospective_binding(
+        workspace_id=workspace_id,
+        plan_sha256=eligibility["plan_sha256"],
+        workspace_case_id=eligibility["workspace_case_id"],
+        prospective_eligibility_id=eligibility["prospective_eligibility_id"],
+        route_ref=record["canonical_route_evidence"],
+        features=record["features"],
+        frozen_at=frozen_at,
+        no_effect=record["no_effect"],
+    )
+    reconstructed_eligibility = {
+        "schema_version": ELIGIBILITY_V2_SCHEMA_VERSION,
+        "prospective_eligibility": {
+            "schema_version": PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+            "prospective_eligibility_id": eligibility["prospective_eligibility_id"],
+            "workspace_id": workspace_id,
+            "plan_sha256": eligibility["plan_sha256"],
+            "workspace_case_id": eligibility["workspace_case_id"],
+            "frozen_at": frozen_at,
+        },
+        "eligible_case": record["eligible_case"],
+        "canonical_route_evidence": record["canonical_route_evidence"],
+        "features": record["features"],
+        "frozen_at": frozen_at,
+        "no_effect": record["no_effect"],
+    }
+    if _sha256_json(reconstructed_eligibility) != eligibility["eligibility_id"]:
+        raise ShadowCaptureError(
+            "eligibility reference does not match the reconstructed eligibility "
+            "v2 payload"
+        )
     payload = {key: record[key] for key in record if key != "record_id"}
     if _sha256_json(payload) != record_id:
         raise ShadowCaptureError(
@@ -1119,32 +1363,17 @@ def write_new_capture_create_only(path: Path, record: dict[str, Any]) -> None:
     _validate_new_capture_payload(record)
     candidate = _absolute_unresolved(path)
     parent_descriptor = _open_directory_fd(candidate.parent)
-    descriptor: int | None = None
     data = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
     try:
-        try:
-            descriptor = os.open(
-                candidate.name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=parent_descriptor,
-            )
-        except FileExistsError as exc:
-            raise ShadowCaptureError(
+        _publish_create_only(
+            parent_descriptor,
+            candidate.name,
+            data,
+            conflict_message=(
                 "refusing to overwrite an existing prospective capture record"
-            ) from exc
-        except OSError as exc:
-            raise ShadowCaptureError(
-                "prospective output path must resolve to a new regular non-symlink file"
-            ) from exc
-        view = memoryview(data)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-        os.fsync(descriptor)
+            ),
+        )
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         os.close(parent_descriptor)
 
 
@@ -1153,9 +1382,8 @@ def write_new_capture_idempotent(path: Path, record: dict[str, Any]) -> bool:
     try:
         write_new_capture_create_only(path, record)
         return True
-    except ShadowCaptureError as exc:
-        if "overwrite an existing prospective capture record" not in str(exc):
-            raise
+    except ShadowRecordExistsError:
+        pass
     existing = _read_regular_json(path, label="existing prospective capture record")
     _validate_new_capture_payload(existing)
     if existing != record:
@@ -1173,9 +1401,8 @@ def write_prospective_identity_idempotent(
     try:
         write_new_capture_create_only(path, receipt)
         return receipt, True
-    except ShadowCaptureError as exc:
-        if "overwrite an existing prospective capture record" not in str(exc):
-            raise
+    except ShadowRecordExistsError:
+        pass
     existing = _read_regular_json(path, label="existing prospective eligibility")
     validate_prospective_eligibility(existing)
     if existing["workspace_case"] != receipt["workspace_case"]:
@@ -1249,6 +1476,35 @@ def _cohort_directories(root: Path) -> tuple[Path, Path, Path, Path]:
     return prospective, eligibility, records, attempts
 
 
+ATTEMPT_STAGE = "prospective_eligibility_freeze"
+
+
+def _attempt_identity_id(
+    *,
+    workspace_id: str,
+    plan_sha256: str,
+    status: str,
+    reason_code: str,
+    prospective_eligibility_id: str | None,
+) -> str:
+    """Stable attempt identity that deliberately excludes ``attempted_at``.
+
+    Repeated identical rejects/duplicates therefore collapse onto one file
+    instead of minting a fresh attempt per retry timestamp.
+    """
+    return _sha256_json(
+        {
+            "schema_version": "operator-routing-shadow-capture-attempt-identity.v1",
+            "workspace_id": workspace_id,
+            "plan_sha256": plan_sha256,
+            "stage": ATTEMPT_STAGE,
+            "status": status,
+            "reason_code": reason_code,
+            "prospective_eligibility_id": prospective_eligibility_id,
+        }
+    )
+
+
 def _capture_attempt(
     *,
     workspace_id: str,
@@ -1260,18 +1516,25 @@ def _capture_attempt(
 ) -> dict[str, Any]:
     if status not in ATTEMPT_STATUSES:
         raise ShadowCaptureError("capture attempt status is invalid")
-    payload = {
+    attempt_id = _attempt_identity_id(
+        workspace_id=workspace_id,
+        plan_sha256=plan_sha256,
+        status=status,
+        reason_code=reason_code,
+        prospective_eligibility_id=prospective_eligibility_id,
+    )
+    return {
         "schema_version": CAPTURE_ATTEMPT_SCHEMA_VERSION,
+        "attempt_id": attempt_id,
         "workspace_id": workspace_id,
         "plan_sha256": plan_sha256,
-        "stage": "prospective_eligibility_freeze",
+        "stage": ATTEMPT_STAGE,
         "status": status,
         "reason_code": reason_code,
         "prospective_eligibility_id": prospective_eligibility_id,
         "attempted_at": _parse_timestamp(attempted_at, "attempted_at"),
         "no_effect": dict(NO_EFFECT),
     }
-    return {"attempt_id": _sha256_json(payload), **payload}
 
 
 def _validate_capture_attempt(record: Any) -> dict[str, Any]:
@@ -1292,7 +1555,7 @@ def _validate_capture_attempt(record: Any) -> dict[str, Any]:
     if record.get("schema_version") != CAPTURE_ATTEMPT_SCHEMA_VERSION:
         raise ShadowCaptureError("capture attempt schema_version is invalid")
     if (
-        record.get("stage") != "prospective_eligibility_freeze"
+        record.get("stage") != ATTEMPT_STAGE
         or record.get("status") not in ATTEMPT_STATUSES
     ):
         raise ShadowCaptureError("capture attempt stage or status is invalid")
@@ -1326,10 +1589,38 @@ def _validate_capture_attempt(record: Any) -> dict[str, Any]:
         raise ShadowCaptureError("capture attempt timestamp is not normalized")
     if record.get("no_effect") != NO_EFFECT:
         raise ShadowCaptureError("no_effect boundary is invalid")
-    payload = {key: record[key] for key in record if key != "attempt_id"}
-    if _sha256_json(payload) != record.get("attempt_id"):
-        raise ShadowCaptureError("capture attempt id does not match canonical payload")
+    expected_id = _attempt_identity_id(
+        workspace_id=record["workspace_id"],
+        plan_sha256=record["plan_sha256"],
+        status=record["status"],
+        reason_code=reason,
+        prospective_eligibility_id=prospective_id,
+    )
+    if expected_id != record.get("attempt_id"):
+        raise ShadowCaptureError("capture attempt id does not match canonical identity")
     return record
+
+
+def write_attempt_identity_idempotent(path: Path, attempt: dict[str, Any]) -> bool:
+    """Create one attempt receipt, or accept a same-identity one unchanged.
+
+    Two attempts sharing the stable identity differ only by ``attempted_at``;
+    the first written timestamp wins and later retries are duplicates, so a
+    workspace that keeps rejecting for the same reason cannot grow files.
+    """
+    _validate_capture_attempt(attempt)
+    try:
+        write_new_capture_create_only(path, attempt)
+        return True
+    except ShadowRecordExistsError:
+        pass
+    existing = _read_regular_json(path, label="existing capture attempt")
+    _validate_capture_attempt(existing)
+    if existing["attempt_id"] != attempt["attempt_id"]:
+        raise ShadowCaptureError(
+            "existing capture attempt conflicts with deterministic identity"
+        )
+    return False
 
 
 def seal_prospective_case(
@@ -1365,13 +1656,18 @@ def seal_prospective_case(
     )
     case_id = eligibility["eligible_case"]["case_id"]
     eligibility_path = eligibility_dir / f"{case_id}.json"
-    eligibility_created = write_new_capture_idempotent(eligibility_path, eligibility)
+    record_path = records_dir / f"{case_id}.json"
 
     normalized_outcome = _normalize_outcome(outcome)
     refs = _normalize_evidence_refs(
-        primary_evidence_refs, reviewed=normalized_outcome["status"] == "reviewed"
+        primary_evidence_refs,
+        reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
     )
-    record_path = records_dir / f"{case_id}.json"
+
+    # An already-sealed record is an idempotent duplicate: recognise it before
+    # building or mutating anything, so a reseal never re-derives a fresh
+    # capture timestamp and never rejects a valid duplicate on time ordering.
     try:
         record_path.lstat()
     except FileNotFoundError:
@@ -1392,6 +1688,9 @@ def seal_prospective_case(
             raise ShadowCaptureError(
                 "existing sealed shadow record conflicts with the requested case or outcome"
             )
+        eligibility_created = write_new_capture_idempotent(
+            eligibility_path, eligibility
+        )
         return {
             "schema_version": 1,
             "status": "duplicate",
@@ -1402,12 +1701,20 @@ def seal_prospective_case(
             "no_effect": dict(NO_EFFECT),
         }
 
+    # Fresh seal: fully build and validate the record (outcome, evidence and the
+    # freeze -> observe -> capture time ordering) in memory BEFORE mutating any
+    # persistent cohort state. An invalid outcome leaves no partial eligibility.
     record = build_shadow_record_v2(
         eligibility,
         outcome=normalized_outcome,
         primary_evidence_refs=refs,
         captured_at=captured_at or _utc_now(),
     )
+
+    # A record I/O failure after this point leaves at most a valid eligibility
+    # partial result; a retry re-derives the identical eligibility (duplicate)
+    # and then completes the record, so the seal converges cleanly.
+    eligibility_created = write_new_capture_idempotent(eligibility_path, eligibility)
     write_new_capture_create_only(record_path, record)
     return {
         "schema_version": 1,
@@ -1447,6 +1754,7 @@ def capture_workspace_eligibility_best_effort(
         return {
             "schema_version": 1,
             "status": "disabled",
+            "reason_code": "capture_disabled",
             "no_effect": dict(NO_EFFECT),
         }
     attempted_at = frozen_at or _utc_now()
@@ -1479,7 +1787,7 @@ def capture_workspace_eligibility_best_effort(
         attempt_id: str | None = attempt["attempt_id"]
         attempt_audit_status = "unavailable"
         try:
-            attempt_created = write_new_capture_idempotent(
+            attempt_created = write_attempt_identity_idempotent(
                 attempts_dir / f"{attempt['attempt_id']}.json", attempt
             )
             attempt_audit_status = "created" if attempt_created else "duplicate"
@@ -1488,6 +1796,7 @@ def capture_workspace_eligibility_best_effort(
         return {
             "schema_version": 1,
             "status": status,
+            "reason_code": "eligible_verified_route",
             "prospective_eligibility_id": receipt["prospective_eligibility_id"],
             "workspace_case_id": case_id,
             "attempt_id": attempt_id,
@@ -1516,7 +1825,7 @@ def capture_workspace_eligibility_best_effort(
                     prospective_eligibility_id=None,
                     attempted_at=attempted_at,
                 )
-                attempt_created = write_new_capture_idempotent(
+                attempt_created = write_attempt_identity_idempotent(
                     attempts_dir / f"{attempt['attempt_id']}.json", attempt
                 )
                 attempt_id = attempt["attempt_id"]

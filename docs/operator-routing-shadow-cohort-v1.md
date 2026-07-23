@@ -61,6 +61,37 @@ Aufgenommen werden alle Workspace-Fälle, für die vor Task-Start evidence-compl
 
 Diese Regeln verhindern bewusst keine unausgewogene reale Verteilung. Sie verhindern stattdessen, dass nur erfolgreiche Fälle nachträglich ausgewählt und dadurch künstlich positive Trainingsdaten erzeugt werden.
 
+## Integrität und Lineage
+
+### Stabile allowlistete Manifest-Identität
+
+Die kanonische Route-Evidenz bindet keine Hashwerte über das vollständige Manifest. Statt eines `manifest_sha256` über das gesamte Manifest trägt jede Referenz einen `manifest_identity_sha256`, der ausschließlich `workspace_id`, `plan_sha256` und den kanonischen `route_evidence_sha256` bindet. Private Felder (`private_note`, `commands`, Prompts, argv) und mutierende Lifecycle-Felder (`created_at`, `updated_at`, `tasks`, ...) fließen nicht ein. Dadurch ist der Digest zwischen prospektivem Freeze und späterer Task-Bindung identisch und enthält keine privaten Content-Hashes.
+
+### Selbstvalidierende Lineage
+
+Prospective, Eligibility v2 und Record v2 sind vollständig aus ihren eigenen stabilen Feldern nachrechenbar:
+
+- `workspace_case_id` = deterministischer Digest über `workspace_id`, `plan_sha256` und `route_evidence_sha256`.
+- `prospective_eligibility_id` wird aus der vollständig rekonstruierten prospektiven Payload verifiziert.
+- Eligibility v2 rechnet `eligibility_id` über die vollständige Payload nach und beweist zusätzlich die prospektive Kette.
+- Record v2 trägt die stabilen prospektiven Identitätsfelder (`workspace_id`, `plan_sha256`, `workspace_case_id`) in seiner Eligibility-Referenz und rekonstruiert daraus die vollständige Eligibility-v2-Payload; eine gefälschte, in sich konsistente `record_id` mit falscher `eligibility_id` wird abgelehnt.
+
+### V2-Bindung nur an die Writer-Task
+
+Eligibility v2 bindet ausschließlich die routingrelevante Writer-Task-ID. Beliebige referenzierte Test- oder Review-Task-IDs werden abgelehnt. V1 bleibt unverändert.
+
+### Bounded Attempt-Identität
+
+Die Attempt-Identität ist stabil über `workspace_id`, `plan_sha256`, `stage`, `status`, `reason_code` und `prospective_eligibility_id`. Sie bindet bewusst nicht `attempted_at`. Ein idempotenter Retry bewahrt den ersten `attempted_at`, sodass wiederholte identische Rejects oder Duplicates keine unbegrenzte Zahl von Attempt-Dateien erzeugen.
+
+### Kanonische UTC-Z-Zeitstempel
+
+`_parse_timestamp` projiziert äquivalente Offsets auf einen einzigen kanonischen UTC-Z-Instant. Builder normalisieren Eingaben; Validatoren lehnen nichtkanonisch gespeicherte Zeitstempel (auch `+00:00`) ab. Zeitordnung `frozen_at ≤ observed_at ≤ captured_at` wird geprüft.
+
+### Kanonische Primärevidenz
+
+`primary_evidence_refs` verlangt einen allowlisteten Präfix mit nichtleerem, bounded Suffix; ein reiner Präfix wie `github-ci:` wird abgelehnt. Da die Reihenfolge keine Semantik trägt, werden Referenzen deterministisch sortiert, damit identische Evidenzmengen denselben Record ergeben.
+
 ## Speicher- und Privacy-Grenze
 
 Standardwurzel:
@@ -74,9 +105,11 @@ Unterverzeichnisse:
 - `records/`: versiegelte Outcome-Records;
 - `attempts/`: begrenzte Audit-Receipts für Freeze-Versuche.
 
-Verzeichnisse werden owner-private (`0700`) geöffnet oder erzeugt. Records werden create-only mit `0600`, `O_EXCL` und `O_NOFOLLOW` geschrieben. Symlink-Traversal wird abgelehnt.
+Verzeichnisse werden owner-private (`0700`) geöffnet oder erzeugt. Symlink-Traversal wird abgelehnt.
 
-Nicht gespeichert werden Prompts, Transkripte, private Notizen, Umgebungswerte, unbeschränkte argv oder vollständige Workspace-Manifeste. Gespeichert werden nur allowlistete Routing-Features, Identitäts-Hashes und bounded Primärevidenzreferenzen.
+Records werden crash-sicher create-only publiziert: Eine owner-private (`0600`) Temp-Datei im selben Verzeichnis wird vollständig geschrieben und mit `fsync(file)` durabel gemacht, danach wird der finale Name atomar und ohne Überschreiben per no-replace Hard-Link beansprucht, die Temp-Datei entfernt und `fsync(directory)` ausgeführt. Ein Crash vor der finalen Publikation hinterlässt höchstens eine verwaiste Temp-Datei und vergiftet niemals den finalen Slot. Ein bereits belegter Zielname wird als eigener Exception-Typ (`ShadowRecordExistsError`) signalisiert, nicht über Textabgleich.
+
+Nicht gespeichert werden Prompts, Transkripte, private Notizen, Umgebungswerte, unbeschränkte argv oder vollständige Workspace-Manifeste. Es werden keine privaten Content-Hashes gebunden. Gespeichert werden nur allowlistete Routing-Features, stabile Identitäts-Hashes und bounded Primärevidenzreferenzen.
 
 ## No-Effect-Vertrag
 
@@ -99,6 +132,7 @@ Jedes Prospective-, Eligibility-, Record- und Attempt-Artefakt trägt denselben 
 - Ein Ausfall auch dieses Audit-Schreibpfads bleibt fail-open und wird nicht als erfolgreicher Capture behauptet.
 - Existing-but-identical ist idempotentes Duplikat, kein Update.
 - Existing-but-conflicting ist ein Fehler und wird niemals überschrieben.
+- Beim Seal werden Outcome, Evidenz und Zeitordnung vollständig validiert und der Record in-memory gebaut, bevor Eligibility oder Record persistent geschrieben werden. Ein Record-I/O-Fehler hinterlässt höchstens ein gültiges Eligibility-Teilresultat; ein Retry rekonstruiert dieselbe Eligibility als Duplikat und konvergiert sauber zum Record.
 
 ## Separate Seal-Schnittstelle
 
