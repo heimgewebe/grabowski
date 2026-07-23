@@ -1,0 +1,351 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "operator-routing-shadow-record.v1.schema.json",
+  "title": "Operator routing shadow record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_id",
+    "eligibility",
+    "eligible_case",
+    "canonical_route_evidence",
+    "features",
+    "outcome",
+    "primary_evidence_refs",
+    "captured_at",
+    "no_effect"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "operator-routing-shadow-record.v1"
+    },
+    "record_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "eligible_case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "case_id"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{24}$"
+        },
+        "case_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "canonical_route_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "schema_version",
+        "recommendation_id",
+        "route_evidence_sha256",
+        "manifest_sha256"
+      ],
+      "properties": {
+        "source": {
+          "const": "agent-workspace-manifest"
+        },
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "recommendation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "route_evidence_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "features": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "user_requested_external",
+            "parallel_work"
+          ],
+          "properties": {
+            "task_kind": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            },
+            "changed_file_estimate": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "expected_duration_minutes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "novelty": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "risk_flags": {
+              "type": "array",
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              }
+            },
+            "connector_instability": {
+              "type": "boolean"
+            },
+            "user_requested_external": {
+              "type": "boolean"
+            },
+            "parallel_work": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "user_requested_external",
+            "risk_tier",
+            "concurrent_external_activity",
+            "parallelization_candidate",
+            "decision_fork",
+            "architecture_hypotheses"
+          ],
+          "properties": {
+            "task_kind": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 40
+            },
+            "changed_file_estimate": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "expected_duration_minutes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "novelty": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "risk_flags": {
+              "type": "array",
+              "maxItems": 32,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 32
+              }
+            },
+            "connector_instability": {
+              "type": "boolean"
+            },
+            "user_requested_external": {
+              "type": "boolean"
+            },
+            "risk_tier": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "concurrent_external_activity": {
+              "type": "boolean"
+            },
+            "parallelization_candidate": {
+              "type": "boolean"
+            },
+            "decision_fork": {
+              "type": "boolean"
+            },
+            "architecture_hypotheses": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            }
+          }
+        }
+      ]
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "kind",
+            "label",
+            "observed_at",
+            "review_authority"
+          ],
+          "properties": {
+            "status": {
+              "const": "reviewed"
+            },
+            "kind": {
+              "enum": [
+                "task_correctness",
+                "decision_quality"
+              ]
+            },
+            "label": {
+              "enum": [
+                "success",
+                "partial",
+                "failure"
+              ]
+            },
+            "observed_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "review_authority": {
+              "enum": [
+                "diff_bound_review",
+                "operator_decision",
+                "ci_and_review",
+                "bounded_chronik_evidence"
+              ]
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "reason_code",
+            "observed_at"
+          ],
+          "properties": {
+            "status": {
+              "const": "abstained"
+            },
+            "reason_code": {
+              "enum": [
+                "no_semantic_review",
+                "non_semantic_task",
+                "insufficient_primary_evidence",
+                "ambiguous_outcome"
+              ]
+            },
+            "observed_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          }
+        }
+      ]
+    },
+    "primary_evidence_refs": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 300,
+        "pattern": "^(github-ci|diff-review|operator-decision|chronik|artifact):"
+      }
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "no_effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proposal_only",
+        "routing",
+        "policy",
+        "queue",
+        "merge",
+        "runtime"
+      ],
+      "properties": {
+        "proposal_only": {
+          "const": true
+        },
+        "routing": {
+          "const": false
+        },
+        "policy": {
+          "const": false
+        },
+        "queue": {
+          "const": false
+        },
+        "merge": {
+          "const": false
+        },
+        "runtime": {
+          "const": false
+        }
+      }
+    },
+    "eligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "eligibility_id",
+        "frozen_at"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "operator-routing-shadow-eligibility.v1"
+        },
+        "eligibility_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "frozen_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}
