@@ -190,6 +190,7 @@ def _obligation_candidates(limit: int) -> tuple[list[dict[str, Any]], dict[str, 
         "state_filter": "attention",
         "returned": len(candidates),
         "scan_truncated": bool(inventory.get("scan_truncated")),
+        "known_omitted_count_lower_bound": 0,
         "integrity_errors": [],
     }
 
@@ -547,7 +548,7 @@ def build_projection(
     known_omitted = (
         max(0, len(candidates) - max_records)
         + int(bureau_bounds["known_omitted_count_lower_bound"])
-        + (1 if obligation_bounds["scan_truncated"] else 0)
+        + int(obligation_bounds["known_omitted_count_lower_bound"])
     )
     source_bounds = {
         "max_records": max_records,
