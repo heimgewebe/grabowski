@@ -13,7 +13,7 @@ import time
 from typing import Any, Callable, Mapping
 
 import grabowski_private_io as private_io
-from grabowski_grips import run_grip
+from grabowski_grips import run_grip, sha256_json
 from grabowski_operator_obligation import list_obligations, status_obligation
 
 
@@ -39,6 +39,14 @@ BUREAU_GROUP_ORDER = {group: index for index, group in enumerate(BUREAU_ATTENTIO
 SIGNAL_FIELDS = frozenset(
     {
         "failure_evidence",
+        "expected_evidence",
+        "blocking_evidence",
+        "superseding_evidence",
+        "resolution_evidence",
+    }
+)
+OVERRIDABLE_SIGNAL_FIELDS = frozenset(
+    {
         "expected_evidence",
         "blocking_evidence",
         "superseding_evidence",
@@ -106,7 +114,7 @@ def _normalize_evidence_overrides(
             raise ConvergenceBackfillInputError(f"evidence_overrides[{record_id}] must be a non-empty object")
         signals: dict[str, dict[str, str]] = {}
         for raw_field, raw_evidence in raw_signals.items():
-            if raw_field not in SIGNAL_FIELDS:
+            if raw_field not in OVERRIDABLE_SIGNAL_FIELDS:
                 raise ConvergenceBackfillInputError(f"unsupported evidence override field: {raw_field}")
             if not isinstance(raw_evidence, Mapping) or set(raw_evidence) != {"reference", "sha256"}:
                 raise ConvergenceBackfillInputError(
@@ -139,7 +147,11 @@ def _runtime_binding(manifest_path: Path) -> dict[str, str]:
     }
 
 
-def _obligation_candidates(limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _obligation_candidates(
+    limit: int,
+    *,
+    observation_unix: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     inventory = list_obligations({"state": "attention", "limit": limit})
     integrity_errors = inventory.get("integrity_errors")
     if integrity_errors:
@@ -150,13 +162,21 @@ def _obligation_candidates(limit: int) -> tuple[list[dict[str, Any]], dict[str, 
     candidates: list[dict[str, Any]] = []
     for item in records:
         obligation_id = _bounded_text(item.get("obligation_id"), label="obligation_id", maximum=128)
+        inventory_state = _bounded_text(
+            item.get("state"), label=f"operator-obligation:{obligation_id}.inventory_state", maximum=64
+        )
         status = status_obligation(obligation_id)
         record_id = f"operator-obligation:{obligation_id}"
+        status_state = _bounded_text(status.get("state"), label=f"{record_id}.state", maximum=64)
+        if status_state != inventory_state:
+            raise ConvergenceBackfillError(
+                f"operator obligation changed during bounded snapshot: {obligation_id}"
+            )
         open_sha = _validate_sha256(status.get("open_file_sha256"), label=f"{record_id}.open_file_sha256")
         close_sha_raw = status.get("close_file_sha256")
         close_sha = None if close_sha_raw is None else _validate_sha256(close_sha_raw, label=f"{record_id}.close_file_sha256")
         source_identity = {"open_file_sha256": open_sha, "close_file_sha256": close_sha}
-        state = _bounded_text(status.get("state"), label=f"{record_id}.state", maximum=64)
+        state = status_state
         next_action = status.get("next_action") or status.get("recommended_next_action") or ""
         blocking_evidence = None
         if state == "blocked":
@@ -178,7 +198,8 @@ def _obligation_candidates(limit: int) -> tuple[list[dict[str, Any]], dict[str, 
                 "source_kind": "operator_obligation",
                 "record_id": record_id,
                 "observed_state": state,
-                "source_observed_at": status.get("closed_at") or status.get("created_at"),
+                "source_observed_at_unix": observation_unix,
+                "source_recorded_at": status.get("closed_at") or status.get("created_at"),
                 "source_content_sha256": _sha256(source_identity),
                 "open_file_sha256": open_sha,
                 "close_file_sha256": close_sha,
@@ -188,9 +209,11 @@ def _obligation_candidates(limit: int) -> tuple[list[dict[str, Any]], dict[str, 
         )
     return candidates, {
         "state_filter": "attention",
+        "observation_unix": observation_unix,
         "returned": len(candidates),
         "scan_truncated": bool(inventory.get("scan_truncated")),
         "known_omitted_count_lower_bound": 0,
+        "source_completeness_unknown": bool(inventory.get("scan_truncated")),
         "integrity_errors": [],
     }
 
@@ -356,9 +379,31 @@ def _bureau_attention_candidates(
     items = output.get("items")
     if not isinstance(counts, dict) or not isinstance(items, dict):
         raise ConvergenceBackfillError("Bureau attention projection lacks counts or items")
+    if output.get("attention_horizon_seconds") != horizon_seconds:
+        raise ConvergenceBackfillError("Bureau attention horizon does not match the requested horizon")
+    if output.get("task_db") != str(Path(task_db)):
+        raise ConvergenceBackfillError("Bureau attention task database does not match the requested database")
+    missing_groups = sorted(set(BUREAU_ATTENTION_GROUPS) - set(counts))
+    missing_item_groups = sorted(set(BUREAU_ATTENTION_GROUPS) - set(items))
+    if missing_groups or missing_item_groups:
+        raise ConvergenceBackfillError(
+            f"Bureau attention projection lacks canonical groups: counts={missing_groups}; items={missing_item_groups}"
+        )
+    all_counts = list(counts.values())
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in all_counts):
+        raise ConvergenceBackfillError("Bureau attention projection contains an invalid count")
+    task_count = output.get("task_count")
+    if not isinstance(task_count, int) or isinstance(task_count, bool) or task_count < 0:
+        raise ConvergenceBackfillError("Bureau attention task_count is invalid")
+    if task_count != sum(all_counts):
+        raise ConvergenceBackfillError("Bureau attention task_count does not match group counts")
+    expected_current_attention_count = sum(counts.get(group, -1) for group in BUREAU_CURRENT_ATTENTION_GROUPS)
+    if output.get("current_attention_count") != expected_current_attention_count:
+        raise ConvergenceBackfillError("Bureau current attention count does not match canonical groups")
     candidates: list[dict[str, Any]] = []
     omitted_lower_bound = 0
     bounded_counts: dict[str, int] = {}
+    seen_task_ids: set[str] = set()
     for group in BUREAU_ATTENTION_GROUPS:
         raw_count = counts.get(group)
         group_items = items.get(group)
@@ -366,12 +411,17 @@ def _bureau_attention_candidates(
             raise ConvergenceBackfillError(f"Bureau attention count is invalid for {group}")
         if not isinstance(group_items, list):
             raise ConvergenceBackfillError(f"Bureau attention items are invalid for {group}")
+        if len(group_items) > raw_count or len(group_items) > load_limit:
+            raise ConvergenceBackfillError(f"Bureau attention items exceed declared bounds for {group}")
         bounded_counts[group] = raw_count
-        omitted_lower_bound += max(0, raw_count - len(group_items))
+        omitted_lower_bound += raw_count - len(group_items)
         for raw_item in group_items:
             if not isinstance(raw_item, dict):
                 raise ConvergenceBackfillError(f"Bureau attention item is invalid for {group}")
             task_id = _bounded_text(raw_item.get("task_id"), label=f"bureau-attention:{group}.task_id", maximum=512)
+            if task_id in seen_task_ids:
+                raise ConvergenceBackfillError(f"Bureau attention task appears in multiple groups: {task_id}")
+            seen_task_ids.add(task_id)
             updated_at_unix = raw_item.get("updated_at_unix")
             age_seconds = raw_item.get("age_seconds")
             if (
@@ -382,6 +432,8 @@ def _bureau_attention_candidates(
                 or age_seconds < 0
             ):
                 raise ConvergenceBackfillError(f"Bureau attention timestamps are invalid for {task_id}")
+            if age_seconds != max(0, observation_unix - updated_at_unix):
+                raise ConvergenceBackfillError(f"Bureau attention age is inconsistent for {task_id}")
             record_id = f"bureau-attention:{group}:{task_id}"
             source_material = {
                 "group": group,
@@ -450,9 +502,45 @@ def _apply_evidence_overrides(
             continue
         item["explicit_evidence_overrides"] = signals
         for field, evidence in signals.items():
+            if item["classifier_input"].get(field) is not None:
+                raise ConvergenceBackfillInputError(
+                    f"evidence override may not replace canonical evidence: {item['record_id']}.{field}"
+                )
             item["classifier_input"][field] = (
                 f"{evidence['reference']}:evidence_sha256:{evidence['sha256']}"
             )
+
+
+def _validate_classifier_receipt(
+    classified: dict[str, Any],
+    *,
+    classifier_records: list[dict[str, Any]],
+    output: dict[str, Any],
+    receipt: dict[str, Any],
+) -> None:
+    grip = receipt.get("grip")
+    if not isinstance(grip, dict) or grip.get("name") != "convergence-state-classify":
+        raise ConvergenceBackfillError("classifier receipt is not bound to convergence-state-classify")
+    expected_parameters_sha256 = sha256_json({"records": classifier_records})
+    if receipt.get("parameters_sha256") != expected_parameters_sha256:
+        raise ConvergenceBackfillError("classifier parameters receipt hash does not match selected records")
+    expected_output_sha256 = sha256_json(output)
+    if receipt.get("output_sha256") != expected_output_sha256:
+        raise ConvergenceBackfillError("classifier output receipt hash does not match classifier output")
+    receipt_sha256 = receipt.get("receipt_sha256")
+    top_level_receipt_sha256 = classified.get("receipt_sha256")
+    if (
+        not isinstance(receipt_sha256, str)
+        or SHA256_RE.fullmatch(receipt_sha256) is None
+        or top_level_receipt_sha256 != receipt_sha256
+    ):
+        raise ConvergenceBackfillError("classifier receipt SHA-256 binding is invalid")
+    expected_receipt_sha256 = sha256_json(
+        {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    )
+    if receipt_sha256 != expected_receipt_sha256:
+        raise ConvergenceBackfillError("classifier receipt SHA-256 does not match receipt content")
+
 
 
 def build_projection(
@@ -485,7 +573,9 @@ def build_projection(
         if runtime_binding is not None
         else _runtime_binding(Path(deployment_manifest))
     )
-    obligations, obligation_bounds = _obligation_candidates(max_records)
+    obligations, obligation_bounds = _obligation_candidates(
+        max_records, observation_unix=selected_observation_unix
+    )
     bureau, bureau_bounds = _bureau_attention_candidates(
         Path(task_db),
         observation_unix=selected_observation_unix,
@@ -525,6 +615,12 @@ def build_projection(
         raise ConvergenceBackfillError(
             "classifier output record identities do not match the selected bounded snapshot"
         )
+    _validate_classifier_receipt(
+        classified,
+        classifier_records=classifier_records,
+        output=output,
+        receipt=receipt,
+    )
     source_records = []
     per_source_evidence_references = []
     for item in selected:
@@ -562,6 +658,7 @@ def build_projection(
             or bureau_bounds["scan_truncated"]
         ),
         "known_omitted_count_lower_bound": known_omitted,
+        "source_completeness_unknown": bool(obligation_bounds["scan_truncated"]),
     }
     conflicted_record_ids = sorted(
         str(record.get("record_id"))
@@ -574,6 +671,7 @@ def build_projection(
         "truncation": {
             "selection_truncated": source_bounds["selection_truncated"],
             "known_omitted_count_lower_bound": source_bounds["known_omitted_count_lower_bound"],
+            "source_completeness_unknown": source_bounds["source_completeness_unknown"],
         },
         "conflicted_record_ids": conflicted_record_ids,
         "per_source_evidence_references": per_source_evidence_references,
@@ -627,40 +725,82 @@ def _ensure_private_directory(directory: Path) -> None:
 
 
 def _private_file_sha256(path: Path) -> str:
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    directory = path.parent
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+        directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(directory, directory_flags)
     try:
-        before = os.fstat(descriptor)
+        directory_before = os.fstat(directory_fd)
+        linked_directory_before = directory.lstat()
         if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != os.getuid()
-            or stat.S_IMODE(before.st_mode) != 0o600
-            or before.st_nlink != 1
-            or before.st_size > MAX_ARTIFACT_BYTES
+            not stat.S_ISDIR(directory_before.st_mode)
+            or stat.S_ISLNK(linked_directory_before.st_mode)
+            or directory_before.st_uid != os.getuid()
+            or stat.S_IMODE(directory_before.st_mode) & 0o077
+            or (directory_before.st_dev, directory_before.st_ino)
+            != (linked_directory_before.st_dev, linked_directory_before.st_ino)
         ):
-            raise ConvergenceBackfillError(f"unsafe convergence backfill projection: {path}")
-        digest = hashlib.sha256()
-        remaining = before.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
-            if not chunk:
-                raise ConvergenceBackfillError(f"short convergence backfill projection read: {path}")
-            digest.update(chunk)
-            remaining -= len(chunk)
-        after = os.fstat(descriptor)
-        before_identity = (
-            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns
-        )
-        after_identity = (
-            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
-        )
-        if before_identity != after_identity:
-            raise ConvergenceBackfillError(f"convergence backfill projection changed during read: {path}")
-        return digest.hexdigest()
+            raise ConvergenceBackfillError(f"unsafe convergence backfill directory: {directory}")
+
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or before.st_size > MAX_ARTIFACT_BYTES
+            ):
+                raise ConvergenceBackfillError(f"unsafe convergence backfill projection: {path}")
+            digest = hashlib.sha256()
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 64 * 1024))
+                if not chunk:
+                    raise ConvergenceBackfillError(f"short convergence backfill projection read: {path}")
+                digest.update(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            current = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            before_identity = (
+                before.st_dev, before.st_ino, before.st_mode, before.st_nlink,
+                before.st_uid, before.st_size, before.st_mtime_ns, before.st_ctime_ns
+            )
+            after_identity = (
+                after.st_dev, after.st_ino, after.st_mode, after.st_nlink,
+                after.st_uid, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+            )
+            current_identity = (
+                current.st_dev, current.st_ino, current.st_mode, current.st_nlink,
+                current.st_uid, current.st_size, current.st_mtime_ns, current.st_ctime_ns
+            )
+            if before_identity != after_identity or after_identity != current_identity:
+                raise ConvergenceBackfillError(
+                    f"convergence backfill projection changed or was replaced during read: {path}"
+                )
+            result = digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
+        directory_after = os.fstat(directory_fd)
+        linked_directory_after = directory.lstat()
+        if (
+            (directory_before.st_dev, directory_before.st_ino)
+            != (directory_after.st_dev, directory_after.st_ino)
+            or (directory_after.st_dev, directory_after.st_ino)
+            != (linked_directory_after.st_dev, linked_directory_after.st_ino)
+        ):
+            raise ConvergenceBackfillError(
+                f"convergence backfill directory changed during read: {directory}"
+            )
+        return result
     finally:
-        os.close(descriptor)
+        os.close(directory_fd)
 
 
 def write_projection_create_only(path: Path, projection: dict[str, Any]) -> dict[str, Any]:
@@ -686,4 +826,5 @@ def write_projection_create_only(path: Path, projection: dict[str, Any]) -> dict
         "matches_requested": published_sha256 == requested_sha256,
         "deterministic_projection_sha256": projection.get("deterministic_projection_sha256"),
         "bytes": len(encoded),
+        "requested_bytes": len(encoded),
     }

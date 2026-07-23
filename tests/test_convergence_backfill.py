@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
+import os
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import grabowski_convergence_backfill as backfill
@@ -198,6 +200,7 @@ class ConvergenceBackfillTests(unittest.TestCase):
         self.assertEqual(0, bounds["operator_obligations"]["known_omitted_count_lower_bound"])
         self.assertTrue(bounds["bureau_attention"]["scan_truncated"])
         self.assertEqual(3, bounds["known_omitted_count_lower_bound"])
+        self.assertTrue(bounds["source_completeness_unknown"])
 
     def test_runtime_binding_accepts_sha1_and_rejects_invalid_git_oid(self) -> None:
         inventory = {"records": [{"obligation_id": "goo-test-open", "state": "open"}], "integrity_errors": [], "scan_truncated": False}
@@ -349,7 +352,7 @@ class ConvergenceBackfillTests(unittest.TestCase):
                     bureau_attention_provider=_bureau_provider(),
                 )
 
-    def test_invalid_bureau_projection_fails_closed(self) -> None:
+    def test_bureau_projection_reports_provider_truncation(self) -> None:
         inventory = {"records": [{"obligation_id": "goo-test-open", "state": "open"}], "integrity_errors": [], "scan_truncated": False}
         bad_provider = _bureau_provider(counts={"recent_failed": 1})
         with patch.object(backfill, "list_obligations", return_value=inventory), patch.object(
@@ -361,6 +364,186 @@ class ConvergenceBackfillTests(unittest.TestCase):
                 bureau_attention_provider=bad_provider,
             )
             self.assertTrue(projection["source_bounds"]["bureau_attention"]["scan_truncated"])
+
+    def test_real_bureau_subprocess_provider_binds_immutable_release(self) -> None:
+        inventory = {"records": [], "integrity_errors": [], "scan_truncated": False}
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            release = root / "release"
+            package = release / "src" / "bureau"
+            package.mkdir(parents=True)
+            (release / "pyproject.toml").write_text("[project]\nname = 'bureau-test'\n")
+            (package / "__init__.py").write_text("")
+            (package / "cycle_contract.py").write_text(
+                "def classify_task_attention(task_db, *, now_unix=None, horizon_seconds=10800, limit=20):\n"
+                "    item = {'task_id': 'integration-task', 'unit': 'integration.service', 'state': 'failed', 'age_seconds': 0, 'updated_at_unix': now_unix}\n"
+                "    groups = {'stale_running': [], 'current_outcome_unknown': [], 'recent_failed': [item], 'legacy_outcome_unavailable': [], 'historical_failed': [], 'terminal_history': [], 'healthy_running': []}\n"
+                "    counts = {key: len(value) for key, value in groups.items()}\n"
+                "    return {'available': True, 'task_db': str(task_db), 'attention_horizon_seconds': horizon_seconds, 'task_count': 1, 'current_attention_count': 1, 'counts': counts, 'items': groups}\n"
+            )
+            tree_sha256 = backfill._bureau_package_tree_sha256(release)
+            runtime_payload = {
+                "runtime_identity": {
+                    "manifest": {
+                        "valid": True,
+                        "immutable_release_path": str(release),
+                        "source_commit": "b" * 40,
+                        "release_id": "bureau-integration",
+                        "package_tree_sha256": tree_sha256,
+                        "sha256": "d" * 64,
+                    },
+                    "state": {
+                        "integrity": "ok",
+                        "path": str(root / "state.sqlite3"),
+                        "schema_version": 3,
+                    },
+                }
+            }
+            executable = root / "bureau"
+            executable.write_text(
+                f"#!{sys.executable}\nprint({json.dumps(runtime_payload)!r})\n"
+            )
+            os.chmod(executable, 0o700)
+            task_db = root / "tasks.sqlite3"
+            task_db.write_bytes(b"")
+            with patch.object(backfill, "list_obligations", return_value=inventory):
+                projection = backfill.build_projection(
+                    runtime_binding=RUNTIME,
+                    observation_unix=100,
+                    task_db=task_db,
+                    bureau_executable=executable,
+                )
+        self.assertEqual(1, projection["source_bounds"]["selected_count"])
+        self.assertEqual(
+            "bureau-attention:recent_failed:integration-task",
+            projection["source_records"][0]["record_id"],
+        )
+        self.assertEqual(1, projection["classifier_output"]["counts"]["defect"])
+
+    def test_empty_bounded_snapshot_is_a_valid_projection(self) -> None:
+        inventory = {"records": [], "integrity_errors": [], "scan_truncated": False}
+        with patch.object(backfill, "list_obligations", return_value=inventory):
+            projection = backfill.build_projection(
+                runtime_binding=RUNTIME,
+                observation_unix=100,
+                bureau_attention_provider=_bureau_provider(),
+            )
+        self.assertEqual(0, projection["source_bounds"]["selected_count"])
+        self.assertEqual(0, projection["classifier_output"]["decision_required_count"])
+        self.assertTrue(all(value == 0 for value in projection["classifier_output"]["counts"].values()))
+        self.assertFalse(projection["source_bounds"]["selection_truncated"])
+
+    def test_obligation_state_drift_during_snapshot_fails_closed(self) -> None:
+        inventory = {
+            "records": [{"obligation_id": "goo-test-open", "state": "open"}],
+            "integrity_errors": [],
+            "scan_truncated": False,
+        }
+        changed = _status("goo-test-open", "blocked", close_sha="e" * 64)
+        with patch.object(backfill, "list_obligations", return_value=inventory), patch.object(
+            backfill, "status_obligation", return_value=changed
+        ):
+            with self.assertRaisesRegex(backfill.ConvergenceBackfillError, "changed during bounded snapshot"):
+                backfill.build_projection(
+                    runtime_binding=RUNTIME,
+                    observation_unix=100,
+                    bureau_attention_provider=_bureau_provider(),
+                )
+
+    def test_evidence_override_cannot_replace_canonical_bureau_evidence(self) -> None:
+        inventory = {"records": [], "integrity_errors": [], "scan_truncated": False}
+        provider = _bureau_provider(
+            groups={"stale_running": [_task("stale", "running", 10, 90)]}
+        )
+        with patch.object(backfill, "list_obligations", return_value=inventory):
+            with self.assertRaisesRegex(backfill.ConvergenceBackfillInputError, "may not replace canonical evidence"):
+                backfill.build_projection(
+                    runtime_binding=RUNTIME,
+                    observation_unix=100,
+                    bureau_attention_provider=provider,
+                    evidence_overrides={
+                        "bureau-attention:stale_running:stale": {
+                            "blocking_evidence": {"reference": "replacement", "sha256": "f" * 64}
+                        }
+                    },
+                )
+
+    def test_failure_evidence_is_not_an_override_field(self) -> None:
+        with self.assertRaises(backfill.ConvergenceBackfillInputError):
+            backfill.build_projection(
+                runtime_binding=RUNTIME,
+                observation_unix=100,
+                bureau_attention_provider=_bureau_provider(),
+                evidence_overrides={
+                    "missing": {
+                        "failure_evidence": {"reference": "failure", "sha256": "f" * 64}
+                    }
+                },
+            )
+
+    def test_inconsistent_bureau_declared_count_fails_closed(self) -> None:
+        inventory = {"records": [], "integrity_errors": [], "scan_truncated": False}
+        provider = _bureau_provider(
+            groups={"recent_failed": [_task("failed", "failed", 90, 10)]},
+            counts={"recent_failed": 0},
+        )
+        with patch.object(backfill, "list_obligations", return_value=inventory):
+            with self.assertRaisesRegex(backfill.ConvergenceBackfillError, "exceed declared bounds"):
+                backfill.build_projection(
+                    runtime_binding=RUNTIME,
+                    observation_unix=100,
+                    bureau_attention_provider=provider,
+                )
+
+    def test_classifier_receipt_hashes_must_bind_parameters_and_output(self) -> None:
+        inventory = {
+            "records": [{"obligation_id": "goo-test-open", "state": "open"}],
+            "integrity_errors": [],
+            "scan_truncated": False,
+        }
+
+        def classifier(_name, parameters):
+            records = [
+                {
+                    "record_id": record["record_id"],
+                    "observed_state": record["observed_state"],
+                    "classification": "unknown",
+                    "reason": "test",
+                    "signals": [],
+                    "evidence_sha256s": {},
+                    "requires_decision": True,
+                }
+                for record in parameters["records"]
+            ]
+            return {
+                "status": "passed",
+                "output": {
+                    "schema_version": 1,
+                    "authority": "read_only_evidence_projection",
+                    "records": records,
+                    "counts": {"unknown": len(records)},
+                    "decision_required_count": len(records),
+                    "does_not_establish": [],
+                },
+                "receipt": {
+                    "grip": {"name": "convergence-state-classify"},
+                    "parameters_sha256": "a" * 64,
+                    "output_sha256": "b" * 64,
+                    "receipt_sha256": "c" * 64,
+                },
+                "receipt_sha256": "c" * 64,
+            }
+
+        with patch.object(backfill, "list_obligations", return_value=inventory), patch.object(
+            backfill, "status_obligation", return_value=_status("goo-test-open", "open")
+        ):
+            with self.assertRaisesRegex(backfill.ConvergenceBackfillError, "parameters receipt hash"):
+                backfill.build_projection(
+                    runtime_binding=RUNTIME,
+                    observation_unix=100,
+                    bureau_attention_provider=_bureau_provider(),
+                    classifier=classifier,
+                )
 
 
 if __name__ == "__main__":
