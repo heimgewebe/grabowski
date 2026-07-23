@@ -424,6 +424,42 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertTrue(competitive["external_route_candidates"][1]["paid_only"])
 
 
+    def test_direct_first_route_recommendation_id_is_workspace_schema2_compatible(self) -> None:
+        with mock.patch.object(
+            competition.coding_router,
+            "select_contrast_routes",
+            side_effect=lambda *args, **kwargs: self._route_selection(
+                max_candidates=kwargs["max_candidates"],
+                allow_paid=kwargs["allow_paid"],
+            ),
+        ):
+            routed = competition.grabowski_agent_execution_route(
+                task_kind="code",
+                changed_file_estimate=12,
+                expected_duration_minutes=180,
+                novelty="high",
+                risk_flags=["schema"],
+                user_requested_external=True,
+                available_external_agents=["codex"],
+            )
+        evidence = {
+            "schema_version": 2,
+            "route_policy_version": routed["route_policy_version"],
+            "risk_tier": routed["risk_tier"],
+            "parallel_writer_pilot": routed["parallel_writer_pilot"],
+            "recommendation_id": routed["recommendation_id"],
+            "score": routed["score"],
+            "recommended_route": routed["execution_mode"],
+            "actual_route": "workspace_with_contrast",
+            "input_facts": routed["input_facts"],
+            "external_candidates": routed["external_candidates"],
+            "deviation_reason": "explicit advisory contrast workspace requested after direct operator planning",
+        }
+        normalized = competition.workspace._normalize_route_evidence(evidence)
+        self.assertEqual(normalized["status"], "verified")
+        self.assertTrue(normalized["evidence_complete"])
+        self.assertEqual(normalized["recommendation_id"], routed["recommendation_id"])
+
     def test_route_v21_keeps_routine_code_out_of_full_workspace(self) -> None:
         four_files = competition.grabowski_agent_execution_route(
             task_kind="code",

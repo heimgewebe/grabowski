@@ -70,7 +70,7 @@ Die Zuordnung eines Fable-Routes zum Pool `claude-pro` dient ausschließlich der
 - Nur `grabowski-primary` ist direkt- und writer-fähig.
 - Externe Nicht-Review-Aufgaben erzeugen ausschließlich Kontrastfähigkeit.
 - Review-Routen erzeugen ausschließlich Reviewfähigkeit.
-- Gemischte externe Routen können Kontrast und Review anbieten, werden aber nie writer-fähig.
+- Externe Routen ohne Rollenflag werden für Nicht-Review-Taskklassen als Kontrastrouten behandelt. Unabhängige Review-Fähigkeit ist fail-closed und verlangt `review_only=true`; eine Route wird nie allein wegen historisch gemischter Taskklassen zum Reviewer.
 - `writer_only` ist als Katalogfeld stillgelegt und macht den Katalog ungültig.
 
 Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für `--flag value` sowie `--flag=value` aus `argv_prefix` abgeleitet. Damit bleibt der Befehlsvertrag die einzige Wahrheit für den konkreten CLI-Modus.

@@ -2027,9 +2027,6 @@ def grabowski_agent_execution_route(
         "execution_mode": mode,
         "input_facts": input_facts,
         "external_candidates": candidate_plan,
-        "external_route_candidates": external_route_candidates,
-        "contrast_catalog_sha256": result["contrast_catalog_sha256"],
-        "paid_execution_authorized": paid_authorized,
         "parallel_writer_pilot": result["parallel_writer_pilot"],
     }
     result["recommendation_id"] = _sha256_json(recommendation_contract)
