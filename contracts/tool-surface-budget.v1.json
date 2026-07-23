@@ -324,6 +324,53 @@
         "tool": "grabowski_bureau_task_review"
       }
     },
+    "grabowski_chronik_history": {
+      "evidence_refs": [
+        "bureau:CCM-V1-T002",
+        "tests:tests/test_tasks.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds only bounded historical read authority over redacted Chronik coding-memory events and does not establish current system truth or mutation authority.",
+        "evidence": "The implementation is READ_ONLY, enforces bounded query inputs, validates query binding and rejects unredacted event payloads."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "A generic operation was rejected because historical coding-memory retrieval requires a stable typed filter contract and explicit historical-only truth exclusions.",
+      "rationale": "Coding-history retrieval needs bounded repo-or-host filters and fail-closed redaction/query binding distinct from current-state reads.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "coding-memory",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_chronik_history"
+      }
+    },
+    "grabowski_chronik_outbox_import": {
+      "evidence_refs": [
+        "bureau:CCM-V1-T002",
+        "tests:tests/test_tasks.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds only bounded import authority for one already-redacted Grabowski outbox JSONL into optional local Chronik and does not alter the source outbox.",
+        "evidence": "The implementation requires mutation authority, validates source identity and import receipts, proves source unchanged after execution, and records an audit receipt."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic operation was rejected because the import must bind one exact redacted source file to a typed idempotent Chronik receipt and source-unchanged readback.",
+      "rationale": "The import boundary needs explicit source-digest, idempotency and historical-only semantics that are materially safer than arbitrary command dispatch.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "coding-memory",
+        "effects": [
+          "audit-append",
+          "state-create"
+        ],
+        "read_only": false,
+        "reversibility": "append-only-observation",
+        "risk_class": "medium",
+        "tool": "grabowski_chronik_outbox_import"
+      }
+    },
     "grabowski_coding_agent_catalog": {
       "evidence_refs": [
         "bureau:event-707",

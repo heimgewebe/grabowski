@@ -4149,6 +4149,21 @@ def grabowski_chronik_history(
                 raise ValueError("Chronik coding-memory history contract is stale")
             if history.get("historical_only") is not True:
                 raise ValueError("Chronik coding-memory history is not historical-only")
+            raw_query = history.get("query")
+            if not isinstance(raw_query, dict):
+                raise ValueError("Chronik coding-memory history query is missing")
+            allowed_query_keys = {
+                "repo", "host", "component", "operation", "task_class", "outcome", "since", "limit"
+            }
+            if any(key not in allowed_query_keys for key in raw_query):
+                raise ValueError("Chronik coding-memory history query is unbound")
+            bound_query = {
+                key: value
+                for key, value in raw_query.items()
+                if value not in (None, "")
+            }
+            if bound_query != query:
+                raise ValueError("Chronik coding-memory history query is unbound")
             raw_events = history.get("events", [])
             raw_event_ids = history.get("event_ids", [])
             raw_claims = history.get("does_not_establish", [])
