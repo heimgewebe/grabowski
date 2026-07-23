@@ -3121,6 +3121,9 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
         observation=observation,
     )
     result = _public(stored)
+    import grabowski_task_attention as task_attention
+
+    result["closeout"] = task_attention.terminal_closeout_plan(stored)
     result["lease_maintenance"] = lease_maintenance
     return result
 
