@@ -2793,7 +2793,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "7f53fe1c655b36de506b2789d4a0d067ed4295d23245cef5b66d0a4c8d74b87a",
+      "src/grabowski_mcp.py": "8190ef61c3561e81bb700cfcdc64a2409232e11104b31a3aa941424e53ddc952",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "75be1e72248720a1c21d70366a8a08f3833693e25060c87fce4b1ba802c1fcca",
