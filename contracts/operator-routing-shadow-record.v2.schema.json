@@ -1,0 +1,356 @@
+{
+  "$id": "operator-routing-shadow-record.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "canonical_route_evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "recommendation_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "route_evidence_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "enum": [
+            1,
+            2
+          ],
+          "type": "integer"
+        },
+        "source": {
+          "const": "agent-workspace-manifest"
+        }
+      },
+      "required": [
+        "source",
+        "schema_version",
+        "recommendation_id",
+        "route_evidence_sha256",
+        "manifest_sha256"
+      ],
+      "type": "object"
+    },
+    "captured_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "eligibility": {
+      "additionalProperties": false,
+      "properties": {
+        "eligibility_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "frozen_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "prospective_eligibility_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "operator-routing-shadow-eligibility.v2"
+        }
+      },
+      "required": [
+        "schema_version",
+        "eligibility_id",
+        "prospective_eligibility_id",
+        "frozen_at"
+      ],
+      "type": "object"
+    },
+    "eligible_case": {
+      "additionalProperties": false,
+      "properties": {
+        "case_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "task_id": {
+          "pattern": "^[0-9a-f]{24}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "case_id"
+      ],
+      "type": "object"
+    },
+    "features": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "changed_file_estimate": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "connector_instability": {
+              "type": "boolean"
+            },
+            "expected_duration_minutes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "novelty": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "parallel_work": {
+              "type": "boolean"
+            },
+            "risk_flags": {
+              "items": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 32,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "task_kind": {
+              "maxLength": 40,
+              "minLength": 1,
+              "type": "string"
+            },
+            "user_requested_external": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "user_requested_external",
+            "parallel_work"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "architecture_hypotheses": {
+              "maximum": 4,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "changed_file_estimate": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "concurrent_external_activity": {
+              "type": "boolean"
+            },
+            "connector_instability": {
+              "type": "boolean"
+            },
+            "decision_fork": {
+              "type": "boolean"
+            },
+            "expected_duration_minutes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "novelty": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "parallelization_candidate": {
+              "type": "boolean"
+            },
+            "risk_flags": {
+              "items": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 32,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "risk_tier": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "task_kind": {
+              "maxLength": 40,
+              "minLength": 1,
+              "type": "string"
+            },
+            "user_requested_external": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "user_requested_external",
+            "risk_tier",
+            "concurrent_external_activity",
+            "parallelization_candidate",
+            "decision_fork",
+            "architecture_hypotheses"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "no_effect": {
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "const": false
+        },
+        "policy": {
+          "const": false
+        },
+        "proposal_only": {
+          "const": true
+        },
+        "queue": {
+          "const": false
+        },
+        "routing": {
+          "const": false
+        },
+        "runtime": {
+          "const": false
+        }
+      },
+      "required": [
+        "proposal_only",
+        "routing",
+        "policy",
+        "queue",
+        "merge",
+        "runtime"
+      ],
+      "type": "object"
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "enum": [
+                "task_correctness",
+                "decision_quality"
+              ]
+            },
+            "label": {
+              "enum": [
+                "success",
+                "partial",
+                "failure"
+              ]
+            },
+            "observed_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "review_authority": {
+              "enum": [
+                "diff_bound_review",
+                "operator_decision",
+                "ci_and_review",
+                "bounded_chronik_evidence"
+              ]
+            },
+            "status": {
+              "const": "reviewed"
+            }
+          },
+          "required": [
+            "status",
+            "kind",
+            "label",
+            "observed_at",
+            "review_authority"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "observed_at": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "reason_code": {
+              "enum": [
+                "no_semantic_review",
+                "non_semantic_task",
+                "insufficient_primary_evidence",
+                "ambiguous_outcome"
+              ]
+            },
+            "status": {
+              "const": "abstained"
+            }
+          },
+          "required": [
+            "status",
+            "reason_code",
+            "observed_at"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "primary_evidence_refs": {
+      "items": {
+        "maxLength": 300,
+        "minLength": 1,
+        "pattern": "^(github-ci|diff-review|operator-decision|chronik|artifact):",
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "record_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "operator-routing-shadow-record.v2"
+    }
+  },
+  "required": [
+    "schema_version",
+    "record_id",
+    "eligibility",
+    "eligible_case",
+    "canonical_route_evidence",
+    "features",
+    "outcome",
+    "primary_evidence_refs",
+    "captured_at",
+    "no_effect"
+  ],
+  "title": "Operator routing shadow record v2",
+  "type": "object"
+}

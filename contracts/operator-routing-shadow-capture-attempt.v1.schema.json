@@ -1,0 +1,98 @@
+{
+  "$id": "operator-routing-shadow-capture-attempt.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "attempt_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "attempted_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "no_effect": {
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "const": false
+        },
+        "policy": {
+          "const": false
+        },
+        "proposal_only": {
+          "const": true
+        },
+        "queue": {
+          "const": false
+        },
+        "routing": {
+          "const": false
+        },
+        "runtime": {
+          "const": false
+        }
+      },
+      "required": [
+        "proposal_only",
+        "routing",
+        "policy",
+        "queue",
+        "merge",
+        "runtime"
+      ],
+      "type": "object"
+    },
+    "plan_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "prospective_eligibility_id": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      ]
+    },
+    "reason_code": {
+      "pattern": "^[a-z0-9_]{1,80}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "operator-routing-shadow-capture-attempt.v1"
+    },
+    "stage": {
+      "const": "prospective_eligibility_freeze"
+    },
+    "status": {
+      "enum": [
+        "created",
+        "duplicate",
+        "rejected",
+        "error"
+      ]
+    },
+    "workspace_id": {
+      "pattern": "^gaw-[a-z0-9][a-z0-9-]{7,79}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "workspace_id",
+    "plan_sha256",
+    "stage",
+    "status",
+    "reason_code",
+    "prospective_eligibility_id",
+    "attempted_at",
+    "no_effect"
+  ],
+  "title": "Operator routing shadow capture attempt v1",
+  "type": "object"
+}

@@ -2643,6 +2643,10 @@
         "source": "src/grabowski_repoground_catalog.py"
       },
       {
+        "module": "grabowski_operator_routing_shadow_capture",
+        "source": "src/grabowski_operator_routing_shadow_capture.py"
+      },
+      {
         "module": "grabowski_agent_workspace",
         "source": "src/grabowski_agent_workspace.py"
       },
@@ -2744,14 +2748,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "4bad0636726f1fdbf79923775c440abd2f93c9cc57bfbae2270802f4814ebf6e"
+      "sha256": "e154473b96811a84190abe13d7dd71794ecdf3b89461d7e8547c9952eb73a69e"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
       "src/grabowski_agent_competition.py": "0ebba01d2ae12dd24ba17cb77600d6e6195e3c7344ac18b672463092d573e6ff",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "180b07865a6b9f84fd1510f007395b559444072b48c45f6f97ffc3d4ccf7f26c",
+      "src/grabowski_agent_workspace.py": "d02dabcf1a455b1e313f5fff3b2c0fef11aba01fd16bdf12ad600e2c11a424f9",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
@@ -2797,6 +2801,7 @@
       "src/grabowski_operator.py": "4db64a321dc135762fc7ee26e030bf2070deab14eadfb0787e7cae45ccaaff2b",
       "src/grabowski_operator_obligation.py": "a18dd9e4c9b2915aecdf51897b38da08dc1b557541e823e9fb3bd7a0e470c085",
       "src/grabowski_operator_relay.py": "e0869b3297b473366963670a7105ece12afae308f4ceba80a300db49ddd666b7",
+      "src/grabowski_operator_routing_shadow_capture.py": "3facf2d73d01a48aaba3201418ea08255a24c4e5de282ccf383833031e8a9ad1",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
       "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",
