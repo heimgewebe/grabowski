@@ -106,6 +106,49 @@ def complete_route_evidence() -> dict:
     }
 
 
+def legacy_route_evidence_v21() -> dict:
+    facts = {
+        "task_kind": "code",
+        "changed_file_estimate": 7,
+        "expected_duration_minutes": 120,
+        "novelty": "high",
+        "risk_flags": ["concurrency", "schema"],
+        "connector_instability": True,
+        "concurrent_external_activity": True,
+        "parallelization_candidate": False,
+        "decision_fork": False,
+        "architecture_hypotheses": 1,
+        "user_requested_external": False,
+        "available_external_agents": [],
+    }
+    decision = workspace._route_decision_for_policy(
+        facts, workspace.LEGACY_ROUTE_POLICY_VERSION_V21
+    )
+    recommendation = {
+        "schema_version": 2,
+        "route_policy_version": decision["route_policy_version"],
+        "risk_tier": decision["risk_tier"],
+        "score": decision["score"],
+        "execution_mode": decision["execution_mode"],
+        "input_facts": facts,
+        "external_candidates": decision["external_candidates"],
+        "parallel_writer_pilot": decision["parallel_writer_pilot"],
+    }
+    return {
+        "schema_version": 2,
+        "route_policy_version": decision["route_policy_version"],
+        "risk_tier": decision["risk_tier"],
+        "parallel_writer_pilot": decision["parallel_writer_pilot"],
+        "recommendation_id": workspace._sha256_json(recommendation),
+        "score": decision["score"],
+        "recommended_route": decision["execution_mode"],
+        "actual_route": decision["execution_mode"],
+        "input_facts": facts,
+        "external_candidates": decision["external_candidates"],
+        "deviation_reason": None,
+    }
+
+
 def signed_receipt(payload: dict) -> dict:
     result = dict(payload)
     result["receipt_sha256"] = workspace._sha256_json(result)
@@ -542,6 +585,38 @@ class AgentWorkspaceTests(unittest.TestCase):
                         )
                 mutation.assert_not_called()
                 self.assertFalse((self.root / "direct-first-gate").exists())
+
+    def test_historical_schema2_v21_route_evidence_remains_readable(self) -> None:
+        normalized = workspace._normalize_route_evidence(legacy_route_evidence_v21())
+        self.assertEqual(normalized["status"], "verified")
+        self.assertTrue(normalized["evidence_complete"])
+        self.assertEqual(
+            normalized["route_policy_version"],
+            workspace.LEGACY_ROUTE_POLICY_VERSION_V21,
+        )
+        self.assertEqual(normalized["actual_route"], "full_workspace")
+
+    def test_public_create_rejects_historical_schema2_authority_before_effects(self) -> None:
+        with mock.patch.object(workspace.operator, "_require_operator_mutation") as mutation:
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "verified advisory contrast evidence"
+            ):
+                workspace.grabowski_agent_workspace_create(
+                    route_evidence=legacy_route_evidence_v21(),
+                    binding_kind="thread_focus",
+                    binding_id="thread-legacy-v21",
+                    repository=str(self.git.repo),
+                    expected_base_head=self.git.base,
+                    writer_branch="feat/legacy-v21",
+                    writer_worktree=str(self.root / "legacy-v21"),
+                    allowed_paths=["src"],
+                    writer_argv=["true"],
+                    test_argv=["true"],
+                    review_argv=["true"],
+                    runtime_seconds=600,
+                )
+        mutation.assert_not_called()
+        self.assertFalse((self.root / "legacy-v21").exists())
 
     def test_route_evidence_is_hash_bound_and_missing_evidence_fails_closed(self) -> None:
         normalized = workspace._normalize_route_evidence(complete_route_evidence())

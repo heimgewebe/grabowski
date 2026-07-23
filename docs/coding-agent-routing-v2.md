@@ -51,6 +51,8 @@ Der Ablauf ist:
 
 Ein kanonischer Candidate-Start über `grabowski_agent_competition_start` bindet die gewählte `route_id`, den Katalog-SHA-256, Harness, Modell, Effort, Permission-Modus, Quota-Pools und die Paid-Klassifikation in einen gehashten Route-Vertrag. Neue routegebundene Candidate-Packets, -Manifeste und -Receipts verwenden Schema 3. Historische providergebundene Schema-1/2-Artefakte bleiben lesbar; sie erhalten dadurch keine neue Route-Autorität.
 
+Für Workspace-Routenevidenz bleibt außerdem die historische Policy `workspace-routing-v2.1` als eingefrorener Schema-2-Replaypfad erhalten. Sie dient nur der Lesbarkeit vorhandener Manifeste, Receipts und Shadow-Capture-Belege. Neue Workspace-Erzeugung verlangt ausdrücklich `direct-first-routing-v3.0`; ein historischer `full_workspace`-Beleg kann daher nicht als neue Ausführungsautorität wiederverwendet werden.
+
 ## Fable-Routen
 
 Die historische ID `claude-fable-5-high` bleibt als deaktivierter plan-only Kompatibilitätsalias sichtbar.

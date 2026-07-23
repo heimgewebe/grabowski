@@ -42,7 +42,9 @@ def route_evidence_v2() -> dict:
         "user_requested_external": False,
         "available_external_agents": [],
     }
-    decision = workspace._route_decision(facts)
+    decision = workspace._route_decision_for_policy(
+        facts, workspace.LEGACY_ROUTE_POLICY_VERSION_V21
+    )
     recommendation = {
         "schema_version": 2,
         "route_policy_version": decision["route_policy_version"],
