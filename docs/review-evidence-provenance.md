@@ -1,6 +1,6 @@
 # Review evidence provenance
 
-Status: OpenSSH-signed v2 projection implemented; required-check activation remains gated on live proof and recovery readiness
+Status: OpenSSH-signed v2 projection implemented; required-check activation remains gated on live proof, publisher identity, supersession semantics, and recovery readiness
 
 ## Decision
 
@@ -30,8 +30,10 @@ This design is intentionally narrower than a claim that CI possesses the private
 - Poor review quality, missed findings or a compromised local review-gate implementation before signing.
 - Deletion or loss of the private audit after its digest was signed.
 - The small distributed race between the final GitHub freshness read and the commit-status write.
-- A compromise of the protected default-branch evaluator or its signer allowlist. This is why the trust root becomes meaningfully self-protecting only after `Review evidence gate (attested)` is required and source-bound to the expected GitHub Actions integration.
-- A write-authorized actor can intentionally submit malformed or invalid v2 evidence and make `Review evidence gate (attested)` red. This is an availability/denial-of-service risk, not a false-PASS path.
+- A compromise of the protected default-branch evaluator or its signer allowlist.
+- GitHub required-status source binding identifies an integration/App, not a unique workflow file. Binding the future required context to the general GitHub Actions integration therefore does not by itself prove that this specific review-evidence workflow produced the status. A dedicated publisher identity or an equivalently strong workflow-specific control is still required before hard-gate rollout.
+- A newer v2 comment can make an older run semantically superseded before the newer run has successfully replaced an already-published green status. If the newer run never reaches status publication, an older green commit status can remain visible. Required rollout therefore needs an explicit, tested stale-PASS invalidation or last-completed-attestation contract.
+- Freshness currently treats a write-authorized v2-prefixed comment as a newer generation before cryptographic validity is established. This permits a write-authorized actor without the signing key to supersede an older in-flight v2 run and intentionally drive the attested context toward failure. This is primarily an availability risk, but it interacts with the stale-green window above.
 
 ## Options considered
 
@@ -119,7 +121,19 @@ A required gate with only one signing key can cause repository lockout if that k
 - a separately protected recovery signing key whose public key is already allowlisted; or
 - a tested break-glass procedure that can temporarily change the repository ruleset, rotate the trust root, and restore the required check with an auditable receipt.
 
+Do not add a placeholder or commented recovery public key. Recovery is proven only when a real separately protected private key exists and its public key is already trusted, or when the break-glass path has been exercised and recorded.
+
 Until one recovery path is proven, v2 may be exercised live but `Review evidence gate (attested)` should remain non-required.
+
+## Required-gate blockers
+
+The following are explicit blockers, not deferred implementation details that may be assumed away:
+
+1. **Publisher identity:** prove that only the intended review-evidence publisher can satisfy the required context. A source restriction to the general GitHub Actions integration is insufficient if unrelated workflows under the same integration can publish the same context.
+2. **Supersession contract:** decide whether authority follows the latest submitted v2 command or the latest successfully completed attestation. Whichever model is selected must prevent an older green status from remaining merge-authoritative after it has become semantically stale.
+3. **Cryptographic supersession authority:** decide whether malformed or unsigned v2-prefixed comments may supersede valid attested generations. For a hard gate, requiring a valid signature before a v2 comment gains supersession authority is the safer default unless an explicit fail-red policy is preferred.
+4. **Recovery:** prove key rotation and key-loss recovery without relying on the single active private key.
+5. **Merge basis:** require an up-to-date/strict merge basis or equivalent merge queue.
 
 ## Required-rollout conditions
 
@@ -128,10 +142,11 @@ The status may become required only when all of the following are true:
 1. A real PR has produced a successful v2 status from the trusted default-branch workflow.
 2. Invalid, tampered, unsigned and wrong-key v2 inputs have been observed to fail closed.
 3. The protected branch enforces an up-to-date/strict merge basis or equivalent merge queue.
-4. The required `Review evidence gate (attested)` status is source-bound to the expected GitHub Actions integration, so a user-created commit status with the same text does not satisfy the rule.
-5. The signer allowlist and default-branch evaluator are protected by the resulting gate.
-6. Key rotation and key-loss recovery have a tested, auditable path.
-7. Independent high-critical/platform review requirements remain separate.
+4. The required `Review evidence gate (attested)` status has a publisher identity that is exclusive to, or cryptographically equivalent to, the intended review-evidence evaluator; binding only to the general GitHub Actions integration is not sufficient proof of workflow identity.
+5. The selected supersession contract has been tested across queued, cancelled, failed-before-publication, superseded and runner-unavailable executions, with no stale green status remaining merge-authoritative contrary to that contract.
+6. The signer allowlist and default-branch evaluator are protected by the resulting gate.
+7. Key rotation and key-loss recovery have a tested, auditable path.
+8. Independent high-critical/platform review requirements remain separate.
 
 ## Operational commands
 
