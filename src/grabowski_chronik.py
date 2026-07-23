@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import time
 from contextlib import contextmanager
@@ -896,6 +897,136 @@ def flush_outbox_file_to_plexer(
     }
 
 
+_EVENT_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "ts",
+        "source",
+        "subject",
+        "trust_tier",
+        "status",
+        "caused_by",
+        "evidence_refs",
+        "data",
+        "event_id",
+    }
+)
+_EVENT_SOURCE_KEYS = frozenset({"repo", "component", "run_id"})
+_EVENT_SUBJECT_REPOSITORY_KEYS = frozenset({"scope", "repo", "branch", "head"})
+_EVENT_SUBJECT_HOST_KEYS = frozenset({"scope", "host"})
+_EVENT_DATA_KEYS = frozenset({"result", "operation", "task_class", "blocker_code"})
+_EVENT_OPERATIONS = frozenset(
+    {"implement", "review", "merge", "deploy", "runtime_verify", "recovery", "other"}
+)
+_EVENT_TASK_CLASSES = frozenset(
+    {
+        "coding",
+        "review",
+        "merge",
+        "deploy",
+        "runtime_verify",
+        "recovery",
+        "maintenance",
+        "diagnostic",
+        "other",
+    }
+)
+_EVENT_BLOCKER_CODES = frozenset(
+    {"task-failed", "task-cancelled", "task-timed-out", "task-signalled", "task-outcome-unknown"}
+)
+_EVENT_KIND_RESULT = {
+    "agent.run.started": "started",
+    "agent.run.completed": "completed",
+    "agent.run.blocked": "blocked",
+}
+_RUN_ID_PATTERN = re.compile(r"task-([0-9a-f]{24})-a([1-9][0-9]*)\Z")
+_EVENT_TIMESTAMP_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+
+def _validate_agent_run_event_shape(event: Any, *, label: str) -> None:
+    """Reject anything that is not exactly the agent-run-event.v0 shape Grabowski emits."""
+    if not isinstance(event, dict) or set(event) != _EVENT_TOP_LEVEL_KEYS:
+        raise ValueError(f"{label} has invalid fields")
+    if event.get("schema_version") != "agent-run-event.v0":
+        raise ValueError(f"{label} has invalid schema")
+    kind = event.get("kind")
+    if kind not in _EVENT_KIND_RESULT:
+        raise ValueError(f"{label} has unsupported kind")
+    ts = event.get("ts")
+    if not isinstance(ts, str) or not _EVENT_TIMESTAMP_PATTERN.match(ts):
+        raise ValueError(f"{label} has an invalid timestamp")
+    source = event.get("source")
+    if (
+        not isinstance(source, dict)
+        or set(source) != _EVENT_SOURCE_KEYS
+        or source.get("repo") != "heimgewebe/grabowski"
+        or source.get("component") != "grabowski"
+        or not isinstance(source.get("run_id"), str)
+        or not _RUN_ID_PATTERN.match(source["run_id"])
+    ):
+        raise ValueError(f"{label} is not from Grabowski")
+    subject = event.get("subject")
+    if not isinstance(subject, dict):
+        raise ValueError(f"{label} has an invalid subject")
+    scope = subject.get("scope")
+    if scope == "repository":
+        if (
+            set(subject) - _EVENT_SUBJECT_REPOSITORY_KEYS
+            or not isinstance(subject.get("repo"), str)
+            or not subject["repo"]
+            or any(
+                key in subject and (not isinstance(subject[key], str) or not subject[key])
+                for key in ("branch", "head")
+            )
+        ):
+            raise ValueError(f"{label} has an invalid repository subject")
+    elif scope == "host":
+        if (
+            set(subject) != _EVENT_SUBJECT_HOST_KEYS
+            or not isinstance(subject.get("host"), str)
+            or not subject["host"]
+        ):
+            raise ValueError(f"{label} has an invalid host subject")
+    else:
+        raise ValueError(f"{label} has an invalid subject scope")
+    if event.get("trust_tier") not in {"observed", "declared"}:
+        raise ValueError(f"{label} has an invalid trust tier")
+    if event.get("status") != "active":
+        raise ValueError(f"{label} has an invalid status")
+    if event.get("caused_by") != []:
+        raise ValueError(f"{label} has an invalid caused_by")
+    run_match = _RUN_ID_PATTERN.fullmatch(source["run_id"])
+    assert run_match is not None
+    task_id, attempt = run_match.groups()
+    refs = event.get("evidence_refs")
+    if refs != [
+        f"grabowski-task:{task_id}",
+        f"grabowski-unit:grabowski-task-{task_id}-a{attempt}.service",
+    ]:
+        raise ValueError(f"{label} has invalid evidence refs")
+    data = event.get("data")
+    expected_result = _EVENT_KIND_RESULT[kind]
+    if (
+        not isinstance(data, dict)
+        or set(data) - _EVENT_DATA_KEYS
+        or data.get("result") != expected_result
+        or data.get("operation") not in _EVENT_OPERATIONS
+        or data.get("task_class") not in _EVENT_TASK_CLASSES
+    ):
+        raise ValueError(f"{label} has invalid data")
+    if expected_result == "blocked":
+        blocker_code = data.get("blocker_code")
+        if blocker_code not in _EVENT_BLOCKER_CODES:
+            raise ValueError(f"{label} has an invalid blocker code")
+    elif "blocker_code" in data:
+        raise ValueError(f"{label} has an unexpected blocker code")
+    if event.get("event_id") != event_id(event):
+        raise ValueError(f"{label} has an invalid event_id")
+    if _contains_forbidden_coding_memory_key(event):
+        raise ValueError(f"{label} is not redacted")
+
+
 def _contains_forbidden_coding_memory_key(value: Any) -> bool:
     if isinstance(value, dict):
         for key, nested in value.items():
@@ -912,8 +1043,13 @@ def _contains_forbidden_coding_memory_key(value: Any) -> bool:
     return False
 
 
-def inspect_coding_memory_source(path: str) -> dict[str, Any]:
-    """Validate and hash one redacted Grabowski outbox JSONL without mutating it."""
+def read_coding_memory_source(path: str) -> tuple[dict[str, Any], bytes]:
+    """Validate one redacted Grabowski outbox JSONL and return its metadata and exact bytes.
+
+    The returned bytes are exactly what was read and validated; callers that need to hand
+    the source to an external process must stage a private copy of these bytes rather than
+    re-reading (and re-trusting) the original path.
+    """
     if not isinstance(path, str) or not path.strip():
         raise ValueError("Chronik outbox path must be non-empty text")
     candidate = Path(path).expanduser()
@@ -952,37 +1088,16 @@ def inspect_coding_memory_source(path: str) -> dict[str, Any]:
             raise ValueError(
                 f"Chronik outbox source has invalid JSON at line {line_number}"
             ) from exc
-        if not isinstance(event, dict):
-            raise ValueError(f"Chronik outbox event {line_number} must be an object")
-        if event.get("schema_version") != "agent-run-event.v0":
-            raise ValueError(f"Chronik outbox event {line_number} has invalid schema")
-        source = event.get("source")
-        if (
-            not isinstance(source, dict)
-            or source.get("repo") != "heimgewebe/grabowski"
-            or source.get("component") != "grabowski"
-        ):
-            raise ValueError(
-                f"Chronik outbox event {line_number} is not from Grabowski"
-            )
-        if event.get("kind") not in {
-            "agent.run.started",
-            "agent.run.completed",
-            "agent.run.blocked",
-        }:
-            raise ValueError(f"Chronik outbox event {line_number} has unsupported kind")
-        if _contains_forbidden_coding_memory_key(event):
-            raise ValueError(f"Chronik outbox event {line_number} is not redacted")
-        claimed_event_id = event.get("event_id")
-        if claimed_event_id != event_id(event):
-            raise ValueError(f"Chronik outbox event {line_number} has invalid event_id")
-        event_ids.append(claimed_event_id)
+        _validate_agent_run_event_shape(
+            event, label=f"Chronik outbox event {line_number}"
+        )
+        event_ids.append(event["event_id"])
         canonical_events.append(_canonical_bytes(event))
     if not event_ids:
         raise ValueError("Chronik outbox source is empty")
     if len(event_ids) != len(set(event_ids)):
         raise ValueError("Chronik outbox source contains duplicate event IDs")
-    return {
+    metadata = {
         "path": str(resolved),
         "sha256": _sha256_bytes(raw),
         "bytes": len(raw),
@@ -992,6 +1107,39 @@ def inspect_coding_memory_source(path: str) -> dict[str, Any]:
         "chronik_source_sha256": _sha256_bytes(b"\n".join(canonical_events)),
         "identity": identity,
     }
+    return metadata, raw
+
+
+def inspect_coding_memory_source(path: str) -> dict[str, Any]:
+    """Validate and hash one redacted Grabowski outbox JSONL without mutating it."""
+    metadata, _raw = read_coding_memory_source(path)
+    return metadata
+
+
+def coding_memory_source_unchanged(
+    source: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Compare one source to validated metadata without reparsing JSON."""
+    try:
+        loaded = _read_regular_file(
+            Path(source["path"]),
+            maximum=MAX_CODING_MEMORY_SOURCE_BYTES,
+            label="Chronik coding-memory source readback",
+        )
+    except (OSError, ValueError) as exc:
+        return False, str(exc)
+    if loaded is None:
+        return False, "Chronik coding-memory source disappeared after snapshot"
+    raw, identity = loaded
+    unchanged = (
+        _sha256_bytes(raw) == source.get("sha256")
+        and len(raw) == source.get("bytes")
+        and identity == source.get("identity")
+    )
+    return (
+        unchanged,
+        None if unchanged else "Chronik coding-memory source changed after snapshot",
+    )
 
 
 def coding_memory_configuration() -> dict[str, Any]:
@@ -1007,8 +1155,12 @@ def coding_memory_configuration() -> dict[str, Any]:
     ).expanduser()
     cli = repository / "tools" / "coding_memory.py"
     reason = None
-    if repository.is_symlink() or not repository.is_dir():
+    if not repository.is_absolute():
         reason = "chronik_repository_unavailable"
+    elif repository.is_symlink() or not repository.is_dir():
+        reason = "chronik_repository_unavailable"
+    elif not data_dir.is_absolute():
+        reason = "chronik_data_dir_unavailable"
     elif cli.is_symlink() or not cli.is_file():
         reason = "chronik_coding_memory_cli_unavailable"
     return {
