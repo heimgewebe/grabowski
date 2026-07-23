@@ -8280,7 +8280,7 @@ def repoground_context_pack(
             "runtime_correctness",
         ],
     }
-    return {
+    payload = {
         "kind": "grabowski.repoground_context_pack",
         "schema_version": 1,
         "repo": repo,
@@ -8343,6 +8343,31 @@ def repoground_context_pack(
         ],
     }
 
+
+    deterministic_payload = json.loads(json.dumps(payload, sort_keys=True))
+    deterministic_context_ref = deterministic_payload.get("context_ref")
+    if isinstance(deterministic_context_ref, dict):
+        deterministic_context_ref.pop("generated_at", None)
+    deterministic_sha256 = hashlib.sha256(
+        json.dumps(
+            deterministic_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["determinism"] = {
+        "schema_version": 1,
+        "contract": "stable_except_declared_volatile_fields",
+        "volatile_fields": ["context_ref.generated_at"],
+        "content_sha256": deterministic_sha256,
+        "does_not_establish": [
+            "semantic_equivalence_from_hash_equality",
+            "semantic_completeness",
+            "truth",
+        ],
+    }
+    return payload
 
 _REPOGROUND_REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]{1,200}\Z")
 _REPOGROUND_SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")

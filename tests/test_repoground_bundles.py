@@ -646,6 +646,50 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(ref["freshness_status"], "fresh")
         self.assertEqual(ref["preflight_status"], "pass")
 
+    def test_context_pack_declares_timestamp_volatility_and_stable_content_hash(self) -> None:
+        dt = __import__("datetime")
+        first_time = dt.datetime(2026, 7, 23, 10, 0, 0, tzinfo=dt.timezone.utc)
+        second_time = dt.datetime(2026, 7, 23, 10, 5, 0, tzinfo=dt.timezone.utc)
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+        with patch.object(mcp, "_repoground_agent_preflight", return_value=preflight):
+            with patch.object(mcp, "datetime") as mocked_datetime:
+                mocked_datetime.now.return_value = first_time
+                first = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+                mocked_datetime.now.return_value = second_time
+                second = mcp.repoground_context_pack("demo-repo", "basic_repo_question")
+
+        self.assertNotEqual(
+            first["context_ref"]["generated_at"], second["context_ref"]["generated_at"]
+        )
+        self.assertEqual(
+            first["determinism"]["content_sha256"],
+            second["determinism"]["content_sha256"],
+        )
+        self.assertEqual(
+            first["determinism"]["volatile_fields"], ["context_ref.generated_at"]
+        )
+
+    def test_context_pack_determinism_contract_holds_for_two_repository_bundles(self) -> None:
+        hashes = []
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+        for repo_name, stem in (
+            ("first-repo", "first-repo-max-260701-1200"),
+            ("second-repo", "second-repo-max-260701-1200"),
+        ):
+            _repo, head = self._git_repo(repo_name)
+            self._write_bundle(stem, commit=head)
+            with patch.object(mcp, "_repoground_agent_preflight", return_value=preflight):
+                cold = mcp.repoground_context_pack(repo_name, "basic_repo_question")
+                warm = mcp.repoground_context_pack(repo_name, "basic_repo_question")
+            self.assertEqual(
+                cold["determinism"]["content_sha256"],
+                warm["determinism"]["content_sha256"],
+            )
+            hashes.append(cold["determinism"]["content_sha256"])
+        self.assertNotEqual(hashes[0], hashes[1])
+
     def test_context_pack_rejects_cross_repo_stem(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         self._write_bundle("other-repo-max-260701-1200", commit=head)

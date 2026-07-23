@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "task_id": "REPOGROUND-AGENT-UTILITY-V1-T010",
+  "captured_at": "2026-07-23T20:21:26Z",
+  "finding": {
+    "root_cause": "repoground_context_pack emits context_ref.generated_at from the current UTC clock on every successful read",
+    "classification": "declared volatile metadata",
+    "contract": "stable_except_declared_volatile_fields",
+    "volatile_fields": [
+      "context_ref.generated_at"
+    ],
+    "preserved_evidence": true,
+    "semantic_equality_claimed": false
+  },
+  "fresh_process_observations": [
+    {
+      "repo": "bureau",
+      "stem": "heimgewebe__bureau__main-max-260723-1701",
+      "bundle_commit": "1aa71b15b889318ffd45401ff2b2e66db3c81f30",
+      "live_commit_at_claim": "07e6842bd80e65e3872eef983e525cb47362d374",
+      "manifest_sha256": "5b5e8186f8b5a571f24fb28337937bd23585162f6929b2db23f31b59fa3f031b",
+      "freshness_status": "stale",
+      "process_count": 2,
+      "content_sha256": "6fd746c27e727091633358a79b8796d0a7d57fd121f37ddad80d047f86bd73fb",
+      "content_sha256_equal": true
+    },
+    {
+      "repo": "weltgewebe",
+      "stem": "heimgewebe__weltgewebe__main-max-260723-1700",
+      "bundle_commit": "8a327d8cf59028021b4a277232f21afa1df48423",
+      "live_commit_at_claim": "7b53fcb0fd79c8b0dd2ebabaa8c31673bc442429",
+      "manifest_sha256": "61f58bf220626f1e5f079d3b16b829a6ec343c014421b5a77b5a4810186fd7a1",
+      "freshness_status": "stale",
+      "process_count": 2,
+      "generated_at_values": [
+        "2026-07-23T20:21:25Z",
+        "2026-07-23T20:21:26Z"
+      ],
+      "content_sha256": "846292158632d29ee81d759f232ea148f1f40b2eacfad588168d5c033d642813",
+      "content_sha256_equal": true
+    }
+  ],
+  "test_evidence": {
+    "fresh_repository_bundle_count": 2,
+    "fresh_repository_bundles_are_test_fixtures": true,
+    "warm_and_cold_contract_covered": true,
+    "repoground_bundle_tests": "62 passed, 12 subtests passed",
+    "focused_tests": "4 passed",
+    "ruff_runtime": "pass",
+    "git_diff_check": "pass"
+  },
+  "does_not_establish": [
+    "live_bundle_freshness",
+    "semantic_equivalence_from_hash_equality",
+    "semantic_completeness",
+    "truth",
+    "automatic_default_routing",
+    "repoground_write_authority"
+  ]
+}
