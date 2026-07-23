@@ -64,7 +64,16 @@ class AuditSegmentLifecycleTests(unittest.TestCase):
                     status["total_records"],
                     30 + status["archived_segment_count"],
                 )
-                records = grabowski_mcp._audit_records()
+                records, snapshot_status = grabowski_mcp._audit_records_snapshot()
+                self.assertEqual(snapshot_status["total_records"], len(records))
+                self.assertEqual(
+                    snapshot_status["last_record_sha256"],
+                    records[-1]["record_sha256"],
+                )
+                self.assertEqual(
+                    snapshot_status["archived_segment_count"],
+                    status["archived_segment_count"],
+                )
                 operations = [item.get("operation") for item in records]
                 self.assertEqual(operations.count("segment-test"), 30)
                 first = grabowski_mcp._find_transaction_record(

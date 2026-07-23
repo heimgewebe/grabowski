@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "84d8147c050eddfb1aa6f9072f0642c5d25004c220bf3cf77e96d199ecfcae38",
+  "capability_source_sha256": "9a0dc42bc0e5e0cba9040f2572e1562dd5649b82606d1c6c01aa40a25c4c347f",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "fc272cc9a406566f39d2ee9ea9fd9ccd0a52dca05232d2016ece26872bd1cd24",
+  "contract_sha256": "352b5c9043149b6c59ba4e0b49b0d18cbb609b7396345ad686c372bc84264ad7",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -438,6 +438,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_runtime_health"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Project verified audit-chain records into bounded operational trends.",
+      "effects": [],
+      "id": "grabowski_audit_projection",
+      "purpose": "Derive bounded source-bound operational trends from the verified audit chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_audit_projection"
     },
     {
       "category": "context",

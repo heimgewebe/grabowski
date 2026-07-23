@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
@@ -46,7 +47,12 @@ def _load_read_surface():
     base.AUDIT_LOG = Path("/tmp/audit")
     base._resolve_existing = lambda raw, kind: Path(raw)
     base._deployment_metadata = lambda: {}
-    base._verify_audit_log = lambda path: {"valid": True}
+    base._verify_audit_log = lambda path: {"valid": True, "total_records": 0, "last_record_sha256": None}
+    base._audit_records_snapshot = lambda: (
+        [],
+        {"valid": True, "total_records": 0, "last_record_sha256": None},
+    )
+    base._audit_records = lambda: []
     base._kill_switch_state = lambda: {"engaged": False}
     base._read_limited_process_pipes = lambda *args, **kwargs: (b"", b"", False, False, False)
     capabilities = types.ModuleType("grabowski_capabilities")
@@ -270,6 +276,492 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(parsed["data"][0]["state"], "PENDING")
         self.assertEqual(parsed["stdout"], "")
 
+    def test_audit_projection_binds_verified_snapshot_and_fixed_windows(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "resource-acquire",
+                "timestamp": datetime.fromtimestamp(
+                    now - 60, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "a" * 64,
+                "resource_keys": ["repo:/work/demo", "path:/work/demo/file"],
+                "reclaimed_count": 2,
+            },
+            {
+                "operation": "bureau-candidate-record",
+                "timestamp": datetime.fromtimestamp(
+                    now - 120, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "b" * 64,
+                "bureau_status": "failed",
+                "bureau_code": "request-schema-unsupported",
+                "effect_started": False,
+            },
+            {
+                "operation": "bureau-candidate-record",
+                "timestamp": datetime.fromtimestamp(
+                    now - 180, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "c" * 64,
+                "bureau_status": "failed",
+                "bureau_code": "request-schema-unsupported",
+                "effect_started": False,
+            },
+            {
+                "operation": "bureau-candidate-record",
+                "timestamp": datetime.fromtimestamp(
+                    now - 240, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "d" * 64,
+                "bureau_status": "failed",
+                "bureau_code": "request-schema-unsupported",
+                "effect_started": False,
+            },
+            {
+                "operation": "bureau-task-publish",
+                "timestamp": datetime.fromtimestamp(
+                    now - 270, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "e" * 64,
+                "bureau_status": "published",
+                "bureau_code": "publication-complete",
+                "effect_started": True,
+            },
+            {
+                "operation": "remove",
+                "timestamp": datetime.fromtimestamp(
+                    now - 300, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "f" * 64,
+                "before_sha256": "0" * 64,
+                "after_sha256": None,
+                "rollback": {"available": True},
+            },
+        ]
+        status = {
+            "valid": True,
+            "total_records": len(records),
+            "total_legacy_records": 0,
+            "last_record_sha256": "f" * 64,
+            "archived_segment_count": 2,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection(
+                view="standard", top_limit=5
+            )
+        self.assertEqual(result["projection_kind"], "audit_projection.v1")
+        self.assertEqual(result["source_binding"]["record_count"], len(records))
+        self.assertEqual(result["source_binding"]["last_record_sha256"], "f" * 64)
+        self.assertEqual(
+            [item["label"] for item in result["windows"]], ["24h", "7d", "30d"]
+        )
+        self.assertEqual(result["windows"][0]["record_count"], len(records))
+        self.assertEqual(
+            result["windows"][0]["resource_activity"][
+                "resource_reclamation_event_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            result["windows"][0]["resource_activity"]["reclaimed_resource_count"], 2
+        )
+        self.assertNotIn(
+            "repeated_resource_reclamation",
+            [item["pattern"] for item in result["candidate_patterns"]],
+        )
+        self.assertEqual(
+            result["windows"][0]["mutation_evidence"]["rollback_available"], 1
+        )
+        self.assertEqual(
+            result["candidate_patterns"][0]["pattern"],
+            "repeated_bureau_contract_failures",
+        )
+        self.assertEqual(
+            result["candidate_patterns"][0]["top_codes"][0],
+            {"code": "request-schema-unsupported", "count": 3},
+        )
+        self.assertNotIn(
+            "publication-complete",
+            json.dumps(result["windows"][0]["top_bureau_failure_codes"]),
+        )
+        self.assertEqual(result["candidate_patterns"][0]["authority"], "proposal_only")
+        self.assertNotIn("owner_id", json.dumps(result))
+        self.assertNotIn("/work/demo", json.dumps(result))
+
+
+    def test_audit_projection_redacts_untrusted_dimension_labels(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "/home/alex/private-operation",
+                "timestamp": datetime.fromtimestamp(
+                    now - 60, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "a" * 64,
+                "bureau_code": "secret /home/alex/private-code",
+                "resource_keys": ["secret /home/alex:private-resource"],
+            },
+            {
+                "operation": "friction-record",
+                "timestamp": datetime.fromtimestamp(
+                    now - 30, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "b" * 64,
+                "kind": "secret /home/alex/private-kind",
+                "surface": "secret /home/alex/private-surface",
+            },
+        ]
+        status = {
+            "valid": True,
+            "total_records": 2,
+            "total_legacy_records": 0,
+            "last_record_sha256": "b" * 64,
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection(
+                view="evidence", top_limit=10
+            )
+        encoded = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("/home/alex", encoded)
+        self.assertNotIn("private-operation", encoded)
+        self.assertNotIn("private-code", encoded)
+        self.assertNotIn("private-resource", encoded)
+        self.assertNotIn("private-kind", encoded)
+        self.assertNotIn("private-surface", encoded)
+        self.assertIn("<redacted>", encoded)
+
+    def test_audit_projection_counts_reclamation_events_separately(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "resource-acquire",
+                "timestamp": datetime.fromtimestamp(
+                    now - offset, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": f"{index:x}" * 64,
+                "reclaimed_count": count,
+            }
+            for index, (offset, count) in enumerate(
+                ((60, 1), (120, 2), (180, 3)), start=1
+            )
+        ]
+        status = {
+            "valid": True,
+            "total_records": 3,
+            "total_legacy_records": 0,
+            "last_record_sha256": "3" * 64,
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection()
+        activity = result["windows"][0]["resource_activity"]
+        self.assertEqual(activity["resource_reclamation_event_count"], 3)
+        self.assertEqual(activity["reclaimed_resource_count"], 6)
+        candidate = next(
+            item
+            for item in result["candidate_patterns"]
+            if item["pattern"] == "repeated_resource_reclamation"
+        )
+        self.assertEqual(candidate["event_count_7d"], 3)
+        self.assertEqual(candidate["reclaimed_resource_count_7d"], 6)
+
+    def test_audit_projection_findings_hash_ignores_window_clock_edges(self) -> None:
+        record = {
+            "operation": "task-start",
+            "timestamp": datetime.fromtimestamp(1_800_000_000 - 60, tz=timezone.utc).isoformat(),
+            "record_sha256": "a" * 64,
+        }
+        status = {
+            "valid": True,
+            "total_records": 1,
+            "total_legacy_records": 0,
+            "last_record_sha256": "a" * 64,
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=([record], status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", side_effect=[1_800_000_000, 1_800_000_030]),
+        ):
+            first = read_surface.grabowski_audit_projection()
+            second = read_surface.grabowski_audit_projection()
+        self.assertEqual(first["findings_sha256"], second["findings_sha256"])
+        self.assertNotEqual(first["projection_sha256"], second["projection_sha256"])
+
+    def test_audit_projection_findings_hash_is_presentation_independent(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": operation,
+                "timestamp": datetime.fromtimestamp(
+                    now - offset, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": f"{index:064x}",
+            }
+            for index, (operation, offset) in enumerate(
+                (("task-start", 60), ("resource-acquire", 120), ("friction-record", 180)),
+                start=1,
+            )
+        ]
+        status = {
+            "valid": True,
+            "total_records": len(records),
+            "total_legacy_records": 0,
+            "last_record_sha256": records[-1]["record_sha256"],
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            minimal = read_surface.grabowski_audit_projection(
+                view="minimal", top_limit=1
+            )
+            evidence = read_surface.grabowski_audit_projection(
+                view="evidence", top_limit=25
+            )
+        self.assertEqual(minimal["findings_sha256"], evidence["findings_sha256"])
+        self.assertNotEqual(minimal["projection_sha256"], evidence["projection_sha256"])
+
+    def test_audit_projection_fails_closed_for_invalid_chain(self) -> None:
+        with patch.object(
+            read_surface.base,
+            "_audit_records_snapshot",
+            side_effect=ValueError("previous-hash-mismatch"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "previous-hash-mismatch"):
+                read_surface.grabowski_audit_projection()
+
+    def test_audit_projection_reports_concurrent_advance_without_rebinding_snapshot(
+        self,
+    ) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "task-start",
+                "timestamp": datetime.fromtimestamp(
+                    now - 1, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": "a" * 64,
+            }
+        ]
+        before = {
+            "valid": True,
+            "total_records": 1,
+            "total_legacy_records": 7,
+            "last_record_sha256": "a" * 64,
+            "archived_segment_count": 2,
+            "audit_writable": True,
+        }
+        after = {
+            "valid": True,
+            "total_records": 2,
+            "total_legacy_records": 8,
+            "last_record_sha256": "b" * 64,
+            "archived_segment_count": 3,
+            "audit_writable": False,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, before),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=after),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            result = read_surface.grabowski_audit_projection()
+        self.assertTrue(result["source_binding"]["advanced_during_projection"])
+        self.assertEqual(result["source_binding"]["last_record_sha256"], "a" * 64)
+        self.assertEqual(
+            result["warnings"][0]["code"], "audit_advanced_during_projection"
+        )
+        self.assertEqual(result["warnings"][1]["count"], 7)
+        self.assertEqual(result["source_binding"]["archived_segment_count"], 2)
+        self.assertTrue(result["source_binding"]["audit_writable"])
+        self.assertEqual(result["source_binding"]["post_read_total_records"], 2)
+
+    def test_audit_projection_rejects_non_integer_top_limit(self) -> None:
+        for value in (True, False, 1.5, "2", None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "top_limit"):
+                    read_surface.grabowski_audit_projection(top_limit=value)
+
+    def test_audit_projection_views_and_field_projection(self) -> None:
+        now = 1_800_000_000
+        record = {
+            "operation": "task-start",
+            "timestamp": datetime.fromtimestamp(
+                now - 60, tz=timezone.utc
+            ).isoformat(),
+            "record_sha256": "a" * 64,
+        }
+        status = {
+            "valid": True,
+            "total_records": 1,
+            "total_legacy_records": 0,
+            "last_record_sha256": "a" * 64,
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=([record], status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+        ):
+            minimal = read_surface.grabowski_audit_projection(view="minimal")
+            evidence = read_surface.grabowski_audit_projection(view="evidence")
+            projected = read_surface.grabowski_audit_projection(
+                fields=["findings_sha256"]
+            )
+        self.assertNotIn("top_failure_reasons", minimal["windows"][0])
+        self.assertNotIn("operation_counts", minimal["windows"][0])
+        self.assertIn("top_failure_reasons", evidence["windows"][0])
+        self.assertIn("operation_counts", evidence["windows"][0])
+        self.assertIn("timestamp_quality", evidence["all_time"])
+        self.assertIn("findings_sha256", projected)
+        self.assertIn("projection_sha256", projected)
+        self.assertEqual(projected["findings_sha256"], minimal["findings_sha256"])
+        self.assertEqual(projected["projection_sha256"], minimal["projection_sha256"])
+        self.assertNotIn("windows", projected)
+        self.assertIn("source_binding", projected)
+        self.assertIn("windows", projected["projection"]["omitted_fields"])
+        self.assertIn(
+            "projection_sha256", projected["projection"]["required_fields_preserved"]
+        )
+
+    def test_audit_projection_parses_each_timestamp_once(self) -> None:
+        now = 1_800_000_000
+        records = [
+            {
+                "operation": "task-start",
+                "timestamp": datetime.fromtimestamp(
+                    now - index, tz=timezone.utc
+                ).isoformat(),
+                "record_sha256": f"{index:064x}",
+            }
+            for index in range(1, 101)
+        ]
+        status = {
+            "valid": True,
+            "total_records": len(records),
+            "total_legacy_records": 0,
+            "last_record_sha256": records[-1]["record_sha256"],
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        original = read_surface._audit_timestamp_unix
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=(records, status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", return_value=now),
+            patch.object(
+                read_surface, "_audit_timestamp_unix", wraps=original
+            ) as parser,
+        ):
+            read_surface.grabowski_audit_projection()
+        self.assertEqual(parser.call_count, len(records))
+
+    def test_audit_projection_rejects_snapshot_binding_mismatch(self) -> None:
+        record = {
+            "operation": "task-start",
+            "timestamp": "2027-01-15T08:00:00+00:00",
+            "record_sha256": "a" * 64,
+        }
+        status = {
+            "valid": True,
+            "total_records": 2,
+            "last_record_sha256": "a" * 64,
+        }
+        with patch.object(
+            read_surface.base,
+            "_audit_records_snapshot",
+            return_value=([record], status),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "snapshot binding mismatch"):
+                read_surface.grabowski_audit_projection()
+
+    def test_audit_projection_findings_hash_changes_when_window_membership_changes(
+        self,
+    ) -> None:
+        now = 1_800_000_000
+        record = {
+            "operation": "task-start",
+            "timestamp": datetime.fromtimestamp(
+                now - 86_400 + 10, tz=timezone.utc
+            ).isoformat(),
+            "record_sha256": "a" * 64,
+        }
+        status = {
+            "valid": True,
+            "total_records": 1,
+            "total_legacy_records": 0,
+            "last_record_sha256": "a" * 64,
+            "archived_segment_count": 0,
+            "audit_writable": True,
+        }
+        with (
+            patch.object(
+                read_surface.base,
+                "_audit_records_snapshot",
+                return_value=([record], status),
+            ),
+            patch.object(read_surface.base, "_verify_audit_log", return_value=status),
+            patch.object(read_surface.time, "time", side_effect=[now, now + 30]),
+        ):
+            first = read_surface.grabowski_audit_projection()
+            second = read_surface.grabowski_audit_projection()
+        self.assertEqual(first["windows"][0]["record_count"], 1)
+        self.assertEqual(second["windows"][0]["record_count"], 0)
+        self.assertNotEqual(first["findings_sha256"], second["findings_sha256"])
     def test_contract_drift_combines_structural_and_semantic_health(self) -> None:
         healthy_router = types.ModuleType("grabowski_coding_agent_router")
         healthy_router.coding_agent_catalog_health = lambda: {
@@ -305,7 +797,7 @@ class ReadSurfaceTests(unittest.TestCase):
     def test_contract_contains_all_read_tools(self) -> None:
         contract = json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8"))
         expected = set(contract["expected_tools"])
-        required = {"grabowski_runtime_health", "grabowski_deployment_identity", "grabowski_contract_drift", "grabowski_checkout_summary", "grabowski_git_status", "grabowski_git_diff", "grabowski_git_log", "grabowski_git_show", "grabowski_github_pr_view", "grabowski_github_checks", "grabowski_service_status", "grabowski_service_logs"}
+        required = {"grabowski_runtime_health", "grabowski_audit_projection", "grabowski_deployment_identity", "grabowski_contract_drift", "grabowski_checkout_summary", "grabowski_git_status", "grabowski_git_diff", "grabowski_git_log", "grabowski_git_show", "grabowski_github_pr_view", "grabowski_github_checks", "grabowski_service_status", "grabowski_service_logs"}
         self.assertTrue(required.issubset(expected))
         supporting = {item["module"]: item["source"] for item in contract["supporting_sources"]}
         self.assertEqual(supporting["grabowski_read_surface"], "src/grabowski_read_surface.py")

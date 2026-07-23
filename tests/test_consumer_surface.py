@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 from contextlib import ExitStack
 import hashlib
-import json
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
