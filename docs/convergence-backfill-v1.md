@@ -6,16 +6,18 @@
 
 Die v1-Projektion liest zwei bestehende Autoritäten:
 
-- Operator-Obligationen aus dem create-only Obligation-Store mit Filter `attention` und maximal 100 gelesenen Records.
+- Operator-Obligationen aus dem create-only Obligation-Store mit Filter `attention`. Das Leselimit entspricht dem angeforderten `max_records` und ist dadurch auf höchstens 100 Records begrenzt.
 - Die kanonische Bureau-Attention-Klassifikation `bureau.cycle_contract.classify_task_attention()` aus der durch `bureau --json runtime-identity` verifizierten immutable Bureau-Runtime. T060 erfindet keine zweite Bureau-Attention-Semantik.
 
 Für Bureau werden die Gruppen `stale_running`, `current_outcome_unknown`, `recent_failed`, `legacy_outcome_unavailable` und `historical_failed` übernommen. `stale_running`, `current_outcome_unknown` und `recent_failed` bleiben ausdrücklich als aktuelle Bureau-Attention markiert; die beiden übrigen Gruppen bleiben historische Diagnose. `healthy_running` und allgemeine `terminal_history` gehören nicht zum T060-Attention-Backfill.
 
-Die Bureau-Klassifikation erhält einen expliziten `observation_unix` und einen gebundenen Attention-Horizont. Dadurch ist die zeitabhängige Einordnung mit derselben Beobachtungszeit reproduzierbar. Die Projektion bindet zusätzlich Bureau-Release-ID, Source-Commit, Manifest-SHA-256 und Package-Tree-SHA-256.
+Die Bureau-Klassifikation erhält einen expliziten `observation_unix`, einen gebundenen Attention-Horizont und `limit=max_records`. Das Bureau-Limit gilt kanonisch pro Gruppe; die vollständigen Gruppenzahlen bleiben trotzdem in `counts` erhalten. Vor der globalen Auswahl können dadurch höchstens `len(BUREAU_ATTENTION_GROUPS) * max_records` relevante Bureau-Records materialisiert werden. Die Projektion bindet zusätzlich Bureau-Release-ID, Source-Commit, Manifest-SHA-256 und Package-Tree-SHA-256.
 
-Die kombinierte Auswahl ist auf höchstens 100 Records begrenzt. Operator-Obligationen werden vor Bureau-Attention-Records sortiert, innerhalb einer Quelle nach stabiler Record-ID. Die Projektion meldet Quell-Truncation und eine bekannte Untergrenze ausgelassener Records; bei einer abgeschnittenen Quelle behauptet sie keine exakte vollständige Inventur.
+Die kombinierte Auswahl ist auf höchstens 100 Records begrenzt. Operator-Obligationen werden vor Bureau-Attention-Records sortiert, innerhalb Bureau nach kanonischer Gruppenreihenfolge und anschließend nach stabiler Record-ID.
 
-Jeder ausgewählte Quellrecord enthält eine stabile Record-ID, einen Quell-Beobachtungszeitpunkt und einen SHA-256-Inhaltshinweis. Operator-Obligationen binden an die Hashes ihrer Open-/Close-Dateien. Bureau-Attention-Records binden an die kanonische Bureau-Gruppe, den bounded Task-Record, den Bureau-Source-Commit, Beobachtungszeit und Attention-Horizont.
+`selection_truncated` meldet konservativ, wenn die globale Auswahl oder eine Quelle abgeschnitten sein kann. `known_omitted_count_lower_bound` zählt dagegen nur beweisbar mindestens ausgelassene Records: geladene Kandidaten außerhalb der globalen Auswahl plus die Differenz zwischen vollständigen Bureau-Gruppenzahlen und tatsächlich gelieferten Bureau-Items. Ein `scan_truncated` der Operator-Obligation-Liste erhöht diese bekannte Untergrenze nicht automatisch, weil verbleibende Store-Einträge nicht zwingend den `attention`-Filter erfüllen. Bei einer abgeschnittenen Quelle behauptet die Projektion daher keine exakte vollständige Inventur.
+
+Jeder ausgewählte Quellrecord enthält eine stabile Record-ID, einen Quell-Beobachtungszeitpunkt und einen SHA-256-Inhaltshinweis. Operator-Obligationen binden an die Hashes ihrer Open-/Close-Dateien; eine noch offene Obligation bindet `close_file_sha256` deterministisch als `null`. Bureau-Attention-Records binden an die kanonische Bureau-Gruppe, den bounded Task-Record, den Bureau-Source-Commit, Beobachtungszeit und Attention-Horizont.
 
 ## Klassifikation
 
@@ -29,7 +31,7 @@ Standardabbildung:
 - Bureau `recent_failed` und `historical_failed` liefern Failure-Evidenz.
 - Bureau `current_outcome_unknown` und `legacy_outcome_unavailable` bleiben ohne erfundene terminale Evidenz `unknown`.
 
-Zusätzliche `expected`, `blocking`, `superseding` oder `resolution` Evidenz darf nur als expliziter, SHA-256-gebundener Override für einen Record innerhalb der ausgewählten bounded Snapshot-Menge eingespeist werden. Ein Tippfehler oder Override außerhalb der Auswahl blockiert fail-closed.
+Zusätzliche `expected`, `blocking`, `superseding` oder `resolution` Evidenz darf nur als expliziter, SHA-256-gebundener Override für einen Record innerhalb der ausgewählten bounded Snapshot-Menge eingespeist werden. Ein Tippfehler oder Override außerhalb der Auswahl blockiert fail-closed. Dieselbe Override-Logik gilt für ausgewählte Operator-Obligationen und Bureau-Attention-Records.
 
 ## Determinismus und Receipts
 
