@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
-from contextlib import contextmanager
 import hashlib
 import io
 import json
