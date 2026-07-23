@@ -20,6 +20,7 @@ STATE_ROOT_ENV = "GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT"
 PLEXER_EVENTS_URL_ENV = "GRABOWSKI_PLEXER_EVENTS_URL"
 CODING_MEMORY_REPO_ENV = "GRABOWSKI_CHRONIK_CODING_MEMORY_REPO"
 CODING_MEMORY_DATA_DIR_ENV = "GRABOWSKI_CHRONIK_CODING_MEMORY_DATA_DIR"
+CODING_MEMORY_PYTHON_ENV = "GRABOWSKI_CHRONIK_CODING_MEMORY_PYTHON"
 TASK_ENABLED_FIELD = "chronik_outbox_enabled"
 TASK_STATE_ROOT_FIELD = "chronik_outbox_state_root"
 TASK_CONTEXT_FIELD = "chronik_context_json"
@@ -1162,31 +1163,65 @@ def coding_memory_source_unchanged(
     )
 
 
+def _resolve_coding_memory_repository(configured: Path) -> Path | None:
+    """Resolve a direct checkout or the canonical immutable Chronik release pointer."""
+    if not configured.is_absolute():
+        return None
+    if not configured.is_symlink():
+        return configured if configured.is_dir() else None
+    if configured.name != "current":
+        return None
+    try:
+        resolved = configured.resolve(strict=True)
+    except OSError:
+        return None
+    releases = configured.parent / "releases"
+    if (
+        resolved.is_symlink()
+        or not resolved.is_dir()
+        or resolved.parent != releases
+        or re.fullmatch(r"[0-9a-f]{40}", resolved.name) is None
+    ):
+        return None
+    return resolved
+
+
 def coding_memory_configuration() -> dict[str, Any]:
     """Resolve the optional local Chronik coding-memory CLI without requiring it."""
-    repository = Path(
-        os.environ.get(CODING_MEMORY_REPO_ENV, str(Path.home() / "repos" / "chronik"))
+    configured_repository = Path(
+        os.environ.get(
+            CODING_MEMORY_REPO_ENV,
+            str(Path.home() / ".local" / "lib" / "chronik" / "current"),
+        )
     ).expanduser()
     data_dir = Path(
         os.environ.get(
             CODING_MEMORY_DATA_DIR_ENV,
-            str(Path.home() / ".local" / "state" / "chronik"),
+            str(Path.home() / ".local" / "state" / "chronik" / "data"),
         )
     ).expanduser()
-    cli = repository / "tools" / "coding_memory.py"
+    runtime_python = Path(
+        os.environ.get(
+            CODING_MEMORY_PYTHON_ENV,
+            str(Path.home() / "repos" / "chronik" / ".venv" / "bin" / "python"),
+        )
+    ).expanduser()
+    repository = _resolve_coding_memory_repository(configured_repository)
+    cli = (repository or configured_repository) / "tools" / "coding_memory.py"
     reason = None
-    if not repository.is_absolute():
-        reason = "chronik_repository_unavailable"
-    elif repository.is_symlink() or not repository.is_dir():
+    if repository is None:
         reason = "chronik_repository_unavailable"
     elif not data_dir.is_absolute():
         reason = "chronik_data_dir_unavailable"
+    elif not runtime_python.is_absolute() or not runtime_python.is_file() or not os.access(runtime_python, os.X_OK):
+        reason = "chronik_python_unavailable"
     elif cli.is_symlink() or not cli.is_file():
         reason = "chronik_coding_memory_cli_unavailable"
     return {
         "available": reason is None,
         "reason": reason,
-        "repository": str(repository),
+        "repository": str(repository or configured_repository),
         "data_dir": str(data_dir),
+        "python": str(runtime_python),
         "cli": str(cli),
     }

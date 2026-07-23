@@ -147,14 +147,15 @@ The task-local `chronik_context_json` remains the persisted context truth. It is
 Two typed tools expose the optional local coding-memory seam:
 
 - `grabowski_chronik_outbox_import(path)` imports exactly one existing `grabowski_*.jsonl` directly below `chronik-outbox`. The source must contain only hash-valid, redacted `agent-run-event.v0` records from Grabowski. The adapter calls Chronik's existing positional `import INPUT` command, verifies that the source identity is unchanged afterwards, and returns a SHA-256-bound receipt. Re-import is delegated to Chronik's idempotent event-ID contract; the source is never deleted or compacted by this tool.
-- `grabowski_chronik_history(...)` calls Chronik's bounded `query` command for exactly one repository or host target. Its optional `component` filter follows Chronik's canonical producer/source-component semantics; task-context `subject.component` remains event metadata and is not silently reinterpreted as the CLI filter. The adapter verifies that Chronik's returned query envelope is exactly bound to the requested repository/host and rejects the response unless every returned event is a valid Grabowski event that matches the requested target and filters before anything is exposed. Every response is historical-only and explicitly does not establish current Git state, current CI state, current runtime state, or safe retry.
+- `grabowski_chronik_history(...)` calls Chronik's bounded `query` command for exactly one repository or host target. Its optional `component` filter follows Chronik's canonical producer/source-component semantics. A separate `subject_component` filter targets task-context `subject.component`; the two filters can be combined and are never silently reinterpreted as each other. The adapter verifies that Chronik's returned query envelope is exactly bound to the requested repository/host and rejects the response unless every returned event is a valid Grabowski event that matches the requested target and filters before anything is exposed. Every response is historical-only and explicitly does not establish current Git state, current CI state, current runtime state, or safe retry.
 
 The optional checkout and data directory are configured with:
 
 ```text
 GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT=/home/alex/.local/state
-GRABOWSKI_CHRONIK_CODING_MEMORY_REPO=/home/alex/repos/chronik
-GRABOWSKI_CHRONIK_CODING_MEMORY_DATA_DIR=/home/alex/.local/state/chronik
+GRABOWSKI_CHRONIK_CODING_MEMORY_REPO=/home/alex/.local/lib/chronik/current
+GRABOWSKI_CHRONIK_CODING_MEMORY_DATA_DIR=/home/alex/.local/state/chronik/data
+GRABOWSKI_CHRONIK_CODING_MEMORY_PYTHON=/home/alex/repos/chronik/.venv/bin/python
 ```
 
-A missing or stale checkout, missing `tools/coding_memory.py`, invalid CLI output, timeout, or non-zero exit is returned as a bounded unavailable result. These failures do not affect normal task creation, execution, reconciliation, or lifecycle event writing.
+The default repository pointer is Chronik's deployed `current` symlink. The default Python interpreter matches the existing Chronik outbox-import runtime venv instead of reusing Grabowski's dependency-isolated runtime. Grabowski resolves it before execution and accepts it only when it names one direct 40-hex release directory below the sibling `releases/` directory; arbitrary repository symlinks remain fail-closed. A missing or stale release, missing `tools/coding_memory.py`, invalid CLI output, timeout, or non-zero exit is returned as a bounded unavailable result. These failures do not affect normal task creation, execution, reconciliation, or lifecycle event writing.
