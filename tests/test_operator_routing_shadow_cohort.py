@@ -161,7 +161,7 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
         source = inspect.getsource(workspace.grabowski_agent_workspace_create)
         self.assertLess(
             source.index(
-                "_capture_routing_shadow_prospective_best_effort(_manifest(workspace_id))"
+                "_capture_routing_shadow_prospective_best_effort(manifest)"
             ),
             source.index("tasks.grabowski_task_start("),
         )

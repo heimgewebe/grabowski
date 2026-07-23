@@ -5271,7 +5271,7 @@ def grabowski_agent_workspace_create(
         evidence={"plan_sha256": plan_sha256, "binding": manifest["binding"]},
     )
     _write_manifest(manifest)
-    _capture_routing_shadow_prospective_best_effort(_manifest(workspace_id))
+    _capture_routing_shadow_prospective_best_effort(manifest)
     writer_task_argv = _writer_task_argv(manifest)
     writer_task_argv_sha256 = _task_argv_sha256(writer_task_argv)
     try:
