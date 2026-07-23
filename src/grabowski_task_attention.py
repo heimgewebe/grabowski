@@ -23,7 +23,9 @@ ATTENTION_VIEWS = frozenset({"current", "history"})
 CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS = frozenset(
     {"decision_closed", "decision_superseded"}
 )
+ARCHIVE_RESOLVED_CLASSIFICATIONS = CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
 TERMINAL_ATTENTION_STATES = frozenset({"failed", "timed_out", "signalled"})
+RECOVERY_ATTENTION_STATES = frozenset({"interrupted", "outcome_unknown"})
 ATTENTION_STATES = tuple(tasks.TASK_STATE_PROJECTIONS["attention"])
 MAX_RECORD_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 2_048
@@ -332,6 +334,7 @@ def _validate_outcome_receipt(
     record: dict[str, Any],
     binding: dict[str, Any],
     expected_receipt_sha256: str | None,
+    allowed_states: frozenset[str] = TERMINAL_ATTENTION_STATES,
 ) -> str:
     base_required = {
         "schema_version",
@@ -381,8 +384,8 @@ def _validate_outcome_receipt(
         raise TaskAttentionIntegrityError("task outcome receipt argv binding is invalid")
     if value["execution_envelope_sha256"] != binding["execution_envelope_sha256"]:
         raise TaskAttentionIntegrityError("task outcome receipt envelope binding is invalid")
-    if value["state"] not in TERMINAL_ATTENTION_STATES:
-        raise TaskAttentionIntegrityError("task outcome receipt is not a decision-eligible attention outcome")
+    if value["state"] not in allowed_states:
+        raise TaskAttentionIntegrityError("task outcome receipt state is not allowed for this closeout")
     observation = value["observation"]
     if not isinstance(observation, dict):
         raise TaskAttentionIntegrityError("task outcome observation is invalid")
@@ -544,6 +547,7 @@ def _read_valid_outcome(
     record: dict[str, Any],
     *,
     expected_receipt_sha256: str | None,
+    allowed_states: frozenset[str] = TERMINAL_ATTENTION_STATES,
 ) -> tuple[dict[str, Any], str, str]:
     binding = _task_binding(record)
     _terminalization_sha256, authoritative_receipt_sha256 = _lifecycle_binding(record)
@@ -591,6 +595,7 @@ def _read_valid_outcome(
                 record=record,
                 binding=binding,
                 expected_receipt_sha256=expected_receipt_sha256,
+                allowed_states=allowed_states,
             )
         except TaskAttentionConflictError as exc:
             if first_conflict is None:
@@ -850,6 +855,132 @@ def _classify_record(record: dict[str, Any]) -> dict[str, Any]:
     base["authority"] = decision["authority"]
     base["evidence_ref"] = decision["evidence_ref"]
     return base
+
+
+def terminal_closeout_plan(record: dict[str, Any]) -> dict[str, Any]:
+    """Project one task closeout without creating a second lifecycle truth.
+
+    The task row and authoritative lifecycle receipt remain the terminal-state
+    authority. Attention decisions remain create-only evidence. This projection
+    only joins both authorities to answer whether a retained terminal task is
+    ready for archival or still has exactly one concrete closeout obligation.
+    """
+    if not isinstance(record, dict):
+        raise TaskAttentionInputError("task closeout record must be an object")
+    binding = _task_binding(record)
+    state = record.get("state")
+    if not isinstance(state, str) or state not in tasks.TASK_STATES:
+        raise TaskAttentionInputError("task closeout state is invalid")
+
+    terminal = tasks._is_terminal_state(state)
+    lifecycle_evidence_valid = False
+    lifecycle_evidence_error: str | None = None
+    outcome_receipt_sha256: str | None = None
+    attention_classification = "not_required"
+    attention_decision: str | None = None
+
+    if state in TERMINAL_ATTENTION_STATES:
+        classified = _classify_record(record)
+        attention_classification = str(classified["classification"])
+        attention_decision = classified.get("decision")
+        outcome_receipt_sha256 = classified.get("outcome_receipt_sha256")
+        if attention_classification == "invalid_evidence":
+            lifecycle_evidence_error = str(
+                classified.get("evidence_error") or "TaskAttentionIntegrityError"
+            )
+        else:
+            lifecycle_evidence_valid = outcome_receipt_sha256 is not None
+    elif terminal:
+        try:
+            _outcome, outcome_receipt_sha256, _outcome_file_sha256 = _read_valid_outcome(
+                record,
+                expected_receipt_sha256=None,
+                allowed_states=frozenset(tasks.TASK_STATE_PROJECTIONS["terminal"]),
+            )
+            lifecycle_evidence_valid = True
+        except (
+            FileNotFoundError,
+            OSError,
+            TaskAttentionError,
+            TaskAttentionInputError,
+        ) as exc:
+            lifecycle_evidence_error = type(exc).__name__
+
+    operator_obligation: dict[str, Any] | None = None
+    if state in tasks.TASK_STATE_PROJECTIONS["active"]:
+        closeout_state = "active"
+        recommended_next_action = "observe the active task before closeout"
+    elif state in RECOVERY_ATTENTION_STATES:
+        closeout_state = "recovery_required"
+        operator_obligation = {
+            "kind": "reconcile_task",
+            "task_id": binding["task_id"],
+            "reason": f"task_state:{state}",
+        }
+        recommended_next_action = "reconcile authoritative task state before any closeout decision"
+    elif not terminal:
+        closeout_state = "blocking"
+        operator_obligation = {
+            "kind": "inspect_task_state",
+            "task_id": binding["task_id"],
+            "reason": f"task_state:{state}",
+        }
+        recommended_next_action = "inspect task state before closeout"
+    elif not lifecycle_evidence_valid:
+        closeout_state = "evidence_repair_required"
+        operator_obligation = {
+            "kind": "repair_terminal_evidence",
+            "task_id": binding["task_id"],
+            "reason": lifecycle_evidence_error or "terminal_evidence_invalid",
+        }
+        recommended_next_action = "repair terminal lifecycle evidence before attention or archive closeout"
+    elif state in TERMINAL_ATTENTION_STATES:
+        if attention_classification in ARCHIVE_RESOLVED_CLASSIFICATIONS:
+            closeout_state = "ready_to_archive"
+            recommended_next_action = "archive after retention and lifecycle revalidation"
+        elif attention_classification == "decision_deferred":
+            closeout_state = "attention_deferred"
+            operator_obligation = {
+                "kind": "resolve_deferred_attention",
+                "task_id": binding["task_id"],
+                "reason": attention_classification,
+            }
+            recommended_next_action = "resolve the deferred attention decision before archival"
+        else:
+            closeout_state = "attention_required"
+            operator_obligation = {
+                "kind": "decide_task_attention",
+                "task_id": binding["task_id"],
+                "reason": attention_classification,
+            }
+            recommended_next_action = "record an evidence-bound attention decision before archival"
+    else:
+        closeout_state = "ready_to_archive"
+        recommended_next_action = "archive after retention and lifecycle revalidation"
+
+    return {
+        "schema_version": 1,
+        "task_binding": binding,
+        "state": state,
+        "terminal": terminal,
+        "lifecycle_evidence_valid": lifecycle_evidence_valid,
+        "lifecycle_evidence_error": lifecycle_evidence_error,
+        "outcome_receipt_sha256": outcome_receipt_sha256,
+        "attention_required": state in TERMINAL_ATTENTION_STATES,
+        "attention_classification": attention_classification,
+        "attention_decision": attention_decision,
+        "closeout_state": closeout_state,
+        "archive_ready": closeout_state == "ready_to_archive",
+        "operator_obligation": operator_obligation,
+        "recommended_next_action": recommended_next_action,
+        "does_not_establish": [
+            "task_output_correctness",
+            "automatic_supersession",
+            "archive_retention_satisfied",
+            "physical_checkout_cleanup",
+            "deletion_authority",
+        ],
+    }
 
 
 def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any]:
