@@ -50,9 +50,9 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
         self.assertEqual(report["baseline_tool_count"], 125)
-        self.assertEqual(report["current_tool_count"], 165)
-        self.assertEqual(report["growth"], 48)
-        self.assertEqual(report["accepted_addition_count"], 48)
+        self.assertEqual(report["current_tool_count"], 166)
+        self.assertEqual(report["growth"], 49)
+        self.assertEqual(report["accepted_addition_count"], 49)
         self.assertEqual(report["operation_count"], 3)
         self.assertEqual(report["retired_tool_count"], 8)
 
@@ -148,7 +148,7 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
             report["accepted_addition_count"],
             len(self.contract["accepted_additions"]) + 1,
         )
-        self.assertEqual(report["growth"], 49)
+        self.assertEqual(report["growth"], 50)
 
     def test_semantic_drift_of_existing_tool_is_rejected(self) -> None:
         capabilities = copy.deepcopy(self.capabilities)

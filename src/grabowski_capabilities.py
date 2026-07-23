@@ -233,6 +233,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "repoground_agent_handoff": {
+        "category": "knowledge",
+        "purpose": "Route one bounded caller-selected agent handoff explicitly between native live reads and RepoGround context.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "repoground_find_symbol": {
         "category": "knowledge",
         "purpose": "Find bounded Python symbol definitions in an existing RepoGround bundle.",

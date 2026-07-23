@@ -33,6 +33,7 @@ MAX_PAGE_LIMIT = 100
 MAX_CURRENT_SCAN_ROWS = 5 * MAX_PAGE_LIMIT
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
+ARCHIVE_EFFECT_LEASE_TTL_SECONDS = 120
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
 DECISION_FILE_RE = re.compile(r"(?P<task_id>[0-9a-f]{24})\.a(?P<attempt>[1-9][0-9]*)\.json\Z")
@@ -981,6 +982,675 @@ def terminal_closeout_plan(record: dict[str, Any]) -> dict[str, Any]:
             "deletion_authority",
         ],
     }
+
+
+def _task_archive_effect_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_TASK_ARCHIVE_EFFECT_ROOT")
+    root = (
+        Path(configured).expanduser()
+        if configured
+        else tasks.TASK_DB.parent / "task-archive-effects"
+    )
+    if not root.is_absolute():
+        raise TaskAttentionIntegrityError("task archive effect root must be absolute")
+    return root
+
+
+def _validate_archive_execution_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    required = {
+        "task_id",
+        "expected_attempt",
+        "expected_unit",
+        "expected_authoritative_unit",
+        "expected_argv_sha256",
+        "expected_execution_envelope_sha256",
+        "expected_lifecycle_receipt_sha256",
+        "minimum_age_seconds",
+        "execution_id",
+    }
+    value = _validate_exact_keys(
+        parameters,
+        allowed=required,
+        required=required,
+        label="task closeout archive parameters",
+    )
+    value["task_id"] = tasks._validate_task_id(value["task_id"])
+    value["expected_lifecycle_receipt_sha256"] = _validate_sha256(
+        value["expected_lifecycle_receipt_sha256"],
+        label="expected_lifecycle_receipt_sha256",
+    )
+    minimum_age_seconds = value["minimum_age_seconds"]
+    if (
+        isinstance(minimum_age_seconds, bool)
+        or not isinstance(minimum_age_seconds, int)
+        or minimum_age_seconds < 0
+    ):
+        raise TaskAttentionInputError("minimum_age_seconds must be a non-negative integer")
+    value["execution_id"] = _validate_text(
+        value["execution_id"],
+        label="execution_id",
+        maximum=512,
+    )
+    return value
+
+
+def _validate_archive_target(
+    parameters: dict[str, Any],
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    binding = _task_binding(record)
+    _validate_expected_binding(parameters, binding)
+    expected_receipt = parameters["expected_lifecycle_receipt_sha256"]
+    if record.get("lifecycle_receipt_sha256") != expected_receipt:
+        raise TaskAttentionConflictError(
+            "current task lifecycle receipt does not match the expected archive target"
+        )
+    closeout = terminal_closeout_plan(record)
+    if closeout.get("outcome_receipt_sha256") != expected_receipt:
+        raise TaskAttentionConflictError(
+            "current task closeout receipt does not match the expected archive target"
+        )
+    if closeout.get("archive_ready") is not True:
+        raise TaskAttentionConflictError(
+            "task closeout is not ready for archival: "
+            + str(closeout.get("closeout_state") or "unknown")
+        )
+    return closeout
+
+
+def _task_archive_source_binding(record: dict[str, Any]) -> tuple[dict[str, Any], str, str]:
+    archive_record = tasks._task_archive_record(record)
+    record_sha256 = _sha256_json(archive_record)
+    source_schema_version = tasks.TASK_CURRENT_SCHEMA_VERSION
+    source_store_sha256 = _sha256_json(
+        {
+            "schema_version": 1,
+            "scope": "selected_task_record_snapshot",
+            "task_store_schema_version": source_schema_version,
+            "task_id": archive_record["task_id"],
+            "task_record_sha256": record_sha256,
+        }
+    )
+    return archive_record, record_sha256, source_store_sha256
+
+
+def _assert_task_archive_retention(
+    record: dict[str, Any],
+    *,
+    minimum_age_seconds: int,
+    now_unix: int,
+) -> int:
+    terminalized_at = record.get("terminalized_at_unix")
+    updated_at = record.get("updated_at_unix")
+    age_anchor = terminalized_at if isinstance(terminalized_at, int) else updated_at
+    if isinstance(age_anchor, bool) or not isinstance(age_anchor, int):
+        raise TaskAttentionIntegrityError("task archive retention anchor is unavailable")
+    retention_boundary_unix = age_anchor + minimum_age_seconds
+    if now_unix < retention_boundary_unix:
+        raise TaskAttentionConflictError(
+            "task archive minimum retention is not yet satisfied"
+        )
+    return retention_boundary_unix
+
+
+def _assert_no_live_task_resource_leases(
+    record: dict[str, Any],
+    *,
+    now_unix: int,
+) -> dict[str, Any]:
+    resource_keys = sorted(tasks._record_resource_keys(record))
+    active: list[dict[str, Any]] = []
+    for resource_key in resource_keys:
+        lease = tasks.resources.inspect_resource(resource_key)
+        if lease is None:
+            continue
+        expires_at_unix = lease.get("expires_at_unix")
+        if (
+            isinstance(expires_at_unix, int)
+            and not isinstance(expires_at_unix, bool)
+            and expires_at_unix > now_unix
+        ):
+            active.append(
+                {
+                    "resource_key": resource_key,
+                    "owner_id": lease.get("owner_id"),
+                    "expires_at_unix": expires_at_unix,
+                    "metadata_sha256": lease.get("metadata_sha256"),
+                }
+            )
+    if active:
+        raise TaskAttentionConflictError(
+            "task archive is blocked by active task resource leases"
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_task_archive_lease_observation",
+        "task_id": record["task_id"],
+        "resource_keys": resource_keys,
+        "active_lease": False,
+    }
+
+
+def _assert_no_live_task_process(record: dict[str, Any]) -> dict[str, Any]:
+    try:
+        observation = tasks._observe(record)
+    except Exception as exc:
+        raise TaskAttentionIntegrityError(
+            "task archive process liveness could not be observed"
+        ) from exc
+    properties = observation.get("properties")
+    probe = observation.get("probe")
+    if not isinstance(properties, dict) or not isinstance(probe, dict):
+        raise TaskAttentionIntegrityError("task archive process observation is incomplete")
+    if probe.get("outcome_unknown"):
+        raise TaskAttentionIntegrityError("task archive process observation outcome is unknown")
+    active_state = properties.get("ActiveState")
+    if active_state in {"active", "activating", "reloading", "deactivating"}:
+        raise TaskAttentionConflictError(
+            "task archive is blocked because the authoritative unit is still live"
+        )
+    if active_state not in {"inactive", "failed"}:
+        raise TaskAttentionIntegrityError(
+            "task archive authoritative unit liveness is ambiguous"
+        )
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_task_archive_process_observation",
+        "task_id": record["task_id"],
+        "authoritative_unit": tasks._authoritative_unit(record),
+        "active_process": False,
+    }
+
+
+def _task_archive_classification(
+    record: dict[str, Any],
+    *,
+    expected_lifecycle_receipt_sha256: str,
+    archived: bool,
+    archive_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    import grabowski_lifecycle_evidence as lifecycle_evidence
+
+    archive_record, record_sha256, _source_store_sha256 = _task_archive_source_binding(record)
+    now_unix = int(time.time())
+    lease_source = _assert_no_live_task_resource_leases(record, now_unix=now_unix)
+    process_source = _assert_no_live_task_process(record)
+    _outcome, outcome_receipt_sha256, outcome_file_sha256 = _read_valid_outcome(
+        record,
+        expected_receipt_sha256=expected_lifecycle_receipt_sha256,
+        allowed_states=frozenset(tasks.TASK_STATE_PROJECTIONS["terminal"]),
+    )
+    sources: dict[str, dict[str, Any]] = {
+        "task": {
+            "schema_version": 1,
+            "kind": "grabowski_task_archive_task_observation",
+            "task_id": record["task_id"],
+            "state": record["state"],
+            "task_record_sha256": record_sha256,
+        },
+        "lease": lease_source,
+        "process": process_source,
+        "receipt": {
+            "schema_version": 1,
+            "kind": "grabowski_task_archive_receipt_observation",
+            "task_id": record["task_id"],
+            "lifecycle_receipt_sha256": expected_lifecycle_receipt_sha256,
+            "outcome_receipt_sha256": outcome_receipt_sha256,
+            "outcome_file_sha256": outcome_file_sha256,
+            "archive_evidence": archive_evidence,
+        },
+    }
+    for source in ("workspace", "checkout", "tmux"):
+        sources[source] = {
+            "schema_version": 1,
+            "kind": "grabowski_task_archive_not_applicable_observation",
+            "source": source,
+            "task_id": record["task_id"],
+            "reason": "task_archive_does_not_mutate_related_runtime_object",
+        }
+    required_sources = lifecycle_evidence.REQUIRED_SOURCES
+    observed_sources = frozenset({"task", "lease", "process", "receipt"})
+    source_applicability = {
+        source: ("observed" if source in observed_sources else "not_applicable")
+        for source in sorted(required_sources)
+    }
+    source_sha256s = {
+        source: _sha256_json(sources[source])
+        for source in sorted(required_sources)
+    }
+    classified = lifecycle_evidence.classify_observation_bundle(
+        lifecycle_evidence.LifecycleObservationBundle(
+            identity=str(record["task_id"]),
+            kind="task",
+            observed_sources=observed_sources,
+            source_sha256s=source_sha256s,
+            source_applicability=source_applicability,
+            state=str(record["state"]),
+            archived=archived,
+            dirty=False,
+            active_task=False,
+            active_process=False,
+            active_lease=False,
+            foreign_retention=False,
+            retention_expired=False,
+            retention_recovery_archived=False,
+            shared_reference=False,
+            open_task_role=False,
+            tmux_session_present=False,
+            tmux_role_bound=False,
+            receipt_integrity_valid=True,
+        )
+    )
+    if archived:
+        expected_classification = "archived"
+    else:
+        expected_classification = "terminal_archivable"
+    if classified.get("classification") != expected_classification:
+        raise TaskAttentionConflictError(
+            "task archive lifecycle classification is not eligible: "
+            + str(classified.get("classification"))
+        )
+    return classified
+
+
+def _task_archive_lease_observations(leases: list[dict[str, Any]]) -> list[Any]:
+    import grabowski_lifecycle_effect_plan as effect_plan
+
+    observations: list[Any] = []
+    for lease in leases:
+        observations.append(
+            effect_plan.LeaseObservation(
+                resource_key=str(lease["resource_key"]),
+                owner_id=str(lease["owner_id"]),
+                expires_at_unix=int(lease["expires_at_unix"]),
+                metadata_sha256=str(lease["metadata_sha256"]),
+            )
+        )
+    return observations
+
+
+def _existing_task_projection_binding(
+    task_id: str,
+    *,
+    expected_record_sha256: str,
+) -> dict[str, Any] | None:
+    projection = tasks._task_current_projection()
+    bindings = projection.get("archived_task_bindings")
+    if not isinstance(bindings, dict):
+        raise TaskAttentionIntegrityError("task archive current projection is invalid")
+    binding = bindings.get(task_id)
+    if binding is None:
+        return None
+    if (
+        not isinstance(binding, dict)
+        or binding.get("record_sha256") != expected_record_sha256
+    ):
+        raise TaskAttentionIntegrityError(
+            "task archive current projection conflicts with the authoritative task record"
+        )
+    return {
+        "task_id": task_id,
+        "record_sha256": expected_record_sha256,
+        "segment_id": binding.get("segment_id"),
+        "switch_sha256": binding.get("switch_sha256"),
+        "projection_sha256": projection.get("projection_sha256"),
+    }
+
+
+def _release_owned_archive_resources(
+    owner: str,
+    resource_keys: list[str],
+) -> dict[str, Any]:
+    owned: list[str] = []
+    foreign_preserved: list[dict[str, Any]] = []
+    for resource_key in resource_keys:
+        lease = tasks.resources.inspect_resource(resource_key)
+        if lease is None:
+            continue
+        if lease.get("owner_id") == owner:
+            owned.append(resource_key)
+        else:
+            foreign_preserved.append(
+                {
+                    "resource_key": resource_key,
+                    "owner_id": lease.get("owner_id"),
+                }
+            )
+    if not owned:
+        return {
+            "status": "not_required",
+            "released": [],
+            "foreign_preserved": foreign_preserved,
+        }
+    try:
+        released = tasks.resources.release_resources(owner, owned)
+    except Exception as exc:
+        return {
+            "status": "release_failed",
+            "released": [],
+            "foreign_preserved": foreign_preserved,
+            "error_type": type(exc).__name__,
+        }
+    return {
+        "status": "released",
+        "released": [item["resource_key"] for item in released["released"]],
+        "foreign_preserved": foreign_preserved,
+    }
+
+
+def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
+    import grabowski_lifecycle_archive as lifecycle
+    import grabowski_lifecycle_effect_plan as effect_plan
+    import grabowski_lifecycle_projection as lifecycle_projection
+
+    value = _validate_archive_execution_parameters(parameters)
+    task_id = str(value["task_id"])
+    record = tasks._row_raw(task_id)
+    closeout = _validate_archive_target(value, record)
+    archive_record, record_sha256, source_store_sha256 = _task_archive_source_binding(record)
+    archive_root = tasks._task_archive_root()
+    effect_root = _task_archive_effect_root()
+    projection_root = tasks._task_projection_root()
+    archive_resource = lifecycle._task_archive_effect_resource_key(archive_root)
+    effect_resource = lifecycle._task_archive_effect_resource_key(effect_root)
+    projection_resource = lifecycle_projection._projection_resource_key(projection_root)
+    resources_to_hold = sorted(
+        {archive_resource, effect_resource, projection_resource}
+    )
+    caller_execution_id = str(value["execution_id"])
+    caller_execution_id_sha256 = hashlib.sha256(
+        caller_execution_id.encode("utf-8")
+    ).hexdigest()
+    execution_id = (
+        f"task-closeout-archive:{task_id}:"
+        f"{caller_execution_id_sha256[:32]}"
+    )
+    execution_id_sha256 = hashlib.sha256(
+        execution_id.encode("utf-8")
+    ).hexdigest()
+    owner = tasks.resources._owner(
+        "operator:task-closeout-archive:" + execution_id_sha256[:24]
+    )
+    existing_projection = _existing_task_projection_binding(
+        task_id,
+        expected_record_sha256=record_sha256,
+    )
+    if existing_projection is not None:
+        resource_release = _release_owned_archive_resources(
+            owner,
+            resources_to_hold,
+        )
+        return {
+            "schema_version": 1,
+            "task_binding": _task_binding(record),
+            "closeout": closeout,
+            "archive_record_sha256": record_sha256,
+            "execution_id_sha256": execution_id_sha256,
+            "caller_execution_id_sha256": caller_execution_id_sha256,
+            "already_archived": True,
+            "idempotent_replay": True,
+            "projection": existing_projection,
+            "resource_release": resource_release,
+            "does_not_establish": [
+                "physical_task_row_deletion",
+                "workspace_cleanup_authority",
+                "checkout_cleanup_authority",
+                "blind_retry_after_recovery_required",
+            ],
+        }
+
+    now_unix = int(time.time())
+    retention_boundary_unix = _assert_task_archive_retention(
+        record,
+        minimum_age_seconds=int(value["minimum_age_seconds"]),
+        now_unix=now_unix,
+    )
+    _assert_no_live_task_resource_leases(record, now_unix=now_unix)
+    _assert_no_live_task_process(record)
+    lease_result: dict[str, Any] | None = None
+    resource_release: dict[str, Any] = {"status": "not_acquired", "released": []}
+    output: dict[str, Any] | None = None
+    try:
+        try:
+            lease_result = tasks.resources.acquire_resources(
+                owner,
+                resources_to_hold,
+                purpose=f"task closeout archive {task_id}",
+                ttl_seconds=ARCHIVE_EFFECT_LEASE_TTL_SECONDS,
+                metadata={
+                    "schema_version": 1,
+                    "operation": "task-closeout-archive",
+                    "task_id": task_id,
+                    "execution_id_sha256": execution_id_sha256,
+                    "caller_execution_id_sha256": caller_execution_id_sha256,
+                },
+            )
+        except tasks.resources.ResourceConflict as exc:
+            raise TaskAttentionConflictError(str(exc)) from exc
+        lease_observations = _task_archive_lease_observations(
+            list(lease_result["leases"])
+        )
+
+        current = tasks._row_raw(task_id)
+        current_closeout = _validate_archive_target(value, current)
+        current_archive_record, current_record_sha256, current_source_store_sha256 = (
+            _task_archive_source_binding(current)
+        )
+        if current_record_sha256 != record_sha256:
+            raise TaskAttentionConflictError(
+                "task archive record changed before archive planning"
+            )
+        if current_source_store_sha256 != source_store_sha256:
+            raise TaskAttentionConflictError(
+                "task archive source binding changed before archive planning"
+            )
+        current_now = int(time.time())
+        _assert_task_archive_retention(
+            current,
+            minimum_age_seconds=int(value["minimum_age_seconds"]),
+            now_unix=current_now,
+        )
+        classification = _task_archive_classification(
+            current,
+            expected_lifecycle_receipt_sha256=str(
+                value["expected_lifecycle_receipt_sha256"]
+            ),
+            archived=False,
+        )
+        # The dry-run plan uses the immutable earliest eligibility instant as its
+        # reference time so an ambiguous retry reconstructs the same plan digest.
+        # Wall-clock retention and all live evidence are still checked immediately
+        # before planning and again before effect execution. This reference is not
+        # an execution timestamp.
+        archive_plan = lifecycle.build_task_archive_plan(
+            [current_archive_record],
+            {task_id: classification},
+            now_unix=retention_boundary_unix,
+            minimum_age_seconds=int(value["minimum_age_seconds"]),
+        )
+        if archive_plan.get("blocked") or archive_plan.get("eligible_task_ids") != [task_id]:
+            raise TaskAttentionConflictError(
+                "task archive dry-run plan is not eligible for exactly the target task"
+            )
+        archive_effect_plan = effect_plan.build_effect_plan(
+            [classification],
+            effect_kind="task_archive",
+            lease_owner_id=owner,
+            required_resource_keys=[archive_resource, effect_resource],
+            created_at_unix=retention_boundary_unix,
+        )
+
+        revalidated_record = tasks._row_raw(task_id)
+        _validate_archive_target(value, revalidated_record)
+        revalidated_archive_record, revalidated_record_sha256, _ = (
+            _task_archive_source_binding(revalidated_record)
+        )
+        if revalidated_record_sha256 != record_sha256:
+            raise TaskAttentionConflictError(
+                "task archive record changed during immediate revalidation"
+            )
+        _assert_task_archive_retention(
+            revalidated_record,
+            minimum_age_seconds=int(value["minimum_age_seconds"]),
+            now_unix=int(time.time()),
+        )
+        revalidated_classification = _task_archive_classification(
+            revalidated_record,
+            expected_lifecycle_receipt_sha256=str(
+                value["expected_lifecycle_receipt_sha256"]
+            ),
+            archived=False,
+        )
+        archive_effect = lifecycle.execute_task_archive_effect(
+            [revalidated_archive_record],
+            archive_root=archive_root,
+            effect_root=effect_root,
+            source_store_sha256=source_store_sha256,
+            source_schema_version=tasks.TASK_CURRENT_SCHEMA_VERSION,
+            archive_plan=archive_plan,
+            plan=archive_effect_plan,
+            current_classifications={task_id: revalidated_classification},
+            lease_observations=lease_observations,
+            execution_id=execution_id,
+        )
+        manifest = archive_effect["manifest"]
+        effect_receipt = archive_effect["effect_receipt"]["receipt"]
+        archive_evidence = {
+            "archive_manifest_sha256": manifest["manifest_sha256"],
+            "archive_segment_sha256": manifest["segment_sha256"],
+            "archive_plan_sha256": manifest["plan_sha256"],
+            "effect_receipt_sha256": effect_receipt["receipt_sha256"],
+        }
+
+        projected = _existing_task_projection_binding(
+            task_id,
+            expected_record_sha256=record_sha256,
+        )
+        projection_replay = projected is not None
+        if projected is not None:
+            if projected.get("segment_id") != manifest.get("segment_id"):
+                raise TaskAttentionIntegrityError(
+                    "task archive projection points at a different archive segment"
+                )
+        else:
+            projection_record = tasks._row_raw(task_id)
+            _validate_archive_target(value, projection_record)
+            _, projection_record_sha256, _ = _task_archive_source_binding(
+                projection_record
+            )
+            if projection_record_sha256 != record_sha256:
+                raise TaskAttentionConflictError(
+                    "task archive record changed before projection switch"
+                )
+            archived_classification = _task_archive_classification(
+                projection_record,
+                expected_lifecycle_receipt_sha256=str(
+                    value["expected_lifecycle_receipt_sha256"]
+                ),
+                archived=True,
+                archive_evidence=archive_evidence,
+            )
+            projection_plan = effect_plan.build_effect_plan(
+                [archived_classification],
+                effect_kind="current_projection_switch",
+                lease_owner_id=owner,
+                required_resource_keys=[projection_resource],
+                created_at_unix=retention_boundary_unix,
+            )
+            projection_revalidated_record = tasks._row_raw(task_id)
+            _validate_archive_target(value, projection_revalidated_record)
+            _, projection_revalidated_sha256, _ = _task_archive_source_binding(
+                projection_revalidated_record
+            )
+            if projection_revalidated_sha256 != record_sha256:
+                raise TaskAttentionConflictError(
+                    "task archive record changed during projection revalidation"
+                )
+            projection_current_classification = _task_archive_classification(
+                projection_revalidated_record,
+                expected_lifecycle_receipt_sha256=str(
+                    value["expected_lifecycle_receipt_sha256"]
+                ),
+                archived=True,
+                archive_evidence=archive_evidence,
+            )
+            projection_revalidation = effect_plan.revalidate_effect_plan(
+                projection_plan,
+                {task_id: projection_current_classification},
+                lease_observations,
+                now_unix=int(time.time()),
+            )
+            if projection_revalidation.get("ready_for_effect") is not True:
+                raise TaskAttentionConflictError(
+                    "task archive projection revalidation is not ready"
+                )
+            projection_effect = lifecycle_projection.apply_task_archive_projection_switch(
+                Path(str(archive_effect["segment_dir"])),
+                projection_root=projection_root,
+                plan=projection_plan,
+                revalidation=projection_revalidation,
+                applied_at_unix=int(time.time()),
+            )
+
+        final_projection = _existing_task_projection_binding(
+            task_id,
+            expected_record_sha256=record_sha256,
+        )
+        if final_projection is None:
+            raise TaskAttentionIntegrityError(
+                "task archive projection readback did not contain the archived task"
+            )
+        output = {
+            "schema_version": 1,
+            "task_binding": _task_binding(revalidated_record),
+            "closeout": current_closeout,
+            "retention_boundary_unix": retention_boundary_unix,
+            "minimum_age_seconds": int(value["minimum_age_seconds"]),
+            "archive_record_sha256": record_sha256,
+            "source_store_sha256": source_store_sha256,
+            "source_store_scope": "selected_task_record_snapshot",
+            "archive_plan_sha256": archive_plan["plan_sha256"],
+            "archive_plan_reference_unix": retention_boundary_unix,
+            "archive_plan_reference_semantics": "earliest_retention_eligibility_for_idempotent_replay",
+            "archive_segment": {
+                "segment_id": manifest["segment_id"],
+                "segment_identity_sha256": manifest["segment_identity_sha256"],
+                "manifest_sha256": manifest["manifest_sha256"],
+                "segment_sha256": manifest["segment_sha256"],
+                "idempotent_replay": bool(archive_effect.get("idempotent_replay")),
+            },
+            "archive_effect_receipt_sha256": effect_receipt["receipt_sha256"],
+            "execution_id_sha256": execution_id_sha256,
+            "caller_execution_id_sha256": caller_execution_id_sha256,
+            "projection": final_projection,
+            "projection_idempotent_replay": projection_replay,
+            "already_archived": False,
+            "idempotent_replay": bool(
+                archive_effect.get("idempotent_replay") or projection_replay
+            ),
+            "does_not_establish": [
+                "physical_task_row_deletion",
+                "workspace_cleanup_authority",
+                "checkout_cleanup_authority",
+                "blind_retry_after_recovery_required",
+            ],
+        }
+    except (
+        lifecycle.LifecycleArchiveError,
+        lifecycle_projection.LifecycleProjectionError,
+        effect_plan.LifecycleEffectPlanError,
+    ) as exc:
+        raise TaskAttentionError(str(exc)) from exc
+    finally:
+        if lease_result is not None:
+            resource_release = _release_owned_archive_resources(
+                owner,
+                resources_to_hold,
+            )
+    if output is None:
+        raise TaskAttentionError("task closeout archive ended without a result")
+    output["resource_release"] = resource_release
+    return output
 
 
 def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any]:

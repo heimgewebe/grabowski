@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "afc0d4ae211abbd9162b601201e0c9c811d9e63139e6eef63e9d19a724cdacc6",
+  "capability_source_sha256": "2996cc1ca538cf55248ef7ce3b932fb1ab13374e7e16cd181676b82e839babbb",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "6b85d90dcca50a698e3a5a2eecff8da09fca34edb5e6563220305f0a3be1d56b",
+  "contract_sha256": "4bad0636726f1fdbf79923775c440abd2f93c9cc57bfbae2270802f4814ebf6e",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -394,6 +394,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "repoground_context_compose"
+    },
+    {
+      "category": "knowledge",
+      "description": "Build one explicit read-only agent handoff without choosing a retrieval mode implicitly.",
+      "effects": [],
+      "id": "repoground_agent_handoff",
+      "purpose": "Route one bounded caller-selected agent handoff explicitly between native live reads and RepoGround context.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_agent_handoff"
     },
     {
       "category": "knowledge",
@@ -1231,7 +1242,7 @@
     },
     {
       "category": "coding-memory",
-      "description": "Read bounded historical coding events without asserting current truth.",
+      "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source component.",
       "effects": [],
       "id": "grabowski_chronik_history",
       "purpose": "Read bounded historical coding events without asserting current truth.",
@@ -1374,7 +1385,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Append evidence-bound friction closeout decisions without rewriting history.",
+      "description": "Append evidence-bound friction decisions or exact append-only revisions.",
       "effects": [
         "state-append",
         "audit-record"

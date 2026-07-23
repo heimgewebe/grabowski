@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "6b85d90dcca50a698e3a5a2eecff8da09fca34edb5e6563220305f0a3be1d56b"
+    "sha256": "4bad0636726f1fdbf79923775c440abd2f93c9cc57bfbae2270802f4814ebf6e"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "b310bb7886321d5d7444429bab3da2521080bbf553022a2bd83531f198d0db1d"
+    "sha256": "05bac809643d905d0e9dc27c2cd453c3169571af6ffaabb1fcd1ceba2d27ca10"
   },
   "counts": {
     "core": 22,
-    "full": 165,
-    "operator": 150
+    "full": 166,
+    "operator": 151
   },
   "profiles": {
     "core": [
@@ -70,6 +70,7 @@
       "repoground_range_get",
       "repoground_context_pack",
       "repoground_context_compose",
+      "repoground_agent_handoff",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",
@@ -236,6 +237,7 @@
       "repoground_range_get",
       "repoground_context_pack",
       "repoground_context_compose",
+      "repoground_agent_handoff",
       "repoground_find_symbol",
       "repoground_get_callers",
       "repoground_get_callees",

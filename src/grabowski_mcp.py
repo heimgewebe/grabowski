@@ -256,6 +256,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "repoground_range_get": ("bundle_registry",),
     "repoground_context_pack": ("bundle_registry",),
     "repoground_context_compose": ("bundle_registry",),
+    "repoground_agent_handoff": ("bundle_registry",),
     "repoground_find_symbol": ("bundle_registry",),
     "repoground_get_callers": ("bundle_registry",),
     "repoground_get_callees": ("bundle_registry",),
@@ -8939,6 +8940,149 @@ def repoground_context_compose(
             "merge_readiness",
             "runtime_behavior",
             "regression_absence",
+        ],
+    }
+
+
+_REPOGROUND_AGENT_HANDOFF_OPERATIONS = frozenset(
+    {"change_impact", "find_relevant_tests", "ground_claim"}
+)
+_REPOGROUND_AGENT_HANDOFF_RETRIEVAL_MODES = frozenset(
+    {"native_live_tools", "repoground_context", "combined", "no_additional_retrieval"}
+)
+_REPOGROUND_AGENT_HANDOFF_NATIVE_TOOLS: dict[str, tuple[str, ...]] = {
+    "change_impact": ("grabowski_git_status", "grabowski_git_show", "grabowski_git_diff"),
+    "find_relevant_tests": ("grabowski_git_diff", "grabowski_read_text", "grabowski_list_directory"),
+    "ground_claim": ("grabowski_read_text", "grabowski_git_show", "grabowski_git_status"),
+}
+
+
+@mcp.tool(name="repoground_agent_handoff", annotations=READ_ANNOTATIONS)
+def repoground_agent_handoff(
+    repo: str,
+    operation: str,
+    retrieval_mode: str,
+    base_revision: str | None = None,
+    target_revision: str | None = None,
+    claim: str | None = None,
+    context_budget_bytes: int = 12000,
+    expected_diff_sha256: str | None = None,
+    stem: str | None = None,
+    query: str | None = None,
+) -> dict[str, Any]:
+    """Build one explicit read-only agent handoff without choosing a retrieval mode implicitly."""
+    _require_capability("bundle_registry")
+    repo = _repoground_validate_repo(repo) or ""
+    if operation not in _REPOGROUND_AGENT_HANDOFF_OPERATIONS:
+        raise ValueError(
+            "operation must be one of: change_impact, find_relevant_tests, ground_claim"
+        )
+    if retrieval_mode not in _REPOGROUND_AGENT_HANDOFF_RETRIEVAL_MODES:
+        raise ValueError(
+            "retrieval_mode must be one of: native_live_tools, repoground_context, "
+            "combined, no_additional_retrieval"
+        )
+
+    normalized_base: str | None = None
+    normalized_target: str | None = None
+    normalized_claim: str | None = None
+    if operation in {"change_impact", "find_relevant_tests"}:
+        if claim is not None:
+            raise ValueError("claim is only valid for ground_claim")
+        if not isinstance(base_revision, str) or not base_revision.strip():
+            raise ValueError(f"base_revision is required for {operation}")
+        if not isinstance(target_revision, str) or not target_revision.strip():
+            raise ValueError(f"target_revision is required for {operation}")
+        normalized_base = base_revision.strip()
+        normalized_target = target_revision.strip()
+    elif operation == "ground_claim":
+        if base_revision is not None or target_revision is not None:
+            raise ValueError("base_revision and target_revision are not valid for ground_claim")
+        if expected_diff_sha256 is not None:
+            raise ValueError("expected_diff_sha256 is not valid for ground_claim")
+        if query is not None:
+            raise ValueError("query is not valid for ground_claim; use claim")
+        if not isinstance(claim, str) or not claim.strip() or len(claim.strip()) > 500:
+            raise ValueError(
+                "claim must be a non-empty string up to 500 characters for ground_claim"
+            )
+        normalized_claim = claim.strip()
+
+    routes: list[dict[str, Any]] = []
+    use_repoground = retrieval_mode in {"repoground_context", "combined"}
+    use_native = retrieval_mode in {"native_live_tools", "combined"}
+
+    if use_repoground:
+        if operation in {"change_impact", "find_relevant_tests"}:
+            assert normalized_base is not None and normalized_target is not None
+            evidence = repoground_context_compose(
+                repo,
+                normalized_base,
+                normalized_target,
+                task_profile="change_impact",
+                context_budget_bytes=context_budget_bytes,
+                expected_diff_sha256=expected_diff_sha256,
+                stem=stem,
+                query=query,
+            )
+            tool_name = "repoground_context_compose"
+        else:
+            assert normalized_claim is not None
+            evidence = repoground_context_pack(
+                repo,
+                task_profile="basic_repo_question",
+                stem=stem,
+                query=normalized_claim,
+            )
+            tool_name = "repoground_context_pack"
+        routes.append(
+            {
+                "kind": "repoground_context",
+                "tool": tool_name,
+                "executed": True,
+                "authority": "bounded_published_repository_evidence",
+                "repoground_evidence": evidence,
+            }
+        )
+
+    if use_native:
+        routes.append(
+            {
+                "kind": "native_live_tools",
+                "tools": list(_REPOGROUND_AGENT_HANDOFF_NATIVE_TOOLS[operation]),
+                "executed": False,
+                "authority": "live_repository_readback",
+            }
+        )
+
+    return {
+        "kind": "grabowski.repoground_agent_handoff",
+        "schema_version": 1,
+        "repo": repo,
+        "operation": operation,
+        "retrieval_mode": retrieval_mode,
+        "routes": routes,
+        "routing_contract": {
+            "selection": "caller_explicit",
+            "automatic_selection": False,
+            "default_route": None,
+            "global_repoground_promotion": False,
+        },
+        "mutation_boundary": {
+            "writes": [],
+            "read_paths_do_not_refresh": True,
+        },
+        "does_not_establish": [
+            "truth",
+            "completeness",
+            "patch_correctness",
+            "test_sufficiency",
+            "test_coverage",
+            "review_completeness",
+            "merge_readiness",
+            "runtime_behavior",
+            "regression_absence",
+            "global_repoground_routing_authority",
         ],
     }
 

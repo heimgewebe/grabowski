@@ -80,12 +80,23 @@ class TaskAttentionTests(unittest.TestCase):
         (self.root / "state").mkdir(parents=True, exist_ok=True)
         os.chmod(self.root / "state", 0o700)
         self.audit_log = self.root / "state" / "write-audit.jsonl"
+        self.archive_root = self.root / "state" / "task-archives"
+        self.archive_effect_root = self.root / "state" / "task-archive-effects"
+        self.projection_root = self.root / "state" / "task-projection"
         self.patches = [
             patch.object(tasks, "TASK_DB", self.database),
             patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
             patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
-            patch.dict(os.environ, {"GRABOWSKI_TASK_ATTENTION_ROOT": str(self.decisions)}),
+            patch.dict(
+                os.environ,
+                {
+                    "GRABOWSKI_TASK_ATTENTION_ROOT": str(self.decisions),
+                    "GRABOWSKI_TASK_ARCHIVE_ROOT": str(self.archive_root),
+                    "GRABOWSKI_TASK_ARCHIVE_EFFECT_ROOT": str(self.archive_effect_root),
+                    "GRABOWSKI_TASK_PROJECTION_ROOT": str(self.projection_root),
+                },
+            ),
         ]
         for item in self.patches:
             item.start()
@@ -95,7 +106,9 @@ class TaskAttentionTests(unittest.TestCase):
             item.stop()
         self.temporary.cleanup()
 
-    def _start(self) -> dict[str, object]:
+    def _start(
+        self, resource_keys: list[str] | None = None
+    ) -> dict[str, object]:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
@@ -107,6 +120,7 @@ class TaskAttentionTests(unittest.TestCase):
                 cwd=str(self.root),
                 runtime_seconds=60,
                 resume_policy="verify-then-retry",
+                resource_keys=resource_keys,
             )
 
     def _failed_task(self) -> dict[str, object]:
@@ -114,6 +128,46 @@ class TaskAttentionTests(unittest.TestCase):
         task_id = started["task"]["task_id"]
         tasks._set_state(task_id, "failed", observation={"state": "failed"})
         return tasks._row(task_id)
+
+    def _completed_task(
+        self, resource_keys: list[str] | None = None
+    ) -> dict[str, object]:
+        started = self._start(resource_keys=resource_keys)
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(task_id, "completed", observation={"state": "completed"})
+        return tasks._row(task_id)
+
+    def _archive_parameters(
+        self, record: dict[str, object], **overrides: object
+    ) -> dict[str, object]:
+        value: dict[str, object] = {
+            "task_id": record["task_id"],
+            "expected_attempt": record["attempt"],
+            "expected_unit": record["unit"],
+            "expected_authoritative_unit": record["authoritative_unit"],
+            "expected_argv_sha256": record["argv_sha256"],
+            "expected_execution_envelope_sha256": record[
+                "execution_envelope_sha256"
+            ],
+            "expected_lifecycle_receipt_sha256": record[
+                "lifecycle_receipt_sha256"
+            ],
+            "minimum_age_seconds": 0,
+            "execution_id": f"test-task-closeout-archive:{record['task_id']}",
+        }
+        value.update(overrides)
+        return value
+
+    @staticmethod
+    def _inactive_process_observation() -> dict[str, object]:
+        return {
+            "properties": {
+                "LoadState": "not-found",
+                "ActiveState": "inactive",
+                "SubState": "dead",
+            },
+            "probe": {"returncode": 0, "outcome_unknown": False},
+        }
 
     def _parameters(self, record: dict[str, object], **overrides: object) -> dict[str, object]:
         outcome = json.loads(
@@ -538,6 +592,217 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertFalse(plan["attention_required"])
         self.assertEqual("not_required", plan["attention_classification"])
         self.assertIsNone(plan["operator_obligation"])
+
+    def test_task_archive_classification_uses_typed_not_applicable_sources(self) -> None:
+        record = self._completed_task()
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            classified = attention._task_archive_classification(
+                record,
+                expected_lifecycle_receipt_sha256=str(
+                    record["lifecycle_receipt_sha256"]
+                ),
+                archived=False,
+            )
+
+        evidence_snapshot = classified["evidence"]
+        self.assertEqual(
+            {"task", "lease", "process", "receipt"},
+            set(evidence_snapshot["observed_sources"]),
+        )
+        for source in ("workspace", "checkout", "tmux"):
+            self.assertEqual(
+                "not_applicable",
+                evidence_snapshot["source_applicability"][source],
+            )
+            self.assertNotIn(source, evidence_snapshot["observed_sources"])
+            self.assertIn(source, evidence_snapshot["source_sha256s"])
+        for source in ("task", "lease", "process", "receipt"):
+            self.assertEqual(
+                "observed",
+                evidence_snapshot["source_applicability"][source],
+            )
+
+    def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+            second = attention.execute_closeout_archive(parameters)
+
+        self.assertFalse(first["already_archived"])
+        self.assertEqual("released", first["resource_release"]["status"])
+        self.assertEqual(3, len(first["resource_release"]["released"]))
+        self.assertRegex(first["archive_effect_receipt_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(first["projection"]["projection_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(second["already_archived"])
+        self.assertTrue(second["idempotent_replay"])
+        self.assertEqual("not_required", second["resource_release"]["status"])
+        self.assertEqual(
+            first["projection"]["projection_sha256"],
+            second["projection"]["projection_sha256"],
+        )
+
+    def test_closeout_archive_namespaces_same_caller_execution_id_per_task(self) -> None:
+        first_record = self._completed_task()
+        second_record = self._completed_task()
+        shared_execution_id = "shared-caller-retry-key"
+
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(
+                self._archive_parameters(
+                    first_record, execution_id=shared_execution_id
+                )
+            )
+            second = attention.execute_closeout_archive(
+                self._archive_parameters(
+                    second_record, execution_id=shared_execution_id
+                )
+            )
+
+        self.assertEqual(
+            first["caller_execution_id_sha256"],
+            second["caller_execution_id_sha256"],
+        )
+        self.assertNotEqual(
+            first["execution_id_sha256"],
+            second["execution_id_sha256"],
+        )
+        self.assertNotEqual(
+            first["archive_effect_receipt_sha256"],
+            second["archive_effect_receipt_sha256"],
+        )
+
+    def test_closeout_archive_replay_releases_leftover_owned_effect_leases(self) -> None:
+        import grabowski_lifecycle_archive as lifecycle
+        import grabowski_lifecycle_projection as lifecycle_projection
+
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+
+        owner = (
+            "operator:task-closeout-archive:"
+            + first["execution_id_sha256"][:24]
+        )
+        resource_keys = sorted(
+            {
+                lifecycle._task_archive_effect_resource_key(self.archive_root),
+                lifecycle._task_archive_effect_resource_key(self.archive_effect_root),
+                lifecycle_projection._projection_resource_key(self.projection_root),
+            }
+        )
+        tasks.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="simulate ambiguous release after successful projection",
+            ttl_seconds=60,
+        )
+
+        replay = attention.execute_closeout_archive(parameters)
+
+        self.assertTrue(replay["already_archived"])
+        self.assertEqual("released", replay["resource_release"]["status"])
+        self.assertEqual(resource_keys, replay["resource_release"]["released"])
+        for resource_key in resource_keys:
+            self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+
+    def test_closeout_archive_failed_task_requires_attention_decision(self) -> None:
+        record = self._failed_task()
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionConflictError,
+            "not ready for archival",
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+
+    def test_closeout_archive_failed_task_accepts_closed_decision(self) -> None:
+        record = self._failed_task()
+        attention.record_decision(self._parameters(record, decision="closed"))
+
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            result = attention.execute_closeout_archive(
+                self._archive_parameters(record)
+            )
+
+        self.assertFalse(result["already_archived"])
+        self.assertEqual("decision_closed", result["closeout"]["attention_classification"])
+        self.assertEqual("released", result["resource_release"]["status"])
+
+    def test_closeout_archive_blocks_until_minimum_retention_is_satisfied(self) -> None:
+        record = self._completed_task()
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionConflictError,
+            "minimum retention",
+        ):
+            attention.execute_closeout_archive(
+                self._archive_parameters(record, minimum_age_seconds=10**9)
+            )
+
+        self.assertFalse(self.archive_root.exists())
+        self.assertFalse(self.projection_root.exists())
+
+    def test_closeout_archive_blocks_live_authoritative_unit(self) -> None:
+        record = self._completed_task()
+        live = {
+            "properties": {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+            },
+            "probe": {"returncode": 0, "outcome_unknown": False},
+        }
+
+        with patch.object(tasks, "_observe", return_value=live), self.assertRaisesRegex(
+            attention.TaskAttentionConflictError,
+            "still live",
+        ):
+            attention.execute_closeout_archive(self._archive_parameters(record))
+
+    def test_closeout_archive_blocks_reacquired_task_resource_lease(self) -> None:
+        resource_key = "component:test-task-closeout-archive"
+        record = self._completed_task(resource_keys=[resource_key])
+        foreign_owner = "operator:test-foreign-retention"
+        tasks.resources.acquire_resources(
+            foreign_owner,
+            [resource_key],
+            purpose="test active lease after terminalization",
+            ttl_seconds=60,
+        )
+        try:
+            with patch.object(
+                tasks,
+                "_observe",
+                return_value=self._inactive_process_observation(),
+            ), self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "active task resource leases",
+            ):
+                attention.execute_closeout_archive(self._archive_parameters(record))
+        finally:
+            tasks.resources.release_resources(foreign_owner, [resource_key])
 
     def test_current_reconciliation_excludes_closed_and_superseded_but_keeps_deferred(self) -> None:
         closed = self._failed_task()

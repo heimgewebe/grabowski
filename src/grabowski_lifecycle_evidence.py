@@ -10,22 +10,33 @@ SCHEMA_VERSION = 1
 REQUIRED_SOURCES = frozenset(
     {"task", "workspace", "lease", "checkout", "process", "tmux", "receipt"}
 )
+SOURCE_APPLICABILITY_SCHEMA_VERSION = 1
+SOURCE_APPLICABILITY_STATES = frozenset(
+    {"observed", "explicit_absence", "not_applicable"}
+)
+READBACK_SOURCE_APPLICABILITY_STATES = frozenset(
+    {"observed", "explicit_absence"}
+)
 
 
 @dataclass(frozen=True)
 class LifecycleObservationBundle:
     """Normalized current observations from the typed operator surfaces.
 
-    ``observed_sources`` means the source was actively checked for this object,
-    including the explicit observation that no matching live object exists.
-    ``source_sha256s`` binds each checked source payload after the caller has
-    normalized/redacted it. Missing source checks or digests fail closed.
+    ``observed_sources`` contains only sources for which an actual readback was
+    performed, including a readback that proves explicit absence.
+    ``source_applicability`` distinguishes an observed object, explicit absence,
+    and a source that is formally not applicable to this lifecycle kind. Every
+    required source remains digest-bound. Missing, unknown, contradictory, or
+    schema-foreign applicability fails closed.
     """
 
     identity: str
     kind: str
     observed_sources: frozenset[str]
     source_sha256s: Mapping[str, str]
+    source_applicability: Mapping[str, str]
+    source_applicability_schema_version: int = SOURCE_APPLICABILITY_SCHEMA_VERSION
     state: str | None = None
     closed: bool | None = None
     archived: bool = False
@@ -46,12 +57,57 @@ class LifecycleObservationBundle:
 
 def _source_errors(bundle: LifecycleObservationBundle) -> list[str]:
     errors = [f"source_error:{value}" for value in bundle.source_errors]
-    unknown_sources = sorted(set(bundle.observed_sources) - REQUIRED_SOURCES)
+    observed_sources = set(bundle.observed_sources)
+    unknown_sources = sorted(observed_sources - REQUIRED_SOURCES)
     errors.extend(f"source_unknown:{source}" for source in unknown_sources)
-    for source in sorted(REQUIRED_SOURCES - set(bundle.observed_sources)):
-        errors.append(f"source_unobserved:{source}")
-    for source in sorted(REQUIRED_SOURCES & set(bundle.observed_sources)):
-        digest = bundle.source_sha256s.get(source)
+
+    if bundle.source_applicability_schema_version != SOURCE_APPLICABILITY_SCHEMA_VERSION:
+        errors.append("source_applicability_schema_unsupported")
+
+    applicability = bundle.source_applicability
+    if not isinstance(applicability, Mapping):
+        errors.append("source_applicability_invalid")
+        applicability = {}
+    unknown_applicability_sources = sorted(
+        source
+        for source in applicability
+        if isinstance(source, str) and source not in REQUIRED_SOURCES
+    )
+    errors.extend(
+        f"source_applicability_unknown:{source}"
+        for source in unknown_applicability_sources
+    )
+    if any(not isinstance(source, str) for source in applicability):
+        errors.append("source_applicability_unknown_key_type")
+    for source in sorted(REQUIRED_SOURCES):
+        if source not in applicability:
+            errors.append(f"source_applicability_missing:{source}")
+            if source not in observed_sources:
+                errors.append(f"source_unobserved:{source}")
+            continue
+        state = applicability[source]
+        if state not in SOURCE_APPLICABILITY_STATES:
+            errors.append(f"source_applicability_invalid:{source}")
+            continue
+        if state in READBACK_SOURCE_APPLICABILITY_STATES and source not in observed_sources:
+            errors.append(f"source_unobserved:{source}")
+        if state == "not_applicable" and source in observed_sources:
+            errors.append(
+                f"source_applicability_contradiction:{source}:not_applicable"
+            )
+
+    source_sha256s = bundle.source_sha256s
+    if not isinstance(source_sha256s, Mapping):
+        errors.append("source_digest_mapping_invalid")
+        source_sha256s = {}
+    unknown_digest_sources = sorted(
+        source
+        for source in source_sha256s
+        if isinstance(source, str) and source not in REQUIRED_SOURCES
+    )
+    errors.extend(f"source_digest_unknown:{source}" for source in unknown_digest_sources)
+    for source in sorted(REQUIRED_SOURCES):
+        digest = source_sha256s.get(source)
         if not isinstance(digest, str) or lifecycle.SHA256.fullmatch(digest) is None:
             errors.append(f"source_unbound:{source}")
     return errors
@@ -122,8 +178,15 @@ def normalized_evidence(bundle: LifecycleObservationBundle) -> dict[str, Any]:
     )
     source_sha256s = {
         source: bundle.source_sha256s[source]
-        for source in sorted(bundle.source_sha256s)
-        if source in REQUIRED_SOURCES and source in bundle.observed_sources
+        for source in sorted(REQUIRED_SOURCES)
+        if isinstance(bundle.source_sha256s, Mapping)
+        and isinstance(bundle.source_sha256s.get(source), str)
+    }
+    source_applicability = {
+        source: bundle.source_applicability[source]
+        for source in sorted(REQUIRED_SOURCES)
+        if isinstance(bundle.source_applicability, Mapping)
+        and isinstance(bundle.source_applicability.get(source), str)
     }
     body = {
         "schema_version": SCHEMA_VERSION,
@@ -132,6 +195,8 @@ def normalized_evidence(bundle: LifecycleObservationBundle) -> dict[str, Any]:
         "lifecycle_kind": bundle.kind,
         "observed_sources": sorted(bundle.observed_sources),
         "required_sources": sorted(REQUIRED_SOURCES),
+        "source_applicability_schema_version": bundle.source_applicability_schema_version,
+        "source_applicability": source_applicability,
         "source_sha256s": source_sha256s,
         "source_errors": list(bundle.source_errors),
         "state": bundle.state,

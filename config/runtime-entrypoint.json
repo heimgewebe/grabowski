@@ -32,6 +32,7 @@
     "repoground_range_get",
     "repoground_context_pack",
     "repoground_context_compose",
+    "repoground_agent_handoff",
     "repoground_find_symbol",
     "repoground_get_callers",
     "repoground_get_callees",

@@ -17,6 +17,7 @@ import grabowski_grips as grips
 import grabowski_grip_orchestration as grip_orchestration
 import grabowski_merge_guard as merge_guard
 import grabowski_resources as resources
+import grabowski_task_attention as task_attention
 
 def _self_review_audit(
     *,
@@ -708,6 +709,7 @@ class GripFoundationTests(unittest.TestCase):
                 "runtime-deploy-check",
                 "task-attention-decision",
                 "task-attention-reconciliation",
+                "task-closeout-archive",
                 "scout",
                 "situation",
                 "worktree-ensure",
@@ -733,6 +735,80 @@ class GripFoundationTests(unittest.TestCase):
         ):
             self.assertIn(field, specs["repo-orient"])
         self.assertEqual("operator", specs["repo-orient"]["profile"])
+
+    def test_task_closeout_archive_grip_runs_typed_archive_surface(self) -> None:
+        parameters = {
+            "task_id": "a" * 24,
+            "expected_attempt": 1,
+            "expected_unit": "grabowski-task-test-a1.service",
+            "expected_authoritative_unit": "grabowski-task-test-a1.service",
+            "expected_argv_sha256": "b" * 64,
+            "expected_execution_envelope_sha256": None,
+            "expected_lifecycle_receipt_sha256": "c" * 64,
+            "minimum_age_seconds": 86400,
+            "execution_id": "operator-closeout-1",
+        }
+        output = {
+            "closeout": {"closeout_state": "ready_to_archive"},
+            "retention_boundary_unix": 123,
+            "archive_segment": {"manifest_sha256": "d" * 64},
+            "projection": {"projection_sha256": "e" * 64},
+            "resource_release": {"status": "released", "released": []},
+        }
+
+        with patch.object(
+            task_attention,
+            "execute_closeout_archive",
+            return_value=output,
+        ) as execute:
+            result = grips.grip_run(
+                "task-closeout-archive",
+                parameters,
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("passed", result["output"]["receipt_status"])
+        self.assertEqual(parameters, execute.call_args.args[0])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["projection-readback"])
+        self.assertEqual("pass", checks["exact-resource-leases-released"])
+        self.assertEqual("high", grips.grip_risk_level("task-closeout-archive"))
+
+    def test_task_closeout_archive_grip_reports_conflict_as_blocked(self) -> None:
+        parameters = {
+            "task_id": "a" * 24,
+            "expected_attempt": 1,
+            "expected_unit": "grabowski-task-test-a1.service",
+            "expected_authoritative_unit": "grabowski-task-test-a1.service",
+            "expected_argv_sha256": "b" * 64,
+            "expected_execution_envelope_sha256": None,
+            "expected_lifecycle_receipt_sha256": "c" * 64,
+            "minimum_age_seconds": 86400,
+            "execution_id": "operator-closeout-1",
+        }
+
+        with patch.object(
+            task_attention,
+            "execute_closeout_archive",
+            side_effect=task_attention.TaskAttentionConflictError(
+                "minimum retention is not yet satisfied"
+            ),
+        ):
+            result = grips.grip_run(
+                "task-closeout-archive",
+                parameters,
+                profile="operator",
+                allow_mutation=True,
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("blocked", result["output"]["receipt_status"])
+        self.assertEqual(
+            ["task_closeout_archive_conflict"],
+            result["output"]["blocked_reasons"],
+        )
 
     def test_grip_list_profile_visibility(self) -> None:
         surface = grips.grip_list(profile="observer")

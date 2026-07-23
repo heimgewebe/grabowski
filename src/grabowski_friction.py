@@ -42,7 +42,9 @@ FRICTION_CLOSEOUT_STATUSES = frozenset({
     "accepted_risk",
     "wont_fix",
     "linked_to_task",
+    "reopened",
 })
+FRICTION_TERMINAL_CLOSEOUT_STATUSES = FRICTION_CLOSEOUT_STATUSES - {"reopened"}
 FRICTION_CLOSEOUT_NON_CLAIMS = (
     "does_not_prove_root_cause",
     "does_not_authorize_task_resume",
@@ -624,11 +626,16 @@ def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
         ),
         "closeout": (
             {
+                "closeout_id": _bounded_summary_text(closeout.get("closeout_id"), max_chars=32),
+                "status": _bounded_summary_text(closeout.get("status"), max_chars=40),
                 "decision": _bounded_summary_text(closeout.get("decision")),
                 "evidence_ref": _bounded_summary_text(closeout.get("evidence_ref")),
                 "resolved_by": _bounded_summary_text(closeout.get("resolved_by"), max_chars=120),
                 "closed_at": _bounded_summary_text(closeout.get("closed_at"), max_chars=40),
                 "bureau_task_id": _bounded_summary_text(closeout.get("bureau_task_id"), max_chars=200),
+                "supersedes_closeout_id": _bounded_summary_text(
+                    closeout.get("supersedes_closeout_id"), max_chars=32
+                ),
             }
             if closeout is not None
             else None
@@ -1677,7 +1684,21 @@ def _valid_closeout_record(record: dict[str, Any]) -> bool:
         "status", "evidence_ref", "resolved_by", "closed_at", "closed_at_unix",
         "reason", "bureau_task_id", "non_claims",
     }
-    if set(record) != required or record.get("schema_version") != 1:
+    schema_version = record.get("schema_version")
+    if schema_version == 1:
+        if set(record) != required or record.get("status") == "reopened":
+            return False
+    elif schema_version == 2:
+        if set(record) != required | {"supersedes_closeout_id"}:
+            return False
+        supersedes_closeout_id = record.get("supersedes_closeout_id")
+        if (
+            not isinstance(supersedes_closeout_id, str)
+            or not FRICTION_CLOSEOUT_ID_RE.fullmatch(supersedes_closeout_id)
+            or supersedes_closeout_id == record.get("closeout_id")
+        ):
+            return False
+    else:
         return False
     if not isinstance(record.get("closeout_id"), str) or not FRICTION_CLOSEOUT_ID_RE.fullmatch(record["closeout_id"]):
         return False
@@ -1691,7 +1712,7 @@ def _valid_closeout_record(record: dict[str, Any]) -> bool:
             return False
     if not record["decision"].strip() or not record["evidence_ref"].strip() or not record["resolved_by"].strip():
         return False
-    if record["status"] == "deferred" and not record["reason"].strip():
+    if record["status"] in {"deferred", "reopened"} and not record["reason"].strip():
         return False
     if record["bureau_task_id"] and not BUREAU_TASK_ID_RE.fullmatch(record["bureau_task_id"]):
         return False
@@ -1705,22 +1726,57 @@ def _valid_closeout_record(record: dict[str, Any]) -> bool:
     return record.get("non_claims") == list(FRICTION_CLOSEOUT_NON_CLAIMS)
 
 
+def _valid_closeout_transition(existing: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    existing_status = str(existing.get("status") or "")
+    candidate_status = str(candidate.get("status") or "")
+    if existing_status == "reopened":
+        return candidate_status in FRICTION_TERMINAL_CLOSEOUT_STATUSES
+    return candidate_status == "reopened"
+
+
 def _closeout_index() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     loaded = _load_jsonl_records(FRICTION_DECISION_LOG, require_private=True)
     index: dict[str, dict[str, Any]] = {}
     invalid_record_count = 0
     duplicate_event_ids: set[str] = set()
     conflicting_event_ids: set[str] = set()
+    duplicate_closeout_ids: set[str] = set()
+    revision_event_ids: set[str] = set()
+    invalid_revision_event_ids: set[str] = set()
+    seen_closeout_ids: set[str] = set()
+    valid_record_count = 0
     for record in loaded["records"]:
         if not _valid_closeout_record(record):
             invalid_record_count += 1
             continue
+        closeout_id = record["closeout_id"]
+        if closeout_id in seen_closeout_ids:
+            duplicate_closeout_ids.add(closeout_id)
+            continue
+        seen_closeout_ids.add(closeout_id)
+        valid_record_count += 1
         event_id = record["event_id"]
         existing = index.get(event_id)
-        if existing is not None:
+        is_revision = record.get("schema_version") == 2
+        if existing is None:
+            if is_revision:
+                invalid_revision_event_ids.add(event_id)
+                conflicting_event_ids.add(event_id)
+                continue
+            index[event_id] = record
+            continue
+        if not is_revision:
             duplicate_event_ids.add(event_id)
             if _closeout_signature(existing) != _closeout_signature(record):
                 conflicting_event_ids.add(event_id)
+            continue
+        revision_event_ids.add(event_id)
+        if (
+            record.get("supersedes_closeout_id") != existing.get("closeout_id")
+            or not _valid_closeout_transition(existing, record)
+        ):
+            invalid_revision_event_ids.add(event_id)
+            conflicting_event_ids.add(event_id)
             continue
         index[event_id] = record
     for event_id in conflicting_event_ids:
@@ -1731,13 +1787,17 @@ def _closeout_index() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         invalid_record_count,
         duplicate_event_ids,
         conflicting_event_ids,
+        duplicate_closeout_ids,
+        invalid_revision_event_ids,
     ))
     return index, {
         "path": str(FRICTION_DECISION_LOG),
         "exists": FRICTION_DECISION_LOG.exists(),
         "records": len(loaded["records"]),
+        "record_count": len(loaded["records"]),
         "scanned_lines": loaded["scanned_lines"],
-        "valid_records": len(index),
+        "valid_records": valid_record_count,
+        "effective_records": len(index),
         "invalid_lines": loaded["invalid_lines"],
         "non_object_lines": loaded["non_object_lines"],
         "invalid_record_count": invalid_record_count,
@@ -1746,6 +1806,12 @@ def _closeout_index() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
         "duplicate_event_ids_truncated": len(duplicate_event_ids) > 20,
         "conflicting_event_ids": sorted(conflicting_event_ids)[:20],
         "conflicting_event_ids_truncated": len(conflicting_event_ids) > 20,
+        "duplicate_closeout_ids": sorted(duplicate_closeout_ids)[:20],
+        "duplicate_closeout_ids_truncated": len(duplicate_closeout_ids) > 20,
+        "revision_event_ids": sorted(revision_event_ids)[:20],
+        "revision_event_ids_truncated": len(revision_event_ids) > 20,
+        "invalid_revision_event_ids": sorted(invalid_revision_event_ids)[:20],
+        "invalid_revision_event_ids_truncated": len(invalid_revision_event_ids) > 20,
         "integrity_valid": integrity_valid,
     }
 
@@ -1753,12 +1819,14 @@ def _closeout_index() -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
 def _closeout_signature(record: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(record.get(key) for key in (
         "event_id",
+        "failure_class",
         "status",
         "decision",
         "evidence_ref",
         "resolved_by",
         "reason",
         "bureau_task_id",
+        "supersedes_closeout_id",
     ))
 
 
@@ -1787,6 +1855,8 @@ def resolve_friction(
     failure_class: str = "",
     reason: str = "",
     bureau_task_id: str = "",
+    supersedes_closeout_id: str = "",
+    expected_match_count: int | None = None,
 ) -> dict[str, Any]:
     event_selector = _clean_text(event_id, label="event_id", required=False, max_bytes=128)
     class_selector = _clean_text(failure_class, label="failure_class", required=False, max_bytes=80)
@@ -1796,16 +1866,36 @@ def resolve_friction(
         event_selector = _validate_event_id(event_selector)
     if class_selector and class_selector not in FAILURE_CLASSES:
         raise ValueError(f"failure_class must be one of {sorted(FAILURE_CLASSES)}")
+    if expected_match_count is not None and (
+        isinstance(expected_match_count, bool)
+        or not isinstance(expected_match_count, int)
+        or expected_match_count < 0
+    ):
+        raise ValueError("expected_match_count must be a non-negative integer")
+    if class_selector and expected_match_count is None:
+        raise ValueError("failure_class closeout requires expected_match_count")
+    if event_selector and expected_match_count not in (None, 1):
+        raise ValueError("event_id closeout expected_match_count must be 1 when provided")
+    clean_supersedes_closeout_id = _clean_text(
+        supersedes_closeout_id,
+        label="supersedes_closeout_id",
+        required=False,
+        max_bytes=32,
+    )
+    if clean_supersedes_closeout_id and not FRICTION_CLOSEOUT_ID_RE.fullmatch(clean_supersedes_closeout_id):
+        raise ValueError("supersedes_closeout_id must be a 32-character lowercase hex closeout id")
     closeout_status = _validate_enum(status, label="status", allowed=set(FRICTION_CLOSEOUT_STATUSES))
     clean_decision = _clean_text(decision, label="decision")
     clean_evidence_ref = _clean_text(evidence_ref, label="evidence_ref")
     clean_resolved_by = _clean_text(resolved_by, label="resolved_by", max_bytes=200)
     clean_reason = _clean_text(reason, label="reason", required=False)
     clean_task_id = _validate_bureau_task_id(bureau_task_id) if bureau_task_id else ""
-    if closeout_status == "deferred" and not clean_reason:
-        raise ValueError("deferred closeout requires reason")
+    if closeout_status in {"deferred", "reopened"} and not clean_reason:
+        raise ValueError(f"{closeout_status} closeout requires reason")
     if closeout_status == "linked_to_task" and not clean_task_id:
         raise ValueError("linked_to_task closeout requires bureau_task_id")
+    if closeout_status == "reopened" and not clean_supersedes_closeout_id:
+        raise ValueError("reopened closeout requires supersedes_closeout_id")
 
     raw = _load_jsonl_records(FRICTION_LOG)
     events = [record for record in raw["records"] if _has_event_id(record)]
@@ -1821,8 +1911,6 @@ def resolve_friction(
 
     with _decision_log_lock(exclusive=True):
         closeouts, closeout_meta = _closeout_index()
-        if closeout_meta["duplicate_event_ids"]:
-            raise RuntimeError("friction decision log contains duplicate closeouts")
         if not closeout_meta["integrity_valid"]:
             raise RuntimeError("friction decision log integrity is invalid")
         binding_mismatches = _closeout_binding_mismatch_ids(events, closeouts)
@@ -1834,6 +1922,7 @@ def resolve_friction(
             if event_selector not in by_id:
                 raise ValueError("event_id not found in friction ledger")
             targets = [by_id[event_selector]]
+            matched_target_count = 1
         else:
             matching_targets = [
                 event
@@ -1842,16 +1931,26 @@ def resolve_friction(
                 and event.get("resolved") is not True
                 and _event_id(event) not in closeouts
             ]
-            targets = matching_targets[:MAX_FRICTION_CLOSEOUT_BATCH]
+            matched_target_count = len(matching_targets)
+            if matched_target_count != expected_match_count:
+                raise ValueError(
+                    "failure_class closeout expected_match_count mismatch: "
+                    f"expected {expected_match_count}, matched {matched_target_count}"
+                )
+            if matched_target_count > MAX_FRICTION_CLOSEOUT_BATCH:
+                raise ValueError(
+                    "failure_class closeout match count exceeds max batch size: "
+                    f"matched {matched_target_count}, max {MAX_FRICTION_CLOSEOUT_BATCH}"
+                )
+            targets = matching_targets
 
-        matched_target_count = len(targets) if event_selector else len(matching_targets)
-        targets_truncated = matched_target_count > len(targets)
-        remaining_target_count = matched_target_count - len(targets)
+        targets_truncated = False
+        remaining_target_count = 0
 
         for event in targets:
             target_event_id = _event_id(event)
-            candidate = {
-                "schema_version": 1,
+            candidate: dict[str, Any] = {
+                "schema_version": 2 if clean_supersedes_closeout_id else 1,
                 "closeout_id": uuid.uuid4().hex,
                 "event_id": target_event_id,
                 "failure_class": classify_friction_event(event),
@@ -1865,12 +1964,30 @@ def resolve_friction(
                 "bureau_task_id": clean_task_id,
                 "non_claims": list(FRICTION_CLOSEOUT_NON_CLAIMS),
             }
+            if clean_supersedes_closeout_id:
+                candidate["supersedes_closeout_id"] = clean_supersedes_closeout_id
             existing = closeouts.get(target_event_id)
-            if existing is not None:
-                if _closeout_signature(existing) == _closeout_signature(candidate):
-                    already_recorded.append(target_event_id)
-                    continue
-                raise ValueError(f"event_id already has a different closeout: {target_event_id}")
+            if existing is not None and _closeout_signature(existing) == _closeout_signature(candidate):
+                already_recorded.append(target_event_id)
+                continue
+            if existing is None:
+                if clean_supersedes_closeout_id:
+                    raise ValueError(
+                        f"event_id has no closeout to supersede: {target_event_id}"
+                    )
+            else:
+                if not clean_supersedes_closeout_id:
+                    raise ValueError(f"event_id already has a different closeout: {target_event_id}")
+                if existing.get("closeout_id") != clean_supersedes_closeout_id:
+                    raise ValueError(
+                        "supersedes_closeout_id does not match current closeout for event_id: "
+                        f"{target_event_id}"
+                    )
+                if not _valid_closeout_transition(existing, candidate):
+                    raise ValueError(
+                        "invalid friction closeout revision transition: "
+                        f"{existing.get('status')} -> {closeout_status}"
+                    )
             _append_jsonl(FRICTION_DECISION_LOG, candidate)
             closeouts[target_event_id] = candidate
             appended.append(candidate)
@@ -1881,18 +1998,22 @@ def resolve_friction(
         "selector": event_selector or class_selector,
         "selector_kind": "event_id" if event_selector else "failure_class",
         "status": closeout_status,
+        "expected_match_count": expected_match_count,
+        "supersedes_closeout_id": clean_supersedes_closeout_id or None,
         "appended_count": len(appended),
         "already_recorded_count": len(already_recorded),
         "event_ids": [record["event_id"] for record in appended][:20],
     })
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "path": str(FRICTION_DECISION_LOG),
         "selector": {
             "event_id": event_selector or None,
             "failure_class": class_selector or None,
         },
         "status": closeout_status,
+        "expected_match_count": expected_match_count,
+        "supersedes_closeout_id": clean_supersedes_closeout_id or None,
         "target_count": len(targets),
         "matched_target_count": matched_target_count,
         "targets_truncated": targets_truncated,
@@ -2070,8 +2191,13 @@ def friction_summary(
         closeout = closeouts.get(event_id)
         if closeout is not None:
             event["closeout"] = closeout
-            event["resolved"] = True
-            resolution_counts[str(closeout.get("status") or "unknown")] += 1
+            closeout_status = str(closeout.get("status") or "unknown")
+            if closeout_status == "reopened":
+                event["resolved"] = False
+                resolution_counts["reopened"] += 1
+            else:
+                event["resolved"] = True
+                resolution_counts[closeout_status] += 1
         elif event.get("resolved") is True:
             resolution_counts["legacy_resolved"] += 1
         else:
@@ -2081,7 +2207,7 @@ def friction_summary(
         by_kind[kind] = by_kind.get(kind, 0) + 1
         by_surface[surface] = by_surface.get(surface, 0) + 1
         overlaid_events.append(event)
-    unresolved = resolution_counts["unresolved"]
+    unresolved = resolution_counts["unresolved"] + resolution_counts["reopened"]
     classification = classify_failure_events(overlaid_events)
     diagnostics = connector_transport_diagnostics(overlaid_events)
     proposals = propose_next_grip_from_friction(overlaid_events)
@@ -2112,6 +2238,9 @@ def friction_summary(
                 "invalid_record_count",
                 "duplicate_event_ids",
                 "conflicting_event_ids",
+                "duplicate_closeout_ids",
+                "revision_event_ids",
+                "invalid_revision_event_ids",
             )
             if key in closeout_meta
         },
@@ -2238,8 +2367,10 @@ def grabowski_friction_resolve(
     failure_class: str = "",
     reason: str = "",
     bureau_task_id: str = "",
+    supersedes_closeout_id: str = "",
+    expected_match_count: int | None = None,
 ) -> dict[str, Any]:
-    """Append evidence-bound friction closeout decisions without rewriting history."""
+    """Append evidence-bound friction decisions or exact append-only revisions."""
     base._require_mutations_enabled("friction_record")
     return resolve_friction(
         status=status,
@@ -2250,6 +2381,8 @@ def grabowski_friction_resolve(
         failure_class=failure_class,
         reason=reason,
         bureau_task_id=bureau_task_id,
+        supersedes_closeout_id=supersedes_closeout_id,
+        expected_match_count=expected_match_count,
     )
 
 
