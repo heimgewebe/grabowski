@@ -1203,6 +1203,47 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
         self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
 
+    def test_route_bound_codex_receipt_rejects_non_read_only_sandbox_binding(self) -> None:
+        contract = self._route_contract("codex-sol-high")
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-codex-sandbox-binding"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id="codex-sandbox-binding",
+                provider="codex",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Contrast sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="codex-sol-high",
+            )
+        receipt = self._write_receipt(
+            started["competition_id"], changed_paths=[], risks=[], tests=[]
+        )
+        packet = competition._validated_packet(started["competition_id"])
+        command = list(receipt["command_shape"])
+        command[command.index("--sandbox") + 1] = "workspace-write"
+        command.append("read-only")
+        receipt["command_shape"] = command
+        receipt["command_sha256"] = competition._sha256_json(command)
+        with self.assertRaisesRegex(
+            competition.AgentCompetitionError, "Codex command shape"
+        ):
+            competition._validate_receipt_execution(receipt, packet)
+
     def test_route_bound_agy_receipt_preserves_route_and_zero_budget_binding(self) -> None:
         contract = self._route_contract("agy-gemini-flash-medium")
         with (

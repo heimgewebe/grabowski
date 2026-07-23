@@ -1387,8 +1387,19 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
         if command[0] != route_contract["argv_prefix"][0]:
             raise AgentCompetitionError("candidate receipt command does not match route executable")
         if receipt["provider"] == "codex":
-            if command[:3] != ["codexr", route_contract["argv_prefix"][1], "exec"] or "--sandbox" not in command or "read-only" not in command:
-                raise AgentCompetitionError("candidate receipt Codex command shape is invalid")
+            sandbox_indexes = [
+                index for index, item in enumerate(command) if item == "--sandbox"
+            ]
+            if (
+                command[:3]
+                != ["codexr", route_contract["argv_prefix"][1], "exec"]
+                or len(sandbox_indexes) != 1
+                or sandbox_indexes[0] + 1 >= len(command)
+                or command[sandbox_indexes[0] + 1] != "read-only"
+            ):
+                raise AgentCompetitionError(
+                    "candidate receipt Codex command shape is invalid"
+                )
         elif receipt["provider"] == "claude":
             prefix = route_contract["argv_prefix"]
             permission_mode = route_contract["permission_mode"]
