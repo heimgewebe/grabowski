@@ -258,8 +258,10 @@ class ConvergenceBackfillReviewHardeningTests(unittest.TestCase):
             )
         bounds = projection["source_bounds"]
         self.assertTrue(bounds["selection_truncated"])
+        self.assertTrue(bounds["operator_obligations"]["scan_truncated"])
+        self.assertEqual(0, bounds["operator_obligations"]["known_omitted_count_lower_bound"])
         self.assertEqual(3, bounds["bureau_attention"]["known_omitted_count_lower_bound"])
-        self.assertEqual(6, bounds["known_omitted_count_lower_bound"])
+        self.assertEqual(5, bounds["known_omitted_count_lower_bound"])
 
 
 if __name__ == "__main__":
