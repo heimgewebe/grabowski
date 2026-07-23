@@ -2409,8 +2409,8 @@ def _run_convergence_state_classify(
 ) -> dict[str, Any]:
     del spec, runner
     records = parameters["records"]
-    if not isinstance(records, list) or not 1 <= len(records) <= 100:
-        raise GripPreflightError("records must contain between 1 and 100 objects")
+    if not isinstance(records, list) or len(records) > 100:
+        raise GripPreflightError("records must contain between 0 and 100 objects")
     seen: set[str] = set()
     classified: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()

@@ -6940,6 +6940,16 @@ class GateEvidenceConvergenceGripTests(unittest.TestCase):
         self.assertEqual("superseded", by_id["superseded-blocked"]["classification"])
         self.assertEqual("conflicted", by_id["terminal-conflict"]["classification"])
 
+    def test_convergence_state_classify_accepts_empty_bounded_snapshot(self) -> None:
+        result = grips.grip_run(
+            "convergence-state-classify",
+            {"records": []},
+        )
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual([], result["output"]["records"])
+        self.assertEqual(0, result["output"]["decision_required_count"])
+        self.assertTrue(all(value == 0 for value in result["output"]["counts"].values()))
+
     def test_convergence_state_classify_rejects_duplicate_ids(self) -> None:
         duplicate = {
             "record_id": "same",
