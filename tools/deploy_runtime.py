@@ -690,12 +690,14 @@ class Snapshot:
 
     @property
     def source_set_sha256(self) -> str:
-        value: Any = self.source_sha256s
-        if self.runtime_asset_sha256s:
+        value: Any
+        if self.contract.schema_version >= 3:
             value = {
                 "runtime_assets": self.runtime_asset_sha256s,
                 "sources": self.source_sha256s,
             }
+        else:
+            value = self.source_sha256s
         encoded = json.dumps(
             value,
             sort_keys=True,

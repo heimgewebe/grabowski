@@ -1804,7 +1804,7 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Create one four-role tmux workspace with one isolated durable writer task.",
+      "description": "Create one explicit advisory contrast workspace; direct work stays authoritative.",
       "effects": [
         "worktree-create",
         "branch-create",
@@ -1813,7 +1813,7 @@
         "lease-create"
       ],
       "id": "grabowski_agent_workspace_create",
-      "purpose": "Create one task-bound four-pane tmux workspace with one isolated writer worktree.",
+      "purpose": "Create one explicitly requested advisory contrast workspace while ChatGPT/Grabowski remains the authoritative writer.",
       "read_only": false,
       "reversibility": "close-and-preserved-worktree",
       "risk_class": "high",
@@ -1852,7 +1852,7 @@
         "task-state-refresh"
       ],
       "id": "grabowski_agent_workspace_collect",
-      "purpose": "Freeze writer evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
+      "purpose": "Freeze advisory contrast evidence, run read-only tests and review, and write a head- and diff-bound receipt.",
       "read_only": false,
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
@@ -1882,7 +1882,7 @@
         "task-state-refresh"
       ],
       "id": "grabowski_agent_workspace_writer_handoff",
-      "purpose": "Start one operator-bound replacement writer after a proven terminal failure without replacing original evidence.",
+      "purpose": "Start one operator-bound replacement contrast writer after a proven terminal failure without granting authoritative writer status.",
       "read_only": false,
       "reversibility": "preserved-worktree-and-receipts",
       "risk_class": "high",
@@ -1990,10 +1990,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Recommend a lean R0-R3 route without authorizing parallel writers.",
+      "description": "Keep implementation direct and optionally recommend advisory contrast.",
       "effects": [],
       "id": "grabowski_agent_execution_route",
-      "purpose": "Recommend a lean R0-R3 direct, isolated, full-workspace, contrast or explicitly fork-gated competition route while keeping parallel writers advisory-only.",
+      "purpose": "Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -2012,10 +2012,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Recommend one zero-marginal-cost coding route without authorizing execution.",
+      "description": "Keep all authoritative work direct; rank agents only as advisory reviewers.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
-      "purpose": "Recommend one zero-marginal-cost, quota-aware coding route and provider-independent reviewer without granting dispatch or execution authority.",
+      "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -2120,6 +2120,7 @@
       "agy",
       "cline"
     ],
+    "coding_agent_priority_semantics": "legacy_name_review_and_contrast_only",
     "control_loop": [
       "typed_grabowski_tool",
       "grabowski_micro_task",
@@ -2142,63 +2143,79 @@
       "agy",
       "cline"
     ],
+    "execution_priority_semantics": "authoritative_operator_then_advisory_helpers",
     "name": "Operator Relay v0",
     "operator_first_for": [
       "task_decomposition",
-      "bounded_code_change",
+      "all_code_changes",
+      "tests",
       "integration",
       "critical_self_review",
+      "merge",
+      "deployment",
+      "closeout",
       "recovery"
+    ],
+    "review_and_contrast_agent_priority": [
+      "claude",
+      "codex",
+      "agy",
+      "cline"
     ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "chatgpt_operator_adaptive_workspace_external_competition_when_high_value",
-      "local_micro_reasoning": "ollama_api_qwen_coder",
+      "complex_code_task": "chatgpt_operator_direct_external_review_or_explicit_contrast",
+      "local_micro_reasoning": "chatgpt_operator_direct",
       "memory_prioritization": "bureau",
-      "patch_fallback": "aider_no_auto_commit",
+      "patch_fallback": "chatgpt_operator_direct",
       "patch_file_relay": "operator_patch_relay",
-      "quick_light_reasoning": "chatgpt_operator_external_opt_in_agy_print",
+      "quick_light_reasoning": "chatgpt_operator_direct",
       "repo_state_context": "steuerboard_operator_report",
-      "security_or_architecture_review": "chatgpt_operator_external_opt_in_claude",
-      "session_resume": "tmux_first_agy_when_useful",
+      "security_or_architecture_review": "chatgpt_operator_plus_external_independent_review",
+      "session_resume": "chatgpt_operator_direct",
       "shell_or_git_grip": "grabowski_task"
     },
-    "rule": "Keep ChatGPT as operator and execute bounded work first. Delegate only when a helper adds useful scale or independent contrast.",
+    "rule": "ChatGPT/Grabowski performs authoritative work directly at every scale. External agents are advisory reviewers or explicitly requested isolated contrast programmers only.",
     "workspace_execution_model": {
       "automatic_patch_apply": false,
       "automatic_winner_selection": false,
-      "default": "adaptive_operator_routing",
+      "capacity_fallback_to_external_writer": false,
+      "default": "direct_operator",
       "delegation_triggers": [
-        "high_novelty_design_space",
-        "independent_contrast",
-        "multiple_plausible_implementations",
-        "security_schema_or_concurrency_risk",
-        "capacity_fallback"
+        "independent_review",
+        "security_or_architecture_review",
+        "explicit_contrast_request",
+        "multiple_plausible_implementations_for_comparison"
       ],
       "direct_operator_for": [
-        "small_low_risk_fix",
-        "simple_document_change",
-        "bounded_deterministic_edit"
-      ],
-      "external_agent_delegation": "adaptive_opt_in",
-      "external_candidate_authority": "advisory_only",
-      "external_programming_modes": [
-        "competitor",
-        "contrast"
-      ],
-      "full_workspace_for": [
+        "all_authoritative_implementation",
+        "all_reviews",
+        "all_task_sizes",
         "runtime_or_security_change",
         "long_or_multi_file_implementation",
         "parallel_or_foreign_state",
         "connector_or_execution_state_uncertainty"
       ],
+      "external_agent_delegation": "review_or_explicit_contrast_only",
+      "external_candidate_authority": "advisory_only",
+      "external_primary_reviewer_forbidden": true,
+      "external_primary_writer_forbidden": true,
+      "external_programming_modes": [
+        "competitor",
+        "contrast"
+      ],
+      "full_workspace_for": [],
       "lane_owner": "chatgpt_operator",
       "max_external_candidates": 2,
       "operator_self_serves_lanes": [
         "captain",
         "writer",
         "tests",
-        "review"
+        "review",
+        "integration",
+        "merge",
+        "deployment",
+        "closeout"
       ],
       "role_evidence_isolated": true,
       "workspace_not_universal": true
@@ -2696,6 +2713,18 @@
       {
         "module": "grabowski_lifecycle_read_surface",
         "source": "src/grabowski_lifecycle_read_surface.py"
+      },
+      {
+        "module": "grabowski_operator_relay",
+        "source": "src/grabowski_operator_relay.py"
+      },
+      {
+        "module": "grabowski_coding_agent_catalog_data",
+        "source": "src/grabowski_coding_agent_catalog_data.py"
+      },
+      {
+        "module": "grabowski_coding_agent_router_cli",
+        "source": "src/grabowski_coding_agent_router_cli.py"
       }
     ]
   },
@@ -2703,11 +2732,11 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "2eff269804f2bae21634f5c6929db36c7a165722812659b28df777f16340cafa"
+      "sha256": "fa8cb43bc4e88ade3bcf91869966f7f0d7b5a988aef74ad3e156ccb1820bb20d"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "0a1fc4b72c36cf383adcf53cafb16e975f601feb11f292d26525e5b7ed6fbb7a"
+      "sha256": "2996cc1ca538cf55248ef7ce3b932fb1ab13374e7e16cd181676b82e839babbb"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2715,14 +2744,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "6447c4f2f0cd8c2a756b5a8ed87d5dd65765a24135ecfe75f1772358e2736f4f"
+      "sha256": "4bad0636726f1fdbf79923775c440abd2f93c9cc57bfbae2270802f4814ebf6e"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
-      "src/grabowski_agent_competition.py": "a73185abdcd26b6bad07b1fc5511182b820fd0e7b6eee3fbb9b558f5df83f442",
+      "src/grabowski_agent_competition.py": "0ebba01d2ae12dd24ba17cb77600d6e6195e3c7344ac18b672463092d573e6ff",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "f5633b849e3b892e33779bff3a2fe3f182a55d873d1e965cfd011141136d6ab5",
+      "src/grabowski_agent_workspace.py": "180b07865a6b9f84fd1510f007395b559444072b48c45f6f97ffc3d4ccf7f26c",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "4ea793a295ca5d4dc73489795984fe8ffd27d623377d058c6fe5d71ee477fec8",
@@ -2733,11 +2762,13 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "0a1fc4b72c36cf383adcf53cafb16e975f601feb11f292d26525e5b7ed6fbb7a",
+      "src/grabowski_capabilities.py": "2996cc1ca538cf55248ef7ce3b932fb1ab13374e7e16cd181676b82e839babbb",
       "src/grabowski_checkouts.py": "2c1a313621eeaf416e84e5bf55357bce5f561be7e909b7f48adaab3f4b229e53",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
-      "src/grabowski_coding_agent_router.py": "56f71abd6cfe2da8c3c130b7985539a72cc58524ffd1ed80d63ee4fb6a5f9c0f",
+      "src/grabowski_coding_agent_catalog_data.py": "6d5c262aa9e191dd3a4c76f108d9b061b51ee59e72ec70edb97ae5cd37299d86",
+      "src/grabowski_coding_agent_router.py": "5805afacf47870f49acdb836a542e354a6a8801df5a5e2b511f097e40e727050",
+      "src/grabowski_coding_agent_router_cli.py": "c81f5ae95805e8abd5e1636c0330cccd7a9bf0db1bc0c9e58e9b8286660510c0",
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "34499a7982324e24563a393712067248a4c570a0111b29c3ac4647bdba172eb6",
@@ -2758,13 +2789,14 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "2a32c060b70f0a4da5fc1a3c37d086e6d26cfd55dacfb5cb2bc50922469d72fa",
+      "src/grabowski_mcp.py": "7f53fe1c655b36de506b2789d4a0d067ed4295d23245cef5b66d0a4c8d74b87a",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "75be1e72248720a1c21d70366a8a08f3833693e25060c87fce4b1ba802c1fcca",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "4db64a321dc135762fc7ee26e030bf2070deab14eadfb0787e7cae45ccaaff2b",
       "src/grabowski_operator_obligation.py": "a18dd9e4c9b2915aecdf51897b38da08dc1b557541e823e9fb3bd7a0e470c085",
+      "src/grabowski_operator_relay.py": "e0869b3297b473366963670a7105ece12afae308f4ceba80a300db49ddd666b7",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
       "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",

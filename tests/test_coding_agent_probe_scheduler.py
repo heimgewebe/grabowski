@@ -26,9 +26,17 @@ assert SPEC is not None and SPEC.loader is not None
 SCHEDULER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(SCHEDULER)
 
+TEST_SCRUBBED_ENV = ("ROUTER_AUTH_ENV_A", "ROUTER_AUTH_ENV_B")
+
 
 class CodingAgentProbeSchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.expected_scrub_patch = mock.patch.object(
+            SCHEDULER,
+            "EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV",
+            TEST_SCRUBBED_ENV,
+        )
+        self.expected_scrub_patch.start()
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.state = self.root / "state.json"
@@ -50,6 +58,7 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         os.chmod(self.state, 0o600)
 
     def tearDown(self) -> None:
+        self.expected_scrub_patch.stop()
         self.temporary.cleanup()
 
     @staticmethod
@@ -101,6 +110,7 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         program = f"""\
 #!/usr/bin/env python3
 import hashlib
+import hmac
 import json
 import os
 from datetime import datetime, timezone
@@ -115,10 +125,30 @@ if sys.argv[1] == "probe":
         "observed_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "harnesses": {{}},
         "providers": {{"codex": {{"available": True}}}},
-        "api_key_environment_scrubbed": [],
+        "verified_quota_pools": [],
+        "api_key_environment_scrubbed": {list(TEST_SCRUBBED_ENV)!r},
+        "model_invocations": 0,
+        "paid_api_requests_authorized": 0,
     }}
-    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    body["catalog_probe_sha256"] = hashlib.sha256(canonical).hexdigest()
+    digest_fields = (
+        "schema_version",
+        "observed_at",
+        "harnesses",
+        "providers",
+        "verified_quota_pools",
+        "api_key_environment_scrubbed",
+        "model_invocations",
+        "paid_api_requests_authorized",
+    )
+    canonical = json.dumps(
+        {{field: body[field] for field in digest_fields}},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    body["catalog_probe_sha256"] = hmac.new(
+        b"grabowski-coding-agent-probe-v3", canonical, hashlib.sha256
+    ).hexdigest()
     if {tamper_digest!r}:
         body["catalog_probe_sha256"] = "0" * 64
     state["catalog"] = body
@@ -182,6 +212,167 @@ else:
         )
         self.assertFalse(self.failure.exists())
 
+    def test_probe_validation_rejects_plain_sha256_without_domain_binding(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        canonical = json.dumps(
+            {field: probe[field] for field in SCHEDULER.PROBE_DIGEST_FIELDS},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        probe["catalog_probe_sha256"] = hashlib.sha256(canonical).hexdigest()
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "digest does not match"
+        ):
+            SCHEDULER.validate_probe(probe)
+
+    def test_probe_validation_rejects_tampered_scrub_claim_outside_digest(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        digest = SCHEDULER.probe_digest(probe)
+        probe["catalog_probe_sha256"] = digest
+        probe["api_key_environment_scrubbed"] = ["ROUTER_AUTH_ENV_A"]
+        self.assertNotEqual(digest, SCHEDULER.probe_digest(probe))
+        with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, "digest does not match"):
+            SCHEDULER.validate_probe(probe)
+
+    def test_probe_validation_rejects_invalid_verified_pool_claims(self) -> None:
+        base = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        for value in (
+            ["grok-com", "grok-com"],
+            ["unknown"],
+            [{"pool": "grok-com"}],
+        ):
+            with self.subTest(value=value):
+                probe = {**base, "verified_quota_pools": value}
+                probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+                with self.assertRaisesRegex(
+                    SCHEDULER.ProbeSchedulerError, "verified_quota_pools"
+                ):
+                    SCHEDULER.validate_probe(probe)
+
+    def test_probe_validation_rejects_unknown_fields_and_nonzero_execution_claims(self) -> None:
+        base = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": [],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        unknown = {**base, "password": "must-not-be-stored"}
+        unknown["catalog_probe_sha256"] = SCHEDULER.probe_digest(base)
+        with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, "exact metadata-only schema"):
+            SCHEDULER.validate_probe(unknown)
+        for field in ("model_invocations", "paid_api_requests_authorized"):
+            with self.subTest(field=field):
+                probe = {**base, field: 1}
+                probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+                with self.assertRaisesRegex(SCHEDULER.ProbeSchedulerError, f"{field} must be integer zero"):
+                    SCHEDULER.validate_probe(probe)
+
+    def test_state_validation_preserves_same_catalog_and_adds_only_verified_time(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": "2026-07-20T11:00:00Z",
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": ["grok-com"],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+        before = {
+            **self.initial,
+            "pools": {
+                "pool": {"status": "available"},
+                "grok-com": {"status": "unknown"},
+                "jules-account": {
+                    "status": "unknown",
+                    "verified_at": "2026-07-19T00:00:00Z",
+                },
+            },
+        }
+        after = json.loads(json.dumps(before))
+        after["catalog"] = probe
+        after["pools"]["grok-com"]["verified_at"] = probe["observed_at"]
+        after["pools"]["jules-account"].pop("verified_at")
+        SCHEDULER.validate_state_after_probe(before, after, probe)
+
+        tampered = json.loads(json.dumps(after))
+        tampered["pools"]["pool"]["status"] = "blocked"
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "beyond verified timestamps"
+        ):
+            SCHEDULER.validate_state_after_probe(before, tampered, probe)
+
+    def test_state_validation_requires_exact_reset_after_catalog_change(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": "2026-07-20T11:00:00Z",
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": ["jules-account"],
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+        after = {
+            "schema_version": 2,
+            "updated_at": probe["observed_at"],
+            "catalog_sha256": "new-catalog",
+            "catalog": probe,
+            "pools": {
+                "jules-account": {"verified_at": probe["observed_at"]}
+            },
+            "routes": {},
+            "history": self.initial["history"],
+        }
+        SCHEDULER.validate_state_after_probe(self.initial, after, probe)
+
+        stale_routes = json.loads(json.dumps(after))
+        stale_routes["routes"] = self.initial["routes"]
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "reset route history"
+        ):
+            SCHEDULER.validate_state_after_probe(self.initial, stale_routes, probe)
+
+        stale_pools = json.loads(json.dumps(after))
+        stale_pools["pools"]["pool"] = self.initial["pools"]["pool"]
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError, "reset pool state"
+        ):
+            SCHEDULER.validate_state_after_probe(self.initial, stale_pools, probe)
+
     def test_history_mutation_fails_closed_and_records_bounded_failure(self) -> None:
         self.write_router(mutate_history=True)
         result = SCHEDULER.main(self.arguments())
@@ -212,6 +403,27 @@ else:
         self.assertEqual("ProbeSchedulerError", failure["error_type"])
         self.assertEqual("probe_scheduler_failed_closed", failure["error"])
         self.assertFalse(self.receipt.exists())
+
+    def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
+        with self.assertRaisesRegex(
+            SCHEDULER.ProbeSchedulerError,
+            r"sensitive field: providers\.claude\.auth\.password",
+        ):
+            SCHEDULER.assert_probe_digest_safe(
+                {"providers": {"claude": {"auth": {"password": "redacted"}}}}
+            )
+        for sensitive_field in ("token_hint", "auth_secret", "credential_value"):
+            with self.subTest(sensitive_field=sensitive_field):
+                with self.assertRaisesRegex(
+                    SCHEDULER.ProbeSchedulerError, "sensitive field"
+                ):
+                    SCHEDULER.assert_probe_digest_safe({sensitive_field: "redacted"})
+        SCHEDULER.assert_probe_digest_safe(
+            {
+                "api_key_environment_scrubbed": ["ROUTER_AUTH_ENV_A"],
+                "context_token_count": 4096,
+            }
+        )
 
     def test_lock_contention_is_a_clean_noop(self) -> None:
         self.write_router()

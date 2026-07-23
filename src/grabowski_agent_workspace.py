@@ -121,8 +121,10 @@ ROUTE_RISK_FLAGS = frozenset({
     "data_migration", "privilege", "external_api", "cross_repo",
     "destructive", "user_data",
 })
-ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy"})
-ROUTE_POLICY_VERSION = "workspace-routing-v2.1"
+ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy", "codex"})
+LEGACY_ROUTE_EXTERNAL_AGENTS_V21 = frozenset({"claude", "agy"})
+LEGACY_ROUTE_POLICY_VERSION_V21 = "workspace-routing-v2.1"
+ROUTE_POLICY_VERSION = "direct-first-routing-v3.0"
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]
 
@@ -572,7 +574,7 @@ def _route_decision_v1(input_facts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
+def _route_decision_v21(input_facts: dict[str, Any]) -> dict[str, Any]:
     """Route conservatively: one writer by default, contrast only for qualified R3 code."""
     kind = str(input_facts["task_kind"])
     changed_files = int(input_facts["changed_file_estimate"])
@@ -774,7 +776,7 @@ def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
     return {
         "score": score,
         "risk_tier": risk_tier,
-        "route_policy_version": ROUTE_POLICY_VERSION,
+        "route_policy_version": LEGACY_ROUTE_POLICY_VERSION_V21,
         "execution_mode": mode,
         "external_candidates": candidates,
         "design_space": design_space,
@@ -785,13 +787,156 @@ def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _route_decision_v2(input_facts: dict[str, Any]) -> dict[str, Any]:
+    """Keep ChatGPT/Grabowski as the direct writer at every scale."""
+    kind = str(input_facts["task_kind"])
+    changed_files = int(input_facts["changed_file_estimate"])
+    duration = int(input_facts["expected_duration_minutes"])
+    novelty = str(input_facts["novelty"])
+    risk_flags = list(input_facts["risk_flags"])
+    connector_instability = bool(input_facts["connector_instability"])
+    concurrent_activity = bool(input_facts["concurrent_external_activity"])
+    parallelization_candidate = bool(input_facts["parallelization_candidate"])
+    decision_fork = bool(input_facts["decision_fork"])
+    architecture_hypotheses = int(input_facts["architecture_hypotheses"])
+    external_requested = bool(input_facts["user_requested_external"])
+    external_available = list(input_facts["available_external_agents"])
+
+    critical_flags = {
+        "security", "runtime", "deployment", "schema", "concurrency",
+        "data_migration", "privilege", "cross_repo", "destructive", "user_data",
+    }
+    design_flags = {"security", "schema", "concurrency", "data_migration", "cross_repo"}
+    score = 0
+    if kind in {"code", "operations"}:
+        score += 1
+    if changed_files >= 7:
+        score += 1
+    if changed_files >= 15:
+        score += 1
+    if duration >= 60:
+        score += 1
+    if duration >= 180:
+        score += 1
+    score += {"low": 0, "medium": 1, "high": 2}[novelty]
+    score += min(4, len(risk_flags))
+    if connector_instability:
+        score += 1
+    if concurrent_activity:
+        score += 1
+
+    trivial_work = bool(
+        changed_files <= 1
+        and duration <= 15
+        and novelty == "low"
+        and not risk_flags
+        and not connector_instability
+        and not concurrent_activity
+    )
+    critical_risk = bool(set(risk_flags) & critical_flags)
+    r3_scale = bool(kind == "code" and novelty == "high" and duration >= 120 and changed_files >= 8)
+    if trivial_work:
+        risk_tier = "R0"
+    elif critical_risk or r3_scale:
+        risk_tier = "R3"
+    elif (
+        (kind == "code" and (changed_files >= 7 or duration >= 90 or novelty == "high" or bool(risk_flags) or connector_instability or concurrent_activity))
+        or (kind == "operations" and (duration >= 90 or bool(risk_flags) or connector_instability or concurrent_activity))
+        or (kind == "analysis" and novelty == "high" and duration >= 90)
+    ):
+        risk_tier = "R2"
+    else:
+        risk_tier = "R1"
+
+    design_space = bool(novelty == "high" or set(risk_flags) & design_flags)
+    contrast_eligible = bool(
+        external_requested
+        and kind == "code"
+        and design_space
+        and external_available
+    )
+    competition_eligible = bool(
+        contrast_eligible
+        and decision_fork
+        and architecture_hypotheses >= 2
+        and len(external_available) >= 2
+    )
+    candidates: list[dict[str, str]] = []
+    if competition_eligible:
+        candidates = [
+            {
+                "provider": external_available[0],
+                "mode": "competitor",
+                "timing": "after_direct_operator_plan",
+            },
+            {
+                "provider": external_available[1],
+                "mode": "contrast",
+                "timing": "after_direct_operator_candidate",
+            },
+        ]
+    elif contrast_eligible:
+        candidates = [
+            {
+                "provider": external_available[0],
+                "mode": "contrast",
+                "timing": "after_direct_operator_plan_or_candidate",
+            }
+        ]
+
+    parallel_writer_pilot = {
+        "requested": parallelization_candidate,
+        "eligible_for_assessment": False,
+        "execution_authorized": False,
+        "workspace_group_implemented": False,
+        "required_shard_count": 0,
+        "minimum_estimated_minutes_per_shard": 0,
+        "assessment_blockers": [
+            "direct-first policy forbids external authoritative writer shards"
+        ] if parallelization_candidate else [],
+        "implementation_blockers": [
+            "external agents are limited to advisory review or contrast",
+            "ChatGPT/Grabowski remains the only authoritative writer and integrator",
+        ],
+    }
+    return {
+        "score": score,
+        "risk_tier": risk_tier,
+        "route_policy_version": ROUTE_POLICY_VERSION,
+        "execution_mode": "direct_operator",
+        "external_candidates": candidates,
+        "design_space": design_space,
+        "trivial_work": trivial_work,
+        "parallel_writer_pilot": parallel_writer_pilot,
+        "contrast_eligible": contrast_eligible,
+        "competition_eligible": competition_eligible,
+        "direct_implementation_required": True,
+        "external_primary_writer_forbidden": True,
+    }
+
 def _route_decision(input_facts: dict[str, Any]) -> dict[str, Any]:
-    """Replay the policy matching the exact route-input schema."""
+    """Replay the current policy matching the exact route-input schema."""
     return (
         _route_decision_v1(input_facts)
         if "parallel_work" in input_facts
         else _route_decision_v2(input_facts)
     )
+
+
+def _route_decision_for_policy(
+    input_facts: dict[str, Any], route_policy_version: str
+) -> dict[str, Any]:
+    """Replay one supported schema-2 policy without granting legacy create authority."""
+    if route_policy_version == ROUTE_POLICY_VERSION:
+        return _route_decision_v2(input_facts)
+    if route_policy_version == LEGACY_ROUTE_POLICY_VERSION_V21:
+        if set(input_facts.get("available_external_agents", [])) - LEGACY_ROUTE_EXTERNAL_AGENTS_V21:
+            raise AgentWorkspaceError(
+                "legacy route evidence contains an external agent unavailable in v2.1"
+            )
+        return _route_decision_v21(input_facts)
+    raise AgentWorkspaceError("route_evidence route policy version is unsupported")
 
 
 def _normalize_route_evidence(value: Any) -> dict[str, Any]:
@@ -802,7 +947,7 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
             "recommendation_id": None,
             "score": None,
             "recommended_route": None,
-            "actual_route": "full_workspace",
+            "actual_route": "workspace_with_contrast",
             "input_facts": None,
             "external_candidates": [],
             "deviation_reason": None,
@@ -851,13 +996,23 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
     )
     if recommended not in ROUTE_EXECUTION_MODES or actual not in ROUTE_EXECUTION_MODES:
         raise AgentWorkspaceError("route_evidence route is invalid")
-    if actual not in {
-        "full_workspace",
-        "workspace_with_contrast",
-        "workspace_with_competition",
-    }:
+    route_policy_version = (
+        value.get("route_policy_version") if schema_version == 2 else None
+    )
+    legacy_schema2 = (
+        schema_version == 2
+        and route_policy_version == LEGACY_ROUTE_POLICY_VERSION_V21
+    )
+    allowed_actual_routes = (
+        {"full_workspace", "workspace_with_contrast", "workspace_with_competition"}
+        if schema_version == 1 or legacy_schema2
+        else {"workspace_with_contrast", "workspace_with_competition"}
+    )
+    if actual not in allowed_actual_routes:
         raise AgentWorkspaceError(
-            "agent workspace actual_route must be a workspace route"
+            "agent workspace actual_route must be an advisory contrast route"
+            if schema_version == 2 and not legacy_schema2
+            else "agent workspace actual_route must be a workspace route"
         )
     facts = _normalize_route_input_facts(
         value.get("input_facts"), schema_version=schema_version
@@ -899,9 +1054,31 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         candidates.append(
             {"provider": provider, "mode": mode, "timing": timing}
         )
-    decision = _route_decision(facts)
+    decision = (
+        _route_decision_for_policy(facts, str(route_policy_version))
+        if schema_version == 2
+        else _route_decision(facts)
+    )
     if schema_version == 2:
-        if value.get("route_policy_version") != decision["route_policy_version"]:
+        if route_policy_version == ROUTE_POLICY_VERSION:
+            if facts.get("user_requested_external") is not True:
+                raise AgentWorkspaceError(
+                    "direct-first agent workspace requires explicit external contrast request"
+                )
+            if not candidates:
+                raise AgentWorkspaceError(
+                    "direct-first agent workspace requires at least one advisory candidate"
+                )
+            expected_actual = (
+                "workspace_with_competition"
+                if len(candidates) == 2
+                else "workspace_with_contrast"
+            )
+            if actual != expected_actual:
+                raise AgentWorkspaceError(
+                    "agent workspace actual_route does not match advisory candidate count"
+                )
+        if route_policy_version != decision["route_policy_version"]:
             raise AgentWorkspaceError(
                 "route_evidence route policy version is invalid"
             )
@@ -2012,7 +2189,11 @@ def _normalize_create(
         },
         "roles": {
             "captain": {"access": "integrator_control", "merge_authority": False},
-            "writer": {"access": "write_worktree", "merge_authority": False},
+            "writer": {
+                "access": "write_worktree",
+                "merge_authority": False,
+                "authority": "advisory_contrast_only",
+            },
             "tests": {"access": "read_only", "merge_authority": False},
             "review": {"access": "read_only", "merge_authority": False},
         },
@@ -2020,7 +2201,10 @@ def _normalize_create(
             "operator_may_coordinate_all_roles": True,
             "single_unisolated_agent_may_not_substitute_for_all_roles": True,
             "captain": "operator_control_plane",
-            "writer": "isolated_mutating_execution",
+            "writer": "isolated_advisory_contrast_execution",
+            "authoritative_writer": "chatgpt_operator",
+            "external_agent_authority": "advisory_only",
+            "direct_implementation_required": True,
             "tests": "deterministic_read_only_validation",
             "review": "independently_bound_read_only_review",
             "observer": "optional_read_only_process_analysis",
@@ -4949,7 +5133,21 @@ def grabowski_agent_workspace_create(
     runtime_seconds: int = 3600,
     memory_max_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Create one four-role tmux workspace with one isolated durable writer task."""
+    """Create one explicit advisory contrast workspace; direct work stays authoritative."""
+    if not isinstance(route_evidence, dict) or route_evidence.get("schema_version") != 2:
+        raise AgentWorkspaceError(
+            "direct-first workspace creation requires schema-v2 advisory route evidence"
+        )
+    normalized_route = _normalize_route_evidence(route_evidence)
+    if (
+        normalized_route.get("status") != "verified"
+        or normalized_route.get("route_policy_version") != ROUTE_POLICY_VERSION
+        or normalized_route.get("actual_route")
+        not in {"workspace_with_contrast", "workspace_with_competition"}
+    ):
+        raise AgentWorkspaceError(
+            "direct-first workspace creation requires verified advisory contrast evidence"
+        )
     operator._require_operator_mutation("tmux_interaction")
     operator._require_operator_mutation("durable_job")
     operator._require_operator_mutation("git_cli")

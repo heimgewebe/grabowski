@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 import grabowski_agent_workspace as workspace
+import grabowski_coding_agent_router as coding_router
 import grabowski_operator_core as operator
 import grabowski_tasks as tasks
 
@@ -31,7 +32,7 @@ COMPETITION_ROOT = Path(
     )
 ).expanduser()
 RUNNER = Path(__file__).resolve().parent.parent / "tools" / "external_programming_candidate.py"
-PROVIDERS = {"claude", "agy"}
+PROVIDERS = {"claude", "agy", "codex"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
 TASK_KINDS = {"code", "docs", "analysis", "operations"}
@@ -228,6 +229,152 @@ def _validate_budget_contract(value: Any, *, provider: str) -> dict[str, Any]:
     return value
 
 
+def _validate_route_contract(value: Any) -> dict[str, Any]:
+    required = {
+        "schema_version", "catalog_sha256", "route_id", "harness", "harness_binary",
+        "model", "effort", "argv_prefix", "permission_mode", "quota_pools", "paid_only",
+        "authority", "automatic_patch_apply", "route_contract_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise AgentCompetitionError("route contract shape is invalid")
+    observed = value["route_contract_sha256"]
+    unsigned = {key: item for key, item in value.items() if key != "route_contract_sha256"}
+    if (
+        value["schema_version"] != 1
+        or not isinstance(observed, str)
+        or SHA256_RE.fullmatch(observed) is None
+        or observed != _sha256_json(unsigned)
+        or not isinstance(value["catalog_sha256"], str)
+        or SHA256_RE.fullmatch(value["catalog_sha256"]) is None
+        or not isinstance(value["route_id"], str)
+        or not value["route_id"]
+        or value["harness"] not in PROVIDERS
+        or not isinstance(value["harness_binary"], str)
+        or not value["harness_binary"]
+        or not isinstance(value["model"], str)
+        or not value["model"]
+        or not isinstance(value["argv_prefix"], list)
+        or not value["argv_prefix"]
+        or any(not isinstance(item, str) or not item for item in value["argv_prefix"])
+        or value["argv_prefix"][0] not in {value["harness_binary"], "codexr"}
+        or not isinstance(value["quota_pools"], list)
+        or not value["quota_pools"]
+        or any(not isinstance(item, str) or not item for item in value["quota_pools"])
+        or type(value["paid_only"]) is not bool
+        or value["authority"] != "advisory_only"
+        or value["automatic_patch_apply"] is not False
+    ):
+        raise AgentCompetitionError("route contract semantics are invalid")
+    if value["model"] == "claude-fable-5":
+        prefix = value["argv_prefix"]
+        if value["paid_only"] is not True:
+            raise AgentCompetitionError("Fable route contract must be paid-only")
+        try:
+            model_index = prefix.index("--model")
+        except ValueError as exc:
+            raise AgentCompetitionError("Fable route contract must bind --model explicitly") from exc
+        if model_index + 1 >= len(prefix) or prefix[model_index + 1] != "claude-fable-5":
+            raise AgentCompetitionError("Fable route contract --model must match claude-fable-5")
+    return value
+
+
+def _route_budget_contract(
+    route_contract: dict[str, Any],
+    max_budget_usd: float,
+    *,
+    paid_execution_authorized: bool,
+    hard_limit_required: bool,
+) -> dict[str, Any]:
+    paid_only = route_contract["paid_only"] is True
+    provider = route_contract["harness"]
+    if paid_only:
+        if not paid_execution_authorized:
+            raise AgentCompetitionError(
+                "paid-only route requires explicit paid execution authorization"
+            )
+        if not 0 < float(max_budget_usd) <= 10:
+            raise AgentCompetitionError("paid-only route requires max_budget_usd in (0, 10]")
+        hard_limit = provider == "claude"
+        if hard_limit_required and not hard_limit:
+            raise AgentCompetitionError(
+                f"paid route provider {provider} cannot enforce a hard USD budget"
+            )
+        return {
+            "requested_max_usd": float(max_budget_usd),
+            "enforcement": "provider_cli_hard_limit" if hard_limit else "not_supported_by_provider",
+            "hard_limit": hard_limit,
+            "hard_limit_required": hard_limit_required,
+            "timeout_is_not_budget": not hard_limit,
+            "paid_execution_authorized": True,
+            "cost_basis": "explicit-paid-route",
+        }
+    if paid_execution_authorized:
+        raise AgentCompetitionError(
+            "paid_execution_authorized may only be set for a paid-only route"
+        )
+    if float(max_budget_usd) != 0:
+        raise AgentCompetitionError(
+            "zero-marginal catalog route requires max_budget_usd=0"
+        )
+    return {
+        "requested_max_usd": 0.0,
+        "enforcement": "catalog_zero_marginal_cost",
+        "hard_limit": False,
+        "hard_limit_required": False,
+        "timeout_is_not_budget": True,
+        "paid_execution_authorized": False,
+        "cost_basis": "catalog-zero-marginal-route",
+    }
+
+
+def _validate_route_budget_contract(
+    value: Any, *, route_contract: dict[str, Any]
+) -> dict[str, Any]:
+    required = {
+        "requested_max_usd", "enforcement", "hard_limit", "hard_limit_required",
+        "timeout_is_not_budget", "paid_execution_authorized", "cost_basis",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise AgentCompetitionError("route budget contract shape is invalid")
+    requested = value["requested_max_usd"]
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, (int, float))
+        or not math.isfinite(float(requested))
+        or type(value["hard_limit"]) is not bool
+        or type(value["hard_limit_required"]) is not bool
+        or type(value["timeout_is_not_budget"]) is not bool
+        or type(value["paid_execution_authorized"]) is not bool
+    ):
+        raise AgentCompetitionError("route budget contract fields are invalid")
+    if route_contract["paid_only"] is True:
+        if (
+            not 0 < float(requested) <= 10
+            or value["paid_execution_authorized"] is not True
+            or value["cost_basis"] != "explicit-paid-route"
+            or value["hard_limit"] is not (route_contract["harness"] == "claude")
+            or value["enforcement"] != (
+                "provider_cli_hard_limit"
+                if route_contract["harness"] == "claude"
+                else "not_supported_by_provider"
+            )
+            or value["timeout_is_not_budget"] is not (route_contract["harness"] != "claude")
+            or (value["hard_limit_required"] and route_contract["harness"] != "claude")
+        ):
+            raise AgentCompetitionError("paid route budget contract semantics are invalid")
+    elif (
+        float(requested) != 0
+        or value["paid_execution_authorized"] is not False
+        or value["cost_basis"] != "catalog-zero-marginal-route"
+        or value["enforcement"] != "catalog_zero_marginal_cost"
+        or value["hard_limit"] is not False
+        or value["hard_limit_required"] is not False
+        or value["timeout_is_not_budget"] is not True
+    ):
+        raise AgentCompetitionError("zero-marginal route budget contract semantics are invalid")
+    return value
+
+
 def _competition_id(provider: str, mode: str, task_sha256: str, request_id: str) -> str:
     request_digest = _sha256_bytes(request_id.encode("utf-8"))[:10]
     return f"gac-{provider}-{mode}-{task_sha256[:10]}-{request_digest}"
@@ -244,7 +391,7 @@ def _competition_root() -> Path:
 
 def _competition_dir(identifier: str) -> Path:
     clean = workspace._required_string(identifier, "competition_id", max_length=100)
-    if re.fullmatch(r"gac-(claude|agy)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
+    if re.fullmatch(r"gac-(claude|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
         raise AgentCompetitionError("competition_id has an invalid format")
     return _competition_root() / clean
 
@@ -733,8 +880,14 @@ def _validated_packet(identifier: str) -> dict[str, Any]:
         "packet_nonce", "created_at", "packet_sha256",
     }
     version = packet.get("schema_version")
-    required = common if version == 1 else common | {"budget_contract"}
-    if version not in {1, 2} or set(packet) != required:
+    required = (
+        common
+        if version == 1
+        else common | {"budget_contract"}
+        if version == 2
+        else common | {"budget_contract", "route_contract"}
+    )
+    if version not in {1, 2, 3} or set(packet) != required:
         raise AgentCompetitionError("candidate packet shape is invalid")
     packet_hash = packet["packet_sha256"]
     unsigned_packet = {key: value for key, value in packet.items() if key != "packet_sha256"}
@@ -827,6 +980,13 @@ def _validated_packet(identifier: str) -> dict[str, Any]:
         raise AgentCompetitionError("candidate packet auxiliary fields are invalid")
     if version == 2:
         _validate_budget_contract(packet["budget_contract"], provider=packet["provider"])
+    elif version == 3:
+        route_contract = _validate_route_contract(packet["route_contract"])
+        if route_contract["harness"] != packet["provider"]:
+            raise AgentCompetitionError("candidate packet provider does not match route contract")
+        _validate_route_budget_contract(
+            packet["budget_contract"], route_contract=route_contract
+        )
     return {**packet, "allowed_paths": allowed, "forbidden_paths": forbidden}
 
 
@@ -909,7 +1069,7 @@ def _manifest_from_task(
     if not isinstance(task_id, str) or not task_id:
         raise AgentCompetitionError("reconciled durable task identity is invalid")
     manifest: dict[str, Any] = {
-        "schema_version": 2 if packet["schema_version"] == 2 else 1,
+        "schema_version": packet["schema_version"],
         "kind": "external_programming_competition_manifest",
         "competition_id": identifier,
         "request_id": packet["request_id"],
@@ -928,8 +1088,10 @@ def _manifest_from_task(
         "authority": "advisory_only",
         "automatic_apply": False,
     }
-    if packet["schema_version"] == 2:
+    if packet["schema_version"] >= 2:
         manifest["budget_contract"] = packet["budget_contract"]
+    if packet["schema_version"] == 3:
+        manifest["route_contract"] = packet["route_contract"]
     manifest["manifest_sha256"] = _sha256_json(manifest)
     return manifest
 
@@ -943,8 +1105,14 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
         "automatic_apply", "manifest_sha256",
     }
     version = manifest.get("schema_version")
-    required = common if version == 1 else common | {"budget_contract"}
-    if version not in {1, 2} or set(manifest) != required:
+    required = (
+        common
+        if version == 1
+        else common | {"budget_contract"}
+        if version == 2
+        else common | {"budget_contract", "route_contract"}
+    )
+    if version not in {1, 2, 3} or set(manifest) != required:
         raise AgentCompetitionError("competition manifest shape is invalid")
     observed_hash = manifest["manifest_sha256"]
     unsigned = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
@@ -972,6 +1140,13 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
             raise AgentCompetitionError(f"competition manifest {field} is invalid")
     if version == 2:
         _validate_budget_contract(manifest["budget_contract"], provider=manifest["provider"])
+    elif version == 3:
+        route_contract = _validate_route_contract(manifest["route_contract"])
+        if route_contract["harness"] != manifest["provider"]:
+            raise AgentCompetitionError("competition manifest provider does not match route contract")
+        _validate_route_budget_contract(
+            manifest["budget_contract"], route_contract=route_contract
+        )
     packet = _validated_packet(identifier)
     bindings = {
         "competition_id": identifier,
@@ -990,8 +1165,10 @@ def _validated_manifest(identifier: str) -> dict[str, Any]:
             raise AgentCompetitionError(f"candidate packet binding mismatch: {field}")
     if packet["schema_version"] != version:
         raise AgentCompetitionError("candidate packet schema does not match manifest")
-    if version == 2 and packet.get("budget_contract") != manifest["budget_contract"]:
+    if version >= 2 and packet.get("budget_contract") != manifest["budget_contract"]:
         raise AgentCompetitionError("candidate packet budget binding mismatch")
+    if version == 3 and packet.get("route_contract") != manifest["route_contract"]:
+        raise AgentCompetitionError("candidate packet route binding mismatch")
     directory = _validate_competition_directory(_competition_dir(identifier))
     frozen_runner = _load_regular_bytes(
         directory / "runner.py",
@@ -1202,12 +1379,59 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
         not isinstance(command, list)
         or not 1 <= len(command) <= 40
         or any(not isinstance(item, str) or not item or len(item) > 20000 or "\x00" in item for item in command)
-        or command[0] != receipt["provider"]
         or receipt["command_sha256"] != _sha256_json(command)
     ):
         raise AgentCompetitionError("candidate receipt command_shape is invalid")
-    if receipt["provider"] == "claude":
-        if len(command) < 4 or command[1:4] != ["-p", "--output-format", "json"] or "--tools=" not in command:
+    if receipt.get("schema_version") == 3:
+        route_contract = _validate_route_contract(receipt.get("route_contract"))
+        if command[0] != route_contract["argv_prefix"][0]:
+            raise AgentCompetitionError("candidate receipt command does not match route executable")
+        if receipt["provider"] == "codex":
+            sandbox_indexes = [
+                index for index, item in enumerate(command) if item == "--sandbox"
+            ]
+            if (
+                command[:3]
+                != ["codexr", route_contract["argv_prefix"][1], "exec"]
+                or len(sandbox_indexes) != 1
+                or sandbox_indexes[0] + 1 >= len(command)
+                or command[sandbox_indexes[0] + 1] != "read-only"
+            ):
+                raise AgentCompetitionError(
+                    "candidate receipt Codex command shape is invalid"
+                )
+        elif receipt["provider"] == "claude":
+            prefix = route_contract["argv_prefix"]
+            permission_mode = route_contract["permission_mode"]
+            permission_ok = (
+                "--permission-mode" in command
+                and command[command.index("--permission-mode") + 1] == permission_mode
+            ) or f"--permission-mode={permission_mode}" in command
+            if (
+                command[: len(prefix)] != prefix
+                or "-p" not in command
+                or "--output-format" not in command
+                or command[command.index("--output-format") + 1] != "json"
+                or "--json-schema" not in command
+                or "--tools=" not in command
+                or not permission_ok
+                or "--safe-mode" not in command
+                or "--no-session-persistence" not in command
+            ):
+                raise AgentCompetitionError("candidate receipt Claude route command shape is invalid")
+        elif receipt["provider"] == "agy":
+            prefix = route_contract["argv_prefix"]
+            if (
+                command[: len(prefix)] != prefix
+                or "--mode" not in command
+                or command[command.index("--mode") + 1] != "plan"
+                or "--sandbox" not in command
+            ):
+                raise AgentCompetitionError("candidate receipt agy route command shape is invalid")
+        else:
+            raise AgentCompetitionError("route-bound candidate provider is unsupported")
+    elif receipt["provider"] == "claude":
+        if command[0] != "claude" or len(command) < 4 or command[1:4] != ["-p", "--output-format", "json"] or "--tools=" not in command:
             raise AgentCompetitionError("candidate receipt Claude command shape is invalid")
     elif command[:4] != ["agy", "--mode", "plan", "--sandbox"]:
         raise AgentCompetitionError("candidate receipt agy command shape is invalid")
@@ -1256,6 +1480,15 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
         )
         if packet.get("budget_contract") != budget_contract:
             raise AgentCompetitionError("candidate receipt budget binding mismatch")
+    elif receipt.get("schema_version") == 3:
+        route_contract = _validate_route_contract(receipt.get("route_contract"))
+        if packet.get("route_contract") != route_contract:
+            raise AgentCompetitionError("candidate receipt route binding mismatch")
+        budget_contract = _validate_route_budget_contract(
+            receipt.get("budget_contract"), route_contract=route_contract
+        )
+        if packet.get("budget_contract") != budget_contract:
+            raise AgentCompetitionError("candidate receipt budget binding mismatch")
     total_cost = receipt.get("total_cost_usd")
     if total_cost is not None and (
         isinstance(total_cost, bool)
@@ -1291,10 +1524,16 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
         "does_not_establish", "receipt_sha256",
     }
     version = receipt.get("schema_version")
-    required = common if version == 1 else common | {"budget_contract"}
+    required = (
+        common
+        if version == 1
+        else common | {"budget_contract"}
+        if version == 2
+        else common | {"budget_contract", "route_contract"}
+    )
     allowed = required | {"total_cost_usd", "output_wrapper"}
     receipt_fields = set(receipt)
-    if version not in {1, 2} or not required <= receipt_fields <= allowed:
+    if version not in {1, 2, 3} or not required <= receipt_fields <= allowed:
         raise AgentCompetitionError("candidate receipt shape is invalid")
     if receipt["kind"] != "external_programming_candidate_receipt":
         raise AgentCompetitionError("candidate receipt contract is invalid")
@@ -1315,8 +1554,10 @@ def _receipt(identifier: str, manifest: dict[str, Any] | None = None) -> dict[st
     for field, expected in bindings.items():
         if receipt.get(field) != expected:
             raise AgentCompetitionError(f"candidate receipt binding mismatch: {field}")
-    if version == 2 and receipt["budget_contract"] != bound_manifest["budget_contract"]:
+    if version >= 2 and receipt["budget_contract"] != bound_manifest["budget_contract"]:
         raise AgentCompetitionError("candidate receipt budget does not match manifest")
+    if version == 3 and receipt["route_contract"] != bound_manifest["route_contract"]:
+        raise AgentCompetitionError("candidate receipt route does not match manifest")
     if receipt["authority"] != "advisory_only" or any(
         receipt[field] is not False
         for field in ("automatic_apply", "automatic_commit", "automatic_merge", "automatic_deploy")
@@ -1528,8 +1769,10 @@ def grabowski_agent_execution_route(
     parallelization_candidate: bool = False,
     decision_fork: bool = False,
     architecture_hypotheses: int = 1,
+    coding_task_class: str = "complex-patch",
+    paid_execution_authorized: bool = False,
 ) -> dict[str, Any]:
-    """Recommend a lean R0-R3 route without authorizing parallel writers."""
+    """Keep implementation direct and optionally recommend advisory contrast."""
     kind = workspace._required_string(task_kind, "task_kind", max_length=32)
     if kind not in TASK_KINDS:
         raise AgentCompetitionError(
@@ -1620,8 +1863,8 @@ def grabowski_agent_execution_route(
     if available_external_agents is None:
         normalized_agents = [
             provider
-            for provider in ("claude", "agy")
-            if shutil.which(provider)
+            for provider in ("codex", "claude", "agy")
+            if shutil.which(provider) or (provider == "codex" and shutil.which("codexr"))
         ]
     else:
         agents = available_external_agents
@@ -1642,9 +1885,15 @@ def grabowski_agent_execution_route(
             )
         normalized_agents = [
             provider
-            for provider in ("claude", "agy")
+            for provider in ("codex", "claude", "agy")
             if provider in requested_agents
         ]
+    paid_authorized = _strict_bool(
+        paid_execution_authorized, "paid_execution_authorized"
+    )
+    coding_task_value = workspace._required_string(
+        coding_task_class, "coding_task_class", max_length=64
+    )
     input_facts = {
         "task_kind": kind,
         "changed_file_estimate": changed_file_estimate,
@@ -1659,10 +1908,58 @@ def grabowski_agent_execution_route(
         "user_requested_external": external_requested,
         "available_external_agents": normalized_agents,
     }
+    predecision = workspace._route_decision(input_facts)
+    requested_candidates = len(predecision["external_candidates"])
+    contrast_selection = {
+        "status": "not-requested",
+        "state_error_type": None,
+        "catalog_sha256": None,
+        "routes": [],
+        "excluded": {},
+    }
+    selected_routes: list[dict[str, Any]] = []
+    if requested_candidates:
+        contrast_selection = coding_router.select_contrast_routes(
+            coding_task_value,
+            changed_files=changed_file_estimate,
+            duration_minutes=expected_duration_minutes,
+            novelty=novelty_value,
+            risk_flags=normalized_flags,
+            max_candidates=requested_candidates,
+            allow_paid=paid_authorized,
+            allowed_harnesses=set(normalized_agents) & {"codex", "claude", "agy"},
+        )
+        selected_routes = list(contrast_selection["routes"])
+        input_facts["available_external_agents"] = [
+            item["harness"] for item in selected_routes
+        ]
     decision = workspace._route_decision(input_facts)
     score = int(decision["score"])
     mode = str(decision["execution_mode"])
     candidate_plan = list(decision["external_candidates"])
+    external_route_candidates: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidate_plan):
+        if index >= len(selected_routes):
+            break
+        route = selected_routes[index]
+        if route["harness"] != candidate["provider"]:
+            raise AgentCompetitionError(
+                "catalog route selection disagrees with deterministic provider replay"
+            )
+        external_route_candidates.append(
+            {
+                "route_id": route["route"],
+                "provider": route["harness"],
+                "model": route["model"],
+                "mode": candidate["mode"],
+                "timing": candidate["timing"],
+                "paid_only": route["paid_only"],
+                "catalog_sha256": contrast_selection["catalog_sha256"],
+                "execution_eligible_if_separately_authorized": route[
+                    "execution_eligible_if_separately_authorized"
+                ],
+            }
+        )
     design_space = bool(decision["design_space"])
     external_available = list(input_facts["available_external_agents"])
     trivial_work = bool(decision["trivial_work"])
@@ -1672,15 +1969,21 @@ def grabowski_agent_execution_route(
         "risk_tier": decision["risk_tier"],
         "score": score,
         "execution_mode": mode,
-        "full_workspace": mode.startswith("full_workspace")
-        or mode.startswith("workspace_with_"),
+        "full_workspace": False,
         "external_candidates": candidate_plan,
+        "external_route_candidates": external_route_candidates,
+        "contrast_route_selection_status": contrast_selection["status"],
+        "contrast_route_state_error_type": contrast_selection["state_error_type"],
+        "contrast_catalog_sha256": contrast_selection["catalog_sha256"],
+        "paid_execution_authorized": paid_authorized,
         "max_external_candidates": 2,
         "external_results_are_advisory": True,
         "automatic_patch_apply": False,
         "automatic_winner_selection": False,
         "operator_remains_integrator": True,
-        "roles_remain_isolated": mode != "direct_operator",
+        "direct_implementation_required": True,
+        "external_primary_writer_forbidden": True,
+        "roles_remain_isolated": bool(candidate_plan),
         "single_mutating_writer": True,
         "parallel_writer_pilot": decision["parallel_writer_pilot"],
         "input_facts": input_facts,
@@ -1706,15 +2009,14 @@ def grabowski_agent_execution_route(
             "bound commit or exported context becomes unavailable or mismatched",
             "candidate attempts mutation or returns unstructured output",
             "additional candidate would repeat an already represented approach",
-            "parallel writer assessment lacks a two-shard conflict-domain proof",
+            "external candidate attempts to become the authoritative writer",
         ],
         "does_not_establish": [
             "execution_authority",
             "candidate_correctness",
             "merge_readiness",
+            "permission_to_delegate_authoritative_implementation",
             "need_for_external_agents",
-            "parallel_writer_safety",
-            "workspace_group_availability",
         ],
     }
     recommendation_contract = {
@@ -1749,6 +2051,8 @@ def grabowski_agent_competition_start(
     timeout_seconds: int = 900,
     max_budget_usd: float = 0.0,
     require_hard_budget: bool = True,
+    route_id: str = "",
+    paid_execution_authorized: bool = False,
 ) -> dict[str, Any]:
     """Start one durable advisory-only external competitor or contrast programmer."""
     operator._require_operator_capability("git_cli")
@@ -1768,21 +2072,50 @@ def grabowski_agent_competition_start(
         or not 0 <= float(max_budget_usd) <= 10
     ):
         raise AgentCompetitionError("max_budget_usd must be in [0, 10]")
-    policy_cap_usd = _external_provider_budget_cap()
-    if float(max_budget_usd) > policy_cap_usd:
-        raise AgentCompetitionError(
-            f"max_budget_usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
-        )
     hard_budget_required = _strict_bool(require_hard_budget, "require_hard_budget")
-    if float(max_budget_usd) == 0:
-        raise AgentCompetitionError(
-            "zero-cost policy blocks external provider execution; pass an explicit positive max_budget_usd only with fresh cost authorization"
-        )
-    budget_contract = _budget_contract(
-        provider_value,
-        float(max_budget_usd),
-        hard_limit_required=hard_budget_required,
+    paid_authorized = _strict_bool(
+        paid_execution_authorized, "paid_execution_authorized"
     )
+    route_value = route_id.strip() if isinstance(route_id, str) else ""
+    route_contract: dict[str, Any] | None = None
+    if route_value:
+        try:
+            route_contract = coding_router.contrast_route_execution_contract(
+                route_value, paid_execution_authorized=paid_authorized
+            )
+        except coding_router.CodingAgentRouterError as exc:
+            raise AgentCompetitionError(str(exc)) from exc
+        if provider_value != route_contract["harness"]:
+            raise AgentCompetitionError(
+                "provider must match the canonical route harness"
+            )
+        budget_contract = _route_budget_contract(
+            route_contract,
+            float(max_budget_usd),
+            paid_execution_authorized=paid_authorized,
+            hard_limit_required=hard_budget_required,
+        )
+        if route_contract["paid_only"] is True:
+            policy_cap_usd = _external_provider_budget_cap()
+            if float(max_budget_usd) > policy_cap_usd:
+                raise AgentCompetitionError(
+                    f"max_budget_usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
+                )
+    else:
+        policy_cap_usd = _external_provider_budget_cap()
+        if float(max_budget_usd) > policy_cap_usd:
+            raise AgentCompetitionError(
+                f"max_budget_usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
+            )
+        if float(max_budget_usd) == 0:
+            raise AgentCompetitionError(
+                "legacy provider-only execution requires an explicit positive max_budget_usd; canonical zero-marginal execution requires route_id"
+            )
+        budget_contract = _budget_contract(
+            provider_value,
+            float(max_budget_usd),
+            hard_limit_required=hard_budget_required,
+        )
     repo, head = _repository(repository, expected_head)
     operator._require_operator_mutation(
         "durable_job", path=str(repo), repo=str(repo)
@@ -1802,9 +2135,14 @@ def grabowski_agent_competition_start(
     if sensitive_allowed:
         raise AgentCompetitionError(f"sensitive-looking allowed paths are not exportable: {sensitive_allowed}")
     contexts = _context(repo, head, context_paths, allowed, forbidden)
-    executable = shutil.which(provider_value)
+    execution_binary = (
+        route_contract["argv_prefix"][0]
+        if route_contract is not None
+        else provider_value
+    )
+    executable = shutil.which(execution_binary)
     if not executable:
-        raise AgentCompetitionError(f"provider executable is unavailable: {provider_value}")
+        raise AgentCompetitionError(f"provider executable is unavailable: {execution_binary}")
     runner_bytes = _load_regular_bytes(
         RUNNER,
         label="external candidate runner source",
@@ -1828,6 +2166,7 @@ def grabowski_agent_competition_start(
         "primary_summary": summary,
         "timeout_seconds": timeout_seconds,
         "budget_contract": budget_contract,
+        **({"route_contract": route_contract} if route_contract is not None else {}),
     }
     request_fingerprint = _sha256_json(request_contract)
     identifier = _competition_id(provider_value, mode_value, task_sha256, request_value)
@@ -1853,6 +2192,7 @@ def grabowski_agent_competition_start(
                     "competition_id": identifier,
                     "request_id": request_value,
                     "provider": existing["provider"],
+                    "route_id": existing.get("route_contract", {}).get("route_id"),
                     "mode": existing["mode"],
                     "task_id": existing["task_id"],
                     "packet_sha256": existing["packet_sha256"],
@@ -1887,6 +2227,7 @@ def grabowski_agent_competition_start(
                         "competition_id": identifier,
                         "request_id": request_value,
                         "provider": packet["provider"],
+                        "route_id": packet.get("route_contract", {}).get("route_id"),
                         "mode": packet["mode"],
                         "task_id": reconciled_task["task_id"],
                         "packet_sha256": packet["packet_sha256"],
@@ -1909,7 +2250,7 @@ def grabowski_agent_competition_start(
         os.mkdir(provider_workspace, 0o700)
         _validate_competition_directory(provider_workspace)
         packet: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3 if route_contract is not None else 2,
             "kind": "external_programming_candidate_packet",
             "competition_id": identifier,
             "request_id": request_value,
@@ -1926,6 +2267,7 @@ def grabowski_agent_competition_start(
             "context": contexts,
             "primary_summary": summary,
             "budget_contract": budget_contract,
+            **({"route_contract": route_contract} if route_contract is not None else {}),
             "packet_nonce": secrets.token_hex(16),
             "created_at": workspace._utc(),
         }
@@ -2023,6 +2365,7 @@ def grabowski_agent_competition_start(
                     "competition_id": identifier,
                     "request_id": request_value,
                     "provider": provider_value,
+                    "route_id": route_contract.get("route_id") if route_contract is not None else None,
                     "mode": mode_value,
                     "task_id": task_record["task_id"],
                     "packet_sha256": packet["packet_sha256"],
@@ -2061,6 +2404,7 @@ def grabowski_agent_competition_start(
             "competition_id": identifier,
             "request_id": request_value,
             "provider": provider_value,
+            "route_id": route_contract.get("route_id") if route_contract is not None else None,
             "mode": mode_value,
             "task_id": task_record["task_id"],
             "packet_sha256": packet["packet_sha256"],

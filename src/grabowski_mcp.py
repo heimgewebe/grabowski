@@ -44,6 +44,7 @@ import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
 import grabowski_grips
+import grabowski_operator_relay
 import grabowski_merge_guard
 import grabowski_repoground_catalog as repoground_catalog
 
@@ -4741,89 +4742,7 @@ def _runtime_tool_contract_summary(
 
 
 def _operator_relay_protocol() -> dict[str, Any]:
-    return {
-        "name": "Operator Relay v0",
-        "doc_path": "docs/blocked-action-protocol-v0.md",
-        "rule": "ChatGPT stays operator and handles bounded work first. Delegate only when a helper adds useful scale or independent contrast.",
-        "control_loop": [
-            "typed_grabowski_tool",
-            "grabowski_micro_task",
-            "receipt_before_next_step",
-        ],
-        "execution_priority": [
-            "chatgpt_operator",
-            "claude",
-            "codex",
-            "agy",
-            "cline",
-        ],
-        "coding_agent_priority": [
-            "claude",
-            "codex",
-            "agy",
-            "cline",
-        ],
-        "workspace_execution_model": {
-            "default": "adaptive_operator_routing",
-            "lane_owner": "chatgpt_operator",
-            "operator_self_serves_lanes": ["captain", "writer", "tests", "review"],
-            "role_evidence_isolated": True,
-            "workspace_not_universal": True,
-            "direct_operator_for": [
-                "small_low_risk_fix",
-                "simple_document_change",
-                "bounded_deterministic_edit",
-            ],
-            "full_workspace_for": [
-                "runtime_or_security_change",
-                "long_or_multi_file_implementation",
-                "parallel_or_foreign_state",
-                "connector_or_execution_state_uncertainty",
-            ],
-            "external_agent_delegation": "adaptive_opt_in",
-            "delegation_triggers": [
-                "high_novelty_design_space",
-                "independent_contrast",
-                "multiple_plausible_implementations",
-                "security_schema_or_concurrency_risk",
-                "capacity_fallback",
-            ],
-            "external_programming_modes": ["competitor", "contrast"],
-            "max_external_candidates": 2,
-            "external_candidate_authority": "advisory_only",
-            "automatic_patch_apply": False,
-            "automatic_winner_selection": False,
-        },
-        "operator_first_for": [
-            "task_decomposition",
-            "bounded_code_change",
-            "integration",
-            "critical_self_review",
-            "recovery",
-        ],
-        "routing_roles": {
-            "complex_code_task": "chatgpt_operator_adaptive_workspace_external_competition_when_high_value",
-            "quick_light_reasoning": "chatgpt_operator_external_opt_in_agy_print",
-            "local_micro_reasoning": "ollama_api_qwen_coder",
-            "shell_or_git_grip": "grabowski_task",
-            "security_or_architecture_review": "chatgpt_operator_external_opt_in_claude",
-            "session_resume": "tmux_first_agy_when_useful",
-            "memory_prioritization": "bureau",
-            "patch_file_relay": "operator_patch_relay",
-            "patch_fallback": "aider_no_auto_commit",
-            "audit": "grabowski_git",
-            "repo_state_context": "steuerboard_operator_report",
-        },
-        "does_not_establish": [
-            "new_privileges",
-            "automatic_merge",
-            "automatic_push",
-            "automatic_deploy",
-            "free_shell_as_default_path",
-            "durable_agent_autonomy",
-            "steuerboard_report_action_approval",
-        ],
-    }
+    return grabowski_operator_relay.operator_relay_protocol()
 
 
 STATUS_VIEWS = consumer_surface.CONSUMER_VIEWS
