@@ -47,6 +47,7 @@ class LifecycleProjectionTests(unittest.TestCase):
                 kind="task",
                 observed_sources=ALL_SOURCES,
                 source_sha256s=SOURCE_SHA256S,
+                source_applicability={source: "observed" for source in ALL_SOURCES},
                 state="completed",
                 archived=True,
                 receipt_integrity_valid=True,

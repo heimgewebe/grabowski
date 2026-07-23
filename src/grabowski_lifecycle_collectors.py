@@ -637,6 +637,7 @@ def collect_lifecycle_classification(request: LifecycleCollectorRequest) -> dict
         raise ValueError("exact_resource_keys must contain non-empty strings")
 
     observed_sources: set[str] = set()
+    source_applicability: dict[str, str] = {}
     source_sha256s: dict[str, str] = {}
     source_errors: list[str] = []
     projections: dict[str, dict[str, Any]] = {}
@@ -694,6 +695,13 @@ def collect_lifecycle_classification(request: LifecycleCollectorRequest) -> dict
             source_errors.append(f"{name}:{source.error}")
         projection, derived = projectors[name](source.payload)
         projections[name] = projection
+        present = projection.get("present")
+        if present is True:
+            source_applicability[name] = "observed"
+        elif present is False:
+            source_applicability[name] = "explicit_absence"
+        else:
+            source_errors.append(f"{name}:source_applicability_projection_invalid")
         source_sha256s[name] = lifecycle.sha256_json(projection)
         source_errors.extend(f"{name}:{error}" for error in projection["errors"])
         for key, value in derived.items():
@@ -745,6 +753,13 @@ def collect_lifecycle_classification(request: LifecycleCollectorRequest) -> dict
             ),
         )
         projections["receipt"] = projection
+        present = projection.get("present")
+        if present is True:
+            source_applicability["receipt"] = "observed"
+        elif present is False:
+            source_applicability["receipt"] = "explicit_absence"
+        else:
+            source_errors.append("receipt:source_applicability_projection_invalid")
         source_sha256s["receipt"] = lifecycle.sha256_json(projection)
         source_errors.extend(f"receipt:{error}" for error in projection["errors"])
         facts.update(derived)
@@ -754,6 +769,7 @@ def collect_lifecycle_classification(request: LifecycleCollectorRequest) -> dict
         kind=request.kind,
         observed_sources=frozenset(observed_sources),
         source_sha256s=source_sha256s,
+        source_applicability=source_applicability,
         source_errors=tuple(sorted(set(source_errors))),
         **facts,
     )

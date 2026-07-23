@@ -1209,6 +1209,11 @@ def _task_archive_classification(
             "reason": "task_archive_does_not_mutate_related_runtime_object",
         }
     required_sources = lifecycle_evidence.REQUIRED_SOURCES
+    observed_sources = frozenset({"task", "lease", "process", "receipt"})
+    source_applicability = {
+        source: ("observed" if source in observed_sources else "not_applicable")
+        for source in sorted(required_sources)
+    }
     source_sha256s = {
         source: _sha256_json(sources[source])
         for source in sorted(required_sources)
@@ -1217,8 +1222,9 @@ def _task_archive_classification(
         lifecycle_evidence.LifecycleObservationBundle(
             identity=str(record["task_id"]),
             kind="task",
-            observed_sources=required_sources,
+            observed_sources=observed_sources,
             source_sha256s=source_sha256s,
+            source_applicability=source_applicability,
             state=str(record["state"]),
             archived=archived,
             dirty=False,

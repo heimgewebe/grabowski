@@ -511,6 +511,7 @@ class TaskArchiveEffectTests(unittest.TestCase):
                 kind="task",
                 observed_sources=observed,
                 source_sha256s=source_sha256s,
+                source_applicability={source: "observed" for source in observed},
                 state="completed",
                 receipt_integrity_valid=True,
             )
@@ -695,6 +696,10 @@ class TaskArchiveEffectTests(unittest.TestCase):
                         for index, source in enumerate(
                             sorted(lifecycle_evidence.REQUIRED_SOURCES)
                         )
+                    },
+                    source_applicability={
+                        source: "observed"
+                        for source in lifecycle_evidence.REQUIRED_SOURCES
                     },
                     state="running",
                     active_task=True,
