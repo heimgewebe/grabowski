@@ -1060,6 +1060,93 @@ def _annotate_groups(
         }
 
 
+def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, Any]:
+    """
+    Evaluates evidence signals for a single projected work group and derives
+    a read-only convergence stage and recommended next action.
+    Operates strictly on evidence collected by current_work (tasks, attention, leases, checkouts, workers, physical).
+    Does NOT grant mutation authority.
+    """
+    source_states = set(group.get("source_states", []))
+    action_reasons = set(group.get("action_reasons", []))
+    projection_state = group.get("projection_state", "unknown")
+    checkout_refs = group.get("checkout_refs", [])
+    has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
+    has_live_surfaces = bool(
+        group.get("lease_summary", {}).get("count", 0)
+        or checkout_refs
+        or group.get("worker_refs")
+        or group.get("physical_refs", {}).get("tmux_sessions")
+        or group.get("physical_refs", {}).get("processes")
+    )
+
+    has_terminal_evidence = bool(
+        {
+            "task:completed",
+            "task:failed",
+            "task:cancelled",
+            "task:interrupted",
+            "task:timed_out",
+            "task:signalled",
+            "attention:decision_closed",
+            "attention:decision_superseded",
+        }
+        & source_states
+        or projection_state == "terminal_archived"
+    )
+
+    # 1. closed-not-cleaned: task/obligation explicitly terminal or closed, but checkout/leases/tmux retained
+    if has_terminal_evidence and (
+        has_cleanup_candidate
+        or "cleanup-candidate" in action_reasons
+        or (projection_state == "terminal_archived" and has_live_surfaces)
+    ):
+        return {
+            "convergence_stage": "closed-not-cleaned",
+            "next_convergence_action": "reconcile terminal worktree hygiene and safe lifecycle reconciliation",
+            "finishable_chain": True,
+            "priority": 1,
+        }
+
+    # Fallbacks for active/blocking/resumable states
+    if projection_state == "blocking":
+        reason_str = ", ".join(sorted(action_reasons)[:2]) or "unresolved evidence"
+        return {
+            "convergence_stage": "blocking",
+            "next_convergence_action": f"inspect blocking work group: {reason_str}",
+            "finishable_chain": False,
+            "priority": 2,
+        }
+    elif projection_state == "resumable":
+        return {
+            "convergence_stage": "resumable",
+            "next_convergence_action": "inspect resumable work group and attention state",
+            "finishable_chain": False,
+            "priority": 3,
+        }
+    elif projection_state == "active":
+        return {
+            "convergence_stage": "active",
+            "next_convergence_action": "monitor active work execution",
+            "finishable_chain": False,
+            "priority": 4,
+        }
+    elif projection_state == "terminal_archived" and not has_live_surfaces:
+        return {
+            "convergence_stage": "terminal_archived",
+            "next_convergence_action": "none: work group terminal and cleaned",
+            "finishable_chain": False,
+            "priority": 5,
+        }
+
+    return {
+        "convergence_stage": "unknown",
+        "next_convergence_action": "inspect work group bindings and authority references",
+        "finishable_chain": False,
+        "priority": 6,
+    }
+
+
 def build_current_work_projection(
     *,
     tasks_payload: dict[str, Any] | None,
@@ -1170,6 +1257,27 @@ def build_current_work_projection(
         source_errors=errors,
     )
 
+    chain_candidates: list[dict[str, Any]] = []
+    for group in projected:
+        rec = derive_group_convergence_recommendation(group)
+        group["convergence_stage"] = rec["convergence_stage"]
+        group["next_convergence_action"] = rec["next_convergence_action"]
+        chain_candidates.append(rec)
+
+    finishable_items = [c for c in chain_candidates if c["finishable_chain"]]
+    if finishable_items:
+        finishable_items.sort(key=lambda x: x["priority"])
+        top_rec = finishable_items[0]
+    elif chain_candidates:
+        chain_candidates.sort(key=lambda x: x["priority"])
+        top_rec = chain_candidates[0]
+    else:
+        top_rec = {
+            "convergence_stage": "none",
+            "next_convergence_action": "none: workspace converged",
+            "priority": 9,
+        }
+
     snapshot_material = {
         "view": view,
         "groups": [_snapshot_group(group) for group in projected],
@@ -1263,6 +1371,15 @@ def build_current_work_projection(
             if state_counts["resumable"]
             else "none"
         ),
+        "next_convergence_action": top_rec["next_convergence_action"],
+        "convergence_summary": {
+            "finishable_chain_prioritized": top_rec.get("finishable_chain", False),
+            "primary_stage": top_rec["convergence_stage"],
+            "closed_not_cleaned_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "closed-not-cleaned"),
+            "blocking_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "blocking"),
+            "resumable_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "resumable"),
+            "active_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "active"),
+        },
         "does_not_establish": [
             "a new independently mutable lifecycle or work-state truth",
             "a new task, lease, checkout, worker, process or tmux authority",
@@ -1270,5 +1387,8 @@ def build_current_work_projection(
             "terminal success from a tmux session, process or heuristic relation alone",
             "absence of work beyond any explicitly truncated or failed source",
             "authority from task cwd overlap or session naming heuristics",
+            "mutation authority or automatic execution from convergence recommendation",
+            "GitHub PR status or remote deployment truth not collected by current_work",
         ],
     }
+
