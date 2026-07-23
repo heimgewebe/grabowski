@@ -735,7 +735,7 @@ def publish_commit_status(
     head_sha: str,
     passed: bool,
     failure_count: int,
-    context: str = STATUS_CONTEXT,
+    context: str,
 ) -> None:
     target_url = None
     server_url = os.environ.get("GITHUB_SERVER_URL")

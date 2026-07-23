@@ -402,6 +402,12 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateInputError, "derived review status"):
             gate._required_check_names_from_catalog(raw)
 
+    def test_publish_commit_status_requires_explicit_context(self) -> None:
+        import inspect
+
+        context = inspect.signature(ci.publish_commit_status).parameters["context"]
+        self.assertIs(context.default, inspect.Parameter.empty)
+
     def test_workflow_uses_created_only_and_no_concurrency_queue(self) -> None:
         text = (
             ROOT / ".github" / "workflows" / "review-evidence-status.yml"
