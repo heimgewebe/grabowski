@@ -1967,5 +1967,272 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         self.assertEqual(paths, ["src/app.py", "tests/test_app.py"])
 
 
+class RepoGroundAgentHandoffTests(unittest.TestCase):
+    def test_agent_handoff_exposes_exact_operations_and_modes(self) -> None:
+        self.assertEqual(
+            mcp._REPOGROUND_AGENT_HANDOFF_OPERATIONS,
+            {"change_impact", "find_relevant_tests", "ground_claim"},
+        )
+        self.assertEqual(
+            mcp._REPOGROUND_AGENT_HANDOFF_RETRIEVAL_MODES,
+            {
+                "native_live_tools",
+                "repoground_context",
+                "combined",
+                "no_additional_retrieval",
+            },
+        )
+
+    def test_agent_handoff_rejects_invalid_operation_and_mode(self) -> None:
+        with patch.object(mcp, "_require_capability", return_value=None):
+            with self.assertRaisesRegex(ValueError, "operation must be one of"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo", "search_everything", "no_additional_retrieval"
+                )
+            with self.assertRaisesRegex(ValueError, "retrieval_mode must be one of"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo", "change_impact", "automatic"
+                )
+
+    def test_agent_handoff_requires_operation_inputs(self) -> None:
+        with patch.object(mcp, "_require_capability", return_value=None):
+            with self.assertRaisesRegex(ValueError, "base_revision is required"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo", "change_impact", "native_live_tools"
+                )
+            with self.assertRaisesRegex(ValueError, "target_revision is required"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo",
+                    "find_relevant_tests",
+                    "native_live_tools",
+                    base_revision="base",
+                )
+            with self.assertRaisesRegex(ValueError, "claim must be"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo", "ground_claim", "native_live_tools"
+                )
+            with self.assertRaisesRegex(ValueError, "claim is only valid"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo",
+                    "change_impact",
+                    "native_live_tools",
+                    base_revision="base",
+                    target_revision="target",
+                    claim="irrelevant",
+                )
+            with self.assertRaisesRegex(ValueError, "not valid for ground_claim"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo",
+                    "ground_claim",
+                    "native_live_tools",
+                    base_revision="base",
+                    claim="claim",
+                )
+            with self.assertRaisesRegex(ValueError, "use claim"):
+                mcp.repoground_agent_handoff(
+                    "demo-repo",
+                    "ground_claim",
+                    "native_live_tools",
+                    claim="claim",
+                    query="ignored",
+                )
+
+    def test_agent_handoff_no_additional_retrieval_calls_nothing_and_has_no_default(self) -> None:
+        with (
+            patch.object(mcp, "_require_capability", return_value=None),
+            patch.object(mcp, "repoground_context_compose") as compose,
+            patch.object(mcp, "repoground_context_pack") as pack,
+        ):
+            result = mcp.repoground_agent_handoff(
+                "demo-repo",
+                "change_impact",
+                "no_additional_retrieval",
+                base_revision="base",
+                target_revision="target",
+            )
+        self.assertEqual(result["routes"], [])
+        self.assertEqual(
+            result["routing_contract"],
+            {
+                "selection": "caller_explicit",
+                "automatic_selection": False,
+                "default_route": None,
+                "global_repoground_promotion": False,
+            },
+        )
+        self.assertEqual(result["mutation_boundary"]["writes"], [])
+        compose.assert_not_called()
+        pack.assert_not_called()
+
+    def test_agent_handoff_native_mode_is_declarative_only(self) -> None:
+        with (
+            patch.object(mcp, "_require_capability", return_value=None),
+            patch.object(mcp, "repoground_context_compose") as compose,
+            patch.object(mcp, "repoground_context_pack") as pack,
+        ):
+            result = mcp.repoground_agent_handoff(
+                "demo-repo",
+                "change_impact",
+                "native_live_tools",
+                base_revision="base",
+                target_revision="target",
+            )
+        self.assertEqual(result["routes"][0]["kind"], "native_live_tools")
+        self.assertFalse(result["routes"][0]["executed"])
+        self.assertEqual(result["routes"][0]["authority"], "live_repository_readback")
+        compose.assert_not_called()
+        pack.assert_not_called()
+
+    def test_agent_handoff_change_impact_delegates_to_compose(self) -> None:
+        evidence = {"status": "available", "context": {"direct_changes": []}}
+        with (
+            patch.object(mcp, "_require_capability", return_value=None),
+            patch.object(
+                mcp, "repoground_context_compose", return_value=evidence
+            ) as compose,
+        ):
+            result = mcp.repoground_agent_handoff(
+                "demo-repo",
+                "change_impact",
+                "repoground_context",
+                base_revision=" base ",
+                target_revision=" target ",
+                expected_diff_sha256="0" * 64,
+                query="changed files",
+            )
+        compose.assert_called_once_with(
+            "demo-repo",
+            "base",
+            "target",
+            task_profile="change_impact",
+            context_budget_bytes=12000,
+            expected_diff_sha256="0" * 64,
+            stem=None,
+            query="changed files",
+        )
+        self.assertIs(result["routes"][0]["repoground_evidence"], evidence)
+        self.assertTrue(result["routes"][0]["executed"])
+
+    def test_agent_handoff_find_relevant_tests_reuses_compose(self) -> None:
+        evidence = {
+            "status": "available",
+            "context": {"related_tests": [{"path": "tests/test_app.py"}]},
+        }
+        with (
+            patch.object(mcp, "_require_capability", return_value=None),
+            patch.object(
+                mcp, "repoground_context_compose", return_value=evidence
+            ) as compose,
+        ):
+            result = mcp.repoground_agent_handoff(
+                "demo-repo",
+                "find_relevant_tests",
+                "repoground_context",
+                base_revision="base",
+                target_revision="target",
+            )
+        compose.assert_called_once_with(
+            "demo-repo",
+            "base",
+            "target",
+            task_profile="change_impact",
+            context_budget_bytes=12000,
+            expected_diff_sha256=None,
+            stem=None,
+            query=None,
+        )
+        self.assertEqual(result["routes"][0]["tool"], "repoground_context_compose")
+        self.assertIs(result["routes"][0]["repoground_evidence"], evidence)
+
+    def test_agent_handoff_ground_claim_reuses_basic_context_pack(self) -> None:
+        evidence = {"available": True, "bounded_evidence": {"snippets": []}}
+        with (
+            patch.object(mcp, "_require_capability", return_value=None),
+            patch.object(mcp, "repoground_context_pack", return_value=evidence) as pack,
+        ):
+            result = mcp.repoground_agent_handoff(
+                "demo-repo",
+                "ground_claim",
+                "repoground_context",
+                claim=" The claim ",
+            )
+        pack.assert_called_once_with(
+            "demo-repo",
+            task_profile="basic_repo_question",
+            stem=None,
+            query="The claim",
+        )
+        self.assertIs(result["routes"][0]["repoground_evidence"], evidence)
+
+    def test_agent_handoff_combined_keeps_authorities_separate(self) -> None:
+        evidence = {"status": "available"}
+        with (
+            patch.object(mcp, "_require_capability", return_value=None),
+            patch.object(
+                mcp, "repoground_context_compose", return_value=evidence
+            ) as compose,
+        ):
+            result = mcp.repoground_agent_handoff(
+                "demo-repo",
+                "change_impact",
+                "combined",
+                base_revision="base",
+                target_revision="target",
+            )
+        compose.assert_called_once()
+        self.assertEqual(
+            [route["kind"] for route in result["routes"]],
+            ["repoground_context", "native_live_tools"],
+        )
+        self.assertEqual(
+            [route["authority"] for route in result["routes"]],
+            ["bounded_published_repository_evidence", "live_repository_readback"],
+        )
+        self.assertFalse(result["routes"][1]["executed"])
+        self.assertIn("truth", result["does_not_establish"])
+        self.assertIn("global_repoground_routing_authority", result["does_not_establish"])
+
+    def test_agent_handoff_paired_baseline_preserves_evidence_for_two_repositories(self) -> None:
+        for repo in ("lenskit", "bureau"):
+            with self.subTest(repo=repo):
+                evidence = {
+                    "kind": "grabowski.repoground_context_compose",
+                    "repo": repo,
+                    "status": "available",
+                    "context": {"direct_changes": [{"path": "example.py"}]},
+                }
+                with (
+                    patch.object(mcp, "_require_capability", return_value=None),
+                    patch.object(
+                        mcp, "repoground_context_compose", return_value=evidence
+                    ) as compose,
+                ):
+                    result = mcp.repoground_agent_handoff(
+                        repo,
+                        "change_impact",
+                        "repoground_context",
+                        base_revision="base",
+                        target_revision="target",
+                    )
+                compose.assert_called_once()
+                self.assertIs(result["routes"][0]["repoground_evidence"], evidence)
+                self.assertFalse(result["routing_contract"]["global_repoground_promotion"])
+
+    def test_agent_handoff_is_registered_in_runtime_and_capabilities(self) -> None:
+        runtime = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text()
+        )
+        self.assertIn("repoground_agent_handoff", runtime["expected_tools"])
+        import grabowski_capabilities
+
+        self.assertIn(
+            "repoground_agent_handoff", grabowski_capabilities.TOOL_PROFILES
+        )
+        self.assertEqual(
+            mcp.TOOL_CAPABILITY_REQUIREMENTS["repoground_agent_handoff"],
+            ("bundle_registry",),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
