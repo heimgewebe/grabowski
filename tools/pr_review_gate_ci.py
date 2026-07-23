@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, Callable
 
 try:
@@ -24,12 +25,26 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
 SCHEMA_VERSION = 1
 AUDIT_KIND = "grabowski_self_review_audit"
 STATUS_KIND = "grabowski_review_gate_status"
+ATTESTATION_KIND = evidence_schemas.REVIEW_GATE_ATTESTATION_KIND
 RESULT_KIND = "grabowski_review_gate_ci_result"
-STATUS_CONTEXT = "Review evidence gate"
-COMMENT_PREFIX = "/grabowski-review-evidence v1"
+LEGACY_STATUS_CONTEXT = "Review evidence gate"
+ATTESTED_STATUS_CONTEXT = "Review evidence gate (attested)"
+ADVISORY_STATUS_CONTEXT = "Review evidence gate (advisory)"
+STATUS_CONTEXT = ATTESTED_STATUS_CONTEXT
+COMMENT_PREFIX_V1 = "/grabowski-review-evidence v1"
+COMMENT_PREFIX_V2 = "/grabowski-review-evidence v2"
+COMMENT_PREFIX = COMMENT_PREFIX_V1
+SIGNER_PRINCIPAL = evidence_schemas.REVIEW_GATE_SIGNER_PRINCIPAL
+SIGNATURE_NAMESPACE = evidence_schemas.REVIEW_GATE_SIGNATURE_NAMESPACE
+DEFAULT_ALLOWED_SIGNERS_PATH = (
+    Path(__file__).resolve().parents[1] / "config" / "review-evidence-allowed-signers"
+)
 MAX_AUDIT_BYTES = 64 * 1024
 MAX_STATUS_BYTES = 16 * 1024
 MAX_STATUS_B64_BYTES = 32 * 1024
+MAX_ATTESTATION_BYTES = 24 * 1024
+MAX_ATTESTATION_B64_BYTES = 40 * 1024
+MAX_SIGNATURE_BYTES = 16 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
 ALLOWED_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write", "push"})
 REVIEW_TIER_RANK = evidence_schemas.REVIEW_TIER_RANK
@@ -39,7 +54,10 @@ COMMENT_STATE_STALE = "stale_or_edited"
 COMMENT_STATE_OUTSIDE_WINDOW = "outside_bounded_window"
 COMMENT_STATE_AUTHORIZATION_UNKNOWN = "authorization_unknown"
 COMMENT_RE = re.compile(
-    rf"\A{re.escape(COMMENT_PREFIX)}(?:\s+(?P<payload>[A-Za-z0-9+/=]+))?\s*\Z"
+    rf"\A{re.escape(COMMENT_PREFIX_V1)}(?:\s+(?P<payload>[A-Za-z0-9+/=]+))?\s*\Z"
+)
+COMMENT_V2_RE = re.compile(
+    rf"\A{re.escape(COMMENT_PREFIX_V2)}(?:\s+(?P<payload>[A-Za-z0-9+/=]+))?\s*\Z"
 )
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -147,6 +165,158 @@ def encode_status_projection(status: dict[str, Any]) -> str:
     return base64.b64encode(canonical_status_bytes(status)).decode("ascii")
 
 
+def _run_signature_command(argv: list[str], *, stdin: bytes) -> bytes:
+    try:
+        result = subprocess.run(
+            argv,
+            input=stdin,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CiEvidenceError("review evidence signature command could not be executed") from exc
+    if result.returncode != 0:
+        raise CiEvidenceError("review evidence signature operation failed")
+    return result.stdout
+
+
+def sign_status_projection(status: dict[str, Any], *, signing_key: str | Path) -> bytes:
+    failures = _status_schema_failures(status)
+    if failures:
+        raise CiEvidenceError("; ".join(failures))
+    key_path = Path(signing_key).expanduser()
+    if not key_path.is_file():
+        raise CiEvidenceError("review evidence signing key is missing")
+    signature = _run_signature_command(
+        [
+            "ssh-keygen",
+            "-Y",
+            "sign",
+            "-f",
+            str(key_path),
+            "-n",
+            SIGNATURE_NAMESPACE,
+        ],
+        stdin=canonical_status_bytes(status),
+    )
+    if len(signature) > MAX_SIGNATURE_BYTES or not signature.startswith(
+        b"-----BEGIN SSH SIGNATURE-----"
+    ):
+        raise CiEvidenceError("review evidence signature output is invalid")
+    return signature
+
+
+def build_signed_status_attestation(
+    audit_bytes: bytes, *, signing_key: str | Path
+) -> dict[str, Any]:
+    status = build_status_projection(audit_bytes)
+    signature = sign_status_projection(status, signing_key=signing_key)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": ATTESTATION_KIND,
+        "signer_principal": SIGNER_PRINCIPAL,
+        "signature_namespace": SIGNATURE_NAMESPACE,
+        "status": status,
+        "signature_b64": base64.b64encode(signature).decode("ascii"),
+    }
+
+
+def canonical_attestation_bytes(attestation: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(attestation, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def encode_signed_status_attestation(attestation: dict[str, Any]) -> str:
+    return base64.b64encode(canonical_attestation_bytes(attestation)).decode("ascii")
+
+
+def verify_signed_status_attestation(
+    attestation: Any, *, allowed_signers_path: str | Path
+) -> dict[str, Any]:
+    failures = _prefixed_schema_failures(
+        attestation,
+        label="signed review gate status",
+        prefix="signed status evidence",
+    )
+    if failures:
+        raise CiEvidenceError("; ".join(failures))
+    assert isinstance(attestation, dict)
+    status = attestation.get("status")
+    status_failures = _status_schema_failures(status)
+    if status_failures:
+        raise CiEvidenceError("; ".join(status_failures))
+    assert isinstance(status, dict)
+    signature_raw = attestation.get("signature_b64")
+    if not isinstance(signature_raw, str):
+        raise CiEvidenceError("signed status evidence signature is missing")
+    try:
+        signature = base64.b64decode(signature_raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CiEvidenceError("signed status evidence signature is not valid base64") from exc
+    if len(signature) > MAX_SIGNATURE_BYTES or not signature.startswith(
+        b"-----BEGIN SSH SIGNATURE-----"
+    ):
+        raise CiEvidenceError("signed status evidence signature is invalid")
+
+    allowed_path = Path(allowed_signers_path)
+    if not allowed_path.is_file():
+        raise CiEvidenceError("trusted review evidence signer allowlist is missing")
+    with tempfile.NamedTemporaryFile(mode="wb", prefix="grabowski-review-signature-") as handle:
+        handle.write(signature)
+        handle.flush()
+        _run_signature_command(
+            [
+                "ssh-keygen",
+                "-Y",
+                "verify",
+                "-f",
+                str(allowed_path),
+                "-I",
+                SIGNER_PRINCIPAL,
+                "-n",
+                SIGNATURE_NAMESPACE,
+                "-s",
+                handle.name,
+            ],
+            stdin=canonical_status_bytes(status),
+        )
+    return status
+
+
+def decode_signed_status_attestation(
+    raw: str, *, allowed_signers_path: str | Path
+) -> dict[str, Any]:
+    normalized = raw.strip()
+    if not normalized:
+        raise CiEvidenceError("signed status evidence is missing")
+    try:
+        normalized_size = len(normalized.encode("ascii"))
+    except UnicodeEncodeError as exc:
+        raise CiEvidenceError("signed status evidence is not valid base64") from exc
+    if normalized_size > MAX_ATTESTATION_B64_BYTES:
+        raise CiEvidenceError(
+            f"signed status evidence exceeds {MAX_ATTESTATION_B64_BYTES} base64 bytes"
+        )
+    try:
+        decoded = base64.b64decode(normalized, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise CiEvidenceError("signed status evidence is not valid base64") from exc
+    if len(decoded) > MAX_ATTESTATION_BYTES:
+        raise CiEvidenceError(
+            f"decoded signed status evidence exceeds {MAX_ATTESTATION_BYTES} bytes"
+        )
+    try:
+        attestation = json.loads(decoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CiEvidenceError("signed status evidence is not valid UTF-8 JSON") from exc
+    return verify_signed_status_attestation(
+        attestation, allowed_signers_path=allowed_signers_path
+    )
+
+
 def _status_schema_failures(status: Any) -> list[str]:
     failures = _prefixed_schema_failures(
         status, label="review gate status", prefix="status evidence"
@@ -205,6 +375,30 @@ def parse_comment_status(body: str) -> dict[str, Any]:
     return decode_status_projection(payload)
 
 
+def parse_comment_evidence(
+    body: str, *, allowed_signers_path: str | Path
+) -> tuple[dict[str, Any], bool]:
+    stripped = body.strip()
+    match_v2 = COMMENT_V2_RE.fullmatch(stripped)
+    if match_v2 is not None:
+        payload = match_v2.group("payload")
+        if not payload:
+            raise CiEvidenceError("signed status evidence is missing")
+        return (
+            decode_signed_status_attestation(
+                payload, allowed_signers_path=allowed_signers_path
+            ),
+            True,
+        )
+    match_v1 = COMMENT_RE.fullmatch(stripped)
+    if match_v1 is not None:
+        payload = match_v1.group("payload")
+        if not payload:
+            raise CiEvidenceError("status evidence is missing")
+        return decode_status_projection(payload), False
+    raise CiEvidenceError("review evidence comment command is malformed")
+
+
 def permission_allows_publish(permission: Any) -> bool:
     return (
         isinstance(permission, str)
@@ -212,9 +406,17 @@ def permission_allows_publish(permission: Any) -> bool:
     )
 
 
-def _is_review_command(body: str) -> bool:
+def _review_command_prefix(body: str) -> str | None:
     stripped = body.strip()
-    return stripped == COMMENT_PREFIX or stripped.startswith(COMMENT_PREFIX + " ")
+    for prefix in (COMMENT_PREFIX_V1, COMMENT_PREFIX_V2):
+        if stripped == prefix or stripped.startswith(prefix + " "):
+            return prefix
+    return None
+
+
+def _is_review_command(body: str, *, command_prefix: str | None = None) -> bool:
+    prefix = _review_command_prefix(body)
+    return prefix is not None and (command_prefix is None or prefix == command_prefix)
 
 
 def _comment_identity(comment: Any) -> tuple[int, str, str] | None:
@@ -238,6 +440,7 @@ def select_latest_authorized_command_comment_id(
     comments: list[Any],
     *,
     permission_lookup: Callable[[str], Any],
+    command_prefix: str = COMMENT_PREFIX_V1,
 ) -> int | None:
     candidates: list[tuple[int, str]] = []
     for comment in comments:
@@ -245,7 +448,7 @@ def select_latest_authorized_command_comment_id(
         if identity is None:
             continue
         comment_id, actor, body = identity
-        if not _is_review_command(body):
+        if not _is_review_command(body, command_prefix=command_prefix):
             continue
         candidates.append((comment_id, actor))
 
@@ -275,9 +478,14 @@ def command_comment_authorization_state(
         return COMMENT_STATE_OUTSIDE_WINDOW
     if current_body != current_comment_body:
         return COMMENT_STATE_STALE
+    command_prefix = _review_command_prefix(current_comment_body)
+    if command_prefix is None:
+        return COMMENT_STATE_STALE
     try:
         latest = select_latest_authorized_command_comment_id(
-            comments, permission_lookup=permission_lookup
+            comments,
+            permission_lookup=permission_lookup,
+            command_prefix=command_prefix,
         )
     except CiEvidenceError:
         return COMMENT_STATE_AUTHORIZATION_UNKNOWN
@@ -527,6 +735,7 @@ def publish_commit_status(
     head_sha: str,
     passed: bool,
     failure_count: int,
+    context: str,
 ) -> None:
     target_url = None
     server_url = os.environ.get("GITHUB_SERVER_URL")
@@ -535,9 +744,13 @@ def publish_commit_status(
         target_url = f"{server_url.rstrip('/')}/{repo_name}/actions/runs/{run_id}"
     payload: dict[str, Any] = {
         "state": "success" if passed else "failure",
-        "context": STATUS_CONTEXT,
+        "context": context,
         "description": (
-            "Authorized review assertion passed current bindings"
+            (
+                "Attested review evidence passed current bindings"
+                if context == ATTESTED_STATUS_CONTEXT
+                else "Authorized review assertion passed current bindings"
+            )
             if passed
             else f"Review evidence blocked ({failure_count} validation failure(s))"
         ),
@@ -569,6 +782,8 @@ def _safe_result(
     complexity: dict[str, Any] | None,
     authorized: bool,
     permission: str | None,
+    provenance_verified: bool = False,
+    status_context: str | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -598,6 +813,8 @@ def _safe_result(
         ),
         "authorized": authorized,
         "actor_permission": permission,
+        "provenance_verified": provenance_verified,
+        "status_context": status_context,
         "verdict": "PASS" if authorized and not failures else "BLOCK",
         "failures": failures,
         "private_evidence_included": False,
@@ -630,9 +847,35 @@ def prepare_command(args: argparse.Namespace) -> int:
         except FileExistsError as exc:
             raise CiEvidenceError(f"status projection already exists: {output}") from exc
     if args.comment:
-        print(f"{COMMENT_PREFIX} {encode_status_projection(status)}")
+        print(f"{COMMENT_PREFIX_V1} {encode_status_projection(status)}")
     elif args.base64:
         print(encode_status_projection(status))
+    else:
+        print(rendered, end="")
+    return 0
+
+
+def prepare_attested_command(args: argparse.Namespace) -> int:
+    audit_bytes = Path(args.audit).read_bytes()
+    attestation = build_signed_status_attestation(
+        audit_bytes, signing_key=args.signing_key
+    )
+    rendered = json.dumps(attestation, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with output.open("x", encoding="utf-8") as handle:
+                handle.write(rendered)
+        except FileExistsError as exc:
+            raise CiEvidenceError(f"signed status attestation already exists: {output}") from exc
+    if args.comment:
+        print(
+            f"{COMMENT_PREFIX_V2} "
+            f"{encode_signed_status_attestation(attestation)}"
+        )
+    elif args.base64:
+        print(encode_signed_status_attestation(attestation))
     else:
         print(rendered, end="")
     return 0
@@ -652,6 +895,14 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         if args.actor and args.actor != event_actor:
             raise CiEvidenceError(
                 "--actor must match GITHUB_ACTOR when publishing status"
+            )
+        if getattr(args, "allowed_signers", None):
+            raise CiEvidenceError(
+                "--allowed-signers cannot override the trusted repository allowlist when publishing status"
+            )
+        if os.environ.get("REVIEW_GATE_ALLOWED_SIGNERS"):
+            raise CiEvidenceError(
+                "REVIEW_GATE_ALLOWED_SIGNERS cannot override the trusted repository allowlist when publishing status"
             )
         actor = event_actor
     else:
@@ -677,6 +928,21 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
     pr = load_live_pr(repo_name, args.pr)
     head_sha = _normalize_git_sha(pr.get("headRefOid"))
     comment_body = os.environ.get(args.comment_body_env, "")
+    command_prefix = _review_command_prefix(comment_body)
+    status_context = (
+        ATTESTED_STATUS_CONTEXT
+        if command_prefix == COMMENT_PREFIX_V2
+        else ADVISORY_STATUS_CONTEXT
+    )
+    allowed_signers_path = (
+        str(DEFAULT_ALLOWED_SIGNERS_PATH)
+        if args.publish_status
+        else (
+            getattr(args, "allowed_signers", None)
+            or os.environ.get("REVIEW_GATE_ALLOWED_SIGNERS")
+            or str(DEFAULT_ALLOWED_SIGNERS_PATH)
+        )
+    )
     permission_cache: dict[str, str | None] = {actor: permission}
 
     if args.comment_id is not None:
@@ -696,6 +962,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
                     head_sha=head_sha,
                     passed=False,
                     failure_count=len(failures),
+                    context=status_context,
                 )
             result = _safe_result(
                 repo_name=repo_name,
@@ -707,6 +974,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
                 complexity=None,
                 authorized=True,
                 permission=permission,
+                status_context=status_context,
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 1
@@ -722,6 +990,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
                     head_sha=head_sha,
                     passed=False,
                     failure_count=len(failures),
+                    context=status_context,
                 )
             result = _safe_result(
                 repo_name=repo_name,
@@ -733,6 +1002,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
                 complexity=None,
                 authorized=True,
                 permission=permission,
+                status_context=status_context,
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0 if comment_state == COMMENT_STATE_SUPERSEDED else 1
@@ -741,8 +1011,11 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
     complexity = gate.classify_complexity(pr, None, repo_name=repo_name)
     failures: list[str] = []
     status: dict[str, Any] | None = None
+    provenance_verified = False
     try:
-        status = parse_comment_status(comment_body)
+        status, provenance_verified = parse_comment_evidence(
+            comment_body, allowed_signers_path=allowed_signers_path
+        )
     except CiEvidenceError as exc:
         failures.append(str(exc))
     if status is not None:
@@ -784,6 +1057,8 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
                     complexity=complexity,
                     authorized=True,
                     permission=permission,
+                    provenance_verified=provenance_verified,
+                    status_context=status_context,
                 )
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 0
@@ -806,6 +1081,7 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
             head_sha=final_head,
             passed=not failures,
             failure_count=len(failures),
+            context=status_context,
         )
 
     result = _safe_result(
@@ -818,6 +1094,8 @@ def evaluate_comment_command(args: argparse.Namespace) -> int:
         complexity=complexity,
         authorized=True,
         permission=permission,
+        provenance_verified=provenance_verified,
+        status_context=status_context,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if not failures else 1
@@ -835,12 +1113,22 @@ def build_parser() -> argparse.ArgumentParser:
     output_mode.add_argument("--comment", action="store_true")
     prepare.set_defaults(handler=prepare_command)
 
+    prepare_attested = subparsers.add_parser("prepare-attested")
+    prepare_attested.add_argument("--audit", required=True)
+    prepare_attested.add_argument("--signing-key", required=True)
+    prepare_attested.add_argument("--output")
+    attested_output_mode = prepare_attested.add_mutually_exclusive_group()
+    attested_output_mode.add_argument("--base64", action="store_true")
+    attested_output_mode.add_argument("--comment", action="store_true")
+    prepare_attested.set_defaults(handler=prepare_attested_command)
+
     evaluate = subparsers.add_parser("evaluate-comment")
     evaluate.add_argument("--pr", type=int, required=True)
     evaluate.add_argument("--repo-name")
     evaluate.add_argument("--actor")
     evaluate.add_argument("--comment-id", type=int)
     evaluate.add_argument("--comment-body-env", default="REVIEW_GATE_COMMENT_BODY")
+    evaluate.add_argument("--allowed-signers")
     evaluate.add_argument("--publish-status", action="store_true")
     evaluate.set_defaults(handler=evaluate_comment_command)
     return parser

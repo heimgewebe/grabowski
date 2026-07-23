@@ -9,6 +9,9 @@ _MISSING = object()
 
 # Bump when review-gate policy semantics change in a way that invalidates prior audits.
 REVIEW_POLICY_VERSION = 2
+REVIEW_GATE_ATTESTATION_KIND = "grabowski_review_gate_attestation"
+REVIEW_GATE_SIGNER_PRINCIPAL = "grabowski-review-gate@heimgewebe"
+REVIEW_GATE_SIGNATURE_NAMESPACE = "review-evidence@grabowski.heimgewebe"
 REVIEW_TIER_RANK = {
     "documentation": 1,
     "very_small": 1,
@@ -394,10 +397,35 @@ REVIEW_GATE_STATUS_SCHEMA = EvidenceSchema(
 )
 
 
+REVIEW_GATE_ATTESTATION_SCHEMA = EvidenceSchema(
+    name="Grabowski review-gate signed attestation v1",
+    fields={
+        "schema_version": FieldRule(("integer",), const=1),
+        "kind": FieldRule(("string",), const=REVIEW_GATE_ATTESTATION_KIND),
+        "signer_principal": FieldRule(("string",), const=REVIEW_GATE_SIGNER_PRINCIPAL),
+        "signature_namespace": FieldRule(("string",), const=REVIEW_GATE_SIGNATURE_NAMESPACE),
+        "status": OBJECT,
+        "signature_b64": STRING,
+    },
+    required=frozenset(
+        {
+            "schema_version",
+            "kind",
+            "signer_principal",
+            "signature_namespace",
+            "status",
+            "signature_b64",
+        }
+    ),
+    additional_properties=False,
+)
+
+
 SCHEMAS = {
     "self-review": SELF_REVIEW_SCHEMA,
     "self-review audit": SELF_REVIEW_AUDIT_SCHEMA,
     "review gate status": REVIEW_GATE_STATUS_SCHEMA,
+    "signed review gate status": REVIEW_GATE_ATTESTATION_SCHEMA,
     "external review evidence": EXTERNAL_REVIEW_SCHEMA,
     "Claude evidence": CLAUDE_EVIDENCE_SCHEMA,
 }

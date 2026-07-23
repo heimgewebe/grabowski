@@ -290,6 +290,7 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
             head_sha="a" * 40,
             passed=False,
             failure_count=1,
+            context=ci.ADVISORY_STATUS_CONTEXT,
         )
 
     def test_authorization_unknown_replaces_old_green_with_failure(self) -> None:
@@ -327,6 +328,7 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
             head_sha="a" * 40,
             passed=False,
             failure_count=1,
+            context=ci.ADVISORY_STATUS_CONTEXT,
         )
 
     def test_newer_authorized_command_on_final_freshness_skips_old_status_mutation(self) -> None:
@@ -386,6 +388,26 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateInputError, "derived review status"):
             gate._required_check_names_from_catalog(raw)
 
+    def test_legacy_review_status_is_forbidden_in_required_catalog(self) -> None:
+        raw = json.dumps(
+            {"schema_version": 1, "required_checks": [ci.LEGACY_STATUS_CONTEXT]}
+        )
+        with self.assertRaisesRegex(gate.GateInputError, "derived review status"):
+            gate._required_check_names_from_catalog(raw)
+
+    def test_advisory_derived_status_is_also_forbidden_in_required_catalog(self) -> None:
+        raw = json.dumps(
+            {"schema_version": 1, "required_checks": [ci.ADVISORY_STATUS_CONTEXT]}
+        )
+        with self.assertRaisesRegex(gate.GateInputError, "derived review status"):
+            gate._required_check_names_from_catalog(raw)
+
+    def test_publish_commit_status_requires_explicit_context(self) -> None:
+        import inspect
+
+        context = inspect.signature(ci.publish_commit_status).parameters["context"]
+        self.assertIs(context.default, inspect.Parameter.empty)
+
     def test_workflow_uses_created_only_and_no_concurrency_queue(self) -> None:
         text = (
             ROOT / ".github" / "workflows" / "review-evidence-status.yml"
@@ -395,6 +417,9 @@ class ReviewEvidenceHardeningTests(unittest.TestCase):
         self.assertNotIn("concurrency:", text)
         self.assertIn("github.event.comment.body == '/grabowski-review-evidence v1'", text)
         self.assertIn("'/grabowski-review-evidence v1 '", text)
+        self.assertIn("github.event.comment.body == '/grabowski-review-evidence v2'", text)
+        self.assertIn("'/grabowski-review-evidence v2 '", text)
+        self.assertIn("ref: ${{ github.event.repository.default_branch }}", text)
 
 
 class ReviewEvidenceSchemaHardeningTests(unittest.TestCase):

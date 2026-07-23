@@ -4186,7 +4186,7 @@ def grabowski_chronik_outbox_import(path: str) -> dict[str, Any]:
     source, raw = chronik.read_coding_memory_source(path)
     configuration = chronik.coding_memory_configuration()
     base_payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "grabowski_chronik_outbox_import_receipt",
         "source": {
             key: source[key]

@@ -3117,6 +3117,35 @@ else:
         self.assertFalse(result["outcome_unknown"])
         self.assertEqual(1, result["events_imported"])
 
+    def test_outbox_import_accepts_host_subject_without_optional_metadata(self) -> None:
+        context = {
+            "subject_scope": "host",
+            "host": "heim-pc",
+            "operation": "recovery",
+            "task_class": "recovery",
+        }
+        event = tasks.chronik.build_event(
+            {
+                "task_id": "c" * 24,
+                "unit": "grabowski-task-" + "c" * 24 + "-a1.service",
+                "attempt": 1,
+                "created_at_unix": 1_700_000_000,
+                "updated_at_unix": 1_700_000_100,
+                "terminalized_at_unix": 1_700_000_200,
+                "chronik_context_json": context,
+            },
+            "completed",
+        )
+        self.source.write_bytes(tasks.chronik._canonical_bytes(event) + b"\n")
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertTrue(result["available"])
+        self.assertTrue(result["succeeded"])
+        self.assertEqual(1, result["events_imported"])
+
     def test_outbox_import_rejects_invalid_receipt_digest_without_real_mutation(self) -> None:
         source = self.cli.read_text(encoding="utf-8")
         self.cli.write_text(

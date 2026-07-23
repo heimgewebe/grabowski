@@ -989,7 +989,7 @@ def _validate_agent_run_event_shape(event: Any, *, label: str) -> None:
             raise ValueError(f"{label} has an invalid repository subject")
     elif scope == "host":
         if (
-            set(subject) != _EVENT_SUBJECT_HOST_KEYS
+            set(subject) - _EVENT_SUBJECT_HOST_KEYS
             or not isinstance(subject.get("host"), str)
             or not subject["host"]
         ):
