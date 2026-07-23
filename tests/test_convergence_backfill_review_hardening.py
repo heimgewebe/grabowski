@@ -81,22 +81,26 @@ def _classifier(_name: str, parameters: dict[str, object]) -> dict[str, object]:
         for record in raw_records
         if isinstance(record, dict)
     ]
+    output = {
+        "schema_version": 1,
+        "authority": "test-classifier",
+        "records": records,
+        "counts": {"unknown": len(records)},
+        "decision_required_count": len(records),
+        "does_not_establish": [],
+    }
+    receipt = {
+        "grip": {"name": "convergence-state-classify"},
+        "parameters_sha256": backfill.sha256_json(parameters),
+        "output_sha256": backfill.sha256_json(output),
+    }
+    receipt_sha256 = backfill.sha256_json(receipt)
+    receipt["receipt_sha256"] = receipt_sha256
     return {
         "status": "passed",
-        "output": {
-            "schema_version": 1,
-            "authority": "test-classifier",
-            "records": records,
-            "counts": {"unknown": len(records)},
-            "decision_required_count": len(records),
-            "does_not_establish": [],
-        },
-        "receipt": {
-            "grip": "convergence-state-classify",
-            "parameters_sha256": "e" * 64,
-            "output_sha256": "f" * 64,
-        },
-        "receipt_sha256": "1" * 64,
+        "output": output,
+        "receipt": receipt,
+        "receipt_sha256": receipt_sha256,
     }
 
 
