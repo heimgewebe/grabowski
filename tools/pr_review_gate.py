@@ -26,6 +26,9 @@ BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
 DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 # Bootstrap policies are sticky code-owned defaults until a base-side catalog exists.
 BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
+    "heimgewebe/hausKI": ("Detect changes",),
+    "heimgewebe/hausKI-audio": ("scan",),
+    "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
 }
