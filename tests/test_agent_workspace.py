@@ -279,6 +279,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.state = self.root / "state"
         self.state.mkdir()
         os.chmod(self.state, 0o700)
+        self.shadow_cohort_root = self.root / "routing-shadow-cohort"
+        self.shadow_cohort_env_patch = mock.patch.dict(
+            os.environ,
+            {"GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT": str(self.shadow_cohort_root)},
+        )
+        self.shadow_cohort_env_patch.start()
+        self.addCleanup(self.shadow_cohort_env_patch.stop)
         self.audit_log_patch = mock.patch.object(
             workspace.operator.base, "AUDIT_LOG", self.state / "write-audit.jsonl"
         )
@@ -1657,6 +1664,25 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(calls, ["writer", "tests"])
         start.assert_not_called()
         self.assertFalse((self.root / "tests-preflight").exists())
+
+    def test_workspace_shadow_capture_is_confined_to_test_state(self) -> None:
+        self.assertEqual(
+            os.environ.get("GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT"),
+            str(self.shadow_cohort_root),
+        )
+        self.assertFalse(self.shadow_cohort_root.exists())
+
+        manifest = {
+            "workspace_id": "gaw-test-shadow-isolation-12345678",
+            "plan_sha256": "a" * 64,
+            "tasks": {"writer": None, "tests": None, "review": None},
+            "route_evidence": complete_route_evidence(),
+        }
+        result = workspace._capture_routing_shadow_prospective_best_effort(manifest)
+
+        self.assertEqual(result["status"], "created")
+        self.assertTrue((self.shadow_cohort_root / "prospective").is_dir())
+        self.assertTrue((self.shadow_cohort_root / "attempts").is_dir())
 
     def test_create_rollback_preserves_dirty_writer_worktree(self) -> None:
         plan_id, _ = workspace._workspace_identity("thread_focus", "thread-rollback", self.git.repo, self.git.base)
