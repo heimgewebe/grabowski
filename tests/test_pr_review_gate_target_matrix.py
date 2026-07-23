@@ -85,6 +85,14 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
             self.assertEqual(result, ("Detect docs updates", "Core Guard Tests"))
             self.assertEqual(read_catalog.call_count, 2)
 
+    def test_mitschreiber_bootstrap_applies_when_base_has_no_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            with mock.patch.object(pr_review_gate, "_required_check_catalog_text_at_revision", return_value=None) as read_catalog:
+                result = pr_review_gate.expected_check_names_for_repo(repo, repo_name="heimgewebe/mitschreiber", head_sha="a" * 40, base_sha="b" * 40)
+            self.assertEqual(result, ("ci / reusable-ci",))
+            self.assertEqual(read_catalog.call_count, 2)
+
     def test_required_check_catalog_rejects_invalid_duplicate_and_oversized_entries(self) -> None:
         too_many = {
             "schema_version": 1,
