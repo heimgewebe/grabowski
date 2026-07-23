@@ -286,7 +286,7 @@
         "type": "string",
         "minLength": 1,
         "maxLength": 300,
-        "pattern": "^(github-ci|diff-review|operator-decision|chronik|artifact):"
+        "pattern": "^(github-ci|diff-review|operator-decision|chronik|artifact):.+$"
       }
     },
     "captured_at": {

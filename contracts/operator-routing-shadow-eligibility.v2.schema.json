@@ -6,7 +6,7 @@
     "canonical_route_evidence": {
       "additionalProperties": false,
       "properties": {
-        "manifest_sha256": {
+        "manifest_identity_sha256": {
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
@@ -34,7 +34,7 @@
         "schema_version",
         "recommendation_id",
         "route_evidence_sha256",
-        "manifest_sha256"
+        "manifest_identity_sha256"
       ],
       "type": "object"
     },
