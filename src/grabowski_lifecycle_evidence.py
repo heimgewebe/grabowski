@@ -6,7 +6,7 @@ from typing import Any, Mapping
 import grabowski_lifecycle_archive as lifecycle
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REQUIRED_SOURCES = frozenset(
     {"task", "workspace", "lease", "checkout", "process", "tmux", "receipt"}
 )
@@ -17,6 +17,38 @@ SOURCE_APPLICABILITY_STATES = frozenset(
 READBACK_SOURCE_APPLICABILITY_STATES = frozenset(
     {"observed", "explicit_absence"}
 )
+SOURCE_APPLICABILITY_PROFILE_FULL_READBACK_V1 = "full_readback.v1"
+SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1 = "task_archive.v1"
+SOURCE_APPLICABILITY_PROFILES = {
+    SOURCE_APPLICABILITY_PROFILE_FULL_READBACK_V1: {
+        "kinds": None,
+        "not_applicable_sources": frozenset(),
+    },
+    SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1: {
+        "kinds": frozenset({"task"}),
+        "not_applicable_sources": frozenset({"workspace", "checkout", "tmux"}),
+    },
+}
+
+
+def source_applicability_profile_policy(profile: Any, *, kind: str) -> dict[str, str]:
+    if not isinstance(profile, str) or not profile:
+        raise ValueError("source_applicability_profile_invalid")
+    spec = SOURCE_APPLICABILITY_PROFILES.get(profile)
+    if spec is None:
+        raise ValueError("source_applicability_profile_unknown")
+    kinds = spec["kinds"]
+    if kinds is not None and kind not in kinds:
+        raise ValueError("source_applicability_profile_kind_invalid")
+    not_applicable_sources = spec["not_applicable_sources"]
+    return {
+        source: (
+            "not_applicable"
+            if source in not_applicable_sources
+            else "readback_required"
+        )
+        for source in sorted(REQUIRED_SOURCES)
+    }
 
 
 @dataclass(frozen=True)
@@ -26,9 +58,10 @@ class LifecycleObservationBundle:
     ``observed_sources`` contains only sources for which an actual readback was
     performed, including a readback that proves explicit absence.
     ``source_applicability`` distinguishes an observed object, explicit absence,
-    and a source that is formally not applicable to this lifecycle kind. Every
-    required source remains digest-bound. Missing, unknown, contradictory, or
-    schema-foreign applicability fails closed.
+    and a source that is formally not applicable under the canonical
+    ``source_applicability_profile``. Every required source remains digest-bound.
+    Missing, unknown, contradictory, profile-foreign, or schema-foreign
+    applicability fails closed.
     """
 
     identity: str
@@ -36,6 +69,7 @@ class LifecycleObservationBundle:
     observed_sources: frozenset[str]
     source_sha256s: Mapping[str, str]
     source_applicability: Mapping[str, str]
+    source_applicability_profile: str = SOURCE_APPLICABILITY_PROFILE_FULL_READBACK_V1
     source_applicability_schema_version: int = SOURCE_APPLICABILITY_SCHEMA_VERSION
     state: str | None = None
     closed: bool | None = None
@@ -58,11 +92,31 @@ class LifecycleObservationBundle:
 def _source_errors(bundle: LifecycleObservationBundle) -> list[str]:
     errors = [f"source_error:{value}" for value in bundle.source_errors]
     observed_sources = set(bundle.observed_sources)
-    unknown_sources = sorted(observed_sources - REQUIRED_SOURCES)
+    unknown_sources = sorted(
+        source
+        for source in observed_sources
+        if isinstance(source, str) and source not in REQUIRED_SOURCES
+    )
     errors.extend(f"source_unknown:{source}" for source in unknown_sources)
+    if any(not isinstance(source, str) for source in observed_sources):
+        errors.append("source_unknown_key_type")
 
-    if bundle.source_applicability_schema_version != SOURCE_APPLICABILITY_SCHEMA_VERSION:
+    version = bundle.source_applicability_schema_version
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != SOURCE_APPLICABILITY_SCHEMA_VERSION
+    ):
         errors.append("source_applicability_schema_unsupported")
+
+    try:
+        profile_policy = source_applicability_profile_policy(
+            bundle.source_applicability_profile,
+            kind=bundle.kind,
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
+        profile_policy = None
 
     applicability = bundle.source_applicability
     if not isinstance(applicability, Mapping):
@@ -86,9 +140,19 @@ def _source_errors(bundle: LifecycleObservationBundle) -> list[str]:
                 errors.append(f"source_unobserved:{source}")
             continue
         state = applicability[source]
-        if state not in SOURCE_APPLICABILITY_STATES:
+        if not isinstance(state, str) or state not in SOURCE_APPLICABILITY_STATES:
             errors.append(f"source_applicability_invalid:{source}")
             continue
+        if profile_policy is not None:
+            expected = profile_policy[source]
+            if expected == "not_applicable" and state != "not_applicable":
+                errors.append(
+                    f"source_applicability_profile_mismatch:{source}:expected_not_applicable"
+                )
+            if expected == "readback_required" and state == "not_applicable":
+                errors.append(
+                    f"source_applicability_profile_mismatch:{source}:expected_readback"
+                )
         if state in READBACK_SOURCE_APPLICABILITY_STATES and source not in observed_sources:
             errors.append(f"source_unobserved:{source}")
         if state == "not_applicable" and source in observed_sources:
@@ -106,6 +170,8 @@ def _source_errors(bundle: LifecycleObservationBundle) -> list[str]:
         if isinstance(source, str) and source not in REQUIRED_SOURCES
     )
     errors.extend(f"source_digest_unknown:{source}" for source in unknown_digest_sources)
+    if any(not isinstance(source, str) for source in source_sha256s):
+        errors.append("source_digest_unknown_key_type")
     for source in sorted(REQUIRED_SOURCES):
         digest = source_sha256s.get(source)
         if not isinstance(digest, str) or lifecycle.SHA256.fullmatch(digest) is None:
@@ -196,6 +262,11 @@ def normalized_evidence(bundle: LifecycleObservationBundle) -> dict[str, Any]:
         "observed_sources": sorted(bundle.observed_sources),
         "required_sources": sorted(REQUIRED_SOURCES),
         "source_applicability_schema_version": bundle.source_applicability_schema_version,
+        "source_applicability_profile": (
+            bundle.source_applicability_profile
+            if isinstance(bundle.source_applicability_profile, str)
+            else None
+        ),
         "source_applicability": source_applicability,
         "source_sha256s": source_sha256s,
         "source_errors": list(bundle.source_errors),

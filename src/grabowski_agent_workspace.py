@@ -5116,6 +5116,51 @@ def _existing_workspace_response(
     }
 
 
+def _capture_routing_shadow_prospective_best_effort(
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze proposal-only route eligibility without adding a workspace failure path."""
+    try:
+        import grabowski_operator_routing_shadow_capture as shadow_capture
+
+        result = shadow_capture.capture_workspace_eligibility_best_effort(manifest)
+    except Exception:
+        result = {
+            "schema_version": 1,
+            "status": "error",
+            "reason_code": "hook_import_or_capture_error",
+            "prospective_eligibility_id": None,
+            "attempt_id": None,
+            "no_effect": {
+                "proposal_only": True,
+                "routing": False,
+                "policy": False,
+                "queue": False,
+                "merge": False,
+                "runtime": False,
+            },
+        }
+    try:
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "operator-routing-shadow-prospective-freeze",
+                "workspace_id": manifest.get("workspace_id"),
+                "plan_sha256": manifest.get("plan_sha256"),
+                "status": result.get("status"),
+                "reason_code": result.get("reason_code"),
+                "prospective_eligibility_id": result.get(
+                    "prospective_eligibility_id"
+                ),
+                "attempt_id": result.get("attempt_id"),
+                "decision_effect": False,
+            }
+        )
+    except Exception:
+        pass
+    return result
+
+
 @mcp.tool(name="grabowski_agent_workspace_create", annotations=MUTATING)
 def grabowski_agent_workspace_create(
     binding_kind: str,
@@ -5226,6 +5271,7 @@ def grabowski_agent_workspace_create(
         evidence={"plan_sha256": plan_sha256, "binding": manifest["binding"]},
     )
     _write_manifest(manifest)
+    _capture_routing_shadow_prospective_best_effort(_manifest(workspace_id))
     writer_task_argv = _writer_task_argv(manifest)
     writer_task_argv_sha256 = _task_argv_sha256(writer_task_argv)
     try:

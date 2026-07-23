@@ -1211,8 +1211,13 @@ def _task_archive_classification(
     required_sources = lifecycle_evidence.REQUIRED_SOURCES
     observed_sources = frozenset({"task", "lease", "process", "receipt"})
     source_applicability = {
-        source: ("observed" if source in observed_sources else "not_applicable")
-        for source in sorted(required_sources)
+        "task": "observed",
+        "workspace": "not_applicable",
+        "lease": "explicit_absence",
+        "checkout": "not_applicable",
+        "process": "explicit_absence",
+        "tmux": "not_applicable",
+        "receipt": "observed",
     }
     source_sha256s = {
         source: _sha256_json(sources[source])
@@ -1225,6 +1230,9 @@ def _task_archive_classification(
             observed_sources=observed_sources,
             source_sha256s=source_sha256s,
             source_applicability=source_applicability,
+            source_applicability_profile=(
+                lifecycle_evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+            ),
             state=str(record["state"]),
             archived=archived,
             dirty=False,
