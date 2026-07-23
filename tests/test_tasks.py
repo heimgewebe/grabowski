@@ -3026,7 +3026,12 @@ else:
             first = tasks.grabowski_chronik_outbox_import(str(self.source))
             second = tasks.grabowski_chronik_outbox_import(str(self.source))
         self.assertTrue(first["available"])
-        self.assertTrue(first["imported"])
+        self.assertTrue(first["import_succeeded"])
+        self.assertEqual(1, first["imported_event_count"])
+        self.assertEqual(0, first["skipped_existing_event_count"])
+        self.assertTrue(second["import_succeeded"])
+        self.assertEqual(0, second["imported_event_count"])
+        self.assertEqual(1, second["skipped_existing_event_count"])
         self.assertEqual(1, first["chronik_result"]["imported"])
         self.assertEqual(0, second["chronik_result"]["imported"])
         self.assertEqual(1, second["chronik_result"]["skipped_existing"])
@@ -3049,9 +3054,64 @@ else:
         ):
             result = tasks.grabowski_chronik_outbox_import(str(self.source))
         self.assertFalse(result["available"])
-        self.assertFalse(result["imported"])
+        self.assertFalse(result["import_succeeded"])
         self.assertTrue(result["outcome_unknown"])
         self.assertIn("receipt digest", result["failure"]["contract_error"])
+    def test_outbox_import_executes_exact_validated_snapshot(self) -> None:
+        original_event = json.loads(self.source.read_text(encoding="utf-8"))
+        replacement_event = json.loads(json.dumps(original_event))
+        replacement_event["data"]["operation"] = "review"
+        replacement_event["event_id"] = tasks.chronik.event_id(replacement_event)
+        original_run = tasks._chronik_cli_run
+
+        def swap_source(arguments):
+            self.source.write_bytes(
+                tasks.chronik._canonical_bytes(replacement_event) + b"\n"
+            )
+            return original_run(arguments)
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_chronik_cli_run", side_effect=swap_source),
+        ):
+            result = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertFalse(result["import_succeeded"])
+        self.assertTrue(result["outcome_unknown"])
+        ledger_events = json.loads(
+            (self.data_dir / "events.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            [original_event["event_id"]],
+            [event["event_id"] for event in ledger_events],
+        )
+
+    def test_outbox_import_projects_cli_receipt(self) -> None:
+        original_run = tasks._chronik_cli_run
+
+        def add_opaque_field(arguments):
+            configuration, execution = original_run(arguments)
+            assert execution is not None
+            payload = json.loads(execution["stdout"])
+            payload["opaque_secret"] = "must-not-escape"
+            unsigned = dict(payload)
+            unsigned.pop("receipt_sha256", None)
+            payload["receipt_sha256"] = tasks._sha256_json(unsigned)
+            execution = dict(execution)
+            execution["stdout"] = json.dumps(payload)
+            return configuration, execution
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_chronik_cli_run", side_effect=add_opaque_field),
+        ):
+            result = tasks.grabowski_chronik_outbox_import(str(self.source))
+        self.assertTrue(result["import_succeeded"])
+        self.assertNotIn("opaque_secret", json.dumps(result))
+        self.assertRegex(
+            result["chronik_result"]["cli_receipt_sha256"], r"[0-9a-f]{64}\Z"
+        )
 
     def test_outbox_import_rejects_noncanonical_state_root(self) -> None:
         foreign = self.root / "foreign" / "chronik-outbox" / self.source.name
@@ -3087,6 +3147,28 @@ else:
             self.assertIn(claim, result["does_not_establish"])
             self.assertIn(claim, result["history"]["does_not_establish"])
         self.assertRegex(result["result_sha256"], r"[0-9a-f]{64}\Z")
+
+    def test_history_projects_cli_result_without_opaque_fields(self) -> None:
+        original_run = tasks._chronik_cli_run
+
+        def add_opaque_field(arguments):
+            configuration, execution = original_run(arguments)
+            assert execution is not None
+            payload = json.loads(execution["stdout"])
+            payload["opaque_secret"] = "must-not-escape"
+            execution = dict(execution)
+            execution["stdout"] = json.dumps(payload)
+            return configuration, execution
+
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks, "_chronik_cli_run", side_effect=add_opaque_field),
+        ):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", operation="implement", limit=1
+            )
+        self.assertTrue(result["available"])
+        self.assertNotIn("opaque_secret", json.dumps(result))
 
     def test_history_rejects_unredacted_event_without_exposure(self) -> None:
         with patch.object(tasks.operator, "_require_operator_capability"):
@@ -3183,7 +3265,7 @@ else:
         ):
             result = tasks.grabowski_chronik_outbox_import(str(self.source))
         self.assertFalse(result["available"])
-        self.assertFalse(result["imported"])
+        self.assertFalse(result["import_succeeded"])
         self.assertTrue(result["outcome_unknown"])
         self.assertIn("stale", result["failure"]["contract_error"])
 
@@ -3195,7 +3277,7 @@ else:
         ):
             imported = tasks.grabowski_chronik_outbox_import(str(self.source))
         self.assertFalse(imported["available"])
-        self.assertFalse(imported["imported"])
+        self.assertFalse(imported["import_succeeded"])
         self.assertEqual(
             "chronik_coding_memory_cli_unavailable", imported["failure"]["code"]
         )
@@ -3206,7 +3288,7 @@ else:
         ):
             failed_import = tasks.grabowski_chronik_outbox_import(str(self.source))
         self.assertFalse(failed_import["available"])
-        self.assertFalse(failed_import["imported"])
+        self.assertFalse(failed_import["import_succeeded"])
         self.assertTrue(failed_import["outcome_unknown"])
         self.assertTrue(failed_import["source_unchanged"])
         with patch.object(tasks.operator, "_require_operator_capability"):

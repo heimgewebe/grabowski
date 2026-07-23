@@ -4118,23 +4118,40 @@ def _validate_chronik_import_result(
     if payload.get("historical_only") is not True:
         raise ValueError("Chronik coding-memory import is not historical-only")
     claims = payload.get("does_not_establish")
-    if not isinstance(claims, list) or not set(
-        chronik.CODING_MEMORY_DOES_NOT_ESTABLISH
-    ).issubset(claims):
+    if (
+        not isinstance(claims, list)
+        or not all(isinstance(claim, str) for claim in claims)
+        or not set(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH).issubset(claims)
+    ):
         raise ValueError("Chronik coding-memory import truth exclusions are incomplete")
     if not _chronik_unsigned_receipt_valid(payload):
         raise ValueError("Chronik coding-memory import receipt digest is invalid")
-    return payload
+    return {
+        "schema_version": payload["schema_version"],
+        "domain": payload["domain"],
+        "event_ids": list(payload["event_ids"]),
+        "requested": requested,
+        "imported": imported,
+        "skipped_existing": skipped,
+        "source_sha256": payload["source_sha256"],
+        "historical_only": True,
+        "does_not_establish": sorted(set(claims)),
+        "cli_receipt_sha256": payload["receipt_sha256"],
+    }
 
 
 @mcp.tool(name="grabowski_chronik_outbox_import", annotations=MUTATING)
 def grabowski_chronik_outbox_import(path: str) -> dict[str, Any]:
     """Import one redacted Grabowski outbox JSONL into optional local Chronik."""
     operator._require_operator_mutation("durable_job")
-    source = chronik.inspect_coding_memory_source(path)
-    configuration, execution = _chronik_cli_run(["import", source["path"]])
+    source, source_bytes = chronik.read_coding_memory_source(path)
+    with tempfile.TemporaryDirectory(prefix="grabowski-chronik-import-") as temporary:
+        snapshot = Path(temporary) / Path(source["path"]).name
+        snapshot.write_bytes(source_bytes)
+        snapshot.chmod(0o400)
+        configuration, execution = _chronik_cli_run(["import", str(snapshot)])
     base_payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "grabowski_chronik_outbox_import_receipt",
         "source": {
             key: source[key]
@@ -4142,7 +4159,9 @@ def grabowski_chronik_outbox_import(path: str) -> dict[str, Any]:
         },
         "cli_present": bool(configuration["available"]),
         "available": False,
-        "imported": False,
+        "import_succeeded": False,
+        "imported_event_count": 0,
+        "skipped_existing_event_count": 0,
         "idempotent_import_contract": True,
         "source_unchanged": True,
         "outcome_unknown": False,
@@ -4191,7 +4210,11 @@ def grabowski_chronik_outbox_import(path: str) -> dict[str, Any]:
             payload = {
                 **base_payload,
                 "available": source_unchanged,
-                "imported": source_unchanged,
+                "import_succeeded": source_unchanged,
+                "imported_event_count": cli_result["imported"] if source_unchanged else 0,
+                "skipped_existing_event_count": (
+                    cli_result["skipped_existing"] if source_unchanged else 0
+                ),
                 "source_unchanged": source_unchanged,
                 "outcome_unknown": not source_unchanged,
                 "chronik_result": cli_result if source_unchanged else None,
@@ -4211,7 +4234,9 @@ def grabowski_chronik_outbox_import(path: str) -> dict[str, Any]:
             "source_sha256": source["sha256"],
             "source_event_count": source["event_count"],
             "available": receipt["available"],
-            "imported": receipt["imported"],
+            "import_succeeded": receipt["import_succeeded"],
+            "imported_event_count": receipt["imported_event_count"],
+            "skipped_existing_event_count": receipt["skipped_existing_event_count"],
             "outcome_unknown": receipt["outcome_unknown"],
             "receipt_sha256": receipt["receipt_sha256"],
         }
@@ -4356,13 +4381,16 @@ def grabowski_chronik_history(
             }
         else:
             events = raw_events[:limit]
-            history = dict(history)
-            history["events"] = events
-            history["event_ids"] = raw_event_ids[:limit]
-            history["historical_only"] = True
-            history["does_not_establish"] = sorted(
-                set(raw_claims) | set(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH)
-            )
+            history = {
+                "schema_version": "chronik-coding-history.v1",
+                "query": dict(query),
+                "events": events,
+                "event_ids": raw_event_ids[:limit],
+                "historical_only": True,
+                "does_not_establish": sorted(
+                    set(raw_claims) | set(chronik.CODING_MEMORY_DOES_NOT_ESTABLISH)
+                ),
+            }
             payload = {
                 **base_payload,
                 "available": True,
