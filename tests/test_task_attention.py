@@ -620,9 +620,18 @@ class TaskAttentionTests(unittest.TestCase):
             )
             self.assertNotIn(source, evidence_snapshot["observed_sources"])
             self.assertIn(source, evidence_snapshot["source_sha256s"])
-        for source in ("task", "lease", "process", "receipt"):
+        self.assertEqual(
+            "task_archive.v1",
+            evidence_snapshot["source_applicability_profile"],
+        )
+        for source in ("task", "receipt"):
             self.assertEqual(
                 "observed",
+                evidence_snapshot["source_applicability"][source],
+            )
+        for source in ("lease", "process"):
+            self.assertEqual(
+                "explicit_absence",
                 evidence_snapshot["source_applicability"][source],
             )
 

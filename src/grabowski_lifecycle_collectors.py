@@ -770,6 +770,9 @@ def collect_lifecycle_classification(request: LifecycleCollectorRequest) -> dict
         observed_sources=frozenset(observed_sources),
         source_sha256s=source_sha256s,
         source_applicability=source_applicability,
+        source_applicability_profile=(
+            lifecycle_evidence.SOURCE_APPLICABILITY_PROFILE_FULL_READBACK_V1
+        ),
         source_errors=tuple(sorted(set(source_errors))),
         **facts,
     )

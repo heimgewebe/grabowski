@@ -12,6 +12,11 @@ import grabowski_lifecycle_evidence as lifecycle_evidence
 
 
 SCHEMA_VERSION = 1
+LEGACY_EFFECT_PLAN_SCHEMA_VERSION = 1
+EFFECT_PLAN_SCHEMA_VERSION = 2
+SUPPORTED_EFFECT_PLAN_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_EFFECT_PLAN_SCHEMA_VERSION, EFFECT_PLAN_SCHEMA_VERSION}
+)
 EFFECT_KINDS = frozenset(
     {
         "task_archive",
@@ -45,7 +50,19 @@ PLAN_KEYS = frozenset(
         "plan_sha256",
     }
 )
-PLAN_ENTRY_KEYS = frozenset(
+ENTRY_CONTRACT_LEGACY_V1 = "legacy_v1"
+ENTRY_CONTRACT_APPLICABILITY_V1 = "applicability_v1"
+ENTRY_CONTRACT_PROFILED_V2 = "profiled_v2"
+PLAN_ENTRY_KEYS_V1 = frozenset(
+    {
+        "identity",
+        "lifecycle_kind",
+        "classification",
+        "evidence_sha256",
+        "source_sha256s",
+    }
+)
+PLAN_ENTRY_KEYS_V1_APPLICABILITY = frozenset(
     {
         "identity",
         "lifecycle_kind",
@@ -56,6 +73,40 @@ PLAN_ENTRY_KEYS = frozenset(
         "source_sha256s",
     }
 )
+PLAN_ENTRY_KEYS_V2 = frozenset(
+    {
+        "identity",
+        "lifecycle_kind",
+        "classification",
+        "evidence_sha256",
+        "source_applicability_schema_version",
+        "source_applicability_profile",
+        "source_applicability",
+        "source_sha256s",
+    }
+)
+PLAN_ENTRY_KEYS = PLAN_ENTRY_KEYS_V2
+
+
+def _entry_contract_for_keys(
+    keys: set[str] | frozenset[str],
+    *,
+    plan_schema_version: int,
+) -> str:
+    if plan_schema_version == LEGACY_EFFECT_PLAN_SCHEMA_VERSION:
+        if keys == PLAN_ENTRY_KEYS_V1:
+            return ENTRY_CONTRACT_LEGACY_V1
+        if keys == PLAN_ENTRY_KEYS_V1_APPLICABILITY:
+            return ENTRY_CONTRACT_APPLICABILITY_V1
+        raise LifecycleEffectPlanIntegrityError(
+            "effect plan entry fields are not exact"
+        )
+    if plan_schema_version == EFFECT_PLAN_SCHEMA_VERSION and keys == PLAN_ENTRY_KEYS_V2:
+        return ENTRY_CONTRACT_PROFILED_V2
+    raise LifecycleEffectPlanIntegrityError(
+        "effect plan entry fields are not exact"
+    )
+
 REVALIDATION_DOES_NOT_ESTABLISH = [
     "effect_execution",
     "physical_deletion_authority",
@@ -199,13 +250,17 @@ def _expected_classification(effect_kind: str) -> str:
 
 
 def _normalize_source_sha256s(value: Any, *, label: str) -> dict[str, str]:
-    if not isinstance(value, Mapping) or not value:
-        raise ValueError(f"{label} must be a non-empty source digest mapping")
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a source digest mapping")
+    if set(value) != lifecycle_evidence.REQUIRED_SOURCES:
+        raise ValueError(f"{label} must bind exactly the required lifecycle sources")
     normalized: dict[str, str] = {}
-    for source, digest in value.items():
-        key = _validate_string(source, label=f"{label}.source")
-        normalized[key] = _validate_sha256(digest, label=f"{label}.{key}")
-    return dict(sorted(normalized.items()))
+    for source in sorted(lifecycle_evidence.REQUIRED_SOURCES):
+        normalized[source] = _validate_sha256(
+            value[source],
+            label=f"{label}.{source}",
+        )
+    return normalized
 
 
 def _normalize_source_applicability(value: Any, *, label: str) -> dict[str, str]:
@@ -216,10 +271,30 @@ def _normalize_source_applicability(value: Any, *, label: str) -> dict[str, str]
     normalized: dict[str, str] = {}
     for source in sorted(lifecycle_evidence.REQUIRED_SOURCES):
         state = value[source]
-        if state not in lifecycle_evidence.SOURCE_APPLICABILITY_STATES:
+        if (
+            not isinstance(state, str)
+            or state not in lifecycle_evidence.SOURCE_APPLICABILITY_STATES
+        ):
             raise ValueError(f"{label}.{source} has invalid applicability")
         normalized[source] = state
     return normalized
+
+
+def _normalize_source_applicability_profile(
+    value: Any,
+    *,
+    lifecycle_kind: str,
+    label: str,
+) -> str:
+    profile = _validate_string(value, label=label)
+    try:
+        lifecycle_evidence.source_applicability_profile_policy(
+            profile,
+            kind=lifecycle_kind,
+        )
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a canonical applicability profile") from exc
+    return profile
 
 
 def _reclassify_evidence_snapshot(evidence: Mapping[str, Any]) -> dict[str, Any]:
@@ -230,6 +305,7 @@ def _reclassify_evidence_snapshot(evidence: Mapping[str, Any]) -> dict[str, Any]
             observed_sources=frozenset(evidence["observed_sources"]),
             source_sha256s=evidence["source_sha256s"],
             source_applicability=evidence["source_applicability"],
+            source_applicability_profile=evidence["source_applicability_profile"],
             source_applicability_schema_version=evidence[
                 "source_applicability_schema_version"
             ],
@@ -262,11 +338,77 @@ def _reclassify_evidence_snapshot(evidence: Mapping[str, Any]) -> dict[str, Any]
     return reclassified
 
 
+def _legacy_v1_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    legacy = {
+        key: value
+        for key, value in evidence.items()
+        if key
+        not in {
+            "evidence_sha256",
+            "source_applicability_schema_version",
+            "source_applicability_profile",
+            "source_applicability",
+        }
+    }
+    legacy["schema_version"] = 1
+    if (
+        evidence.get("source_applicability_profile")
+        == lifecycle_evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+    ):
+        # Before applicability typing, task archive represented its three
+        # non-mutated runtime sources as synthetic observed readbacks. Rebuild
+        # that exact pre-T093 v1 evidence shape.
+        legacy["observed_sources"] = sorted(lifecycle_evidence.REQUIRED_SOURCES)
+    return legacy
+
+
+def _legacy_v1_evidence_sha256(evidence: Mapping[str, Any]) -> str:
+    return sha256_json(_legacy_v1_evidence(evidence))
+
+
+def _transitional_v1_applicability(
+    evidence: Mapping[str, Any],
+) -> dict[str, str]:
+    applicability = _normalize_source_applicability(
+        evidence.get("source_applicability"),
+        label="classification.evidence.source_applicability",
+    )
+    if (
+        evidence.get("source_applicability_profile")
+        == lifecycle_evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+    ):
+        # T093's first live v1 contract distinguished N/A sources but still used
+        # "observed" for lease/process readbacks that proved absence. Preserve
+        # that historical encoding when revalidating its persisted plans.
+        applicability = dict(applicability)
+        applicability["lease"] = "observed"
+        applicability["process"] = "observed"
+    return applicability
+
+
+def _transitional_v1_evidence(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    transitional = {
+        key: value
+        for key, value in evidence.items()
+        if key not in {"evidence_sha256", "source_applicability_profile"}
+    }
+    transitional["schema_version"] = 1
+    transitional["source_applicability"] = _transitional_v1_applicability(evidence)
+    return transitional
+
+
 def _normalize_classification(
     raw: Mapping[str, Any],
     *,
     effect_kind: str,
+    entry_contract: str = ENTRY_CONTRACT_PROFILED_V2,
 ) -> dict[str, Any]:
+    if entry_contract not in {
+        ENTRY_CONTRACT_LEGACY_V1,
+        ENTRY_CONTRACT_APPLICABILITY_V1,
+        ENTRY_CONTRACT_PROFILED_V2,
+    }:
+        raise ValueError("unsupported effect plan entry contract")
     evidence = raw.get("evidence")
     if not isinstance(evidence, Mapping):
         raise ValueError("classification.evidence must be an object")
@@ -312,6 +454,31 @@ def _normalize_classification(
         raise LifecycleEffectPlanError(
             f"{identity} has unresolved evidence normalization errors"
         )
+    source_sha256s = _normalize_source_sha256s(
+        evidence.get("source_sha256s"),
+        label=f"classification[{identity}].evidence.source_sha256s",
+    )
+    if entry_contract == ENTRY_CONTRACT_LEGACY_V1:
+        return {
+            "identity": identity,
+            "lifecycle_kind": lifecycle_kind,
+            "classification": classification,
+            "evidence_sha256": _legacy_v1_evidence_sha256(evidence),
+            "source_sha256s": source_sha256s,
+        }
+    if entry_contract == ENTRY_CONTRACT_APPLICABILITY_V1:
+        return {
+            "identity": identity,
+            "lifecycle_kind": lifecycle_kind,
+            "classification": classification,
+            "evidence_sha256": sha256_json(_transitional_v1_evidence(evidence)),
+            "source_applicability_schema_version": (
+                lifecycle_evidence.SOURCE_APPLICABILITY_SCHEMA_VERSION
+            ),
+            "source_applicability": _transitional_v1_applicability(evidence),
+            "source_sha256s": source_sha256s,
+        }
+
     evidence_sha256 = _validate_sha256(
         reclassified.get("evidence_sha256"),
         label=f"classification[{identity}].evidence_sha256",
@@ -320,19 +487,22 @@ def _normalize_classification(
         "source_applicability_schema_version"
     )
     if (
-        source_applicability_schema_version
+        isinstance(source_applicability_schema_version, bool)
+        or not isinstance(source_applicability_schema_version, int)
+        or source_applicability_schema_version
         != lifecycle_evidence.SOURCE_APPLICABILITY_SCHEMA_VERSION
     ):
         raise ValueError(
             f"classification[{identity}].evidence source applicability schema is unsupported"
         )
+    source_applicability_profile = _normalize_source_applicability_profile(
+        evidence.get("source_applicability_profile"),
+        lifecycle_kind=lifecycle_kind,
+        label=f"classification[{identity}].evidence.source_applicability_profile",
+    )
     source_applicability = _normalize_source_applicability(
         evidence.get("source_applicability"),
         label=f"classification[{identity}].evidence.source_applicability",
-    )
-    source_sha256s = _normalize_source_sha256s(
-        evidence.get("source_sha256s"),
-        label=f"classification[{identity}].evidence.source_sha256s",
     )
     return {
         "identity": identity,
@@ -340,6 +510,7 @@ def _normalize_classification(
         "classification": classification,
         "evidence_sha256": evidence_sha256,
         "source_applicability_schema_version": source_applicability_schema_version,
+        "source_applicability_profile": source_applicability_profile,
         "source_applicability": source_applicability,
         "source_sha256s": source_sha256s,
     }
@@ -360,7 +531,11 @@ def build_effect_plan(
         raise ValueError("created_at_unix must be an integer")
     resources = _normalize_resource_keys(required_resource_keys)
     entries = [
-        _normalize_classification(raw, effect_kind=effect_kind)
+        _normalize_classification(
+            raw,
+            effect_kind=effect_kind,
+            entry_contract=ENTRY_CONTRACT_PROFILED_V2,
+        )
         for raw in classifications
     ]
     if not entries:
@@ -371,7 +546,7 @@ def build_effect_plan(
         raise ValueError("classifications must not contain duplicate identities")
 
     body = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": EFFECT_PLAN_SCHEMA_VERSION,
         "kind": "grabowski_lifecycle_effect_plan",
         "effect_kind": effect_kind,
         "created_at_unix": created_at_unix,
@@ -394,7 +569,12 @@ def _validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     body = {key: item for key, item in value.items() if key != "plan_sha256"}
     if sha256_json(body) != expected_digest:
         raise LifecycleEffectPlanIntegrityError("effect plan digest mismatch")
-    if body.get("schema_version") != SCHEMA_VERSION:
+    plan_schema_version = body.get("schema_version")
+    if (
+        isinstance(plan_schema_version, bool)
+        or not isinstance(plan_schema_version, int)
+        or plan_schema_version not in SUPPORTED_EFFECT_PLAN_SCHEMA_VERSIONS
+    ):
         raise LifecycleEffectPlanIntegrityError("unsupported effect plan schema")
     if body.get("kind") != "grabowski_lifecycle_effect_plan":
         raise LifecycleEffectPlanIntegrityError("effect plan kind mismatch")
@@ -428,12 +608,19 @@ def _validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(entries, list) or not entries:
         raise LifecycleEffectPlanIntegrityError("effect plan entries are missing")
     normalized_entries: list[dict[str, Any]] = []
+    plan_entry_contract: str | None = None
     for raw in entries:
         if not isinstance(raw, Mapping):
             raise LifecycleEffectPlanIntegrityError("effect plan entry is invalid")
-        if set(raw) != PLAN_ENTRY_KEYS:
+        entry_contract = _entry_contract_for_keys(
+            set(raw),
+            plan_schema_version=plan_schema_version,
+        )
+        if plan_entry_contract is None:
+            plan_entry_contract = entry_contract
+        elif entry_contract != plan_entry_contract:
             raise LifecycleEffectPlanIntegrityError(
-                "effect plan entry fields are not exact"
+                "effect plan may not mix entry contracts"
             )
         identity = _validate_string(raw.get("identity"), label="plan.entry.identity")
         lifecycle_kind = _validate_string(
@@ -447,32 +634,50 @@ def _validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         evidence_sha256 = _validate_sha256(
             raw.get("evidence_sha256"), label=f"plan.entry[{identity}].evidence_sha256"
         )
-        source_applicability_schema_version = raw.get(
-            "source_applicability_schema_version"
-        )
-        if (
-            source_applicability_schema_version
-            != lifecycle_evidence.SOURCE_APPLICABILITY_SCHEMA_VERSION
-        ):
-            raise LifecycleEffectPlanIntegrityError(
-                f"effect plan entry source applicability schema drift for {identity}"
-            )
-        source_applicability = _normalize_source_applicability(
-            raw.get("source_applicability"),
-            label=f"plan.entry[{identity}].source_applicability",
-        )
         source_sha256s = _normalize_source_sha256s(
             raw.get("source_sha256s"), label=f"plan.entry[{identity}].source_sha256s"
         )
-        normalized_entry = {
+        normalized_entry: dict[str, Any] = {
             "identity": identity,
             "lifecycle_kind": lifecycle_kind,
             "classification": classification,
             "evidence_sha256": evidence_sha256,
-            "source_applicability_schema_version": source_applicability_schema_version,
-            "source_applicability": source_applicability,
-            "source_sha256s": source_sha256s,
         }
+        if entry_contract in {
+            ENTRY_CONTRACT_APPLICABILITY_V1,
+            ENTRY_CONTRACT_PROFILED_V2,
+        }:
+            source_applicability_schema_version = raw.get(
+                "source_applicability_schema_version"
+            )
+            if (
+                isinstance(source_applicability_schema_version, bool)
+                or not isinstance(source_applicability_schema_version, int)
+                or source_applicability_schema_version
+                != lifecycle_evidence.SOURCE_APPLICABILITY_SCHEMA_VERSION
+            ):
+                raise LifecycleEffectPlanIntegrityError(
+                    f"effect plan entry source applicability schema drift for {identity}"
+                )
+            source_applicability = _normalize_source_applicability(
+                raw.get("source_applicability"),
+                label=f"plan.entry[{identity}].source_applicability",
+            )
+            normalized_entry["source_applicability_schema_version"] = (
+                source_applicability_schema_version
+            )
+            if entry_contract == ENTRY_CONTRACT_PROFILED_V2:
+                normalized_entry["source_applicability_profile"] = (
+                    _normalize_source_applicability_profile(
+                        raw.get("source_applicability_profile"),
+                        lifecycle_kind=lifecycle_kind,
+                        label=(
+                            f"plan.entry[{identity}].source_applicability_profile"
+                        ),
+                    )
+                )
+            normalized_entry["source_applicability"] = source_applicability
+        normalized_entry["source_sha256s"] = source_sha256s
         if normalized_entry != dict(raw):
             raise LifecycleEffectPlanIntegrityError(
                 f"effect plan entry is not canonical for {identity}"
@@ -608,7 +813,15 @@ def revalidate_effect_plan(
             errors.append(f"current_classification_missing:{identity}")
             continue
         try:
-            normalized = _normalize_classification(current, effect_kind=effect_kind)
+            entry_contract = _entry_contract_for_keys(
+                set(expected),
+                plan_schema_version=value["schema_version"],
+            )
+            normalized = _normalize_classification(
+                current,
+                effect_kind=effect_kind,
+                entry_contract=entry_contract,
+            )
         except (ValueError, LifecycleEffectPlanError) as exc:
             errors.append(f"current_classification_invalid:{identity}:{type(exc).__name__}")
             continue
@@ -619,13 +832,22 @@ def revalidate_effect_plan(
             errors.append(f"classification_drift:{identity}")
         if normalized["evidence_sha256"] != expected["evidence_sha256"]:
             errors.append(f"evidence_drift:{identity}")
-        if (
-            normalized["source_applicability_schema_version"]
-            != expected["source_applicability_schema_version"]
+        if entry_contract in {
+            ENTRY_CONTRACT_APPLICABILITY_V1,
+            ENTRY_CONTRACT_PROFILED_V2,
+        }:
+            if (
+                normalized["source_applicability_schema_version"]
+                != expected["source_applicability_schema_version"]
+            ):
+                errors.append(f"source_applicability_schema_drift:{identity}")
+            if normalized["source_applicability"] != expected["source_applicability"]:
+                errors.append(f"source_applicability_drift:{identity}")
+        if entry_contract == ENTRY_CONTRACT_PROFILED_V2 and (
+            normalized["source_applicability_profile"]
+            != expected["source_applicability_profile"]
         ):
-            errors.append(f"source_applicability_schema_drift:{identity}")
-        if normalized["source_applicability"] != expected["source_applicability"]:
-            errors.append(f"source_applicability_drift:{identity}")
+            errors.append(f"source_applicability_profile_drift:{identity}")
         if normalized["source_sha256s"] != expected["source_sha256s"]:
             errors.append(f"source_digest_drift:{identity}")
 
@@ -891,18 +1113,30 @@ def _normalize_recovery_refs(values: Iterable[str]) -> list[str]:
 
 
 def _source_bindings_sha256(plan: Mapping[str, Any]) -> str:
-    bindings = [
-        {
+    bindings: list[dict[str, Any]] = []
+    for entry in plan["entries"]:
+        contract = _entry_contract_for_keys(
+            set(entry),
+            plan_schema_version=int(plan["schema_version"]),
+        )
+        binding = {
             "identity": entry["identity"],
             "evidence_sha256": entry["evidence_sha256"],
-            "source_applicability_schema_version": entry[
-                "source_applicability_schema_version"
-            ],
-            "source_applicability": entry["source_applicability"],
-            "source_sha256s": entry["source_sha256s"],
         }
-        for entry in plan["entries"]
-    ]
+        if contract in {
+            ENTRY_CONTRACT_APPLICABILITY_V1,
+            ENTRY_CONTRACT_PROFILED_V2,
+        }:
+            binding["source_applicability_schema_version"] = entry[
+                "source_applicability_schema_version"
+            ]
+            if contract == ENTRY_CONTRACT_PROFILED_V2:
+                binding["source_applicability_profile"] = entry[
+                    "source_applicability_profile"
+                ]
+            binding["source_applicability"] = entry["source_applicability"]
+        binding["source_sha256s"] = entry["source_sha256s"]
+        bindings.append(binding)
     return sha256_json(bindings)
 
 

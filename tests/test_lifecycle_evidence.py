@@ -71,21 +71,100 @@ class LifecycleEvidenceAggregationTests(unittest.TestCase):
         self.assertIn("checkout", result["evidence"]["source_sha256s"])
 
     def test_not_applicable_is_bound_without_fake_observation(self) -> None:
-        applicability = {source: "observed" for source in ALL_SOURCES}
-        applicability["workspace"] = "not_applicable"
+        observed = frozenset({"task", "lease", "process", "receipt"})
+        applicability = {
+            "task": "observed",
+            "workspace": "not_applicable",
+            "lease": "explicit_absence",
+            "checkout": "not_applicable",
+            "process": "explicit_absence",
+            "tmux": "not_applicable",
+            "receipt": "observed",
+        }
         result = evidence.classify_observation_bundle(
             self.bundle(
-                observed_sources=ALL_SOURCES - {"workspace"},
+                observed_sources=observed,
                 source_applicability=applicability,
+                source_applicability_profile=(
+                    evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+                ),
             )
         )
         self.assertEqual(result["classification"], "terminal_archivable")
-        self.assertEqual(
-            result["evidence"]["source_applicability"]["workspace"],
-            "not_applicable",
+        for source in ("workspace", "checkout", "tmux"):
+            self.assertEqual(
+                result["evidence"]["source_applicability"][source],
+                "not_applicable",
+            )
+            self.assertNotIn(source, result["evidence"]["observed_sources"])
+            self.assertIn(source, result["evidence"]["source_sha256s"])
+
+    def test_full_readback_profile_rejects_not_applicable_bypass(self) -> None:
+        result = evidence.classify_observation_bundle(
+            self.bundle(
+                observed_sources=frozenset(),
+                source_applicability={
+                    source: "not_applicable" for source in ALL_SOURCES
+                },
+            )
         )
-        self.assertNotIn("workspace", result["evidence"]["observed_sources"])
-        self.assertIn("workspace", result["evidence"]["source_sha256s"])
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_applicability_profile_mismatch:task:expected_readback",
+            result["reason_codes"],
+        )
+
+    def test_task_archive_profile_rejects_wrong_not_applicable_source(self) -> None:
+        applicability = {
+            "task": "not_applicable",
+            "workspace": "not_applicable",
+            "lease": "explicit_absence",
+            "checkout": "not_applicable",
+            "process": "explicit_absence",
+            "tmux": "not_applicable",
+            "receipt": "observed",
+        }
+        result = evidence.classify_observation_bundle(
+            self.bundle(
+                observed_sources=frozenset({"lease", "process", "receipt"}),
+                source_applicability=applicability,
+                source_applicability_profile=(
+                    evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+                ),
+            )
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_applicability_profile_mismatch:task:expected_readback",
+            result["reason_codes"],
+        )
+
+    def test_unknown_source_applicability_profile_fails_closed(self) -> None:
+        result = evidence.classify_observation_bundle(
+            self.bundle(source_applicability_profile="unknown.v1")
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_applicability_profile_unknown",
+            result["reason_codes"],
+        )
+
+    def test_source_applicability_profile_kind_mismatch_fails_closed(self) -> None:
+        result = evidence.classify_observation_bundle(
+            self.bundle(
+                kind="workspace",
+                state=None,
+                closed=True,
+                source_applicability_profile=(
+                    evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+                ),
+            )
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_applicability_profile_kind_invalid",
+            result["reason_codes"],
+        )
 
     def test_missing_source_applicability_fails_closed(self) -> None:
         applicability = {source: "observed" for source in ALL_SOURCES}
@@ -135,6 +214,18 @@ class LifecycleEvidenceAggregationTests(unittest.TestCase):
             result["reason_codes"],
         )
 
+    def test_non_string_source_applicability_value_fails_closed(self) -> None:
+        applicability = {source: "observed" for source in ALL_SOURCES}
+        applicability["process"] = []
+        result = evidence.classify_observation_bundle(
+            self.bundle(source_applicability=applicability)
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_applicability_invalid:process",
+            result["reason_codes"],
+        )
+
     def test_not_applicable_may_not_claim_active_readback(self) -> None:
         applicability = {source: "observed" for source in ALL_SOURCES}
         applicability["workspace"] = "not_applicable"
@@ -154,6 +245,28 @@ class LifecycleEvidenceAggregationTests(unittest.TestCase):
         self.assertEqual(result["classification"], "ambiguous")
         self.assertIn(
             "observation_error:source_applicability_schema_unsupported",
+            result["reason_codes"],
+        )
+
+    def test_boolean_source_applicability_schema_is_fail_closed(self) -> None:
+        result = evidence.classify_observation_bundle(
+            self.bundle(source_applicability_schema_version=True)
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_applicability_schema_unsupported",
+            result["reason_codes"],
+        )
+
+    def test_non_string_source_digest_key_fails_closed(self) -> None:
+        bindings = dict(SOURCE_SHA256S)
+        bindings[1] = "f" * 64
+        result = evidence.classify_observation_bundle(
+            self.bundle(source_sha256s=bindings)
+        )
+        self.assertEqual(result["classification"], "ambiguous")
+        self.assertIn(
+            "observation_error:source_digest_unknown_key_type",
             result["reason_codes"],
         )
 

@@ -49,6 +49,107 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         values.update(overrides)
         return effect_plan.build_effect_plan(**values)
 
+    def task_archive_classification(self, identity: str = "task-a"):
+        return self.classification(
+            identity=identity,
+            observed_sources=frozenset({"task", "lease", "process", "receipt"}),
+            source_applicability={
+                "task": "observed",
+                "workspace": "not_applicable",
+                "lease": "explicit_absence",
+                "checkout": "not_applicable",
+                "process": "explicit_absence",
+                "tmux": "not_applicable",
+                "receipt": "observed",
+            },
+            source_applicability_profile=(
+                evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+            ),
+        )
+
+    def legacy_v1_plan(self, classification=None):
+        current = classification or self.classification()
+        snapshot = current["evidence"]
+        legacy_evidence = {
+            key: value
+            for key, value in snapshot.items()
+            if key
+            not in {
+                "evidence_sha256",
+                "source_applicability_schema_version",
+                "source_applicability_profile",
+                "source_applicability",
+            }
+        }
+        legacy_evidence["schema_version"] = 1
+        if (
+            snapshot["source_applicability_profile"]
+            == evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+        ):
+            legacy_evidence["observed_sources"] = sorted(ALL_SOURCES)
+        entry = {
+            "identity": current["identity"],
+            "lifecycle_kind": current["kind"],
+            "classification": current["classification"],
+            "evidence_sha256": effect_plan.sha256_json(legacy_evidence),
+            "source_sha256s": snapshot["source_sha256s"],
+        }
+        body = {
+            "schema_version": 1,
+            "kind": "grabowski_lifecycle_effect_plan",
+            "effect_kind": "task_archive",
+            "created_at_unix": 1000,
+            "lease_owner_id": OWNER,
+            "required_resource_keys": sorted(RESOURCE_KEYS),
+            "entries": [entry],
+            "mutation_performed": False,
+            "requires_immediate_revalidation": True,
+            "does_not_establish": list(effect_plan.PLAN_DOES_NOT_ESTABLISH),
+        }
+        return {**body, "plan_sha256": effect_plan.sha256_json(body)}
+
+    def transitional_v1_plan(self, classification=None):
+        current = classification or self.task_archive_classification()
+        snapshot = current["evidence"]
+        transitional_applicability = dict(snapshot["source_applicability"])
+        if (
+            snapshot["source_applicability_profile"]
+            == evidence.SOURCE_APPLICABILITY_PROFILE_TASK_ARCHIVE_V1
+        ):
+            transitional_applicability["lease"] = "observed"
+            transitional_applicability["process"] = "observed"
+        transitional_evidence = {
+            key: value
+            for key, value in snapshot.items()
+            if key not in {"evidence_sha256", "source_applicability_profile"}
+        }
+        transitional_evidence["schema_version"] = 1
+        transitional_evidence["source_applicability"] = transitional_applicability
+        entry = {
+            "identity": current["identity"],
+            "lifecycle_kind": current["kind"],
+            "classification": current["classification"],
+            "evidence_sha256": effect_plan.sha256_json(transitional_evidence),
+            "source_applicability_schema_version": (
+                snapshot["source_applicability_schema_version"]
+            ),
+            "source_applicability": transitional_applicability,
+            "source_sha256s": snapshot["source_sha256s"],
+        }
+        body = {
+            "schema_version": 1,
+            "kind": "grabowski_lifecycle_effect_plan",
+            "effect_kind": "task_archive",
+            "created_at_unix": 1000,
+            "lease_owner_id": OWNER,
+            "required_resource_keys": sorted(RESOURCE_KEYS),
+            "entries": [entry],
+            "mutation_performed": False,
+            "requires_immediate_revalidation": True,
+            "does_not_establish": list(effect_plan.PLAN_DOES_NOT_ESTABLISH),
+        }
+        return {**body, "plan_sha256": effect_plan.sha256_json(body)}
+
     def lease(self, resource_key: str, **overrides):
         values = {
             "resource_key": resource_key,
@@ -94,6 +195,7 @@ class LifecycleEffectPlanTests(unittest.TestCase):
     def test_build_plan_binds_evidence_sources_and_resources(self) -> None:
         classification = self.classification()
         plan = self.build_plan([classification])
+        self.assertEqual(plan["schema_version"], effect_plan.EFFECT_PLAN_SCHEMA_VERSION)
         self.assertEqual(plan["effect_kind"], "task_archive")
         self.assertEqual(plan["lease_owner_id"], OWNER)
         self.assertEqual(plan["required_resource_keys"], sorted(RESOURCE_KEYS))
@@ -101,6 +203,10 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         self.assertEqual(
             plan["entries"][0]["source_applicability"],
             classification["evidence"]["source_applicability"],
+        )
+        self.assertEqual(
+            plan["entries"][0]["source_applicability_profile"],
+            classification["evidence"]["source_applicability_profile"],
         )
         self.assertEqual(
             plan["entries"][0]["source_sha256s"],
@@ -301,6 +407,160 @@ class LifecycleEffectPlanTests(unittest.TestCase):
         forged = {**classification, "evidence": snapshot}
         with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
             self.build_plan([forged])
+
+    def test_revalidation_fails_on_source_applicability_profile_drift(self) -> None:
+        original = self.classification()
+        plan = self.build_plan([original])
+        changed = self.task_archive_classification()
+        result = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": changed},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+        self.assertFalse(result["ready_for_effect"])
+        self.assertIn("evidence_drift:task-a", result["errors"])
+        self.assertIn("source_applicability_profile_drift:task-a", result["errors"])
+        self.assertIn("source_applicability_drift:task-a", result["errors"])
+
+    def test_source_digest_mapping_requires_exact_required_sources(self) -> None:
+        missing = dict(SOURCE_SHA256S)
+        missing.pop("process")
+        with self.assertRaises(ValueError):
+            effect_plan._normalize_source_sha256s(missing, label="test")
+        extra = dict(SOURCE_SHA256S)
+        extra["unknown"] = "f" * 64
+        with self.assertRaises(ValueError):
+            effect_plan._normalize_source_sha256s(extra, label="test")
+
+    def test_source_applicability_normalizer_rejects_non_string_state(self) -> None:
+        applicability = {source: "observed" for source in ALL_SOURCES}
+        applicability["process"] = []
+        with self.assertRaises(ValueError):
+            effect_plan._normalize_source_applicability(applicability, label="test")
+
+    def test_legacy_v1_plan_remains_verifiable_and_revalidatable(self) -> None:
+        classification = self.task_archive_classification()
+        plan = self.legacy_v1_plan(classification)
+        self.assertEqual(
+            plan,
+            effect_plan._validate_plan(plan),
+        )
+        result = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": classification},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+        self.assertTrue(result["ready_for_effect"])
+        self.assertEqual([], result["errors"])
+        self.assertEqual(plan["entries"], result["current_bindings"])
+
+    def test_legacy_v1_source_binding_and_receipt_contract_remain_stable(self) -> None:
+        classification = self.task_archive_classification()
+        plan = self.legacy_v1_plan(classification)
+        expected_bindings = effect_plan.sha256_json(
+            [
+                {
+                    "identity": plan["entries"][0]["identity"],
+                    "evidence_sha256": plan["entries"][0]["evidence_sha256"],
+                    "source_sha256s": plan["entries"][0]["source_sha256s"],
+                }
+            ]
+        )
+        self.assertEqual(
+            expected_bindings,
+            effect_plan._source_bindings_sha256(plan),
+        )
+        revalidation = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": classification},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        self.assertEqual(expected_bindings, receipt["source_bindings_sha256"])
+        with tempfile.TemporaryDirectory() as directory:
+            result = effect_plan.write_effect_execution_receipt(
+                receipt,
+                receipt_root=Path(directory),
+                plan=plan,
+                revalidation=revalidation,
+            )
+            self.assertEqual("verified", result["status"])
+
+    def test_transitional_t093_v1_plan_remains_revalidatable(self) -> None:
+        classification = self.task_archive_classification()
+        plan = self.transitional_v1_plan(classification)
+        self.assertEqual(plan, effect_plan._validate_plan(plan))
+        result = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": classification},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+        self.assertTrue(result["ready_for_effect"])
+        self.assertEqual([], result["errors"])
+        self.assertEqual(plan["entries"], result["current_bindings"])
+        self.assertEqual(
+            "observed",
+            result["current_bindings"][0]["source_applicability"]["lease"],
+        )
+        self.assertEqual(
+            "observed",
+            result["current_bindings"][0]["source_applicability"]["process"],
+        )
+
+    def test_transitional_t093_v1_receipt_binding_remains_stable(self) -> None:
+        classification = self.task_archive_classification()
+        plan = self.transitional_v1_plan(classification)
+        entry = plan["entries"][0]
+        expected_bindings = effect_plan.sha256_json(
+            [
+                {
+                    "identity": entry["identity"],
+                    "evidence_sha256": entry["evidence_sha256"],
+                    "source_applicability_schema_version": entry[
+                        "source_applicability_schema_version"
+                    ],
+                    "source_applicability": entry["source_applicability"],
+                    "source_sha256s": entry["source_sha256s"],
+                }
+            ]
+        )
+        self.assertEqual(
+            expected_bindings,
+            effect_plan._source_bindings_sha256(plan),
+        )
+        revalidation = effect_plan.revalidate_effect_plan(
+            plan,
+            {"task-a": classification},
+            self.valid_leases(),
+            now_unix=1500,
+        )
+        receipt = self.build_receipt(plan=plan, revalidation=revalidation)
+        self.assertEqual(expected_bindings, receipt["source_bindings_sha256"])
+        with tempfile.TemporaryDirectory() as directory:
+            result = effect_plan.write_effect_execution_receipt(
+                receipt,
+                receipt_root=Path(directory),
+                plan=plan,
+                revalidation=revalidation,
+            )
+            self.assertEqual("verified", result["status"])
+
+    def test_schema_v1_plan_may_not_mix_legacy_and_transitional_entries(self) -> None:
+        first = self.legacy_v1_plan(self.task_archive_classification("task-a"))
+        second = self.transitional_v1_plan(
+            self.task_archive_classification("task-b")
+        )
+        body = {
+            key: value for key, value in first.items() if key != "plan_sha256"
+        }
+        body["entries"] = [first["entries"][0], second["entries"][0]]
+        mixed = {**body, "plan_sha256": effect_plan.sha256_json(body)}
+        with self.assertRaises(effect_plan.LifecycleEffectPlanIntegrityError):
+            effect_plan._validate_plan(mixed)
 
     def test_revalidation_fails_when_object_becomes_active(self) -> None:
         original = self.classification()
