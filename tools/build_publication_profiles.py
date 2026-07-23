@@ -40,6 +40,7 @@ CORE_TOOLS = {
 }
 OPERATOR_ORIENTATION_TOOLS = {
     "grabowski_runtime_health",
+    "grabowski_audit_projection",
     "grabowski_contract_drift",
     "repoground_bundle_discover",
     "repoground_bundle_status",
