@@ -6463,8 +6463,27 @@ def _repoground_json(path: Path, *, max_bytes: int = 2_000_000) -> dict[str, Any
 def _repoground_validate_repo(repo: str | None) -> str | None:
     if repo is None or repo == "":
         return None
-    if not isinstance(repo, str) or not _REPOGROUND_REPO_RE.fullmatch(repo):
-        raise ValueError("repo must be a simple repository name")
+    if not isinstance(repo, str):
+        raise ValueError(
+            "repo must be a repository name, owner__repository, or owner/repository identity"
+        )
+    if "/" in repo:
+        if repo.count("/") != 1:
+            raise ValueError(
+                "repo must be a repository name, owner__repository, or owner/repository identity"
+            )
+        owner, repository = repo.split("/", 1)
+        if not _REPOGROUND_REPO_RE.fullmatch(owner) or not _REPOGROUND_REPO_RE.fullmatch(
+            repository
+        ):
+            raise ValueError(
+                "repo must be a repository name, owner__repository, or owner/repository identity"
+            )
+        return repo
+    if not _REPOGROUND_REPO_RE.fullmatch(repo):
+        raise ValueError(
+            "repo must be a repository name, owner__repository, or owner/repository identity"
+        )
     return repo
 
 
@@ -7729,16 +7748,18 @@ def _repoground_selected_manifest_for_repo(
             if isinstance(inspected, dict):
                 candidate_repo = inspected.get("repo")
                 candidate_repo_id = inspected.get("repo_id")
+                repo_identity = repo.replace("/", "__", 1) if "/" in repo else repo
+                qualified = "__" in repo_identity
                 matches = (
-                    candidate_repo_id == repo
-                    if "__" in repo
-                    else candidate_repo == repo
+                    candidate_repo_id == repo_identity
+                    if qualified
+                    else candidate_repo == repo_identity
                 )
                 if not matches:
                     error_reason = "bundle_repo_mismatch"
                     bundle_repo = (
                         str(candidate_repo_id)
-                        if "__" in repo and isinstance(candidate_repo_id, str)
+                        if qualified and isinstance(candidate_repo_id, str)
                         else str(candidate_repo)
                         if isinstance(candidate_repo, str)
                         else None

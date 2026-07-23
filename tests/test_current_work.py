@@ -796,7 +796,58 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             {"surface": "grabowski_checkout_inventory", "repository": REPOSITORY},
         )
 
+    def test_convergence_recommendation_prioritizes_finishable_chains(self) -> None:
+        # Construct a project with a closed-not-cleaned work group (terminal task with live surfaces/cleanup candidate)
+        result = project(
+            tasks_payload={
+                "tasks": [task("t-done", state="completed", updated=50)],
+                "pagination": {"has_more": False},
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "chk-candidate",
+                            "/home/alex/repos/.worktrees/chk-candidate",
+                            cleanup_candidate=True,
+                            owner_ids=["task:t-done"],
+                        )
+                    ],
+                }
+            ],
+        )
+        self.assertIn("next_convergence_action", result)
+        self.assertIn("reconcile terminal worktree hygiene and safe lifecycle reconciliation", result["next_convergence_action"])
+        self.assertEqual(result["convergence_summary"]["primary_stage"], "closed-not-cleaned")
+        self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
+        self.assertEqual(result["convergence_summary"]["closed_not_cleaned_count"], 1)
+
+    def test_generic_blocking_group_with_cleanup_candidate_is_blocking_not_closed_cleaned(self) -> None:
+        result = project(
+            tasks_payload={
+                "tasks": [task("t-running", state="running", updated=50)],
+                "pagination": {"has_more": False},
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "chk-candidate",
+                            "/home/alex/repos/.worktrees/chk-candidate",
+                            cleanup_candidate=True,
+                            task_ids=["t-running"],
+                        )
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(result["convergence_summary"]["primary_stage"], "blocking")
+        self.assertEqual(result["convergence_summary"]["closed_not_cleaned_count"], 0)
+        self.assertIn("inspect blocking work group", result["next_convergence_action"])
 
 
 if __name__ == "__main__":
     unittest.main()
+

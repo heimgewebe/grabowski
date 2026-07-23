@@ -178,6 +178,101 @@ class TaskArchivePlanTests(unittest.TestCase):
         )
         self.assertEqual(len(plan["plan_sha256"]), 64)
 
+    def test_failed_task_archive_requires_authoritative_resolved_attention_closeout(self) -> None:
+        record = self.task("failed", updated_at=100)
+        record["state"] = "failed"
+        classifications = {"failed": {"classification": "terminal_archivable"}}
+
+        with (
+            mock.patch("grabowski_tasks._row_raw", return_value=record),
+            mock.patch(
+                "grabowski_task_attention.terminal_closeout_plan",
+                return_value={"archive_ready": False, "closeout_state": "attention_required"},
+            ),
+        ):
+            required = lifecycle.build_task_archive_plan(
+                [record], classifications, now_unix=1000, minimum_age_seconds=100
+            )
+        with (
+            mock.patch("grabowski_tasks._row_raw", return_value=record),
+            mock.patch(
+                "grabowski_task_attention.terminal_closeout_plan",
+                return_value={"archive_ready": False, "closeout_state": "attention_deferred"},
+            ),
+        ):
+            deferred = lifecycle.build_task_archive_plan(
+                [record], classifications, now_unix=1000, minimum_age_seconds=100
+            )
+        with (
+            mock.patch("grabowski_tasks._row_raw", return_value=record),
+            mock.patch(
+                "grabowski_task_attention.terminal_closeout_plan",
+                return_value={"archive_ready": True, "closeout_state": "ready_to_archive"},
+            ),
+        ):
+            closed = lifecycle.build_task_archive_plan(
+                [record], classifications, now_unix=1000, minimum_age_seconds=100
+            )
+
+        self.assertEqual([], required["eligible_task_ids"])
+        self.assertIn(
+            "attention_closeout:attention_required", required["blocked"][0]["reason_codes"]
+        )
+        self.assertEqual([], deferred["eligible_task_ids"])
+        self.assertIn(
+            "attention_closeout:attention_deferred", deferred["blocked"][0]["reason_codes"]
+        )
+        self.assertEqual(["failed"], closed["eligible_task_ids"])
+
+    def test_failed_task_archive_rejects_stale_attention_authority_binding(self) -> None:
+        record = self.task("failed", updated_at=100)
+        record["state"] = "failed"
+        stale = {**record, "lifecycle_receipt_sha256": "b" * 64}
+        classifications = {"failed": {"classification": "terminal_archivable"}}
+
+        with (
+            mock.patch("grabowski_tasks._row_raw", return_value=stale),
+            mock.patch("grabowski_task_attention.terminal_closeout_plan") as closeout_plan,
+        ):
+            plan = lifecycle.build_task_archive_plan(
+                [record], classifications, now_unix=1000, minimum_age_seconds=100
+            )
+
+        self.assertEqual([], plan["eligible_task_ids"])
+        self.assertIn(
+            "attention_authority_binding_mismatch", plan["blocked"][0]["reason_codes"]
+        )
+        closeout_plan.assert_not_called()
+
+    def test_failed_task_archive_blocks_when_attention_authority_is_unavailable(self) -> None:
+        record = self.task("failed", updated_at=100)
+        record["state"] = "failed"
+        classifications = {"failed": {"classification": "terminal_archivable"}}
+
+        with mock.patch("grabowski_tasks._row_raw", side_effect=ValueError("missing")):
+            plan = lifecycle.build_task_archive_plan(
+                [record], classifications, now_unix=1000, minimum_age_seconds=100
+            )
+
+        self.assertEqual([], plan["eligible_task_ids"])
+        self.assertIn(
+            "attention_authority_unavailable:ValueError",
+            plan["blocked"][0]["reason_codes"],
+        )
+
+    def test_completed_task_archive_does_not_require_attention_classification(self) -> None:
+        record = self.task("completed", updated_at=100)
+        classifications = {"completed": {"classification": "terminal_archivable"}}
+
+        plan = lifecycle.build_task_archive_plan(
+            [record],
+            classifications,
+            now_unix=1000,
+            minimum_age_seconds=100,
+        )
+
+        self.assertEqual(["completed"], plan["eligible_task_ids"])
+
     def test_plan_digest_changes_when_source_record_changes(self) -> None:
         record = self.task("old", updated_at=100)
         classifications = {"old": {"classification": "terminal_archivable"}}

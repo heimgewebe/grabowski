@@ -210,17 +210,26 @@ OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
 OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
 TUNNEL_METRICS_URL = core.HEALTH_URL.rsplit("/", 1)[0] + "/metrics"
-TUNNEL_DRAIN_GAUGE_NAMES = (
-    "commands_queue_length",
-    "dispatcher_worker_pool_occupancy",
-)
-TUNNEL_DRAIN_COUNTER_NAMES = (
+TUNNEL_DRAIN_QUEUE_GAUGE_NAME = "commands_queue_length"
+TUNNEL_DRAIN_WORKER_GAUGE_NAME = "dispatcher_worker_pool_occupancy"
+TUNNEL_DRAIN_DIRECT_COUNTER_NAMES = (
     "commands_polled_total",
     "commands_enqueued_total",
 )
+TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME = "commands_final_responses_total"
+TUNNEL_DRAIN_RESPONSE_HISTOGRAM_COUNT_NAME = "command_end_to_end_latency_milliseconds_count"
+TUNNEL_DRAIN_COUNTER_NAMES = (
+    *TUNNEL_DRAIN_DIRECT_COUNTER_NAMES,
+    TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME,
+)
 TUNNEL_DRAIN_IDENTITY_NAMES = ("process_start_time_seconds",)
 TUNNEL_DRAIN_STABILITY_NAMES = TUNNEL_DRAIN_COUNTER_NAMES + TUNNEL_DRAIN_IDENTITY_NAMES
-TUNNEL_DRAIN_METRIC_NAMES = TUNNEL_DRAIN_GAUGE_NAMES + TUNNEL_DRAIN_STABILITY_NAMES
+TUNNEL_DRAIN_DIRECT_METRIC_NAMES = (
+    TUNNEL_DRAIN_QUEUE_GAUGE_NAME,
+    TUNNEL_DRAIN_WORKER_GAUGE_NAME,
+    *TUNNEL_DRAIN_DIRECT_COUNTER_NAMES,
+    *TUNNEL_DRAIN_IDENTITY_NAMES,
+)
 TUNNEL_DRAIN_REQUIRED_IDLE_SAMPLES = 3
 TUNNEL_DRAIN_SAMPLE_INTERVAL_SECONDS = 0.1
 OPERATOR_HTTP_ARGUMENTS = (
@@ -2268,15 +2277,44 @@ def wait_until_ready(timeout_seconds: int) -> DualReadiness:
 def _parse_tunnel_drain_metrics(text: str) -> dict[str, float]:
     observed: dict[str, float] = {}
     duplicates: list[str] = []
+    response_series_seen: set[str] = set()
+    final_response_count = 0.0
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        for name in TUNNEL_DRAIN_METRIC_NAMES:
-            if not (line.startswith(name + " ") or line.startswith(name + "{")):
+        metric, separator, value_text = line.rpartition(" ")
+        if not separator:
+            continue
+        if (
+            metric.startswith(TUNNEL_DRAIN_RESPONSE_HISTOGRAM_COUNT_NAME + "{")
+            and 'latency_type="enqueue_to_response"' in metric
+        ):
+            if metric in response_series_seen:
+                duplicates.append(TUNNEL_DRAIN_RESPONSE_HISTOGRAM_COUNT_NAME)
                 continue
-            metric, separator, value_text = line.rpartition(" ")
-            if not separator or not (metric == name or metric.startswith(name + "{")):
+            response_series_seen.add(metric)
+            try:
+                value = float(value_text)
+            except ValueError:
+                core.fail(
+                    "Tunnel-Drain-Metrik ist nicht numerisch",
+                    phase="tunnel-drain-metrics",
+                    details={"metric": TUNNEL_DRAIN_RESPONSE_HISTOGRAM_COUNT_NAME},
+                )
+            if not math.isfinite(value) or value < 0:
+                core.fail(
+                    "Tunnel-Drain-Metrik hat einen unzulässigen Wert",
+                    phase="tunnel-drain-metrics",
+                    details={
+                        "metric": TUNNEL_DRAIN_RESPONSE_HISTOGRAM_COUNT_NAME,
+                        "value": value_text,
+                    },
+                )
+            final_response_count += value
+            continue
+        for name in TUNNEL_DRAIN_DIRECT_METRIC_NAMES:
+            if not (metric == name or metric.startswith(name + "{")):
                 continue
             if name in observed:
                 duplicates.append(name)
@@ -2296,7 +2334,7 @@ def _parse_tunnel_drain_metrics(text: str) -> dict[str, float]:
                     details={"metric": name, "value": value_text},
                 )
             observed[name] = value
-    missing = [name for name in TUNNEL_DRAIN_METRIC_NAMES if name not in observed]
+    missing = [name for name in TUNNEL_DRAIN_DIRECT_METRIC_NAMES if name not in observed]
     if duplicates or missing:
         core.fail(
             "Tunnel-Drain-Metriken sind nicht eindeutig vollständig",
@@ -2307,7 +2345,24 @@ def _parse_tunnel_drain_metrics(text: str) -> dict[str, float]:
                 "observed": observed,
             },
         )
+    observed[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME] = final_response_count
     return observed
+
+
+def _tunnel_drain_idle_mismatch(observed: dict[str, float]) -> dict[str, float]:
+    enqueued = observed["commands_enqueued_total"]
+    polled = observed["commands_polled_total"]
+    final_responses = observed[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]
+    mismatch: dict[str, float] = {}
+    if observed[TUNNEL_DRAIN_QUEUE_GAUGE_NAME] != 0:
+        mismatch[TUNNEL_DRAIN_QUEUE_GAUGE_NAME] = observed[TUNNEL_DRAIN_QUEUE_GAUGE_NAME]
+    if polled != enqueued:
+        mismatch["commands_polled_total"] = polled
+        mismatch["commands_enqueued_total"] = enqueued
+    if final_responses != enqueued:
+        mismatch[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME] = final_responses
+        mismatch["commands_enqueued_total"] = enqueued
+    return mismatch
 
 
 def _tunnel_drain_counter_snapshot(observed: dict[str, float]) -> dict[str, float]:
@@ -2380,7 +2435,7 @@ def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
                             "observed_process_start_time_seconds": process_start_time,
                         },
                     )
-                idle = all(observed[name] == 0 for name in TUNNEL_DRAIN_GAUGE_NAMES)
+                idle = not _tunnel_drain_idle_mismatch(observed)
                 if not idle:
                     consecutive_idle = 0
                     last_idle_stability = None
@@ -2434,11 +2489,7 @@ def verify_tunnel_drain_final_guard(
             phase="tunnel-drain-final-guard",
             details={"metrics_error": _error_summary(exc)},
         )
-    busy = {
-        name: observed[name]
-        for name in TUNNEL_DRAIN_GAUGE_NAMES
-        if observed[name] != 0
-    }
+    busy = _tunnel_drain_idle_mismatch(observed)
     stability = _tunnel_drain_stability_snapshot(observed)
     changed_stability = {
         name: {"expected": expected_stability.get(name), "observed": stability[name]}
@@ -2746,7 +2797,8 @@ def deploy_url(
             f"attempts={drain_proof['attempts']} "
             f"stable={drain_proof['consecutive_idle_samples']} "
             f"final_queue={final_drain_metrics['commands_queue_length']:g} "
-            f"final_workers={final_drain_metrics['dispatcher_worker_pool_occupancy']:g}"
+            f"final_responses={final_drain_metrics[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]:g} "
+            f"workers_observed={final_drain_metrics['dispatcher_worker_pool_occupancy']:g}"
         )
         print(f"Legacy-Backup:   {activation.legacy_backup}")
     except Exception as original:
