@@ -26,8 +26,8 @@ BLOCKING_REVIEW_STATES = {"CHANGES_REQUESTED", "DISMISSED", "PENDING"}
 DEFAULT_EXPECTED_CHECK_NAMES = ("validate (3.10)", "validate (3.12)")
 # Bootstrap policies are sticky code-owned defaults until a base-side catalog exists.
 BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
-    "heimgewebe/hausKI": ("Detect changes",),
-    "heimgewebe/hausKI-audio": ("scan",),
+    "heimgewebe/hauski": ("Detect changes",),
+    "heimgewebe/hauski-audio": ("scan",),
     "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
     "heimgewebe/mitschreiber": ("ci / reusable-ci",),
     "heimgewebe/weltgewebe": ("Detect docs updates", "Core Guard Tests"),
@@ -1876,7 +1876,7 @@ def expected_check_names_for_repo(
     )
     if policy_catalog is not None:
         return _required_check_names_from_catalog(policy_catalog)
-    bootstrap = BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO.get(repo_name or "")
+    bootstrap = BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO.get((repo_name or "").casefold())
     if bootstrap is not None:
         return bootstrap
     workflow = _workflow_text_at_revision(repo, policy_sha) if policy_sha is not None else None
