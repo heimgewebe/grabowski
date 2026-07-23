@@ -96,7 +96,9 @@ class PrReviewGateTargetMatrixTests(unittest.TestCase):
     def test_direct_cutover_bootstrap_mappings_apply_when_base_has_no_catalog(self) -> None:
         cases = {
             "heimgewebe/hausKI": ("Detect changes",),
+            "heimgewebe/hauski": ("Detect changes",),
             "heimgewebe/hausKI-audio": ("scan",),
+            "heimgewebe/hauski-audio": ("scan",),
             "heimgewebe/metarepo": ("ci (ubuntu-latest)", "ci (macos-latest)"),
         }
         for repo_name, expected in cases.items():
