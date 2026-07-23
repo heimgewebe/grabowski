@@ -61,6 +61,7 @@ _ARCHIVE_INDEX_CACHE: dict[Path, tuple[tuple[int, int, int, int, int], dict[str,
 _MANIFEST_CACHE: dict[Path, tuple[tuple[int, int, int, int, int], dict[str, Any]]] = {}
 
 
+
 def enabled() -> bool:
     return os.environ.get(ENABLED_ENV, "").strip().lower() in TRUTHY
 
@@ -739,14 +740,15 @@ def _context(record: dict[str, Any]) -> dict[str, Any]:
 def _subject(context: dict[str, Any]) -> dict[str, Any]:
     scope = context.get("subject_scope")
     if scope == "repository":
-        subject = {"scope": "repository", "repo": context["repo"]}
-        for key in ("branch", "head"):
-            if context.get(key):
-                subject[key] = context[key]
-        return subject
-    if scope == "host":
-        return {"scope": "host", "host": context["host"]}
-    raise ValueError("stored Chronik context has invalid subject scope")
+        subject: dict[str, Any] = {"scope": "repository", "repo": context["repo"]}
+    elif scope == "host":
+        subject = {"scope": "host", "host": context["host"]}
+    else:
+        raise ValueError("stored Chronik context has invalid subject scope")
+    for key in ("branch", "head", "component", "bureau_task_id", "pr_number"):
+        if context.get(key) is not None and context.get(key) != "":
+            subject[key] = context[key]
+    return subject
 
 
 def build_event(record: dict[str, Any], state: str) -> dict[str, Any] | None:
@@ -913,8 +915,12 @@ _EVENT_TOP_LEVEL_KEYS = frozenset(
     }
 )
 _EVENT_SOURCE_KEYS = frozenset({"repo", "component", "run_id"})
-_EVENT_SUBJECT_REPOSITORY_KEYS = frozenset({"scope", "repo", "branch", "head"})
-_EVENT_SUBJECT_HOST_KEYS = frozenset({"scope", "host"})
+_EVENT_SUBJECT_REPOSITORY_KEYS = frozenset(
+    {"scope", "repo", "branch", "head", "component", "bureau_task_id", "pr_number"}
+)
+_EVENT_SUBJECT_HOST_KEYS = frozenset(
+    {"scope", "host", "component", "bureau_task_id", "pr_number"}
+)
 _EVENT_DATA_KEYS = frozenset({"result", "operation", "task_class", "blocker_code"})
 _EVENT_OPERATIONS = frozenset(
     {"implement", "review", "merge", "deploy", "runtime_verify", "recovery", "other"}
@@ -990,6 +996,20 @@ def _validate_agent_run_event_shape(event: Any, *, label: str) -> None:
             raise ValueError(f"{label} has an invalid host subject")
     else:
         raise ValueError(f"{label} has an invalid subject scope")
+    for optional_key in ("component", "bureau_task_id"):
+        if optional_key in subject and (
+            not isinstance(subject[optional_key], str)
+            or not subject[optional_key]
+            or len(subject[optional_key]) > 160
+            or any(ord(character) < 32 for character in subject[optional_key])
+        ):
+            raise ValueError(f"{label} has invalid subject metadata")
+    if "pr_number" in subject and (
+        isinstance(subject["pr_number"], bool)
+        or not isinstance(subject["pr_number"], int)
+        or not 1 <= subject["pr_number"] <= 2_147_483_647
+    ):
+        raise ValueError(f"{label} has invalid subject metadata")
     if event.get("trust_tier") not in {"observed", "declared"}:
         raise ValueError(f"{label} has an invalid trust tier")
     if event.get("status") != "active":

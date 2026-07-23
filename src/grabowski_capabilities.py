@@ -708,20 +708,6 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
-    "grabowski_task_archive_list": {
-        "category": "task-archive",
-        "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
-        "risk_class": "low",
-        "effects": [],
-        "reversibility": "not-applicable",
-    },
-    "grabowski_task_archive_read": {
-        "category": "task-archive",
-        "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
-        "risk_class": "low",
-        "effects": [],
-        "reversibility": "not-applicable",
-    },
     "grabowski_chronik_outbox_import": {
         "category": "coding-memory",
         "purpose": "Import one redacted Grabowski outbox JSONL into optional local Chronik.",
@@ -732,6 +718,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
     "grabowski_chronik_history": {
         "category": "coding-memory",
         "purpose": "Read bounded historical coding events without asserting current truth.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_task_archive_list": {
+        "category": "task-archive",
+        "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_task_archive_read": {
+        "category": "task-archive",
+        "purpose": "Read one fully integrity-verified immutable task archive segment with bounded pagination.",
         "risk_class": "low",
         "effects": [],
         "reversibility": "not-applicable",

@@ -213,6 +213,27 @@ class ChronikAgentOutboxTests(unittest.TestCase):
         self.assertNotIn("cwd", rendered)
         self.assertNotIn("environment", rendered)
 
+    def test_repository_context_projects_optional_component_bureau_and_pr(self):
+        self.enable()
+        context = {
+            "subject_scope": "repository",
+            "repo": "heimgewebe/chronik",
+            "operation": "implement",
+            "task_class": "coding",
+            "component": "task-runner",
+            "bureau_task_id": "CCM-V1-T002",
+            "pr_number": 306,
+        }
+        chronik.record_task_state(record(host="local", chronik_context_json=json.dumps(context)), "completed")
+        event = json.loads(self.lines()[0])
+        self.assertEqual(event["subject"], {
+            "scope": "repository",
+            "repo": "heimgewebe/chronik",
+            "component": "task-runner",
+            "bureau_task_id": "CCM-V1-T002",
+            "pr_number": 306,
+        })
+
     def test_host_context_never_fabricates_repository(self):
         self.enable()
         context = {
