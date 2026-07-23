@@ -1,6 +1,6 @@
 # Review evidence CI status
 
-Status: signed v2 provenance implemented; required rollout remains blocked on live proof and signer-recovery readiness
+Status: signed v2 provenance implemented; required rollout remains blocked on live proof, publisher identity, supersession semantics, and signer-recovery readiness
 
 ## Purpose
 
@@ -12,13 +12,15 @@ The CI status is a projection of review evidence, not a replacement for the loca
 
 ## Trusted execution boundary
 
-The workflow is triggered by immutable `issue_comment.created` events, so GitHub loads the workflow from the repository default branch rather than executing workflow code proposed by the pull request. Corrections are made by posting a new command; editing an old command is not a supported way to create a new review-evidence generation.
+The workflow is triggered by immutable `issue_comment.created` events, so GitHub loads the workflow definition from the repository default branch rather than executing workflow code proposed by the pull request. Corrections are made by posting a new command; editing an old command is not a supported way to create a new review-evidence generation.
 
 Only exact v1 or v2 commands enter the job. v1 carries an unsigned sanitized projection and can mutate only the advisory context. v2 carries a signed attestation envelope; before the required-eligible context can be written, the default-branch evaluator verifies the OpenSSH signature against `config/review-evidence-allowed-signers`, the fixed signer principal, and the fixed review-evidence signature namespace. Before any status mutation, `tools/pr_review_gate_ci.py` also asks GitHub for the triggering actor's repository permission. Only `admin`, `maintain`, `write`, or legacy `push` permission may publish a status. In publish mode, the supplied actor must match `GITHUB_ACTOR`, and a concrete comment ID is mandatory.
 
 The workflow intentionally has no concurrency queue. Every eligible command may run; stale runs independently re-read authorization state immediately before publication. This avoids losing a valid pending command because another `issue_comment` run replaced it in a shared concurrency group.
 
-Before publication, the evaluator re-reads the bounded last-100 PR comment window, requires the triggering comment to still have the exact event body, and requires it to be the newest authorized command in the same protocol generation. v1 and v2 freshness generations are independent, so an unsigned advisory command cannot supersede an attested v2 command. The evaluator repeats that freshness check immediately before the final status write. A genuinely superseded same-version command is the only safe no-op. An edited, missing, or out-of-window triggering command is blocking and, once the actor has been authorized and the current head is known, publishes a failure to that command generation's own status context rather than silently preserving an older green status.
+Before publication, the evaluator re-reads the bounded last-100 PR comment window, requires the triggering comment to still have the exact event body, and requires it to be the newest authorized command in the same protocol generation. v1 and v2 freshness generations are independent, so an unsigned advisory command cannot supersede an attested v2 command. The evaluator repeats that freshness check immediately before the final status write. A genuinely superseded same-version command is a no-op for that older run. An edited, missing, or out-of-window triggering command is blocking and, once the actor has been authorized and the current head is known, attempts to publish a failure to that command generation's own status context rather than silently preserving an older green status.
+
+This freshness contract is sufficient for observation but is not yet a complete hard-gate generation protocol. A newer v2 comment can supersede an older run before the newer run itself reaches status publication. If that newer run is queued, cancelled, runner-starved, fails checkout, or otherwise terminates before replacing an already-published green status, the older green commit status can remain visible. Required rollout therefore needs an explicit, tested supersession contract that prevents a status from remaining merge-authoritative after it has become semantically stale.
 
 The job needs only the ephemeral repository `GITHUB_TOKEN` with:
 
@@ -67,7 +69,7 @@ v1 is advisory-only. v2 contains the same sanitized projection plus a detached O
 
 The public projection references the detailed local audit only by `audit_sha256`. That digest remains traceability evidence rather than proof that CI possesses the private audit contents.
 
-v1 therefore remains an **authorized operator assertion**. v2 adds cryptographic provenance for the exact canonical projection: a write-authorized actor who lacks an allowlisted private signing key cannot fabricate a v2 PASS. The signature still does not prove durable existence of the private audit or review quality; it attests that a trusted local signing key signed the exact public projection and its audit digest. The detailed threat model, option comparison and key lifecycle are defined in `docs/review-evidence-provenance.md`.
+v1 therefore remains an **authorized operator assertion**. v2 adds cryptographic provenance for the exact canonical projection: a write-authorized actor who lacks an allowlisted private signing key cannot fabricate a v2 PASS. The signature still does not prove durable existence of the private audit or review quality; it attests that a trusted local signing key signed the exact public projection and its audit digest. The detailed threat model, option comparison, required-gate blockers and key lifecycle are defined in `docs/review-evidence-provenance.md`.
 
 ## Stale-evidence detection
 
@@ -105,18 +107,20 @@ The evaluator distinguishes:
 - `current`: exact triggering body and newest authorized command in the same protocol generation;
 - `superseded`: a newer authorized command of the same protocol generation exists; the older run performs no status mutation;
 - `stale_or_edited`: the triggering comment still exists in the window but its body no longer matches the event;
-- `outside_bounded_window`: the triggering comment cannot be proven current within the bounded window.
+- `outside_bounded_window`: the triggering comment cannot be proven current within the bounded window;
 - `authorization_unknown`: authorization of a newer command could not be determined safely.
 
-Failures to read the current comment window after the triggering actor and PR head are known likewise attempt to replace any older green status with a blocking status rather than silently preserving it. Only `superseded` is a safe no-op. The other non-current states are blocking once the triggering actor has been authorized. Permission lookups are cached per evaluation, and subprocess calls have bounded timeouts.
+Failures to read the current comment window after the triggering actor and PR head are known likewise attempt to replace any older green status with a blocking status rather than silently preserving it. Only `superseded` is currently a no-op. The other non-current states are blocking once the triggering actor has been authorized. Permission lookups are cached per evaluation, and subprocess calls have bounded timeouts.
 
-There remains an unavoidable small distributed-systems race between the final freshness read and the commit-status API write. The second freshness read and final head/base read materially narrow that window; a newer authorized command will subsequently re-evaluate the same head. A future attested status service could make generation ordering atomic, but this workflow does not claim that stronger property.
+For v2, "authorized" freshness currently means repository write permission plus the v2 command prefix; cryptographic validity is established later during evidence parsing. Therefore a write-authorized malformed or unsigned v2-prefixed comment can supersede an older in-flight v2 run. Whether hard-gate supersession authority should itself require a valid signature remains an explicit rollout decision.
+
+There remains an unavoidable small distributed-systems race between the final freshness read and the commit-status API write. The second freshness read and final head/base read materially narrow that window. A future attested status service or another atomic generation mechanism could provide stronger ordering; this workflow does not claim that property.
 
 ## Self-reference boundary
 
 `Review evidence gate`, `Review evidence gate (advisory)`, and `Review evidence gate (attested)` are outputs derived from the local review gate. Feeding either red or pending state back into `tools/pr_review_gate.py` would create a recovery deadlock: the local gate could not produce the new evidence needed to repair its derived status.
 
-The local gate therefore ignores all three derived status names when evaluating its input checks, and the local required-check catalog explicitly rejects both. Branch protection remains independent and may eventually require only the `Review evidence gate (attested)` context after the rollout blockers in this document are resolved. All other failed, cancelled, pending, or errored checks retain their existing blocking behavior.
+The local gate therefore ignores all three derived status names when evaluating its input checks, and the local required-check catalog explicitly rejects all three. Branch protection remains independent and may eventually require only the `Review evidence gate (attested)` context after the rollout blockers in this document are resolved. All other failed, cancelled, pending, or errored checks retain their existing blocking behavior.
 
 ## High-critical and platform-review controls
 
@@ -129,7 +133,8 @@ Any GitHub branch-protection review requirement or other platform review require
 1. **v1 advisory phase**: keep unsigned evidence on `Review evidence gate (advisory)` and exercise missing, stale, red, green, base-drift, policy-drift, edited/out-of-window, and superseded paths.
 2. **v2 attestation observation**: exercise real signed v2 commands through the trusted default-branch workflow. Confirm valid signatures pass and tampered, unsigned, wrong-key and missing-allowlist paths fail closed.
 3. **Merge-basis prerequisite**: ensure required branch protection uses a strict/up-to-date merge basis or equivalent merge queue so later base drift cannot leave an unchanged head merge-eligible on an older green status.
-4. **Source-binding prerequisite**: bind the future required `Review evidence gate (attested)` context to the expected GitHub Actions integration rather than accepting an arbitrary user-created status with the same text.
-5. **Recovery prerequisite**: prove signer rotation and key-loss recovery as described in `docs/review-evidence-provenance.md`. A single lost key must not create an unrecoverable repository lockout.
-6. **Required phase**: only after stable v2 observation and all prerequisites, configure branch protection to require `Review evidence gate (attested)` in addition to existing CI and independent review requirements. Never add either derived context to the local required-check catalog.
-7. **Rollback**: remove the branch-protection requirement first. The signed workflow can then remain non-required or be disabled without weakening the pre-existing local review gate or CI checks.
+4. **Publisher-identity prerequisite**: give the future required `Review evidence gate (attested)` context a publisher identity exclusive to, or cryptographically equivalent to, the intended review-evidence evaluator. Binding only to the general GitHub Actions integration is not sufficient workflow-specific provenance.
+5. **Supersession prerequisite**: select and live-test the authoritative generation model, including queued, cancelled, runner-unavailable and failure-before-publication cases, so an older green status cannot remain merge-authoritative contrary to that model.
+6. **Recovery prerequisite**: prove signer rotation and key-loss recovery as described in `docs/review-evidence-provenance.md`. A single lost key must not create an unrecoverable repository lockout.
+7. **Required phase**: only after stable v2 observation and all prerequisites, configure branch protection to require `Review evidence gate (attested)` in addition to existing CI and independent review requirements. Never add any derived review-evidence context to the local required-check catalog.
+8. **Rollback**: remove the branch-protection requirement first. The signed workflow can then remain non-required or be disabled without weakening the pre-existing local review gate or CI checks.
