@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "task_id": "REPOGROUND-AGENT-UTILITY-V1-T004",
+  "measured_at": "2026-07-23T07:23:40Z",
+  "implementation_base_head": "2b083a0b8b911da545e6350d55162a0490478bd2",
+  "operation": "ground_claim",
+  "retrieval_mode": "repoground_context",
+  "query": "What is the canonical repository agent entry surface?",
+  "method": {
+    "kind": "paired_live_baseline_wrapper_isolation_v1",
+    "description": "Read one real RepoGround baseline value per repository, then feed that exact value through repoground_agent_handoff to isolate wrapper behavior from a second time-separated live read.",
+    "capability_registration_validated_separately_by_tests": true,
+    "branch_runtime_import_used_deployed_virtualenv": true
+  },
+  "repositories": [
+    {
+      "repo": "lenskit",
+      "role": "repoground_repository",
+      "freshness": "fresh_exact",
+      "stem": "heimgewebe__lenskit__main-max-260723-0258",
+      "manifest_sha256": "fe3d3a8b813ecc595f08672659db061d03692a97f80e34d7b10b79b1471ad67a",
+      "publication_git_commit": "5b887ceed78858774ac1dc4e517d18ea0e86c91e",
+      "baseline_available": true,
+      "baseline_sha256": "922ae45c063f1f176982141c76c5eedf5cd6f63d0a765da6b42fad44adb3b081",
+      "handoff_evidence_sha256": "922ae45c063f1f176982141c76c5eedf5cd6f63d0a765da6b42fad44adb3b081",
+      "exact_evidence_preservation": true,
+      "critical_regression": false
+    },
+    {
+      "repo": "bureau",
+      "role": "second_active_repository",
+      "freshness": "fresh_exact",
+      "stem": "heimgewebe__bureau__main-max-260723-0704",
+      "manifest_sha256": "7187f16b7f6167b72e30cee26b4ba1edd53cb613f19989c158d7ec151bdb3af1",
+      "publication_git_commit": "774ba3938fb2ba6fd03fe23cedb910659c44c0e8",
+      "baseline_available": true,
+      "baseline_sha256": "1507d02dc05d0d04da4abb5e7b3302171408ddd145ff99a30c4757312205e015",
+      "handoff_evidence_sha256": "1507d02dc05d0d04da4abb5e7b3302171408ddd145ff99a30c4757312205e015",
+      "exact_evidence_preservation": true,
+      "critical_regression": false
+    }
+  ],
+  "routing_contract": {
+    "selection": "caller_explicit",
+    "automatic_selection": false,
+    "default_route": null,
+    "global_repoground_promotion": false,
+    "writes": []
+  },
+  "negative_probe": {
+    "repo": "grabowski",
+    "freshness": "stale_head",
+    "published_git_commit": "300278d55b8602f58f7866e5cb4951fd6d853578",
+    "live_head": "2b083a0b8b911da545e6350d55162a0490478bd2",
+    "used_as_positive_baseline": false,
+    "reason": "A healthy publication is not sufficient when its source head is stale."
+  },
+  "observation": {
+    "kind": "time_separated_double_read_variance",
+    "severity": "follow_up",
+    "description": "Back-to-back independent live context-pack reads were not byte-identical in every cold trial, while later field-by-field comparisons were identical. The paired proof therefore isolates the wrapper using the same real baseline value. Root cause was not established in this task."
+  },
+  "verdict": "pass_with_follow_up_observation"
+}

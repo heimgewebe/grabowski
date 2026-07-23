@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "5a5ef47656939b392cb3a3507d702a8b652623245d944fc9504d5ecf3255b58d",
+  "capability_source_sha256": "0a1fc4b72c36cf383adcf53cafb16e975f601feb11f292d26525e5b7ed6fbb7a",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b7e8a09228adc8e01d2ab9e5d465de5d1b4356fe530d38306e40ba63f0332341",
+  "contract_sha256": "6447c4f2f0cd8c2a756b5a8ed87d5dd65765a24135ecfe75f1772358e2736f4f",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -394,6 +394,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "repoground_context_compose"
+    },
+    {
+      "category": "knowledge",
+      "description": "Build one explicit read-only agent handoff without choosing a retrieval mode implicitly.",
+      "effects": [],
+      "id": "repoground_agent_handoff",
+      "purpose": "Route one bounded caller-selected agent handoff explicitly between native live reads and RepoGround context.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "repoground_agent_handoff"
     },
     {
       "category": "knowledge",
