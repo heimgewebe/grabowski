@@ -31,7 +31,11 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
 PASS_CHECK_BUCKETS = {"pass"}
-DERIVED_REVIEW_STATUS_NAMES = {"Review evidence gate"}
+DERIVED_REVIEW_STATUS_NAMES = {
+    "Review evidence gate",
+    "Review evidence gate (advisory)",
+    "Review evidence gate (attested)",
+}
 BASE_BOUND_REQUIRED_CHECK_NAMES = {"registry-registration-preflight/freshness"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
