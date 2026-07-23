@@ -99,6 +99,7 @@ class ReviewEvidencePublicationRaceTests(unittest.TestCase):
             head_sha="a" * 40,
             passed=False,
             failure_count=1,
+            context=ci.ADVISORY_STATUS_CONTEXT,
         )
 
     def test_superseded_command_is_safe_noop(self) -> None:

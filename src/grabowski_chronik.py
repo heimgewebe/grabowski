@@ -914,8 +914,8 @@ def _contains_forbidden_coding_memory_key(value: Any) -> bool:
     return False
 
 
-def inspect_coding_memory_source(path: str) -> dict[str, Any]:
-    """Validate and hash one redacted Grabowski outbox JSONL without mutating it."""
+def _load_coding_memory_source(path: str) -> tuple[dict[str, Any], bytes]:
+    """Validate one redacted Grabowski outbox JSONL and return its exact bytes."""
     if not isinstance(path, str) or not path.strip():
         raise ValueError("Chronik outbox path must be non-empty text")
     candidate = Path(path).expanduser()
@@ -984,7 +984,7 @@ def inspect_coding_memory_source(path: str) -> dict[str, Any]:
         raise ValueError("Chronik outbox source is empty")
     if len(event_ids) != len(set(event_ids)):
         raise ValueError("Chronik outbox source contains duplicate event IDs")
-    return {
+    source = {
         "path": str(resolved),
         "sha256": _sha256_bytes(raw),
         "bytes": len(raw),
@@ -994,6 +994,18 @@ def inspect_coding_memory_source(path: str) -> dict[str, Any]:
         "chronik_source_sha256": _sha256_bytes(b"\n".join(canonical_events)),
         "identity": identity,
     }
+    return source, raw
+
+
+def inspect_coding_memory_source(path: str) -> dict[str, Any]:
+    """Validate and hash one redacted Grabowski outbox JSONL without mutating it."""
+    source, _ = _load_coding_memory_source(path)
+    return source
+
+
+def read_coding_memory_source(path: str) -> tuple[dict[str, Any], bytes]:
+    """Return source metadata and the exact bytes validated for coding-memory import."""
+    return _load_coding_memory_source(path)
 
 
 def coding_memory_configuration() -> dict[str, Any]:
