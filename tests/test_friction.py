@@ -1515,6 +1515,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             evidence_ref="bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T019",
             resolved_by="chatgpt-grabowski",
             reason="Historical incidents are retained but no longer require individual action.",
+            expected_match_count=2,
         )
 
         self.assertEqual(result["target_count"], 2)
@@ -1524,7 +1525,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(summary["unresolved"], 1)
         self.assertEqual(summary["failure_classification"]["decision_required_count"], 1)
 
-    def test_class_closeout_is_bounded_and_reports_remaining_targets(self) -> None:
+    def test_class_closeout_requires_expected_count_and_rejects_oversized_match(self) -> None:
         module = self._load_module()
         module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
         events = [
@@ -1544,31 +1545,37 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        first = module.resolve_friction(
-            failure_class="platform_filter",
-            status="deferred",
-            decision="Close one bounded batch.",
-            evidence_ref="receipt:bulk-1",
-            resolved_by="operator",
-            reason="Bounded triage batch.",
-        )
-        self.assertEqual(first["target_count"], module.MAX_FRICTION_CLOSEOUT_BATCH)
-        self.assertEqual(first["matched_target_count"], module.MAX_FRICTION_CLOSEOUT_BATCH + 2)
-        self.assertTrue(first["targets_truncated"])
-        self.assertEqual(first["remaining_target_count"], 2)
-        self.assertEqual(module.friction_summary(view="evidence", limit=500)["unresolved"], 2)
+        with self.assertRaisesRegex(ValueError, "requires expected_match_count"):
+            module.resolve_friction(
+                failure_class="platform_filter",
+                status="deferred",
+                decision="Unsafe implicit bulk closeout.",
+                evidence_ref="receipt:bulk-missing-count",
+                resolved_by="operator",
+                reason="Must fail closed.",
+            )
+        with self.assertRaisesRegex(ValueError, "expected_match_count mismatch"):
+            module.resolve_friction(
+                failure_class="platform_filter",
+                status="deferred",
+                decision="Stale expected count.",
+                evidence_ref="receipt:bulk-mismatch",
+                resolved_by="operator",
+                reason="Must fail closed.",
+                expected_match_count=1,
+            )
+        with self.assertRaisesRegex(ValueError, "exceeds max batch size"):
+            module.resolve_friction(
+                failure_class="platform_filter",
+                status="deferred",
+                decision="Oversized confirmed batch.",
+                evidence_ref="receipt:bulk-oversized",
+                resolved_by="operator",
+                reason="Must remain bounded.",
+                expected_match_count=module.MAX_FRICTION_CLOSEOUT_BATCH + 2,
+            )
+        self.assertFalse(module.FRICTION_DECISION_LOG.exists())
 
-        second = module.resolve_friction(
-            failure_class="platform_filter",
-            status="deferred",
-            decision="Close the remaining bounded batch.",
-            evidence_ref="receipt:bulk-2",
-            resolved_by="operator",
-            reason="Bounded triage batch.",
-        )
-        self.assertEqual(second["target_count"], 2)
-        self.assertFalse(second["targets_truncated"])
-        self.assertEqual(second["remaining_target_count"], 0)
 
     def test_summary_ignores_closeout_for_duplicate_raw_event_id(self) -> None:
         module = self._load_module()
@@ -1624,6 +1631,113 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(second["already_recorded_count"], 1)
         with self.assertRaisesRegex(ValueError, "different closeout"):
             module.resolve_friction(**{**kwargs, "decision": "Conflicting decision."})
+
+    def test_reopen_revision_is_append_only_and_restores_unresolved_state(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        raw_before = module.FRICTION_LOG.read_bytes()
+        first = module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="Initial decision.",
+            evidence_ref="receipt:initial",
+            resolved_by="operator",
+        )
+        first_closeout_id = first["closeout_ids"][0]
+
+        reopened = module.resolve_friction(
+            event_id="filter-1",
+            status="reopened",
+            decision="Retract erroneous closeout.",
+            evidence_ref=f"closeout:{first_closeout_id}",
+            resolved_by="operator",
+            reason="The prior decision was applied to the wrong event.",
+            supersedes_closeout_id=first_closeout_id,
+        )
+
+        self.assertEqual(reopened["appended_count"], 1)
+        self.assertEqual(module.FRICTION_LOG.read_bytes(), raw_before)
+        records = [
+            json.loads(line)
+            for line in module.FRICTION_DECISION_LOG.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["schema_version"], 1)
+        self.assertEqual(records[1]["schema_version"], 2)
+        self.assertEqual(records[1]["status"], "reopened")
+        self.assertEqual(records[1]["supersedes_closeout_id"], first_closeout_id)
+        summary = module.friction_summary(view="evidence", limit=10)
+        self.assertTrue(summary["decision_log"]["integrity_valid"])
+        self.assertEqual(summary["unresolved"], 3)
+        self.assertEqual(summary["resolution_counts"]["reopened"], 1)
+        event = next(item for item in summary["events"] if item["event_id"] == "filter-1")
+        self.assertFalse(event["resolved"])
+        self.assertEqual(event["resolution_status"], "reopened")
+        self.assertEqual(summary["failure_classification"]["decision_required_count"], 3)
+
+    def test_reopen_revision_requires_exact_current_predecessor(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        first = module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="Initial decision.",
+            evidence_ref="receipt:initial",
+            resolved_by="operator",
+        )
+        with self.assertRaisesRegex(ValueError, "does not match current closeout"):
+            module.resolve_friction(
+                event_id="filter-1",
+                status="reopened",
+                decision="Invalid retraction.",
+                evidence_ref="closeout:wrong",
+                resolved_by="operator",
+                reason="Wrong predecessor must fail closed.",
+                supersedes_closeout_id="b" * 32,
+            )
+        records = module.FRICTION_DECISION_LOG.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0])["closeout_id"], first["closeout_ids"][0])
+
+    def test_reopened_event_can_receive_new_terminal_revision(self) -> None:
+        module = self._load_module()
+        self._write_closeout_events(module)
+        first = module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="Initial decision.",
+            evidence_ref="receipt:initial",
+            resolved_by="operator",
+        )
+        reopened = module.resolve_friction(
+            event_id="filter-1",
+            status="reopened",
+            decision="Retract erroneous closeout.",
+            evidence_ref=f"closeout:{first['closeout_ids'][0]}",
+            resolved_by="operator",
+            reason="Correction.",
+            supersedes_closeout_id=first["closeout_ids"][0],
+        )
+        final = module.resolve_friction(
+            event_id="filter-1",
+            status="resolved",
+            decision="New evidence-bound decision.",
+            evidence_ref="receipt:replacement",
+            resolved_by="operator",
+            supersedes_closeout_id=reopened["closeout_ids"][0],
+        )
+        self.assertEqual(final["appended_count"], 1)
+        self.assertEqual(
+            len(module.FRICTION_DECISION_LOG.read_text(encoding="utf-8").splitlines()),
+            3,
+        )
+        summary = module.friction_summary(view="evidence", limit=10)
+        self.assertTrue(summary["decision_log"]["integrity_valid"])
+        self.assertEqual(summary["unresolved"], 2)
+        event = next(item for item in summary["events"] if item["event_id"] == "filter-1")
+        self.assertTrue(event["resolved"])
+        self.assertEqual(event["resolution_status"], "resolved")
+
 
     def test_invalid_event_and_deferred_without_reason_are_rejected(self) -> None:
         module = self._load_module()
