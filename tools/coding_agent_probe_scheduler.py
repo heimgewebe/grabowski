@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,27 @@ PRIVATE_DIRECTORY_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
 SPECIAL_PERMISSION_BITS = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
 PROCESS_TERMINATION_GRACE_SECONDS = 2
+PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v3"
+PROBE_DIGEST_FIELDS = (
+    "schema_version",
+    "observed_at",
+    "harnesses",
+    "providers",
+    "verified_quota_pools",
+    "api_key_environment_scrubbed",
+    "model_invocations",
+    "paid_api_requests_authorized",
+)
+SENSITIVE_PROBE_FIELD_TOKENS = (
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "credential",
+    "api_key",
+    "apikey",
+)
+ALLOWED_SENSITIVE_METADATA_FIELDS = frozenset({"api_key_environment_scrubbed"})
 FORBIDDEN_API_KEY_ENV = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -51,6 +73,14 @@ FORBIDDEN_API_KEY_ENV = (
     "GOOGLE_API_KEY",
     "OPENROUTER_API_KEY",
     "AZURE_OPENAI_API_KEY",
+)
+EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "XAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
 )
 
 
@@ -77,6 +107,48 @@ def canonical_bytes(value: Any) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
+
+
+def assert_probe_digest_safe(value: Any, *, path: tuple[str, ...] = ()) -> None:
+    if isinstance(value, dict):
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            normalized = key.casefold().replace("-", "_")
+            if (
+                key not in ALLOWED_SENSITIVE_METADATA_FIELDS
+                and any(
+                    normalized == token
+                    or normalized.startswith(f"{token}_")
+                    or normalized.endswith(f"_{token}")
+                    for token in SENSITIVE_PROBE_FIELD_TOKENS
+                )
+            ):
+                location = ".".join((*path, key))
+                raise ProbeSchedulerError(
+                    f"probe digest payload contains sensitive field: {location}"
+                )
+            assert_probe_digest_safe(nested, path=(*path, key))
+        return
+    if isinstance(value, list):
+        for index, nested in enumerate(value):
+            assert_probe_digest_safe(nested, path=(*path, str(index)))
+
+
+def probe_digest(value: dict[str, Any]) -> str:
+    missing = [field for field in PROBE_DIGEST_FIELDS if field not in value]
+    if missing:
+        raise ProbeSchedulerError(
+            f"probe digest payload is missing fields: {', '.join(missing)}"
+        )
+    projection = {field: value[field] for field in PROBE_DIGEST_FIELDS}
+    assert_probe_digest_safe(projection)
+    payload = json.dumps(
+        projection,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(PROBE_DIGEST_DOMAIN, payload, hashlib.sha256).hexdigest()
 
 
 def value_sha256(value: Any) -> str:
@@ -516,10 +588,63 @@ def validate_probe(probe: dict[str, Any]) -> None:
         raise ProbeSchedulerError("probe digest is invalid")
     digest_input = dict(probe)
     digest_input.pop("catalog_probe_sha256", None)
-    if digest != value_sha256(digest_input):
+    if digest != probe_digest(digest_input):
         raise ProbeSchedulerError("probe digest does not match its payload")
+    expected_fields = set(PROBE_DIGEST_FIELDS) | {"catalog_probe_sha256"}
+    if set(probe) != expected_fields:
+        raise ProbeSchedulerError("probe fields do not match the exact metadata-only schema")
+    assert_probe_digest_safe(digest_input)
+    for field in ("model_invocations", "paid_api_requests_authorized"):
+        value = probe.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            raise ProbeSchedulerError(f"probe {field} must be integer zero")
+    scrubbed_environment = probe.get("api_key_environment_scrubbed")
+    if (
+        not isinstance(scrubbed_environment, list)
+        or any(not isinstance(name, str) for name in scrubbed_environment)
+        or len(set(scrubbed_environment)) != len(scrubbed_environment)
+        or set(scrubbed_environment) != set(EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV)
+    ):
+        raise ProbeSchedulerError("probe api_key_environment_scrubbed is invalid")
     if not isinstance(probe.get("providers"), dict):
         raise ProbeSchedulerError("probe providers are missing")
+    verified_pools = probe.get("verified_quota_pools", [])
+    if (
+        not isinstance(verified_pools, list)
+        or any(not isinstance(pool_id, str) for pool_id in verified_pools)
+        or len(set(verified_pools)) != len(verified_pools)
+        or any(
+            pool_id not in {"grok-com", "jules-account"}
+            for pool_id in verified_pools
+        )
+    ):
+        raise ProbeSchedulerError("probe verified_quota_pools is invalid")
+
+
+def _expected_probe_pools(
+    before: dict[str, Any],
+    probe: dict[str, Any],
+    *,
+    catalog_changed: bool,
+) -> dict[str, Any]:
+    pools = {} if catalog_changed else json.loads(
+        json.dumps(before.get("pools", {}), sort_keys=True)
+    )
+    if not isinstance(pools, dict):
+        raise ProbeSchedulerError("router pool state before probe is invalid")
+    verified_pools = set(probe.get("verified_quota_pools", []))
+    for pool_id in ("grok-com", "jules-account"):
+        existing = pools.get(pool_id)
+        if pool_id in verified_pools:
+            if existing is not None and not isinstance(existing, dict):
+                raise ProbeSchedulerError("verified pool state before probe is invalid")
+            pools[pool_id] = {
+                **(existing if isinstance(existing, dict) else {}),
+                "verified_at": probe["observed_at"],
+            }
+        elif isinstance(existing, dict):
+            existing.pop("verified_at", None)
+    return pools
 
 
 def validate_state_after_probe(
@@ -533,8 +658,31 @@ def validate_state_after_probe(
         raise ProbeSchedulerError("router state is not bound to the probe output")
     if after.get("history", {}) != before.get("history", {}):
         raise ProbeSchedulerError("probe changed router history")
-    if after.get("routes", {}) != before.get("routes", {}):
-        raise ProbeSchedulerError("probe changed route outcome history")
+    before_catalog_sha256 = before.get("catalog_sha256")
+    after_catalog_sha256 = after.get("catalog_sha256")
+    if not isinstance(after_catalog_sha256, str) or not after_catalog_sha256:
+        raise ProbeSchedulerError("router state catalog_sha256 is invalid")
+    catalog_changed = before_catalog_sha256 != after_catalog_sha256
+    expected_routes = {} if catalog_changed else before.get("routes", {})
+    if not isinstance(expected_routes, dict):
+        raise ProbeSchedulerError("router route history before probe is invalid")
+    if after.get("routes", {}) != expected_routes:
+        reason = (
+            "probe did not reset route history after catalog change"
+            if catalog_changed
+            else "probe changed route outcome history"
+        )
+        raise ProbeSchedulerError(reason)
+    expected_pools = _expected_probe_pools(
+        before, probe, catalog_changed=catalog_changed
+    )
+    if after.get("pools", {}) != expected_pools:
+        reason = (
+            "probe did not reset pool state after catalog change"
+            if catalog_changed
+            else "probe changed pool state beyond verified timestamps"
+        )
+        raise ProbeSchedulerError(reason)
     if not isinstance(after.get("routes", {}), dict):
         raise ProbeSchedulerError("router route history is invalid")
     if not isinstance(after.get("pools", {}), dict):
@@ -566,7 +714,7 @@ def bounded_failure(exc: BaseException) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Refresh the advisory coding-agent catalog without model execution."
+        description="Refresh advisory coding-agent runtime metadata without model execution."
     )
     result.add_argument("--router", type=Path, default=DEFAULT_ROUTER)
     result.add_argument(

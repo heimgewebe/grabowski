@@ -88,6 +88,102 @@ class AgentCompetitionTests(unittest.TestCase):
             patcher.stop()
         self.temporary.cleanup()
 
+
+    def _route_selection(self, *, max_candidates: int, allow_paid: bool) -> dict:
+        routes = [
+            {
+                "route": "codex-sol-high",
+                "harness": "codex",
+                "model": "gpt-5.6-sol",
+                "paid_only": False,
+                "execution_eligible_if_separately_authorized": True,
+            }
+        ]
+        if allow_paid and max_candidates >= 2:
+            routes.append(
+                {
+                    "route": "claude-fable-5-contrast-high",
+                    "harness": "claude",
+                    "model": "claude-fable-5",
+                    "paid_only": True,
+                    "execution_eligible_if_separately_authorized": True,
+                }
+            )
+        return {
+            "status": "recommended",
+            "state_error_type": None,
+            "catalog_sha256": "a" * 64,
+            "routes": routes[:max_candidates],
+            "excluded": {},
+        }
+
+    def _route_contract(self, route_id: str, *, paid: bool = False) -> dict:
+        if route_id == "codex-sol-high":
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "codex",
+                "harness_binary": "codex",
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+                "argv_prefix": ["codexr", "architecture"],
+                "permission_mode": None,
+                "quota_pools": ["openai-agentic"],
+                "paid_only": False,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
+        elif route_id == "agy-gemini-flash-medium":
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "agy",
+                "harness_binary": "agy",
+                "model": "gemini-3.5-flash",
+                "effort": "medium",
+                "argv_prefix": ["agy", "--model", "Gemini 3.5 Flash (Medium)"],
+                "permission_mode": None,
+                "quota_pools": ["agy-gemini", "agy-account"],
+                "paid_only": False,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
+        else:
+            if not paid:
+                raise competition.coding_router.CodingAgentRouterError(
+                    "paid-only route requires explicit paid execution authorization"
+                )
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "claude",
+                "harness_binary": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+                "argv_prefix": [
+                    "claude",
+                    "-p",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--model",
+                    "claude-fable-5",
+                    "--effort",
+                    "high",
+                ],
+                "permission_mode": "acceptEdits",
+                "quota_pools": ["claude-pro"],
+                "paid_only": True,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
+        return {
+            **contract,
+            "route_contract_sha256": competition._sha256_json(contract),
+        }
+
     def _task_start(self, task_id: str):
         return {
             "task": {
@@ -141,6 +237,7 @@ class AgentCompetitionTests(unittest.TestCase):
         patch: str = "",
     ) -> dict:
         manifest = competition._validated_manifest(identifier)
+        packet = competition._validated_packet(identifier)
         provider_workspace = self.state / identifier / "provider-workspace"
         prompt = b"test provider prompt\n"
         prompt_path = provider_workspace / "prompt.txt"
@@ -169,14 +266,29 @@ class AgentCompetitionTests(unittest.TestCase):
             },
             "patch_rejection": None,
         }
-        if manifest["provider"] == "claude":
+        if manifest["schema_version"] == 3 and manifest["provider"] == "codex":
+            command = [
+                "codexr",
+                manifest["route_contract"]["argv_prefix"][1],
+                "exec",
+                "--sandbox",
+                "read-only",
+            ]
+        elif manifest["schema_version"] == 3 and manifest["provider"] == "agy":
+            command = [
+                *manifest["route_contract"]["argv_prefix"],
+                "--mode",
+                "plan",
+                "--sandbox",
+            ]
+        elif manifest["provider"] == "claude":
             command = ["claude", "-p", "--output-format", "json", "--tools="]
         else:
             command = ["agy", "--mode", "plan", "--sandbox"]
         snapshot = {
             "head": self.head,
             "commit_bound": True,
-            "context_count": 2,
+            "context_count": len(packet["context"]),
             "worktree_clean_required": False,
         }
         receipt = {
@@ -214,8 +326,10 @@ class AgentCompetitionTests(unittest.TestCase):
                 "correctness", "test_pass", "review_pass", "merge_readiness", "preferred_candidate"
             ],
         }
-        if manifest["schema_version"] == 2:
+        if manifest["schema_version"] >= 2:
             receipt["budget_contract"] = manifest["budget_contract"]
+        if manifest["schema_version"] == 3:
+            receipt["route_contract"] = manifest["route_contract"]
         receipt["receipt_sha256"] = competition._sha256_json(receipt)
         competition._atomic_json(self.state / identifier / "receipt.json", receipt)
         return receipt
@@ -275,23 +389,76 @@ class AgentCompetitionTests(unittest.TestCase):
             available_external_agents=["claude", "agy"],
         )
         self.assertEqual(direct["execution_mode"], "direct_operator")
-        competitive = competition.grabowski_agent_execution_route(
-            task_kind="code",
-            changed_file_estimate=12,
-            expected_duration_minutes=180,
-            novelty="high",
-            risk_flags=["security", "concurrency"],
-            user_requested_external=True,
-            available_external_agents=["claude", "agy"],
-            decision_fork=True,
-            architecture_hypotheses=2,
-        )
-        self.assertEqual(competitive["execution_mode"], "workspace_with_competition")
+        with mock.patch.object(
+            competition.coding_router,
+            "select_contrast_routes",
+            side_effect=lambda *args, **kwargs: self._route_selection(
+                max_candidates=kwargs["max_candidates"],
+                allow_paid=kwargs["allow_paid"],
+            ),
+        ):
+            competitive = competition.grabowski_agent_execution_route(
+                task_kind="code",
+                changed_file_estimate=12,
+                expected_duration_minutes=180,
+                novelty="high",
+                risk_flags=["security", "concurrency"],
+                user_requested_external=True,
+                available_external_agents=["codex", "claude"],
+                decision_fork=True,
+                architecture_hypotheses=2,
+                paid_execution_authorized=True,
+            )
+        self.assertEqual(competitive["execution_mode"], "direct_operator")
         self.assertEqual(competitive["risk_tier"], "R3")
-        self.assertEqual(competitive["route_policy_version"], "workspace-routing-v2.1")
+        self.assertEqual(competitive["route_policy_version"], "direct-first-routing-v3.0")
         self.assertFalse(competitive["automatic_winner_selection"])
+        self.assertTrue(competitive["direct_implementation_required"])
+        self.assertTrue(competitive["external_primary_writer_forbidden"])
+        self.assertFalse(competitive["full_workspace"])
         self.assertEqual(len(competitive["external_candidates"]), 2)
+        self.assertEqual(
+            [item["route_id"] for item in competitive["external_route_candidates"]],
+            ["codex-sol-high", "claude-fable-5-contrast-high"],
+        )
+        self.assertTrue(competitive["external_route_candidates"][1]["paid_only"])
 
+
+    def test_direct_first_route_recommendation_id_is_workspace_schema2_compatible(self) -> None:
+        with mock.patch.object(
+            competition.coding_router,
+            "select_contrast_routes",
+            side_effect=lambda *args, **kwargs: self._route_selection(
+                max_candidates=kwargs["max_candidates"],
+                allow_paid=kwargs["allow_paid"],
+            ),
+        ):
+            routed = competition.grabowski_agent_execution_route(
+                task_kind="code",
+                changed_file_estimate=12,
+                expected_duration_minutes=180,
+                novelty="high",
+                risk_flags=["schema"],
+                user_requested_external=True,
+                available_external_agents=["codex"],
+            )
+        evidence = {
+            "schema_version": 2,
+            "route_policy_version": routed["route_policy_version"],
+            "risk_tier": routed["risk_tier"],
+            "parallel_writer_pilot": routed["parallel_writer_pilot"],
+            "recommendation_id": routed["recommendation_id"],
+            "score": routed["score"],
+            "recommended_route": routed["execution_mode"],
+            "actual_route": "workspace_with_contrast",
+            "input_facts": routed["input_facts"],
+            "external_candidates": routed["external_candidates"],
+            "deviation_reason": "explicit advisory contrast workspace requested after direct operator planning",
+        }
+        normalized = competition.workspace._normalize_route_evidence(evidence)
+        self.assertEqual(normalized["status"], "verified")
+        self.assertTrue(normalized["evidence_complete"])
+        self.assertEqual(normalized["recommendation_id"], routed["recommendation_id"])
 
     def test_route_v21_keeps_routine_code_out_of_full_workspace(self) -> None:
         four_files = competition.grabowski_agent_execution_route(
@@ -308,8 +475,8 @@ class AgentCompetitionTests(unittest.TestCase):
             novelty="low",
             available_external_agents=["claude"],
         )
-        self.assertEqual(four_files["execution_mode"], "isolated_worktree")
-        self.assertEqual(six_files["execution_mode"], "isolated_worktree")
+        self.assertEqual(four_files["execution_mode"], "direct_operator")
+        self.assertEqual(six_files["execution_mode"], "direct_operator")
         self.assertEqual(four_files["risk_tier"], "R1")
         self.assertFalse(four_files["full_workspace"])
 
@@ -321,19 +488,26 @@ class AgentCompetitionTests(unittest.TestCase):
             novelty="high",
             risk_flags=["schema"],
             user_requested_external=True,
-            available_external_agents=["claude", "agy"],
+            available_external_agents=["codex", "claude"],
         )
-        contrast = competition.grabowski_agent_execution_route(**base)
-        competition_route = competition.grabowski_agent_execution_route(
-            **base,
-            decision_fork=True,
-            architecture_hypotheses=2,
-        )
-        self.assertEqual(contrast["execution_mode"], "workspace_with_contrast")
+        with mock.patch.object(
+            competition.coding_router,
+            "select_contrast_routes",
+            side_effect=lambda *args, **kwargs: self._route_selection(
+                max_candidates=kwargs["max_candidates"],
+                allow_paid=kwargs["allow_paid"],
+            ),
+        ):
+            contrast = competition.grabowski_agent_execution_route(**base)
+            competition_route = competition.grabowski_agent_execution_route(
+                **base,
+                decision_fork=True,
+                architecture_hypotheses=2,
+                paid_execution_authorized=True,
+            )
+        self.assertEqual(contrast["execution_mode"], "direct_operator")
         self.assertEqual(len(contrast["external_candidates"]), 1)
-        self.assertEqual(
-            competition_route["execution_mode"], "workspace_with_competition"
-        )
+        self.assertEqual(competition_route["execution_mode"], "direct_operator")
         self.assertEqual(len(competition_route["external_candidates"]), 2)
 
     def test_parallelization_candidate_does_not_authorize_or_change_live_route(self) -> None:
@@ -351,8 +525,12 @@ class AgentCompetitionTests(unittest.TestCase):
         )
         self.assertEqual(candidate["score"], baseline["score"])
         self.assertEqual(candidate["execution_mode"], baseline["execution_mode"])
-        self.assertTrue(
+        self.assertFalse(
             candidate["parallel_writer_pilot"]["eligible_for_assessment"]
+        )
+        self.assertIn(
+            "direct-first policy",
+            candidate["parallel_writer_pilot"]["assessment_blockers"][0],
         )
         self.assertFalse(
             candidate["parallel_writer_pilot"]["execution_authorized"]
@@ -972,7 +1150,7 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_default_zero_budget_blocks_before_provider_task_start(self) -> None:
         with mock.patch.object(competition.tasks, "grabowski_task_start") as start:
-            with self.assertRaisesRegex(competition.AgentCompetitionError, "zero-cost policy blocks"):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "legacy provider-only execution"):
                 competition.grabowski_agent_competition_start(
                     request_id="zero-cost-default",
                     provider="claude",
@@ -985,6 +1163,213 @@ class AgentCompetitionTests(unittest.TestCase):
                     timeout_seconds=120,
                 )
         start.assert_not_called()
+
+
+    def test_route_bound_codex_start_uses_zero_budget_and_schema3(self) -> None:
+        contract = self._route_contract("codex-sol-high")
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-codex-route"),
+            ) as start,
+        ):
+            result = competition.grabowski_agent_competition_start(
+                request_id="codex-route-zero",
+                provider="codex",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Contrast sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="codex-sol-high",
+            )
+        packet = competition._validated_packet(result["competition_id"])
+        self.assertEqual(packet["schema_version"], 3)
+        self.assertEqual(packet["route_contract"]["route_id"], "codex-sol-high")
+        self.assertEqual(packet["budget_contract"]["requested_max_usd"], 0)
+        self.assertFalse(packet["budget_contract"]["paid_execution_authorized"])
+        self.assertEqual(result["route_id"], "codex-sol-high")
+        start.assert_called_once()
+
+    def test_route_bound_codex_receipt_preserves_route_and_zero_budget_binding(self) -> None:
+        contract = self._route_contract("codex-sol-high")
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-codex-receipt"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id="codex-route-receipt",
+                provider="codex",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Contrast sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="codex-sol-high",
+            )
+        self._write_receipt(
+            started["competition_id"], changed_paths=[], risks=[], tests=[]
+        )
+        manifest = competition._validated_manifest(started["competition_id"])
+        receipt = competition._receipt(started["competition_id"], manifest)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["route_contract"], contract)
+        self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
+        self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
+
+    def test_route_bound_codex_receipt_rejects_non_read_only_sandbox_binding(self) -> None:
+        contract = self._route_contract("codex-sol-high")
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-codex-sandbox-binding"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id="codex-sandbox-binding",
+                provider="codex",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Contrast sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="codex-sol-high",
+            )
+        receipt = self._write_receipt(
+            started["competition_id"], changed_paths=[], risks=[], tests=[]
+        )
+        packet = competition._validated_packet(started["competition_id"])
+        command = list(receipt["command_shape"])
+        command[command.index("--sandbox") + 1] = "workspace-write"
+        command.append("read-only")
+        receipt["command_shape"] = command
+        receipt["command_sha256"] = competition._sha256_json(command)
+        with self.assertRaisesRegex(
+            competition.AgentCompetitionError, "Codex command shape"
+        ):
+            competition._validate_receipt_execution(receipt, packet)
+
+    def test_route_bound_agy_receipt_preserves_route_and_zero_budget_binding(self) -> None:
+        contract = self._route_contract("agy-gemini-flash-medium")
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-agy-receipt"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id="agy-route-receipt",
+                provider="agy",
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Contrast sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="agy-gemini-flash-medium",
+            )
+        self._write_receipt(
+            started["competition_id"], changed_paths=[], risks=[], tests=[]
+        )
+        manifest = competition._validated_manifest(started["competition_id"])
+        receipt = competition._receipt(started["competition_id"], manifest)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["route_contract"], contract)
+        self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
+        self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
+
+    def test_route_bound_fable_requires_paid_authorization_and_positive_policy_cap(self) -> None:
+        with mock.patch.object(
+            competition.coding_router,
+            "contrast_route_execution_contract",
+            side_effect=competition.coding_router.CodingAgentRouterError(
+                "paid-only route requires explicit paid execution authorization"
+            ),
+        ):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "paid-only route"):
+                competition.grabowski_agent_competition_start(
+                    request_id="fable-no-paid-auth",
+                    provider="claude",
+                    mode="contrast",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task="Contrast sample",
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py"],
+                    max_budget_usd=1,
+                    route_id="claude-fable-5-contrast-high",
+                )
+
+        contract = self._route_contract(
+            "claude-fable-5-contrast-high", paid=True
+        )
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {competition.EXTERNAL_PROVIDER_BUDGET_CAP_ENV: "0"},
+                clear=False,
+            ),
+        ):
+            with self.assertRaisesRegex(competition.AgentCompetitionError, "policy cap of 0 USD"):
+                competition.grabowski_agent_competition_start(
+                    request_id="fable-zero-cap",
+                    provider="claude",
+                    mode="contrast",
+                    repository=str(self.repo),
+                    expected_head=self.head,
+                    task="Contrast sample",
+                    allowed_paths=["src", "tests"],
+                    context_paths=["src/sample.py"],
+                    max_budget_usd=1,
+                    route_id="claude-fable-5-contrast-high",
+                    paid_execution_authorized=True,
+                )
 
     def test_positive_budget_is_blocked_by_zero_runtime_policy_cap(self) -> None:
         with (
@@ -1291,7 +1676,7 @@ class AgentCompetitionTests(unittest.TestCase):
             risk_flags=["security"],
             available_external_agents=["claude", "agy"],
         )
-        self.assertEqual(result["execution_mode"], "full_workspace")
+        self.assertEqual(result["execution_mode"], "direct_operator")
         self.assertEqual(result["external_candidates"], [])
 
 

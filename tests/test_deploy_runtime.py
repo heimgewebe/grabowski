@@ -147,6 +147,49 @@ class DeployRuntimeTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(len(first), 64)
 
+    def test_source_set_sha256_separates_schema_three_empty_assets(self) -> None:
+        def snapshot(schema_version: int) -> deploy_runtime.Snapshot:
+            contract = deploy_runtime.RuntimeContract(
+                schema_version=schema_version,
+                mode="module",
+                module="grabowski_mcp",
+                source=Path("src/grabowski_mcp.py"),
+                expected_tools=("grabowski_status",),
+            )
+            return deploy_runtime.Snapshot(
+                repo_head="a" * 40,
+                dirty=False,
+                contract=contract,
+                contract_bytes=json.dumps(contract.to_manifest()).encode(),
+                runtime_input_bytes=b"mcp==1.27.2\n",
+                runtime_lock_bytes=b"lock\n",
+                source_bytes=b"print('same source')\n",
+            )
+
+        schema_two = snapshot(2)
+        schema_three = snapshot(3)
+        expected_schema_two = deploy_runtime.sha256_bytes(
+            json.dumps(
+                schema_two.source_sha256s,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        expected_schema_three = deploy_runtime.sha256_bytes(
+            json.dumps(
+                {
+                    "runtime_assets": {},
+                    "sources": schema_three.source_sha256s,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+        self.assertEqual(schema_two.source_set_sha256, expected_schema_two)
+        self.assertEqual(schema_three.source_set_sha256, expected_schema_three)
+        self.assertNotEqual(schema_two.source_set_sha256, schema_three.source_set_sha256)
+
     def test_module_entrypoint_contract_loads(self) -> None:
         raw = json.dumps(
             {

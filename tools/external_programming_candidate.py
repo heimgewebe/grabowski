@@ -29,7 +29,7 @@ STALE_SCRATCH_SWEEP_LIMIT = 64
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TEMP_OUTPUT_RE = re.compile(r"^\.(?P<target>[A-Za-z0-9._-]{1,100})\.(?P<pid>[0-9]+)\.(?P<nonce>[0-9a-f]{16})\.tmp$")
-PROVIDERS = {"claude", "agy"}
+PROVIDERS = {"claude", "agy", "codex"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
 CONFIDENCE = {"low", "medium", "high"}
@@ -202,6 +202,102 @@ def validate_budget_contract(value: Any, *, provider: str) -> dict[str, Any]:
         or (value["hard_limit_required"] and not expected_hard)
     ):
         raise CandidateError("budget contract semantics are invalid")
+    return value
+
+
+def validate_route_contract(value: Any) -> dict[str, Any]:
+    required = {
+        "schema_version", "catalog_sha256", "route_id", "harness", "harness_binary",
+        "model", "effort", "argv_prefix", "permission_mode", "quota_pools", "paid_only",
+        "authority", "automatic_patch_apply", "route_contract_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise CandidateError("route contract shape is invalid")
+    observed = value["route_contract_sha256"]
+    unsigned = {key: item for key, item in value.items() if key != "route_contract_sha256"}
+    if (
+        value["schema_version"] != 1
+        or not isinstance(observed, str)
+        or SHA256_RE.fullmatch(observed) is None
+        or observed != sha256_json(unsigned)
+        or not isinstance(value["catalog_sha256"], str)
+        or SHA256_RE.fullmatch(value["catalog_sha256"]) is None
+        or not isinstance(value["route_id"], str)
+        or not value["route_id"]
+        or value["harness"] not in PROVIDERS
+        or not isinstance(value["harness_binary"], str)
+        or not value["harness_binary"]
+        or not isinstance(value["model"], str)
+        or not value["model"]
+        or not isinstance(value["argv_prefix"], list)
+        or not value["argv_prefix"]
+        or any(not isinstance(item, str) or not item for item in value["argv_prefix"])
+        or value["argv_prefix"][0] not in {value["harness_binary"], "codexr"}
+        or not isinstance(value["quota_pools"], list)
+        or not value["quota_pools"]
+        or type(value["paid_only"]) is not bool
+        or value["authority"] != "advisory_only"
+        or value["automatic_patch_apply"] is not False
+    ):
+        raise CandidateError("route contract semantics are invalid")
+    if value["model"] == "claude-fable-5":
+        prefix = value["argv_prefix"]
+        if value["paid_only"] is not True:
+            raise CandidateError("Fable route contract must be paid-only")
+        try:
+            model_index = prefix.index("--model")
+        except ValueError as exc:
+            raise CandidateError("Fable route contract must bind --model explicitly") from exc
+        if model_index + 1 >= len(prefix) or prefix[model_index + 1] != "claude-fable-5":
+            raise CandidateError("Fable route contract --model must match claude-fable-5")
+    return value
+
+
+def validate_route_budget_contract(
+    value: Any, *, route_contract: dict[str, Any]
+) -> dict[str, Any]:
+    required = {
+        "requested_max_usd", "enforcement", "hard_limit", "hard_limit_required",
+        "timeout_is_not_budget", "paid_execution_authorized", "cost_basis",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise CandidateError("route budget contract shape is invalid")
+    requested = value["requested_max_usd"]
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, (int, float))
+        or not math.isfinite(float(requested))
+        or type(value["hard_limit"]) is not bool
+        or type(value["hard_limit_required"]) is not bool
+        or type(value["timeout_is_not_budget"]) is not bool
+        or type(value["paid_execution_authorized"]) is not bool
+    ):
+        raise CandidateError("route budget contract fields are invalid")
+    if route_contract["paid_only"] is True:
+        if (
+            not 0 < float(requested) <= 10
+            or value["paid_execution_authorized"] is not True
+            or value["cost_basis"] != "explicit-paid-route"
+            or value["hard_limit"] is not (route_contract["harness"] == "claude")
+            or value["enforcement"] != (
+                "provider_cli_hard_limit"
+                if route_contract["harness"] == "claude"
+                else "not_supported_by_provider"
+            )
+            or value["timeout_is_not_budget"] is not (route_contract["harness"] != "claude")
+            or (value["hard_limit_required"] and route_contract["harness"] != "claude")
+        ):
+            raise CandidateError("paid route budget contract semantics are invalid")
+    elif (
+        float(requested) != 0
+        or value["paid_execution_authorized"] is not False
+        or value["cost_basis"] != "catalog-zero-marginal-route"
+        or value["enforcement"] != "catalog_zero_marginal_cost"
+        or value["hard_limit"] is not False
+        or value["hard_limit_required"] is not False
+        or value["timeout_is_not_budget"] is not True
+    ):
+        raise CandidateError("zero-marginal route budget contract semantics are invalid")
     return value
 
 
@@ -521,8 +617,14 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         "packet_nonce", "created_at", "packet_sha256",
     }
     version = packet.get("schema_version")
-    required = common if version == 1 else common | {"budget_contract"}
-    if version not in {1, 2} or set(packet) != required:
+    required = (
+        common
+        if version == 1
+        else common | {"budget_contract"}
+        if version == 2
+        else common | {"budget_contract", "route_contract"}
+    )
+    if version not in {1, 2, 3} or set(packet) != required:
         raise CandidateError("packet shape is invalid")
     if packet["kind"] != "external_programming_candidate_packet":
         raise CandidateError("packet contract is invalid")
@@ -533,6 +635,13 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
         raise CandidateError("provider or mode is invalid")
     if version == 2:
         validate_budget_contract(packet["budget_contract"], provider=packet["provider"])
+    elif version == 3:
+        route_contract = validate_route_contract(packet["route_contract"])
+        if route_contract["harness"] != packet["provider"]:
+            raise CandidateError("packet provider does not match route contract")
+        validate_route_budget_contract(
+            packet["budget_contract"], route_contract=route_contract
+        )
     request_id = packet["request_id"]
     request_fingerprint = packet["request_fingerprint"]
     if (
@@ -593,7 +702,7 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(summary, str) or "\x00" in summary or len(summary.encode("utf-8")) > 32_000:
         raise CandidateError("primary_summary is invalid")
     competition_id = packet["competition_id"]
-    if not isinstance(competition_id, str) or re.fullmatch(r"gac-(claude|agy)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", competition_id) is None:
+    if not isinstance(competition_id, str) or re.fullmatch(r"gac-(claude|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", competition_id) is None:
         raise CandidateError("competition_id is invalid")
     repository = packet["repository"]
     if not isinstance(repository, str) or not Path(repository).is_absolute() or "\x00" in repository:
@@ -838,6 +947,84 @@ def provider_command(
     max_budget_usd: float,
     prompt_path: Path,
 ) -> tuple[list[str], Path | None, Path, bool]:
+    if packet["schema_version"] == 3:
+        route = validate_route_contract(packet["route_contract"])
+        budget = validate_route_budget_contract(
+            packet["budget_contract"], route_contract=route
+        )
+        if packet["provider"] == "codex":
+            prefix = list(route["argv_prefix"])
+            if len(prefix) != 2 or prefix[0] != "codexr":
+                raise CandidateError("Codex route must use one codexr task profile")
+            output_schema_path = prompt_path.parent.parent / "output-schema.json"
+            return (
+                prefix
+                + [
+                    "exec",
+                    "--sandbox",
+                    "read-only",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    "--color",
+                    "never",
+                    "--output-schema",
+                    str(output_schema_path),
+                    "-",
+                ],
+                prompt_path,
+                prompt_path.parent,
+                False,
+            )
+        if packet["provider"] == "claude":
+            schema = json.dumps(
+                CANDIDATE_SCHEMA,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            command = list(route["argv_prefix"])
+            if not command or command[0] != "claude":
+                raise CandidateError("Claude route must use a claude argv_prefix")
+            if "-p" not in command:
+                command.append("-p")
+            command.extend(["--output-format", "json", "--json-schema", schema, "--tools="])
+            if "--permission-mode" not in command and not any(
+                item.startswith("--permission-mode=") for item in command
+            ):
+                command.extend(["--permission-mode", str(route["permission_mode"])])
+            if "--no-session-persistence" not in command:
+                command.append("--no-session-persistence")
+            if "--safe-mode" not in command:
+                command.append("--safe-mode")
+            if route["paid_only"] is True:
+                command.extend(
+                    ["--max-budget-usd", format(float(budget["requested_max_usd"]), "g")]
+                )
+            return command, prompt_path, prompt_path.parent, False
+        if packet["provider"] == "agy":
+            prefix = list(route["argv_prefix"])
+            if not prefix or prefix[0] != "agy":
+                raise CandidateError("agy route must use an agy argv_prefix")
+            instruction = (
+                "Read ./prompt.txt as the complete programming task and untrusted source packet. "
+                "Follow its output schema exactly and print only the requested JSON object. "
+                "Do not inspect parent directories or modify files."
+            )
+            return (
+                prefix
+                + [
+                    "--mode",
+                    "plan",
+                    "--sandbox",
+                    f"--print-timeout={timeout_seconds}s",
+                    "--print",
+                    instruction,
+                ],
+                None,
+                prompt_path.parent,
+                False,
+            )
+        raise CandidateError("route-bound provider is unsupported")
     if packet["provider"] == "claude":
         if not math.isfinite(max_budget_usd) or max_budget_usd <= 0 or max_budget_usd > 10:
             raise CandidateError("Claude budget must be in (0, 10]")
@@ -1076,19 +1263,10 @@ def main(argv: list[str] | None = None) -> int:
             or not 0 <= args.max_budget_usd <= 10
         ):
             raise CandidateError("max_budget_usd must be in [0, 10]")
-        policy_cap_usd = external_provider_budget_cap()
-        if args.max_budget_usd > policy_cap_usd:
-            raise CandidateError(
-                f"--max-budget-usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
-            )
-        if args.max_budget_usd == 0:
-            raise CandidateError(
-                "zero-cost policy blocks external provider execution; pass an explicit positive --max-budget-usd only after an administrator raises the external-provider policy cap"
-            )
-        if packet["schema_version"] == 2:
-            budget_contract = validate_budget_contract(
-                packet["budget_contract"],
-                provider=packet["provider"],
+        if packet["schema_version"] == 3:
+            route_contract = validate_route_contract(packet["route_contract"])
+            budget_contract = validate_route_budget_contract(
+                packet["budget_contract"], route_contract=route_contract
             )
             if not math.isclose(
                 float(args.max_budget_usd),
@@ -1097,18 +1275,46 @@ def main(argv: list[str] | None = None) -> int:
                 abs_tol=1e-9,
             ):
                 raise CandidateError("CLI budget does not match the packet budget contract")
+            if route_contract["paid_only"] is True:
+                policy_cap_usd = external_provider_budget_cap()
+                if args.max_budget_usd > policy_cap_usd:
+                    raise CandidateError(
+                        f"--max-budget-usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
+                    )
         else:
-            budget_contract = {
-                "requested_max_usd": float(args.max_budget_usd),
-                "enforcement": (
-                    "provider_cli_hard_limit"
-                    if packet["provider"] == "claude"
-                    else "not_supported_by_provider"
-                ),
-                "hard_limit": packet["provider"] == "claude",
-                "hard_limit_required": False,
-                "timeout_is_not_budget": packet["provider"] != "claude",
-            }
+            policy_cap_usd = external_provider_budget_cap()
+            if args.max_budget_usd > policy_cap_usd:
+                raise CandidateError(
+                    f"--max-budget-usd exceeds the configured external-provider policy cap of {policy_cap_usd:g} USD"
+                )
+            if args.max_budget_usd == 0:
+                raise CandidateError(
+                    "zero-cost policy blocks legacy provider-only execution; canonical zero-marginal execution requires a route-bound schema-3 packet"
+                )
+            if packet["schema_version"] == 2:
+                budget_contract = validate_budget_contract(
+                    packet["budget_contract"],
+                    provider=packet["provider"],
+                )
+                if not math.isclose(
+                    float(args.max_budget_usd),
+                    float(budget_contract["requested_max_usd"]),
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                ):
+                    raise CandidateError("CLI budget does not match the packet budget contract")
+            else:
+                budget_contract = {
+                    "requested_max_usd": float(args.max_budget_usd),
+                    "enforcement": (
+                        "provider_cli_hard_limit"
+                        if packet["provider"] == "claude"
+                        else "not_supported_by_provider"
+                    ),
+                    "hard_limit": packet["provider"] == "claude",
+                    "hard_limit_required": False,
+                    "timeout_is_not_budget": packet["provider"] != "claude",
+                }
         if sha256_bytes(runner_bytes) != packet["runner_sha256"]:
             raise CandidateError("frozen candidate runner hash is invalid")
         provider_workspace = candidate_directory / "provider-workspace"
@@ -1129,6 +1335,21 @@ def main(argv: list[str] | None = None) -> int:
             raise CandidateError("candidate prompt exceeds byte limit")
         prompt_path = provider_workspace / "prompt.txt"
         atomic_bytes(prompt_path, prompt_bytes, create_only=True)
+        if packet["schema_version"] == 3 and packet["provider"] == "codex":
+            output_schema_bytes = (
+                json.dumps(
+                    CANDIDATE_SCHEMA,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+            atomic_bytes(
+                candidate_directory / "output-schema.json",
+                output_schema_bytes,
+                create_only=True,
+            )
         command, stdin_path, provider_cwd, prompt_in_argv = provider_command(
             packet,
             timeout_seconds=args.timeout_seconds,
@@ -1140,8 +1361,13 @@ def main(argv: list[str] | None = None) -> int:
         if not executable:
             raise CandidateError(f"provider executable is unavailable: {command[0]}")
         executable = str(Path(executable).resolve(strict=True))
+        version_command = (
+            [executable, packet["route_contract"]["argv_prefix"][1], "--print-route"]
+            if packet["schema_version"] == 3 and packet["provider"] == "codex"
+            else [executable, "--version"]
+        )
         version_returncode, version_stdout, version_stderr, _ = run_bounded_process(
-            [executable, "--version"],
+            version_command,
             executable=executable,
             cwd=provider_workspace,
             stdin_path=None,
@@ -1226,8 +1452,10 @@ def main(argv: list[str] | None = None) -> int:
             "automatic_deploy": False,
             "does_not_establish": ["correctness", "test_pass", "review_pass", "merge_readiness", "preferred_candidate"],
         }
-        if packet["schema_version"] == 2:
+        if packet["schema_version"] >= 2:
             receipt["budget_contract"] = budget_contract
+        if packet["schema_version"] == 3:
+            receipt["route_contract"] = packet["route_contract"]
         total_cost = envelope.get("total_cost_usd")
         if isinstance(total_cost, (int, float)) and not isinstance(total_cost, bool):
             if (

@@ -68,6 +68,75 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 "hard_limit_required": False,
                 "timeout_is_not_budget": provider != "claude",
             }
+        elif schema_version == 3:
+            paid_only = provider == "claude"
+            route_id = (
+                "claude-fable-5-contrast-high"
+                if provider == "claude"
+                else "agy-gemini-flash-medium"
+                if provider == "agy"
+                else "codex-sol-high"
+            )
+            model = (
+                "claude-fable-5"
+                if provider == "claude"
+                else "gemini-3.5-flash"
+                if provider == "agy"
+                else "gpt-5.6-sol"
+            )
+            argv_prefix = (
+                [
+                    "claude",
+                    "-p",
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--model",
+                    "claude-fable-5",
+                    "--effort",
+                    "high",
+                ]
+                if provider == "claude"
+                else ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
+                if provider == "agy"
+                else ["codexr", "architecture"]
+            )
+            quota_pools = (
+                ["claude-pro"]
+                if provider == "claude"
+                else ["agy-gemini", "agy-account"]
+                if provider == "agy"
+                else ["openai-agentic"]
+            )
+            route = {
+                "schema_version": 1,
+                "catalog_sha256": "9" * 64,
+                "route_id": route_id,
+                "harness": provider,
+                "harness_binary": provider,
+                "model": model,
+                "effort": "high" if provider != "agy" else "medium",
+                "argv_prefix": argv_prefix,
+                "permission_mode": "acceptEdits" if paid_only else None,
+                "quota_pools": quota_pools,
+                "paid_only": paid_only,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
+            route["route_contract_sha256"] = candidate_tool.sha256_json(route)
+            packet["route_contract"] = route
+            packet["budget_contract"] = {
+                "requested_max_usd": max_budget_usd if paid_only else 0.0,
+                "enforcement": (
+                    "provider_cli_hard_limit" if paid_only else "catalog_zero_marginal_cost"
+                ),
+                "hard_limit": paid_only,
+                "hard_limit_required": False,
+                "timeout_is_not_budget": not paid_only,
+                "paid_execution_authorized": paid_only,
+                "cost_basis": (
+                    "explicit-paid-route" if paid_only else "catalog-zero-marginal-route"
+                ),
+            }
         packet["packet_sha256"] = candidate_tool.sha256_json(packet)
         path = directory / "packet.json"
         path.write_text(json.dumps(packet), encoding="utf-8")
@@ -107,6 +176,151 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             "contrast_observations": ["avoid new abstraction"],
             "confidence": "medium",
         }
+
+
+    def test_route_bound_codex_command_uses_subscription_wrapper_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet = candidate_tool.validate_packet(
+                candidate_tool.load_private_json(
+                    self._packet(root, repo, provider="codex", schema_version=3, max_budget_usd=0),
+                    label="packet",
+                )
+            )
+            prompt = root / "prompt.txt"
+            prompt.write_text("prompt", encoding="utf-8")
+            command, stdin_path, cwd, prompt_in_argv = candidate_tool.provider_command(
+                packet,
+                timeout_seconds=120,
+                max_budget_usd=0,
+                prompt_path=prompt,
+            )
+        self.assertEqual(command[:3], ["codexr", "architecture", "exec"])
+        self.assertIn("read-only", command)
+        self.assertIn("--ephemeral", command)
+        self.assertIn("--output-schema", command)
+        self.assertEqual(
+            command[command.index("--output-schema") + 1],
+            str(prompt.parent.parent / "output-schema.json"),
+        )
+        self.assertEqual(command[-1], "-")
+        self.assertEqual(stdin_path, prompt)
+        self.assertEqual(cwd, prompt.parent)
+        self.assertFalse(prompt_in_argv)
+
+    def test_route_bound_agy_command_uses_exact_catalog_model_plan_and_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet = candidate_tool.validate_packet(
+                candidate_tool.load_private_json(
+                    self._packet(root, repo, provider="agy", schema_version=3, max_budget_usd=0),
+                    label="packet",
+                )
+            )
+            prompt = root / "prompt.txt"
+            prompt.write_text("prompt", encoding="utf-8")
+            command, stdin_path, cwd, prompt_in_argv = candidate_tool.provider_command(
+                packet,
+                timeout_seconds=120,
+                max_budget_usd=0,
+                prompt_path=prompt,
+            )
+        self.assertEqual(
+            command[:3], ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
+        )
+        self.assertIn("--mode", command)
+        self.assertEqual(command[command.index("--mode") + 1], "plan")
+        self.assertIn("--sandbox", command)
+        self.assertIsNone(stdin_path)
+        self.assertEqual(cwd, prompt.parent)
+        self.assertFalse(prompt_in_argv)
+
+    def test_route_bound_free_sonnet_command_preserves_catalog_prefix_and_adds_contrast_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet_path = self._packet(
+                root, repo, provider="claude", schema_version=3, max_budget_usd=0
+            )
+            packet = json.loads(packet_path.read_text(encoding="utf-8"))
+            route = packet["route_contract"]
+            route.update(
+                {
+                    "route_id": "claude-sonnet-5-high",
+                    "model": "claude-sonnet-5",
+                    "argv_prefix": ["claude", "--model", "sonnet", "--effort", "high"],
+                    "permission_mode": "acceptEdits",
+                    "quota_pools": ["claude-pro"],
+                    "paid_only": False,
+                }
+            )
+            route["route_contract_sha256"] = candidate_tool.sha256_json(
+                {key: value for key, value in route.items() if key != "route_contract_sha256"}
+            )
+            packet["budget_contract"] = {
+                "requested_max_usd": 0.0,
+                "enforcement": "catalog_zero_marginal_cost",
+                "hard_limit": False,
+                "hard_limit_required": False,
+                "timeout_is_not_budget": True,
+                "paid_execution_authorized": False,
+                "cost_basis": "catalog-zero-marginal-route",
+            }
+            packet["packet_sha256"] = candidate_tool.sha256_json(
+                {key: value for key, value in packet.items() if key != "packet_sha256"}
+            )
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            validated = candidate_tool.validate_packet(
+                candidate_tool.load_private_json(packet_path, label="packet")
+            )
+            prompt = root / "prompt.txt"
+            prompt.write_text("prompt", encoding="utf-8")
+            command, _stdin_path, _cwd, _prompt_in_argv = candidate_tool.provider_command(
+                validated, timeout_seconds=120, max_budget_usd=0, prompt_path=prompt
+            )
+        self.assertEqual(
+            command[:5], ["claude", "--model", "sonnet", "--effort", "high"]
+        )
+        self.assertIn("-p", command)
+        self.assertIn("--safe-mode", command)
+        self.assertIn("--no-session-persistence", command)
+        self.assertEqual(
+            command[command.index("--permission-mode") + 1], "acceptEdits"
+        )
+        self.assertNotIn("--max-budget-usd", command)
+
+    def test_route_bound_fable_command_is_paid_and_uses_exact_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet = candidate_tool.validate_packet(
+                candidate_tool.load_private_json(
+                    self._packet(root, repo, provider="claude", schema_version=3, max_budget_usd=1.5),
+                    label="packet",
+                )
+            )
+            prompt = root / "prompt.txt"
+            prompt.write_text("prompt", encoding="utf-8")
+            command, _stdin_path, _cwd, _prompt_in_argv = candidate_tool.provider_command(
+                packet,
+                timeout_seconds=120,
+                max_budget_usd=1.5,
+                prompt_path=prompt,
+            )
+        self.assertIn("claude-fable-5", command)
+        self.assertIn("--max-budget-usd", command)
+        self.assertEqual(command[command.index("--max-budget-usd") + 1], "1.5")
+        self.assertIn("--tools=", command)
 
     def test_prompt_contains_schema_for_agy_and_nonce_fences(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
