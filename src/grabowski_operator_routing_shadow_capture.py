@@ -243,7 +243,7 @@ def _writer_task_reference(manifest: dict[str, Any]) -> str | None:
     return None
 
 
-def _normalize_evidence_refs(value: Any, *, reviewed: bool) -> list[str]:
+def _normalize_evidence_refs(value: Any, *, reviewed: bool, sort: bool) -> list[str]:
     if not isinstance(value, list) or len(value) > 16:
         raise ShadowCaptureError(
             "primary_evidence_refs must be a list with at most 16 entries"
@@ -267,9 +267,13 @@ def _normalize_evidence_refs(value: Any, *, reviewed: bool) -> list[str]:
         raise ShadowCaptureError(
             "reviewed outcomes require at least one primary evidence reference"
         )
-    # Evidence order carries no semantics: sort so identical evidence sets yield
-    # one canonical record identity regardless of caller ordering.
-    refs.sort()
+    if sort:
+        # V2 evidence order carries no semantics: sort so identical evidence sets
+        # yield one canonical, order-independent record identity regardless of
+        # caller ordering. V1 records predate this rule (PR #410 froze caller
+        # order into record_id), so the v1 builder/validator pass sort=False to
+        # keep those historical, unsorted-but-valid records provable unchanged.
+        return sorted(refs)
     return refs
 
 
@@ -620,6 +624,7 @@ def build_shadow_record(
     refs = _normalize_evidence_refs(
         primary_evidence_refs,
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=False,
     )
     normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
     frozen_at = eligibility["frozen_at"]
@@ -692,6 +697,7 @@ def validate_shadow_record(record: Any) -> dict[str, Any]:
     refs = _normalize_evidence_refs(
         record.get("primary_evidence_refs"),
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=False,
     )
     if refs != record.get("primary_evidence_refs"):
         raise ShadowCaptureError("primary_evidence_refs is not normalized")
@@ -885,6 +891,18 @@ def _prove_prospective_binding(
     the bound one, so the entire prospective receipt can be rebuilt from the v2
     lineage fields and its ``prospective_eligibility_id`` re-derived here.
     """
+    # Re-derive the manifest identity digest from workspace, plan and route so an
+    # isolated eligibility-v2/record-v2 cannot substitute a foreign digest and
+    # then re-hash prospective_eligibility_id, eligibility_id and record_id into
+    # a self-consistent but forged lineage. The digest is a pure function of the
+    # bound (workspace_id, plan_sha256, route_evidence_sha256), never free input.
+    if route_ref["manifest_identity_sha256"] != _manifest_identity_sha256(
+        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+    ):
+        raise ShadowCaptureError(
+            "canonical_route_evidence.manifest_identity_sha256 is not bound to "
+            "workspace, plan and route"
+        )
     if workspace_case_id != _workspace_case_id(
         workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
     ):
@@ -1173,6 +1191,7 @@ def build_shadow_record_v2(
     refs = _normalize_evidence_refs(
         primary_evidence_refs,
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
     )
     normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
     frozen_at = eligibility["frozen_at"]
@@ -1263,6 +1282,7 @@ def validate_shadow_record_v2(record: Any) -> dict[str, Any]:
     refs = _normalize_evidence_refs(
         record.get("primary_evidence_refs"),
         reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
     )
     if refs != record.get("primary_evidence_refs"):
         raise ShadowCaptureError("primary_evidence_refs is not normalized")
@@ -1640,7 +1660,9 @@ def seal_prospective_case(
 
     normalized_outcome = _normalize_outcome(outcome)
     refs = _normalize_evidence_refs(
-        primary_evidence_refs, reviewed=normalized_outcome["status"] == "reviewed"
+        primary_evidence_refs,
+        reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
     )
 
     # An already-sealed record is an idempotent duplicate: recognise it before

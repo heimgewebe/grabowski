@@ -595,6 +595,77 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
         ):
             capture.validate_shadow_record_v2(record)
 
+    def test_forged_manifest_identity_with_consistent_lineage_is_rejected(
+        self,
+    ) -> None:
+        # An isolated eligibility-v2/record-v2 must not be able to substitute a
+        # foreign manifest identity digest and then re-hash every dependent id so
+        # the lineage stays internally self-consistent. The digest is a pure
+        # function of (workspace_id, plan_sha256, route_evidence_sha256) and must
+        # be deterministically re-derived, not trusted as free input.
+        record = self._bound_record()
+        forged = copy.deepcopy(record)
+        forged["canonical_route_evidence"]["manifest_identity_sha256"] = "d" * 64
+        elig = forged["eligibility"]
+        route_ref = forged["canonical_route_evidence"]
+        # Re-derive prospective_eligibility_id over the tampered route evidence.
+        prospective_payload = {
+            "schema_version": capture.PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+            "workspace_case": {
+                "workspace_id": elig["workspace_id"],
+                "plan_sha256": elig["plan_sha256"],
+                "case_id": elig["workspace_case_id"],
+            },
+            "canonical_route_evidence": route_ref,
+            "features": forged["features"],
+            "frozen_at": elig["frozen_at"],
+            "no_effect": forged["no_effect"],
+        }
+        elig["prospective_eligibility_id"] = capture._sha256_json(prospective_payload)
+        # Re-derive eligibility_id over the tampered route evidence.
+        eligibility_payload = {
+            "schema_version": capture.ELIGIBILITY_V2_SCHEMA_VERSION,
+            "prospective_eligibility": {
+                "schema_version": capture.PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+                "prospective_eligibility_id": elig["prospective_eligibility_id"],
+                "workspace_id": elig["workspace_id"],
+                "plan_sha256": elig["plan_sha256"],
+                "workspace_case_id": elig["workspace_case_id"],
+                "frozen_at": elig["frozen_at"],
+            },
+            "eligible_case": forged["eligible_case"],
+            "canonical_route_evidence": route_ref,
+            "features": forged["features"],
+            "frozen_at": elig["frozen_at"],
+            "no_effect": forged["no_effect"],
+        }
+        elig["eligibility_id"] = capture._sha256_json(eligibility_payload)
+        # Re-seal a self-consistent record_id over the fully re-derived lineage,
+        # so only the manifest-identity re-derivation can catch the forgery.
+        forged["record_id"] = capture._sha256_json(
+            {k: v for k, v in forged.items() if k != "record_id"}
+        )
+        with self.assertRaisesRegex(
+            capture.ShadowCaptureError, "manifest_identity_sha256 is not bound"
+        ):
+            capture.validate_shadow_record_v2(forged)
+
+        # The same forgery must also fail closed at the eligibility-v2 layer.
+        forged_eligibility = {
+            "schema_version": capture.ELIGIBILITY_V2_SCHEMA_VERSION,
+            "eligibility_id": elig["eligibility_id"],
+            "prospective_eligibility": eligibility_payload["prospective_eligibility"],
+            "eligible_case": forged["eligible_case"],
+            "canonical_route_evidence": route_ref,
+            "features": forged["features"],
+            "frozen_at": elig["frozen_at"],
+            "no_effect": forged["no_effect"],
+        }
+        with self.assertRaisesRegex(
+            capture.ShadowCaptureError, "manifest_identity_sha256 is not bound"
+        ):
+            capture.validate_bound_eligibility_v2(forged_eligibility)
+
     # ------------------------------------------------------------------
     # Stable allowlisted manifest identity (goal 2)
     # ------------------------------------------------------------------

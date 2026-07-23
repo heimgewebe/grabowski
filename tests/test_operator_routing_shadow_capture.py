@@ -159,6 +159,20 @@ class OperatorRoutingShadowCaptureTests(unittest.TestCase):
         self.assertNotIn("concurrent_external_activity", record["features"])
         self.assertEqual(capture.validate_shadow_record(record), record)
 
+    def test_valid_unsorted_v1_evidence_order_remains_provable(self) -> None:
+        # A historical PR #410 v1 record froze primary_evidence_refs in caller
+        # order and hashed record_id over that order. The v1 validator must not
+        # re-sort the refs before proving record_id, or existing valid records
+        # with an unsorted-but-unique evidence order fail closed on replay.
+        unsorted = ["github-ci:run:2", "github-ci:run:1"]
+        record = self.build(route_evidence_v1(), refs=unsorted)
+        self.assertEqual(record["primary_evidence_refs"], unsorted)
+        self.assertNotEqual(record["primary_evidence_refs"], sorted(unsorted))
+        # validate_shadow_record re-derives record_id over the payload and only
+        # returns the record when the hash matches, so a clean round-trip proves
+        # the historical record_id stays provable over the preserved order.
+        self.assertEqual(capture.validate_shadow_record(record), record)
+
     def test_persisted_normalized_route_evidence_is_replayed_exactly(self) -> None:
         persisted = workspace._normalize_route_evidence(route_evidence_v1())
         record = self.build(persisted)
