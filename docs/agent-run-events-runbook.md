@@ -48,6 +48,9 @@ Use these task parameters for a real smoke:
 chronik_outbox=True
 chronik_outbox_state_root=/tmp/grabowski-chronik-smoke
 chronik_operation=implement
+chronik_component=task-runner
+chronik_bureau_task_id=CCM-V1-T002
+chronik_pr_number=306
 ```
 
 The state root is accepted only when `chronik_outbox` is true. This prevents accidental path configuration without activation.
@@ -56,7 +59,7 @@ The state root is accepted only when `chronik_outbox` is true. This prevents acc
 
 For a local task with exactly one canonical `repo:/absolute/path` resource claim, Grabowski reads that repository's `origin` URL and records a repository-scoped subject only when it resolves to a bounded `heimgewebe/<repo>` identity. Otherwise the subject is explicitly host-scoped. Multiple claims, foreign remotes, missing remotes and remote-host tasks never fabricate a repository.
 
-Every new event carries bounded `operation` and `task_class` fields. `chronik_operation` accepts only `implement`, `review`, `merge`, `deploy`, `runtime_verify`, `recovery` or `other`; the task class is derived deterministically from that value. Non-`other` operations require an enabled task-local outbox. Events never contain raw argv, cwd, environment variables, secrets or private filesystem paths.
+Every new event carries bounded `operation` and `task_class` fields. `chronik_operation` accepts only `implement`, `review`, `merge`, `deploy`, `runtime_verify`, `recovery` or `other`; the task class is derived deterministically from that value. When the caller knows them, `chronik_component`, `chronik_bureau_task_id` and `chronik_pr_number` add bounded target-component, Bureau-task and pull-request references to the persisted subject. These references are accepted only with an enabled task-local outbox; the PR number must be a positive bounded integer. Non-`other` operations also require an enabled task-local outbox. Events never contain raw argv, cwd, environment variables, secrets or private filesystem paths.
 
 Event payloads are deterministic for one persisted task transition. `agent.run.started` uses the task creation timestamp; terminal events use the terminalization timestamp, falling back to the persisted update timestamp for legacy rows. The `event_id` is the SHA-256 of the complete canonical payload without the ID itself. Re-emitting the same transition therefore recreates byte-identical evidence, while changed timestamps, subjects or data receive a different ID. An existing ID with different payload fails closed.
 
@@ -136,3 +139,22 @@ Stop the experiment if any of these happen:
 ## Current decision
 
 Default state remains off. The writer is a diagnostic seam, not a dependency.
+
+## Explicit coding-memory import and history
+
+The task-local `chronik_context_json` remains the persisted context truth. It is derived by `grabowski_task_start` from canonical resource claims plus `chronik_operation` and the optional bounded `chronik_component`, `chronik_bureau_task_id` and `chronik_pr_number` fields; callers do not provide a second context object or migration-only compatibility field.
+
+Two typed tools expose the optional local coding-memory seam:
+
+- `grabowski_chronik_outbox_import(path)` imports exactly one existing `grabowski_*.jsonl` directly below `chronik-outbox`. The source must contain only hash-valid, redacted `agent-run-event.v0` records from Grabowski. The adapter calls Chronik's existing positional `import INPUT` command, verifies that the source identity is unchanged afterwards, and returns a SHA-256-bound receipt. Re-import is delegated to Chronik's idempotent event-ID contract; the source is never deleted or compacted by this tool.
+- `grabowski_chronik_history(...)` calls Chronik's bounded `query` command for exactly one repository or host target. The adapter verifies that Chronik's returned query envelope is exactly bound to the requested repository/host and rejects the response unless every returned event is a valid Grabowski event that matches the requested target and filters before anything is exposed. Every response is historical-only and explicitly does not establish current Git state, current CI state, current runtime state, or safe retry.
+
+The optional checkout and data directory are configured with:
+
+```text
+GRABOWSKI_CHRONIK_OUTBOX_STATE_ROOT=/home/alex/.local/state
+GRABOWSKI_CHRONIK_CODING_MEMORY_REPO=/home/alex/repos/chronik
+GRABOWSKI_CHRONIK_CODING_MEMORY_DATA_DIR=/home/alex/.local/state/chronik
+```
+
+A missing or stale checkout, missing `tools/coding_memory.py`, invalid CLI output, timeout, or non-zero exit is returned as a bounded unavailable result. These failures do not affect normal task creation, execution, reconciliation, or lifecycle event writing.

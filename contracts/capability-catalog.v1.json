@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "9a0dc42bc0e5e0cba9040f2572e1562dd5649b82606d1c6c01aa40a25c4c347f",
+  "capability_source_sha256": "5a5ef47656939b392cb3a3507d702a8b652623245d944fc9504d5ecf3255b58d",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "352b5c9043149b6c59ba4e0b49b0d18cbb609b7396345ad686c372bc84264ad7",
+  "contract_sha256": "b7e8a09228adc8e01d2ab9e5d465de5d1b4356fe530d38306e40ba63f0332341",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1214,6 +1214,31 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_task_list"
+    },
+    {
+      "category": "coding-memory",
+      "description": "Import one redacted Grabowski outbox JSONL into optional local Chronik.",
+      "effects": [
+        "state-create",
+        "audit-append"
+      ],
+      "id": "grabowski_chronik_outbox_import",
+      "purpose": "Import one redacted Grabowski outbox JSONL into optional local Chronik.",
+      "read_only": false,
+      "reversibility": "append-only-observation",
+      "risk_class": "medium",
+      "tool": "grabowski_chronik_outbox_import"
+    },
+    {
+      "category": "coding-memory",
+      "description": "Read bounded historical coding events without asserting current truth.",
+      "effects": [],
+      "id": "grabowski_chronik_history",
+      "purpose": "Read bounded historical coding events without asserting current truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_chronik_history"
     },
     {
       "category": "task",

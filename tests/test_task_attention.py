@@ -77,10 +77,14 @@ class TaskAttentionTests(unittest.TestCase):
         self.outcomes = self.database.with_suffix(".outcomes")
         self.decisions = self.database.with_suffix(".attention-decisions")
         self.resource_database = self.root / "state" / "resources.sqlite3"
+        (self.root / "state").mkdir(parents=True, exist_ok=True)
+        os.chmod(self.root / "state", 0o700)
+        self.audit_log = self.root / "state" / "write-audit.jsonl"
         self.patches = [
             patch.object(tasks, "TASK_DB", self.database),
             patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
+            patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
             patch.dict(os.environ, {"GRABOWSKI_TASK_ATTENTION_ROOT": str(self.decisions)}),
         ]
         for item in self.patches:
