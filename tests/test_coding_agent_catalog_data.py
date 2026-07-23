@@ -53,7 +53,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 catalog, validation = router._load_catalog()
         self.assertEqual(validation["catalog_source"], "deployment_catalog")
-        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v3")
+        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v4")
         self.assertNotIn("legacy", catalog)
 
     def test_catalog_path_without_override_gate_is_ignored(self) -> None:
@@ -66,7 +66,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 catalog, validation = router._load_catalog()
         self.assertEqual(validation["catalog_source"], "deployment_catalog")
-        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v3")
+        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v4")
 
     def test_environment_override_remains_explicit_and_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -34,7 +34,7 @@ Auch explizite Review-Aufgaben wie `independent-review`, `critical-review` und `
 
 Plan-Modus gilt global als Review-Modus: Jede Route mit `plan` als Permission- oder Approval-Modus muss `review_only=true` sein, mindestens eine als unabhängiger Review klassifizierte Aufgabe anbieten und darf keine Kontrastaufgabe enthalten.
 
-Claude Fable 5 besitzt dafür die aktive Route `claude-fable-5-review-high`. Claude Opus 4.8 bleibt ebenfalls plan-only und wird ausschließlich als Reviewer oder Urteilsinstanz geführt.
+Claude Fable 5 ist pay-only. Die Route `claude-fable-5-review-high` bleibt katalogisiert, wird aber vom normalen kostenfreien Review-Ranking ausgeschlossen und erhält durch ihre bloße Existenz keine Ausführungsautorität. Claude Opus 4.8 bleibt plan-only und kann innerhalb des vorhandenen Claude-Kontingents weiterhin als Reviewer oder Urteilsinstanz gerankt werden.
 
 ## Kontrastprogrammierung
 
@@ -47,7 +47,9 @@ Der Ablauf ist:
 3. Ihre Änderungen bleiben außerhalb des autoritativen Writerpfads.
 4. ChatGPT/Grabowski vergleicht, reproduziert und übernimmt nur nach eigener Prüfung einzelne Ideen oder Patches.
 
-`grabowski_agent_execution_route` bleibt deshalb auch bei großen und riskanten Aufgaben auf `execution_mode=direct_operator`. Eine ausdrückliche Kontrastanforderung ergänzt lediglich beratende Kandidaten. Externe parallele Writer-Shards sind nicht zulässig.
+`grabowski_agent_execution_route` bleibt deshalb auch bei großen und riskanten Aufgaben auf `execution_mode=direct_operator`. Eine ausdrückliche Kontrastanforderung ergänzt lediglich beratende Kandidaten. Die konkrete Modell-/Harnesswahl stammt dabei nicht mehr aus einer zweiten providerbasierten Routinglogik: Der Coding-Agent-Katalog rankt konkrete `route_id`-Werte und veröffentlicht sie als `external_route_candidates`. Der kostenfreie Frontier-Standard ist `codex-sol-high`; der Selector rankt jedoch alle aktivierten, kontrastfähigen Katalogrouten nach Aufgabenfit, Qualität, Quota, Cooldown und adaptiver Historie. Dadurch können auch geeignete Agy-Routen als kostenfreie Fallbacks gewählt werden. Codex läuft über den vorhandenen `codexr`-Wrapper subscription-only, mit `max_budget_usd=0`, read-only Sandbox und einem expliziten `codex exec --output-schema`-Vertrag für das Candidate-JSON; routegebundene Agy-Candidates laufen mit ihrem exakten Katalog-`argv_prefix` im bestehenden `plan`-/`sandbox`-Vertrag ebenfalls mit `max_budget_usd=0`. Eine pay-only Route wie `claude-fable-5-contrast-high` wird nur bei ausdrücklicher Paid-Autorisierung und nur als explizit katalogisierte Paid-Ausnahme überhaupt in die Auswahl aufgenommen. Externe parallele Writer-Shards sind nicht zulässig.
+
+Ein kanonischer Candidate-Start über `grabowski_agent_competition_start` bindet die gewählte `route_id`, den Katalog-SHA-256, Harness, Modell, Effort, Permission-Modus, Quota-Pools und die Paid-Klassifikation in einen gehashten Route-Vertrag. Neue routegebundene Candidate-Packets, -Manifeste und -Receipts verwenden Schema 3. Historische providergebundene Schema-1/2-Artefakte bleiben lesbar; sie erhalten dadurch keine neue Route-Autorität.
 
 ## Fable-Routen
 
@@ -55,9 +57,11 @@ Die historische ID `claude-fable-5-high` bleibt als deaktivierter plan-only Komp
 
 Die zwischenzeitliche ID `claude-fable-5-writer-high` ist deaktiviert. Sie wird nicht mehr als Writer geroutet und verweist in ihrem `disabled_reason` auf die Direct-first-Doktrin.
 
-Der zulässige mutierende Vergleichspfad heißt `claude-fable-5-contrast-high`. Er verwendet `--safe-mode --permission-mode acceptEdits`, ist aber `contrast_only=true`, besitzt keine Writer-Autorität und darf ausschließlich in einem isolierten Vergleichsraum laufen.
+Der zulässige mutierende Vergleichspfad heißt `claude-fable-5-contrast-high`. Er verwendet `--safe-mode --permission-mode acceptEdits`, ist aber `contrast_only=true`, besitzt keine Writer-Autorität und darf ausschließlich in einem isolierten Vergleichsraum laufen. Die Route ist `paid_only=true`, wird nie automatisch gewählt und verlangt vor dem Start sowohl `paid_execution_authorized=true` als auch ein positives `max_budget_usd` innerhalb des separat konfigurierten External-Provider-Kostenlimits. Der Candidate-Runner übergibt dieses Limit zusätzlich als Claude-CLI-Hard-Budget.
 
-Unabhängige Fable-Reviews laufen über `claude-fable-5-review-high` mit `--permission-mode plan` und `review_only=true`.
+Unabhängige Fable-Reviews sind weiterhin über `claude-fable-5-review-high` katalogisiert (`--permission-mode plan`, `review_only=true`), aber ebenfalls `paid_only=true` und deshalb vom normalen kostenfreien Reviewer-Ranking ausgeschlossen. Dieser PR führt keinen automatischen Paid-Review-Fallback ein.
+
+Die Zuordnung eines Fable-Routes zum Pool `claude-pro` dient ausschließlich der gemeinsamen Claude-Authentifizierungs-, Quota- und Concurrency-Abstammung. Die routeeigene Klassifikation `paid_only=true` überstimmt für die Ausführung die statische Nullkostenklassifikation dieses gemeinsamen Pools; Kostenautorität entsteht erst aus dem expliziten routegebundenen Budgetvertrag.
 
 ## Abgeleitete Rollen
 
@@ -75,12 +79,12 @@ Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für `-
 
 Modellklassen ordnen nur noch Review- und Kontrastqualität, nicht die Autorenschaft:
 
-- **S:** GPT-5.6 Sol high und Claude Fable 5 als bevorzugte Kontrastrouten; Sol xhigh als teure Revieweskalation.
+- **S:** GPT-5.6 Sol high als bevorzugte kostenfreie Frontier-Kontrastroute; Claude Fable 5 nur als ausdrücklich autorisierte pay-only Kontrastroute; Sol xhigh als hochwertige Revieweskalation.
 - **A:** Claude Opus 4.8, Sol medium, Terra high, Sonnet 5 high und Grok 4.5 high.
 - **B:** Terra medium, Luna high, Sonnet 5 medium und Gemini 3.1 Pro high.
 - **C:** Flash-, GPT-OSS-, ältere Agy-Claude- und lokale oder unklare Fallbacks.
 
-Jules ist ein verwalteter Remote-Harness; die Platzhalteridentität behauptet kein zugrunde liegendes Modell. PAYG-, API-Key- und unbekannte Kostenpfade bleiben gesperrt.
+Jules ist ein verwalteter Remote-Harness; die Platzhalteridentität behauptet kein zugrunde liegendes Modell. API-Key-Fallbacks, unbekannte Kostenpfade und automatische PAYG-Fallbacks bleiben gesperrt. Ein ausdrücklich als `paid_only` katalogisierter Fable-Pfad ist die enge Ausnahme: Er erfordert eine separate Paid-Autorisierung, ein positives per-Aufruf-Budget und ein positives Runtime-Kostenlimit; ohne alle drei Bedingungen blockiert der Start vor dem Provider-Task.
 
 `argv_prefix` bleibt in dieser Version die kanonische Befehlsquelle. Permission- und Approval-Modi werden zentral, reihenfolgeunabhängig und für beide CLI-Schreibweisen (`--flag value` und `--flag=value`) validiert; der abgeleitete Wert erscheint als strukturiertes Feld `permission_mode` in Katalog- und Routingausgaben. Ein eigenständiges autoritatives Katalogfeld wäre eine separate Schemamigration und wird nicht neben dem bestehenden Befehlsvertrag als zweite Wahrheit eingeführt.
 
@@ -98,9 +102,9 @@ Selbstlernen kann keine externe Route zum autoritativen Writer machen und die Di
 
 ## Sicherheit und Kosten
 
-Automatische Agentenausführung bleibt deaktiviert. Review- und Kontrastempfehlungen sind beratend. Es gibt genau einen autoritativen mutierenden Writer: ChatGPT/Grabowski.
+Automatische Agentenausführung bleibt deaktiviert. Review- und Kontrastempfehlungen sind beratend. Es gibt genau einen autoritativen mutierenden Writer: ChatGPT/Grabowski. Ein externer Candidate wird nur durch einen getrennten expliziten Start erzeugt; ein Routingresultat allein startet weder Codex noch Claude.
 
-Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließlich aus dem versionierten Katalog. Dynamischer Laufzeitstatus darf nur Verfügbarkeit, Restquote, Cooldown, aktive Sitzungen und Verifikationszeit ergänzen. Ungültige oder zukünftige Werte sperren die betroffene externe Route fail-closed, nicht die direkte Operatorarbeit.
+Statische Kosten-, PAYG-, Reserve- und Parallelitätspolitik stammt ausschließlich aus dem versionierten Katalog. Dynamischer Laufzeitstatus darf nur Verfügbarkeit, Restquote, Cooldown, aktive Sitzungen und Verifikationszeit ergänzen. Ungültige oder zukünftige Werte sperren die betroffene externe Route fail-closed, nicht die direkte Operatorarbeit. `zero_marginal_cost_only=true` bleibt für automatische Auswahl und historische provider-only Starts fail-closed wirksam; `zero_marginal_cost_only_scope` begrenzt diese Alt-Policy ausdrücklich auf `automatic-and-legacy-provider-only-routes`. Die einzige maschinenlesbare Paid-Ausnahme steht in `explicit_paid_route_exceptions` und muss exakt mit den `paid_contrast_routes` übereinstimmen. `paid_only=true` ist zusätzlich eine routeeigene Ausführungssperre: Ohne explizite Paid-Autorisierung wird die Route weder im normalen Ranking berücksichtigt noch als ausführbarer Route-Vertrag aufgelöst. Für kostenfreie Codex-Kontraste bleibt `max_budget_usd=0` obligatorisch; für Fable ist ein positives Budget obligatorisch.
 
 Kontingentpools bilden eine Elternkette. Sperre, Erschöpfung, Cooldown, Reservegrenze, Parallelitätsgrenze oder Kostenunsicherheit eines Elternpools sperrt jede zugehörige externe Review- oder Kontrastroute.
 

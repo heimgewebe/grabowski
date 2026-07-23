@@ -1,5 +1,5 @@
 {
-  "catalog_version": "direct-first-review-contrast-v3",
+  "catalog_version": "direct-first-review-contrast-v4",
   "harnesses": {
     "agy": {
       "aliases": [
@@ -108,9 +108,9 @@
   "kind": "coding-agent-catalog",
   "models": {
     "claude-fable-5": {
-      "availability": "live-verified",
+      "availability": "paid-only",
       "base_quality_rank": 100,
-      "evidence": "live-access-verified; capability heuristic",
+      "evidence": "owner-confirmed-paid-only-2026-07-23; capability heuristic",
       "family": "anthropic-fable",
       "identity_kind": "model",
       "name": "Claude Fable 5",
@@ -632,8 +632,7 @@
       "principle": "Grabowski/ChatGPT performs every authoritative implementation directly, independent of size. External frontier models are ranked only for advisory review or explicitly requested isolated contrast work.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
-        "codex-sol-high",
-        "claude-fable-5-contrast-high"
+        "codex-sol-high"
       ],
       "upper_review_or_contrast_routes": [
         "codex-sol-medium",
@@ -641,6 +640,9 @@
         "codex-terra-high",
         "claude-sonnet-5-high",
         "grok-4.5-high"
+      ],
+      "paid_contrast_routes": [
+        "claude-fable-5-contrast-high"
       ]
     },
     "model_quality_is_prior_not_truth": true,
@@ -725,7 +727,12 @@
     "unknown_quota_execution": "advisory-only",
     "zero_marginal_cost_only": true,
     "critical_external_review_target_independent_family": true,
-    "critical_external_review_target_independent_provider": true
+    "critical_external_review_target_independent_provider": true,
+    "paid_routes_require_explicit_authorization": true,
+    "zero_marginal_cost_only_scope": "automatic-and-legacy-provider-only-routes",
+    "explicit_paid_route_exceptions": [
+      "claude-fable-5-contrast-high"
+    ]
   },
   "quota_pools": {
     "agy-account": {
@@ -772,7 +779,7 @@
       "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "note": "Sonnet, Fable, Opus and claude -p share this pool; the announced separate Agent SDK credit is paused.",
+      "note": "Sonnet and Opus share this subscription pool; Claude Fable 5 is paid-only and requires separate explicit paid authorization. The announced separate Agent SDK credit is paused.",
       "payg_fallback_allowed": false,
       "quota_mode": "shared-five-hour-and-weekly-plan-limits",
       "reserve_floor": 0.3,
@@ -1285,7 +1292,7 @@
       "base_quality_rank": 100,
       "burn_weight": 2.4,
       "delegation_overhead_minutes": 7,
-      "disabled_reason": "Compatibility alias retained as plan-only. Authoritative implementation stays with grabowski-primary; use claude-fable-5-review-high for review or claude-fable-5-contrast-high for explicitly requested advisory contrast.",
+      "disabled_reason": "Compatibility alias retained as plan-only. Authoritative implementation stays with grabowski-primary; use claude-fable-5-review-high for review or claude-fable-5-contrast-high for explicitly requested advisory contrast. Fable is paid-only and never an automatic fallback.",
       "effort": "high",
       "enabled": false,
       "harness": "claude",
@@ -1310,7 +1317,8 @@
         "critical-review",
         "security-review"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "paid_only": true
     },
     {
       "argv_prefix": [
@@ -1328,7 +1336,7 @@
       "burn_weight": 2.4,
       "contrast_only": true,
       "delegation_overhead_minutes": 7,
-      "disabled_reason": "Compatibility alias retired by the direct-first policy; authoritative writing stays with grabowski-primary. Use claude-fable-5-contrast-high only for explicit advisory contrast.",
+      "disabled_reason": "Compatibility alias retired by the direct-first policy; authoritative writing stays with grabowski-primary. Use claude-fable-5-contrast-high only for explicit advisory contrast. Fable is paid-only and never an automatic fallback.",
       "effort": "high",
       "enabled": false,
       "harness": "claude",
@@ -1363,7 +1371,8 @@
         "refactor",
         "migration"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "paid_only": true
     },
     {
       "argv_prefix": [
@@ -1415,7 +1424,8 @@
         "refactor",
         "migration"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "paid_only": true
     },
     {
       "argv_prefix": [
@@ -1461,7 +1471,8 @@
         "critical-review",
         "security-review"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "paid_only": true
     },
     {
       "argv_prefix": [

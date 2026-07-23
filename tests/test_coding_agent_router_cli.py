@@ -109,7 +109,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(stored["pools"], {})
         self.assertEqual(stored["catalog"], fake_probe)
         self.assertEqual(stored["catalog_sha256"], validation["catalog_sha256"])
-        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v3")
+        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v4")
 
         status, readback = self._main(["status"])
         self.assertEqual(status, 0)

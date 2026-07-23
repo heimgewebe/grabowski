@@ -219,9 +219,21 @@ class CodingAgentRouterTests(unittest.TestCase):
         result = router.grabowski_coding_agent_catalog(include_disabled=True)
         self.assertTrue(result["validation"]["valid"])
         policy = result["frontier_model_policy"]
+        self.assertEqual(policy["top_contrast_routes"], ["codex-sol-high"])
         self.assertEqual(
-            policy["top_contrast_routes"],
-            ["codex-sol-high", "claude-fable-5-contrast-high"],
+            policy["paid_contrast_routes"], ["claude-fable-5-contrast-high"]
+        )
+        self.assertTrue(
+            self.catalog["policy"]["paid_routes_require_explicit_authorization"]
+        )
+        self.assertTrue(self.catalog["policy"]["zero_marginal_cost_only"])
+        self.assertEqual(
+            self.catalog["policy"]["zero_marginal_cost_only_scope"],
+            "automatic-and-legacy-provider-only-routes",
+        )
+        self.assertEqual(
+            self.catalog["policy"]["explicit_paid_route_exceptions"],
+            ["claude-fable-5-contrast-high"],
         )
         direct = result["direct_work_policy"]
         self.assertEqual(direct["canonical_primary"], "grabowski-primary")
@@ -587,18 +599,142 @@ class CodingAgentRouterTests(unittest.TestCase):
         policy = router.grabowski_coding_agent_catalog(include_disabled=True)[
             "frontier_model_policy"
         ]
+        self.assertEqual(policy["top_contrast_routes"], ["codex-sol-high"])
         self.assertEqual(
-            policy["top_contrast_routes"],
-            ["codex-sol-high", "claude-fable-5-contrast-high"],
+            policy["paid_contrast_routes"], ["claude-fable-5-contrast-high"]
         )
         public = {
             route["route"]: route
             for model in router.grabowski_coding_agent_catalog(include_disabled=True)["models"]
             for route in model["routes"]
         }
-        for route_id in policy["top_contrast_routes"]:
+        for route_id in [
+            *policy["top_contrast_routes"],
+            *policy["paid_contrast_routes"],
+        ]:
             self.assertTrue(public[route_id]["contrast_capable"])
             self.assertFalse(public[route_id]["writer_capable"])
+        fable_route = next(
+            route
+            for route in self.catalog["routes"]
+            if route["id"] == "claude-fable-5-contrast-high"
+        )
+        self.assertTrue(fable_route["paid_only"])
+
+
+    def test_fable_routes_are_paid_only_and_never_default_ranked(self) -> None:
+        fable_routes = [
+            route for route in self.catalog["routes"] if route["model"] == "claude-fable-5"
+        ]
+        self.assertTrue(fable_routes)
+        self.assertTrue(all(route.get("paid_only") is True for route in fable_routes))
+        review = self._route("independent-review")
+        ranked = [*review["reviewers"], *review["review_fallbacks"]]
+        self.assertFalse(any(item["model"] == "claude-fable-5" for item in ranked))
+
+    def test_catalog_rejects_unmarked_fable_and_paid_route_in_free_frontier(self) -> None:
+        missing_paid = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in missing_paid["routes"]
+            if item["id"] == "claude-fable-5-review-high"
+        )
+        route.pop("paid_only")
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "paid-only model route"):
+            router._validate_catalog(missing_paid)
+
+        missing_model_binding = json.loads(json.dumps(self.catalog))
+        route = next(
+            item for item in missing_model_binding["routes"]
+            if item["id"] == "claude-fable-5-contrast-high"
+        )
+        route["argv_prefix"] = [item for item in route["argv_prefix"] if item not in {"--model", "claude-fable-5"}]
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "must bind --model explicitly"):
+            router._validate_catalog(missing_model_binding)
+
+        paid_in_free = json.loads(json.dumps(self.catalog))
+        paid_in_free["policy"]["frontier_model_policy"]["top_contrast_routes"] = [
+            "claude-fable-5-contrast-high"
+        ]
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "invalid or paid-only"):
+            router._validate_catalog(paid_in_free)
+
+    def test_contrast_selector_defaults_to_codex_and_paid_authorization_adds_fable(self) -> None:
+        free = router.select_contrast_routes(
+            "complex-patch",
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            max_candidates=2,
+            allow_paid=False,
+            allowed_harnesses={"codex", "claude"},
+        )
+        self.assertEqual(free["status"], "recommended")
+        self.assertEqual(free["routes"][0]["route"], "codex-sol-high")
+        self.assertTrue(all(not item["paid_only"] for item in free["routes"]))
+        free_seen = {item["route"] for item in free["routes"]} | set(free["excluded"])
+        self.assertNotIn("claude-fable-5-contrast-high", free_seen)
+
+        paid = router.select_contrast_routes(
+            "complex-patch",
+            changed_files=20,
+            duration_minutes=180,
+            novelty="high",
+            max_candidates=2,
+            allow_paid=True,
+            allowed_harnesses={"codex", "claude"},
+        )
+        paid_seen = {item["route"] for item in paid["routes"]} | set(paid["excluded"])
+        self.assertIn("claude-fable-5-contrast-high", paid_seen)
+        self.assertLessEqual(len(paid["routes"]), 2)
+        self.assertEqual(
+            len({item["harness"] for item in paid["routes"]}), len(paid["routes"])
+        )
+
+        agy = router.select_contrast_routes(
+            "docs",
+            changed_files=2,
+            duration_minutes=30,
+            novelty="medium",
+            max_candidates=1,
+            allow_paid=False,
+            allowed_harnesses={"agy"},
+        )
+        self.assertEqual(agy["status"], "recommended")
+        self.assertEqual(len(agy["routes"]), 1)
+        self.assertEqual(agy["routes"][0]["harness"], "agy")
+        self.assertTrue(agy["routes"][0]["route"].startswith("agy-"))
+        self.assertFalse(agy["routes"][0]["paid_only"])
+
+    def test_contrast_execution_contract_enforces_fable_paid_boundary(self) -> None:
+        codex = router.contrast_route_execution_contract("codex-sol-high")
+        self.assertEqual(codex["harness"], "codex")
+        self.assertEqual(codex["argv_prefix"], ["codexr", "architecture"])
+        self.assertFalse(codex["paid_only"])
+        agy = router.contrast_route_execution_contract("agy-gemini-flash-medium")
+        self.assertEqual(agy["harness"], "agy")
+        self.assertEqual(agy["argv_prefix"][:2], ["agy", "--model"])
+        self.assertFalse(agy["paid_only"])
+        self.assertEqual(
+            codex["route_contract_sha256"],
+            router._canonical_sha256(
+                {key: value for key, value in codex.items() if key != "route_contract_sha256"}
+            ),
+        )
+        with self.assertRaisesRegex(router.CodingAgentRouterError, "paid-only route"):
+            router.contrast_route_execution_contract("claude-fable-5-contrast-high")
+        sonnet = router.contrast_route_execution_contract("claude-sonnet-5-high")
+        self.assertEqual(sonnet["harness"], "claude")
+        self.assertEqual(
+            sonnet["argv_prefix"],
+            ["claude", "--model", "sonnet", "--effort", "high"],
+        )
+        self.assertEqual(sonnet["permission_mode"], "acceptEdits")
+        self.assertFalse(sonnet["paid_only"])
+        fable = router.contrast_route_execution_contract(
+            "claude-fable-5-contrast-high", paid_execution_authorized=True
+        )
+        self.assertTrue(fable["paid_only"])
+        self.assertEqual(fable["model"], "claude-fable-5")
 
     def test_task_specific_defaults_keep_all_implementation_direct(self) -> None:
         for task_class, kwargs in (
@@ -647,7 +783,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_learning_applies_to_review_routes_not_authoritative_writing(
         self,
     ) -> None:
-        route_id = "claude-fable-5-review-high"
+        route_id = "claude-opus-4.8-high"
         self.state["routes"] = {
             route_id: {
                 "by_task_class": {

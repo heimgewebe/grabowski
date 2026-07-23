@@ -121,7 +121,7 @@ ROUTE_RISK_FLAGS = frozenset({
     "data_migration", "privilege", "external_api", "cross_repo",
     "destructive", "user_data",
 })
-ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy"})
+ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy", "codex"})
 ROUTE_POLICY_VERSION = "direct-first-routing-v3.0"
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 BindingVerifier = Callable[[str, str], dict[str, Any]]

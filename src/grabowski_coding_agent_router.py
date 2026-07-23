@@ -34,6 +34,7 @@ QUALITY_DIMENSIONS = (
 CLAUDE_PLAN_TYPES = {"pro", "max", "team", "enterprise"}
 QUALITY_CLASSES = {"S", "A", "B", "C", "HARNESS", "CONTROLLER"}
 EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+PAID_ONLY_MODEL_IDS = frozenset({"claude-fable-5"})
 POOL_STATUSES = {
     "unknown",
     "available",
@@ -400,10 +401,33 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             raise CodingAgentRouterError(
                 f"{identifier}: writer_only is retired; use contrast_only or review_only"
             )
-        for role_flag in ("contrast_only", "review_only"):
+        for role_flag in ("contrast_only", "review_only", "paid_only"):
             if role_flag in route and not isinstance(route[role_flag], bool):
                 raise CodingAgentRouterError(
                     f"{identifier}: {role_flag} must be a boolean"
+                )
+        if route.get("model") in PAID_ONLY_MODEL_IDS:
+            if route.get("paid_only") is not True:
+                raise CodingAgentRouterError(
+                    f"{identifier}: paid-only model route must declare paid_only=true"
+                )
+            argv_prefix = route.get("argv_prefix")
+            if not isinstance(argv_prefix, list):
+                raise CodingAgentRouterError(
+                    f"{identifier}: paid-only model route argv_prefix is invalid"
+                )
+            try:
+                model_index = argv_prefix.index("--model")
+            except ValueError as exc:
+                raise CodingAgentRouterError(
+                    f"{identifier}: paid-only model route must bind --model explicitly"
+                ) from exc
+            if (
+                model_index + 1 >= len(argv_prefix)
+                or argv_prefix[model_index + 1] != route.get("model")
+            ):
+                raise CodingAgentRouterError(
+                    f"{identifier}: paid-only model route --model must match route model"
                 )
         if route.get("contrast_only") is True and route.get("review_only") is True:
             raise CodingAgentRouterError(
@@ -620,13 +644,51 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
         if (
             route is None
             or route.get("enabled") is not True
+            or route.get("paid_only") is True
             or not route_capabilities_by_id.get(route_id, {}).get(
                 "contrast_capable", False
             )
         ):
             raise CodingAgentRouterError(
-                f"catalog top contrast route {route_id} is invalid"
+                f"catalog top contrast route {route_id} is invalid or paid-only"
             )
+    paid_contrast_routes = catalog["policy"].get("frontier_model_policy", {}).get(
+        "paid_contrast_routes", []
+    )
+    if not isinstance(paid_contrast_routes, list):
+        raise CodingAgentRouterError("catalog paid_contrast_routes is invalid")
+    for route_id in paid_contrast_routes:
+        route = routes.get(route_id)
+        if (
+            route is None
+            or route.get("enabled") is not True
+            or route.get("paid_only") is not True
+            or not route_capabilities_by_id.get(route_id, {}).get(
+                "contrast_capable", False
+            )
+        ):
+            raise CodingAgentRouterError(
+                f"catalog paid contrast route {route_id} is invalid"
+            )
+    if catalog["policy"].get("paid_routes_require_explicit_authorization") is not True:
+        raise CodingAgentRouterError(
+            "catalog paid_routes_require_explicit_authorization must be true"
+        )
+    if (
+        catalog["policy"].get("zero_marginal_cost_only") is not True
+        or catalog["policy"].get("zero_marginal_cost_only_scope")
+        != "automatic-and-legacy-provider-only-routes"
+    ):
+        raise CodingAgentRouterError(
+            "catalog zero-marginal cost scope is invalid"
+        )
+    explicit_paid_exceptions = catalog["policy"].get(
+        "explicit_paid_route_exceptions"
+    )
+    if explicit_paid_exceptions != paid_contrast_routes:
+        raise CodingAgentRouterError(
+            "catalog explicit paid route exceptions must equal paid_contrast_routes"
+        )
     return {
         "valid": True,
         "catalog_sha256": _canonical_sha256(catalog),
@@ -1059,12 +1121,15 @@ def _score_route(
     previous_group: str | None,
     previous_provider: str | None,
     capabilities: dict[str, Any] | None = None,
+    allow_paid: bool = False,
 ) -> tuple[float | None, float, float, list[str], list[str], bool]:
     reasons: list[str] = []
     if capabilities is None:
         capabilities = _route_capabilities(route, catalog)
     if route.get("enabled") is not True or route.get("controller") is True:
         return None, 0.0, 0.0, reasons, ["disabled or controller route"], False
+    if route.get("paid_only") is True and not allow_paid:
+        return None, 0.0, 0.0, reasons, ["paid-only route requires explicit paid authorization"], False
     available, availability_reason = _route_available(route, catalog, state)
     if not available:
         return None, 0.0, 0.0, reasons, [availability_reason], False
@@ -1263,6 +1328,7 @@ def _recommendation(
         "effort": route.get("effort"),
         "independence_group": route["independence_group"],
         "quota_pools": route["quota_pools"],
+        "paid_only": route.get("paid_only") is True,
         "burn_weight": route.get("burn_weight", 1),
         "quality_score": quality_score,
         "adaptive_score": adaptive_score,
@@ -1391,6 +1457,224 @@ def _validate_request(
         _strict_bool(latency_priority, "latency_priority"),
         _strict_bool(need_review, "need_review"),
     )
+
+
+def _current_contrast_state(
+    catalog: dict[str, Any], validation: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    state, error_type = _load_optional_advisory_state()
+    if error_type is not None:
+        return None, "router-state-invalid", error_type
+    if not state:
+        return None, "router-state-unavailable", None
+    if state.get("catalog_sha256") != validation["catalog_sha256"]:
+        return None, "router-state-catalog-mismatch", None
+    if not _state_catalog_fresh(state):
+        return None, "router-state-stale", None
+    return state, "current", None
+
+
+def select_contrast_routes(
+    task_class: str,
+    *,
+    changed_files: int = 1,
+    duration_minutes: int = 30,
+    novelty: str = "medium",
+    risk_flags: list[str] | None = None,
+    latency_priority: bool = False,
+    max_candidates: int = 1,
+    allow_paid: bool = False,
+    allowed_harnesses: set[str] | None = None,
+) -> dict[str, Any]:
+    """Rank concrete catalog route IDs for advisory contrast without authorizing execution."""
+    catalog, validation = _load_catalog()
+    (
+        task_value,
+        changed_value,
+        duration_value,
+        novelty_value,
+        flags,
+        latency_value,
+        _review_value,
+    ) = _validate_request(
+        task_class,
+        changed_files,
+        duration_minutes,
+        novelty,
+        risk_flags,
+        latency_priority,
+        False,
+        catalog,
+    )
+    if isinstance(max_candidates, bool) or not isinstance(max_candidates, int) or not 1 <= max_candidates <= 2:
+        raise CodingAgentRouterError("max_candidates must be 1 or 2")
+    if type(allow_paid) is not bool:
+        raise CodingAgentRouterError("allow_paid must be boolean")
+    state, status, error_type = _current_contrast_state(catalog, validation)
+    if state is None:
+        return {
+            "status": status,
+            "state_error_type": error_type,
+            "catalog_sha256": validation["catalog_sha256"],
+            "routes": [],
+            "excluded": {},
+        }
+    route_map = _route_map(catalog)
+    derivations = _route_derivations(catalog)
+    explicit_paid_routes = set(
+        catalog["policy"].get("explicit_paid_route_exceptions", [])
+    )
+    candidate_ids: list[str] = []
+    for route in catalog["routes"]:
+        route_id = route["id"]
+        capabilities = derivations[route_id]["capabilities"]
+        if (
+            route.get("enabled") is not True
+            or route.get("controller") is True
+            or not capabilities.get("contrast_capable", False)
+        ):
+            continue
+        if route.get("paid_only") is True and (
+            not allow_paid or route_id not in explicit_paid_routes
+        ):
+            continue
+        candidate_ids.append(route_id)
+    ranked: list[dict[str, Any]] = []
+    excluded: dict[str, list[str]] = {}
+    used_harnesses: set[str] = set()
+    for route_id in candidate_ids:
+        route = route_map[route_id]
+        if allowed_harnesses is not None and route["harness"] not in allowed_harnesses:
+            excluded[route_id] = ["harness is not allowed by the caller"]
+            continue
+        derivation = derivations[route_id]
+        score, quality_score, adaptive_score, reasons, rejection, execution_eligible = _score_route(
+            route,
+            task_value,
+            catalog,
+            state,
+            changed_files=changed_value,
+            duration_minutes=duration_value,
+            novelty=novelty_value,
+            risk_flags=flags,
+            latency_priority=latency_value,
+            reviewer=False,
+            previous_group=None,
+            previous_provider=None,
+            capabilities=derivation["capabilities"],
+            allow_paid=allow_paid,
+        )
+        if score is None:
+            excluded[route_id] = rejection
+            continue
+        recommendation = _recommendation(
+            route,
+            score,
+            quality_score,
+            adaptive_score,
+            reasons,
+            catalog,
+            execution_eligible,
+            derivation,
+        )
+        ranked.append(recommendation)
+    ranked.sort(
+        key=lambda item: (
+            item["score"],
+            item["quality_score"],
+            item["route"],
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    for item in ranked:
+        if item["harness"] in used_harnesses:
+            excluded[item["route"]] = ["duplicate harness would not add provider diversity"]
+            continue
+        selected.append(item)
+        used_harnesses.add(item["harness"])
+        if len(selected) >= max_candidates:
+            break
+    return {
+        "status": "recommended" if selected else "no-eligible-contrast-route",
+        "state_error_type": None,
+        "catalog_sha256": validation["catalog_sha256"],
+        "routes": selected,
+        "excluded": excluded,
+    }
+
+
+def contrast_route_execution_contract(
+    route_id: str, *, paid_execution_authorized: bool = False
+) -> dict[str, Any]:
+    """Resolve one concrete contrast route to a hash-bound runner contract."""
+    if not isinstance(route_id, str) or not route_id or len(route_id) > 120:
+        raise CodingAgentRouterError("route_id is invalid")
+    if type(paid_execution_authorized) is not bool:
+        raise CodingAgentRouterError("paid_execution_authorized must be boolean")
+    catalog, validation = _load_catalog()
+    routes = _route_map(catalog)
+    route = routes.get(route_id)
+    derivations = _route_derivations(catalog)
+    if (
+        route is None
+        or route.get("enabled") is not True
+        or not derivations.get(route_id, {}).get("capabilities", {}).get("contrast_capable", False)
+    ):
+        raise CodingAgentRouterError("route_id is not an enabled contrast route")
+    paid_only = route.get("paid_only") is True
+    if paid_only and route_id not in set(
+        catalog["policy"].get("explicit_paid_route_exceptions", [])
+    ):
+        raise CodingAgentRouterError(
+            "paid-only route is not an explicit paid route exception"
+        )
+    if paid_only and not paid_execution_authorized:
+        raise CodingAgentRouterError("paid-only route requires explicit paid execution authorization")
+    state, status, error_type = _current_contrast_state(catalog, validation)
+    if state is None:
+        suffix = f" ({error_type})" if error_type else ""
+        raise CodingAgentRouterError(f"contrast route state is not current: {status}{suffix}")
+    available, reason = _route_available(route, catalog, state)
+    if not available:
+        raise CodingAgentRouterError(f"contrast route is unavailable: {reason}")
+    pool_reasons: list[str] = []
+    for pool_id in _route_quota_pools(route, catalog):
+        allowed, reasons, _scarcity, _execution = _pool_gate(
+            pool_id, catalog, state, critical=False
+        )
+        pool_reasons.extend(f"{pool_id}: {item}" for item in reasons)
+        if not allowed:
+            raise CodingAgentRouterError(
+                "contrast route quota gate failed: " + "; ".join(pool_reasons)
+            )
+    argv_prefix = route.get("argv_prefix")
+    if (
+        not isinstance(argv_prefix, list)
+        or not argv_prefix
+        or any(not isinstance(item, str) or not item for item in argv_prefix)
+    ):
+        raise CodingAgentRouterError("contrast route argv_prefix is invalid")
+    harness = catalog["harnesses"][route["harness"]]
+    permission_mode = derivations[route_id]["permission_mode"]
+    if route["harness"] == "claude" and permission_mode is None:
+        permission_mode = "acceptEdits"
+    contract = {
+        "schema_version": 1,
+        "catalog_sha256": validation["catalog_sha256"],
+        "route_id": route_id,
+        "harness": route["harness"],
+        "harness_binary": harness.get("binary"),
+        "model": route["model"],
+        "effort": route.get("effort"),
+        "argv_prefix": argv_prefix,
+        "permission_mode": permission_mode,
+        "quota_pools": route["quota_pools"],
+        "paid_only": paid_only,
+        "authority": "advisory_only",
+        "automatic_patch_apply": False,
+    }
+    return {**contract, "route_contract_sha256": _canonical_sha256(contract)}
 
 
 @mcp.tool(name="grabowski_coding_agent_catalog", annotations=READ_ONLY)
@@ -1610,6 +1894,10 @@ def grabowski_coding_agent_route(
             "allowed": not direct_review_task,
             "requires_explicit_request": True,
             "route_tool": "grabowski_agent_execution_route",
+            "route_selector": "coding-agent-catalog",
+            "start_tool": "grabowski_agent_competition_start",
+            "concrete_route_id_required_for_canonical_start": True,
+            "paid_routes_require_explicit_authorization": True,
             "authority": "advisory_only",
             "automatic_patch_apply": False,
         },
