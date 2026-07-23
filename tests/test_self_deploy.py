@@ -233,6 +233,35 @@ class SelfDeployToolTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "dirty"):
                     SELF_DEPLOY._deployment_source_preflight(expected, None, None)
 
+    def test_preflight_rejects_repoground_managed_source_before_git_or_lease_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            managed_root = root / ".repoground-sources"
+            source = managed_root / "heimgewebe__grabowski__main"
+            canonical.mkdir()
+            source.mkdir(parents=True)
+            expected = "d" * 40
+            with patch.object(
+                SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical
+            ), patch.object(
+                SELF_DEPLOY, "REPOGROUND_MANAGED_SOURCE_ROOT", managed_root
+            ), patch.dict(
+                os.environ, {"REPOGROUND_SOURCE_ROOT": str(root / "configured-root")}
+            ), patch.object(
+                SELF_DEPLOY, "_git_common_directory"
+            ) as git_common, patch.object(
+                SELF_DEPLOY, "_resource_inspect"
+            ) as resource_inspect:
+                with self.assertRaisesRegex(RuntimeError, "RepoGround-managed"):
+                    SELF_DEPLOY._deployment_source_preflight(
+                        expected,
+                        str(source),
+                        "task:deploy-source",
+                    )
+            git_common.assert_not_called()
+            resource_inspect.assert_not_called()
+
     def test_explicit_detached_worktree_source_is_identity_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -951,6 +980,71 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         environment = popen.call_args.kwargs["env"]
         for name in bindings:
             self.assertNotIn(name, environment)
+
+    def test_repoground_managed_source_guard_rejects_direct_and_symlink_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            managed_root = root / ".repoground-sources"
+            managed_repo = managed_root / "heimgewebe__grabowski__main"
+            managed_repo.mkdir(parents=True)
+            alias = root / "alias"
+            alias.symlink_to(managed_repo, target_is_directory=True)
+            allowed = root / ".grabowski-worktrees" / "deploy"
+            allowed.mkdir(parents=True)
+            with patch.object(
+                RUNNER, "REPOGROUND_MANAGED_SOURCE_ROOT", managed_root
+            ), patch.dict(
+                os.environ, {"REPOGROUND_SOURCE_ROOT": str(root / "configured-root")}
+            ):
+                with self.assertRaisesRegex(RuntimeError, "RepoGround-managed"):
+                    RUNNER.assert_not_repoground_managed_source(managed_repo)
+                with self.assertRaisesRegex(RuntimeError, "RepoGround-managed"):
+                    RUNNER.assert_not_repoground_managed_source(alias)
+                RUNNER.assert_not_repoground_managed_source(allowed)
+                self.assertIn(
+                    managed_root.resolve(),
+                    RUNNER.repoground_managed_source_roots(),
+                )
+                self.assertIn(
+                    (root / "configured-root").resolve(),
+                    RUNNER.repoground_managed_source_roots(),
+                )
+
+    def test_runner_rejects_repoground_managed_source_before_delay_or_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            managed_root = root / ".repoground-sources"
+            repo = managed_root / "heimgewebe__grabowski__main"
+            repo.mkdir(parents=True)
+            expected = "f" * 40
+            argv = [
+                "runner",
+                "--repo",
+                str(repo),
+                "--canonical-repo",
+                str(root / "canonical"),
+                "--source-kind",
+                "detached-worktree",
+                "--source-identity-sha256",
+                "0" * 64,
+                "--expected-head",
+                expected,
+                "--delay-seconds",
+                "5",
+            ]
+            with patch.object(
+                RUNNER, "REPOGROUND_MANAGED_SOURCE_ROOT", managed_root
+            ), patch.dict(
+                os.environ, {"REPOGROUND_SOURCE_ROOT": str(root / "configured-root")}
+            ), patch.object(sys, "argv", argv), patch.object(
+                RUNNER, "load_finalization_binding", return_value=None
+            ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
+                RUNNER, "verify_repository"
+            ) as verify, patch.object(RUNNER, "run_streamed") as streamed:
+                self.assertEqual(RUNNER.main(), 1)
+            sleep.assert_not_called()
+            verify.assert_not_called()
+            streamed.assert_not_called()
 
     def test_verify_repository_accepts_detached_shared_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
