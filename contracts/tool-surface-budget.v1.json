@@ -327,15 +327,16 @@
     "grabowski_chronik_history": {
       "evidence_refs": [
         "bureau:CCM-V1-T002",
-        "tests:tests/test_tasks.py"
+        "tests:tests/test_tasks.py",
+        "docs:docs/agent-run-events-runbook.md"
       ],
       "exception_detail": {
-        "claim": "This tool adds only bounded historical read authority over redacted Chronik coding-memory events and does not establish current system truth or mutation authority.",
-        "evidence": "The implementation is READ_ONLY, enforces bounded query inputs, validates query binding and rejects unredacted event payloads."
+        "claim": "This tool adds only bounded historical coding-event read authority and does not establish current runtime truth.",
+        "evidence": "The implementation requires exactly one repo or host scope, bounds result count, invokes only Chronik query, and labels historical results with explicit non-claims."
       },
       "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "A generic operation was rejected because historical coding-memory retrieval requires a stable typed filter contract and explicit historical-only truth exclusions.",
-      "rationale": "Coding-history retrieval needs bounded repo-or-host filters and fail-closed redaction/query binding distinct from current-state reads.",
+      "operation_alternative_considered": "A generic typed operation was rejected because historical coding-memory lookup has a recurring bounded filter and non-current-truth response contract that needs direct schema-visible validation.",
+      "rationale": "Chronik history is a stable read surface with dedicated repo-or-host scoping, bounded pagination semantics, and explicit historical-truth limits distinct from generic operation dispatch.",
       "tool_contract": {
         "authority_class": "read",
         "category": "coding-memory",
@@ -349,15 +350,16 @@
     "grabowski_chronik_outbox_import": {
       "evidence_refs": [
         "bureau:CCM-V1-T002",
-        "tests:tests/test_tasks.py"
+        "tests:tests/test_tasks.py",
+        "docs:docs/agent-run-events-runbook.md"
       ],
       "exception_detail": {
-        "claim": "This tool adds only bounded import authority for one already-redacted Grabowski outbox JSONL into optional local Chronik and does not alter the source outbox.",
-        "evidence": "The implementation requires mutation authority, validates source identity and import receipts, proves source unchanged after execution, and records an audit receipt."
+        "claim": "This tool owns only idempotent append-oriented import authority from one inspected redacted Grabowski outbox into optional local Chronik.",
+        "evidence": "The source is identity- and hash-inspected before import, re-read afterwards, the input is not mutated, and receipts expose unknown outcomes instead of claiming success."
       },
       "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "A generic operation was rejected because the import must bind one exact redacted source file to a typed idempotent Chronik receipt and source-unchanged readback.",
-      "rationale": "The import boundary needs explicit source-digest, idempotency and historical-only semantics that are materially safer than arbitrary command dispatch.",
+      "operation_alternative_considered": "A generic operation was rejected because the import crosses from Grabowski outbox evidence into an optional local Chronik store and requires an independently mutation-gated, receipt-bearing authority boundary.",
+      "rationale": "Chronik import is a narrow append-oriented cross-store effect whose source-integrity and idempotency contract should remain separately reviewable from arbitrary durable job execution.",
       "tool_contract": {
         "authority_class": "mutation",
         "category": "coding-memory",

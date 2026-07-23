@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -1458,6 +1459,45 @@ def _validate_chronik_operation(value: str, *, enabled: bool) -> str:
     return value
 
 
+def _validate_chronik_context_metadata(
+    component: str,
+    bureau_task_id: str,
+    pr_number: int | None,
+    *,
+    enabled: bool,
+) -> tuple[str, str, int | None]:
+    values = {
+        "chronik_component": (component, 160),
+        "chronik_bureau_task_id": (bureau_task_id, 160),
+    }
+    normalized: dict[str, str] = {}
+    for label, (value, maximum) in values.items():
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
+        candidate = value.strip()
+        if len(candidate) > maximum or any(ord(character) < 32 for character in candidate):
+            raise ValueError(f"{label} is invalid")
+        normalized[label] = candidate
+    if pr_number is not None and (
+        isinstance(pr_number, bool)
+        or not isinstance(pr_number, int)
+        or not 1 <= pr_number <= 2_147_483_647
+    ):
+        raise ValueError("chronik_pr_number must be a positive bounded integer")
+    if not enabled and (
+        normalized["chronik_component"]
+        or normalized["chronik_bureau_task_id"]
+        or pr_number is not None
+    ):
+        raise ValueError("Chronik context metadata requires chronik_outbox")
+    return (
+        normalized["chronik_component"],
+        normalized["chronik_bureau_task_id"],
+        pr_number,
+    )
+
+
+
 def _validate_resume_policy(value: str) -> str:
     if value not in RESUME_POLICIES:
         raise ValueError(f"resume_policy must be one of {sorted(RESUME_POLICIES)}")
@@ -1685,13 +1725,27 @@ def _task_lease_metadata(
     return metadata
 
 
-def _chronik_context(host: str, resource_keys: list[str], operation: str) -> str:
-    context: dict[str, str] = {
+def _chronik_context(
+    host: str,
+    resource_keys: list[str],
+    operation: str,
+    *,
+    component: str = "",
+    bureau_task_id: str = "",
+    pr_number: int | None = None,
+) -> str:
+    context: dict[str, Any] = {
         "subject_scope": "host",
         "host": host,
         "operation": operation,
         "task_class": CHRONIK_OPERATION_TASK_CLASS[operation],
     }
+    if component:
+        context["component"] = component
+    if bureau_task_id:
+        context["bureau_task_id"] = bureau_task_id
+    if pr_number is not None:
+        context["pr_number"] = pr_number
     if fleet.fleet_host(host)["transport"] != "local":
         return _canonical_json(context)
     repositories = [key.removeprefix("repo:") for key in resource_keys if key.startswith("repo:")]
@@ -1707,12 +1761,10 @@ def _chronik_context(host: str, resource_keys: list[str], operation: str) -> str
     match = re.search(r"(?:github\.com[:/])(?P<slug>[^/\s]+/[^/\s]+?)(?:\.git)?$", remote)
     if match is None or not match.group("slug").startswith("heimgewebe/"):
         return _canonical_json(context)
-    return _canonical_json({
-        "subject_scope": "repository",
-        "repo": match.group("slug"),
-        "operation": operation,
-        "task_class": CHRONIK_OPERATION_TASK_CLASS[operation],
-    })
+    context.pop("host", None)
+    context["subject_scope"] = "repository"
+    context["repo"] = match.group("slug")
+    return _canonical_json(context)
 
 
 def _lease_owner(task_id: str) -> str:
@@ -2838,6 +2890,9 @@ def grabowski_task_start(
     chronik_outbox: bool = False,
     chronik_outbox_state_root: str | None = None,
     chronik_operation: str = "other",
+    chronik_component: str = "",
+    chronik_bureau_task_id: str = "",
+    chronik_pr_number: int | None = None,
     runtime_python: bool = False,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
@@ -2867,6 +2922,14 @@ def grabowski_task_start(
     chronik_operation = _validate_chronik_operation(
         chronik_operation, enabled=bool(chronik_enabled)
     )
+    chronik_component, chronik_bureau_task_id, chronik_pr_number = (
+        _validate_chronik_context_metadata(
+            chronik_component,
+            chronik_bureau_task_id,
+            chronik_pr_number,
+            enabled=bool(chronik_enabled),
+        )
+    )
     requested_resources = _resource_keys(resource_keys)
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
@@ -2875,7 +2938,14 @@ def grabowski_task_start(
         requested=requested_resources,
     )
     chronik_context_json = (
-        _chronik_context(host, task_resources, chronik_operation)
+        _chronik_context(
+            host,
+            task_resources,
+            chronik_operation,
+            component=chronik_component,
+            bureau_task_id=chronik_bureau_task_id,
+            pr_number=chronik_pr_number,
+        )
         if chronik_enabled
         else None
     )
@@ -3865,6 +3935,8 @@ def _managed_cargo_evidence_from_task_store(max_entries: int) -> dict[str, Any]:
         cache_root=MANAGED_CARGO_CACHE_ROOT,
         max_entries=max_entries,
     )
+
+
 CHRONIK_CLI_TIMEOUT_SECONDS = 30
 CHRONIK_CLI_MAX_OUTPUT_BYTES = 64 * 1024
 CHRONIK_HISTORY_MAX_LIMIT = 100
@@ -3879,6 +3951,72 @@ def _chronik_bounded_text(value: str, *, label: str, maximum: int = 256) -> str:
     ):
         raise ValueError(f"{label} is invalid")
     return normalized
+
+
+def _chronik_parse_timestamp(value: str, *, label: str) -> datetime:
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def _chronik_history_event_matches_query(
+    event: dict[str, Any],
+    normalized: dict[str, str],
+    *,
+    since_timestamp: datetime | None,
+) -> bool:
+    if event.get("schema_version") != "agent-run-event.v0":
+        return False
+    source = event.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("repo") != "heimgewebe/grabowski"
+        or source.get("component") != "grabowski"
+    ):
+        return False
+    if event.get("kind") not in {
+        "agent.run.started",
+        "agent.run.completed",
+        "agent.run.blocked",
+    }:
+        return False
+    if event.get("event_id") != chronik.event_id(event):
+        return False
+    subject = event.get("subject")
+    data = event.get("data")
+    if not isinstance(subject, dict) or not isinstance(data, dict):
+        return False
+    if normalized["repo"]:
+        if subject.get("scope") != "repository" or subject.get("repo") != normalized["repo"]:
+            return False
+    elif subject.get("scope") != "host" or subject.get("host") != normalized["host"]:
+        return False
+    if normalized["component"] and subject.get("component") != normalized["component"]:
+        return False
+    if normalized["operation"] and data.get("operation") != normalized["operation"]:
+        return False
+    if normalized["task_class"] and data.get("task_class") != normalized["task_class"]:
+        return False
+    if normalized["outcome"] and data.get("result") != normalized["outcome"]:
+        return False
+    if since_timestamp is not None:
+        timestamp = event.get("ts")
+        if not isinstance(timestamp, str):
+            return False
+        try:
+            event_timestamp = _chronik_parse_timestamp(timestamp, label="history event ts")
+        except ValueError:
+            return False
+        if event_timestamp < since_timestamp:
+            return False
+    return True
 
 
 def _chronik_cli_run(
@@ -4111,6 +4249,11 @@ def grabowski_chronik_history(
     }
     if bool(normalized["repo"]) == bool(normalized["host"]):
         raise ValueError("exactly one of repo or host is required")
+    since_timestamp = (
+        _chronik_parse_timestamp(normalized["since"], label="since")
+        if normalized["since"]
+        else None
+    )
     arguments = ["query"]
     target_key = "repo" if normalized["repo"] else "host"
     arguments.append(f"--{target_key}={normalized[target_key]}")
@@ -4149,20 +4292,17 @@ def grabowski_chronik_history(
                 raise ValueError("Chronik coding-memory history contract is stale")
             if history.get("historical_only") is not True:
                 raise ValueError("Chronik coding-memory history is not historical-only")
-            raw_query = history.get("query")
-            if not isinstance(raw_query, dict):
-                raise ValueError("Chronik coding-memory history query is missing")
-            allowed_query_keys = {
-                "repo", "host", "component", "operation", "task_class", "outcome", "since", "limit"
+            expected_history_query = {
+                "repo": normalized["repo"] or None,
+                "host": normalized["host"] or None,
+                "component": normalized["component"] or None,
+                "operation": normalized["operation"] or None,
+                "task_class": normalized["task_class"] or None,
+                "outcome": normalized["outcome"] or None,
+                "since": normalized["since"] or None,
+                "limit": limit,
             }
-            if any(key not in allowed_query_keys for key in raw_query):
-                raise ValueError("Chronik coding-memory history query is unbound")
-            bound_query = {
-                key: value
-                for key, value in raw_query.items()
-                if value not in (None, "")
-            }
-            if bound_query != query:
+            if history.get("query") != expected_history_query:
                 raise ValueError("Chronik coding-memory history query is unbound")
             raw_events = history.get("events", [])
             raw_event_ids = history.get("event_ids", [])
@@ -4186,6 +4326,15 @@ def grabowski_chronik_history(
                 for event in raw_events
             ):
                 raise ValueError("Chronik coding-memory history contains unredacted event")
+            if any(
+                not _chronik_history_event_matches_query(
+                    event, normalized, since_timestamp=since_timestamp
+                )
+                for event in raw_events
+            ):
+                raise ValueError(
+                    "Chronik coding-memory history contains event unbound to requested query"
+                )
             if not isinstance(raw_claims, list) or not all(
                 isinstance(claim, str) for claim in raw_claims
             ):
