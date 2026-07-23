@@ -2944,13 +2944,13 @@ def event_id(event):
     return 'sha256:' + hashlib.sha256(canonical(unsigned)).hexdigest()
 
 
-def make_event(target_scope, target_value, index, operation, task_class, component):
+def make_event(target_scope, target_value, index, operation, task_class, subject_component):
     task_id = ('a' if index == 0 else 'b') * 24
     subject = ({'scope': 'repository', 'repo': target_value}
                if target_scope == 'repository'
                else {'scope': 'host', 'host': target_value})
-    if component:
-        subject['component'] = component
+    if subject_component:
+        subject['component'] = subject_component
     event = {
         'schema_version': 'agent-run-event.v0',
         'kind': 'agent.run.completed',
@@ -2977,6 +2977,7 @@ target = query.add_mutually_exclusive_group(required=True)
 target.add_argument('--repo')
 target.add_argument('--host')
 query.add_argument('--component')
+query.add_argument('--subject-component')
 query.add_argument('--operation')
 query.add_argument('--task-class')
 query.add_argument('--outcome')
@@ -3003,7 +3004,9 @@ else:
     target_scope = 'repository' if args.repo else 'host'
     target_value = args.repo or args.host
     fault = target_value.removeprefix('fault-') if target_value.startswith('fault-') else args.component
-    events = [make_event(target_scope, target_value, index, args.operation, args.task_class, args.component) for index in range(2)]
+    events = [make_event(target_scope, target_value, index, args.operation, args.task_class, 'task-runner') for index in range(2)]
+    if args.subject_component:
+        events = [event for event in events if event['subject'].get('component') == args.subject_component]
     if fault == 'leak':
         events[0]['stdout'] = 'sensitive historical output'
     if fault == 'extra-data':
@@ -3017,6 +3020,8 @@ else:
         events[0]['subject']['repo'] = 'heimgewebe/other'
         events[0]['event_id'] = event_id(events[0])
     query_value = {'repo': args.repo, 'host': args.host, 'component': args.component, 'operation': args.operation, 'task_class': args.task_class, 'outcome': args.outcome, 'since': args.since, 'limit': args.limit}
+    if args.subject_component is not None:
+        query_value['subject_component'] = args.subject_component
     if fault == 'bad-query':
         query_value['repo'] = 'heimgewebe/other'
     target_value_obj = ({'scope': 'repository', 'repo': args.repo}
@@ -3072,6 +3077,7 @@ else:
             {
                 tasks.chronik.CODING_MEMORY_REPO_ENV: str(self.repository),
                 tasks.chronik.CODING_MEMORY_DATA_DIR_ENV: str(self.data_dir),
+                tasks.chronik.CODING_MEMORY_PYTHON_ENV: sys.executable,
                 tasks.chronik.STATE_ROOT_ENV: str(self.root / "state"),
             },
             clear=False,
@@ -3082,6 +3088,72 @@ else:
         self.environment.stop()
         self.audit_patch.stop()
         self.temporary.cleanup()
+
+    def test_coding_memory_configuration_resolves_canonical_release_pointer(self) -> None:
+        runtime_root = self.root / "chronik-runtime"
+        release = runtime_root / "releases" / ("a" * 40)
+        cli = release / "tools" / "coding_memory.py"
+        cli.parent.mkdir(parents=True)
+        cli.write_text("print('{}')\n", encoding="utf-8")
+        current = runtime_root / "current"
+        current.symlink_to(Path("releases") / release.name)
+        with patch.dict(
+            os.environ,
+            {
+                tasks.chronik.CODING_MEMORY_REPO_ENV: str(current),
+                tasks.chronik.CODING_MEMORY_DATA_DIR_ENV: str(self.data_dir),
+            },
+            clear=False,
+        ):
+            configuration = tasks.chronik.coding_memory_configuration()
+        self.assertTrue(configuration["available"])
+        self.assertEqual(str(release), configuration["repository"])
+        self.assertEqual(sys.executable, configuration["python"])
+        self.assertEqual(str(cli), configuration["cli"])
+
+    def test_coding_memory_configuration_rejects_missing_runtime_python(self) -> None:
+        with patch.dict(
+            os.environ,
+            {tasks.chronik.CODING_MEMORY_PYTHON_ENV: str(self.root / "missing-python")},
+            clear=False,
+        ):
+            configuration = tasks.chronik.coding_memory_configuration()
+        self.assertFalse(configuration["available"])
+        self.assertEqual("chronik_python_unavailable", configuration["reason"])
+
+    def test_chronik_cli_run_uses_configured_runtime_python(self) -> None:
+        configuration = {
+            "python": "/opt/chronik-runtime/bin/python",
+            "cli": "/opt/chronik-release/tools/coding_memory.py",
+            "repository": str(self.repository),
+        }
+        with patch.object(
+            tasks.operator,
+            "_run",
+            return_value={"returncode": 0, "stdout": "{}", "stderr": "", "timed_out": False},
+        ) as run:
+            tasks._chronik_cli_run(["query", "--repo=heimgewebe/grabowski"], configuration=configuration, data_dir=self.data_dir)
+        command = run.call_args.args[0]
+        self.assertEqual("/opt/chronik-runtime/bin/python", command[0])
+        self.assertEqual("/opt/chronik-release/tools/coding_memory.py", command[1])
+
+    def test_coding_memory_configuration_rejects_noncanonical_symlink(self) -> None:
+        target = self.root / "foreign-chronik"
+        (target / "tools").mkdir(parents=True)
+        (target / "tools" / "coding_memory.py").write_text("print('{}')\n", encoding="utf-8")
+        linked = self.root / "chronik-link"
+        linked.symlink_to(target)
+        with patch.dict(
+            os.environ,
+            {
+                tasks.chronik.CODING_MEMORY_REPO_ENV: str(linked),
+                tasks.chronik.CODING_MEMORY_DATA_DIR_ENV: str(self.data_dir),
+            },
+            clear=False,
+        ):
+            configuration = tasks.chronik.coding_memory_configuration()
+        self.assertFalse(configuration["available"])
+        self.assertEqual("chronik_repository_unavailable", configuration["reason"])
 
     def test_outbox_import_is_idempotent_hash_bound_and_preserves_source(self) -> None:
         before = hashlib.sha256(self.source.read_bytes()).hexdigest()
@@ -3214,6 +3286,7 @@ else:
             "repo": "heimgewebe/grabowski",
             "host": "",
             "component": "grabowski",
+            "subject_component": "",
             "operation": "",
             "task_class": "",
             "outcome": "",
@@ -3230,6 +3303,41 @@ else:
                 event, normalized, since_timestamp=None
             )
         )
+        normalized["component"] = "grabowski"
+        normalized["subject_component"] = "task-runner"
+        self.assertTrue(
+            tasks._chronik_history_event_matches_query(
+                event, normalized, since_timestamp=None
+            )
+        )
+        normalized["subject_component"] = "grabowski"
+        self.assertFalse(
+            tasks._chronik_history_event_matches_query(
+                event, normalized, since_timestamp=None
+            )
+        )
+
+    def test_history_subject_component_filter_is_explicit_and_query_bound(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski",
+                component="grabowski",
+                subject_component="task-runner",
+                limit=1,
+            )
+        self.assertTrue(result["available"])
+        self.assertEqual("task-runner", result["query"]["subject_component"])
+        self.assertEqual("task-runner", result["history"]["query"]["subject_component"])
+        self.assertEqual(1, len(result["events"]))
+
+    def test_history_subject_component_filter_can_return_no_matches(self) -> None:
+        with patch.object(tasks.operator, "_require_operator_capability"):
+            result = tasks.grabowski_chronik_history(
+                repo="heimgewebe/grabowski", subject_component="other", limit=2
+            )
+        self.assertTrue(result["available"])
+        self.assertEqual([], result["events"])
+        self.assertEqual([], result["history"]["event_ids"])
 
     def test_history_rejects_unredacted_or_extra_event_fields_without_exposure(self) -> None:
         for component, secret in (("leak", "sensitive historical output"), ("extra-data", "sensitive summary"), ("extra-top", "sensitive metadata"), ("bad-data-value", "sensitive-operation")):

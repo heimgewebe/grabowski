@@ -1230,7 +1230,7 @@
     },
     {
       "category": "coding-memory",
-      "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source component.",
+      "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source component.\nsubject_component independently filters task-context subject.component.",
       "effects": [],
       "id": "grabowski_chronik_history",
       "purpose": "Read bounded historical coding events without asserting current truth.",
@@ -2768,7 +2768,7 @@
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
       "src/grabowski_capabilities.py": "2996cc1ca538cf55248ef7ce3b932fb1ab13374e7e16cd181676b82e839babbb",
       "src/grabowski_checkouts.py": "2c1a313621eeaf416e84e5bf55357bce5f561be7e909b7f48adaab3f4b229e53",
-      "src/grabowski_chronik.py": "2a3a2a2e57607137dcc3f49ce56fff075de4d591205556c58268f21e9ccebd7f",
+      "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
       "src/grabowski_coding_agent_catalog_data.py": "6d5c262aa9e191dd3a4c76f108d9b061b51ee59e72ec70edb97ae5cd37299d86",
       "src/grabowski_coding_agent_router.py": "5805afacf47870f49acdb836a542e354a6a8801df5a5e2b511f097e40e727050",
@@ -2817,7 +2817,7 @@
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_task_attention.py": "fb7c62a50d6a1b0ec7eb33c9733121dc7024dc0a077ae8210aaaa4adf53cf81b",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "093b08e12494bc65d2d6e979bcff80f5b344567d0d634027755c2f2bfb9a656b",
+      "src/grabowski_tasks.py": "76e396765784f54c4d14891f37c0743af49fd1252468fdc82f84c3061cee8ab4",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"

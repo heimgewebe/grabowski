@@ -4000,6 +4000,8 @@ def _chronik_history_event_matches_query(
         return False
     if normalized["component"] and source.get("component") != normalized["component"]:
         return False
+    if normalized["subject_component"] and subject.get("component") != normalized["subject_component"]:
+        return False
     if normalized["operation"] and data.get("operation") != normalized["operation"]:
         return False
     if normalized["task_class"] and data.get("task_class") != normalized["task_class"]:
@@ -4023,7 +4025,7 @@ def _chronik_cli_run(
     arguments: list[str], *, configuration: dict[str, Any], data_dir: Path | str
 ) -> dict[str, Any]:
     command = [
-        sys.executable,
+        configuration["python"],
         configuration["cli"],
         "--data-dir",
         str(data_dir),
@@ -4390,6 +4392,7 @@ def grabowski_chronik_history(
     repo: str = "",
     host: str = "",
     component: str = "",
+    subject_component: str = "",
     operation: str = "",
     task_class: str = "",
     outcome: str = "",
@@ -4399,6 +4402,7 @@ def grabowski_chronik_history(
     """Read bounded historical coding events without asserting current truth.
 
     The optional component filter is bound to Chronik's canonical producer/source component.
+    subject_component independently filters task-context subject.component.
     """
     operator._require_operator_capability("durable_job")
     if (
@@ -4411,6 +4415,7 @@ def grabowski_chronik_history(
         "repo": _chronik_bounded_text(repo, label="repo"),
         "host": _chronik_bounded_text(host, label="host"),
         "component": _chronik_bounded_text(component, label="component"),
+        "subject_component": _chronik_bounded_text(subject_component, label="subject_component"),
         "operation": _chronik_bounded_text(operation, label="operation"),
         "task_class": _chronik_bounded_text(task_class, label="task_class"),
         "outcome": _chronik_bounded_text(outcome, label="outcome"),
@@ -4426,7 +4431,7 @@ def grabowski_chronik_history(
     arguments = ["query"]
     target_key = "repo" if normalized["repo"] else "host"
     arguments.append(f"--{target_key}={normalized[target_key]}")
-    for key in ("component", "operation", "task_class", "outcome", "since"):
+    for key in ("component", "subject_component", "operation", "task_class", "outcome", "since"):
         if normalized[key]:
             arguments.append(f"--{key.replace('_', '-')}={normalized[key]}")
     arguments.append(f"--limit={limit}")
@@ -4474,7 +4479,10 @@ def grabowski_chronik_history(
         if history.get("historical_only") is not True:
             raise ValueError("Chronik coding-memory history is not historical-only")
         raw_query = history.get("query")
-        if not isinstance(raw_query, dict) or set(raw_query) != _CHRONIK_QUERY_KEYS:
+        expected_query_keys = set(_CHRONIK_QUERY_KEYS)
+        if normalized["subject_component"]:
+            expected_query_keys.add("subject_component")
+        if not isinstance(raw_query, dict) or set(raw_query) != expected_query_keys:
             raise ValueError("Chronik coding-memory history query is unbound")
         bound_query = {
             key: value for key, value in raw_query.items() if value not in (None, "")
