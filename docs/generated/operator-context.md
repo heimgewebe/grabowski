@@ -126,6 +126,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |
 | `grabowski_task_resume` | task | no | variable | Recreate a missing or stopped task unit from its persistent record. |
 | `grabowski_task_list` | task | yes | low | List recent persistent task records with optional state filtering. |
+| `grabowski_chronik_outbox_import` | coding-memory | no | medium | Import one redacted Grabowski outbox JSONL into optional local Chronik. |
+| `grabowski_chronik_history` | coding-memory | yes | low | Read bounded historical coding events without asserting current truth. |
 | `grabowski_task_reconcile_check` | task | yes | low | Preview reconcile effects for persistent task records without mutating state. |
 | `grabowski_task_reconcile_refresh` | task | no | medium | Refresh persistent task records and release terminal leases without resuming processes. |
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |

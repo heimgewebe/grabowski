@@ -235,6 +235,12 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.git = GitFixture(self.root)
         self.state = self.root / "state"
         self.state.mkdir()
+        os.chmod(self.state, 0o700)
+        self.audit_log_patch = mock.patch.object(
+            workspace.operator.base, "AUDIT_LOG", self.state / "write-audit.jsonl"
+        )
+        self.audit_log_patch.start()
+        self.addCleanup(self.audit_log_patch.stop)
         self.outcome_log_patch = mock.patch.object(
             friction, "EXECUTION_OUTCOME_LOG", self.state / "execution-outcomes.jsonl"
         )

@@ -19,6 +19,7 @@ MAX_CAPTURE_BYTES = 65_536
 MAX_MANIFEST_BYTES = 2_000_000
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
 FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 FINALIZATION_ENV = {
     "job_id": "GRABOWSKI_JOB_ID",
     "unit": "GRABOWSKI_JOB_UNIT",
@@ -270,6 +271,31 @@ def _validated_repository_path(repo: Path, *, label: str) -> Path:
     return resolved
 
 
+def repoground_managed_source_roots() -> tuple[Path, ...]:
+    roots = [REPOGROUND_MANAGED_SOURCE_ROOT]
+    configured = os.environ.get("REPOGROUND_SOURCE_ROOT")
+    if configured:
+        configured_root = Path(configured)
+        if not configured_root.is_absolute():
+            raise RuntimeError("RepoGround managed source root must be an absolute path")
+        roots.append(configured_root)
+    return tuple(dict.fromkeys(root.resolve(strict=False) for root in roots))
+
+
+def assert_not_repoground_managed_source(repo: Path) -> None:
+    """Reject deploy execution from RepoGround publisher-owned source checkouts."""
+    resolved_repo = repo.resolve(strict=False)
+    for resolved_root in repoground_managed_source_roots():
+        try:
+            resolved_repo.relative_to(resolved_root)
+        except ValueError:
+            continue
+        raise RuntimeError(
+            "RepoGround-managed source repository cannot be used as a deploy source: "
+            f"{repo}"
+        )
+
+
 def _git_prefix(repo: Path) -> list[str]:
     return [
         "git",
@@ -311,6 +337,7 @@ def verify_repository(
     if source_kind not in SOURCE_KINDS:
         raise ValueError("source_kind is invalid")
     source = _validated_repository_path(repo, label="source repository")
+    assert_not_repoground_managed_source(source)
     canonical = _validated_repository_path(
         canonical_repo,
         label="canonical repository",
@@ -408,6 +435,7 @@ def main() -> int:
         binding = load_finalization_binding()
         if binding is not None and binding["expected_head"] != args.expected_head:
             raise RuntimeError("job finalization expected_head does not match runner arguments")
+        assert_not_repoground_managed_source(repo)
         emit(
             "scheduled",
             repo=str(repo),

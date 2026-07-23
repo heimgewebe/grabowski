@@ -708,6 +708,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_chronik_outbox_import": {
+        "category": "coding-memory",
+        "purpose": "Import one redacted Grabowski outbox JSONL into optional local Chronik.",
+        "risk_class": "medium",
+        "effects": ["state-create", "audit-append"],
+        "reversibility": "append-only-observation",
+    },
+    "grabowski_chronik_history": {
+        "category": "coding-memory",
+        "purpose": "Read bounded historical coding events without asserting current truth.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_task_archive_list": {
         "category": "task-archive",
         "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",
