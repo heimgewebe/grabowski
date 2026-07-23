@@ -227,6 +227,12 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(result, {"recorded": True})
         self.assertFalse(active["value"])
 
+    def test_atomic_write_keeps_private_mode_without_path_chmod(self) -> None:
+        with mock.patch.object(cli.os, "chmod") as path_chmod:
+            cli._atomic_write_private_json(self.state, {"schema_version": 2})
+        path_chmod.assert_not_called()
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
+
     def test_state_target_symlink_is_rejected(self) -> None:
         real = self.root / "real-state.json"
         real.write_text("{}\n", encoding="utf-8")

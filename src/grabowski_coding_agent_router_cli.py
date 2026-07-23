@@ -538,7 +538,6 @@ def _atomic_write_private_json(path: Path, value: dict[str, Any]) -> None:
         if _state_target_identity(path) != initial_target:
             raise CodingAgentRouterCliError("router state target changed before replace")
         os.replace(temporary, path)
-        os.chmod(path, 0o600)
         directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
