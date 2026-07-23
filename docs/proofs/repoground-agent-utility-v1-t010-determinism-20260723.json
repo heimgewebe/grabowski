@@ -11,6 +11,11 @@
       "context_ref.generated_at"
     ],
     "other_volatile_fields_found": [],
+    "volatility_scope": {
+      "lane": "context pack read without a query argument",
+      "covered": "context_ref, freshness, bundle_status, preflight, bounded_evidence with empty snippets and ranges, access_wrappers, agent_handoff",
+      "not_covered": "the retrieval lane (query argument set), which delegates snippet and range ordering to the external repoground index; no cold-start determinism claim is made for it"
+    },
     "preserved_evidence": true,
     "semantic_equality_claimed": false,
     "hash_scope": {
@@ -148,6 +153,7 @@
     "automatic_default_routing",
     "repoground_write_authority",
     "byte_equality_across_hosts_or_paths",
+    "retrieval_lane_determinism",
     "retrieval_quality_improvement",
     "test_sufficiency"
   ]
