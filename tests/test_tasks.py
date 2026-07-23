@@ -3001,35 +3001,36 @@ else:
         raise SystemExit(2)
     target_scope = 'repository' if args.repo else 'host'
     target_value = args.repo or args.host
+    fault = target_value.removeprefix('fault-') if target_value.startswith('fault-') else args.component
     events = [make_event(target_scope, target_value, index, args.operation, args.task_class, args.component) for index in range(2)]
-    if args.component == 'leak':
+    if fault == 'leak':
         events[0]['stdout'] = 'sensitive historical output'
-    if args.component == 'extra-data':
+    if fault == 'extra-data':
         events[0]['data']['summary'] = 'sensitive summary'
-    if args.component == 'extra-top':
+    if fault == 'extra-top':
         events[0]['metadata'] = 'sensitive metadata'
-    if args.component == 'bad-data-value':
+    if fault == 'bad-data-value':
         events[0]['data']['operation'] = 'sensitive-operation'
         events[0]['event_id'] = event_id(events[0])
-    if args.component == 'bad-event-target':
+    if fault == 'bad-event-target':
         events[0]['subject']['repo'] = 'heimgewebe/other'
         events[0]['event_id'] = event_id(events[0])
     query_value = {'repo': args.repo, 'host': args.host, 'component': args.component, 'operation': args.operation, 'task_class': args.task_class, 'outcome': args.outcome, 'since': args.since, 'limit': args.limit}
-    if args.component == 'bad-query':
+    if fault == 'bad-query':
         query_value['repo'] = 'heimgewebe/other'
     target_value_obj = ({'scope': 'repository', 'repo': args.repo}
                         if args.repo else {'scope': 'host', 'host': args.host})
-    if args.component == 'bad-target':
+    if fault == 'bad-target':
         target_value_obj = {'scope': 'repository', 'repo': 'heimgewebe/other'}
     snapshot = {'domain': 'agent.ledger', 'sha256': '0' * 64, 'complete_bytes': 123, 'total_record_count': 2, 'valid_record_count': 2, 'invalid_record_count': 0, 'integrity_valid': True, 'diagnostics': [], 'diagnostics_truncated': False}
-    if args.component == 'bad-integrity':
+    if fault == 'bad-integrity':
         snapshot.update({'valid_record_count': 1, 'invalid_record_count': 1, 'integrity_valid': False})
-    if args.component == 'bad-diagnostics':
+    if fault == 'bad-diagnostics':
         snapshot['diagnostics'] = ['sensitive diagnostic']
     history = {'schema_version': 'chronik-coding-history.v1', 'query': query_value, 'target': target_value_obj, 'events': events[:args.limit], 'event_ids': [event['event_id'] for event in events[:args.limit]], 'ledger_snapshot': snapshot, 'historical_only': True, 'does_not_establish': ['current_git_state', 'current_ci_state', 'current_runtime_state', 'safe_retry']}
-    if args.component == 'unknown-history':
+    if fault == 'unknown-history':
         history['debug'] = 'sensitive debug output'
-    if args.component == 'extra-claims':
+    if fault == 'extra-claims':
         history['does_not_establish'].append('sensitive claim')
     print(json.dumps(history))
 """,
@@ -3204,6 +3205,31 @@ else:
         self.assertEqual({"scope": "repository", "repo": "heimgewebe/grabowski"}, result["history"]["target"])
         self.assertTrue(result["history"]["ledger_snapshot"]["integrity_valid"])
 
+    def test_history_component_filter_uses_chronik_source_component(self) -> None:
+        event = json.loads(self.source.read_text(encoding="utf-8"))
+        self.assertEqual("task-runner", event["subject"]["component"])
+        self.assertEqual("grabowski", event["source"]["component"])
+        normalized = {
+            "repo": "heimgewebe/grabowski",
+            "host": "",
+            "component": "grabowski",
+            "operation": "",
+            "task_class": "",
+            "outcome": "",
+            "since": "",
+        }
+        self.assertTrue(
+            tasks._chronik_history_event_matches_query(
+                event, normalized, since_timestamp=None
+            )
+        )
+        normalized["component"] = "task-runner"
+        self.assertFalse(
+            tasks._chronik_history_event_matches_query(
+                event, normalized, since_timestamp=None
+            )
+        )
+
     def test_history_rejects_unredacted_or_extra_event_fields_without_exposure(self) -> None:
         for component, secret in (("leak", "sensitive historical output"), ("extra-data", "sensitive summary"), ("extra-top", "sensitive metadata"), ("bad-data-value", "sensitive-operation")):
             with patch.object(tasks.operator, "_require_operator_capability"):
@@ -3213,9 +3239,14 @@ else:
             self.assertNotIn(secret, json.dumps(result))
 
     def test_history_rejects_unbound_query_target_and_invalid_ledger(self) -> None:
-        for component, marker in (("bad-query", "query"), ("bad-target", "target"), ("bad-integrity", "integrity"), ("bad-diagnostics", "fields")):
+        for component, marker in (("bad-query", "query"), ("bad-target", "target")):
             with patch.object(tasks.operator, "_require_operator_capability"):
                 result = tasks.grabowski_chronik_history(repo="heimgewebe/grabowski", component=component, limit=2)
+            self.assertFalse(result["available"])
+            self.assertIn(marker, result["failure"]["contract_error"])
+        for fault, marker in (("bad-integrity", "integrity"), ("bad-diagnostics", "fields")):
+            with patch.object(tasks.operator, "_require_operator_capability"):
+                result = tasks.grabowski_chronik_history(host=f"fault-{fault}", limit=2)
             self.assertFalse(result["available"])
             self.assertIn(marker, result["failure"]["contract_error"])
 
@@ -3228,7 +3259,7 @@ else:
 
     def test_history_rejects_extra_truth_claims_without_exposure(self) -> None:
         with patch.object(tasks.operator, "_require_operator_capability"):
-            result = tasks.grabowski_chronik_history(repo="heimgewebe/grabowski", component="extra-claims")
+            result = tasks.grabowski_chronik_history(host="fault-extra-claims")
         self.assertFalse(result["available"])
         self.assertNotIn("sensitive claim", json.dumps(result))
         self.assertIn("truth exclusions", result["failure"]["contract_error"])

@@ -1219,7 +1219,7 @@
     },
     {
       "category": "coding-memory",
-      "description": "Read bounded historical coding events without asserting current truth.",
+      "description": "Read bounded historical coding events without asserting current truth.\n\nThe optional component filter is bound to Chronik's canonical producer/source component.",
       "effects": [],
       "id": "grabowski_chronik_history",
       "purpose": "Read bounded historical coding events without asserting current truth.",
@@ -2768,7 +2768,7 @@
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_task_attention.py": "17644d4dfb90b5b377ebb25a7f06e5a35534dc37ef22c411312b50380e093fd6",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
-      "src/grabowski_tasks.py": "50c440a3b84e40e7194ce51561a9b6a03b205d86ddbad4695fe3d926002ab239",
+      "src/grabowski_tasks.py": "093b08e12494bc65d2d6e979bcff80f5b344567d0d634027755c2f2bfb9a656b",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"

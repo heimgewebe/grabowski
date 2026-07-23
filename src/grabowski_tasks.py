@@ -3998,7 +3998,7 @@ def _chronik_history_event_matches_query(
             return False
     elif subject.get("scope") != "host" or subject.get("host") != normalized["host"]:
         return False
-    if normalized["component"] and subject.get("component") != normalized["component"]:
+    if normalized["component"] and source.get("component") != normalized["component"]:
         return False
     if normalized["operation"] and data.get("operation") != normalized["operation"]:
         return False
@@ -4396,7 +4396,10 @@ def grabowski_chronik_history(
     since: str = "",
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Read bounded historical coding events without asserting current truth."""
+    """Read bounded historical coding events without asserting current truth.
+
+    The optional component filter is bound to Chronik's canonical producer/source component.
+    """
     operator._require_operator_capability("durable_job")
     if (
         isinstance(limit, bool)
