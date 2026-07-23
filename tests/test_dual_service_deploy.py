@@ -2132,38 +2132,53 @@ class DeploymentSequenceTests(unittest.TestCase):
     def test_tunnel_drain_metrics_require_unique_complete_nonnegative_values(self) -> None:
         valid = (
             "commands_queue_length{scope=\"controlplane\"} 0\n"
-            "dispatcher_worker_pool_occupancy{scope=\"dispatcher\"} 2\n"
+            "dispatcher_worker_pool_occupancy{scope=\"dispatcher\"} 10\n"
             "commands_polled_total{scope=\"controlplane\"} 10\n"
             "commands_enqueued_total{scope=\"controlplane\"} 10\n"
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response",request_method="tools/call"} 6\n'
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response",request_method="initialize"} 4\n'
+            'command_end_to_end_latency_milliseconds_count{latency_type="poll_to_response",request_method="tools/call"} 6\n'
             "process_start_time_seconds 1000\n"
         )
         self.assertEqual(
             {
                 "commands_queue_length": 0.0,
-                "dispatcher_worker_pool_occupancy": 2.0,
+                "dispatcher_worker_pool_occupancy": 10.0,
                 "commands_polled_total": 10.0,
                 "commands_enqueued_total": 10.0,
+                "commands_final_responses_total": 10.0,
                 "process_start_time_seconds": 1000.0,
             },
             dual._parse_tunnel_drain_metrics(valid),
         )
+        duplicate_response = valid + (
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response",request_method="tools/call"} 6\n'
+        )
         invalid = {
             "missing": "commands_queue_length 0\n",
             "duplicate": valid + "dispatcher_worker_pool_occupancy 0\n",
-            "negative": valid.replace("occupancy{scope=\"dispatcher\"} 2", "occupancy{scope=\"dispatcher\"} -1"),
-            "nan": valid.replace("occupancy{scope=\"dispatcher\"} 2", "occupancy{scope=\"dispatcher\"} NaN"),
+            "duplicate_response": duplicate_response,
+            "negative": valid.replace(
+                "occupancy{scope=\"dispatcher\"} 10",
+                "occupancy{scope=\"dispatcher\"} -1",
+            ),
+            "nan": valid.replace(
+                "occupancy{scope=\"dispatcher\"} 10",
+                "occupancy{scope=\"dispatcher\"} NaN",
+            ),
         }
         for name, payload in invalid.items():
             with self.subTest(name=name), self.assertRaises(core.DeployError):
                 dual._parse_tunnel_drain_metrics(payload)
 
-    def test_tunnel_drain_wait_requires_stable_counters_across_idle_samples(self) -> None:
-        def metrics(*, workers: int, counter: int) -> str:
+    def test_tunnel_drain_wait_requires_completed_responses_and_stable_counters(self) -> None:
+        def metrics(*, workers: int, counter: int, responses: int) -> str:
             return (
                 "commands_queue_length 0\n"
                 f"dispatcher_worker_pool_occupancy {workers}\n"
                 f"commands_polled_total {counter}\n"
                 f"commands_enqueued_total {counter}\n"
+                f'command_end_to_end_latency_milliseconds_count{{latency_type="enqueue_to_response",request_method="tools/call"}} {responses}\n'
                 "process_start_time_seconds 1000\n"
             )
 
@@ -2172,22 +2187,25 @@ class DeploymentSequenceTests(unittest.TestCase):
                 core,
                 "http_text",
                 side_effect=[
-                    metrics(workers=1, counter=10),
-                    metrics(workers=0, counter=10),
-                    metrics(workers=0, counter=11),
-                    metrics(workers=0, counter=11),
-                    metrics(workers=0, counter=11),
+                    metrics(workers=10, counter=10, responses=9),
+                    metrics(workers=10, counter=10, responses=10),
+                    metrics(workers=10, counter=11, responses=10),
+                    metrics(workers=10, counter=11, responses=11),
+                    metrics(workers=10, counter=11, responses=11),
+                    metrics(workers=10, counter=11, responses=11),
                 ],
             ),
             mock.patch.object(dual.time, "sleep"),
         ):
             result = dual.wait_for_tunnel_dispatcher_idle(timeout_seconds=5)
-        self.assertEqual(5, result["attempts"])
+        self.assertEqual(6, result["attempts"])
         self.assertEqual(3, result["consecutive_idle_samples"])
+        self.assertEqual(10.0, result["metrics"]["dispatcher_worker_pool_occupancy"])
         self.assertEqual(
             {
                 "commands_polled_total": 11.0,
                 "commands_enqueued_total": 11.0,
+                "commands_final_responses_total": 11.0,
                 "process_start_time_seconds": 1000.0,
             },
             result["stability"],
@@ -2196,15 +2214,13 @@ class DeploymentSequenceTests(unittest.TestCase):
     def test_tunnel_drain_wait_fails_closed_on_counter_regression(self) -> None:
         first = (
             "commands_queue_length 0\n"
-            "dispatcher_worker_pool_occupancy 1\n"
+            "dispatcher_worker_pool_occupancy 10\n"
             "commands_polled_total 10\n"
             "commands_enqueued_total 10\n"
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response"} 10\n'
             "process_start_time_seconds 1000\n"
         )
-        regressed = first.replace(
-            "dispatcher_worker_pool_occupancy 1",
-            "dispatcher_worker_pool_occupancy 0",
-        ).replace("total 10", "total 9")
+        regressed = first.replace("commands_polled_total 10", "commands_polled_total 9")
         with (
             mock.patch.object(core, "http_text", side_effect=[first, regressed]),
             mock.patch.object(dual.time, "sleep"),
@@ -2217,12 +2233,16 @@ class DeploymentSequenceTests(unittest.TestCase):
     def test_tunnel_drain_wait_fails_closed_on_process_switch(self) -> None:
         first = (
             "commands_queue_length 1\n"
-            "dispatcher_worker_pool_occupancy 1\n"
+            "dispatcher_worker_pool_occupancy 10\n"
             "commands_polled_total 10\n"
             "commands_enqueued_total 10\n"
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response"} 10\n'
             "process_start_time_seconds 1000\n"
         )
-        restarted = first.replace("process_start_time_seconds 1000", "process_start_time_seconds 1001")
+        restarted = first.replace(
+            "process_start_time_seconds 1000",
+            "process_start_time_seconds 1001",
+        )
         with (
             mock.patch.object(core, "http_text", side_effect=[first, restarted]),
             mock.patch.object(dual.time, "sleep"),
@@ -2239,22 +2259,37 @@ class DeploymentSequenceTests(unittest.TestCase):
             raised.exception.details["observed_process_start_time_seconds"],
         )
 
-    def test_tunnel_drain_final_guard_requires_same_counters_and_idle_gauges(self) -> None:
+    def test_tunnel_drain_final_guard_requires_same_completed_response_state(self) -> None:
         idle = (
             "commands_queue_length 0\n"
-            "dispatcher_worker_pool_occupancy 0\n"
+            "dispatcher_worker_pool_occupancy 10\n"
             "commands_polled_total 10\n"
             "commands_enqueued_total 10\n"
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response"} 10\n'
             "process_start_time_seconds 1000\n"
         )
         expected = {
             "commands_polled_total": 10.0,
             "commands_enqueued_total": 10.0,
+            "commands_final_responses_total": 10.0,
             "process_start_time_seconds": 1000.0,
         }
         with mock.patch.object(core, "http_text", return_value=idle):
             observed = dual.verify_tunnel_drain_final_guard(expected)
-        self.assertEqual(0.0, observed["dispatcher_worker_pool_occupancy"])
+        self.assertEqual(10.0, observed["dispatcher_worker_pool_occupancy"])
+
+        incomplete = idle.replace(
+            'latency_type="enqueue_to_response"} 10',
+            'latency_type="enqueue_to_response"} 9',
+        )
+        with mock.patch.object(core, "http_text", return_value=incomplete):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.verify_tunnel_drain_final_guard(expected)
+        self.assertEqual("tunnel-drain-final-guard", raised.exception.phase)
+        self.assertIn(
+            "commands_final_responses_total",
+            raised.exception.details["busy_metrics"],
+        )
 
         churned = idle.replace("commands_enqueued_total 10", "commands_enqueued_total 11")
         with mock.patch.object(core, "http_text", return_value=churned):
@@ -2328,7 +2363,8 @@ class DeploymentSequenceTests(unittest.TestCase):
                 side_effect=lambda stability: events.append("drain:final-guard")
                 or {
                     "commands_queue_length": 0.0,
-                    "dispatcher_worker_pool_occupancy": 0.0,
+                    "dispatcher_worker_pool_occupancy": 10.0,
+                    "commands_final_responses_total": 10.0,
                 },
             ),
             mock.patch.object(

@@ -445,17 +445,26 @@ def inspect_candidate(
 def _normalize_repo_query(repo: str | None) -> str | None:
     if repo is None:
         return None
-    if "__" in repo:
-        owner, repository = repo.split("__", 1)
+    separator: str | None = None
+    if "/" in repo:
+        if repo.count("/") != 1:
+            raise ValueError(
+                "repo must be a safe repository name, owner__repository, or owner/repository identity"
+            )
+        separator = "/"
+    elif "__" in repo:
+        separator = "__"
+    if separator is not None:
+        owner, repository = repo.split(separator, 1)
         if not _safe_segment(owner) or not _safe_segment(repository):
             raise ValueError(
-                "repo must be a safe repository name or owner__repository identity"
+                "repo must be a safe repository name, owner__repository, or owner/repository identity"
             )
         return f"{owner}__{repository}"
     safe = _safe_segment(repo)
     if safe is None:
         raise ValueError(
-            "repo must be a safe repository name or owner__repository identity"
+            "repo must be a safe repository name, owner__repository, or owner/repository identity"
         )
     return safe
 

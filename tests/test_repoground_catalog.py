@@ -276,6 +276,37 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
         self.assertTrue(qualified["available"])
         self.assertEqual("alice__demo", qualified["selected"][0]["repo_id"])
 
+    def test_owner_slash_repo_identity_matches_owner_underscore_identity(self) -> None:
+        self.write_canonical(
+            owner="alice",
+            run_dir="20260718T120000Z-a",
+            created_at="2026-07-18T12:00:00Z",
+        )
+
+        underscored = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="alice__demo"
+        )
+        slashed = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="alice/demo"
+        )
+
+        self.assertTrue(underscored["available"])
+        self.assertTrue(slashed["available"])
+        self.assertEqual(
+            underscored["selected"][0]["manifest_sha256"],
+            slashed["selected"][0]["manifest_sha256"],
+        )
+        self.assertEqual("alice__demo", slashed["selected"][0]["repo_id"])
+
+    def test_malformed_owner_slash_repo_identity_fails_before_scanning(self) -> None:
+        for repo in ("/demo", "alice/", "alice/demo/extra"):
+            with self.subTest(repo=repo), patch.object(
+                catalog, "scan_catalog", wraps=catalog.scan_catalog
+            ) as scan:
+                with self.assertRaisesRegex(ValueError, "owner/repository"):
+                    catalog.resolve_catalog(self.canonical, self.legacy, repo=repo)
+                self.assertEqual(0, scan.call_count)
+
     def test_duplicate_canonical_stem_fails_closed(self) -> None:
         duplicate_stem = "heimgewebe__demo__main-max-260718-1200"
         self.write_canonical(
