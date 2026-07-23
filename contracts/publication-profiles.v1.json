@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "352b5c9043149b6c59ba4e0b49b0d18cbb609b7396345ad686c372bc84264ad7"
+    "sha256": "b7e8a09228adc8e01d2ab9e5d465de5d1b4356fe530d38306e40ba63f0332341"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "5237fbf1cf5e1370334c3d513c1540cb5723227f40c27f216c130dbb2604ba69"
+    "sha256": "99714d363b60bd36c8b79f044ce94a405793b0e7252e78f5f0522ab1d10b9e01"
   },
   "counts": {
     "core": 22,
-    "full": 163,
-    "operator": 148
+    "full": 165,
+    "operator": 150
   },
   "profiles": {
     "core": [
@@ -135,6 +135,8 @@
       "grabowski_task_cancel",
       "grabowski_task_resume",
       "grabowski_task_list",
+      "grabowski_chronik_outbox_import",
+      "grabowski_chronik_history",
       "grabowski_task_reconcile_check",
       "grabowski_task_reconcile_refresh",
       "grabowski_task_reconcile_resume",
@@ -286,6 +288,8 @@
       "grabowski_task_cancel",
       "grabowski_task_resume",
       "grabowski_task_list",
+      "grabowski_chronik_outbox_import",
+      "grabowski_chronik_history",
       "grabowski_task_reconcile_check",
       "grabowski_task_reconcile_refresh",
       "grabowski_task_reconcile_resume",
