@@ -1374,7 +1374,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Append evidence-bound friction closeout decisions without rewriting history.",
+      "description": "Append evidence-bound friction decisions or exact append-only revisions.",
       "effects": [
         "state-append",
         "audit-record"
