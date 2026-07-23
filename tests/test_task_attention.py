@@ -593,6 +593,39 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual("not_required", plan["attention_classification"])
         self.assertIsNone(plan["operator_obligation"])
 
+    def test_task_archive_classification_uses_typed_not_applicable_sources(self) -> None:
+        record = self._completed_task()
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            classified = attention._task_archive_classification(
+                record,
+                expected_lifecycle_receipt_sha256=str(
+                    record["lifecycle_receipt_sha256"]
+                ),
+                archived=False,
+            )
+
+        evidence_snapshot = classified["evidence"]
+        self.assertEqual(
+            {"task", "lease", "process", "receipt"},
+            set(evidence_snapshot["observed_sources"]),
+        )
+        for source in ("workspace", "checkout", "tmux"):
+            self.assertEqual(
+                "not_applicable",
+                evidence_snapshot["source_applicability"][source],
+            )
+            self.assertNotIn(source, evidence_snapshot["observed_sources"])
+            self.assertIn(source, evidence_snapshot["source_sha256s"])
+        for source in ("task", "lease", "process", "receipt"):
+            self.assertEqual(
+                "observed",
+                evidence_snapshot["source_applicability"][source],
+            )
+
     def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)

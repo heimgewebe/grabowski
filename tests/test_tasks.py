@@ -147,6 +147,7 @@ class TaskTests(unittest.TestCase):
                     kind="task",
                     observed_sources=all_sources,
                     source_sha256s=source_sha256s,
+                    source_applicability={source: "observed" for source in all_sources},
                     state="completed",
                     archived=True,
                     receipt_integrity_valid=True,
