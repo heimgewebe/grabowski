@@ -8342,32 +8342,36 @@ def repoground_context_pack(
             "runtime_correctness",
         ],
     }
-
-
-    deterministic_payload = json.loads(json.dumps(payload, sort_keys=True))
-    deterministic_context_ref = deterministic_payload.get("context_ref")
-    if isinstance(deterministic_context_ref, dict):
-        deterministic_context_ref.pop("generated_at", None)
-    deterministic_sha256 = hashlib.sha256(
-        json.dumps(
-            deterministic_payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()
+    hashed_view = dict(payload)
+    hashed_view["context_ref"] = {
+        key: value for key, value in context_ref.items() if key != "generated_at"
+    }
     payload["determinism"] = {
         "schema_version": 1,
         "contract": "stable_except_declared_volatile_fields",
         "volatile_fields": ["context_ref.generated_at"],
-        "content_sha256": deterministic_sha256,
+        "hash_algorithm": "sha256",
+        "hash_input": "json_sort_keys_compact_utf8",
+        "hash_excluded_fields": ["context_ref.generated_at", "determinism"],
+        "comparability_scope": "same_host_same_publication_paths",
+        "content_sha256": hashlib.sha256(
+            json.dumps(
+                hashed_view,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
         "does_not_establish": [
             "semantic_equivalence_from_hash_equality",
             "semantic_completeness",
             "truth",
+            "default_routing_authority",
+            "byte_equality_across_hosts_or_paths",
         ],
     }
     return payload
+
 
 _REPOGROUND_REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]{1,200}\Z")
 _REPOGROUND_SHA256_RE = re.compile(r"[a-f0-9]{64}\Z")
