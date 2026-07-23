@@ -361,6 +361,10 @@
       "source": "src/grabowski_repoground_catalog.py"
     },
     {
+      "module": "grabowski_operator_routing_shadow_capture",
+      "source": "src/grabowski_operator_routing_shadow_capture.py"
+    },
+    {
       "module": "grabowski_agent_workspace",
       "source": "src/grabowski_agent_workspace.py"
     },
