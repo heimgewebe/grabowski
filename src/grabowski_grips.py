@@ -217,6 +217,31 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="task_attention_reconciliation",
     ),
+    "task-closeout-archive": GripSpec(
+        name="task-closeout-archive",
+        version="1.0",
+        summary="Archive and project one retention-eligible terminal task after evidence-bound closeout revalidation.",
+        effect=MUTATING,
+        required_parameters=(
+            "task_id",
+            "expected_attempt",
+            "expected_unit",
+            "expected_authoritative_unit",
+            "expected_argv_sha256",
+            "expected_execution_envelope_sha256",
+            "expected_lifecycle_receipt_sha256",
+            "minimum_age_seconds",
+            "execution_id",
+        ),
+        acceptance_ids=(
+            "closeout-ready",
+            "retention-revalidated",
+            "archive-effect-receipt",
+            "projection-readback",
+            "exact-resource-leases-released",
+        ),
+        runner="task_closeout_archive",
+    ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
         version="1.0",
@@ -392,6 +417,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "runtime-deploy-check",
         "task-attention-decision",
         "task-attention-reconciliation",
+        "task-closeout-archive",
         "connector-snapshot-bind",
         "convergence-assess",
         "gate-evidence-preflight",
@@ -421,6 +447,7 @@ GRIP_SURFACE_TARGETS = {
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
     "task-attention-decision": "one create-only current-attempt attention decision",
     "task-attention-reconciliation": "bounded attention-task evidence classification",
+    "task-closeout-archive": "one retention-eligible terminal task archive and current projection switch",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -472,7 +499,7 @@ MECHANIC_FORBIDDEN_EFFECTS = tuple(sorted(CAPTAIN_HIGH_IMPACT_ACTIONS | {"force-
 GRIP_RISK_LEVELS = {
     name: (
         "high"
-        if name in GRIP_SURFACE_CAPTAIN_ONLY or name == "worktree-hygiene-reconcile"
+        if name in GRIP_SURFACE_CAPTAIN_ONLY or name in {"worktree-hygiene-reconcile", "task-closeout-archive"}
         else "medium"
         if spec.effect == MUTATING
         else "low"
@@ -5895,6 +5922,72 @@ def _run_task_attention_reconciliation(
     return {**output, "receipt_status": "passed"}
 
 
+def _run_task_closeout_archive(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_task_attention
+
+    try:
+        output = grabowski_task_attention.execute_closeout_archive(parameters)
+    except grabowski_task_attention.TaskAttentionInputError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except grabowski_task_attention.TaskAttentionConflictError as exc:
+        _check(receipt, "closeout-ready", "fail", str(exc))
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["task_closeout_archive_conflict"],
+            "error": str(exc),
+        }
+    except (
+        grabowski_task_attention.TaskAttentionIntegrityError,
+        grabowski_task_attention.TaskAttentionError,
+        OSError,
+    ) as exc:
+        _check(receipt, "archive-effect-receipt", "fail", type(exc).__name__)
+        raise GripActionError("task closeout archive failed closed") from exc
+    _check(receipt, "closeout-ready", "pass", output["closeout"]["closeout_state"])
+    _check(
+        receipt,
+        "retention-revalidated",
+        "pass",
+        str(output.get("retention_boundary_unix", "already-archived")),
+    )
+    archive_segment = output.get("archive_segment")
+    if isinstance(archive_segment, dict):
+        archive_detail = str(archive_segment.get("manifest_sha256"))
+    else:
+        archive_detail = "existing-projection-readback"
+    _check(receipt, "archive-effect-receipt", "pass", archive_detail)
+    _check(
+        receipt,
+        "projection-readback",
+        "pass",
+        str(output["projection"]["projection_sha256"]),
+    )
+    release = output.get("resource_release", {})
+    release_status = release.get("status") if isinstance(release, dict) else None
+    if release_status not in {"released", "not_required"}:
+        _check(
+            receipt,
+            "exact-resource-leases-released",
+            "fail",
+            str(release_status or "unknown"),
+        )
+        return {**output, "receipt_status": "failed"}
+    _check(
+        receipt,
+        "exact-resource-leases-released",
+        "pass",
+        str(release_status),
+    )
+    return {**output, "receipt_status": "passed"}
+
+
 def _run_operator_obligation_open(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -6240,6 +6333,7 @@ _RUNNERS = {
     "runtime_deploy_check": _run_runtime_deploy_check,
     "task_attention_decision": _run_task_attention_decision,
     "task_attention_reconciliation": _run_task_attention_reconciliation,
+    "task_closeout_archive": _run_task_closeout_archive,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "convergence_assess": _run_convergence_assess,
     "gate_evidence_preflight": _run_gate_evidence_preflight,
