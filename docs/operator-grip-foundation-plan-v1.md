@@ -91,7 +91,7 @@ Friction Loop
   Repeated blocked work becomes a new grip.
 
 Agent Loop
-  Codex, Claude, agy, Ollama and Aider provide review, patch or reasoning.
+  Codex, Claude, Antigravity, OpenCode, OpenHands, Ollama and Aider provide review, patch or reasoning.
   Grabowski integrates and records evidence.
 ```
 
@@ -205,7 +205,7 @@ Build after the foundation.
    - ask Codex/Claude/other agent for review with prompt hash, scope and stop condition.
 
 2. `agent-patch-request`
-   - request patch from Codex/Aider/agy/local model with bounded scope.
+   - request patch from Codex/Aider/Antigravity/OpenCode/OpenHands/local model with bounded scope.
 
 3. `agent-result-integrate`
    - integrate review or patch with scope check, tests and receipt.

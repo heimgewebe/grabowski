@@ -97,7 +97,7 @@ TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
     "attention": ("interrupted", "outcome_unknown", "failed", "timed_out", "signalled"),
     "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled"),
 }
-MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex"})
+MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex", "opencode", "openhands"})
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
 SYSTEMD_SCOPES = {"user", "system"}

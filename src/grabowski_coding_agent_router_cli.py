@@ -225,7 +225,9 @@ def _binary_versions(catalog: dict[str, Any]) -> dict[str, Any]:
     commands = {
         "codex": ["--version"],
         "claude": ["--version"],
-        "agy": ["--version"],
+        "antigravity": ["--version"],
+        "opencode": ["--version"],
+        "openhands": ["--version"],
         "grok": ["--version"],
         "jules": ["version"],
         "cline": ["--version"],
@@ -295,6 +297,136 @@ def _configured_models(catalog: dict[str, Any], harness: str) -> list[str]:
     )
 
 
+def _openhands_subscription_auth_status(
+    *, home: Path | None = None, now_ms: int | None = None
+) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "authenticated": False,
+        "provider": "openai",
+        "status": "missing",
+        "storage_mode_ok": False,
+    }
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        status["status"] = "unsafe-storage"
+        return status
+
+    base = home or Path.home()
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+
+    def directory_ok(metadata: os.stat_result, *, private: bool) -> bool:
+        return (
+            stat.S_ISDIR(metadata.st_mode)
+            and metadata.st_uid == os.getuid()
+            and (not private or stat.S_IMODE(metadata.st_mode) & 0o077 == 0)
+        )
+
+    def file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+
+    try:
+        home_fd = os.open(base, directory_flags)
+        descriptors.append(home_fd)
+        if not directory_ok(os.fstat(home_fd), private=False):
+            status["status"] = "unsafe-storage"
+            return status
+
+        openhands_fd = os.open(".openhands", directory_flags, dir_fd=home_fd)
+        descriptors.append(openhands_fd)
+        if not directory_ok(os.fstat(openhands_fd), private=False):
+            status["status"] = "unsafe-storage"
+            return status
+
+        auth_fd = os.open("auth", directory_flags, dir_fd=openhands_fd)
+        descriptors.append(auth_fd)
+        auth_before = os.fstat(auth_fd)
+        if not directory_ok(auth_before, private=True):
+            status["status"] = "unsafe-storage"
+            return status
+
+        credential_fd = os.open("openai_oauth.json", file_flags, dir_fd=auth_fd)
+        descriptors.append(credential_fd)
+        before = os.fstat(credential_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size > 64 * 1024
+        ):
+            status["status"] = "unsafe-storage"
+            return status
+
+        payload = bytearray()
+        while len(payload) <= 64 * 1024:
+            chunk = os.read(credential_fd, min(16 * 1024, 64 * 1024 + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > 64 * 1024:
+            status["status"] = "invalid"
+            return status
+
+        after = os.fstat(credential_fd)
+        linked = os.stat("openai_oauth.json", dir_fd=auth_fd, follow_symlinks=False)
+        auth_after = os.fstat(auth_fd)
+        if (
+            file_identity(before) != file_identity(after)
+            or file_identity(after) != file_identity(linked)
+            or file_identity(auth_before) != file_identity(auth_after)
+        ):
+            status["status"] = "unsafe-storage"
+            return status
+        status["storage_mode_ok"] = True
+    except FileNotFoundError:
+        return status
+    except OSError:
+        status["status"] = "unreadable"
+        return status
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        status["status"] = "invalid"
+        return status
+    if not isinstance(value, dict):
+        status["status"] = "invalid"
+        return status
+    expires_at = value.get("expires_at")
+    token_shape_ok = (
+        value.get("type") == "oauth"
+        and value.get("vendor") == "openai"
+        and isinstance(value.get("access_token"), str)
+        and bool(value.get("access_token"))
+        and isinstance(value.get("refresh_token"), str)
+        and bool(value.get("refresh_token"))
+        and isinstance(expires_at, int)
+        and not isinstance(expires_at, bool)
+    )
+    if not token_shape_ok:
+        status["status"] = "invalid"
+        return status
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if expires_at <= current_ms + 60_000:
+        status["status"] = "expired"
+        return status
+    status["authenticated"] = True
+    status["status"] = "valid"
+    return status
+
+
 def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     harnesses = _binary_versions(catalog)
     providers: dict[str, Any] = {}
@@ -322,14 +454,35 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         "models": _configured_models(catalog, "claude"),
     }
 
-    agy = _run_harness_metadata(harnesses, "agy", ["models"], catalog)
-    providers["agy"] = {
-        "available": harnesses.get("agy", {}).get("available") is True,
+    antigravity = _run_harness_metadata(
+        harnesses, "antigravity", ["models"], catalog
+    )
+    providers["antigravity"] = {
+        "available": harnesses.get("antigravity", {}).get("available") is True,
         "models": (
-            [line.strip() for line in str(agy.get("stdout", "")).splitlines() if line.strip()]
-            if agy.get("ok") is True
+            [line.strip() for line in str(antigravity.get("stdout", "")).splitlines() if line.strip()]
+            if antigravity.get("ok") is True
             else []
         ),
+        "legacy_state_key": "agy",
+    }
+    opencode = _run_harness_metadata(harnesses, "opencode", ["models"], catalog)
+    opencode_models = (
+        [line.strip() for line in str(opencode.get("stdout", "")).splitlines() if line.strip()]
+        if opencode.get("ok") is True
+        else []
+    )
+    providers["opencode"] = {
+        "available": harnesses.get("opencode", {}).get("available") is True,
+        "models": opencode_models,
+        "free_model_verified": "opencode/deepseek-v4-flash-free" in opencode_models,
+    }
+    openhands_auth = _openhands_subscription_auth_status()
+    providers["openhands"] = {
+        "available": harnesses.get("openhands", {}).get("available") is True,
+        **openhands_auth,
+        "approval_mode": "always-approve",
+        "models": _configured_models(catalog, "openhands"),
     }
 
     grok_status = _run_harness_metadata(
@@ -394,6 +547,10 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         verified_quota_pools.append("grok-com")
     if providers["jules"].get("authenticated") is True:
         verified_quota_pools.append("jules-account")
+    if providers["opencode"].get("free_model_verified") is True:
+        verified_quota_pools.append("opencode-free")
+    if providers["openhands"].get("authenticated") is True:
+        verified_quota_pools.append("openhands-account")
     body = {
         "schema_version": 2,
         "observed_at": _iso_now(),

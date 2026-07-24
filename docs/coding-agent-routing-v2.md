@@ -125,3 +125,10 @@ Die Probe-Unit hängt nicht von einer Benutzerkopie des Katalogs ab. Ihre Startb
 - `systemd/grabowski-coding-agent-probe.timer.example`
 
 Die Live-Ziele sind `%h/bin/agent-route`, `%h/.local/libexec/grabowski/coding_agent_probe_scheduler.py` und die Unit unter `%h/.config/systemd/user/`; der Wrapper-Pin liegt privat unter `%h/.config/grabowski/coding-agent-probe-scheduler-router.sha256`. Nur `%h/.local/state/grabowski/coding-agent-router` ist für den Dienst schreibbar. `MemoryMax=512M` und `TasksMax=50` begrenzen einen fehlerhaften Kindprozess. Der sichere Cutover lautet: geprüftes Runtime-Release aktivieren, Wrapper samt Pin installieren, Probe ausführen und Status sowie Direct-first-Empfehlung zurücklesen.
+## Kanonische Harness-Erweiterungen vom 24. Juli 2026
+
+- `antigravity` ist die kanonische Google-Harness-Identität; das ausführbare CLI bleibt `agy`. Historische `agy`-Receipts bleiben lesbar, neue Routing-Evidenz verwendet `antigravity`.
+- `opencode` ist als mutierender, isolierter Kontrast-Harness aufgenommen. Die initiale Live-Route ist an `opencode/deepseek-v4-flash-free`, JSON-Ereignisse, `--pure` und `--auto` gebunden und wurde mit Kosten `0` live geprüft.
+- `openhands` ist als vollständiger mutierender Kontrast-Harness aufgenommen. Headless-Ausführung ist absichtlich an `--always-approve` gebunden. Diese Eigentümerentscheidung ersetzt keine Lease-, Worktree-, Review- oder Integrationsgrenze.
+- OpenHands bleibt bis zu einem live attestierten, kostenfreien oder abonnementsgebundenen Modellzugang fail-closed.
+- Die Direct-first-Autorität bleibt unverändert: Externe Ergebnisse sind bis zur Operatorprüfung beratend.

@@ -134,18 +134,56 @@ class AgentCompetitionTests(unittest.TestCase):
                 "authority": "advisory_only",
                 "automatic_patch_apply": False,
             }
-        elif route_id == "agy-gemini-flash-medium":
+        elif route_id == "antigravity-gemini-flash-medium":
             contract = {
                 "schema_version": 1,
                 "catalog_sha256": "a" * 64,
                 "route_id": route_id,
-                "harness": "agy",
+                "harness": "antigravity",
                 "harness_binary": "agy",
                 "model": "gemini-3.5-flash",
                 "effort": "medium",
-                "argv_prefix": ["agy", "--model", "Gemini 3.5 Flash (Medium)"],
+                "argv_prefix": ["agy", "--model", "gemini-3.5-flash-medium"],
                 "permission_mode": None,
-                "quota_pools": ["agy-gemini", "agy-account"],
+                "quota_pools": ["antigravity-gemini", "antigravity-account"],
+                "paid_only": False,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
+        elif route_id == "opencode-deepseek-v4-flash-free":
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "opencode",
+                "harness_binary": "opencode",
+                "model": "deepseek-v4-flash",
+                "effort": None,
+                "argv_prefix": [
+                    "opencode", "run", "--pure", "--auto", "--format", "json",
+                    "--model", "opencode/deepseek-v4-flash-free",
+                ],
+                "permission_mode": None,
+                "quota_pools": ["opencode-free"],
+                "paid_only": False,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
+        elif route_id == "openhands-always-approve":
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "openhands",
+                "harness_binary": "openhands",
+                "model": "openhands-managed-latest",
+                "effort": None,
+                "argv_prefix": [
+                    "openhands", "--headless", "--json", "--always-approve",
+                    "--exit-without-confirmation", "--task",
+                ],
+                "permission_mode": None,
+                "quota_pools": ["openhands-account"],
                 "paid_only": False,
                 "authority": "advisory_only",
                 "automatic_patch_apply": False,
@@ -274,12 +312,17 @@ class AgentCompetitionTests(unittest.TestCase):
                 "--sandbox",
                 "read-only",
             ]
-        elif manifest["schema_version"] == 3 and manifest["provider"] == "agy":
+        elif manifest["schema_version"] == 3 and manifest["provider"] == "antigravity":
             command = [
                 *manifest["route_contract"]["argv_prefix"],
                 "--mode",
                 "plan",
                 "--sandbox",
+            ]
+        elif manifest["schema_version"] == 3 and manifest["provider"] in {"opencode", "openhands"}:
+            command = [
+                *manifest["route_contract"]["argv_prefix"],
+                "Read prompt.txt and return the requested JSON object.",
             ]
         elif manifest["provider"] == "claude":
             command = ["claude", "-p", "--output-format", "json", "--tools="]
@@ -386,7 +429,7 @@ class AgentCompetitionTests(unittest.TestCase):
             changed_file_estimate=1,
             expected_duration_minutes=5,
             novelty="low",
-            available_external_agents=["claude", "agy"],
+            available_external_agents=["claude", "antigravity"],
         )
         self.assertEqual(direct["execution_mode"], "direct_operator")
         with mock.patch.object(
@@ -1078,7 +1121,7 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_one_candidate_cannot_create_validation_consensus_by_repeating_a_test(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="duplicate test")
-        second = self._start(provider="agy", mode="contrast", task="duplicate test")
+        second = self._start(provider="antigravity", mode="contrast", task="duplicate test")
         self._write_receipt(
             first["competition_id"],
             changed_paths=[],
@@ -1101,7 +1144,7 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_compare_does_not_claim_identical_empty_patches_or_perfect_empty_paths(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="empty comparison")
-        second = self._start(provider="agy", mode="contrast", task="empty comparison")
+        second = self._start(provider="antigravity", mode="contrast", task="empty comparison")
         self._write_receipt(first["competition_id"], changed_paths=[], risks=[], tests=[])
         self._write_receipt(second["competition_id"], changed_paths=[], risks=[], tests=[])
         result = competition.grabowski_agent_competition_compare(
@@ -1118,7 +1161,7 @@ class AgentCompetitionTests(unittest.TestCase):
 
     def test_compare_emits_consensus_and_divergence_without_winner(self) -> None:
         first = self._start(provider="claude", mode="competitor", task="same task")
-        second = self._start(provider="agy", mode="contrast", task="same task")
+        second = self._start(provider="antigravity", mode="contrast", task="same task")
         self._write_receipt(
             first["competition_id"],
             changed_paths=["src/sample.py", "tests/test_sample.py"],
@@ -1280,8 +1323,8 @@ class AgentCompetitionTests(unittest.TestCase):
         ):
             competition._validate_receipt_execution(receipt, packet)
 
-    def test_route_bound_agy_receipt_preserves_route_and_zero_budget_binding(self) -> None:
-        contract = self._route_contract("agy-gemini-flash-medium")
+    def test_route_bound_antigravity_receipt_preserves_route_and_zero_budget_binding(self) -> None:
+        contract = self._route_contract("antigravity-gemini-flash-medium")
         with (
             mock.patch.object(
                 competition.coding_router,
@@ -1291,12 +1334,12 @@ class AgentCompetitionTests(unittest.TestCase):
             mock.patch.object(
                 competition.tasks,
                 "grabowski_task_start",
-                return_value=self._task_start("task-agy-receipt"),
+                return_value=self._task_start("task-antigravity-receipt"),
             ),
         ):
             started = competition.grabowski_agent_competition_start(
-                request_id="agy-route-receipt",
-                provider="agy",
+                request_id="antigravity-route-receipt",
+                provider="antigravity",
                 mode="contrast",
                 repository=str(self.repo),
                 expected_head=self.head,
@@ -1305,7 +1348,7 @@ class AgentCompetitionTests(unittest.TestCase):
                 context_paths=["src/sample.py"],
                 timeout_seconds=120,
                 max_budget_usd=0,
-                route_id="agy-gemini-flash-medium",
+                route_id="antigravity-gemini-flash-medium",
             )
         self._write_receipt(
             started["competition_id"], changed_paths=[], risks=[], tests=[]
@@ -1318,6 +1361,55 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(receipt["route_contract"], contract)
         self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
         self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
+
+    def _assert_zero_budget_route_receipt(self, *, provider: str, route_id: str) -> None:
+        contract = self._route_contract(route_id)
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "contrast_route_execution_contract",
+                return_value=contract,
+            ),
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start(f"task-{provider}-receipt"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id=f"{provider}-route-receipt",
+                provider=provider,
+                mode="contrast",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Contrast sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id=route_id,
+            )
+        self._write_receipt(
+            started["competition_id"], changed_paths=[], risks=[], tests=[]
+        )
+        manifest = competition._validated_manifest(started["competition_id"])
+        receipt = competition._receipt(started["competition_id"], manifest)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["schema_version"], 3)
+        self.assertEqual(receipt["route_contract"], contract)
+        self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
+        self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
+
+    def test_route_bound_opencode_receipt_preserves_route_and_zero_budget_binding(self) -> None:
+        self._assert_zero_budget_route_receipt(
+            provider="opencode", route_id="opencode-deepseek-v4-flash-free"
+        )
+
+    def test_route_bound_openhands_receipt_preserves_always_approve_binding(self) -> None:
+        self._assert_zero_budget_route_receipt(
+            provider="openhands", route_id="openhands-always-approve"
+        )
 
     def test_route_bound_fable_requires_paid_authorization_and_positive_policy_cap(self) -> None:
         with mock.patch.object(
@@ -1418,14 +1510,14 @@ class AgentCompetitionTests(unittest.TestCase):
                 )
 
     def test_agy_budget_contract_is_explicit_and_hard_requirement_fails_closed(self) -> None:
-        started = self._start(provider="agy")
+        started = self._start(provider="antigravity")
         self.assertFalse(started["budget_contract"]["hard_limit"])
         self.assertEqual(started["budget_contract"]["enforcement"], "not_supported_by_provider")
         self.assertTrue(started["budget_contract"]["timeout_is_not_budget"])
         with self.assertRaisesRegex(competition.AgentCompetitionError, "cannot enforce a hard USD budget"):
             self._authorized_start(
-                request_id="agy-hard-budget",
-                provider="agy",
+                request_id="antigravity-hard-budget",
+                provider="antigravity",
                 mode="contrast",
                 repository=str(self.repo),
                 expected_head=self.head,
@@ -1674,7 +1766,7 @@ class AgentCompetitionTests(unittest.TestCase):
             expected_duration_minutes=5,
             novelty="high",
             risk_flags=["security"],
-            available_external_agents=["claude", "agy"],
+            available_external_agents=["claude", "antigravity"],
         )
         self.assertEqual(result["execution_mode"], "direct_operator")
         self.assertEqual(result["external_candidates"], [])

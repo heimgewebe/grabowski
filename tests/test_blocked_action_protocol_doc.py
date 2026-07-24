@@ -39,9 +39,9 @@ class BlockedActionProtocolDocTests(unittest.TestCase):
             "Standard fuer alle Lanes",
             "standardmaessig aus",
             "keine Kopien dieses ChatGPT-Kontexts",
-            "Claude -> Codex -> agy -> Cline",
+            "Claude -> Codex -> Antigravity -> OpenCode -> OpenHands -> Cline",
             "Cline",
-            "agy --print",
+            "`agy --print` (Antigravity CLI)",
             "Ollama API mit qwen coder",
             "tmux ist Standard",
             "bounded Patch-Fallback",
@@ -52,7 +52,7 @@ class BlockedActionProtocolDocTests(unittest.TestCase):
         for stale_phrase in (
             "Codex Once",
             "Beste Wahl fuer kleine Repo-Code-Slices",
-            "agy / tmux Session",
+            "Antigravity / tmux Session",
             "Lokale KI / Goose / Ollama / Aider",
         ):
             self.assertNotIn(stale_phrase, self.text)

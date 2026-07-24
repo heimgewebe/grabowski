@@ -55,7 +55,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             for index, item in enumerate(argv[:-1]):
                 if item == "--model":
                     model = argv[index + 1]
-                    if route["harness"] == "agy":
+                    if route["harness"] == "antigravity":
                         agy_models.append(model)
                     elif route["harness"] == "grok":
                         grok_models.append(model)
@@ -92,7 +92,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                             "claude-sonnet-5",
                         ],
                     },
-                    "agy": {"models": sorted(set(agy_models))},
+                    "antigravity": {"models": sorted(set(agy_models))},
                     "grok": {
                         "logged_in": True,
                         "models": sorted(set(grok_models)),
@@ -690,30 +690,30 @@ class CodingAgentRouterTests(unittest.TestCase):
             len({item["harness"] for item in paid["routes"]}), len(paid["routes"])
         )
 
-        agy = router.select_contrast_routes(
+        antigravity = router.select_contrast_routes(
             "docs",
             changed_files=2,
             duration_minutes=30,
             novelty="medium",
             max_candidates=1,
             allow_paid=False,
-            allowed_harnesses={"agy"},
+            allowed_harnesses={"antigravity"},
         )
-        self.assertEqual(agy["status"], "recommended")
-        self.assertEqual(len(agy["routes"]), 1)
-        self.assertEqual(agy["routes"][0]["harness"], "agy")
-        self.assertTrue(agy["routes"][0]["route"].startswith("agy-"))
-        self.assertFalse(agy["routes"][0]["paid_only"])
+        self.assertEqual(antigravity["status"], "recommended")
+        self.assertEqual(len(antigravity["routes"]), 1)
+        self.assertEqual(antigravity["routes"][0]["harness"], "antigravity")
+        self.assertTrue(antigravity["routes"][0]["route"].startswith("antigravity-"))
+        self.assertFalse(antigravity["routes"][0]["paid_only"])
 
     def test_contrast_execution_contract_enforces_fable_paid_boundary(self) -> None:
         codex = router.contrast_route_execution_contract("codex-sol-high")
         self.assertEqual(codex["harness"], "codex")
         self.assertEqual(codex["argv_prefix"], ["codexr", "architecture"])
         self.assertFalse(codex["paid_only"])
-        agy = router.contrast_route_execution_contract("agy-gemini-flash-medium")
-        self.assertEqual(agy["harness"], "agy")
-        self.assertEqual(agy["argv_prefix"][:2], ["agy", "--model"])
-        self.assertFalse(agy["paid_only"])
+        antigravity = router.contrast_route_execution_contract("antigravity-gemini-flash-medium")
+        self.assertEqual(antigravity["harness"], "antigravity")
+        self.assertEqual(antigravity["argv_prefix"][:2], ["agy", "--model"])
+        self.assertFalse(antigravity["paid_only"])
         self.assertEqual(
             codex["route_contract_sha256"],
             router._canonical_sha256(
@@ -855,12 +855,12 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_parent_quota_pool_is_enforced_even_when_route_omits_it(self) -> None:
         catalog = json.loads(json.dumps(self.catalog))
         route = next(
-            item for item in catalog["routes"] if item["id"] == "agy-gemini-pro-high"
+            item for item in catalog["routes"] if item["id"] == "antigravity-gemini-pro-high"
         )
-        route["quota_pools"] = ["agy-gemini"]
+        route["quota_pools"] = ["antigravity-gemini"]
         self.assertEqual(
             router._route_quota_pools(route, catalog),
-            ["agy-gemini", "agy-account"],
+            ["antigravity-gemini", "antigravity-account"],
         )
 
         blocked_parent_states = (
@@ -872,16 +872,16 @@ class CodingAgentRouterTests(unittest.TestCase):
             {"remaining_ratio": 0.10},
         )
         expected_reasons = (
-            "agy-account: pool status exhausted",
-            "agy-account: pool concurrency is saturated",
-            "agy-account: reserve floor reached (0.15)",
+            "antigravity-account: pool status exhausted",
+            "antigravity-account: pool concurrency is saturated",
+            "antigravity-account: reserve floor reached (0.15)",
         )
         for parent_state, expected_reason in zip(
             blocked_parent_states, expected_reasons, strict=True
         ):
             with self.subTest(parent_state=parent_state):
                 state = self._fresh_state()
-                state["pools"]["agy-account"] = parent_state
+                state["pools"]["antigravity-account"] = parent_state
                 score, _, _, reasons, exclusion, execution = router._score_route(
                     route,
                     "complex-patch",

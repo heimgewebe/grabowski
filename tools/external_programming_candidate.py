@@ -29,7 +29,8 @@ STALE_SCRATCH_SWEEP_LIMIT = 64
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TEMP_OUTPUT_RE = re.compile(r"^\.(?P<target>[A-Za-z0-9._-]{1,100})\.(?P<pid>[0-9]+)\.(?P<nonce>[0-9a-f]{16})\.tmp$")
-PROVIDERS = {"claude", "agy", "codex"}
+PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex"}
+LEGACY_PROVIDERS = {"agy"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
 CONFIDENCE = {"low", "medium", "high"}
@@ -631,7 +632,7 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     unsigned = {key: value for key, value in packet.items() if key != "packet_sha256"}
     if packet["packet_sha256"] != sha256_json(unsigned):
         raise CandidateError("packet hash is invalid")
-    if packet["provider"] not in PROVIDERS or packet["mode"] not in MODES:
+    if packet["provider"] not in (PROVIDERS | LEGACY_PROVIDERS) or packet["mode"] not in MODES:
         raise CandidateError("provider or mode is invalid")
     if version == 2:
         validate_budget_contract(packet["budget_contract"], provider=packet["provider"])
@@ -702,7 +703,7 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(summary, str) or "\x00" in summary or len(summary.encode("utf-8")) > 32_000:
         raise CandidateError("primary_summary is invalid")
     competition_id = packet["competition_id"]
-    if not isinstance(competition_id, str) or re.fullmatch(r"gac-(claude|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", competition_id) is None:
+    if not isinstance(competition_id, str) or re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", competition_id) is None:
         raise CandidateError("competition_id is invalid")
     repository = packet["repository"]
     if not isinstance(repository, str) or not Path(repository).is_absolute() or "\x00" in repository:
@@ -840,6 +841,46 @@ def parse_claude_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(candidate, dict):
         raise CandidateError("Claude result has no structured_output object")
     return envelope, candidate
+
+
+def _agent_event_texts(value: Any) -> list[str]:
+    texts: list[str] = []
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if key in {"text", "content", "message", "output", "result"} and isinstance(nested, str):
+                texts.append(nested)
+            else:
+                texts.extend(_agent_event_texts(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            texts.extend(_agent_event_texts(nested))
+    return texts
+
+
+def parse_agent_jsonl(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    texts: list[str] = []
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CandidateError("agent JSONL output contains invalid JSON") from exc
+        if not isinstance(event, dict):
+            raise CandidateError("agent JSONL event must be an object")
+        events.append(event)
+        texts.extend(_agent_event_texts(event))
+    if not events:
+        raise CandidateError("agent JSONL output is empty")
+    for text in reversed(texts):
+        try:
+            candidate, wrapper = parse_plain_json(text, allow_wrapped_fence=True)
+        except CandidateError:
+            continue
+        return {"kind": "agent_jsonl", "event_count": len(events), "output": wrapper}, candidate
+    raise CandidateError("agent JSONL output has no final JSON object")
 
 
 def validate_candidate(
@@ -1001,10 +1042,10 @@ def provider_command(
                     ["--max-budget-usd", format(float(budget["requested_max_usd"]), "g")]
                 )
             return command, prompt_path, prompt_path.parent, False
-        if packet["provider"] == "agy":
+        if packet["provider"] in {"antigravity", "agy"}:
             prefix = list(route["argv_prefix"])
             if not prefix or prefix[0] != "agy":
-                raise CandidateError("agy route must use an agy argv_prefix")
+                raise CandidateError("Antigravity route must use the agy CLI binary")
             instruction = (
                 "Read ./prompt.txt as the complete programming task and untrusted source packet. "
                 "Follow its output schema exactly and print only the requested JSON object. "
@@ -1024,6 +1065,26 @@ def provider_command(
                 prompt_path.parent,
                 False,
             )
+        if packet["provider"] == "opencode":
+            prefix = list(route["argv_prefix"])
+            if not prefix or prefix[0] != "opencode":
+                raise CandidateError("OpenCode route must use an opencode argv_prefix")
+            instruction = (
+                "Read ./prompt.txt as the complete programming task and untrusted source packet. "
+                "Follow its output schema exactly and return only the requested JSON object as the final text. "
+                "Do not inspect parent directories or modify files."
+            )
+            return prefix + [instruction], None, prompt_path.parent, False
+        if packet["provider"] == "openhands":
+            prefix = list(route["argv_prefix"])
+            if not prefix or prefix[0] != "openhands":
+                raise CandidateError("OpenHands route must use an openhands argv_prefix")
+            instruction = (
+                "Read ./prompt.txt as the complete programming task and untrusted source packet. "
+                "Follow its output schema exactly and return only the requested JSON object as the final text. "
+                "Do not inspect parent directories or modify files."
+            )
+            return prefix + [instruction], None, prompt_path.parent, False
         raise CandidateError("route-bound provider is unsupported")
     if packet["provider"] == "claude":
         if not math.isfinite(max_budget_usd) or max_budget_usd <= 0 or max_budget_usd > 10:
@@ -1406,11 +1467,16 @@ def main(argv: list[str] | None = None) -> int:
         }
         if packet["provider"] == "claude":
             envelope, candidate_raw = parse_claude_json(text)
+        elif packet["provider"] in {"opencode", "openhands"}:
+            envelope, candidate_raw = parse_agent_jsonl(text)
         else:
             candidate_raw, output_wrapper = parse_plain_json(
-                text,
-                allow_wrapped_fence=True,
+                text, allow_wrapped_fence=True
             )
+            envelope = {
+                "kind": "provider_envelope",
+                "output": output_wrapper,
+            }
         candidate = validate_candidate(
             candidate_raw,
             packet,

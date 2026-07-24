@@ -32,7 +32,8 @@ COMPETITION_ROOT = Path(
     )
 ).expanduser()
 RUNNER = Path(__file__).resolve().parent.parent / "tools" / "external_programming_candidate.py"
-PROVIDERS = {"claude", "agy", "codex"}
+PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex"}
+LEGACY_PROVIDERS = {"agy"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
 TASK_KINDS = {"code", "docs", "analysis", "operations"}
@@ -391,7 +392,7 @@ def _competition_root() -> Path:
 
 def _competition_dir(identifier: str) -> Path:
     clean = workspace._required_string(identifier, "competition_id", max_length=100)
-    if re.fullmatch(r"gac-(claude|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
+    if re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
         raise AgentCompetitionError("competition_id has an invalid format")
     return _competition_root() / clean
 
@@ -1419,7 +1420,7 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
                 or "--no-session-persistence" not in command
             ):
                 raise AgentCompetitionError("candidate receipt Claude route command shape is invalid")
-        elif receipt["provider"] == "agy":
+        elif receipt["provider"] in {"antigravity", "agy"}:
             prefix = route_contract["argv_prefix"]
             if (
                 command[: len(prefix)] != prefix
@@ -1427,14 +1428,42 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
                 or command[command.index("--mode") + 1] != "plan"
                 or "--sandbox" not in command
             ):
-                raise AgentCompetitionError("candidate receipt agy route command shape is invalid")
+                raise AgentCompetitionError("candidate receipt Antigravity route command shape is invalid")
+        elif receipt["provider"] == "opencode":
+            prefix = route_contract["argv_prefix"]
+            if (
+                command[: len(prefix)] != prefix
+                or len(command) != len(prefix) + 1
+                or command[1] != "run"
+                or "--pure" not in command
+                or "--auto" not in command
+                or "--format" not in command
+                or command[command.index("--format") + 1] != "json"
+                or not isinstance(command[-1], str)
+                or not command[-1].strip()
+            ):
+                raise AgentCompetitionError("candidate receipt OpenCode route command shape is invalid")
+        elif receipt["provider"] == "openhands":
+            prefix = route_contract["argv_prefix"]
+            if (
+                command[: len(prefix)] != prefix
+                or len(command) != len(prefix) + 1
+                or "--headless" not in command
+                or "--json" not in command
+                or "--always-approve" not in command
+                or "--exit-without-confirmation" not in command
+                or "--task" not in command
+                or not isinstance(command[-1], str)
+                or not command[-1].strip()
+            ):
+                raise AgentCompetitionError("candidate receipt OpenHands route command shape is invalid")
         else:
             raise AgentCompetitionError("route-bound candidate provider is unsupported")
     elif receipt["provider"] == "claude":
         if command[0] != "claude" or len(command) < 4 or command[1:4] != ["-p", "--output-format", "json"] or "--tools=" not in command:
             raise AgentCompetitionError("candidate receipt Claude command shape is invalid")
     elif command[:4] != ["agy", "--mode", "plan", "--sandbox"]:
-        raise AgentCompetitionError("candidate receipt agy command shape is invalid")
+        raise AgentCompetitionError("candidate receipt legacy agy command shape is invalid")
     if receipt["provider_cwd_kind"] != "isolated_provider_workspace" or receipt["prompt_in_argv"] is not False:
         raise AgentCompetitionError("candidate receipt provider isolation fields are invalid")
     returncode = receipt["returncode"]
@@ -1863,8 +1892,12 @@ def grabowski_agent_execution_route(
     if available_external_agents is None:
         normalized_agents = [
             provider
-            for provider in ("codex", "claude", "agy")
-            if shutil.which(provider) or (provider == "codex" and shutil.which("codexr"))
+            for provider in ("codex", "claude", "antigravity", "opencode", "openhands")
+            if (
+                (provider == "codex" and (shutil.which("codex") or shutil.which("codexr")))
+                or (provider == "antigravity" and shutil.which("agy"))
+                or (provider not in {"codex", "antigravity"} and shutil.which(provider))
+            )
         ]
     else:
         agents = available_external_agents
@@ -1885,7 +1918,7 @@ def grabowski_agent_execution_route(
             )
         normalized_agents = [
             provider
-            for provider in ("codex", "claude", "agy")
+            for provider in ("codex", "claude", "antigravity", "opencode", "openhands")
             if provider in requested_agents
         ]
     paid_authorized = _strict_bool(
@@ -1927,7 +1960,7 @@ def grabowski_agent_execution_route(
             risk_flags=normalized_flags,
             max_candidates=requested_candidates,
             allow_paid=paid_authorized,
-            allowed_harnesses=set(normalized_agents) & {"codex", "claude", "agy"},
+            allowed_harnesses=set(normalized_agents) & {"codex", "claude", "antigravity", "opencode", "openhands"},
         )
         selected_routes = list(contrast_selection["routes"])
         input_facts["available_external_agents"] = [

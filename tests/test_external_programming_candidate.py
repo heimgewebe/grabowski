@@ -31,7 +31,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         directory: Path,
         repo: Path,
         *,
-        provider: str = "agy",
+        provider: str = "antigravity",
         runner_bytes: bytes | None = None,
         schema_version: int = 1,
         max_budget_usd: float = 2.0,
@@ -73,15 +73,15 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             route_id = (
                 "claude-fable-5-contrast-high"
                 if provider == "claude"
-                else "agy-gemini-flash-medium"
-                if provider == "agy"
+                else "antigravity-gemini-flash-medium"
+                if provider == "antigravity"
                 else "codex-sol-high"
             )
             model = (
                 "claude-fable-5"
                 if provider == "claude"
                 else "gemini-3.5-flash"
-                if provider == "agy"
+                if provider == "antigravity"
                 else "gpt-5.6-sol"
             )
             argv_prefix = (
@@ -96,15 +96,15 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                     "high",
                 ]
                 if provider == "claude"
-                else ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
-                if provider == "agy"
+                else ["agy", "--model", "gemini-3.5-flash-medium"]
+                if provider == "antigravity"
                 else ["codexr", "architecture"]
             )
             quota_pools = (
                 ["claude-pro"]
                 if provider == "claude"
-                else ["agy-gemini", "agy-account"]
-                if provider == "agy"
+                else ["antigravity-gemini", "antigravity-account"]
+                if provider == "antigravity"
                 else ["openai-agentic"]
             )
             route = {
@@ -112,9 +112,9 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 "catalog_sha256": "9" * 64,
                 "route_id": route_id,
                 "harness": provider,
-                "harness_binary": provider,
+                "harness_binary": "agy" if provider == "antigravity" else provider,
                 "model": model,
-                "effort": "high" if provider != "agy" else "medium",
+                "effort": "high" if provider != "antigravity" else "medium",
                 "argv_prefix": argv_prefix,
                 "permission_mode": "acceptEdits" if paid_only else None,
                 "quota_pools": quota_pools,
@@ -219,7 +219,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             repo.mkdir(mode=0o700)
             packet = candidate_tool.validate_packet(
                 candidate_tool.load_private_json(
-                    self._packet(root, repo, provider="agy", schema_version=3, max_budget_usd=0),
+                    self._packet(root, repo, provider="antigravity", schema_version=3, max_budget_usd=0),
                     label="packet",
                 )
             )
@@ -232,7 +232,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 prompt_path=prompt,
             )
         self.assertEqual(
-            command[:3], ["agy", "--model", "Gemini 3.5 Flash (Medium)"]
+            command[:3], ["agy", "--model", "gemini-3.5-flash-medium"]
         )
         self.assertIn("--mode", command)
         self.assertEqual(command[command.index("--mode") + 1], "plan")
@@ -708,7 +708,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             root.chmod(0o700)
             repo = root / "repo"
             repo.mkdir(mode=0o700)
-            path = self._packet(root, repo, schema_version=2, provider="agy", max_budget_usd=1.5)
+            path = self._packet(root, repo, schema_version=2, provider="antigravity", max_budget_usd=1.5)
             packet = candidate_tool.validate_packet(candidate_tool.load_private_json(path, label="packet"))
             self.assertFalse(packet["budget_contract"]["hard_limit"])
             self.assertTrue(packet["budget_contract"]["timeout_is_not_budget"])
@@ -726,7 +726,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             "timeout_is_not_budget": False,
         }
         with self.assertRaisesRegex(candidate_tool.CandidateError, "budget contract semantics"):
-            candidate_tool.validate_budget_contract(contract, provider="agy")
+            candidate_tool.validate_budget_contract(contract, provider="antigravity")
 
     def test_sensitive_candidate_path_is_rejected_even_inside_allowed_root(self) -> None:
         packet = {
@@ -838,7 +838,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             packet_path = self._packet(
                 directory,
                 repo,
-                provider="agy",
+                provider="antigravity",
                 runner_bytes=runner_bytes,
                 schema_version=2,
                 max_budget_usd=1.0,
@@ -857,6 +857,27 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 ])
             self.assertEqual(result, 2)
             bounded.assert_not_called()
+
+
+    def test_parse_agent_jsonl_extracts_final_text_object(self) -> None:
+        candidate = {key: [] for key in (
+            "assumptions", "design_invariants", "tradeoffs", "risks",
+            "proposed_tests", "contrast_observations", "changed_paths"
+        )}
+        candidate.update({
+            "approach_id": "probe",
+            "approach_summary": "Probe",
+            "confidence": "medium",
+        })
+        output = "\n".join((
+            json.dumps({"type": "step_start"}),
+            json.dumps({"type": "text", "part": {"type": "text", "text": json.dumps(candidate)}}),
+            json.dumps({"type": "step_finish", "cost": 0}),
+        ))
+        envelope, parsed = candidate_tool.parse_agent_jsonl(output)
+        self.assertEqual(parsed, candidate)
+        self.assertEqual(envelope["kind"], "agent_jsonl")
+        self.assertEqual(envelope["event_count"], 3)
 
 
 if __name__ == "__main__":

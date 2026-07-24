@@ -1,8 +1,9 @@
 {
-  "catalog_version": "direct-first-review-contrast-v4",
+  "catalog_version": "direct-first-review-contrast-v5",
   "harnesses": {
-    "agy": {
+    "antigravity": {
       "aliases": [
+        "agy",
         "gemini"
       ],
       "async": true,
@@ -103,6 +104,29 @@
       "mutating": true,
       "plan_mode": true,
       "structured_output": true
+    },
+    "opencode": {
+      "aliases": [],
+      "async": true,
+      "binary": "opencode",
+      "headless": true,
+      "isolated_worktree": true,
+      "kind": "local-cloud-client",
+      "mutating": true,
+      "plan_mode": true,
+      "structured_output": true
+    },
+    "openhands": {
+      "aliases": [],
+      "approval_mode": "always-approve",
+      "async": true,
+      "binary": "openhands",
+      "headless": true,
+      "isolated_worktree": true,
+      "kind": "local-cloud-client",
+      "mutating": true,
+      "plan_mode": false,
+      "structured_output": true
     }
   },
   "kind": "coding-agent-catalog",
@@ -128,7 +152,7 @@
       "quality_prior_class": "S"
     },
     "claude-opus-4.6": {
-      "availability": "live-via-agy",
+      "availability": "live-via-antigravity",
       "base_quality_rank": 69,
       "evidence": "configured-heuristic",
       "family": "anthropic-opus",
@@ -185,7 +209,7 @@
       }
     },
     "claude-sonnet-4.6": {
-      "availability": "live-via-agy",
+      "availability": "live-via-antigravity",
       "base_quality_rank": 68,
       "evidence": "configured-heuristic",
       "family": "anthropic-sonnet",
@@ -228,8 +252,8 @@
       "resolved_model": "claude-sonnet-5"
     },
     "deepseek-v4-flash": {
-      "availability": "configured-not-verified-free",
-      "evidence": "unverified-heuristic",
+      "availability": "live-verified-free-via-opencode",
+      "evidence": "live-model-list-and-zero-cost-smoke-2026-07-24",
       "family": "deepseek-v4",
       "name": "DeepSeek V4 Flash",
       "provider_family": "deepseek",
@@ -379,7 +403,7 @@
       "quality_prior_class": "A"
     },
     "gpt-oss-120b": {
-      "availability": "live-via-agy",
+      "availability": "live-via-antigravity",
       "base_quality_rank": 62,
       "evidence": "configured-heuristic",
       "family": "openai-gpt-oss",
@@ -522,6 +546,26 @@
         "review": 4,
         "speed": 6
       }
+    },
+    "openhands-managed-latest": {
+      "availability": "installed-auth-pending",
+      "evidence": "OpenHands CLI 1.16.0 and SDK 1.21.0 live-verified; authenticated model not yet attested",
+      "exclude_from_model_hierarchy": true,
+      "family": "openhands-managed",
+      "identity_kind": "managed-harness-placeholder",
+      "name": "OpenHands configured model",
+      "provider_family": "multi-provider",
+      "quality": {
+        "architecture": 8,
+        "autonomy": 9,
+        "coding": 8,
+        "context": 9,
+        "debugging": 8,
+        "reliability": 7,
+        "review": 7,
+        "speed": 4
+      },
+      "quality_prior_class": null
     }
   },
   "nonclaims": [
@@ -535,7 +579,7 @@
     "merge-readiness",
     "provider-parity-objective"
   ],
-  "observed_at": "2026-07-18T12:14:34Z",
+  "observed_at": "2026-07-24",
   "policy": {
     "adaptive_learning": {
       "access_probes_are_not_outcomes": true,
@@ -735,7 +779,7 @@
     ]
   },
   "quota_pools": {
-    "agy-account": {
+    "antigravity-account": {
       "cost_mode": "signed-in-account",
       "credits_allowed": false,
       "marginal_cost_usd": 0,
@@ -745,31 +789,31 @@
       "reserve_floor": 0.15,
       "unknown_execution": "advisory-only"
     },
-    "agy-claude": {
+    "antigravity-claude": {
       "cost_mode": "signed-in-account",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "parent_pool": "agy-account",
+      "parent_pool": "antigravity-account",
       "payg_fallback_allowed": false,
       "quota_mode": "opaque-child-family",
       "reserve_floor": 0.15,
       "unknown_execution": "advisory-only"
     },
-    "agy-gemini": {
+    "antigravity-gemini": {
       "cost_mode": "signed-in-account",
       "marginal_cost_usd": 0,
       "max_concurrency": 2,
-      "parent_pool": "agy-account",
+      "parent_pool": "antigravity-account",
       "payg_fallback_allowed": false,
       "quota_mode": "opaque-child-family",
       "reserve_floor": 0.1,
       "unknown_execution": "advisory-only"
     },
-    "agy-gptoss": {
+    "antigravity-gptoss": {
       "cost_mode": "signed-in-account",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "parent_pool": "agy-account",
+      "parent_pool": "antigravity-account",
       "payg_fallback_allowed": false,
       "quota_mode": "opaque-child-family",
       "reserve_floor": 0.05,
@@ -847,6 +891,25 @@
       "max_concurrency": 1,
       "payg_fallback_allowed": false,
       "quota_mode": "unknown"
+    },
+    "opencode-free": {
+      "cost_mode": "temporary-free-account",
+      "freshness_seconds": 86400,
+      "marginal_cost_usd": 0,
+      "max_concurrency": 1,
+      "payg_fallback_allowed": false,
+      "quota_mode": "provider-free-models",
+      "reserve_floor": 0.1,
+      "unknown_execution": "advisory-only"
+    },
+    "openhands-account": {
+      "cost_mode": "signed-in-account",
+      "marginal_cost_usd": 0,
+      "max_concurrency": 1,
+      "payg_fallback_allowed": false,
+      "quota_mode": "opaque-subscription-or-free-provider",
+      "reserve_floor": 0.2,
+      "unknown_execution": "advisory-only"
     }
   },
   "routes": [
@@ -1301,6 +1364,7 @@
       "independence_group": "anthropic-fable",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
+      "paid_only": true,
       "priority": 108,
       "quality_class": "S",
       "quota_pools": [
@@ -1317,8 +1381,7 @@
         "critical-review",
         "security-review"
       ],
-      "tier": "critical",
-      "paid_only": true
+      "tier": "critical"
     },
     {
       "argv_prefix": [
@@ -1345,6 +1408,7 @@
       "independence_group": "anthropic-fable",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
+      "paid_only": true,
       "priority": 108,
       "quality_class": "S",
       "quota_pools": [
@@ -1371,8 +1435,7 @@
         "refactor",
         "migration"
       ],
-      "tier": "critical",
-      "paid_only": true
+      "tier": "critical"
     },
     {
       "argv_prefix": [
@@ -1398,6 +1461,7 @@
       "independence_group": "anthropic-fable",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
+      "paid_only": true,
       "priority": 108,
       "quality_class": "S",
       "quota_pools": [
@@ -1424,8 +1488,7 @@
         "refactor",
         "migration"
       ],
-      "tier": "critical",
-      "paid_only": true
+      "tier": "critical"
     },
     {
       "argv_prefix": [
@@ -1450,6 +1513,7 @@
       "independence_group": "anthropic-fable",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
+      "paid_only": true,
       "priority": 108,
       "quality_class": "S",
       "quota_pools": [
@@ -1471,8 +1535,7 @@
         "critical-review",
         "security-review"
       ],
-      "tier": "critical",
-      "paid_only": true
+      "tier": "critical"
     },
     {
       "argv_prefix": [
@@ -1525,7 +1588,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Gemini 3.5 Flash (Low)"
+        "gemini-3.5-flash-low"
       ],
       "base_quality_rank": 61,
       "burn_weight": 0.4,
@@ -1533,17 +1596,17 @@
       "delegation_overhead_minutes": 4,
       "effort": "low",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-gemini-flash-low",
+      "id": "antigravity-gemini-flash-low",
       "independence_group": "google-gemini-flash",
       "min_duration_minutes": 5,
       "model": "gemini-3.5-flash",
       "priority": 88,
       "quality_class": "C",
       "quota_pools": [
-        "agy-gemini",
-        "agy-account"
+        "antigravity-gemini",
+        "antigravity-account"
       ],
       "task_classes": [
         "mechanical",
@@ -1557,7 +1620,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Gemini 3.5 Flash (Medium)"
+        "gemini-3.5-flash-medium"
       ],
       "base_quality_rank": 64,
       "burn_weight": 0.8,
@@ -1565,17 +1628,17 @@
       "delegation_overhead_minutes": 4,
       "effort": "medium",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-gemini-flash-medium",
+      "id": "antigravity-gemini-flash-medium",
       "independence_group": "google-gemini-flash",
       "min_duration_minutes": 5,
       "model": "gemini-3.5-flash",
       "priority": 92,
       "quality_class": "C",
       "quota_pools": [
-        "agy-gemini",
-        "agy-account"
+        "antigravity-gemini",
+        "antigravity-account"
       ],
       "task_classes": [
         "docs",
@@ -1590,7 +1653,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Gemini 3.5 Flash (High)"
+        "gemini-3.5-flash-high"
       ],
       "base_quality_rank": 66,
       "burn_weight": 1.2,
@@ -1598,17 +1661,17 @@
       "delegation_overhead_minutes": 4,
       "effort": "high",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-gemini-flash-high",
+      "id": "antigravity-gemini-flash-high",
       "independence_group": "google-gemini-flash",
       "min_duration_minutes": 5,
       "model": "gemini-3.5-flash",
       "priority": 90,
       "quality_class": "C",
       "quota_pools": [
-        "agy-gemini",
-        "agy-account"
+        "antigravity-gemini",
+        "antigravity-account"
       ],
       "task_classes": [
         "tests",
@@ -1623,24 +1686,24 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Gemini 3.1 Pro (Low)"
+        "gemini-3.1-pro-low"
       ],
       "base_quality_rank": 69,
       "burn_weight": 1.0,
       "delegation_overhead_minutes": 5,
       "effort": "low",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-gemini-pro-low",
+      "id": "antigravity-gemini-pro-low",
       "independence_group": "google-gemini-pro",
       "min_duration_minutes": 15,
       "model": "gemini-3.1-pro",
       "priority": 94,
       "quality_class": "C",
       "quota_pools": [
-        "agy-gemini",
-        "agy-account"
+        "antigravity-gemini",
+        "antigravity-account"
       ],
       "task_classes": [
         "bounded-patch",
@@ -1655,7 +1718,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Gemini 3.1 Pro (High)"
+        "gemini-3.1-pro-high"
       ],
       "base_quality_rank": 76,
       "burn_weight": 1.6,
@@ -1663,17 +1726,17 @@
       "delegation_overhead_minutes": 5,
       "effort": "high",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-gemini-pro-high",
+      "id": "antigravity-gemini-pro-high",
       "independence_group": "google-gemini-pro",
       "min_duration_minutes": 15,
       "model": "gemini-3.1-pro",
       "priority": 93,
       "quality_class": "B",
       "quota_pools": [
-        "agy-gemini",
-        "agy-account"
+        "antigravity-gemini",
+        "antigravity-account"
       ],
       "risk_affinity": {
         "large-context": 10,
@@ -1694,24 +1757,24 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Claude Sonnet 4.6 (Thinking)"
+        "claude-sonnet-4-6"
       ],
       "base_quality_rank": 68,
       "burn_weight": 1.5,
       "delegation_overhead_minutes": 5,
       "effort": "high",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-claude-sonnet-thinking",
+      "id": "antigravity-claude-sonnet-thinking",
       "independence_group": "anthropic-sonnet",
       "min_duration_minutes": 20,
       "model": "claude-sonnet-4.6",
       "priority": 97,
       "quality_class": "C",
       "quota_pools": [
-        "agy-claude",
-        "agy-account"
+        "antigravity-claude",
+        "antigravity-account"
       ],
       "task_classes": [
         "refactor",
@@ -1726,24 +1789,24 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "Claude Opus 4.6 (Thinking)"
+        "claude-opus-4-6-thinking"
       ],
       "base_quality_rank": 69,
       "burn_weight": 2.3,
       "delegation_overhead_minutes": 6,
       "effort": "high",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-claude-opus-thinking",
+      "id": "antigravity-claude-opus-thinking",
       "independence_group": "anthropic-opus",
       "min_duration_minutes": 25,
       "model": "claude-opus-4.6",
       "priority": 95,
       "quality_class": "C",
       "quota_pools": [
-        "agy-claude",
-        "agy-account"
+        "antigravity-claude",
+        "antigravity-account"
       ],
       "reserve_only": true,
       "task_classes": [
@@ -1759,7 +1822,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "GPT-OSS 120B (Medium)"
+        "gpt-oss-120b-medium"
       ],
       "base_quality_rank": 62,
       "burn_weight": 0.7,
@@ -1767,17 +1830,17 @@
       "delegation_overhead_minutes": 4,
       "effort": "medium",
       "enabled": true,
-      "harness": "agy",
+      "harness": "antigravity",
       "harness_quality": 6,
-      "id": "agy-gptoss-120b-medium",
+      "id": "antigravity-gptoss-120b-medium",
       "independence_group": "open-weight-gptoss",
       "min_duration_minutes": 8,
       "model": "gpt-oss-120b",
       "priority": 82,
       "quality_class": "C",
       "quota_pools": [
-        "agy-gptoss",
-        "agy-account"
+        "antigravity-gptoss",
+        "antigravity-account"
       ],
       "task_classes": [
         "mechanical",
@@ -2055,6 +2118,81 @@
         "openrouter-paid"
       ],
       "task_classes": [],
+      "tier": "deep"
+    },
+    {
+      "argv_prefix": [
+        "opencode",
+        "run",
+        "--pure",
+        "--auto",
+        "--format",
+        "json",
+        "--model",
+        "opencode/deepseek-v4-flash-free"
+      ],
+      "base_quality_rank": 48,
+      "burn_weight": 0.35,
+      "contrast_only": true,
+      "delegation_overhead_minutes": 3,
+      "enabled": true,
+      "harness": "opencode",
+      "harness_quality": 7,
+      "id": "opencode-deepseek-v4-flash-free",
+      "independence_group": "deepseek-v4-opencode",
+      "min_duration_minutes": 5,
+      "model": "deepseek-v4-flash",
+      "priority": 67,
+      "quality_class": "C",
+      "quota_pools": [
+        "opencode-free"
+      ],
+      "task_classes": [
+        "mechanical",
+        "docs",
+        "tests",
+        "bounded-patch",
+        "triage"
+      ],
+      "tier": "balanced"
+    },
+    {
+      "argv_prefix": [
+        "openhands",
+        "--headless",
+        "--json",
+        "--always-approve",
+        "--exit-without-confirmation",
+        "--task"
+      ],
+      "base_quality_rank": 72,
+      "burn_weight": 1.0,
+      "contrast_only": true,
+      "delegation_overhead_minutes": 8,
+      "enabled": true,
+      "harness": "openhands",
+      "harness_quality": 8,
+      "hierarchy_exempt": true,
+      "id": "openhands-always-approve",
+      "independence_group": "openhands-managed",
+      "min_duration_minutes": 15,
+      "model": "openhands-managed-latest",
+      "priority": 79,
+      "quality_class": "HARNESS",
+      "quota_pools": [
+        "openhands-account"
+      ],
+      "task_classes": [
+        "bounded-patch",
+        "tests",
+        "frontend",
+        "refactor",
+        "complex-patch",
+        "deep-debug",
+        "architecture",
+        "long-agent",
+        "migration"
+      ],
       "tier": "deep"
     }
   ],
