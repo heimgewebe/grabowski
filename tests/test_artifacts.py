@@ -512,6 +512,13 @@ class ArtifactTests(unittest.TestCase):
         self._git(repository, "init")
         self._git(repository, "config", "user.name", "Artifact Test")
         self._git(repository, "config", "user.email", "artifact@example.test")
+        self._git(
+            repository,
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:example-owner/repository.git",
+        )
         (repository / "value.txt").write_text("first\n")
         self._git(repository, "add", "value.txt")
         self._git(repository, "commit", "-m", "first")
@@ -533,28 +540,103 @@ class ArtifactTests(unittest.TestCase):
                 pull_request_number=17,
             )
             self.assertEqual(result["schema"], "git-diff-artifact.v1")
+            self.assertEqual(result["repository"], "example-owner/repository")
             self.assertTrue(result["filename"].endswith("-diff.txt"))
-            chunks = []
+            materialized = self.root / result["filename"]
             offset = 0
-            while True:
-                chunk = artifacts.read_text_artifact(
-                    result["artifact_id"],
-                    result["diff_sha256"],
-                    result["receipt_sha256"],
-                    offset=offset,
-                    max_bytes=11,
-                )
-                payload = __import__("base64").b64decode(chunk["payload_b64"])
-                self.assertEqual(chunk["chunk_sha256"], sha(payload))
-                chunks.append(payload)
-                if chunk["next_offset"] is None:
-                    break
-                offset = chunk["next_offset"]
-            data = b"".join(chunks)
+            with materialized.open("xb") as output:
+                while True:
+                    chunk = artifacts.read_text_artifact(
+                        result["artifact_id"],
+                        result["diff_sha256"],
+                        result["receipt_sha256"],
+                        offset=offset,
+                        max_bytes=11,
+                    )
+                    payload = __import__("base64").b64decode(chunk["payload_b64"])
+                    self.assertEqual(chunk["chunk_sha256"], sha(payload))
+                    output.write(payload)
+                    if chunk["next_offset"] is None:
+                        break
+                    offset = chunk["next_offset"]
+            data = materialized.read_bytes()
             self.assertEqual(len(data), result["byte_size"])
             self.assertEqual(sha(data), result["diff_sha256"])
+            self.assertEqual(data.decode("utf-8").encode("utf-8"), data)
             self.assertIn(b"-first", data)
             self.assertIn(b"+second", data)
+
+    def test_text_artifact_accepts_https_origin_identity(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        self._git(
+            repository,
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/other-owner/other-repository.git",
+        )
+        with patch.object(
+            artifacts, "TEXT_ARTIFACT_ROOT", self.root / "text-artifacts"
+        ):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+        self.assertEqual(result["repository"], "other-owner/other-repository")
+
+    def test_text_artifact_requires_canonical_origin_identity(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        self._git(repository, "remote", "remove", "origin")
+        with patch.object(
+            artifacts, "TEXT_ARTIFACT_ROOT", self.root / "text-artifacts"
+        ):
+            with self.assertRaisesRegex(ValueError, "canonical origin"):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1", str(repository), base_commit, head_commit
+                )
+
+    def test_text_artifact_retention_count_is_fail_closed(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root),
+            patch.object(artifacts, "MAX_RETAINED_TEXT_ARTIFACTS", 1),
+        ):
+            artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "retention capacity"
+            ):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1", str(repository), base_commit, head_commit
+                )
+        self.assertEqual(
+            len([path for path in artifact_root.iterdir() if path.is_dir()]), 1
+        )
+        self.assertFalse(any(path.name.startswith(".") for path in artifact_root.iterdir()))
+
+    def test_text_artifact_store_busy_fails_before_temporary_publication(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root),
+            patch.object(
+                artifacts.fcntl,
+                "flock",
+                side_effect=BlockingIOError("store busy"),
+            ) as lock,
+        ):
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "store is busy"
+            ):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1", str(repository), base_commit, head_commit
+                )
+        lock.assert_called_once()
+        self.assertEqual(
+            lock.call_args.args[1], artifacts.fcntl.LOCK_EX | artifacts.fcntl.LOCK_NB
+        )
+        self.assertEqual(list(artifact_root.iterdir()), [])
 
     def test_text_artifact_requires_exact_full_commit_sha(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()

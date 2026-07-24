@@ -14,7 +14,18 @@
     "schema": {"const": "git-diff-artifact.v1"},
     "profile": {"const": "git-diff.v1"},
     "artifact_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
-    "repository": {"type": "string", "minLength": 1, "maxLength": 255},
+    "repository": {
+      "type": "string",
+      "maxLength": 255,
+      "description": "Canonical owner/repository identity; a single legacy repository name remains schema-readable for pre-hardening receipts.",
+      "oneOf": [
+        {"pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"},
+        {
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "deprecated": true
+        }
+      ]
+    },
     "repository_path_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
     "head_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
