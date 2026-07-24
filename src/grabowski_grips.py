@@ -4896,7 +4896,11 @@ def _captain_action_record(
         "does_not_establish": list(does_not_establish),
     }
     if execution_result is not None:
-        for key in ("automatic_platform_effects", "effect_scope_decision"):
+        for key in (
+            "configured_automatic_platform_effects",
+            "automatic_platform_effects",
+            "effect_scope_decision",
+        ):
             if key in execution_result:
                 captain_receipt[key] = execution_result[key]
         captain_receipt["execution_result_sha256"] = sha256_json(execution_result)
@@ -5239,7 +5243,7 @@ def _captain_pr_view(
         "--repo",
         repo_slug,
         "--json",
-        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
+        "number,state,mergedAt,mergeCommit,headRefName,headRefOid,headRepository,isCrossRepository,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
     ]
     try:
         view_result = github_runner(repo_path, view_args)
@@ -5454,6 +5458,25 @@ CAPTAIN_PR_MERGE_AUTOMATIC_EFFECT_BRANCH_DELETION = "branch-deletion"
 CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS = tuple(
     field for _method, field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
 ) + ("delete_branch_on_merge",)
+CAPTAIN_EFFECT_SCOPE_MATCHING = "exact_casefolded_token"
+CAPTAIN_EFFECT_SCOPE_DOES_NOT_ESTABLISH = (
+    "that_github_will_apply_the_configured_effect",
+    "permission_to_change_repository_settings",
+    "permission_to_restore_or_delete_branches_outside_the_merge",
+)
+
+
+def _captain_effect_scope_not_evaluated() -> dict[str, Any]:
+    return {
+        "decision": "not_evaluated",
+        "reasons": ["automatic_effect_scope_not_evaluated"],
+        "configured_automatic_effects": [],
+        "required_effect_authorizations": [],
+        "allowed_effects": [],
+        "forbidden_effects": [],
+        "matching": CAPTAIN_EFFECT_SCOPE_MATCHING,
+        "does_not_establish": list(CAPTAIN_EFFECT_SCOPE_DOES_NOT_ESTABLISH),
+    }
 
 
 def _captain_repository_merge_policy(
@@ -5462,11 +5485,12 @@ def _captain_repository_merge_policy(
     *,
     repo_slug: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    policy_jq = "{" + ",".join(CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS) + "}"
     policy_args = [
         "api",
         f"repos/{repo_slug}",
         "--jq",
-        "{allow_merge_commit,allow_squash_merge,allow_rebase_merge,delete_branch_on_merge}",
+        policy_jq,
     ]
     try:
         policy_result = github_runner(repo_path, policy_args)
@@ -5541,6 +5565,15 @@ def _captain_pr_merge_effect_scope_decision(
     pre_view: dict[str, Any],
 ) -> dict[str, Any]:
     configured_effects: list[dict[str, Any]] = []
+    head_repository_value = pre_view.get("headRepository")
+    head_repository = (
+        head_repository_value.get("nameWithOwner")
+        if isinstance(head_repository_value, dict)
+        else None
+    )
+    head_branch = pre_view.get("headRefName")
+    head_oid = _normalize_40_sha(pre_view.get("headRefOid"))
+    is_cross_repository = pre_view.get("isCrossRepository")
     if merge_policy["settings"]["delete_branch_on_merge"]:
         configured_effects.append(
             {
@@ -5549,7 +5582,19 @@ def _captain_pr_merge_effect_scope_decision(
                 "source": "github_repository_setting",
                 "setting": "delete_branch_on_merge",
                 "configured": True,
-                "target": {"head_branch": pre_view.get("headRefName")},
+                "target": {
+                    "base_repository": action["target"].get("repo"),
+                    "pull_request": action["target"].get("pr"),
+                    "repository": head_repository,
+                    "ref": (
+                        f"refs/heads/{head_branch}"
+                        if isinstance(head_branch, str) and head_branch
+                        else None
+                    ),
+                    "head_branch": head_branch,
+                    "head_oid": head_oid,
+                    "cross_repository": is_cross_repository,
+                },
                 "application": "after successful merge when GitHub considers the head branch eligible",
             }
         )
@@ -5557,6 +5602,15 @@ def _captain_pr_merge_effect_scope_decision(
     allowed = _captain_effect_scope_tokens(scope.get("allowed_effects"))
     forbidden = _captain_effect_scope_tokens(scope.get("forbidden_effects"))
     reasons: list[str] = []
+    if configured_effects and (
+        not isinstance(head_repository, str)
+        or CAPTAIN_REPO_SLUG_RE.fullmatch(head_repository) is None
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or head_oid is None
+        or not isinstance(is_cross_repository, bool)
+    ):
+        reasons.append("automatic_effect_target_unbound:branch-deletion")
     for effect in configured_effects:
         effect_name = str(effect["effect"])
         canonical = effect_name.casefold()
@@ -5573,12 +5627,8 @@ def _captain_pr_merge_effect_scope_decision(
         ],
         "allowed_effects": sorted(allowed),
         "forbidden_effects": sorted(forbidden),
-        "matching": "exact_casefolded_token",
-        "does_not_establish": [
-            "that_github_will_apply_the_configured_effect",
-            "permission_to_change_repository_settings",
-            "permission_to_restore_or_delete_branches_outside_the_merge",
-        ],
+        "matching": CAPTAIN_EFFECT_SCOPE_MATCHING,
+        "does_not_establish": list(CAPTAIN_EFFECT_SCOPE_DOES_NOT_ESTABLISH),
     }
 
 
@@ -5610,6 +5660,10 @@ def _run_captain_pr_merge(
         "command_returned": False,
         "remote_mutation_observed": False,
         "preflight_passed": False,
+        "preflight_errors": [],
+        "configured_automatic_platform_effects": [],
+        "automatic_platform_effects": [],
+        "effect_scope_decision": _captain_effect_scope_not_evaluated(),
         "verification_passed": False,
     }
     pre_view, preflight_summary, preflight_errors = _captain_pr_merge_preflight_view(
@@ -5624,12 +5678,12 @@ def _run_captain_pr_merge(
     execution_result["pre_view"] = pre_view
     execution_result["preflight_view_summary"] = preflight_summary
     if pre_view is None:
-        execution_result["preflight_errors"] = preflight_errors
+        execution_result["preflight_errors"].extend(preflight_errors)
         detail = "; ".join(preflight_errors) if preflight_errors else "pr_pre_execution_view_failed"
         execution_result["verification_error"] = f"pre-execution PR view failed; merge not attempted: {detail}"
         return execution_result
     if preflight_errors:
-        execution_result["preflight_errors"] = preflight_errors
+        execution_result["preflight_errors"].extend(preflight_errors)
         execution_result["verification_error"] = "pre-execution PR state did not match the bound target; merge not attempted"
         return execution_result
     merge_policy, merge_policy_query, merge_policy_errors = _captain_repository_merge_policy(
@@ -5640,7 +5694,7 @@ def _run_captain_pr_merge(
     execution_result["merge_policy_query"] = merge_policy_query
     execution_result["merge_policy"] = merge_policy
     if merge_policy_errors or merge_policy is None:
-        execution_result["preflight_errors"] = merge_policy_errors
+        execution_result["preflight_errors"].extend(merge_policy_errors)
         detail = "; ".join(merge_policy_errors) if merge_policy_errors else "repository_merge_policy_unavailable"
         execution_result["verification_error"] = f"repository merge policy unavailable; merge not attempted: {detail}"
         return execution_result
@@ -5649,13 +5703,13 @@ def _run_captain_pr_merge(
         merge_policy,
         pre_view,
     )
-    execution_result["automatic_platform_effects"] = effect_scope_decision[
-        "configured_automatic_effects"
-    ]
+    configured_effects = effect_scope_decision["configured_automatic_effects"]
+    execution_result["configured_automatic_platform_effects"] = configured_effects
+    execution_result["automatic_platform_effects"] = configured_effects
     execution_result["effect_scope_decision"] = effect_scope_decision
     if effect_scope_decision["decision"] != "passed":
         effect_errors = list(effect_scope_decision["reasons"])
-        execution_result["preflight_errors"] = effect_errors
+        execution_result.setdefault("preflight_errors", []).extend(effect_errors)
         detail = "; ".join(effect_errors)
         execution_result["verification_error"] = (
             "repository automatic effects exceed the bound action scope; "

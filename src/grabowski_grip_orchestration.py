@@ -265,6 +265,10 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 "command_returned": False,
                 "remote_mutation_observed": False,
                 "preflight_passed": False,
+                "preflight_errors": [],
+                "configured_automatic_platform_effects": [],
+                "automatic_platform_effects": [],
+                "effect_scope_decision": core._captain_effect_scope_not_evaluated(),
                 "verification_passed": False,
             }
             try:
