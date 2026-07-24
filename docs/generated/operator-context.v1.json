@@ -2928,7 +2928,7 @@
       "src/grabowski_operator.py": "4db64a321dc135762fc7ee26e030bf2070deab14eadfb0787e7cae45ccaaff2b",
       "src/grabowski_operator_obligation.py": "a18dd9e4c9b2915aecdf51897b38da08dc1b557541e823e9fb3bd7a0e470c085",
       "src/grabowski_operator_relay.py": "4099f2679b4c0af47296bcd26ed881d08d0f4049799ce97a5b8b7cac92d1bad1",
-      "src/grabowski_operator_routing_shadow_capture.py": "23e09f0dfac84508f81f8614bc00156ff9c926fcf7a71d84c3cd085a6b33f042",
+      "src/grabowski_operator_routing_shadow_capture.py": "b0077bdec7036a9672f1983a22235f77fea73de7e2451fa39d712d7f183740d9",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
       "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",

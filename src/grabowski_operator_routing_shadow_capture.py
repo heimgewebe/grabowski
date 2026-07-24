@@ -2701,7 +2701,10 @@ def validate_direct_task_binding(value: Any) -> dict[str, Any]:
         raise ShadowCaptureError("direct task binding_id is invalid")
     return value
 
-def _write_direct_task_binding_idempotent(path: Path, binding: dict[str, Any]) -> bool:
+def _write_direct_task_binding_idempotent(
+    path: Path, binding: dict[str, Any]
+) -> tuple[dict[str, Any], bool]:
+    """Create one binding or preserve the first timestamp for the same identity."""
     validate_direct_task_binding(binding)
     candidate = _absolute_unresolved(path)
     parent_descriptor = _open_directory_fd(candidate.parent)
@@ -2714,18 +2717,19 @@ def _write_direct_task_binding_idempotent(path: Path, binding: dict[str, Any]) -
                 data,
                 conflict_message="refusing to overwrite an existing direct task binding",
             )
-            return True
+            return binding, True
         except ShadowRecordExistsError:
             pass
     finally:
         os.close(parent_descriptor)
     existing = _read_regular_json(path, label="existing direct task binding")
     validate_direct_task_binding(existing)
-    if existing != binding:
+    identity_fields = set(binding) - {"binding_id", "created_at"}
+    if any(existing[field] != binding[field] for field in identity_fields):
         raise ShadowCaptureError(
             "existing direct task binding conflicts with deterministic identity"
         )
-    return False
+    return existing, False
 
 def capture_direct_task_start_best_effort(
     *,
@@ -2794,13 +2798,13 @@ def capture_direct_task_start_best_effort(
         }
         binding = {"binding_id": _sha256_json(payload), **payload}
         binding_dir = _direct_task_binding_directory(cohort_root)
-        created = _write_direct_task_binding_idempotent(
+        stored_binding, created = _write_direct_task_binding_idempotent(
             binding_dir / f"{task_id}.json", binding
         )
         return {
             **capture,
             "binding_status": "created" if created else "duplicate",
-            "binding_id": binding["binding_id"],
+            "binding_id": stored_binding["binding_id"],
             "plan_sha256": plan_sha256,
         }
     except Exception as exc:
@@ -2843,6 +2847,12 @@ def seal_direct_task_case(
             str(Path.home() / ".local/state/grabowski/operator-routing-shadow-cohort"),
         )
     )
+    normalized_outcome = _normalize_outcome(outcome)
+    normalized_assessments = _normalize_semantic_assessments(semantic_assessments)
+    if normalized_outcome["status"] == "reviewed" and len(normalized_assessments) < 2:
+        raise ShadowCaptureError(
+            "reviewed direct task outcome requires at least 2 independent semantic assessments"
+        )
     binding = read_direct_task_binding(task_id, root=cohort_root)
     prospective_dir, _, _, _ = _cohort_directories(cohort_root)
     prospective = _read_regular_json(
@@ -2860,12 +2870,12 @@ def seal_direct_task_case(
         prospective,
         manifest,
         eligible_task_id=task_id,
-        outcome=outcome,
+        outcome=normalized_outcome,
         primary_evidence_refs=primary_evidence_refs,
         root=cohort_root,
         captured_at=captured_at,
         execution_provenance=execution_provenance,
-        semantic_assessments=semantic_assessments,
+        semantic_assessments=normalized_assessments,
     )
 
 def _utc_now() -> str:
