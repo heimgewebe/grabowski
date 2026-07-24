@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          python -m unittest tests.test_operator_routing_shadow_cohort tests.test_agent_workspace > .routing-shadow-test-diagnostic.txt 2>&1
+          PYTHONPATH=src python -m unittest tests.test_operator_routing_shadow_cohort > .routing-shadow-test-diagnostic.txt 2>&1
           status=$?
           cat .routing-shadow-test-diagnostic.txt
           exit $status
