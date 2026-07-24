@@ -763,6 +763,33 @@
         "tool": "grabowski_task_archive_read"
       }
     },
+    "grabowski_task_routing_shadow_seal": {
+      "evidence_refs": [
+        "bureau:OPERATOR-ML-READINESS-V1-T006",
+        "docs:operator-routing-shadow-cohort-v1.md",
+        "tests:test_task_routing_shadow_capture.py",
+        "tests:test_tasks.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the post-terminal, create-only sealing boundary for one already prospectively frozen direct-task routing-shadow case; it cannot start tasks, reconstruct routes, alter routing, or fabricate semantic labels.",
+        "evidence": "The implementation requires canonical direct-task binding readback, terminal task state, execution-provenance compatibility, explicit reviewed semantic evidence or abstention, create-only storage and literal no-effect constants; focused tests cover prelaunch isolation, privacy, idempotence, failure isolation and terminal sealing."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Extending task status or task start was rejected because observation and execution must not gain authority to append independently reviewed semantic outcomes. A generic file or terminal operation would lose typed binding, terminal-state, provenance and no-effect validation.",
+      "rationale": "Prospective inclusion and semantic outcome sealing are intentionally separate authorities. A dedicated narrow tool preserves that separation while allowing real direct tasks to contribute reviewable cohort evidence without granting model, routing, queue, merge, deploy or policy authority.",
+      "tool_contract": {
+        "tool": "grabowski_task_routing_shadow_seal",
+        "category": "task",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "audit-append",
+          "state-create"
+        ],
+        "reversibility": "append-only-observation"
+      }
+    },
     "grabowski_text_artifact_publish": {
       "evidence_refs": [
         "contract:git-diff-artifact.v1",

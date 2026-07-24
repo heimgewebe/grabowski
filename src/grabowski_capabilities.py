@@ -680,6 +680,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["process-start", "state-create", "command-dependent"],
         "reversibility": "cancel-or-command-dependent",
     },
+    "grabowski_task_routing_shadow_seal": {
+        "category": "task",
+        "purpose": "Seal one terminal direct-task routing-shadow case with explicit semantic outcome or abstention and evidence-bound execution provenance.",
+        "risk_class": "medium",
+        "effects": ["state-create", "audit-append"],
+        "reversibility": "append-only-observation",
+    },
     "grabowski_task_status": {
         "category": "task",
         "purpose": "Observe one persistent task and refresh its recorded state.",

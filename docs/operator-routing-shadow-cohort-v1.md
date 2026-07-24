@@ -1,10 +1,10 @@
 # Operator routing shadow cohort v1
 
-Stand: 2026-07-23
+Stand: 2026-07-24
 
 ## Zweck
 
-Diese Stufe sammelt prospektiv Routing-Shadow-Fälle aus realer Agent-Workspace-Nutzung. Sie erweitert den in PR #410 eingeführten Capture-Vertrag, ohne Routing-, Policy-, Queue-, Merge-, Deploy-, Runtime- oder ML-Autorität zu erzeugen.
+Diese Stufe sammelt prospektiv Routing-Shadow-Fälle aus realer Agent-Workspace-Nutzung und aus explizit gerouteten direkten Grabowski-Daueraufgaben. Sie erweitert den in PR #410 eingeführten Capture-Vertrag, ohne Routing-, Policy-, Queue-, Merge-, Deploy-, Runtime- oder ML-Autorität zu erzeugen.
 
 Der entscheidende Zusatz ist ein zweistufiger Eligibility-Vertrag:
 
@@ -103,7 +103,8 @@ Unterverzeichnisse:
 - `prospective/`: erster prospektiver Freeze pro Workspace-Fall;
 - `eligibility/`: spätere Task-Bindung;
 - `records/`: versiegelte Outcome-Records;
-- `attempts/`: begrenzte Audit-Receipts für Freeze-Versuche.
+- `attempts/`: begrenzte Audit-Receipts für Freeze-Versuche;
+- `direct-task-bindings/`: create-only Bindungen direkter Task-IDs an Hashes von Host, argv, Arbeitsverzeichnis und Ressourcenscope sowie an die kanonische Route.
 
 Verzeichnisse werden owner-private (`0700`) geöffnet oder erzeugt. Symlink-Traversal wird abgelehnt.
 
@@ -140,6 +141,22 @@ Jedes Prospective-, Eligibility-, Record- und Attempt-Artefakt trägt denselben 
 
 Die Schnittstelle leitet kein Outcome aus Lifecycle-Status ab. Das Outcome-Input muss exakt `outcome` und `primary_evidence_refs` enthalten. Reviewed Outcomes ohne Primärevidenz werden abgelehnt; Abstention bleibt Abstention.
 
+## Direkte Daueraufgaben
+
+`grabowski_task_start` akzeptiert optional vollständige kanonische `route_evidence`. Dieser Pfad ist absichtlich opt-in: Ein gewöhnlicher Dauerauftrag ohne Route wird weder nachträglich klassifiziert noch in die Kohorte aufgenommen. Für eine Aufnahme gelten zusätzlich folgende Grenzen:
+
+- nur Route-Schema v2 mit `actual_route = direct_operator`, `status = verified` und `evidence_complete = true`;
+- keine externen Kandidaten und keine als extern angeforderte Ausführung;
+- Freeze nach finaler argv-Bindung und Operator-Mutationsprüfung, aber vor Lease, Task-DB und Prozessstart;
+- ein Capture-Fehler bleibt im Taskstart-Beleg sichtbar, darf den Task aber nicht blockieren;
+- die unveränderliche `operator-routing-shadow-direct-task-binding.v1` speichert keine rohen Host-, argv-, cwd- oder Ressourcenwerte, sondern ausschließlich ihre SHA-256-Identitäten;
+- wiederholte identische Starts konvergieren auf dieselbe Bindung; wechselnde Attempt-IDs sind nicht Teil ihrer Identität;
+- ein späterer Taskfehler bleibt als prospektiver unversiegelter Fall sichtbar und darf nicht aus der Kohorte verschwinden.
+
+Die mutierende Schnittstelle `grabowski_task_routing_shadow_seal` versiegelt einen direkten Fall erst nach terminalem Task-Readback. Ein abgeschlossener Task erfordert `execution_provenance.status = completed`; andere terminale Zustände müssen als `execution_aborted` oder `infrastructure_failure` belegt werden. Auch danach entsteht kein fachliches Erfolgslabel: Ohne unabhängige semantische Bewertung muss das Outcome ausdrücklich `abstained` bleiben.
+
+Der direkte Produktionspfad verwendet die kanonische Quellidentität `direct-task-start` und die Provenienz `direct_task_prestart`. Öffentliche oder synthetische Capture-Aufrufe besitzen diese interne Attestierung nicht; ein Produktionsanspruch wird dort weiterhin auf `quarantined` herabgestuft.
+
 ## Nicht etabliert
 
 Diese Stufe etabliert ausdrücklich nicht:
@@ -168,7 +185,7 @@ Diese Erweiterung bleibt reine Capture-Beobachtbarkeit. Sie trainiert kein Model
 
 ### Provenienz- und Zeitgrenzen
 
-Neue direkte Capture-Aufrufe werden als `direct_capture` gebunden und können keinen `production`-Fall behaupten; ein solcher Versuch wird auf `quarantined` herabgestuft. Nur der interne Agent-Workspace-Prestart-Pfad erzeugt standardmäßig `production`. Eine gesetzte `GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN` kann diesen Pfad auf `test`, `synthetic` oder `quarantined` herabstufen, aber nicht auf `production` hochstufen. Das ist eine Bindung an den kanonischen Codepfad, keine kryptographische Runtime-Attestation.
+Neue direkte Capture-Aufrufe werden als `direct_capture` gebunden und können keinen `production`-Fall behaupten; ein solcher Versuch wird auf `quarantined` herabgestuft. Nur die internen Agent-Workspace- und Direct-Task-Prestart-Pfade erzeugen standardmäßig `production`. Eine gesetzte `GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN` kann diesen Pfad auf `test`, `synthetic` oder `quarantined` herabstufen, aber nicht auf `production` hochstufen. Das ist eine Bindung an den kanonischen Codepfad, keine kryptographische Runtime-Attestation.
 
 Für `task_correctness` muss eine beobachtete terminale Ausführung (`completed`, `execution_aborted` oder `infrastructure_failure`) zeitlich vor dem primären Outcome und vor gebundenen semantischen Bewertungen liegen. `decision_quality` bleibt davon getrennt, weil diese Bewertung nicht zwingend das Ausführungsende voraussetzt.
 

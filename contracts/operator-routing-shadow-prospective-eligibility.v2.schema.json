@@ -26,7 +26,11 @@
           "type": "integer"
         },
         "source": {
-          "const": "agent-workspace-manifest"
+          "enum": [
+            "agent-workspace-manifest",
+            "direct-task-start"
+          ],
+          "type": "string"
         }
       },
       "required": [
@@ -44,7 +48,8 @@
         "capture_path": {
           "enum": [
             "agent_workspace_prestart",
-            "direct_capture"
+            "direct_capture",
+            "direct_task_prestart"
           ]
         },
         "case_origin": {

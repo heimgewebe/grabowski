@@ -60,6 +60,9 @@ NO_EFFECT = {
     "merge": False,
     "runtime": False,
 }
+AGENT_WORKSPACE_ROUTE_SOURCE = "agent-workspace-manifest"
+DIRECT_TASK_ROUTE_SOURCE = "direct-task-start"
+ROUTE_SOURCES = {AGENT_WORKSPACE_ROUTE_SOURCE, DIRECT_TASK_ROUTE_SOURCE}
 TOP_LEVEL_FIELDS = {
     "schema_version",
     "record_id",
@@ -408,7 +411,9 @@ def _validate_features(features: Any, *, route_schema_version: int) -> None:
         raise ShadowCaptureError("features.architecture_hypotheses is invalid")
 
 
-def _validated_route_evidence(value: Any) -> dict[str, Any]:
+def _validated_route_evidence(
+    value: Any, *, execution_surface: str = "workspace"
+) -> dict[str, Any]:
     persisted = isinstance(value, dict) and (
         "status" in value or "evidence_complete" in value
     )
@@ -427,7 +432,9 @@ def _validated_route_evidence(value: Any) -> dict[str, Any]:
             if key not in {"status", "evidence_complete"}
         }
     try:
-        normalized = workspace._normalize_route_evidence(candidate)
+        normalized = workspace._normalize_route_evidence(
+            candidate, execution_surface=execution_surface
+        )
     except workspace.AgentWorkspaceError as exc:
         raise ShadowCaptureError(f"canonical route evidence is invalid: {exc}") from exc
     if (
@@ -442,6 +449,19 @@ def _validated_route_evidence(value: Any) -> dict[str, Any]:
     return normalized
 
 
+def _manifest_execution_surface(manifest: dict[str, Any]) -> str:
+    surface = manifest.get("routing_surface", "workspace")
+    if surface not in {"workspace", "direct_task"}:
+        raise ShadowCaptureError("manifest routing_surface is invalid")
+    return str(surface)
+
+def _manifest_route_source(manifest: dict[str, Any]) -> str:
+    return (
+        DIRECT_TASK_ROUTE_SOURCE
+        if _manifest_execution_surface(manifest) == "direct_task"
+        else AGENT_WORKSPACE_ROUTE_SOURCE
+    )
+
 def _case_id(task_id: str, recommendation_id: str) -> str:
     return _sha256_json(
         {
@@ -454,7 +474,7 @@ def _case_id(task_id: str, recommendation_id: str) -> str:
 
 def _route_reference(route: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     return {
-        "source": "agent-workspace-manifest",
+        "source": AGENT_WORKSPACE_ROUTE_SOURCE,
         "schema_version": route["schema_version"],
         "recommendation_id": route["recommendation_id"],
         "route_evidence_sha256": _sha256_json(route),
@@ -463,7 +483,11 @@ def _route_reference(route: dict[str, Any], manifest: dict[str, Any]) -> dict[st
 
 
 def _manifest_identity_sha256(
-    workspace_id: str, plan_sha256: str, route_evidence_sha256: str
+    workspace_id: str,
+    plan_sha256: str,
+    route_evidence_sha256: str,
+    *,
+    route_source: str = AGENT_WORKSPACE_ROUTE_SOURCE,
 ) -> str:
     """Stable allowlisted manifest identity.
 
@@ -472,27 +496,45 @@ def _manifest_identity_sha256(
     (created_at/updated_at/tasks/...), so the digest is identical between the
     prospective freeze and the later task binding of the same workspace case.
     """
-    return _sha256_json(
-        {
-            "schema_version": "operator-routing-shadow-manifest-identity.v1",
+    if route_source not in ROUTE_SOURCES:
+        raise ShadowCaptureError("canonical route source is invalid")
+    payload = {
+        "schema_version": "operator-routing-shadow-manifest-identity.v1",
+        "workspace_id": workspace_id,
+        "plan_sha256": plan_sha256,
+        "route_evidence_sha256": route_evidence_sha256,
+    }
+    if route_source != AGENT_WORKSPACE_ROUTE_SOURCE:
+        payload = {
+            "schema_version": "operator-routing-shadow-manifest-identity.v2",
+            "route_source": route_source,
             "workspace_id": workspace_id,
             "plan_sha256": plan_sha256,
             "route_evidence_sha256": route_evidence_sha256,
         }
-    )
+    return _sha256_json(payload)
 
 
 def _cohort_route_reference(
-    route: dict[str, Any], workspace_id: str, plan_sha256: str
+    route: dict[str, Any],
+    workspace_id: str,
+    plan_sha256: str,
+    *,
+    route_source: str = AGENT_WORKSPACE_ROUTE_SOURCE,
 ) -> dict[str, Any]:
     route_evidence_sha256 = _sha256_json(route)
+    if route_source not in ROUTE_SOURCES:
+        raise ShadowCaptureError("canonical route source is invalid")
     return {
-        "source": "agent-workspace-manifest",
+        "source": route_source,
         "schema_version": route["schema_version"],
         "recommendation_id": route["recommendation_id"],
         "route_evidence_sha256": route_evidence_sha256,
         "manifest_identity_sha256": _manifest_identity_sha256(
-            workspace_id, plan_sha256, route_evidence_sha256
+            workspace_id,
+            plan_sha256,
+            route_evidence_sha256,
+            route_source=route_source,
         ),
     }
 
@@ -529,9 +571,10 @@ def _validate_route_reference(route_ref: Any, *, manifest_field: str) -> int:
     }:
         raise ShadowCaptureError("canonical_route_evidence shape is invalid")
     route_schema_version = route_ref.get("schema_version")
-    if route_ref.get(
-        "source"
-    ) != "agent-workspace-manifest" or route_schema_version not in {1, 2}:
+    if route_ref.get("source") not in ROUTE_SOURCES or route_schema_version not in {
+        1,
+        2,
+    }:
         raise ShadowCaptureError(
             "canonical_route_evidence source or schema_version is invalid"
         )
@@ -559,7 +602,10 @@ def build_eligibility_receipt(
         raise ShadowCaptureError(
             "eligible_task_id is not referenced by the workspace manifest"
         )
-    route = _validated_route_evidence(manifest.get("route_evidence"))
+    route = _validated_route_evidence(
+        manifest.get("route_evidence"),
+        execution_surface=_manifest_execution_surface(manifest),
+    )
     normalized_frozen_at = _parse_timestamp(frozen_at, "frozen_at")
     payload = {
         "schema_version": ELIGIBILITY_SCHEMA_VERSION,
@@ -834,8 +880,15 @@ CAPTURE_ATTEMPT_SCHEMA_VERSION = "operator-routing-shadow-capture-attempt.v1"
 CASE_ORIGINS = {"production", "test", "synthetic", "quarantined"}
 WORKSPACE_PRESTART_CAPTURE_PATH = "agent_workspace_prestart"
 DIRECT_CAPTURE_PATH = "direct_capture"
-CAPTURE_PATHS = {WORKSPACE_PRESTART_CAPTURE_PATH, DIRECT_CAPTURE_PATH}
+DIRECT_TASK_PRESTART_CAPTURE_PATH = "direct_task_prestart"
+CAPTURE_PATHS = {
+    WORKSPACE_PRESTART_CAPTURE_PATH,
+    DIRECT_CAPTURE_PATH,
+    DIRECT_TASK_PRESTART_CAPTURE_PATH,
+}
+DIRECT_TASK_BINDING_SCHEMA_VERSION = "operator-routing-shadow-direct-task-binding.v1"
 _WORKSPACE_PRESTART_ATTESTATION = object()
+_DIRECT_TASK_PRESTART_ATTESTATION = object()
 _UNSET = object()
 EXECUTION_STATUSES = {"completed", "execution_aborted", "infrastructure_failure"}
 EXECUTION_UNKNOWN_REASONS = {"not_observed", "ambiguous"}
@@ -881,16 +934,29 @@ ATTEMPT_STATUSES = {"created", "duplicate", "rejected", "error"}
 
 
 def _workspace_case_id(
-    workspace_id: str, plan_sha256: str, route_evidence_sha256: str
+    workspace_id: str,
+    plan_sha256: str,
+    route_evidence_sha256: str,
+    *,
+    route_source: str = AGENT_WORKSPACE_ROUTE_SOURCE,
 ) -> str:
-    return _sha256_json(
-        {
-            "schema_version": 1,
+    payload = {
+        "schema_version": 1,
+        "workspace_id": workspace_id,
+        "plan_sha256": plan_sha256,
+        "route_evidence_sha256": route_evidence_sha256,
+    }
+    if route_source != AGENT_WORKSPACE_ROUTE_SOURCE:
+        if route_source not in ROUTE_SOURCES:
+            raise ShadowCaptureError("canonical route source is invalid")
+        payload = {
+            "schema_version": 2,
+            "route_source": route_source,
             "workspace_id": workspace_id,
             "plan_sha256": plan_sha256,
             "route_evidence_sha256": route_evidence_sha256,
         }
-    )
+    return _sha256_json(payload)
 
 
 def _prove_prospective_binding(
@@ -918,15 +984,22 @@ def _prove_prospective_binding(
     # then re-hash prospective_eligibility_id, eligibility_id and record_id into
     # a self-consistent but forged lineage. The digest is a pure function of the
     # bound (workspace_id, plan_sha256, route_evidence_sha256), never free input.
+    route_source = route_ref["source"]
     if route_ref["manifest_identity_sha256"] != _manifest_identity_sha256(
-        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+        workspace_id,
+        plan_sha256,
+        route_ref["route_evidence_sha256"],
+        route_source=route_source,
     ):
         raise ShadowCaptureError(
             "canonical_route_evidence.manifest_identity_sha256 is not bound to "
             "workspace, plan and route"
         )
     if workspace_case_id != _workspace_case_id(
-        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+        workspace_id,
+        plan_sha256,
+        route_ref["route_evidence_sha256"],
+        route_source=route_source,
     ):
         raise ShadowCaptureError(
             "workspace_case_id is not bound to workspace, plan and route"
@@ -978,11 +1051,20 @@ def build_prospective_eligibility(
         raise ShadowCaptureError(
             "prospective eligibility must be frozen before workspace tasks are bound"
         )
-    route = _validated_route_evidence(manifest.get("route_evidence"))
+    execution_surface = _manifest_execution_surface(manifest)
+    route_source = _manifest_route_source(manifest)
+    route = _validated_route_evidence(
+        manifest.get("route_evidence"), execution_surface=execution_surface
+    )
     normalized_frozen_at = _parse_timestamp(frozen_at, "frozen_at")
-    route_ref = _cohort_route_reference(route, workspace_id, plan_sha256)
+    route_ref = _cohort_route_reference(
+        route, workspace_id, plan_sha256, route_source=route_source
+    )
     case_id = _workspace_case_id(
-        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+        workspace_id,
+        plan_sha256,
+        route_ref["route_evidence_sha256"],
+        route_source=route_source,
     )
     payload = {
         "schema_version": PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
@@ -1035,15 +1117,22 @@ def validate_prospective_eligibility(receipt: Any) -> dict[str, Any]:
     route_schema_version = _validate_route_reference(
         route_ref, manifest_field="manifest_identity_sha256"
     )
+    route_source = route_ref["source"]
     if route_ref["manifest_identity_sha256"] != _manifest_identity_sha256(
-        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+        workspace_id,
+        plan_sha256,
+        route_ref["route_evidence_sha256"],
+        route_source=route_source,
     ):
         raise ShadowCaptureError(
             "canonical_route_evidence.manifest_identity_sha256 is not bound to "
             "workspace, plan and route"
         )
     if case_id != _workspace_case_id(
-        workspace_id, plan_sha256, route_ref["route_evidence_sha256"]
+        workspace_id,
+        plan_sha256,
+        route_ref["route_evidence_sha256"],
+        route_source=route_ref["source"],
     ):
         raise ShadowCaptureError(
             "workspace_case.case_id is not bound to workspace, plan and route"
@@ -1298,12 +1387,17 @@ def build_bound_eligibility_v2(
     if eligible_task_id != _writer_task_reference(manifest):
         # The prospective route freeze describes the writer decision; v2 binds
         # only that routing-relevant task, never an arbitrary test/review id.
-        raise ShadowCaptureError(
-            "eligible_task_id must be the workspace writer task"
-        )
-    route = _validated_route_evidence(manifest.get("route_evidence"))
+        raise ShadowCaptureError("eligible_task_id must be the workspace writer task")
+    execution_surface = _manifest_execution_surface(manifest)
+    route_source = _manifest_route_source(manifest)
+    route = _validated_route_evidence(
+        manifest.get("route_evidence"), execution_surface=execution_surface
+    )
     current_route_ref = _cohort_route_reference(
-        route, workspace_case["workspace_id"], workspace_case["plan_sha256"]
+        route,
+        workspace_case["workspace_id"],
+        workspace_case["plan_sha256"],
+        route_source=route_source,
     )
     frozen_route_ref = prospective["canonical_route_evidence"]
     if current_route_ref != frozen_route_ref:
@@ -2347,15 +2441,25 @@ def capture_workspace_eligibility_best_effort(
     try:
         prospective_dir, _, _, attempts_dir = _cohort_directories(cohort_root)
         workspace_prestart = prestart_attestation is _WORKSPACE_PRESTART_ATTESTATION
+        direct_task_prestart = prestart_attestation is _DIRECT_TASK_PRESTART_ATTESTATION
+        trusted_prestart = workspace_prestart or direct_task_prestart
         resolved_capture_path = (
-            WORKSPACE_PRESTART_CAPTURE_PATH if workspace_prestart else DIRECT_CAPTURE_PATH
+            WORKSPACE_PRESTART_CAPTURE_PATH
+            if workspace_prestart
+            else DIRECT_TASK_PRESTART_CAPTURE_PATH
+            if direct_task_prestart
+            else DIRECT_CAPTURE_PATH
         )
         resolved_case_origin = (
-            case_origin
-            if case_origin is not None
-            else ("production" if workspace_prestart else "synthetic")
-        ).strip().lower()
-        if not workspace_prestart and resolved_case_origin == "production":
+            (
+                case_origin
+                if case_origin is not None
+                else ("production" if trusted_prestart else "synthetic")
+            )
+            .strip()
+            .lower()
+        )
+        if not trusted_prestart and resolved_case_origin == "production":
             resolved_case_origin = "quarantined"
         receipt = build_prospective_eligibility_v2(
             manifest,
@@ -2433,6 +2537,336 @@ def capture_workspace_eligibility_best_effort(
             "no_effect": dict(NO_EFFECT),
         }
 
+
+def _direct_task_binding_directory(root: Path) -> Path:
+    candidate = _absolute_unresolved(root)
+    parent = candidate.parent
+    if not parent.exists():
+        raise ShadowCaptureError("prospective cohort root parent must already exist")
+    root_path = _ensure_private_child(parent, candidate.name)
+    return _ensure_private_child(root_path, "direct-task-bindings")
+
+def _direct_task_workspace_id(task_id: str) -> str:
+    if not isinstance(task_id, str) or TASK_ID_RE.fullmatch(task_id) is None:
+        raise ShadowCaptureError("direct task id is invalid")
+    workspace_id = f"gaw-direct-task-{task_id}"
+    if workspace.WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise ShadowCaptureError("direct task workspace identity is invalid")
+    return workspace_id
+
+def _direct_task_identity(
+    *,
+    host: str,
+    argv_sha256: str,
+    cwd: str,
+    resource_keys: list[str],
+    runtime_seconds: int,
+) -> dict[str, Any]:
+    if not isinstance(host, str) or not 1 <= len(host) <= 255:
+        raise ShadowCaptureError("direct task host is invalid")
+    if not isinstance(argv_sha256, str) or SHA256_RE.fullmatch(argv_sha256) is None:
+        raise ShadowCaptureError("direct task argv_sha256 is invalid")
+    if not isinstance(cwd, str) or not cwd or len(cwd) > 4096:
+        raise ShadowCaptureError("direct task cwd is invalid")
+    if (
+        not isinstance(resource_keys, list)
+        or len(resource_keys) > 128
+        or any(
+            not isinstance(item, str) or not 1 <= len(item) <= 4096
+            for item in resource_keys
+        )
+    ):
+        raise ShadowCaptureError("direct task resource keys are invalid")
+    if (
+        isinstance(runtime_seconds, bool)
+        or not isinstance(runtime_seconds, int)
+        or not 1 <= runtime_seconds <= 604800
+    ):
+        raise ShadowCaptureError("direct task runtime_seconds is invalid")
+    return {
+        "host_sha256": hashlib.sha256(host.encode("utf-8")).hexdigest(),
+        "argv_sha256": argv_sha256,
+        "cwd_sha256": hashlib.sha256(cwd.encode("utf-8")).hexdigest(),
+        "resource_keys_sha256": _sha256_json(sorted(set(resource_keys))),
+        "runtime_seconds": runtime_seconds,
+    }
+
+def _direct_task_plan_sha256(
+    task_id: str, task_identity: dict[str, Any], route: dict[str, Any]
+) -> str:
+    return _sha256_json(
+        {
+            "schema_version": "operator-routing-shadow-direct-task-plan.v1",
+            "task_id": task_id,
+            "task_identity": task_identity,
+            "route_evidence_sha256": _sha256_json(route),
+        }
+    )
+
+def _direct_task_manifest(
+    *,
+    task_id: str,
+    plan_sha256: str,
+    route: dict[str, Any],
+    writer_bound: bool,
+) -> dict[str, Any]:
+    return {
+        "workspace_id": _direct_task_workspace_id(task_id),
+        "plan_sha256": plan_sha256,
+        "routing_surface": "direct_task",
+        "route_evidence": route,
+        "tasks": {
+            "writer": task_id if writer_bound else None,
+            "tests": None,
+            "review": None,
+        },
+    }
+
+def validate_direct_task_binding(value: Any) -> dict[str, Any]:
+    expected = {
+        "schema_version",
+        "binding_id",
+        "task_id",
+        "workspace_id",
+        "plan_sha256",
+        "task_identity",
+        "route_evidence",
+        "prospective",
+        "created_at",
+        "no_effect",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ShadowCaptureError("direct task binding shape is invalid")
+    if value.get("schema_version") != DIRECT_TASK_BINDING_SCHEMA_VERSION:
+        raise ShadowCaptureError("direct task binding schema_version is invalid")
+    task_id = value.get("task_id")
+    if not isinstance(task_id, str) or TASK_ID_RE.fullmatch(task_id) is None:
+        raise ShadowCaptureError("direct task binding task_id is invalid")
+    if value.get("workspace_id") != _direct_task_workspace_id(task_id):
+        raise ShadowCaptureError("direct task binding workspace_id is invalid")
+    plan_sha256 = value.get("plan_sha256")
+    if not isinstance(plan_sha256, str) or SHA256_RE.fullmatch(plan_sha256) is None:
+        raise ShadowCaptureError("direct task binding plan_sha256 is invalid")
+    identity = value.get("task_identity")
+    identity_fields = {
+        "host_sha256",
+        "argv_sha256",
+        "cwd_sha256",
+        "resource_keys_sha256",
+        "runtime_seconds",
+    }
+    if not isinstance(identity, dict) or set(identity) != identity_fields:
+        raise ShadowCaptureError("direct task binding task_identity is invalid")
+    for field in identity_fields - {"runtime_seconds"}:
+        item = identity.get(field)
+        if not isinstance(item, str) or SHA256_RE.fullmatch(item) is None:
+            raise ShadowCaptureError(f"direct task binding {field} is invalid")
+    runtime_seconds = identity.get("runtime_seconds")
+    if (
+        isinstance(runtime_seconds, bool)
+        or not isinstance(runtime_seconds, int)
+        or not 1 <= runtime_seconds <= 604800
+    ):
+        raise ShadowCaptureError("direct task binding runtime_seconds is invalid")
+    route = _validated_route_evidence(
+        value.get("route_evidence"), execution_surface="direct_task"
+    )
+    if route != value.get("route_evidence"):
+        raise ShadowCaptureError("direct task binding route evidence is not normalized")
+    if plan_sha256 != _direct_task_plan_sha256(task_id, identity, route):
+        raise ShadowCaptureError("direct task binding plan identity is invalid")
+    prospective = value.get("prospective")
+    if not isinstance(prospective, dict) or set(prospective) != {
+        "status",
+        "prospective_eligibility_id",
+        "workspace_case_id",
+    }:
+        raise ShadowCaptureError("direct task binding prospective reference is invalid")
+    if prospective.get("status") != "created":
+        raise ShadowCaptureError("direct task binding prospective status is invalid")
+    for field in ("prospective_eligibility_id", "workspace_case_id"):
+        item = prospective.get(field)
+        if not isinstance(item, str) or SHA256_RE.fullmatch(item) is None:
+            raise ShadowCaptureError(f"direct task binding {field} is invalid")
+    created_at = _parse_timestamp(
+        value.get("created_at"), "direct_task_binding.created_at"
+    )
+    if created_at != value.get("created_at"):
+        raise ShadowCaptureError("direct task binding created_at is not normalized")
+    if value.get("no_effect") != NO_EFFECT:
+        raise ShadowCaptureError("direct task binding no_effect boundary is invalid")
+    payload = {key: item for key, item in value.items() if key != "binding_id"}
+    binding_id = value.get("binding_id")
+    if not isinstance(binding_id, str) or binding_id != _sha256_json(payload):
+        raise ShadowCaptureError("direct task binding_id is invalid")
+    return value
+
+def _write_direct_task_binding_idempotent(path: Path, binding: dict[str, Any]) -> bool:
+    validate_direct_task_binding(binding)
+    candidate = _absolute_unresolved(path)
+    parent_descriptor = _open_directory_fd(candidate.parent)
+    data = (json.dumps(binding, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    try:
+        try:
+            _publish_create_only(
+                parent_descriptor,
+                candidate.name,
+                data,
+                conflict_message="refusing to overwrite an existing direct task binding",
+            )
+            return True
+        except ShadowRecordExistsError:
+            pass
+    finally:
+        os.close(parent_descriptor)
+    existing = _read_regular_json(path, label="existing direct task binding")
+    validate_direct_task_binding(existing)
+    if existing != binding:
+        raise ShadowCaptureError(
+            "existing direct task binding conflicts with deterministic identity"
+        )
+    return False
+
+def capture_direct_task_start_best_effort(
+    *,
+    task_id: str,
+    route_evidence: dict[str, Any],
+    host: str,
+    argv_sha256: str,
+    cwd: str,
+    resource_keys: list[str],
+    runtime_seconds: int,
+    root: Path | None = None,
+    frozen_at: str | None = None,
+) -> dict[str, Any]:
+    """Freeze one routed direct task before launch without affecting task execution."""
+    cohort_root = root or Path(
+        os.environ.get(
+            "GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT",
+            str(Path.home() / ".local/state/grabowski/operator-routing-shadow-cohort"),
+        )
+    )
+    attempted_at = frozen_at or _utc_now()
+    try:
+        route = _validated_route_evidence(
+            route_evidence, execution_surface="direct_task"
+        )
+        identity = _direct_task_identity(
+            host=host,
+            argv_sha256=argv_sha256,
+            cwd=cwd,
+            resource_keys=resource_keys,
+            runtime_seconds=runtime_seconds,
+        )
+        plan_sha256 = _direct_task_plan_sha256(task_id, identity, route)
+        manifest = _direct_task_manifest(
+            task_id=task_id,
+            plan_sha256=plan_sha256,
+            route=route,
+            writer_bound=False,
+        )
+        capture = capture_workspace_eligibility_best_effort(
+            manifest,
+            root=cohort_root,
+            frozen_at=attempted_at,
+            case_origin="production",
+            prestart_attestation=_DIRECT_TASK_PRESTART_ATTESTATION,
+        )
+        if capture.get("status") not in {"created", "duplicate"}:
+            return {**capture, "binding_status": "not_created"}
+        prospective = {
+            "status": "created",
+            "prospective_eligibility_id": capture["prospective_eligibility_id"],
+            "workspace_case_id": capture["workspace_case_id"],
+        }
+        payload = {
+            "schema_version": DIRECT_TASK_BINDING_SCHEMA_VERSION,
+            "task_id": task_id,
+            "workspace_id": manifest["workspace_id"],
+            "plan_sha256": plan_sha256,
+            "task_identity": identity,
+            "route_evidence": route,
+            "prospective": prospective,
+            "created_at": _parse_timestamp(
+                attempted_at, "direct_task_binding.created_at"
+            ),
+            "no_effect": dict(NO_EFFECT),
+        }
+        binding = {"binding_id": _sha256_json(payload), **payload}
+        binding_dir = _direct_task_binding_directory(cohort_root)
+        created = _write_direct_task_binding_idempotent(
+            binding_dir / f"{task_id}.json", binding
+        )
+        return {
+            **capture,
+            "binding_status": "created" if created else "duplicate",
+            "binding_id": binding["binding_id"],
+            "plan_sha256": plan_sha256,
+        }
+    except Exception as exc:
+        return {
+            "schema_version": 1,
+            "status": "rejected" if isinstance(exc, ShadowCaptureError) else "error",
+            "reason_code": _capture_reason(exc),
+            "binding_status": "not_created",
+            "no_effect": dict(NO_EFFECT),
+        }
+
+def read_direct_task_binding(
+    task_id: str, *, root: Path | None = None
+) -> dict[str, Any]:
+    cohort_root = root or Path(
+        os.environ.get(
+            "GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT",
+            str(Path.home() / ".local/state/grabowski/operator-routing-shadow-cohort"),
+        )
+    )
+    binding_dir = _direct_task_binding_directory(cohort_root)
+    binding = _read_regular_json(
+        binding_dir / f"{task_id}.json", label="direct task routing shadow binding"
+    )
+    return validate_direct_task_binding(binding)
+
+def seal_direct_task_case(
+    *,
+    task_id: str,
+    outcome: dict[str, Any],
+    primary_evidence_refs: list[str],
+    execution_provenance: dict[str, Any] | None,
+    semantic_assessments: list[dict[str, Any]] | None,
+    root: Path | None = None,
+    captured_at: str | None = None,
+) -> dict[str, Any]:
+    cohort_root = root or Path(
+        os.environ.get(
+            "GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT",
+            str(Path.home() / ".local/state/grabowski/operator-routing-shadow-cohort"),
+        )
+    )
+    binding = read_direct_task_binding(task_id, root=cohort_root)
+    prospective_dir, _, _, _ = _cohort_directories(cohort_root)
+    prospective = _read_regular_json(
+        prospective_dir / f"{binding['prospective']['workspace_case_id']}.json",
+        label="direct task prospective eligibility",
+    )
+    _validate_any_prospective(prospective)
+    manifest = _direct_task_manifest(
+        task_id=task_id,
+        plan_sha256=binding["plan_sha256"],
+        route=binding["route_evidence"],
+        writer_bound=True,
+    )
+    return seal_prospective_case(
+        prospective,
+        manifest,
+        eligible_task_id=task_id,
+        outcome=outcome,
+        primary_evidence_refs=primary_evidence_refs,
+        root=cohort_root,
+        captured_at=captured_at,
+        execution_provenance=execution_provenance,
+        semantic_assessments=semantic_assessments,
+    )
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
