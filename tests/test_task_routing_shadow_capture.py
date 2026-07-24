@@ -96,7 +96,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _capture(self) -> dict[str, object]:
+    def _capture(self, *, frozen_at: str | None = None) -> dict[str, object]:
         return capture.capture_direct_task_start_best_effort(
             task_id=self.task_id,
             route_evidence=self.route,
@@ -106,7 +106,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
             resource_keys=["repo:/private/operator/worktree"],
             runtime_seconds=60,
             root=self.root,
-            frozen_at=self.frozen_at,
+            frozen_at=frozen_at or self.frozen_at,
         )
 
     def test_direct_route_replay_is_surface_bound(self) -> None:
@@ -133,12 +133,14 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
 
     def test_direct_task_capture_is_private_bounded_and_idempotent(self) -> None:
         first = self._capture()
-        second = self._capture()
+        second = self._capture(frozen_at="2026-07-24T17:31:00Z")
         self.assertEqual("created", first["status"])
         self.assertEqual("created", first["binding_status"])
         self.assertEqual("duplicate", second["status"])
         self.assertEqual("duplicate", second["binding_status"])
+        self.assertEqual(first["binding_id"], second["binding_id"])
         binding = capture.read_direct_task_binding(self.task_id, root=self.root)
+        self.assertEqual(self.frozen_at, binding["created_at"])
         self.assertEqual("direct_operator", binding["route_evidence"]["actual_route"])
         prospective_path = (
             self.root
@@ -246,6 +248,32 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
             schema = json.loads((ROOT / "contracts" / filename).read_text())
             Draft202012Validator.check_schema(schema)
             Draft202012Validator(schema, format_checker=format_checker).validate(sample)
+
+    def test_reviewed_direct_task_case_requires_independent_assessments(self) -> None:
+        self._capture()
+        with self.assertRaisesRegex(
+            capture.ShadowCaptureError, "requires at least 2 independent"
+        ):
+            capture.seal_direct_task_case(
+                task_id=self.task_id,
+                outcome={
+                    "status": "reviewed",
+                    "kind": "task_correctness",
+                    "label": "success",
+                    "observed_at": "2026-07-24T17:31:00Z",
+                    "review_authority": "ci_and_review",
+                },
+                primary_evidence_refs=["artifact:review"],
+                execution_provenance={
+                    "status": "completed",
+                    "observed_at": "2026-07-24T17:30:30Z",
+                    "evidence_refs": ["artifact:task-finalization"],
+                },
+                semantic_assessments=[],
+                root=self.root,
+                captured_at="2026-07-24T17:32:00Z",
+            )
+        self.assertEqual([], list((self.root / "records").iterdir()))
 
     def test_direct_task_case_seals_only_explicit_outcome(self) -> None:
         self._capture()
