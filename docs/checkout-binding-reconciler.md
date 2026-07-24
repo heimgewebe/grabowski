@@ -20,6 +20,6 @@ Die Projektion ist rein beobachtend. Insbesondere begründen weder ein fehlender
 - automatischer Terminalisierung oder
 - Reparatur fremder Bindings.
 
-Aktive Bindings ohne Worktree bleiben blockierend. Terminale Head-Identität wird exakt geprüft; Head-Bewegung in `active` bleibt zulässig. Ergebnisse sind deterministisch sortiert und Evidenz ist begrenzt.
+Aktive Bindings ohne Worktree bleiben blockierend. Fehlende Pflichtidentität, unbekannte Lifecycle-Phasen und fehlende Worktree-Keys und doppelte Checkout-Keys werden als `binding_identity_drift` behandelt; es gibt kein „last row wins“. Ein nicht gesetzter Branch bleibt zulässig, wenn Binding und Worktree darin übereinstimmen. Terminale Head-Identität wird exakt geprüft; Head-Bewegung in `active` bleibt zulässig. Ergebnisse sind deterministisch sortiert und Evidenz ist begrenzt.
 
 Die Komponente stellt zunächst den reinen Reconciliation-Kern bereit. Runtime- und Current-Work-Oberflächen dürfen ihn nur ergänzend einbinden und müssen regulär projizierte Checkouts deduplizieren.

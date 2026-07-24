@@ -58,6 +58,53 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertTrue(result["blocking"])
         self.assertIn("checkout_absence_as_cleanup_proof", result["does_not_establish"])
 
+    def test_missing_binding_identity_is_blocking_drift(self) -> None:
+        for field in (
+            "checkout_key",
+            "repo_common_dir",
+            "repo_path",
+            "checkout_path",
+            "owner_id",
+        ):
+            with self.subTest(field=field):
+                result = reconcile_binding(
+                    binding(**{field: None}),
+                    worktree(),
+                    repository_observable=True,
+                )
+                self.assertEqual(result["state"], "binding_identity_drift")
+                self.assertIn(
+                    f"missing-binding-{field.replace('_', '-')}",
+                    result["reasons"],
+                )
+
+    def test_unknown_binding_phase_is_blocking_drift(self) -> None:
+        result = reconcile_binding(
+            binding(phase="future_phase"),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertIn("binding-phase-invalid", result["reasons"])
+
+    def test_missing_worktree_identity_is_blocking_drift(self) -> None:
+        result = reconcile_binding(
+            binding(),
+            worktree(repo_path=None, head=None),
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertIn("missing-worktree-repo-path", result["reasons"])
+        self.assertIn("missing-worktree-head", result["reasons"])
+
+    def test_nullable_branch_is_valid_when_both_sides_are_unborn(self) -> None:
+        result = reconcile_binding(
+            binding(expected_branch=None),
+            worktree(branch=None),
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "bound_present")
+
     def test_unobservable_repository_precedes_absence_classification(self) -> None:
         result = reconcile_binding(binding(), None, repository_observable=False)
         self.assertEqual(result["state"], "repository_unobservable")
@@ -104,6 +151,66 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertEqual(result["summary"]["orphaned_binding"], 1)
         self.assertEqual(result["blocking_count"], 1)
         self.assertTrue(result["read_only"])
+
+    def test_duplicate_worktree_keys_are_blocking_and_order_independent(self) -> None:
+        first = worktree(path="/tmp/first")
+        second = worktree(path="/tmp/second")
+        forward = reconcile_bindings(
+            [binding()],
+            [first, second],
+            observable_repo_paths=[REPO],
+        )
+        reverse = reconcile_bindings(
+            [binding()],
+            [second, first],
+            observable_repo_paths=[REPO],
+        )
+        self.assertEqual(forward, reverse)
+        row = forward["bindings"][0]
+        self.assertEqual(row["state"], "binding_identity_drift")
+        self.assertEqual(row["worktree_identity"], None)
+        self.assertIn("duplicate-worktree-checkout-key", row["reasons"])
+
+    def test_duplicate_binding_keys_are_blocking_and_order_independent(self) -> None:
+        first = binding(owner_id="operator:z")
+        second = binding(owner_id="operator:a")
+        forward = reconcile_bindings(
+            [first, second],
+            [worktree()],
+            observable_repo_paths=[REPO],
+        )
+        reverse = reconcile_bindings(
+            [second, first],
+            [worktree()],
+            observable_repo_paths=[REPO],
+        )
+        self.assertEqual(forward, reverse)
+        self.assertEqual(forward["blocking_count"], 2)
+        for row in forward["bindings"]:
+            self.assertEqual(row["state"], "binding_identity_drift")
+            self.assertIn("duplicate-binding-checkout-key", row["reasons"])
+
+    def test_unkeyed_worktree_record_blocks_absence_classification(self) -> None:
+        result = reconcile_bindings(
+            [binding()],
+            [worktree(checkout_key=None)],
+            observable_repo_paths=[REPO],
+        )
+        row = result["bindings"][0]
+        self.assertEqual(row["state"], "binding_identity_drift")
+        self.assertIn("worktree-checkout-key-missing", row["reasons"])
+        self.assertNotIn(
+            "binding-has-no-current-git-worktree-record", row["reasons"]
+        )
+
+    def test_terminal_binding_requires_expected_head(self) -> None:
+        result = reconcile_binding(
+            binding(phase="archived", expected_head=None),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertIn("missing-binding-expected-head", result["reasons"])
 
     def test_retention_and_archive_are_evidence_only(self) -> None:
         result = reconcile_binding(
