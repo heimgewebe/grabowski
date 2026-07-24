@@ -180,6 +180,22 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
                 (root / "prospective" / f"{result['workspace_case_id']}.json").read_text()
             )
             self.assertEqual(receipt["case_provenance"]["case_origin"], "synthetic")
+            self.assertEqual(receipt["case_provenance"]["capture_path"], "direct_capture")
+
+    def test_direct_capture_cannot_claim_production_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cohort"
+            result = capture.capture_workspace_eligibility_best_effort(
+                pre_task_manifest(),
+                root=root,
+                frozen_at=FROZEN_AT,
+                case_origin="production",
+            )
+            receipt = json.loads(
+                (root / "prospective" / f"{result['workspace_case_id']}.json").read_text()
+            )
+            self.assertEqual(receipt["case_provenance"]["case_origin"], "quarantined")
+            self.assertEqual(receipt["case_provenance"]["capture_path"], "direct_capture")
 
     def test_latest_prospective_contract_freezes_case_origin(self) -> None:
         receipt = capture.build_prospective_eligibility_v2(
@@ -191,7 +207,7 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
         )
         self.assertEqual(receipt["case_provenance"]["case_origin"], "test")
         tampered = copy.deepcopy(receipt)
-        tampered["case_provenance"]["case_origin"] = "production"
+        tampered["case_provenance"]["case_origin"] = "quarantined"
         with self.assertRaisesRegex(capture.ShadowCaptureError, "prospective_eligibility_id"):
             capture.validate_prospective_eligibility_v2(tampered)
 
@@ -225,6 +241,54 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
                 {"success", "failure"},
             )
             self.assertEqual(len(record["semantic_assessments"]), 2)
+
+    def test_task_correctness_requires_terminal_execution_before_outcome(self) -> None:
+        prospective = capture.build_prospective_eligibility_v2(
+            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="test"
+        )
+        eligibility = capture.build_bound_eligibility_v3(
+            prospective, bound_manifest(), eligible_task_id=TASK_ID
+        )
+        execution = execution_failure_provenance()
+        execution["observed_at"] = "2026-07-23T05:29:30Z"
+        with self.assertRaisesRegex(
+            capture.ShadowCaptureError, "must not precede terminal execution observation"
+        ):
+            capture.build_shadow_record_v3(
+                eligibility,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                execution_provenance=execution,
+                semantic_assessments=None,
+                captured_at=CAPTURED_AT,
+            )
+
+    def test_reseal_enriched_record_without_optional_fields_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cohort"
+            receipt = stored_prospective(root)
+            first = capture.seal_prospective_case(
+                receipt,
+                bound_manifest(),
+                eligible_task_id=TASK_ID,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                execution_provenance=execution_failure_provenance(),
+                semantic_assessments=semantic_assessments(),
+                root=root,
+                captured_at=CAPTURED_AT,
+            )
+            second = capture.seal_prospective_case(
+                receipt,
+                bound_manifest(),
+                eligible_task_id=TASK_ID,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                root=root,
+                captured_at=CAPTURED_AT,
+            )
+            self.assertEqual(second["status"], "duplicate")
+            self.assertEqual(second["record_id"], first["record_id"])
 
     def test_semantic_assessments_require_at_least_two_when_present(self) -> None:
         prospective = capture.build_prospective_eligibility_v2(
@@ -269,7 +333,10 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
         except ModuleNotFoundError:
             self.skipTest("optional jsonschema runtime dependency is unavailable")
         prospective = capture.build_prospective_eligibility_v2(
-            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="production"
+            pre_task_manifest(),
+            frozen_at=FROZEN_AT,
+            case_origin="production",
+            capture_path=capture.WORKSPACE_PRESTART_CAPTURE_PATH,
         )
         eligibility = capture.build_bound_eligibility_v3(
             prospective, bound_manifest(), eligible_task_id=TASK_ID

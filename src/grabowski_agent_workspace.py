@@ -5123,11 +5123,20 @@ def _capture_routing_shadow_prospective_best_effort(
     try:
         import grabowski_operator_routing_shadow_capture as shadow_capture
 
+        configured_origin = os.environ.get("GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN")
+        if configured_origin is None or not configured_origin.strip():
+            case_origin = "production"
+        else:
+            requested_origin = configured_origin.strip().lower()
+            case_origin = (
+                requested_origin
+                if requested_origin in {"test", "synthetic", "quarantined"}
+                else "quarantined"
+            )
         result = shadow_capture.capture_workspace_eligibility_best_effort(
             manifest,
-            case_origin=os.environ.get(
-                "GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "production"
-            ),
+            case_origin=case_origin,
+            prestart_attestation=shadow_capture._WORKSPACE_PRESTART_ATTESTATION,
         )
     except Exception:
         result = {

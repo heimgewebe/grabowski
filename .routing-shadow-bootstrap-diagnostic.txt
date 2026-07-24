@@ -1,1 +1,0 @@
-capture-signature: expected exactly one match in src/grabowski_operator_routing_shadow_capture.py, found 0

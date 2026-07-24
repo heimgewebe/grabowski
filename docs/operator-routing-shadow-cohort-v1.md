@@ -164,3 +164,12 @@ Neue prospektive Fälle verwenden `operator-routing-shadow-prospective-eligibili
 Ein v2-Prospektiv-Receipt wird an `operator-routing-shadow-eligibility.v3` gebunden und als `operator-routing-shadow-record.v3` versiegelt. Record v3 hält das semantische Outcome getrennt von `execution_provenance` (`completed`, `execution_aborted`, `infrastructure_failure` oder explizit `unknown`) und kann entweder keine oder zwei bis vier unabhängig pseudonymisierte semantische Bewertungen derselben Outcome-Art binden. Unterschiedliche `reviewer_pseudonym_sha256` machen Review-Abweichungen messbar, ohne Namen, Prompts, Transkripte, private Notizen oder unbeschränkte argv zu speichern. Fehlende Bewertungen und fehlende Ausführungsbeobachtung werden als leere Liste beziehungsweise `unknown` dargestellt, niemals als Übereinstimmung oder Erfolg.
 
 Diese Erweiterung bleibt reine Capture-Beobachtbarkeit. Sie trainiert kein Modell, ändert weder Routing noch Queue- oder Policy-Zustand, trifft keine Laufzeitentscheidung für den beobachteten Task und autorisiert `OPERATOR-ML-READINESS-V1-T002` nicht. Sie macht ausschließlich die Qualitätssignale messbar, die für eine spätere erneute T004-Prüfung erforderlich sind.
+
+
+### Provenienz- und Zeitgrenzen
+
+Neue direkte Capture-Aufrufe werden als `direct_capture` gebunden und können keinen `production`-Fall behaupten; ein solcher Versuch wird auf `quarantined` herabgestuft. Nur der interne Agent-Workspace-Prestart-Pfad erzeugt standardmäßig `production`. Eine gesetzte `GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN` kann diesen Pfad auf `test`, `synthetic` oder `quarantined` herabstufen, aber nicht auf `production` hochstufen. Das ist eine Bindung an den kanonischen Codepfad, keine kryptographische Runtime-Attestation.
+
+Für `task_correctness` muss eine beobachtete terminale Ausführung (`completed`, `execution_aborted` oder `infrastructure_failure`) zeitlich vor dem primären Outcome und vor gebundenen semantischen Bewertungen liegen. `decision_quality` bleibt davon getrennt, weil diese Bewertung nicht zwingend das Ausführungsende voraussetzt.
+
+Verschiedene `reviewer_pseudonym_sha256` innerhalb eines Records verhindern doppelte Pseudonym-IDs, belegen aber noch keine kryptographisch attestierte Reviewer-Unabhängigkeit. Eine stabile geheimnisgestützte Reviewer-Pseudonymisierung und strukturierte opake Evidence-Referenzen benötigen einen eigenen Folgevertrag; bis dahin dürfen diese Felder nicht als Identitätsattestation interpretiert werden.
