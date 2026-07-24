@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -26,6 +27,115 @@ class BureauPickupTests(unittest.TestCase):
         for patcher in reversed(self.patches):
             patcher.stop()
         self.temp.cleanup()
+
+    def test_private_root_rejects_symlink(self) -> None:
+        target = self.root / "redirected-root"
+        target.mkdir(mode=0o700)
+        pickup.STATE_ROOT.symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "pickup-root-directory-open-failed"
+        ):
+            pickup._private_root()
+
+    def test_run_directory_rejects_symlinked_runs_directory(self) -> None:
+        pickup._private_root()
+        target = self.root / "redirected-runs"
+        target.mkdir(mode=0o700)
+        (pickup.STATE_ROOT / "runs").symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "pickup-runs-directory-open-failed"
+        ):
+            pickup._run_directory(self.intent()["run_id"])
+
+    def test_run_directory_rejects_symlinked_run_directory(self) -> None:
+        pickup._private_root()
+        runs = pickup.STATE_ROOT / "runs"
+        runs.mkdir(mode=0o700)
+        target = self.root / "redirected-run"
+        target.mkdir(mode=0o700)
+        (runs / self.intent()["run_id"]).symlink_to(
+            target, target_is_directory=True
+        )
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "pickup-run-directory-open-failed"
+        ):
+            pickup._run_directory(self.intent()["run_id"])
+
+    def test_private_root_rejects_nonprivate_mode(self) -> None:
+        pickup.STATE_ROOT.mkdir(mode=0o700)
+        pickup.STATE_ROOT.chmod(0o755)
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "pickup-root-directory-unsafe"
+        ):
+            pickup._private_root()
+
+    def test_private_root_rejects_foreign_owner_identity(self) -> None:
+        pickup.STATE_ROOT.mkdir(mode=0o700)
+        with mock.patch.object(pickup.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "pickup-root-directory-unsafe"
+            ):
+                pickup._private_root()
+
+    def test_concurrent_identical_artifact_winner_is_idempotent(self) -> None:
+        run_dir = pickup._run_directory(self.intent()["run_id"])
+        target = run_dir / "race.json"
+        payload = {"ok": True}
+        encoded = pickup._canonical_json(payload)
+        real_open = os.open
+        injected = False
+
+        def publish_winner(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal injected
+            if (
+                path == target.name
+                and flags & os.O_EXCL
+                and dir_fd is not None
+                and not injected
+            ):
+                injected = True
+                winner = real_open(path, flags, mode, dir_fd=dir_fd)
+                try:
+                    os.write(winner, encoded)
+                    os.fsync(winner)
+                finally:
+                    os.close(winner)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(pickup.os, "open", side_effect=publish_winner):
+            digest = pickup._write_bound_json(target, payload)
+        self.assertTrue(injected)
+        self.assertEqual(digest, pickup.hashlib.sha256(encoded).hexdigest())
+        self.assertEqual(target.read_bytes(), encoded)
+
+    def test_artifact_publish_rejects_run_directory_path_swap(self) -> None:
+        run_dir = pickup._run_directory(self.intent()["run_id"])
+        real_assert = pickup._assert_private_directory_binding
+        run_checks = 0
+
+        def swap_on_publish(descriptor, path, *, label):
+            nonlocal run_checks
+            if label == "pickup-run":
+                run_checks += 1
+                if run_checks == 3:
+                    displaced = path.with_name(path.name + "-displaced")
+                    path.rename(displaced)
+                    path.mkdir(mode=0o700)
+            return real_assert(descriptor, path, label=label)
+
+        with mock.patch.object(
+            pickup,
+            "_assert_private_directory_binding",
+            side_effect=swap_on_publish,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "pickup-run-directory-unsafe"
+            ):
+                pickup._write_bound_json(run_dir / "artifact.json", {"ok": True})
+        self.assertFalse((run_dir / "artifact.json").exists())
+        self.assertFalse(
+            (run_dir.with_name(run_dir.name + "-displaced") / "artifact.json").exists()
+        )
 
     def request(self, **overrides):
         value = {

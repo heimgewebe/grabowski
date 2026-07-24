@@ -40,7 +40,7 @@ It releases only the owner-bound keys recorded by the adapter. Missing leases ar
 
 ## Private journal
 
-Each run is stored below `~/.local/state/grabowski/bureau-pickup/runs/<run_id>/` with mode `0700`; files use mode `0600`. Artifacts are immutable and conflict on changed replay content.
+Each run is stored below `~/.local/state/grabowski/bureau-pickup/runs/<run_id>/` with mode `0700`; files use mode `0600`. Every directory component is opened through directory file descriptors with `O_DIRECTORY|O_NOFOLLOW`, bound to the current user, exact private mode and stable inode identity. Artifact reads and create-only writes remain bound to the opened run directory, detect path replacement, and accept a concurrent winner only when its immutable bytes are identical.
 
 ## Non-claims
 
