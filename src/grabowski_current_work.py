@@ -415,10 +415,54 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
     if binding_phase is not None and not isinstance(binding_phase, str):
         raise CurrentWorkProjectionError("checkout binding phase must be text or null")
     raw_drift_reasons = decision.get("binding_drift_reasons", [])
-    if not isinstance(raw_drift_reasons, list) or not all(
-        isinstance(item, str) for item in raw_drift_reasons
-    ):
-        raise CurrentWorkProjectionError("checkout binding drift reasons must be text")
+    if not isinstance(raw_drift_reasons, list) or len(raw_drift_reasons) > MAX_EVIDENCE:
+        raise CurrentWorkProjectionError("checkout binding drift reasons are invalid")
+    drift_reasons = [
+        _text(item, "checkout.lifecycle_decision.binding_drift_reason")
+        for item in raw_drift_reasons
+    ]
+    binding_object_present = isinstance(binding, dict)
+    if binding_present != binding_object_present:
+        raise CurrentWorkProjectionError(
+            "checkout binding presence disagrees with lifecycle binding"
+        )
+    if binding_present:
+        binding_owner_id = _identifier(
+            binding.get("owner_id"), "checkout.lifecycle.binding.owner_id"
+        )
+        stored_phase = _text(
+            binding.get("phase"), "checkout.lifecycle.binding.phase"
+        )
+        if binding_phase != stored_phase:
+            raise CurrentWorkProjectionError(
+                "checkout binding phase disagrees with lifecycle binding"
+            )
+        if binding_consistent and stored_phase not in {
+            "active",
+            "completed_retained",
+            "archived",
+        }:
+            raise CurrentWorkProjectionError(
+                "consistent checkout binding phase is unsupported"
+            )
+        if binding_consistent and drift_reasons:
+            raise CurrentWorkProjectionError(
+                "consistent checkout binding must not contain drift reasons"
+            )
+        if not binding_consistent and not drift_reasons:
+            raise CurrentWorkProjectionError(
+                "inconsistent checkout binding requires drift reasons"
+            )
+    else:
+        binding_owner_id = ""
+        if binding_phase is not None:
+            raise CurrentWorkProjectionError(
+                "checkout binding phase requires a lifecycle binding"
+            )
+        if not binding_consistent or drift_reasons:
+            raise CurrentWorkProjectionError(
+                "absent checkout binding must be consistent and drift-free"
+            )
     return {
         "checkout_key": _identifier(raw.get("checkout_key"), "checkout.checkout_key"),
         "repository": repository,
@@ -446,12 +490,12 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             decision.get("retention_active"),
             "checkout.lifecycle_decision.retention_active",
         ),
-        "binding_owner_id": str(binding.get("owner_id")) if isinstance(binding, dict) and binding.get("owner_id") else "",
+        "binding_owner_id": binding_owner_id,
         "binding_source": dict(binding.get("source")) if isinstance(binding, dict) and isinstance(binding.get("source"), dict) else None,
         "binding_present": binding_present,
         "binding_phase": str(binding_phase or "")[:64],
         "binding_consistent": binding_consistent,
-        "binding_drift_reasons": sorted(set(raw_drift_reasons))[:MAX_EVIDENCE],
+        "binding_drift_reasons": sorted(set(drift_reasons)),
     }
 
 
@@ -711,12 +755,18 @@ def _checkout_candidates(
     heuristic: list[dict[str, Any]] = []
     known_task_ids = set(tasks)
 
-    # Lifecycle binding is the strongest explicit checkout ownership signal.
-    if item["binding_owner_id"]:
+    # Only a consistent lifecycle binding may establish exact checkout ownership.
+    # A drifted binding remains evidence of a blocking contradiction, not authority
+    # for assigning the checkout to the binding's claimed owner.
+    if (
+        item["binding_present"]
+        and item["binding_consistent"]
+        and item["binding_owner_id"]
+    ):
         owner_id = _identifier(item["binding_owner_id"], "checkout.binding_owner_id")
         work_id, kind, binding_id = _owner_binding(owner_id, known_task_ids)
         exact[work_id] = (0, work_id, kind, binding_id)
-    elif item["retention_owner_id"]:
+    elif not item["binding_present"] and item["retention_owner_id"]:
         owner_id = _identifier(item["retention_owner_id"], "checkout.retention_owner_id")
         work_id, kind, binding_id = _owner_binding(owner_id, known_task_ids)
         exact[work_id] = (1, work_id, kind, binding_id)
@@ -836,18 +886,26 @@ def _add_checkouts(
                 group["related_work_ids"].append(candidate)
 
         if item["binding_owner_id"]:
-            _append(
-                group["authority_refs"],
-                {
-                    "source": "checkout-lifecycle-binding",
-                    "checkout_key": item["checkout_key"],
-                    "owner_id": item["binding_owner_id"],
-                    "binding_source": item["binding_source"],
-                    "phase": item["binding_phase"],
-                    "consistent": item["binding_consistent"],
-                    "drift_reasons": item["binding_drift_reasons"],
-                },
-            )
+            binding_ref = {
+                "source": "checkout-lifecycle-binding",
+                "checkout_key": item["checkout_key"],
+                "owner_id": item["binding_owner_id"],
+                "binding_source": item["binding_source"],
+                "phase": item["binding_phase"],
+                "consistent": item["binding_consistent"],
+                "drift_reasons": item["binding_drift_reasons"],
+            }
+            if item["binding_consistent"]:
+                _append(group["authority_refs"], binding_ref)
+            else:
+                _append(
+                    group["heuristic_refs"],
+                    {
+                        **binding_ref,
+                        "kind": "checkout-lifecycle-binding-drift",
+                        "authority": False,
+                    },
+                )
         _append(group["checkout_refs"], item)
         for process in item["processes"]:
             _append(
@@ -885,7 +943,11 @@ def _add_checkouts(
                 )
         elif item["cleanup_candidate"]:
             _blocking(group, "cleanup-candidate")
-        elif item["binding_phase"] in {"completed_retained", "archived"}:
+        elif (
+            item["binding_present"]
+            and item["binding_consistent"]
+            and item["binding_phase"] in {"completed_retained", "archived"}
+        ):
             if item["coordination_blocking"] or item["processes"]:
                 _blocking(group, "closed-checkout-with-live-coordination")
             else:
@@ -1146,7 +1208,8 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     checkout_refs = group.get("checkout_refs", [])
     has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
     has_terminal_checkout_binding = any(
-        c.get("binding_consistent") is True
+        c.get("binding_present") is True
+        and c.get("binding_consistent") is True
         and c.get("binding_phase") in {"completed_retained", "archived"}
         for c in checkout_refs
     )

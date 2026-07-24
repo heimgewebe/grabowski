@@ -670,6 +670,79 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             group["action_reasons"],
         )
 
+    def test_inconsistent_binding_does_not_establish_owner_authority(self) -> None:
+        claimed_owner = "operator:claimed-by-drift"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-drift-owner",
+                            "/home/alex/repos/.worktrees/managed-drift-owner",
+                            lifecycle_state="managed_lifecycle_drift",
+                            binding_owner=claimed_owner,
+                            binding_phase="active",
+                            binding_consistent=False,
+                            drift_reasons=["binding-retention-owner-mismatch"],
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], "checkout:managed-drift-owner")
+        self.assertEqual(group["binding_status"], "checkout-bound")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertFalse(
+            any(
+                ref.get("source") == "checkout-lifecycle-binding"
+                for ref in group["authority_refs"]
+            )
+        )
+        drift_ref = next(
+            ref
+            for ref in group["heuristic_refs"]
+            if ref.get("kind") == "checkout-lifecycle-binding-drift"
+        )
+        self.assertEqual(drift_ref["owner_id"], claimed_owner)
+        self.assertFalse(drift_ref["authority"])
+
+    def test_binding_decision_must_match_lifecycle_binding(self) -> None:
+        record = checkout(
+            "binding-envelope-mismatch",
+            "/home/alex/repos/.worktrees/binding-envelope-mismatch",
+            binding_owner="operator:binding-envelope",
+            binding_phase="active",
+            retention_active=True,
+        )
+        record["lifecycle_decision"]["binding_present"] = False
+        with self.assertRaisesRegex(
+            current_work.CurrentWorkProjectionError,
+            "binding presence disagrees",
+        ):
+            project(
+                checkout_payloads=[
+                    {"repository": REPOSITORY, "worktrees": [record]}
+                ]
+            )
+
+    def test_binding_phase_cannot_be_synthesized_without_binding(self) -> None:
+        record = checkout(
+            "synthetic-terminal-binding",
+            "/home/alex/repos/.worktrees/synthetic-terminal-binding",
+        )
+        record["lifecycle_decision"]["binding_phase"] = "archived"
+        with self.assertRaisesRegex(
+            current_work.CurrentWorkProjectionError,
+            "binding phase requires",
+        ):
+            project(
+                checkout_payloads=[
+                    {"repository": REPOSITORY, "worktrees": [record]}
+                ]
+            )
+
     def test_dirty_managed_drift_remains_blocking_despite_exact_live_lease(self) -> None:
         owner = "operator:dirty-managed-drift"
         path = "/home/alex/repos/.worktrees/dirty-managed-drift"
