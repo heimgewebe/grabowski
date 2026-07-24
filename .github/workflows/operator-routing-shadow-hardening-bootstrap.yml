@@ -52,41 +52,38 @@ jobs:
           git commit -m "chore: record routing-shadow bootstrap diagnostic" || true
           git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
           exit 1
-      - name: Validate focused routing-shadow contracts
-        id: focused
+      - name: Validate repository through canonical gate
+        id: validate_patch
         if: steps.patch.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
           set +e
-          PYTHONPATH=src python -m unittest tests.test_operator_routing_shadow_cohort > .routing-shadow-test-diagnostic.txt 2>&1
+          make validate > .routing-shadow-validate-diagnostic.txt 2>&1
           status=$?
-          cat .routing-shadow-test-diagnostic.txt
+          cat .routing-shadow-validate-diagnostic.txt
           exit $status
-      - name: Persist focused-test diagnostic only
-        if: steps.focused.outcome == 'failure'
+      - name: Persist validation diagnostic only
+        if: steps.validate_patch.outcome == 'failure'
         shell: bash
         run: |
-          cp .routing-shadow-test-diagnostic.txt /tmp/routing-shadow-test-diagnostic.txt
+          cp .routing-shadow-validate-diagnostic.txt /tmp/routing-shadow-validate-diagnostic.txt
           git restore .
           git clean -fd
-          cp /tmp/routing-shadow-test-diagnostic.txt .routing-shadow-test-diagnostic.txt
+          cp /tmp/routing-shadow-validate-diagnostic.txt .routing-shadow-validate-diagnostic.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .routing-shadow-test-diagnostic.txt
-          git commit -m "chore: record routing-shadow focused-test diagnostic" || true
+          git add .routing-shadow-validate-diagnostic.txt
+          git commit -m "chore: record routing-shadow validation diagnostic" || true
           git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
           exit 1
-      - name: Validate repository
-        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success'
-        run: make validate
       - name: Remove bootstrap files and commit validated patch
-        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.validate_patch.outcome == 'success'
         shell: bash
         run: |
           rm .github/workflows/operator-routing-shadow-hardening-bootstrap.yml
           rm tools/_bootstrap_routing_shadow_hardening.py
-          rm -f .routing-shadow-bootstrap-diagnostic.txt .routing-shadow-test-diagnostic.txt
+          rm -f .routing-shadow-bootstrap-diagnostic.txt .routing-shadow-test-diagnostic.txt .routing-shadow-validate-diagnostic.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
