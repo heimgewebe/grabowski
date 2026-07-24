@@ -201,6 +201,145 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertNotIn(f"repo:{self.repo.resolve()}", keys)
 
+    def _bureau_resource_partition(self, keys):
+        return sorted(
+            key
+            for key in keys
+            if key in {
+                f"path:{self.checkout.resolve()}",
+                f"path:{self._common_dir()}",
+            }
+        )
+
+    def _bureau_contract_for_test(self, keys, **kwargs):
+        return {"phase": "work"} if self._bureau_resource_partition(keys) else None
+
+    def test_bureau_checkout_cleanup_sequences_resource_classes_and_succeeds(self) -> None:
+        with (
+            patch.object(
+                checkouts.resources.bureau_leases,
+                "bureau_resource_keys",
+                side_effect=self._bureau_resource_partition,
+            ),
+            patch.object(
+                checkouts.resources.bureau_leases,
+                "enforce_bureau_lease_contract",
+                side_effect=self._bureau_contract_for_test,
+            ),
+        ):
+            archived = self._archive()
+            classes = archived["lease"]["resource_classes"]
+            self.assertEqual(
+                set(classes["bureau"]),
+                {
+                    f"path:{self.checkout.resolve()}",
+                    f"path:{self._common_dir()}",
+                },
+            )
+            self.assertEqual(
+                classes["non_bureau"],
+                [f"repo:{self.repo.resolve()}:branch:topic"],
+            )
+            archive = archived["archive"]
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+            applied = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=False,
+                plan_id=dry_run["dry_run_record"]["plan_id"],
+                expected_plan_sha256=dry_run["plan"]["plan_sha256"],
+                confirmation="remove-linked-checkout",
+            )
+        self.assertFalse(self.checkout.exists())
+        self.assertNotIn("--force", applied["result"]["argv"])
+        self.assertEqual(checkouts._read_resource_leases(), [])
+
+    def test_mixed_bureau_and_non_bureau_acquire_remains_forbidden(self) -> None:
+        bureau_key = f"path:{self.checkout.resolve()}"
+        branch_key = f"repo:{self.repo.resolve()}:branch:topic"
+
+        def classify(keys):
+            return [bureau_key] if bureau_key in keys else []
+
+        def contract(keys, **kwargs):
+            return {"phase": "work"} if classify(keys) else None
+
+        with (
+            patch.object(
+                checkouts.resources.bureau_leases,
+                "bureau_resource_keys",
+                side_effect=classify,
+            ),
+            patch.object(
+                checkouts.resources.bureau_leases,
+                "enforce_bureau_lease_contract",
+                side_effect=contract,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "Bureau and non-Bureau resources must be acquired separately"
+            ):
+                checkouts.resources.acquire_resources(
+                    "mixed-owner",
+                    [bureau_key, branch_key],
+                    purpose="forbidden mixed checkout acquire",
+                    ttl_seconds=60,
+                )
+
+    def test_checkout_resource_sequence_rolls_back_first_group_on_later_failure(self) -> None:
+        bureau_keys = [
+            f"path:{self.checkout.resolve()}",
+            f"path:{self._common_dir()}",
+        ]
+        branch_key = f"repo:{self.repo.resolve()}:branch:topic"
+        calls = []
+
+        def acquire(owner, keys, **kwargs):
+            group = list(keys)
+            calls.append(group)
+            if branch_key in group:
+                raise RuntimeError("simulated branch acquire failure")
+            return {
+                "owner_id": owner,
+                "leases": [
+                    {"resource_key": key, "owner_id": owner}
+                    for key in group
+                ],
+            }
+
+        with (
+            patch.object(
+                checkouts.resources.bureau_leases,
+                "bureau_resource_keys",
+                return_value=bureau_keys,
+            ),
+            patch.object(checkouts.resources, "acquire_resources", side_effect=acquire),
+            patch.object(checkouts.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "branch acquire failure"):
+                checkouts._acquire_checkout_resources(
+                    owner_id="owner-a",
+                    repo_common_dir=self._common_dir(),
+                    checkout_path=self.checkout.resolve(),
+                    purpose="rollback sequence test",
+                    retention_until_unix=int(time.time()) + 3600,
+                    repo_path=self.repo.resolve(),
+                    branch="topic",
+                    metadata={},
+                )
+        self.assertEqual(calls, [bureau_keys, [branch_key]])
+        release.assert_called_once()
+        self.assertEqual(release.call_args.args[1], bureau_keys)
+
     def test_archive_transaction_rolls_back_on_lifecycle_transition_failure(self) -> None:
         common_dir = self._common_dir()
         binding = checkouts._reserve_checkout_lifecycle(
