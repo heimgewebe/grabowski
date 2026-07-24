@@ -153,6 +153,9 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_bureau_task_review` | bureau | no | medium | Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation. |
 | `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |
 | `grabowski_bureau_task_publish` | bureau | no | high | Acquire exact short Bureau leases and publish one reviewed task branch and pull request with bounded readback. |
+| `grabowski_bureau_pickup_execute` | bureau | no | high | Coordinate one exact Bureau claim intent with owner-bound live Grabowski leases, immutable private evidence and authoritative recovery. |
+| `grabowski_bureau_pickup_status` | bureau | yes | low | Read one coordinated Bureau run and its owner-bound lease state without creating or changing coordination truth. |
+| `grabowski_bureau_pickup_release` | bureau | no | high | Release exactly the unchanged owner-bound Grabowski leases recorded for one authoritatively terminal Bureau run. |
 | `grabowski_resource_nonconflict_assess` | resource | no | medium | Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint. |
 | `grabowski_resource_reconcile_obsolete_path_leases` | resource | no | high | Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |

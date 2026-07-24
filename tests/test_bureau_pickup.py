@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,37 @@ class BureauPickupTests(unittest.TestCase):
         for patcher in reversed(self.patches):
             patcher.stop()
         self.temp.cleanup()
+
+    def test_mcp_tool_registration_contract(self) -> None:
+        tree = ast.parse(Path(pickup.__file__).read_text(encoding="utf-8"))
+        expected = {
+            "grabowski_bureau_pickup_execute": "MUTATING",
+            "grabowski_bureau_pickup_status": "READ_ONLY",
+            "grabowski_bureau_pickup_release": "MUTATING",
+        }
+        observed: dict[str, str] = {}
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and isinstance(decorator.func.value, ast.Name)
+                    and decorator.func.value.id == "mcp"
+                    and decorator.func.attr == "tool"
+                ):
+                    continue
+                values = {item.arg: item.value for item in decorator.keywords}
+                name = values.get("name")
+                annotations = values.get("annotations")
+                if (
+                    isinstance(name, ast.Constant)
+                    and isinstance(name.value, str)
+                    and isinstance(annotations, ast.Name)
+                ):
+                    observed[name.value] = annotations.id
+        self.assertEqual(expected, observed)
 
     def test_private_root_rejects_symlink(self) -> None:
         target = self.root / "redirected-root"

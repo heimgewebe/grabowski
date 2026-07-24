@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "47832b4ac08d2d9cd68ddfc1497226c55ceece6afbdd4957b43ccc3299e79a49"
+    "sha256": "150e961ac8c80e5cdf7e6e2aa4d018ce05e3a300da12dcfc7445ab632c6017eb"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "bc5924efbfcaa40ac7e758980c5629de583dae4669a516b04649c5c3060054a7"
+    "sha256": "35933d2fe16dac13126ff1e92210c71db0b042b6153fa6a68ee912931dc9f312"
   },
   "counts": {
     "core": 22,
-    "full": 169,
-    "operator": 154
+    "full": 172,
+    "operator": 157
   },
   "profiles": {
     "core": [
@@ -162,6 +162,9 @@
       "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
+      "grabowski_bureau_pickup_execute",
+      "grabowski_bureau_pickup_status",
+      "grabowski_bureau_pickup_release",
       "grabowski_resource_nonconflict_assess",
       "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
@@ -318,6 +321,9 @@
       "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
+      "grabowski_bureau_pickup_execute",
+      "grabowski_bureau_pickup_status",
+      "grabowski_bureau_pickup_release",
       "grabowski_resource_nonconflict_assess",
       "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",

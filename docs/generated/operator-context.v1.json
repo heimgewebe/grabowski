@@ -1544,6 +1544,48 @@
       "tool": "grabowski_bureau_task_publish"
     },
     {
+      "category": "bureau",
+      "description": "Coordinate one Bureau claim with owner-bound Grabowski leases and recovery.",
+      "effects": [
+        "bureau_claim_intent",
+        "resource_lease",
+        "bureau_run_assignment",
+        "workspace_create",
+        "private_pickup_journal"
+      ],
+      "id": "grabowski_bureau_pickup_execute",
+      "purpose": "Coordinate one exact Bureau claim intent with owner-bound live Grabowski leases, immutable private evidence and authoritative recovery.",
+      "read_only": false,
+      "reversibility": "authoritative-readback-and-compensation",
+      "risk_class": "high",
+      "tool": "grabowski_bureau_pickup_execute"
+    },
+    {
+      "category": "bureau",
+      "description": "Read one coordinated Bureau run and its owner-bound lease state.",
+      "effects": [],
+      "id": "grabowski_bureau_pickup_status",
+      "purpose": "Read one coordinated Bureau run and its owner-bound lease state without creating or changing coordination truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_bureau_pickup_status"
+    },
+    {
+      "category": "bureau",
+      "description": "Release exactly one terminal coordinated run's unchanged Grabowski leases.",
+      "effects": [
+        "resource_lease_release",
+        "private_release_receipt"
+      ],
+      "id": "grabowski_bureau_pickup_release",
+      "purpose": "Release exactly the unchanged owner-bound Grabowski leases recorded for one authoritatively terminal Bureau run.",
+      "read_only": false,
+      "reversibility": "terminal-bound-idempotent-release",
+      "risk_class": "high",
+      "tool": "grabowski_bureau_pickup_release"
+    },
+    {
       "category": "resource",
       "description": "Assess attested same-repository work; issue a short proof only when disjoint.",
       "effects": [
@@ -2423,6 +2465,9 @@
       "grabowski_bureau_task_review",
       "grabowski_bureau_task_publish_preview",
       "grabowski_bureau_task_publish",
+      "grabowski_bureau_pickup_execute",
+      "grabowski_bureau_pickup_status",
+      "grabowski_bureau_pickup_release",
       "grabowski_resource_nonconflict_assess",
       "grabowski_resource_reconcile_obsolete_path_leases",
       "grabowski_resource_acquire",
@@ -2656,6 +2701,10 @@
         "source": "src/grabowski_bureau_intake.py"
       },
       {
+        "module": "grabowski_bureau_pickup",
+        "source": "src/grabowski_bureau_pickup.py"
+      },
+      {
         "module": "grabowski_nonconflict",
         "source": "src/grabowski_nonconflict.py"
       },
@@ -2785,7 +2834,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "b79ead098b1e0c52f37f10884b4573c27aaaf6846fe0eb8a2722db2de45325bf"
+      "sha256": "827fb2855e3d1778813910a959ac5f37520c00d4789aae1e9bd7238aa2366a29"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2793,7 +2842,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "47832b4ac08d2d9cd68ddfc1497226c55ceece6afbdd4957b43ccc3299e79a49"
+      "sha256": "150e961ac8c80e5cdf7e6e2aa4d018ce05e3a300da12dcfc7445ab632c6017eb"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2811,7 +2860,8 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
       "src/grabowski_bureau_leases.py": "5683d99981d9de458e037fee4a1ef8ee565f20b343e9988b1e1ee7d6ec3149da",
-      "src/grabowski_capabilities.py": "b79ead098b1e0c52f37f10884b4573c27aaaf6846fe0eb8a2722db2de45325bf",
+      "src/grabowski_bureau_pickup.py": "8c17062ab1d734c7b5a244b0707427bef912234661e78a659462b279812dec98",
+      "src/grabowski_capabilities.py": "827fb2855e3d1778813910a959ac5f37520c00d4789aae1e9bd7238aa2366a29",
       "src/grabowski_checkouts.py": "deb420e3775f7360995d5ceaf923b894fa279277b61a2220aff981ecd8949144",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
@@ -2838,7 +2888,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "73c6155cefba7d857bb14966006d61d5f79618d7ea42a5a69c22e5dba9f41526",
+      "src/grabowski_mcp.py": "263ccca2976c1cf586a643f2fc5cb6ddead99ca15010cb3a686eb21acd6b00fa",
       "src/grabowski_merge_guard.py": "96d5d3267feb173c06484fe265ff31a7ebc748ef394593b69ed69dc350106331",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "75be1e72248720a1c21d70366a8a08f3833693e25060c87fce4b1ba802c1fcca",
@@ -2856,7 +2906,7 @@
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_resources.py": "cd6b68aabe44ad53dcded80104637c188e404e24b9393469b7f048beb8554fc0",
-      "src/grabowski_runtime.py": "a2015e8e945f7779b79fff3d9f8e8486afb6e172a96312d9a756d1132b054f68",
+      "src/grabowski_runtime.py": "6658f07556f2a26222671bcfd89c53b191b7cff04cbec0d6d5f84aa748bfb9ed",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",

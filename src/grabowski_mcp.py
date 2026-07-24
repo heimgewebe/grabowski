@@ -417,6 +417,9 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_bureau_task_review": ("terminal_execute",),
     "grabowski_bureau_task_publish_preview": (),
     "grabowski_bureau_task_publish": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_pickup_execute": ("resource_lease", "terminal_execute"),
+    "grabowski_bureau_pickup_status": (),
+    "grabowski_bureau_pickup_release": ("resource_lease", "terminal_execute"),
 }
 
 OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
@@ -424,6 +427,8 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_bureau_task_propose",
     "grabowski_bureau_task_review",
     "grabowski_bureau_task_publish",
+    "grabowski_bureau_pickup_execute",
+    "grabowski_bureau_pickup_release",
     "grabowski_text_artifact_publish",
     "grabowski_text_artifact_read",
     "grabowski_github_pr_view",

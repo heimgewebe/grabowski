@@ -1271,6 +1271,36 @@ TOOL_PROFILES.update(
             ],
             "reversibility": "git-and-github-recovery",
         },
+        "grabowski_bureau_pickup_execute": {
+            "category": "bureau",
+            "purpose": "Coordinate one exact Bureau claim intent with owner-bound live Grabowski leases, immutable private evidence and authoritative recovery.",
+            "risk_class": "high",
+            "effects": [
+                "bureau_claim_intent",
+                "resource_lease",
+                "bureau_run_assignment",
+                "workspace_create",
+                "private_pickup_journal",
+            ],
+            "reversibility": "authoritative-readback-and-compensation",
+        },
+        "grabowski_bureau_pickup_status": {
+            "category": "bureau",
+            "purpose": "Read one coordinated Bureau run and its owner-bound lease state without creating or changing coordination truth.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
+        "grabowski_bureau_pickup_release": {
+            "category": "bureau",
+            "purpose": "Release exactly the unchanged owner-bound Grabowski leases recorded for one authoritatively terminal Bureau run.",
+            "risk_class": "high",
+            "effects": [
+                "resource_lease_release",
+                "private_release_receipt",
+            ],
+            "reversibility": "terminal-bound-idempotent-release",
+        },
     }
 )
 
