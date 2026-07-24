@@ -1214,6 +1214,88 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertIn("inspect blocking work group", result["next_convergence_action"])
 
 
+    def test_bound_present_reconciliation_does_not_duplicate_checkout(self) -> None:
+        existing = checkout("key-a", "/tmp/work", dirty=True)
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-a",
+                        "state": "bound_present",
+                        "blocking": False,
+                        "reasons": [],
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(
+            len([row for row in result["work"] if row["binding"]["id"] == "key-a"]),
+            1,
+        )
+        self.assertFalse(
+            any(
+                item.get("source") == "checkout-binding-reconciliation"
+                for item in result["work"][0]["heuristic_refs"]
+            )
+        )
+
+    def test_orphaned_binding_projects_one_blocking_current_work_group(self) -> None:
+        result = project(
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-orphan",
+                        "state": "orphaned_binding",
+                        "blocking": True,
+                        "reasons": ["binding-has-no-current-git-worktree-record"],
+                        "binding_identity": {"checkout_key": "key-orphan"},
+                        "worktree_identity": None,
+                        "evidence": {"owner_id": "operator:test"},
+                        "recommended_next_step": "inspect_git_and_binding_history_without_mutation",
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(result["count"], 1)
+        row = result["work"][0]
+        self.assertEqual(row["work_id"], "checkout-binding:key-orphan")
+        self.assertEqual(row["binding_status"], "unbound")
+        self.assertEqual(row["projection_state"], "blocking")
+        self.assertIn("checkout-binding-orphaned_binding", row["action_reasons"])
+        self.assertIn(
+            "checkout_binding_reconciliation",
+            row["observation"]["relevant_sources"],
+        )
+
+    def test_binding_drift_attaches_to_existing_checkout_without_duplicate(self) -> None:
+        existing = checkout("key-a", "/tmp/work", dirty=False, lifecycle_state="active")
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-a",
+                        "state": "binding_identity_drift",
+                        "blocking": True,
+                        "reasons": ["checkout-path-mismatch"],
+                        "binding_identity": {"checkout_key": "key-a"},
+                        "worktree_identity": {"checkout_key": "key-a"},
+                        "evidence": {"owner_id": "operator:test"},
+                        "recommended_next_step": "reconcile_binding_identity_before_lifecycle_action",
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        matching = [row for row in result["work"] if row["binding"]["id"] == "key-a"]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["projection_state"], "blocking")
+        self.assertIn("checkout-path-mismatch", matching[0]["action_reasons"])
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -540,6 +540,20 @@ def _has_more(payload: dict[str, Any] | None, source: str) -> bool:
     return value
 
 
+def _reconciliation_has_more(payload: dict[str, Any] | None) -> bool:
+    if payload is None:
+        return False
+    pagination = payload.get("pagination", {})
+    if not isinstance(pagination, dict):
+        raise CurrentWorkProjectionError(
+            "checkout_binding_reconciliation.pagination must be an object"
+        )
+    return _has_more(
+        pagination,
+        "checkout_binding_reconciliation.pagination",
+    )
+
+
 def _task_has_more(payload: dict[str, Any] | None) -> bool:
     if payload is None:
         return False
@@ -968,6 +982,87 @@ def _add_checkouts(
             _set_projection_state(group, "terminal_archived")
 
 
+def _add_binding_reconciliation(
+    groups: dict[str, dict[str, Any]],
+    rows: list[dict[str, Any]],
+) -> None:
+    """Attach only blocking reconciliation evidence without duplicating present checkouts."""
+    supported_states = {
+        "bound_present",
+        "orphaned_binding",
+        "repository_unobservable",
+        "binding_identity_drift",
+    }
+    for raw in rows:
+        checkout_key = _identifier(
+            raw.get("checkout_key"),
+            "checkout_binding_reconciliation.checkout_key",
+        )
+        state = _text(
+            raw.get("state"),
+            "checkout_binding_reconciliation.state",
+        )
+        if state not in supported_states:
+            raise CurrentWorkProjectionError(
+                f"unsupported checkout binding reconciliation state: {state}"
+            )
+        blocking = _boolean(
+            raw.get("blocking"),
+            "checkout_binding_reconciliation.blocking",
+        )
+        reasons_raw = raw.get("reasons", [])
+        if (
+            not isinstance(reasons_raw, list)
+            or len(reasons_raw) > MAX_EVIDENCE
+            or not all(isinstance(reason, str) and reason for reason in reasons_raw)
+        ):
+            raise CurrentWorkProjectionError(
+                "checkout binding reconciliation reasons are invalid"
+            )
+        if state == "bound_present":
+            if blocking or reasons_raw:
+                raise CurrentWorkProjectionError(
+                    "bound_present reconciliation must be non-blocking and drift-free"
+                )
+            continue
+        if not blocking:
+            raise CurrentWorkProjectionError(
+                "non-present reconciliation states must be blocking"
+            )
+        work_id = f"checkout:{checkout_key}"
+        group = groups.get(work_id)
+        if group is None:
+            work_id = f"checkout-binding:{checkout_key}"
+            group = _ensure(groups, work_id, "checkout-binding", checkout_key)
+        _append(
+            group["explicit_bindings"],
+            {"kind": "checkout-key", "id": checkout_key},
+        )
+        _append(
+            group["heuristic_refs"],
+            {
+                "source": "checkout-binding-reconciliation",
+                "checkout_key": checkout_key,
+                "state": state,
+                "reasons": sorted(set(reasons_raw)),
+                "binding_identity": raw.get("binding_identity"),
+                "worktree_identity": raw.get("worktree_identity"),
+                "evidence": raw.get("evidence"),
+                "recommended_next_step": raw.get("recommended_next_step"),
+                "authority": False,
+            },
+        )
+        group["source_states"].append(
+            f"checkout-binding-reconciliation:{state}"
+        )
+        _blocking(group, f"checkout-binding-{state}")
+        for reason in sorted(set(reasons_raw)):
+            if len(group["action_reasons"]) >= MAX_EVIDENCE:
+                break
+            if reason not in group["action_reasons"]:
+                group["action_reasons"].append(reason)
+
+
 def _add_physical_surfaces(
     groups: dict[str, dict[str, Any]],
     tmux: dict[str, Any],
@@ -1114,6 +1209,16 @@ def _finalize_groups(
             drill_down.append({"surface": "grabowski_resource_list", "owner_id": owner_id})
         for repository in sorted({item["repository"] for item in group["checkout_refs"]}):
             drill_down.append({"surface": "grabowski_checkout_inventory", "repository": repository})
+        if any(
+            item.get("source") == "checkout-binding-reconciliation"
+            for item in group["heuristic_refs"]
+        ):
+            drill_down.append(
+                {
+                    "surface": "grabowski_checkout_binding_reconciliation",
+                    "checkout_key": group["binding"]["id"],
+                }
+            )
         if group["worker_refs"]:
             drill_down.append({"surface": "worker-status", "worker_ids": [item["worker_id"] for item in group["worker_refs"]]})
         group["drill_down_refs"] = drill_down
@@ -1148,6 +1253,11 @@ def _annotate_groups(
         if group["checkout_refs"]:
             authoritative_sources.add("checkout-inventory")
             relevant_sources.add("checkouts")
+        if any(
+            item.get("source") == "checkout-binding-reconciliation"
+            for item in group["heuristic_refs"]
+        ):
+            relevant_sources.add("checkout_binding_reconciliation")
         if group["worker_refs"]:
             authoritative_sources.add("worker-registry")
             worker_kinds = {str(item.get("kind", "")) for item in group["worker_refs"]}
@@ -1303,6 +1413,7 @@ def build_current_work_projection(
     gui_payload: dict[str, Any] | None,
     source_errors: list[dict[str, Any]] | None = None,
     generated_at_unix: int,
+    reconciliation_payload: dict[str, Any] | None = None,
     view: str = "current",
     limit: int = 20,
     cursor: str | None = None,
@@ -1325,6 +1436,12 @@ def build_current_work_projection(
     lease_rows = _records(resources_payload, "leases", MAX_LEASES, "resources")
     browser_rows = _records(browser_payload, "workers", MAX_WORKERS, "browser")
     gui_rows = _records(gui_payload, "workers", MAX_WORKERS, "gui")
+    reconciliation_rows = _records(
+        reconciliation_payload,
+        "bindings",
+        MAX_WORKTREES,
+        "checkout_binding_reconciliation",
+    )
     if checkout_payloads is None:
         checkout_payloads = []
     if not isinstance(checkout_payloads, list) or len(checkout_payloads) > MAX_REPOSITORIES:
@@ -1369,6 +1486,7 @@ def build_current_work_projection(
     _add_leases(groups, lease_rows, set(tasks) | {item["task_id"] for item in attention_rows})
     _add_workers(groups, browser_rows, gui_rows)
     _add_checkouts(groups, checkouts, tasks, task_paths, view=view)
+    _add_binding_reconciliation(groups, reconciliation_rows)
     unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total = _add_physical_surfaces(
         groups, tmux, processes
     )
@@ -1391,6 +1509,9 @@ def build_current_work_projection(
         "processes": processes["truncated"],
         "browser_workers": _has_more(browser_payload, "browser"),
         "gui_workers": _has_more(gui_payload, "gui"),
+        "checkout_binding_reconciliation": _reconciliation_has_more(
+            reconciliation_payload
+        ),
         "source_errors": source_errors_truncated,
     }
     _annotate_groups(
@@ -1482,6 +1603,9 @@ def build_current_work_projection(
             "attention": "task store plus create-only decision and outcome receipts",
             "resources": "resource lease store",
             "checkouts": "Git linked-worktree state plus checkout lifecycle store",
+            "checkout_binding_reconciliation": (
+                "read-only checkout lifecycle database snapshot plus canonical Git observation"
+            ),
             "workers": "browser and GUI worker registries with bounded fresh observation",
             "tmux": "non-authoritative physical observation",
             "processes": "non-authoritative physical observation",
@@ -1492,6 +1616,7 @@ def build_current_work_projection(
             "leases": len(lease_rows),
             "repositories": len(seen_repositories),
             "worktrees": len(checkouts),
+            "checkout_binding_reconciliations": len(reconciliation_rows),
             "tmux_sessions": len(tmux["sessions"]),
             "processes": len(processes["processes"]),
             "browser_workers": len(browser_rows),

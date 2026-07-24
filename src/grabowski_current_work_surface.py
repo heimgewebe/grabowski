@@ -176,6 +176,14 @@ def _checkout_payloads(repositories: list[str]) -> list[dict[str, Any]]:
     return payloads
 
 
+def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
+    reconciler = _module("grabowski_checkout_binding_reconciler")
+    return reconciler.reconcile_checkout_bindings(
+        repository_filters=repositories,
+        limit=reconciler.MAX_PAGE_LIMIT,
+    )
+
+
 def _tmux_payload() -> dict[str, Any]:
     return _operator().grabowski_tmux_list()
 
@@ -237,6 +245,17 @@ def grabowski_current_work(
             for repository in repository_filters
         ],
     )
+    reconciliation_payload = _attempt_source(
+        "checkout_binding_reconciliation",
+        "git_cli",
+        lambda: _reconciliation_payload(repository_filters),
+        source_errors,
+        {
+            "bindings": [],
+            "pagination": {"has_more": True},
+            "total_count": 0,
+        },
+    )
     tmux_payload = _attempt_source(
         "tmux",
         "tmux_interaction",
@@ -278,6 +297,7 @@ def grabowski_current_work(
         gui_payload=gui_payload,
         source_errors=source_errors,
         generated_at_unix=int(time.time()),
+        reconciliation_payload=reconciliation_payload,
         view=view,
         limit=limit,
         cursor=cursor,

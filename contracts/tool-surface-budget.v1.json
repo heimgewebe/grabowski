@@ -1354,6 +1354,29 @@
         "risk_class": "low",
         "tool": "repoground_range_get"
       }
+    },
+    "grabowski_checkout_binding_reconciliation": {
+      "evidence_refs": [
+        "issue:heimgewebe/grabowski#434",
+        "tests:tests/test_checkout_binding_reconciler.py",
+        "tests:tests/test_current_work.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool owns only bounded read-only comparison between the existing checkout lifecycle store and canonical Git observations.",
+        "evidence": "Immutable-or-copied SQLite snapshots, canonical worktree records, snapshot-bound pagination and regression tests preserve fail-closed behavior without mutation authority."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Extending checkout inventory or Current Work alone was rejected because callers need one typed reconciliation result with explicit absence-versus-unobservability semantics and a snapshot-bound cursor.",
+      "rationale": "Durable bindings can survive physical worktrees; a distinct read-only surface exposes that contradiction without treating absence, retention or archive evidence as cleanup proof.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "checkout-lifecycle",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_checkout_binding_reconciliation"
+      }
     }
   },
   "baseline": {

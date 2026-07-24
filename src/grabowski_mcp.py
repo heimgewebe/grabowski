@@ -328,6 +328,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_git": ("git_cli",),
     "grabowski_git_branch": ("git_cli",),
     "grabowski_checkout_inventory": ("git_cli",),
+    "grabowski_checkout_binding_reconciliation": (),
     "grabowski_checkout_retain": ("git_cli", "resource_lease"),
     "grabowski_checkout_archive": ("git_cli", "resource_lease"),
     "grabowski_checkout_cleanup": ("git_cli", "resource_lease"),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import grabowski_operator_core
 import grabowski_checkouts
+import grabowski_checkout_binding_reconciler
 import grabowski_current_work_surface
 import grabowski_runtime_extensions
 import grabowski_audit_query
@@ -44,6 +45,20 @@ def grabowski_current_work(
     return grabowski_current_work_surface.grabowski_current_work(
         repositories,
         view=view,
+        limit=limit,
+        cursor=cursor,
+    )
+
+
+@mcp.tool(name="grabowski_checkout_binding_reconciliation", annotations=READ_ONLY)
+def grabowski_checkout_binding_reconciliation(
+    repository_filters: list[str] | None = None,
+    limit: int = 20,
+    cursor: str | None = None,
+) -> dict[str, object]:
+    """Compare durable checkout bindings with current Git state, strictly read-only."""
+    return grabowski_checkout_binding_reconciler.reconcile_checkout_bindings(
+        repository_filters=repository_filters,
         limit=limit,
         cursor=cursor,
     )
