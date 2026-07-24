@@ -52,25 +52,259 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _directory_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise BureauPickupError("private-directory-nofollow-unavailable")
+    return os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def _absolute_path(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def _open_existing_directory_chain(path: Path, *, label: str) -> int:
+    """Open an existing absolute directory without following any symlink component."""
+    normalized = _absolute_path(path)
+    descriptor = os.open("/", _directory_flags())
+    try:
+        for component in normalized.parts[1:]:
+            parent_descriptor = descriptor
+            child_descriptor = -1
+            try:
+                child_descriptor = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=parent_descriptor,
+                )
+                linked = os.stat(
+                    component,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                opened = os.fstat(child_descriptor)
+                if (
+                    not stat.S_ISDIR(linked.st_mode)
+                    or stat.S_ISLNK(linked.st_mode)
+                    or _directory_identity(linked) != _directory_identity(opened)
+                ):
+                    raise BureauPickupError(f"{label}-directory-unsafe")
+            except FileNotFoundError:
+                if child_descriptor >= 0:
+                    os.close(child_descriptor)
+                os.close(parent_descriptor)
+                descriptor = -1
+                raise BureauPickupError(f"{label}-missing") from None
+            except BureauPickupError:
+                if child_descriptor >= 0:
+                    os.close(child_descriptor)
+                os.close(parent_descriptor)
+                descriptor = -1
+                raise
+            except OSError as exc:
+                if child_descriptor >= 0:
+                    os.close(child_descriptor)
+                os.close(parent_descriptor)
+                descriptor = -1
+                raise BureauPickupError(
+                    f"{label}-open-failed",
+                    details={"error_type": type(exc).__name__, "component": component},
+                ) from None
+            os.close(parent_descriptor)
+            descriptor = child_descriptor
+        linked = normalized.lstat()
+        opened = os.fstat(descriptor)
+        if _directory_identity(linked) != _directory_identity(opened):
+            raise BureauPickupError(f"{label}-directory-changed")
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _assert_private_directory_binding(
+    descriptor: int,
+    path: Path,
+    *,
+    label: str,
+) -> None:
+    try:
+        linked = path.lstat()
+    except FileNotFoundError:
+        raise BureauPickupError(f"{label}-directory-missing") from None
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o700
+        or _directory_identity(opened) != _directory_identity(linked)
+    ):
+        raise BureauPickupError(f"{label}-directory-unsafe")
+
+
+def _open_or_create_private_child(
+    parent_descriptor: int,
+    parent_path: Path,
+    name: str,
+    *,
+    label: str,
+    create: bool,
+) -> tuple[Path, int]:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError(f"{label} directory name is invalid")
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise BureauPickupError(
+                f"{label}-directory-create-failed",
+                details={"error_type": type(exc).__name__},
+            ) from None
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        raise BureauPickupError(f"{label}-directory-missing") from None
+    except OSError as exc:
+        raise BureauPickupError(
+            f"{label}-directory-open-failed",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    path = parent_path / name
+    try:
+        linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(linked.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or _directory_identity(linked) != _directory_identity(opened)
+        ):
+            raise BureauPickupError(f"{label}-directory-unsafe")
+        _assert_private_directory_binding(descriptor, path, label=label)
+        return path, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_run_directory(run_id: str, *, create: bool) -> tuple[Path, int]:
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError("run_id is invalid")
+    root = _absolute_path(STATE_ROOT)
+    parent_descriptor = _open_existing_directory_chain(
+        root.parent, label="pickup-state-parent"
+    )
+    root_descriptor = runs_descriptor = run_descriptor = -1
+    keep_run_descriptor = False
+    try:
+        root_path, root_descriptor = _open_or_create_private_child(
+            parent_descriptor,
+            root.parent,
+            root.name,
+            label="pickup-root",
+            create=create,
+        )
+        runs_path, runs_descriptor = _open_or_create_private_child(
+            root_descriptor,
+            root_path,
+            "runs",
+            label="pickup-runs",
+            create=create,
+        )
+        run_path, run_descriptor = _open_or_create_private_child(
+            runs_descriptor,
+            runs_path,
+            run_id,
+            label="pickup-run",
+            create=create,
+        )
+        _assert_private_directory_binding(root_descriptor, root_path, label="pickup-root")
+        _assert_private_directory_binding(runs_descriptor, runs_path, label="pickup-runs")
+        _assert_private_directory_binding(run_descriptor, run_path, label="pickup-run")
+        keep_run_descriptor = True
+        return run_path, run_descriptor
+    finally:
+        os.close(parent_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        if runs_descriptor >= 0:
+            os.close(runs_descriptor)
+        if run_descriptor >= 0 and not keep_run_descriptor:
+            os.close(run_descriptor)
+
+
 def _private_root() -> Path:
-    STATE_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(STATE_ROOT, 0o700)
-    return STATE_ROOT
+    root = _absolute_path(STATE_ROOT)
+    parent_descriptor = _open_existing_directory_chain(
+        root.parent, label="pickup-state-parent"
+    )
+    try:
+        root_path, root_descriptor = _open_or_create_private_child(
+            parent_descriptor,
+            root.parent,
+            root.name,
+            label="pickup-root",
+            create=True,
+        )
+        try:
+            _assert_private_directory_binding(root_descriptor, root_path, label="pickup-root")
+        finally:
+            os.close(root_descriptor)
+        return root_path
+    finally:
+        os.close(parent_descriptor)
 
 
 def _run_directory(run_id: str) -> Path:
-    if RUN_ID_RE.fullmatch(run_id) is None:
-        raise ValueError("run_id is invalid")
-    path = _private_root() / "runs" / run_id
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path, 0o700)
+    path, descriptor = _open_run_directory(run_id, create=True)
+    os.close(descriptor)
     return path
 
 
-def _read_private_bytes(path: Path, *, label: str) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _journal_target(path: Path) -> tuple[str, str]:
+    normalized = _absolute_path(path)
+    root = _absolute_path(STATE_ROOT)
+    if (
+        normalized.parent.parent.name != "runs"
+        or normalized.parent.parent.parent != root
+        or RUN_ID_RE.fullmatch(normalized.parent.name) is None
+        or not normalized.name
+        or normalized.name in {".", ".."}
+        or "/" in normalized.name
+        or "\\" in normalized.name
+    ):
+        raise BureauPickupError("pickup-artifact-path-invalid")
+    return normalized.parent.name, normalized.name
+
+
+def _read_private_bytes_at(
+    directory_descriptor: int,
+    directory_path: Path,
+    name: str,
+    *,
+    label: str,
+) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
     except FileNotFoundError:
         raise BureauPickupError(f"{label}-missing") from None
     except OSError as exc:
@@ -79,6 +313,7 @@ def _read_private_bytes(path: Path, *, label: str) -> bytes:
         ) from None
     try:
         before = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode):
             raise BureauPickupError(f"{label}-not-regular")
         if before.st_uid != os.getuid():
@@ -87,6 +322,8 @@ def _read_private_bytes(path: Path, *, label: str) -> bytes:
             raise BureauPickupError(f"{label}-mode-invalid")
         if before.st_nlink != 1:
             raise BureauPickupError(f"{label}-hardlink-invalid")
+        if _directory_identity(before) != _directory_identity(linked):
+            raise BureauPickupError(f"{label}-binding-invalid")
         if before.st_size > MAX_REQUEST_BYTES:
             raise BureauPickupError(f"{label}-too-large")
         chunks: list[bytes] = []
@@ -98,62 +335,127 @@ def _read_private_bytes(path: Path, *, label: str) -> bytes:
             chunks.append(chunk)
             remaining -= len(chunk)
         after = os.fstat(descriptor)
+        linked_after = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
     finally:
         os.close(descriptor)
-    identity_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_mode,
-        before.st_uid,
-        before.st_nlink,
-        before.st_size,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    )
-    identity_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_mode,
-        after.st_uid,
-        after.st_nlink,
-        after.st_size,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    )
-    if identity_before != identity_after:
+    if (
+        _directory_identity(before) != _directory_identity(after)
+        or _directory_identity(after) != _directory_identity(linked_after)
+    ):
         raise BureauPickupError(f"{label}-changed-during-read")
+    _assert_private_directory_binding(
+        directory_descriptor, directory_path, label="pickup-run"
+    )
     raw = b"".join(chunks)
     if len(raw) > MAX_REQUEST_BYTES or len(raw) != before.st_size:
         raise BureauPickupError(f"{label}-size-invalid")
     return raw
 
 
+def _read_private_bytes(path: Path, *, label: str) -> bytes:
+    run_id, name = _journal_target(path)
+    directory_path, directory_descriptor = _open_run_directory(run_id, create=False)
+    try:
+        return _read_private_bytes_at(
+            directory_descriptor,
+            directory_path,
+            name,
+            label=label,
+        )
+    finally:
+        os.close(directory_descriptor)
+
+
 def _write_bound_json(path: Path, value: Any) -> str:
     raw = _canonical_json(value)
     if len(raw) > MAX_REQUEST_BYTES:
         raise ValueError("pickup artifact exceeds the bounded limit")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
-    if path.exists():
-        existing = _read_private_bytes(path, label="pickup-artifact")
-        if existing != raw:
-            raise BureauPickupError(
-                "pickup-artifact-conflict", details={"path": str(path)}
-            )
-        return hashlib.sha256(raw).hexdigest()
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    run_id, name = _journal_target(path)
+    directory_path, directory_descriptor = _open_run_directory(run_id, create=True)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except Exception:
         try:
-            path.unlink()
-        except OSError:
-            pass
-        raise
-    return hashlib.sha256(raw).hexdigest()
+            existing = _read_private_bytes_at(
+                directory_descriptor,
+                directory_path,
+                name,
+                label="pickup-artifact",
+            )
+        except BureauPickupError as exc:
+            if exc.code != "pickup-artifact-missing":
+                raise
+        else:
+            if existing != raw:
+                raise BureauPickupError(
+                    "pickup-artifact-conflict", details={"path": str(path)}
+                )
+            return hashlib.sha256(raw).hexdigest()
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=directory_descriptor)
+        except FileExistsError:
+            winner = _read_private_bytes_at(
+                directory_descriptor,
+                directory_path,
+                name,
+                label="pickup-artifact",
+            )
+            if winner != raw:
+                raise BureauPickupError(
+                    "pickup-artifact-conflict", details={"path": str(path)}
+                ) from None
+            return hashlib.sha256(raw).hexdigest()
+        created_inode: tuple[int, int] | None = None
+        try:
+            created = os.fstat(descriptor)
+            created_inode = (created.st_dev, created.st_ino)
+            if (
+                not stat.S_ISREG(created.st_mode)
+                or created.st_uid != os.getuid()
+                or stat.S_IMODE(created.st_mode) != 0o600
+                or created.st_nlink != 1
+            ):
+                raise BureauPickupError("pickup-artifact-created-unsafe")
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                descriptor = -1
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            linked = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(linked.st_mode)
+                or linked.st_uid != os.getuid()
+                or stat.S_IMODE(linked.st_mode) != 0o600
+                or linked.st_nlink != 1
+                or (linked.st_dev, linked.st_ino) != created_inode
+            ):
+                raise BureauPickupError("pickup-artifact-publish-unsafe")
+            os.fsync(directory_descriptor)
+            _assert_private_directory_binding(
+                directory_descriptor, directory_path, label="pickup-run"
+            )
+            linked_after = os.stat(
+                name, dir_fd=directory_descriptor, follow_symlinks=False
+            )
+            if (linked_after.st_dev, linked_after.st_ino) != created_inode:
+                raise BureauPickupError("pickup-artifact-publish-changed")
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if created_inode is not None:
+                try:
+                    current = os.stat(
+                        name, dir_fd=directory_descriptor, follow_symlinks=False
+                    )
+                    if (current.st_dev, current.st_ino) == created_inode:
+                        os.unlink(name, dir_fd=directory_descriptor)
+                        os.fsync(directory_descriptor)
+                except OSError:
+                    pass
+            raise
+        return hashlib.sha256(raw).hexdigest()
+    finally:
+        os.close(directory_descriptor)
 
 
 def _read_bound_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -743,19 +1045,33 @@ def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _journal_available(run_id: str) -> bool:
+    try:
+        _path, descriptor = _open_run_directory(run_id, create=False)
+    except BureauPickupError as exc:
+        if exc.code in {
+            "pickup-root-directory-missing",
+            "pickup-runs-directory-missing",
+            "pickup-run-directory-missing",
+        }:
+            return False
+        raise
+    os.close(descriptor)
+    return True
+
+
 def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
     """Read one coordinated Bureau run and its owner-bound lease state."""
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
     if RUN_ID_RE.fullmatch(normalized_run_id) is None:
         raise ValueError("run_id is invalid")
     payload = _coordination_status(normalized_run_id)
-    journal = STATE_ROOT.expanduser() / "runs" / normalized_run_id
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup_status",
         "run_id": normalized_run_id,
         "coordination": payload,
-        "journal_available": journal.is_dir() and not journal.is_symlink(),
+        "journal_available": _journal_available(normalized_run_id),
     }
 
 
