@@ -516,6 +516,8 @@ class CaptainMergeGuardRunner:
         self.held_resource_keys: list[str] = []
         self.acquisition: dict[str, Any] | None = None
         self.dispatch_called = False
+        self.repository_policy_args: list[str] | None = None
+        self.repository_policy_snapshot: dict[str, bool] | None = None
         does_not_establish = [
             "merge_authority",
             "review_completeness",
@@ -564,6 +566,92 @@ class CaptainMergeGuardRunner:
         if self.static_errors:
             self.receipt["status"] = "blocked_before_guard"
             self.receipt["errors"] = list(self.static_errors)
+
+    def _is_repository_policy_query(self, args: list[str]) -> bool:
+        target_repo = str(self.action["target"].get("repo", ""))
+        return (
+            len(args) == 4
+            and args[0] == "api"
+            and args[1] == f"repos/{target_repo}"
+            and args[2] == "--jq"
+            and isinstance(args[3], str)
+            and args[3].startswith("{")
+            and args[3].endswith("}")
+        )
+
+    def _repository_policy_snapshot_info(
+        self,
+        result: Any,
+        *,
+        command: list[str],
+    ) -> tuple[dict[str, bool] | None, dict[str, Any], list[str]]:
+        info = _merge_guard_result_info(result)
+        evidence = {
+            "command": ["gh", *command],
+            "returncode": info["returncode"],
+            "stdout_sha256": hashlib.sha256(info["stdout"].encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
+        }
+        errors: list[str] = []
+        if info["returncode"] != 0:
+            errors.append("merge_guard_repository_policy_query_failed")
+            return None, evidence, errors
+        try:
+            raw = json.loads(info["stdout"])
+        except json.JSONDecodeError:
+            errors.append("merge_guard_repository_policy_invalid_json")
+            return None, evidence, errors
+        if (
+            not isinstance(raw, dict)
+            or not raw
+            or any(not isinstance(key, str) or not isinstance(value, bool) for key, value in raw.items())
+        ):
+            errors.append("merge_guard_repository_policy_invalid_shape")
+            return None, evidence, errors
+        snapshot = {key: raw[key] for key in sorted(raw)}
+        evidence["settings"] = snapshot
+        evidence["settings_sha256"] = _sha256_json(snapshot)
+        return snapshot, evidence, errors
+
+    def _capture_repository_policy_snapshot(
+        self,
+        args: list[str],
+        result: Any,
+    ) -> None:
+        snapshot, evidence, errors = self._repository_policy_snapshot_info(
+            result,
+            command=args,
+        )
+        evidence["errors"] = list(errors)
+        self.receipt["repository_policy_snapshot"] = evidence
+        self.repository_policy_args = list(args)
+        self.repository_policy_snapshot = snapshot
+
+    def _revalidate_repository_policy(self) -> list[str]:
+        if self.repository_policy_args is None or self.repository_policy_snapshot is None:
+            errors = ["merge_guard_repository_policy_snapshot_missing"]
+            self.receipt["repository_policy_revalidation"] = {"errors": errors}
+            return errors
+        try:
+            raw = self.github_runner(self.repo_path, list(self.repository_policy_args))
+        except Exception as exc:
+            errors = [f"merge_guard_repository_policy_revalidation_exception:{type(exc).__name__}"]
+            self.receipt["repository_policy_revalidation"] = {
+                "command": ["gh", *self.repository_policy_args],
+                "errors": errors,
+            }
+            return errors
+        snapshot, evidence, errors = self._repository_policy_snapshot_info(
+            raw,
+            command=self.repository_policy_args,
+        )
+        evidence["initial_settings_sha256"] = _sha256_json(self.repository_policy_snapshot)
+        if not errors and snapshot != self.repository_policy_snapshot:
+            errors.append("merge_guard_repository_policy_drift")
+        evidence["matched"] = not errors
+        evidence["errors"] = list(errors)
+        self.receipt["repository_policy_revalidation"] = evidence
+        return errors
 
     def _static_binding_errors(self) -> list[str]:
         expected_head = str(self.parameters.get("expected_head", ""))
@@ -819,7 +907,10 @@ class CaptainMergeGuardRunner:
 
     def __call__(self, repo_path: Path, args: list[str]) -> dict[str, Any]:
         if args[:2] != ["pr", "merge"]:
-            return self.github_runner(repo_path, args)
+            result = self.github_runner(repo_path, args)
+            if self._is_repository_policy_query(args):
+                self._capture_repository_policy_snapshot(args, result)
+            return result
         if self.receipt["status"] != "not_reached":
             raise RuntimeError("merge lease guard permits exactly one merge dispatch")
         observed_at_ns = time.time_ns()
@@ -923,6 +1014,7 @@ class CaptainMergeGuardRunner:
             }
         )
         revalidation_errors = self._revalidate_dispatch_bindings(bindings)
+        revalidation_errors.extend(self._revalidate_repository_policy())
         if revalidation_errors:
             self.receipt["status"] = "blocked_after_guard_revalidation"
             self.receipt["contract_satisfied"] = False
