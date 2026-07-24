@@ -278,5 +278,129 @@ class RecallTests(unittest.TestCase):
         self.assertIn("heimlern_live_update", export["does_not_establish"])
 
 
+    def _chronik_history_result(self, module, *, available: bool = True):
+        event = {
+            "schema_version": "agent-run-event.v0",
+            "kind": "agent.run.completed",
+            "ts": "2026-07-23T12:00:00Z",
+            "source": {
+                "repo": "heimgewebe/grabowski",
+                "component": "grabowski",
+                "run_id": "task-0123456789abcdef01234567-a1",
+            },
+            "subject": {
+                "scope": "repository",
+                "repo": "heimgewebe/grabowski",
+                "component": "chronik",
+            },
+            "trust_tier": "observed",
+            "status": "active",
+            "caused_by": [],
+            "evidence_refs": [
+                "grabowski-task:0123456789abcdef01234567",
+                "grabowski-unit:grabowski-task-0123456789abcdef01234567-a1.service",
+            ],
+            "data": {
+                "result": "completed",
+                "operation": "implement",
+                "task_class": "coding",
+            },
+        }
+        event["event_id"] = module._chronik_event_id(event)
+        query = {"repo": "heimgewebe/grabowski", "subject_component": "chronik", "limit": 20}
+        payload = {
+            "schema_version": 1,
+            "kind": "grabowski_chronik_history",
+            "query": query,
+            "cli_present": True,
+            "available": available,
+            "historical_only": True,
+            "events": [event] if available else [],
+            "does_not_establish": list(module.CHRONIK_HISTORY_DOES_NOT_ESTABLISH),
+        }
+        if available:
+            payload["history"] = {
+                "schema_version": "chronik-coding-history.v1",
+                "query": query,
+                "target": {"scope": "repository", "repo": "heimgewebe/grabowski"},
+                "event_ids": [event["event_id"]],
+                "historical_only": True,
+                "does_not_establish": list(module.CHRONIK_HISTORY_DOES_NOT_ESTABLISH),
+                "ledger_snapshot": {"sha256": "b" * 64},
+            }
+        else:
+            payload["failure"] = {"code": "chronik_repository_unavailable"}
+        payload["result_sha256"] = module._sha256_json(payload)
+        return payload
+
+    def test_chronik_history_recall_is_hash_bound_and_historical_only(self) -> None:
+        module = self._load_module()
+        result = module.export_chronik_history_recall(self._chronik_history_result(module))
+
+        self.assertEqual(result["kind"], "grabowski_operator_historical_recall")
+        self.assertEqual(result["source_trust"], "grabowski_validated_chronik_history")
+        self.assertEqual(result["evidence_binding"], "hash_bound_chronik_event")
+        self.assertTrue(result["historical_only"])
+        self.assertTrue(result["available"])
+        self.assertEqual(result["returned"], 1)
+        item = result["items"][0]
+        self.assertEqual(item["source"], "chronik_event")
+        self.assertEqual(module.SOURCE_TO_EVIDENCE_TYPE["chronik_event"], "chronik_event")
+        self.assertEqual(item["learned_rule_trust"], "historical_observation_not_rule")
+        self.assertEqual(item["evidence_refs"][0]["id"], self._chronik_history_result(module)["events"][0]["event_id"])
+        self.assertIn("current_git_state", result["does_not_establish"])
+        self.assertIn("safe_retry", result["does_not_establish"])
+        self.assertIn("policy_change", item["does_not_establish"])
+
+    def test_chronik_history_recall_bounds_long_valid_subject_without_rejecting_event(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["subject"]["repo"] = "r" * 500
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+
+        self.assertEqual(result["returned"], 1)
+        self.assertLessEqual(len(result["items"][0]["topic"]), 120)
+        self.assertEqual(result["items"][0]["source"], "chronik_event")
+        self.assertNotIn("repo", result["items"][0]["evidence_refs"][0])
+
+    def test_chronik_history_recall_rejects_tampered_receipt_digest(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        history["events"][0]["data"]["operation"] = "merge"
+
+        with self.assertRaisesRegex(ValueError, "result digest"):
+            module.export_chronik_history_recall(history)
+
+    def test_unavailable_chronik_history_becomes_empty_non_authoritative_recall(self) -> None:
+        module = self._load_module()
+        result = module.export_chronik_history_recall(
+            self._chronik_history_result(module, available=False)
+        )
+
+        self.assertFalse(result["available"])
+        self.assertTrue(result["historical_only"])
+        self.assertEqual(result["returned"], 0)
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["failure_code"], "chronik_repository_unavailable")
+        self.assertIn("current_runtime_state", result["does_not_establish"])
+
+    def test_runtime_publishes_canonical_chronik_backed_operator_recall_tool(self) -> None:
+        tasks = (ROOT / "src/grabowski_tasks.py").read_text(encoding="utf-8")
+        capabilities = (ROOT / "src/grabowski_capabilities.py").read_text(encoding="utf-8")
+        mcp = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
+
+        self.assertIn('name="grabowski_operator_historical_recall"', tasks)
+        self.assertIn("recall.export_chronik_history_recall", tasks)
+        self.assertIn('"grabowski_operator_historical_recall": {', capabilities)
+        self.assertIn('"grabowski_operator_historical_recall": ("durable_job",)', mcp)
+
+
 if __name__ == "__main__":
     unittest.main()

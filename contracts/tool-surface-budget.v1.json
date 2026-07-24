@@ -618,6 +618,29 @@
         "tool": "grabowski_operator_blockade_status"
       }
     },
+    "grabowski_operator_historical_recall": {
+      "evidence_refs": [
+        "bureau:CHRONIK-CODING-MEMORY-V1",
+        "docs:docs/operator-recall.md",
+        "tests:tests/test_recall.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool exposes only bounded evidence-bound recall derived from already validated historical Chronik events and grants no current-state or action authority.",
+        "evidence": "The wrapper reuses the strict Chronik history provider, verifies the provider receipt and event digests again at the recall boundary, preserves historical_only, and carries explicit non-claims for Git, CI, runtime, retry, merge, routing and policy truth."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Extending the caller-supplied recall export was rejected because it has an intentionally unverified source contract, while direct Chronik history exposes provider records rather than the normalized evidence-bound operator recall shape. A typed mutation operation is inapplicable to this read-only historical projection.",
+      "rationale": "Operator consumers need one canonical bounded historical recall response that preserves Chronik as a provider rather than a second control plane. The call shape is materially distinct from both unverified caller-supplied recall export and low-level Chronik diagnostics while adding no mutation authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "operator-recall",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_operator_historical_recall"
+      }
+    },
     "grabowski_task_archive_list": {
       "evidence_refs": [
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T071",

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2996cc1ca538cf55248ef7ce3b932fb1ab13374e7e16cd181676b82e839babbb",
+  "capability_source_sha256": "d878a6a577e6274d004250c302cff30f63bae1c03dc4d69d518f386fb046843b",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "e154473b96811a84190abe13d7dd71794ecdf3b89461d7e8547c9952eb73a69e",
+  "contract_sha256": "a0eff57104e5861bbf1836a09cbc4b39f15017829d5b5c31d095bc8ef410a729",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1250,6 +1250,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_chronik_history"
+    },
+    {
+      "category": "operator-recall",
+      "description": "Read evidence-bound operator recall derived from validated Chronik history.",
+      "effects": [],
+      "id": "grabowski_operator_historical_recall",
+      "purpose": "Read evidence-bound operator recall derived from validated Chronik history.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operator_historical_recall"
     },
     {
       "category": "task",
