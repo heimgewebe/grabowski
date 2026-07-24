@@ -77,20 +77,21 @@ _scope_current = (
 )
 _scope_path.write_text(_scope_current, encoding="utf-8")
 
-_scope_context_path = Path("docs/generated/operator-context.v1.json")
-_scope_context = _scope_context_path.read_text(encoding="utf-8")
-_scope_digest = hashlib.sha256(_scope_path.read_bytes()).hexdigest()
-_scope_hash_pattern = rf'("{re.escape(CAPTURE)}": ")[0-9a-f]{{64}}(")'
-_scope_context, _scope_count = re.subn(
-    _scope_hash_pattern,
-    rf"\g<1>{_scope_digest}\g<2>",
-    _scope_context,
+_scope_test_path = Path("tests/test_operator_routing_shadow_cohort.py")
+_scope_tests = _scope_test_path.read_text(encoding="utf-8")
+_scope_old = '        tampered["case_provenance"]["case_origin"] = "production"\n'
+_scope_new = '        tampered["case_provenance"]["case_origin"] = "quarantined"\n'
+if _scope_tests.count(_scope_old) != 1:
+    raise SystemExit(
+        "case-origin tamper test replacement count="
+        f"{_scope_tests.count(_scope_old)}"
+    )
+_scope_test_path.write_text(
+    _scope_tests.replace(_scope_old, _scope_new), encoding="utf-8"
 )
-if _scope_count != 1:
-    raise SystemExit(f"operator context capture hash entry count={_scope_count}")
-_scope_context_path.write_text(_scope_context, encoding="utf-8")
 
 Path("tools/sitecustomize.py").unlink(missing_ok=True)
 Path(".routing-shadow-bootstrap-trigger").unlink(missing_ok=True)
+_scope_subprocess.run(["make", "context-refresh"], check=True)
 '''
         runner.write_text(text, encoding="utf-8")
