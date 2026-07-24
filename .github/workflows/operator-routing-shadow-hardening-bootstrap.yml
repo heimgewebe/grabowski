@@ -24,30 +24,10 @@ jobs:
           path = Path('tools/_bootstrap_routing_shadow_hardening.py')
           text = path.read_text(encoding='utf-8')
           replacements = [
-              (
-                  r')(    \) -> dict\[str, Any\]:)',
-                  r')(\) -> dict\[str, Any\]:)',
-                  1,
-                  'signature guard',
-              ),
-              (
-                  "\n\\1'''",
-                  "\n\\\\1'''",
-                  2,
-                  'replacement backrefs',
-              ),
-              (
-                  r'\n.*?    prospective = eligibility\["prospective_eligibility"\]',
-                  r'\n(?:(?!\ndef ).)*?    prospective = eligibility\["prospective_eligibility"\]',
-                  1,
-                  'builder function boundary',
-              ),
-              (
-                  r'\n.*?    if record\.get\("no_effect"\) != NO_EFFECT:',
-                  r'\n(?:(?!\ndef ).)*?    if record\.get\("no_effect"\) != NO_EFFECT:',
-                  1,
-                  'validator function boundary',
-              ),
+              (r')(    \) -> dict\[str, Any\]:)', r')(\) -> dict\[str, Any\]:)', 1, 'signature guard'),
+              ("\n\\1'''", "\n\\\\1'''", 2, 'replacement backrefs'),
+              (r'\n.*?    prospective = eligibility\["prospective_eligibility"\]', r'\n(?:(?!\ndef ).)*?    prospective = eligibility\["prospective_eligibility"\]', 1, 'builder function boundary'),
+              (r'\n.*?    if record\.get\("no_effect"\) != NO_EFFECT:', r'\n(?:(?!\ndef ).)*?    if record\.get\("no_effect"\) != NO_EFFECT:', 1, 'validator function boundary'),
           ]
           for old, new, expected, label in replacements:
               count = text.count(old)
@@ -60,11 +40,74 @@ jobs:
         id: patch
         continue-on-error: true
         run: python tools/_bootstrap_routing_shadow_hardening.py
-      - name: Persist patch diagnostic only
-        if: steps.patch.outcome == 'failure'
+      - name: Restore v2 and scope timeline hardening to v3
+        id: scope_fix
+        if: steps.patch.outcome == 'success'
+        continue-on-error: true
         shell: bash
         run: |
-          cp .routing-shadow-bootstrap-diagnostic.txt /tmp/routing-shadow-bootstrap-diagnostic.txt
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          path = Path('src/grabowski_operator_routing_shadow_capture.py')
+          current = path.read_text(encoding='utf-8')
+          original = subprocess.check_output(
+              ['git', 'show', 'HEAD:src/grabowski_operator_routing_shadow_capture.py'],
+              text=True,
+          )
+
+          v2_pattern = r'^def build_shadow_record_v2\(.*?(?=^def validate_shadow_record_v2\()'
+          original_v2 = re.search(v2_pattern, original, flags=re.M | re.S)
+          if original_v2 is None:
+              raise SystemExit('original build_shadow_record_v2 function not found')
+          current, count = re.subn(
+              v2_pattern,
+              lambda _: original_v2.group(0),
+              current,
+              count=1,
+              flags=re.M | re.S,
+          )
+          if count != 1:
+              raise SystemExit(f'current build_shadow_record_v2 function count={count}')
+
+          v3_pattern = r'^def build_shadow_record_v3\(.*?(?=^def validate_shadow_record_v3\()'
+          v3_match = re.search(v3_pattern, current, flags=re.M | re.S)
+          if v3_match is None:
+              raise SystemExit('build_shadow_record_v3 function not found')
+          v3 = v3_match.group(0)
+          timeline_pattern = (
+              r'    normalized_captured_at = _parse_timestamp\(captured_at, "captured_at"\)\n'
+              r'    frozen_at = eligibility\["frozen_at"\]\n'
+              r'    timeline_values = \[\("outcome observation", normalized_outcome\["observed_at"\]\)\]\n'
+              r'(?:(?!\ndef ).)*?'
+              r'    prospective = eligibility\["prospective_eligibility"\]'
+          )
+          replacement = '''    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
+    frozen_at = eligibility["frozen_at"]
+    _validate_v3_timeline(
+        frozen_at=frozen_at,
+        outcome=normalized_outcome,
+        execution=execution,
+        assessments=assessments,
+        captured_at=normalized_captured_at,
+    )
+    prospective = eligibility["prospective_eligibility"]'''
+          v3_updated, count = re.subn(
+              timeline_pattern, replacement, v3, count=1, flags=re.S
+          )
+          if count != 1:
+              raise SystemExit(f'v3 builder timeline count={count}')
+          current = current[:v3_match.start()] + v3_updated + current[v3_match.end():]
+          path.write_text(current, encoding='utf-8')
+          PY
+      - name: Persist patch diagnostic only
+        if: steps.patch.outcome == 'failure' || steps.scope_fix.outcome == 'failure'
+        shell: bash
+        run: |
+          printf 'patch_outcome=%s\nscope_fix_outcome=%s\n' "${{ steps.patch.outcome }}" "${{ steps.scope_fix.outcome }}" > /tmp/routing-shadow-bootstrap-diagnostic.txt
+          if [ -f .routing-shadow-bootstrap-diagnostic.txt ]; then cat .routing-shadow-bootstrap-diagnostic.txt >> /tmp/routing-shadow-bootstrap-diagnostic.txt; fi
           git restore .
           git clean -fd
           cp /tmp/routing-shadow-bootstrap-diagnostic.txt .routing-shadow-bootstrap-diagnostic.txt
@@ -76,7 +119,7 @@ jobs:
           exit 1
       - name: Validate repository through canonical gate
         id: validate_patch
-        if: steps.patch.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.scope_fix.outcome == 'success'
         continue-on-error: true
         shell: bash
         run: |
@@ -100,7 +143,7 @@ jobs:
           git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
           exit 1
       - name: Remove bootstrap files and commit validated patch
-        if: steps.patch.outcome == 'success' && steps.validate_patch.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.scope_fix.outcome == 'success' && steps.validate_patch.outcome == 'success'
         shell: bash
         run: |
           rm .github/workflows/operator-routing-shadow-hardening-bootstrap.yml
