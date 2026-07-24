@@ -1061,6 +1061,7 @@ def _worktree_records(repo: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
             "checkout_key": key,
             "path": str(checkout_path),
             "repo_common_dir": str(common_dir),
+            "repo_path": str(main_path),
             "head": raw.get("head"),
             "branch": raw.get("branch"),
             "branch_ref": raw.get("branch_ref"),
@@ -1328,6 +1329,93 @@ def _archive_matches_checkout(
     )
 
 
+def _binding_consistency(
+    record: dict[str, Any],
+    lifecycle: dict[str, Any],
+    *,
+    exists: bool,
+) -> dict[str, Any]:
+    """Validate one durable managed binding without granting lifecycle effects."""
+    binding = lifecycle.get("binding")
+    retention = lifecycle.get("retention")
+    archive = lifecycle.get("latest_archive")
+    if not isinstance(binding, dict):
+        return {
+            "present": False,
+            "phase": None,
+            "consistent": True,
+            "drift_reasons": [],
+        }
+
+    reasons: list[str] = []
+    phase = binding.get("phase")
+    if phase not in {"active", "completed_retained", "archived"}:
+        reasons.append("binding-phase-unsupported")
+    expected_identity = {
+        "checkout_key": record.get("checkout_key"),
+        "repo_common_dir": record.get("repo_common_dir"),
+        "repo_path": record.get("repo_path"),
+        "checkout_path": record.get("path"),
+        "expected_branch": record.get("branch"),
+    }
+    for field, expected in expected_identity.items():
+        if binding.get(field) != expected:
+            reasons.append(f"binding-{field.replace('_', '-')}-mismatch")
+    if record.get("prunable") or not exists:
+        reasons.append("bound-checkout-missing-or-prunable")
+
+    if not isinstance(retention, dict):
+        reasons.append("binding-retention-missing")
+    else:
+        retention_identity = {
+            "checkout_key": record.get("checkout_key"),
+            "repo_common_dir": record.get("repo_common_dir"),
+            "repo_path": record.get("repo_path"),
+            "checkout_path": record.get("path"),
+            "expected_branch": record.get("branch"),
+        }
+        for field, expected in retention_identity.items():
+            if retention.get(field) != expected:
+                reasons.append(f"retention-{field.replace('_', '-')}-mismatch")
+        if retention.get("owner_id") != binding.get("owner_id"):
+            reasons.append("binding-retention-owner-mismatch")
+        if retention.get("expected_head") != binding.get("expected_head"):
+            reasons.append("binding-retention-head-mismatch")
+
+    if phase == "active":
+        if binding.get("terminal_at_unix") is not None:
+            reasons.append("active-binding-has-terminal-timestamp")
+        if binding.get("archived_at_unix") is not None:
+            reasons.append("active-binding-has-archive-timestamp")
+        if isinstance(archive, dict) and archive.get("cleaned_at_unix") is None:
+            reasons.append("active-binding-has-open-archive")
+    elif phase == "completed_retained":
+        if binding.get("expected_head") != record.get("head"):
+            reasons.append("terminal-binding-head-mismatch")
+        if not isinstance(binding.get("terminal_at_unix"), int):
+            reasons.append("completed-retained-terminal-timestamp-missing")
+        if binding.get("archived_at_unix") is not None:
+            reasons.append("completed-retained-has-archive-timestamp")
+        if isinstance(archive, dict) and archive.get("cleaned_at_unix") is None:
+            reasons.append("completed-retained-has-open-archive")
+    elif phase == "archived":
+        if binding.get("expected_head") != record.get("head"):
+            reasons.append("terminal-binding-head-mismatch")
+        if not isinstance(binding.get("archived_at_unix"), int):
+            reasons.append("archived-timestamp-missing")
+        if not _archive_matches_checkout(record, lifecycle):
+            reasons.append("archived-binding-without-matching-open-archive")
+        elif archive.get("owner_id") != binding.get("owner_id"):
+            reasons.append("binding-archive-owner-mismatch")
+
+    return {
+        "present": True,
+        "phase": phase if isinstance(phase, str) else None,
+        "consistent": not reasons,
+        "drift_reasons": sorted(set(reasons)),
+    }
+
+
 def _checkout_lifecycle_decision(
     record: dict[str, Any],
     status: dict[str, Any],
@@ -1340,6 +1428,10 @@ def _checkout_lifecycle_decision(
     """Classify one checkout without authorizing cleanup by classification alone."""
     retention = lifecycle.get("retention")
     archive = lifecycle.get("latest_archive")
+    binding = _binding_consistency(record, lifecycle, exists=exists)
+    binding_present = bool(binding["present"])
+    binding_phase = binding["phase"]
+    binding_consistent = bool(binding["consistent"])
     retention_is_active = _retention_active(lifecycle, now)
     archive_present = isinstance(archive, dict)
     archive_open = archive_present and archive.get("cleaned_at_unix") is None
@@ -1385,6 +1477,51 @@ def _checkout_lifecycle_decision(
         hygiene_mark = "unknown"
         next_step = "repair_status_observability_before_lifecycle_action"
         reasons.append("git status could not prove whether the checkout is clean")
+    elif binding_present and not binding_consistent:
+        state = "managed_lifecycle_drift"
+        hygiene_mark = "unknown"
+        next_step = "reconcile_managed_lifecycle_binding_before_archive_or_cleanup"
+        reasons.extend(binding["drift_reasons"])
+    elif binding_phase == "active":
+        if retention_is_active:
+            state = "retained"
+            hygiene_mark = "retained"
+            next_step = "wait_for_retention_or_owner_review_before_archive"
+            reasons.append("consistent active managed binding has effective retention")
+        else:
+            state = "managed_active_attention"
+            hygiene_mark = "unknown"
+            next_step = "reconcile_active_binding_retention_or_terminal_truth"
+            reasons.append("active managed binding has no effective retention")
+    elif binding_phase == "completed_retained":
+        if blocking:
+            state = "completed_retained_blocked"
+            hygiene_mark = "retained"
+            next_step = "resolve_coordination_blockers_before_archive"
+            reasons.append("terminal-retained checkout still has active coordination")
+        else:
+            state = "completed_retained"
+            hygiene_mark = "retained"
+            next_step = "archive_completed_retained_checkout_after_external_revalidation"
+            reasons.append("terminal managed checkout is retained and not yet archived")
+    elif binding_phase == "archived":
+        if archive_present and not archive_grace_elapsed:
+            state = "archived_grace"
+            hygiene_mark = "archived"
+            next_step = "wait_for_checkout_cleanup_grace"
+            reasons.append("matching recovery archive is younger than the 24-hour cleanup grace")
+        elif archive_present and blocking:
+            state = "archived_blocked"
+            hygiene_mark = "archived"
+            next_step = "resolve_coordination_blockers_before_cleanup_dry_run"
+            reasons.append("checkout is archived but active coordination blocks cleanup")
+        else:
+            state = "cleanup_candidate"
+            hygiene_mark = "obsolete"
+            cleanup_candidate = True
+            requires_cleanup_dry_run = True
+            next_step = "run_checkout_cleanup_dry_run_before_apply"
+            reasons.append("clean managed checkout has matching open recovery archive")
     elif archive_present and not archive_open:
         state = "archive_closed"
         hygiene_mark = "unknown"
@@ -1433,6 +1570,10 @@ def _checkout_lifecycle_decision(
     return {
         "state": state,
         "hygiene_mark": hygiene_mark,
+        "binding_present": binding_present,
+        "binding_phase": binding_phase,
+        "binding_consistent": binding_consistent,
+        "binding_drift_reasons": binding["drift_reasons"],
         "retention_active": retention_is_active,
         "retention_owner_id": retention.get("owner_id") if isinstance(retention, dict) else None,
         "archive_present": archive_present,
@@ -1450,6 +1591,7 @@ def _checkout_lifecycle_decision(
             "permission_to_cleanup",
             "branch_is_obsolete",
             "safe_to_delete_branch",
+            "terminal_external_work_truth_from_binding_alone",
         ],
     }
 

@@ -384,8 +384,14 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
     status = raw.get("status", {})
     coordination = raw.get("coordination", {})
     lifecycle = raw.get("lifecycle", {})
-    if not all(isinstance(item, dict) for item in (status, coordination, lifecycle)):
-        raise CurrentWorkProjectionError("checkout status, coordination and lifecycle must be objects")
+    decision = raw.get("lifecycle_decision", {})
+    if not all(
+        isinstance(item, dict)
+        for item in (status, coordination, lifecycle, decision)
+    ):
+        raise CurrentWorkProjectionError(
+            "checkout status, coordination, lifecycle and decision must be objects"
+        )
     task_rows = coordination.get("tasks", [])
     lease_rows = coordination.get("resource_leases", [])
     process_rows = coordination.get("processes", [])
@@ -393,6 +399,26 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
         raise CurrentWorkProjectionError("checkout coordination lists are invalid")
     retention = lifecycle.get("retention")
     binding = lifecycle.get("binding")
+    binding_present = _boolean(
+        decision.get("binding_present"),
+        "checkout.lifecycle_decision.binding_present",
+        default=isinstance(binding, dict),
+    )
+    binding_consistent = _boolean(
+        decision.get("binding_consistent"),
+        "checkout.lifecycle_decision.binding_consistent",
+        default=not binding_present,
+    )
+    binding_phase = decision.get("binding_phase")
+    if binding_phase is None and isinstance(binding, dict):
+        binding_phase = binding.get("phase")
+    if binding_phase is not None and not isinstance(binding_phase, str):
+        raise CurrentWorkProjectionError("checkout binding phase must be text or null")
+    raw_drift_reasons = decision.get("binding_drift_reasons", [])
+    if not isinstance(raw_drift_reasons, list) or not all(
+        isinstance(item, str) for item in raw_drift_reasons
+    ):
+        raise CurrentWorkProjectionError("checkout binding drift reasons must be text")
     return {
         "checkout_key": _identifier(raw.get("checkout_key"), "checkout.checkout_key"),
         "repository": repository,
@@ -416,8 +442,16 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             for item in process_rows if isinstance(item, dict)
         ][:MAX_EVIDENCE],
         "retention_owner_id": str(retention.get("owner_id")) if isinstance(retention, dict) and retention.get("owner_id") else "",
+        "retention_active": _boolean(
+            decision.get("retention_active"),
+            "checkout.lifecycle_decision.retention_active",
+        ),
         "binding_owner_id": str(binding.get("owner_id")) if isinstance(binding, dict) and binding.get("owner_id") else "",
         "binding_source": dict(binding.get("source")) if isinstance(binding, dict) and isinstance(binding.get("source"), dict) else None,
+        "binding_present": binding_present,
+        "binding_phase": str(binding_phase or "")[:64],
+        "binding_consistent": binding_consistent,
+        "binding_drift_reasons": sorted(set(raw_drift_reasons))[:MAX_EVIDENCE],
     }
 
 
@@ -770,6 +804,7 @@ def _add_checkouts(
             or item["cleanup_candidate"]
             or item["coordination_blocking"]
             or item["processes"]
+            or item["binding_present"]
         )
         if view == "current" and not current_surface:
             continue
@@ -808,6 +843,9 @@ def _add_checkouts(
                     "checkout_key": item["checkout_key"],
                     "owner_id": item["binding_owner_id"],
                     "binding_source": item["binding_source"],
+                    "phase": item["binding_phase"],
+                    "consistent": item["binding_consistent"],
+                    "drift_reasons": item["binding_drift_reasons"],
                 },
             )
         _append(group["checkout_refs"], item)
@@ -817,12 +855,20 @@ def _add_checkouts(
                 {"source": "checkout-inventory", "pid": process["pid"], "command": process["command"], "checkout_path": item["path"]},
             )
         group["source_states"].append(f"checkout:{item['lifecycle_state'] or 'unknown'}")
+        if item["binding_present"]:
+            group["source_states"].append(
+                f"checkout-binding:{item['binding_phase'] or 'unknown'}"
+            )
+
+        if item["binding_present"] and not item["binding_consistent"]:
+            _blocking(group, "managed-lifecycle-drift")
+            for reason in item["binding_drift_reasons"]:
+                if reason not in group["action_reasons"]:
+                    group["action_reasons"].append(reason)
+        if item["lifecycle_state"] == "managed_active_attention":
+            _blocking(group, "managed-active-lifecycle-attention")
 
         if item["dirty"]:
-            # A dirty checkout is normal while one live lease identifies this
-            # concrete checkout and its exact owner is already active. An active
-            # owner elsewhere (for example through an unrelated or retention
-            # lease) must not hide an abandoned dirty checkout.
             identifying_live_lease = any(
                 _resource_identifies_checkout(lease["resource_key"], item)
                 for lease in item["resource_leases"]
@@ -839,13 +885,23 @@ def _add_checkouts(
                 )
         elif item["cleanup_candidate"]:
             _blocking(group, "cleanup-candidate")
+        elif item["binding_phase"] in {"completed_retained", "archived"}:
+            if item["coordination_blocking"] or item["processes"]:
+                _blocking(group, "closed-checkout-with-live-coordination")
+            else:
+                _set_projection_state(group, "terminal_archived")
+                if "closed-not-cleaned" not in group["action_reasons"]:
+                    group["action_reasons"].append("closed-not-cleaned")
+        elif item["binding_phase"] == "active" and item["binding_consistent"]:
+            if item["retention_active"] or item["coordination_blocking"]:
+                _set_projection_state(group, "active")
+            else:
+                _blocking(group, "managed-active-lifecycle-attention")
         elif item["coordination_blocking"]:
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:
             group["binding_status"] = "physical-only"
             _unknown(group, "physical-checkout-without-authority")
-        elif item["lifecycle_state"] in {"archived", "completed_retained"}:
-            _set_projection_state(group, "terminal_archived")
         elif view == "history":
             _set_projection_state(group, "terminal_archived")
 
@@ -1089,6 +1145,11 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     projection_state = group.get("projection_state", "unknown")
     checkout_refs = group.get("checkout_refs", [])
     has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
+    has_terminal_checkout_binding = any(
+        c.get("binding_consistent") is True
+        and c.get("binding_phase") in {"completed_retained", "archived"}
+        for c in checkout_refs
+    )
     has_live_surfaces = bool(
         group.get("lease_summary", {}).get("count", 0)
         or checkout_refs
@@ -1109,6 +1170,7 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "attention:decision_superseded",
         }
         & source_states
+        or has_terminal_checkout_binding
         or projection_state == "terminal_archived"
     )
 
@@ -1116,6 +1178,7 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     if has_terminal_evidence and (
         has_cleanup_candidate
         or "cleanup-candidate" in action_reasons
+        or has_terminal_checkout_binding
         or (projection_state == "terminal_archived" and has_live_surfaces)
     ):
         return {
