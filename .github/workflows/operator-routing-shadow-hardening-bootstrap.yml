@@ -16,18 +16,23 @@ jobs:
         with:
           ref: fix/operator-routing-shadow-observability-hardening-v1
           fetch-depth: 0
-      - name: Correct bootstrap signature guard
+      - name: Correct bootstrap guards
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           path = Path('tools/_bootstrap_routing_shadow_hardening.py')
           text = path.read_text(encoding='utf-8')
-          old = r')(    \) -> dict\[str, Any\]:)'
-          new = r')(\) -> dict\[str, Any\]:)'
-          if text.count(old) != 1:
-              raise SystemExit(f'bootstrap signature guard count={text.count(old)}')
-          path.write_text(text.replace(old, new), encoding='utf-8')
+          old_signature = r')(    \) -> dict\[str, Any\]:)'
+          new_signature = r')(\) -> dict\[str, Any\]:)'
+          if text.count(old_signature) != 1:
+              raise SystemExit(f'bootstrap signature guard count={text.count(old_signature)}')
+          text = text.replace(old_signature, new_signature)
+          old_backref = "\n\\1'''"
+          new_backref = "\n\\\\1'''"
+          if text.count(old_backref) != 2:
+              raise SystemExit(f'bootstrap replacement backref count={text.count(old_backref)}')
+          path.write_text(text.replace(old_backref, new_backref), encoding='utf-8')
           PY
       - name: Apply guarded hardening patch
         id: patch
