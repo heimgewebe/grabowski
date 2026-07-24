@@ -354,6 +354,112 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["projection_state"], "blocking")
         self.assertIn("dirty-checkout", group["action_reasons"])
 
+    def test_dirty_checkout_with_exact_live_operation_lease_is_active(self) -> None:
+        owner = "operator:active-edit"
+        path = "/home/alex/repos/.worktrees/active-edit"
+        result = project(
+            resources_payload={
+                "leases": [lease(owner, f"path:{path}")],
+                "count": 1,
+                "truncated": False,
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "active-edit",
+                            path,
+                            dirty=True,
+                            owner_ids=[owner],
+                        )
+                    ],
+                }
+            ],
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"operation:{owner}")
+        self.assertEqual(group["projection_state"], "active")
+        self.assertFalse(group["action_required"])
+        self.assertNotIn("dirty-checkout", group["action_reasons"])
+
+    def test_dirty_main_checkout_with_exact_live_operation_lease_remains_blocking(self) -> None:
+        owner = "operator:main-edit"
+        path = REPOSITORY
+        record = checkout("main", path, dirty=True, owner_ids=[owner])
+        record["is_main"] = True
+        result = project(
+            resources_payload={
+                "leases": [lease(owner, f"path:{path}")],
+                "count": 1,
+                "truncated": False,
+            },
+            checkout_payloads=[
+                {"repository": REPOSITORY, "worktrees": [record]}
+            ],
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"operation:{owner}")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertTrue(group["action_required"])
+        self.assertIn("dirty-main-checkout", group["action_reasons"])
+
+    def test_dirty_retained_checkout_with_unrelated_live_lease_remains_blocking(self) -> None:
+        owner = "operator:retained-edit"
+        path = "/home/alex/repos/.worktrees/retained-edit"
+        record = checkout("retained-edit", path, dirty=True)
+        record["lifecycle"]["retention"] = {"owner_id": owner}
+        result = project(
+            resources_payload={
+                "leases": [lease(owner, "path:/home/alex/repos/.worktrees/other-edit")],
+                "count": 1,
+                "truncated": False,
+            },
+            checkout_payloads=[
+                {"repository": REPOSITORY, "worktrees": [record]}
+            ],
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"operation:{owner}")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertTrue(group["action_required"])
+        self.assertIn("dirty-checkout", group["action_reasons"])
+
+    def test_dirty_checkout_bound_to_terminal_task_remains_blocking(self) -> None:
+        task_id = "terminal-edit"
+        path = "/home/alex/repos/.worktrees/terminal-edit"
+        result = project(
+            tasks_payload={
+                "tasks": [
+                    task(
+                        task_id,
+                        "completed",
+                        cwd=path,
+                        resource_keys=[f"path:{path}"],
+                    )
+                ],
+                "pagination": {"has_more": False},
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "terminal-edit",
+                            path,
+                            dirty=True,
+                            task_ids=[task_id],
+                        )
+                    ],
+                }
+            ],
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"task:{task_id}")
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertTrue(group["action_required"])
+        self.assertIn("dirty-checkout", group["action_reasons"])
+
     def test_clean_unbound_checkout_is_not_current_work(self) -> None:
         result = project(
             checkout_payloads=[

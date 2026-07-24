@@ -819,7 +819,24 @@ def _add_checkouts(
         group["source_states"].append(f"checkout:{item['lifecycle_state'] or 'unknown'}")
 
         if item["dirty"]:
-            _blocking(group, "dirty-main-checkout" if item["is_main"] else "dirty-checkout")
+            # A dirty checkout is normal while one live lease identifies this
+            # concrete checkout and its exact owner is already active. An active
+            # owner elsewhere (for example through an unrelated or retention
+            # lease) must not hide an abandoned dirty checkout.
+            identifying_live_lease = any(
+                _resource_identifies_checkout(lease["resource_key"], item)
+                for lease in item["resource_leases"]
+            )
+            if (
+                item["is_main"]
+                or len(exact) != 1
+                or group["projection_state"] != "active"
+                or not identifying_live_lease
+            ):
+                _blocking(
+                    group,
+                    "dirty-main-checkout" if item["is_main"] else "dirty-checkout",
+                )
         elif item["cleanup_candidate"]:
             _blocking(group, "cleanup-candidate")
         elif item["coordination_blocking"]:
