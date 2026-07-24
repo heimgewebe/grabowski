@@ -67,8 +67,11 @@ Die Phasen werden read-only wie folgt projiziert:
   Head-, Retention- oder Archivdaten werden `managed_lifecycle_drift`.
 
 `grabowski_current_work` übernimmt Phase und Konsistenz als autoritative
-Checkout-Evidenz. Konsistente aktive Bindungen bleiben aktiv; abgelaufene oder
-widersprüchliche managed Bindungen blockieren; `completed_retained` und
+Checkout-Evidenz. Nur ein konsistentes Binding darf zugleich die exakte
+Owner-Zuordnung des Checkouts begründen. Ein widersprüchliches Binding bleibt
+blockierende Drift-Evidenz, wird aber weder als Owner-Autorität noch als
+terminale Konvergenzautorität verwendet. Konsistente aktive Bindungen bleiben
+aktiv; abgelaufene managed Bindungen blockieren; `completed_retained` und
 `archived` werden als `closed-not-cleaned` priorisiert, solange der Checkout
 noch existiert. Daraus folgt keine Effekt- oder Löschautorität.
 
