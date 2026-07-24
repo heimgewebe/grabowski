@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d878a6a577e6274d004250c302cff30f63bae1c03dc4d69d518f386fb046843b",
+  "capability_source_sha256": "b79ead098b1e0c52f37f10884b4573c27aaaf6846fe0eb8a2722db2de45325bf",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "ce312d6cda3dd9467852c20578dfd2249de6252b3e853414ca9ef54ad2340771",
+  "contract_sha256": "47832b4ac08d2d9cd68ddfc1497226c55ceece6afbdd4957b43ccc3299e79a49",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1699,6 +1699,31 @@
       "reversibility": "destination-preimage-dependent",
       "risk_class": "high",
       "tool": "grabowski_artifact_pull"
+    },
+    {
+      "category": "artifact",
+      "description": "Publish one immutable commit-bound UTF-8 text artifact and receipt.",
+      "effects": [
+        "local-file-create",
+        "receipt-create"
+      ],
+      "id": "grabowski_text_artifact_publish",
+      "purpose": "Produce one bounded .txt unified diff from two exact Git commit SHAs.",
+      "read_only": false,
+      "reversibility": "artifact-retention-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_text_artifact_publish"
+    },
+    {
+      "category": "artifact",
+      "description": "Read one hash-pinned bounded chunk from a published text artifact.",
+      "effects": [],
+      "id": "grabowski_text_artifact_read",
+      "purpose": "Transfer a verified text artifact across isolated runtime filesystems.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_text_artifact_read"
     },
     {
       "category": "browser-worker",

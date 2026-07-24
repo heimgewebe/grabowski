@@ -60,9 +60,14 @@ class ArtifactTests(unittest.TestCase):
         self.resource_patch = patch.object(
             artifacts.resources, "RESOURCE_DB", self.resource_database
         )
+        self.root_patch = patch.object(
+            artifacts.base, "_roots", return_value=(self.root,)
+        )
         self.resource_patch.start()
+        self.root_patch.start()
 
     def tearDown(self) -> None:
+        self.root_patch.stop()
         self.resource_patch.stop()
         self.temporary.cleanup()
 
@@ -489,6 +494,229 @@ class ArtifactTests(unittest.TestCase):
                     "remote", str(source), "/remote/file", expected, create_only=True
                 )
         self.assertEqual(artifacts.resources.list_resources(), [])
+
+
+    def _git(self, repository: Path, *arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return completed.stdout.strip()
+
+    def _repository_with_two_commits(self) -> tuple[Path, str, str]:
+        repository = self.root / "repository"
+        repository.mkdir()
+        self._git(repository, "init")
+        self._git(repository, "config", "user.name", "Artifact Test")
+        self._git(repository, "config", "user.email", "artifact@example.test")
+        (repository / "value.txt").write_text("first\n")
+        self._git(repository, "add", "value.txt")
+        self._git(repository, "commit", "-m", "first")
+        base_commit = self._git(repository, "rev-parse", "HEAD")
+        (repository / "value.txt").write_text("second\n")
+        self._git(repository, "commit", "-am", "second")
+        head_commit = self._git(repository, "rev-parse", "HEAD")
+        return repository, base_commit, head_commit
+
+    def test_text_artifact_publish_and_chunked_read_are_hash_bound(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1",
+                str(repository),
+                base_commit,
+                head_commit,
+                pull_request_number=17,
+            )
+            self.assertEqual(result["schema"], "git-diff-artifact.v1")
+            self.assertTrue(result["filename"].endswith("-diff.txt"))
+            chunks = []
+            offset = 0
+            while True:
+                chunk = artifacts.read_text_artifact(
+                    result["artifact_id"],
+                    result["diff_sha256"],
+                    result["receipt_sha256"],
+                    offset=offset,
+                    max_bytes=11,
+                )
+                payload = __import__("base64").b64decode(chunk["payload_b64"])
+                self.assertEqual(chunk["chunk_sha256"], sha(payload))
+                chunks.append(payload)
+                if chunk["next_offset"] is None:
+                    break
+                offset = chunk["next_offset"]
+            data = b"".join(chunks)
+            self.assertEqual(len(data), result["byte_size"])
+            self.assertEqual(sha(data), result["diff_sha256"])
+            self.assertIn(b"-first", data)
+            self.assertIn(b"+second", data)
+
+    def test_text_artifact_requires_exact_full_commit_sha(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        with patch.object(
+            artifacts, "TEXT_ARTIFACT_ROOT", self.root / "text-artifacts"
+        ):
+            with self.assertRaisesRegex(ValueError, "full lowercase"):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1", str(repository), "HEAD~1", head_commit
+                )
+            with self.assertRaisesRegex(ValueError, "full lowercase"):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1", str(repository), base_commit, "HEAD"
+                )
+
+    def test_text_artifact_read_rejects_tampering(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+            path = artifact_root / result["artifact_id"] / result["filename"]
+            path.write_bytes(path.read_bytes() + b"tampered")
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "integrity verification"
+            ):
+                artifacts.read_text_artifact(
+                    result["artifact_id"],
+                    result["diff_sha256"],
+                    result["receipt_sha256"],
+                )
+
+
+    def test_text_artifact_read_missing_root_is_side_effect_free(self) -> None:
+        artifact_root = self.root / "missing-text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "directory open failed"
+            ):
+                artifacts.read_text_artifact(
+                    "0" * 32,
+                    "1" * 64,
+                    "2" * 64,
+                )
+        self.assertFalse(artifact_root.exists())
+
+    def test_text_artifact_publish_rolls_back_when_audit_fails(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root),
+            patch.object(
+                artifacts.base,
+                "_append_audit",
+                side_effect=RuntimeError("audit unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError,
+                "audit failed; publication was rolled back",
+            ):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1",
+                    str(repository),
+                    base_commit,
+                    head_commit,
+                )
+        self.assertTrue(artifact_root.is_dir())
+        self.assertEqual(list(artifact_root.iterdir()), [])
+
+    def test_text_artifact_read_requires_pinned_receipt_hash(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "receipt hash precondition"
+            ):
+                artifacts.read_text_artifact(
+                    result["artifact_id"], result["diff_sha256"], "0" * 64
+                )
+
+    def test_text_artifact_ignores_git_replace_refs(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        self._git(repository, "checkout", "--detach", base_commit)
+        (repository / "value.txt").write_text("replacement\n")
+        self._git(repository, "commit", "-am", "replacement")
+        replacement_commit = self._git(repository, "rev-parse", "HEAD")
+        self._git(repository, "replace", head_commit, replacement_commit)
+        artifact_root = self.root / "text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+            data = (
+                artifact_root / result["artifact_id"] / result["filename"]
+            ).read_bytes()
+        self.assertIn(b"+second", data)
+        self.assertNotIn(b"+replacement", data)
+
+    def test_text_artifact_read_rejects_symlinked_receipt(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+            directory = artifact_root / result["artifact_id"]
+            receipt = directory / "receipt.json"
+            external = self.root / "external-receipt.json"
+            external.write_bytes(receipt.read_bytes())
+            external.chmod(0o600)
+            receipt.unlink()
+            receipt.symlink_to(external)
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "file open failed"
+            ):
+                artifacts.read_text_artifact(
+                    result["artifact_id"],
+                    result["diff_sha256"],
+                    result["receipt_sha256"],
+                )
+
+    def test_text_artifact_read_rejects_hardlinked_diff(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            result = artifacts.publish_text_artifact(
+                "git-diff.v1", str(repository), base_commit, head_commit
+            )
+            path = artifact_root / result["artifact_id"] / result["filename"]
+            (self.root / "external-diff.txt").hardlink_to(path)
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError,
+                "not one private owner-controlled regular file",
+            ):
+                artifacts.read_text_artifact(
+                    result["artifact_id"],
+                    result["diff_sha256"],
+                    result["receipt_sha256"],
+                )
+
+    def test_text_artifact_blocks_private_key_markers(self) -> None:
+        repository, base_commit, _ = self._repository_with_two_commits()
+        private_key_marker = (
+            "-----" + "BEGIN OPENSSH " + "PRIVATE " + "KEY-----"
+        )
+        (repository / "value.txt").write_text(
+            private_key_marker + "\nnot-a-real-key\n"
+        )
+        self._git(repository, "commit", "-am", "secret marker")
+        head_commit = self._git(repository, "rev-parse", "HEAD")
+        with patch.object(
+            artifacts, "TEXT_ARTIFACT_ROOT", self.root / "text-artifacts"
+        ):
+            with self.assertRaisesRegex(PermissionError, "private-key marker"):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1", str(repository), base_commit, head_commit
+                )
 
 if __name__ == "__main__":
     unittest.main()

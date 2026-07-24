@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "ce312d6cda3dd9467852c20578dfd2249de6252b3e853414ca9ef54ad2340771"
+    "sha256": "47832b4ac08d2d9cd68ddfc1497226c55ceece6afbdd4957b43ccc3299e79a49"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "fe56d8a1d6fca03e0eea610bcd69ae084488ce1f35c915e6bd31c4a2fffc6e4d"
+    "sha256": "bc5924efbfcaa40ac7e758980c5629de583dae4669a516b04649c5c3060054a7"
   },
   "counts": {
     "core": 22,
-    "full": 167,
-    "operator": 152
+    "full": 169,
+    "operator": 154
   },
   "profiles": {
     "core": [
@@ -173,6 +173,8 @@
       "grabowski_artifact_stat",
       "grabowski_artifact_push",
       "grabowski_artifact_pull",
+      "grabowski_text_artifact_publish",
+      "grabowski_text_artifact_read",
       "grabowski_browser_worker_start",
       "grabowski_browser_worker_stored_form_action",
       "grabowski_browser_worker_status",
@@ -327,6 +329,8 @@
       "grabowski_artifact_stat",
       "grabowski_artifact_push",
       "grabowski_artifact_pull",
+      "grabowski_text_artifact_publish",
+      "grabowski_text_artifact_read",
       "grabowski_browser_worker_start",
       "grabowski_browser_worker_stored_form_action",
       "grabowski_browser_worker_status",

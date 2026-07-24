@@ -685,6 +685,55 @@
         "tool": "grabowski_task_archive_read"
       }
     },
+    "grabowski_text_artifact_publish": {
+      "evidence_refs": [
+        "contract:git-diff-artifact.v1",
+        "docs:text-artifact-export.md",
+        "tests:test_artifacts.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only bounded publication of one UTF-8 Git diff from two exact commits into the private text-artifact root.",
+        "evidence": "Exact worktree-root and commit verification, argv-only Git execution, 120-second and 32-MiB limits, no external diff/textconv, high-confidence secret rejection, atomic private writes, fsync and SHA-256 readback."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A typed generic terminal or file-transfer operation was rejected because it would inherit broader path and command authority and could not enforce exact full commit SHAs, Git diff flags, secret blocking, atomic publication and receipt binding as one boundary.",
+      "rationale": "Commit-bound text publication creates an immutable local artifact and receipt under a private retention root. This mutation must remain separate from generic file transfer and terminal execution authority.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "artifact",
+        "effects": [
+          "local-file-create",
+          "receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "artifact-retention-dependent",
+        "risk_class": "high",
+        "tool": "grabowski_text_artifact_publish"
+      }
+    },
+    "grabowski_text_artifact_read": {
+      "evidence_refs": [
+        "contract:git-diff-artifact.v1",
+        "docs:text-artifact-export.md",
+        "tests:test_artifacts.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only a verified, offset-bound chunk from one previously published text artifact.",
+        "evidence": "Caller-supplied receipt and artifact SHA-256 preconditions, canonical receipt validation, full-file integrity recheck, 256-KiB chunk cap, chunk SHA-256 and no arbitrary path input."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic file reads and artifact pull were rejected because they require a shared or registered destination filesystem. Terminal/base64 output was rejected because it lacks a typed offset contract, per-chunk hashes and caller-pinned whole-artifact and receipt identities.",
+      "rationale": "The isolated client filesystem cannot read the host artifact path. A bounded chunk response with external artifact and receipt hash preconditions is materially different from path-based file reads.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "artifact",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_text_artifact_read"
+      }
+    },
     "ipad_capability_manifest": {
       "evidence_refs": [
         "docs:juno-ipad-storage.md",
@@ -914,6 +963,29 @@
         "tool": "ipad_storage_inventory"
       }
     },
+    "repoground_agent_handoff": {
+      "evidence_refs": [
+        "bureau:REPOGROUND-AGENT-UTILITY-V1-T004",
+        "tests:tests/test_repoground_bundles.py",
+        "proof:docs/proofs/repoground-agent-utility-v1-t004-paired-baseline-20260723.json"
+      ],
+      "exception_detail": {
+        "claim": "This tool adds one caller-explicit read-only handoff boundary for exactly three proven agent operations without default routing or mutation authority.",
+        "evidence": "Tests enforce the exact operation and retrieval-mode sets, no automatic/default promotion, no write path, delegated bounded RepoGround evidence, separate live-read authority, and paired baseline preservation across RepoGround/Lenskit and Bureau."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Requiring every agent to compose native live reads and RepoGround context client-side was rejected because it would duplicate routing semantics and blur authority boundaries; automatic global routing was rejected because T004 has evidence only for three bounded operations.",
+      "rationale": "The three proven agent operations need one narrow caller-selected handoff contract that preserves explicit choice among native live tools, RepoGround context, combined use, or no additional retrieval while keeping all execution and write authority outside RepoGround.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "repoground_agent_handoff"
+      }
+    },
     "repoground_bundle_discover": {
       "evidence_refs": [
         "bureau:heimgewebe/bureau#673",
@@ -978,29 +1050,6 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "repoground_context_compose"
-      }
-    },
-    "repoground_agent_handoff": {
-      "evidence_refs": [
-        "bureau:REPOGROUND-AGENT-UTILITY-V1-T004",
-        "tests:tests/test_repoground_bundles.py",
-        "proof:docs/proofs/repoground-agent-utility-v1-t004-paired-baseline-20260723.json"
-      ],
-      "exception_detail": {
-        "claim": "This tool adds one caller-explicit read-only handoff boundary for exactly three proven agent operations without default routing or mutation authority.",
-        "evidence": "Tests enforce the exact operation and retrieval-mode sets, no automatic/default promotion, no write path, delegated bounded RepoGround evidence, separate live-read authority, and paired baseline preservation across RepoGround/Lenskit and Bureau."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Requiring every agent to compose native live reads and RepoGround context client-side was rejected because it would duplicate routing semantics and blur authority boundaries; automatic global routing was rejected because T004 has evidence only for three bounded operations.",
-      "rationale": "The three proven agent operations need one narrow caller-selected handoff contract that preserves explicit choice among native live tools, RepoGround context, combined use, or no additional retrieval while keeping all execution and write authority outside RepoGround.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "knowledge",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "repoground_agent_handoff"
       }
     },
     "repoground_context_pack": {

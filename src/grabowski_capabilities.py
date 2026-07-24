@@ -848,6 +848,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["local-file-create-or-replace", "temporary-file-create"],
         "reversibility": "destination-preimage-dependent",
     },
+    "grabowski_text_artifact_publish": {
+        "category": "artifact",
+        "purpose": "Produce one bounded .txt unified diff from two exact Git commit SHAs.",
+        "risk_class": "high",
+        "effects": ["local-file-create", "receipt-create"],
+        "reversibility": "artifact-retention-dependent",
+    },
+    "grabowski_text_artifact_read": {
+        "category": "artifact",
+        "purpose": "Transfer a verified text artifact across isolated runtime filesystems.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
 }
 
 
