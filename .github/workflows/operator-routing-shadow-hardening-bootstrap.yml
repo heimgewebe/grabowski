@@ -23,16 +23,38 @@ jobs:
           from pathlib import Path
           path = Path('tools/_bootstrap_routing_shadow_hardening.py')
           text = path.read_text(encoding='utf-8')
-          old_signature = r')(    \) -> dict\[str, Any\]:)'
-          new_signature = r')(\) -> dict\[str, Any\]:)'
-          if text.count(old_signature) != 1:
-              raise SystemExit(f'bootstrap signature guard count={text.count(old_signature)}')
-          text = text.replace(old_signature, new_signature)
-          old_backref = "\n\\1'''"
-          new_backref = "\n\\\\1'''"
-          if text.count(old_backref) != 2:
-              raise SystemExit(f'bootstrap replacement backref count={text.count(old_backref)}')
-          path.write_text(text.replace(old_backref, new_backref), encoding='utf-8')
+          replacements = [
+              (
+                  r')(    \) -> dict\[str, Any\]:)',
+                  r')(\) -> dict\[str, Any\]:)',
+                  1,
+                  'signature guard',
+              ),
+              (
+                  "\n\\1'''",
+                  "\n\\\\1'''",
+                  2,
+                  'replacement backrefs',
+              ),
+              (
+                  r'\n.*?    prospective = eligibility\["prospective_eligibility"\]',
+                  r'\n(?:(?!\ndef ).)*?    prospective = eligibility\["prospective_eligibility"\]',
+                  1,
+                  'builder function boundary',
+              ),
+              (
+                  r'\n.*?    if record\.get\("no_effect"\) != NO_EFFECT:',
+                  r'\n(?:(?!\ndef ).)*?    if record\.get\("no_effect"\) != NO_EFFECT:',
+                  1,
+                  'validator function boundary',
+              ),
+          ]
+          for old, new, expected, label in replacements:
+              count = text.count(old)
+              if count != expected:
+                  raise SystemExit(f'bootstrap {label} count={count}, expected={expected}')
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8')
           PY
       - name: Apply guarded hardening patch
         id: patch
