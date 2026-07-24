@@ -55,6 +55,12 @@ PROBE_DIGEST_FIELDS = (
     "model_invocations",
     "paid_api_requests_authorized",
 )
+PROBE_VERIFIABLE_QUOTA_POOLS = (
+    "grok-com",
+    "jules-account",
+    "opencode-free",
+    "openhands-account",
+)
 SENSITIVE_PROBE_FIELD_TOKENS = (
     "password",
     "passwd",
@@ -614,7 +620,7 @@ def validate_probe(probe: dict[str, Any]) -> None:
         or any(not isinstance(pool_id, str) for pool_id in verified_pools)
         or len(set(verified_pools)) != len(verified_pools)
         or any(
-            pool_id not in {"grok-com", "jules-account"}
+            pool_id not in PROBE_VERIFIABLE_QUOTA_POOLS
             for pool_id in verified_pools
         )
     ):
@@ -633,7 +639,7 @@ def _expected_probe_pools(
     if not isinstance(pools, dict):
         raise ProbeSchedulerError("router pool state before probe is invalid")
     verified_pools = set(probe.get("verified_quota_pools", []))
-    for pool_id in ("grok-com", "jules-account"):
+    for pool_id in PROBE_VERIFIABLE_QUOTA_POOLS:
         existing = pools.get(pool_id)
         if pool_id in verified_pools:
             if existing is not None and not isinstance(existing, dict):
