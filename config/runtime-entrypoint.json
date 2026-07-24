@@ -124,6 +124,9 @@
     "grabowski_bureau_task_review",
     "grabowski_bureau_task_publish_preview",
     "grabowski_bureau_task_publish",
+    "grabowski_bureau_pickup_execute",
+    "grabowski_bureau_pickup_status",
+    "grabowski_bureau_pickup_release",
     "grabowski_resource_nonconflict_assess",
     "grabowski_resource_reconcile_obsolete_path_leases",
     "grabowski_resource_acquire",
@@ -330,6 +333,10 @@
     {
       "module": "grabowski_bureau_intake",
       "source": "src/grabowski_bureau_intake.py"
+    },
+    {
+      "module": "grabowski_bureau_pickup",
+      "source": "src/grabowski_bureau_pickup.py"
     },
     {
       "module": "grabowski_nonconflict",

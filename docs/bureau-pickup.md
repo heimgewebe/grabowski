@@ -6,7 +6,7 @@ Bureau remains authoritative for task eligibility, run identity, reservations, w
 
 ## Integration state
 
-This module is the tested orchestration core. Tool decorators are inert until import; capability registration and runtime import are deliberately added only in the separately reviewed integration change after the current MCP-surface work has landed.
+The module declares three canonical MCP tools: `grabowski_bureau_pickup_execute`, `grabowski_bureau_pickup_status` and `grabowski_bureau_pickup_release`. The production runtime imports the module for registration, the deployment manifest includes the module and tools, and the capability catalogue classifies execute and release as operator-gated effects while status remains read-only. These source declarations do not establish that a particular runtime release has already been deployed; deployment identity and live tool readback remain separate evidence.
 
 ## Execute path
 

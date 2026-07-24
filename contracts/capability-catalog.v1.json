@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "b79ead098b1e0c52f37f10884b4573c27aaaf6846fe0eb8a2722db2de45325bf",
+  "capability_source_sha256": "827fb2855e3d1778813910a959ac5f37520c00d4789aae1e9bd7238aa2366a29",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "47832b4ac08d2d9cd68ddfc1497226c55ceece6afbdd4957b43ccc3299e79a49",
+  "contract_sha256": "150e961ac8c80e5cdf7e6e2aa4d018ce05e3a300da12dcfc7445ab632c6017eb",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1554,6 +1554,48 @@
       "reversibility": "git-and-github-recovery",
       "risk_class": "high",
       "tool": "grabowski_bureau_task_publish"
+    },
+    {
+      "category": "bureau",
+      "description": "Coordinate one Bureau claim with owner-bound Grabowski leases and recovery.",
+      "effects": [
+        "bureau_claim_intent",
+        "resource_lease",
+        "bureau_run_assignment",
+        "workspace_create",
+        "private_pickup_journal"
+      ],
+      "id": "grabowski_bureau_pickup_execute",
+      "purpose": "Coordinate one exact Bureau claim intent with owner-bound live Grabowski leases, immutable private evidence and authoritative recovery.",
+      "read_only": false,
+      "reversibility": "authoritative-readback-and-compensation",
+      "risk_class": "high",
+      "tool": "grabowski_bureau_pickup_execute"
+    },
+    {
+      "category": "bureau",
+      "description": "Read one coordinated Bureau run and its owner-bound lease state.",
+      "effects": [],
+      "id": "grabowski_bureau_pickup_status",
+      "purpose": "Read one coordinated Bureau run and its owner-bound lease state without creating or changing coordination truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_bureau_pickup_status"
+    },
+    {
+      "category": "bureau",
+      "description": "Release exactly one terminal coordinated run's unchanged Grabowski leases.",
+      "effects": [
+        "resource_lease_release",
+        "private_release_receipt"
+      ],
+      "id": "grabowski_bureau_pickup_release",
+      "purpose": "Release exactly the unchanged owner-bound Grabowski leases recorded for one authoritatively terminal Bureau run.",
+      "read_only": false,
+      "reversibility": "terminal-bound-idempotent-release",
+      "risk_class": "high",
+      "tool": "grabowski_bureau_pickup_release"
     },
     {
       "category": "resource",

@@ -223,6 +223,84 @@
         "tool": "grabowski_bureau_candidate_record"
       }
     },
+    "grabowski_bureau_pickup_execute": {
+      "evidence_refs": [
+        "bureau:OPERATOR-INTEGRATION-LOOP-V1-T005",
+        "docs:bureau-pickup.md",
+        "tests:test_bureau_pickup.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the coordinated transition from one reviewed Bureau claim intent through exact owner-bound Grabowski lease acquisition to one Bureau assignment or authoritative recovery.",
+        "evidence": "Exact task/run/intent binding, canonical live lease authority, immutable private journal, bounded two-phase acquisition, compensation on definitive non-commit, recovery-required on ambiguity and focused conflict/retry tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A generic terminal command or typed argv operation was rejected because neither can preserve the cross-domain Bureau intent, live lease snapshot, compensation journal, ambiguous-commit readback and exact workspace identity as one bounded contract.",
+      "rationale": "Coordinated pickup crosses two existing authorities without owning either: Bureau eligibility/run truth and Grabowski live lease truth. A dedicated tool is required to expose that narrowly typed two-phase boundary without granting arbitrary command execution or creating a second lifecycle model.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "bureau_claim_intent",
+          "bureau_run_assignment",
+          "private_pickup_journal",
+          "resource_lease",
+          "workspace_create"
+        ],
+        "read_only": false,
+        "reversibility": "authoritative-readback-and-compensation",
+        "risk_class": "high",
+        "tool": "grabowski_bureau_pickup_execute"
+      }
+    },
+    "grabowski_bureau_pickup_release": {
+      "evidence_refs": [
+        "bureau:OPERATOR-INTEGRATION-LOOP-V1-T005",
+        "docs:bureau-pickup.md",
+        "tests:test_bureau_pickup.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only release of the exact unchanged owner-bound lease set journaled for one authoritatively terminal coordinated Bureau run.",
+        "evidence": "Terminal Bureau readback, acquisition digest validation, exact owner/resource/intent binding, live metadata identity checks, idempotent absent-lease handling and immutable release receipt tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic resource-release or terminal execution was rejected because it cannot prove terminal Bureau state, bind the release to the immutable acquisition journal, reject metadata drift and limit effects to the original run-owned lease set.",
+      "rationale": "Terminal lease release is a separate high-risk authority boundary from claim execution. Its dedicated surface prevents active-run release and foreign or drifted lease deletion while retaining exact release evidence.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "bureau",
+        "effects": [
+          "private_release_receipt",
+          "resource_lease_release"
+        ],
+        "read_only": false,
+        "reversibility": "terminal-bound-idempotent-release",
+        "risk_class": "high",
+        "tool": "grabowski_bureau_pickup_release"
+      }
+    },
+    "grabowski_bureau_pickup_status": {
+      "evidence_refs": [
+        "bureau:OPERATOR-INTEGRATION-LOOP-V1-T005",
+        "docs:bureau-pickup.md",
+        "tests:test_bureau_pickup.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool returns only the canonical coordinated-run projection plus bounded local journal availability and performs no claim, lease or workspace mutation.",
+        "evidence": "Read-only Bureau coordination call, symlink-safe non-creating journal probe, explicit read-only MCP annotation, empty effects and focused status tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Reusing execute or release was rejected because a read-only recovery probe must remain callable without mutation authority; a generic command would expose broader process and filesystem access and lose typed run/lease semantics.",
+      "rationale": "Recovery needs a separately callable read-only shape that distinguishes coordinated, drifted, terminal-release-pending and absent-journal states without starting or releasing anything.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "bureau",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_bureau_pickup_status"
+      }
+    },
     "grabowski_bureau_task_propose": {
       "evidence_refs": [
         "bureau:OPERATOR-MACHINE-READABILITY-V1-T017",

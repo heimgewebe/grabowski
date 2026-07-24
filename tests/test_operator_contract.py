@@ -310,6 +310,79 @@ class OperatorContractTests(unittest.TestCase):
         }
         self.assertEqual(expected, declared)
 
+    def test_bureau_pickup_runtime_capability_contract(self) -> None:
+        runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("import grabowski_bureau_pickup", runtime)
+
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        pickup_tools = {
+            "grabowski_bureau_pickup_execute",
+            "grabowski_bureau_pickup_status",
+            "grabowski_bureau_pickup_release",
+        }
+        self.assertTrue(pickup_tools.issubset(set(contract["expected_tools"])))
+        supporting = {
+            item["module"]: item["source"] for item in contract["supporting_sources"]
+        }
+        self.assertEqual(
+            supporting["grabowski_bureau_pickup"],
+            "src/grabowski_bureau_pickup.py",
+        )
+
+        tree = ast.parse(
+            (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
+        )
+        assignments: dict[str, object] = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in {
+                    "TOOL_CAPABILITY_REQUIREMENTS",
+                    "OPERATOR_CAPABILITY_REQUIREMENT_TOOLS",
+                }
+            ):
+                assignments[node.targets[0].id] = ast.literal_eval(node.value)
+        requirements = assignments["TOOL_CAPABILITY_REQUIREMENTS"]
+        operator_tools = assignments["OPERATOR_CAPABILITY_REQUIREMENT_TOOLS"]
+        self.assertEqual(
+            requirements["grabowski_bureau_pickup_execute"],
+            ("resource_lease", "terminal_execute"),
+        )
+        self.assertEqual(requirements["grabowski_bureau_pickup_status"], ())
+        self.assertEqual(
+            requirements["grabowski_bureau_pickup_release"],
+            ("resource_lease", "terminal_execute"),
+        )
+        self.assertIn("grabowski_bureau_pickup_execute", operator_tools)
+        self.assertIn("grabowski_bureau_pickup_release", operator_tools)
+        self.assertNotIn("grabowski_bureau_pickup_status", operator_tools)
+
+        capability_tree = ast.parse(
+            (ROOT / "src" / "grabowski_capabilities.py").read_text(encoding="utf-8")
+        )
+        profiles: dict[str, object] = {}
+        for node in ast.walk(capability_tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "TOOL_PROFILES"
+                and node.func.attr == "update"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Dict)
+            ):
+                profiles.update(ast.literal_eval(node.args[0]))
+        self.assertEqual(profiles["grabowski_bureau_pickup_execute"]["risk_class"], "high")
+        self.assertEqual(profiles["grabowski_bureau_pickup_status"]["effects"], [])
+        self.assertEqual(
+            profiles["grabowski_bureau_pickup_release"]["reversibility"],
+            "terminal-bound-idempotent-release",
+        )
+
     def test_policy_no_longer_forbids_operator_core(self) -> None:
         policy = json.loads(
             (

@@ -18,6 +18,10 @@ try:
 except ModuleNotFoundError:
     import grabowski_operator as operator
 
+mcp = operator.mcp
+READ_ONLY = operator.READ_ONLY
+MUTATING = operator.MUTATING
+
 SCHEMA_VERSION = 1
 STATE_ROOT = Path(
     os.environ.get(
@@ -925,9 +929,11 @@ def _recover_after_commit(
     }
 
 
+@mcp.tool(name="grabowski_bureau_pickup_execute", annotations=MUTATING)
 def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
     """Coordinate one Bureau claim with owner-bound Grabowski leases and recovery."""
     operator._require_operator_mutation("terminal_execute")
+    operator._require_operator_mutation("resource_lease")
     normalized = _normalize_request(request)
     request_sha256 = _sha256(normalized)
     intent_payload = _claim_intent(normalized)
@@ -1060,6 +1066,7 @@ def _journal_available(run_id: str) -> bool:
     return True
 
 
+@mcp.tool(name="grabowski_bureau_pickup_status", annotations=READ_ONLY)
 def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
     """Read one coordinated Bureau run and its owner-bound lease state."""
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
@@ -1141,9 +1148,11 @@ def _verify_release_binding(
     return owner_id, keys
 
 
+@mcp.tool(name="grabowski_bureau_pickup_release", annotations=MUTATING)
 def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     """Release exactly one terminal coordinated run's unchanged Grabowski leases."""
     operator._require_operator_mutation("terminal_execute")
+    operator._require_operator_mutation("resource_lease")
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
     run_dir = _run_directory(normalized_run_id)
     acquisition = _read_bound_json(run_dir / "acquisition.json", label="acquisition")
