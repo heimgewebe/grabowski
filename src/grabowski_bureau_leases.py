@@ -391,6 +391,53 @@ def _json_object(raw: str) -> dict[str, Any]:
     return value
 
 
+def _contract_payload(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("kind") == CONTRACT_KIND:
+        return value
+    expected_keys = {"schema_version", "result", "runtime_identity"}
+    if set(value) != expected_keys:
+        raise BureauLeaseContractError(
+            "contract-envelope-shape-invalid",
+            details={
+                "missing_keys": sorted(expected_keys - set(value)),
+                "extra_keys": sorted(set(value) - expected_keys),
+            },
+        )
+    if value.get("schema_version") != 1:
+        raise BureauLeaseContractError("contract-envelope-schema-version-mismatch")
+    result = value.get("result")
+    if not isinstance(result, dict):
+        raise BureauLeaseContractError("contract-envelope-result-invalid")
+    identity = value.get("runtime_identity")
+    if not isinstance(identity, dict) or identity.get("schema_version") != 1:
+        raise BureauLeaseContractError("contract-runtime-identity-invalid")
+    if identity.get("kind") != "bureau_runtime_identity":
+        raise BureauLeaseContractError("contract-runtime-identity-kind-mismatch")
+    manifest = identity.get("manifest")
+    if not isinstance(manifest, dict) or manifest.get("valid") is not True:
+        raise BureauLeaseContractError("contract-runtime-manifest-invalid")
+    source_commit = manifest.get("source_commit")
+    if (
+        not isinstance(source_commit, str)
+        or _EXPECTED_HEAD_RE.fullmatch(source_commit) is None
+    ):
+        raise BureauLeaseContractError("contract-runtime-source-commit-invalid")
+    registry = identity.get("registry")
+    registry_valid = (
+        isinstance(registry, dict)
+        and registry.get("available") is True
+        and registry.get("bureau_project") is True
+        and registry.get("dirty") is False
+        and registry.get("role") == "canonical-runtime-snapshot"
+        and registry.get("head_equals_origin_main") is True
+        and registry.get("head") == source_commit
+        and registry.get("origin_main") == source_commit
+    )
+    if not registry_valid:
+        raise BureauLeaseContractError("contract-runtime-registry-invalid")
+    return result
+
+
 def enforce_bureau_lease_contract(
     resource_keys: Iterable[str],
     *,
@@ -475,7 +522,8 @@ def enforce_bureau_lease_contract(
                 "stderr_sha256": stderr_sha256,
             },
         )
-    value = _json_object(completed.stdout)
+    output = _json_object(completed.stdout)
+    value = _contract_payload(output)
     if value.get("schema_version") != CONTRACT_SCHEMA_VERSION:
         raise BureauLeaseContractError("contract-schema-version-mismatch")
     if value.get("kind") != CONTRACT_KIND:
