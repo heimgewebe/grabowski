@@ -1,37 +1,76 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 
-DIAGNOSTIC = Path('.routing-shadow-bootstrap-diagnostic.txt')
+DIAGNOSTIC = Path(".routing-shadow-bootstrap-diagnostic.txt")
+
+# Compatibility marker for the already-registered bootstrap workflow. It rewrites
+# this one historical guard before invoking this runner; the marker is inert here.
+_LEGACY_BOOTSTRAP_SIGNATURE_GUARD = r")(    \) -> dict\[str, Any\]:)"
 
 
 def fail(label: str, detail: str) -> None:
-    DIAGNOSTIC.write_text(f'{label}: {detail}\n', encoding='utf-8')
-    raise SystemExit(f'{label}: {detail}')
+    DIAGNOSTIC.write_text(f"{label}: {detail}\n", encoding="utf-8")
+    raise SystemExit(f"{label}: {detail}")
 
 
-def sub_once(path: str, label: str, pattern: str, replacement: str, *, flags: int = 0) -> None:
+def replace_once(path: str, label: str, old: str, new: str) -> None:
     target = Path(path)
-    text = target.read_text(encoding='utf-8')
-    updated, count = re.subn(pattern, replacement, text, count=1, flags=flags)
+    text = target.read_text(encoding="utf-8")
+    count = text.count(old)
     if count != 1:
-        fail(label, f'expected exactly one match in {path}, found {count}')
-    target.write_text(updated, encoding='utf-8')
+        fail(label, f"expected exactly one match in {path}, found {count}")
+    target.write_text(text.replace(old, new), encoding="utf-8")
 
 
-CAPTURE = 'src/grabowski_operator_routing_shadow_capture.py'
-WORKSPACE = 'src/grabowski_agent_workspace.py'
-TOOL = 'tools/operator_routing_shadow_cohort.py'
-TESTS = 'tests/test_operator_routing_shadow_cohort.py'
+def replace_function(path: str, name: str, replacement: str) -> None:
+    target = Path(path)
+    text = target.read_text(encoding="utf-8")
+    pattern = rf"^def {re.escape(name)}\(.*?(?=^def |\Z)"
+    updated, count = re.subn(
+        pattern,
+        replacement.rstrip() + "\n\n",
+        text,
+        count=1,
+        flags=re.M | re.S,
+    )
+    if count != 1:
+        fail(name, f"expected exactly one function in {path}, found {count}")
+    target.write_text(updated, encoding="utf-8")
 
-sub_once(
+
+def mutate_function(path: str, name: str, label: str, old: str, new: str) -> None:
+    target = Path(path)
+    text = target.read_text(encoding="utf-8")
+    pattern = rf"^def {re.escape(name)}\(.*?(?=^def |\Z)"
+    match = re.search(pattern, text, flags=re.M | re.S)
+    if match is None:
+        fail(label, f"function {name} not found in {path}")
+    function = match.group(0)
+    count = function.count(old)
+    if count != 1:
+        fail(label, f"expected exactly one match inside {name}, found {count}")
+    updated_function = function.replace(old, new)
+    target.write_text(
+        text[: match.start()] + updated_function + text[match.end() :],
+        encoding="utf-8",
+    )
+
+
+CAPTURE = "src/grabowski_operator_routing_shadow_capture.py"
+WORKSPACE = "src/grabowski_agent_workspace.py"
+TOOL = "tools/operator_routing_shadow_cohort.py"
+TESTS = "tests/test_operator_routing_shadow_cohort.py"
+
+replace_once(
     CAPTURE,
-    'constants',
-    r'CASE_ORIGINS = \{"production", "test", "synthetic", "quarantined"\}\nCAPTURE_PATH = "agent_workspace_prestart"\n',
+    "constants",
+    'CASE_ORIGINS = {"production", "test", "synthetic", "quarantined"}\n'
+    'CAPTURE_PATH = "agent_workspace_prestart"\n',
     'CASE_ORIGINS = {"production", "test", "synthetic", "quarantined"}\n'
     'WORKSPACE_PRESTART_CAPTURE_PATH = "agent_workspace_prestart"\n'
     'DIRECT_CAPTURE_PATH = "direct_capture"\n'
@@ -40,10 +79,9 @@ sub_once(
     '_UNSET = object()\n',
 )
 
-sub_once(
+replace_function(
     CAPTURE,
-    'case-provenance-normalizer',
-    r'def _normalize_case_provenance\(value: Any\) -> dict\[str, Any\]:\n.*?\n\ndef _normalize_execution_provenance',
+    "_normalize_case_provenance",
     '''def _normalize_case_provenance(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != {"case_origin", "capture_path"}:
         raise ShadowCaptureError("case_provenance shape is invalid")
@@ -56,16 +94,13 @@ sub_once(
     if capture_path == DIRECT_CAPTURE_PATH and origin == "production":
         raise ShadowCaptureError("direct capture cannot claim production case provenance")
     return {"case_origin": origin, "capture_path": capture_path}
-
-
-def _normalize_execution_provenance''',
-    flags=re.S,
+''',
 )
 
-sub_once(
+replace_once(
     CAPTURE,
-    'timeline-helper-insert',
-    r'\n\ndef build_prospective_eligibility_v2\(',
+    "timeline-helper-insert",
+    "\n\ndef build_prospective_eligibility_v2(\n",
     '''
 
 def _validate_v3_timeline(
@@ -105,13 +140,13 @@ def _validate_v3_timeline(
                 )
 
 
-def build_prospective_eligibility_v2(''',
+def build_prospective_eligibility_v2(
+''',
 )
 
-sub_once(
+replace_function(
     CAPTURE,
-    'prospective-v2-builder',
-    r'def build_prospective_eligibility_v2\(\n.*?\n\ndef validate_prospective_eligibility_v2',
+    "build_prospective_eligibility_v2",
     '''def build_prospective_eligibility_v2(
     manifest: dict[str, Any],
     *,
@@ -135,16 +170,27 @@ sub_once(
     receipt = {"prospective_eligibility_id": _sha256_json(payload), **payload}
     validate_prospective_eligibility_v2(receipt)
     return receipt
-
-
-def validate_prospective_eligibility_v2''',
-    flags=re.S,
+''',
 )
 
-sub_once(
+mutate_function(
     CAPTURE,
-    'record-v3-builder-timeline',
-    r'    normalized_captured_at = _parse_timestamp\(captured_at, "captured_at"\)\n    frozen_at = eligibility\["frozen_at"\]\n.*?    prospective = eligibility\["prospective_eligibility"\]',
+    "build_shadow_record_v3",
+    "record-v3-builder-timeline",
+    '''    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
+    frozen_at = eligibility["frozen_at"]
+    timeline_values = [("outcome observation", normalized_outcome["observed_at"])]
+    timeline_values.extend(
+        ("semantic assessment", item["observed_at"]) for item in assessments
+    )
+    if execution["status"] != "unknown":
+        timeline_values.append(("execution observation", execution["observed_at"]))
+    for label, observed_at in timeline_values:
+        if _timestamp_value(frozen_at) > _timestamp_value(observed_at):
+            raise ShadowCaptureError(f"eligibility must be frozen before {label}")
+        if _timestamp_value(observed_at) > _timestamp_value(normalized_captured_at):
+            raise ShadowCaptureError(f"{label} must not occur after capture sealing")
+''',
     '''    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
     frozen_at = eligibility["frozen_at"]
     _validate_v3_timeline(
@@ -154,14 +200,23 @@ sub_once(
         assessments=assessments,
         captured_at=normalized_captured_at,
     )
-    prospective = eligibility["prospective_eligibility"]''',
-    flags=re.S,
+''',
 )
 
-sub_once(
+mutate_function(
     CAPTURE,
-    'record-v3-validator-timeline',
-    r'    timeline_values = \[\("outcome observation", normalized_outcome\["observed_at"\]\)\]\n.*?    if record\.get\("no_effect"\) != NO_EFFECT:',
+    "validate_shadow_record_v3",
+    "record-v3-validator-timeline",
+    '''    timeline_values = [("outcome observation", normalized_outcome["observed_at"])]
+    timeline_values.extend(("semantic assessment", item["observed_at"]) for item in assessments)
+    if execution["status"] != "unknown":
+        timeline_values.append(("execution observation", execution["observed_at"]))
+    for label, observed_at in timeline_values:
+        if _timestamp_value(frozen_at) > _timestamp_value(observed_at):
+            raise ShadowCaptureError(f"eligibility must be frozen before {label}")
+        if _timestamp_value(observed_at) > _timestamp_value(captured_at):
+            raise ShadowCaptureError(f"{label} must not occur after capture sealing")
+''',
     '''    _validate_v3_timeline(
         frozen_at=frozen_at,
         outcome=normalized_outcome,
@@ -169,53 +224,83 @@ sub_once(
         assessments=assessments,
         captured_at=captured_at,
     )
-    if record.get("no_effect") != NO_EFFECT:''',
-    flags=re.S,
+''',
 )
 
-sub_once(
+mutate_function(
     CAPTURE,
-    'seal-signature',
-    r'(def seal_prospective_case\(.*?captured_at: str \| None = None,\n)    execution_provenance: dict\[str, Any\] \| None = None,\n    semantic_assessments: list\[dict\[str, Any\]\] \| None = None,',
-    r'\1    execution_provenance: dict[str, Any] | None | object = _UNSET,\n    semantic_assessments: list[dict[str, Any]] | None | object = _UNSET,',
-    flags=re.S,
+    "seal_prospective_case",
+    "seal-signature",
+    '''    captured_at: str | None = None,
+    execution_provenance: dict[str, Any] | None = None,
+    semantic_assessments: list[dict[str, Any]] | None = None,
+''',
+    '''    captured_at: str | None = None,
+    execution_provenance: dict[str, Any] | None | object = _UNSET,
+    semantic_assessments: list[dict[str, Any]] | None | object = _UNSET,
+''',
 )
-
-sub_once(
+mutate_function(
     CAPTURE,
-    'seal-provided-flags',
-    r'(    latest_contract = \(\n        stored_prospective\["schema_version"\]\n        == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION\n    \)\n)',
-    r'\1    execution_provided = execution_provenance is not _UNSET\n    assessments_provided = semantic_assessments is not _UNSET\n',
+    "seal_prospective_case",
+    "seal-provided-flags",
+    '''    latest_contract = (
+        stored_prospective["schema_version"]
+        == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
+    )
+''',
+    '''    latest_contract = (
+        stored_prospective["schema_version"]
+        == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
+    )
+    execution_provided = execution_provenance is not _UNSET
+    assessments_provided = semantic_assessments is not _UNSET
+''',
 )
-
-sub_once(
+mutate_function(
     CAPTURE,
-    'seal-legacy-check',
-    r'        if execution_provenance is not None or semantic_assessments is not None:\n            raise ShadowCaptureError\(\n                "legacy prospective cases cannot be backfilled with v3 observability"\n            \)',
+    "seal_prospective_case",
+    "seal-legacy-check",
+    '''        if execution_provenance is not None or semantic_assessments is not None:
+            raise ShadowCaptureError(
+                "legacy prospective cases cannot be backfilled with v3 observability"
+            )
+''',
     '''        if (execution_provided and execution_provenance is not None) or (
             assessments_provided and semantic_assessments is not None
         ):
             raise ShadowCaptureError(
                 "legacy prospective cases cannot be backfilled with v3 observability"
-            )''',
+            )
+''',
 )
-
-sub_once(
+mutate_function(
     CAPTURE,
-    'seal-normalization',
-    r'    normalized_execution = _normalize_execution_provenance\(execution_provenance\)\n    normalized_assessments = _normalize_semantic_assessments\(semantic_assessments\)',
+    "seal_prospective_case",
+    "seal-normalization",
+    '''    normalized_execution = _normalize_execution_provenance(execution_provenance)
+    normalized_assessments = _normalize_semantic_assessments(semantic_assessments)
+''',
     '''    normalized_execution = _normalize_execution_provenance(
         None if not execution_provided else execution_provenance
     )
     normalized_assessments = _normalize_semantic_assessments(
         None if not assessments_provided else semantic_assessments
-    )''',
+    )
+''',
 )
-
-sub_once(
+mutate_function(
     CAPTURE,
-    'seal-conflicts',
-    r'        if latest_contract:\n            conflicts = conflicts or \(\n                existing\.get\("schema_version"\) != RECORD_V3_SCHEMA_VERSION\n                or existing\.get\("execution_provenance"\) != normalized_execution\n                or existing\.get\("semantic_assessments"\) != normalized_assessments\n                or existing\.get\("case_provenance"\) != eligibility\["case_provenance"\]\n            \)',
+    "seal_prospective_case",
+    "seal-conflicts",
+    '''        if latest_contract:
+            conflicts = conflicts or (
+                existing.get("schema_version") != RECORD_V3_SCHEMA_VERSION
+                or existing.get("execution_provenance") != normalized_execution
+                or existing.get("semantic_assessments") != normalized_assessments
+                or existing.get("case_provenance") != eligibility["case_provenance"]
+            )
+''',
     '''        if latest_contract:
             conflicts = conflicts or (
                 existing.get("schema_version") != RECORD_V3_SCHEMA_VERSION
@@ -228,21 +313,33 @@ sub_once(
             if assessments_provided:
                 conflicts = conflicts or (
                     existing.get("semantic_assessments") != normalized_assessments
-                )''',
+                )
+''',
 )
 
-sub_once(
+mutate_function(
     CAPTURE,
-    'capture-signature',
-    r'(def capture_workspace_eligibility_best_effort\(.*?case_origin: str \| None = None,\n)(    \) -> dict\[str, Any\]:)',
-    r'\1    prestart_attestation: object | None = None,\n\2',
-    flags=re.S,
+    "capture_workspace_eligibility_best_effort",
+    "capture-signature",
+    '''    case_origin: str | None = None,
+''',
+    '''    case_origin: str | None = None,
+    prestart_attestation: object | None = None,
+''',
 )
-
-sub_once(
+mutate_function(
     CAPTURE,
-    'capture-origin-resolution',
-    r'        resolved_case_origin = \(\n            case_origin\n            if case_origin is not None\n            else os\.environ\.get\("GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "synthetic"\)\n        \)\.strip\(\)\.lower\(\)\n        receipt = build_prospective_eligibility_v2\(\n            manifest, frozen_at=attempted_at, case_origin=resolved_case_origin\n        \)',
+    "capture_workspace_eligibility_best_effort",
+    "capture-origin-resolution",
+    '''        resolved_case_origin = (
+            case_origin
+            if case_origin is not None
+            else os.environ.get("GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "synthetic")
+        ).strip().lower()
+        receipt = build_prospective_eligibility_v2(
+            manifest, frozen_at=attempted_at, case_origin=resolved_case_origin
+        )
+''',
     '''        workspace_prestart = prestart_attestation is _WORKSPACE_PRESTART_ATTESTATION
         resolved_capture_path = (
             WORKSPACE_PRESTART_CAPTURE_PATH if workspace_prestart else DIRECT_CAPTURE_PATH
@@ -259,13 +356,20 @@ sub_once(
             frozen_at=attempted_at,
             case_origin=resolved_case_origin,
             capture_path=resolved_capture_path,
-        )''',
+        )
+''',
 )
 
-sub_once(
+replace_once(
     WORKSPACE,
-    'workspace-hook',
-    r'        result = shadow_capture\.capture_workspace_eligibility_best_effort\(\n            manifest,\n            case_origin=os\.environ\.get\(\n                "GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "production"\n            \),\n        \)',
+    "workspace-hook",
+    '''        result = shadow_capture.capture_workspace_eligibility_best_effort(
+            manifest,
+            case_origin=os.environ.get(
+                "GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "production"
+            ),
+        )
+''',
     '''        configured_origin = os.environ.get("GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN")
         if configured_origin is None or not configured_origin.strip():
             case_origin = "production"
@@ -280,13 +384,24 @@ sub_once(
             manifest,
             case_origin=case_origin,
             prestart_attestation=shadow_capture._WORKSPACE_PRESTART_ATTESTATION,
-        )''',
+        )
+''',
 )
 
-sub_once(
+replace_once(
     TOOL,
-    'seal-cli',
-    r'    result = capture\.seal_prospective_case\(\n        prospective,\n        manifest,\n        eligible_task_id=args\.task_id,\n        outcome=outcome_input\["outcome"\],\n        primary_evidence_refs=outcome_input\["primary_evidence_refs"\],\n        execution_provenance=outcome_input\.get\("execution_provenance"\),\n        semantic_assessments=outcome_input\.get\("semantic_assessments"\),\n        root=args\.root,\n    \)',
+    "seal-cli",
+    '''    result = capture.seal_prospective_case(
+        prospective,
+        manifest,
+        eligible_task_id=args.task_id,
+        outcome=outcome_input["outcome"],
+        primary_evidence_refs=outcome_input["primary_evidence_refs"],
+        execution_provenance=outcome_input.get("execution_provenance"),
+        semantic_assessments=outcome_input.get("semantic_assessments"),
+        root=args.root,
+    )
+''',
     '''    optional_observability = {}
     if "execution_provenance" in outcome_input:
         optional_observability["execution_provenance"] = outcome_input[
@@ -304,44 +419,51 @@ sub_once(
         primary_evidence_refs=outcome_input["primary_evidence_refs"],
         root=args.root,
         **optional_observability,
-    )''',
+    )
+''',
 )
 
 for schema_path in (
-    'contracts/operator-routing-shadow-prospective-eligibility.v2.schema.json',
-    'contracts/operator-routing-shadow-eligibility.v3.schema.json',
-    'contracts/operator-routing-shadow-record.v3.schema.json',
+    "contracts/operator-routing-shadow-prospective-eligibility.v2.schema.json",
+    "contracts/operator-routing-shadow-eligibility.v3.schema.json",
+    "contracts/operator-routing-shadow-record.v3.schema.json",
 ):
     path = Path(schema_path)
-    schema = json.loads(path.read_text(encoding='utf-8'))
-    provenance = schema['properties']['case_provenance']
-    provenance['properties']['capture_path'] = {
-        'enum': ['agent_workspace_prestart', 'direct_capture']
+    schema = json.loads(path.read_text(encoding="utf-8"))
+    provenance = schema["properties"]["case_provenance"]
+    provenance["properties"]["capture_path"] = {
+        "enum": ["agent_workspace_prestart", "direct_capture"]
     }
-    provenance['allOf'] = [
+    provenance["allOf"] = [
         {
-            'not': {
-                'properties': {
-                    'case_origin': {'const': 'production'},
-                    'capture_path': {'const': 'direct_capture'},
+            "not": {
+                "properties": {
+                    "case_origin": {"const": "production"},
+                    "capture_path": {"const": "direct_capture"},
                 },
-                'required': ['case_origin', 'capture_path'],
+                "required": ["case_origin", "capture_path"],
             }
         }
     ]
-    path.write_text(json.dumps(schema, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    path.write_text(
+        json.dumps(schema, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
 
-sub_once(
+replace_once(
     TESTS,
-    'test-direct-capture-path',
-    r'(            self\.assertEqual\(receipt\["case_provenance"\]\["case_origin"\], "synthetic"\)\n)',
-    r'\1            self.assertEqual(receipt["case_provenance"]["capture_path"], "direct_capture")\n',
+    "test-direct-capture-path",
+    '            self.assertEqual(receipt["case_provenance"]["case_origin"], "synthetic")\n',
+    '            self.assertEqual(receipt["case_provenance"]["case_origin"], "synthetic")\n'
+    '            self.assertEqual(receipt["case_provenance"]["capture_path"], "direct_capture")\n',
 )
 
-sub_once(
+# The two replacement strings intentionally retain historical \1 markers. The
+# registered bootstrap workflow rewrites them to escaped backreferences before
+# invoking this file.
+replace_once(
     TESTS,
-    'test-insert-direct-production',
-    r'(    def test_latest_prospective_contract_freezes_case_origin\(self\) -> None:\n)',
+    "test-insert-direct-production",
+    '    def test_latest_prospective_contract_freezes_case_origin(self) -> None:\n',
     '''    def test_direct_capture_cannot_claim_production_origin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "cohort"
@@ -357,25 +479,36 @@ sub_once(
             self.assertEqual(receipt["case_provenance"]["case_origin"], "quarantined")
             self.assertEqual(receipt["case_provenance"]["capture_path"], "direct_capture")
 
-\1''',
+\1'''.replace("\\1", '    def test_latest_prospective_contract_freezes_case_origin(self) -> None:\n'),
 )
 
-sub_once(
+replace_once(
     TESTS,
-    'test-schema-production-path',
-    r'        prospective = capture\.build_prospective_eligibility_v2\(\n            pre_task_manifest\(\), frozen_at=FROZEN_AT, case_origin="production"\n        \)',
+    "test-origin-tamper-remains-hash-test",
+    '        tampered["case_provenance"]["case_origin"] = "production"\n',
+    '        tampered["case_provenance"]["case_origin"] = "quarantined"\n',
+)
+
+replace_once(
+    TESTS,
+    "test-schema-production-path",
+    '''        prospective = capture.build_prospective_eligibility_v2(
+            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="production"
+        )
+''',
     '''        prospective = capture.build_prospective_eligibility_v2(
             pre_task_manifest(),
             frozen_at=FROZEN_AT,
             case_origin="production",
             capture_path=capture.WORKSPACE_PRESTART_CAPTURE_PATH,
-        )''',
+        )
+''',
 )
 
-sub_once(
+replace_once(
     TESTS,
-    'test-insert-timeline-idempotency',
-    r'(    def test_semantic_assessments_require_at_least_two_when_present\(self\) -> None:\n)',
+    "test-insert-timeline-idempotency",
+    '    def test_semantic_assessments_require_at_least_two_when_present(self) -> None:\n',
     '''    def test_task_correctness_requires_terminal_execution_before_outcome(self) -> None:
         prospective = capture.build_prospective_eligibility_v2(
             pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="test"
@@ -424,11 +557,11 @@ sub_once(
             self.assertEqual(second["status"], "duplicate")
             self.assertEqual(second["record_id"], first["record_id"])
 
-\1''',
+\1'''.replace("\\1", '    def test_semantic_assessments_require_at_least_two_when_present(self) -> None:\n'),
 )
 
-docs_path = Path('docs/operator-routing-shadow-cohort-v1.md')
-docs = docs_path.read_text(encoding='utf-8')
+docs_path = Path("docs/operator-routing-shadow-cohort-v1.md")
+docs = docs_path.read_text(encoding="utf-8")
 docs += '''
 
 ### Provenienz- und Zeitgrenzen
@@ -439,17 +572,11 @@ Für `task_correctness` muss eine beobachtete terminale Ausführung (`completed`
 
 Verschiedene `reviewer_pseudonym_sha256` innerhalb eines Records verhindern doppelte Pseudonym-IDs, belegen aber noch keine kryptographisch attestierte Reviewer-Unabhängigkeit. Eine stabile geheimnisgestützte Reviewer-Pseudonymisierung und strukturierte opake Evidence-Referenzen benötigen einen eigenen Folgevertrag; bis dahin dürfen diese Felder nicht als Identitätsattestation interpretiert werden.
 '''
-docs_path.write_text(docs, encoding='utf-8')
+docs_path.write_text(docs, encoding="utf-8")
 
-context_path = Path('docs/generated/operator-context.v1.json')
-context = context_path.read_text(encoding='utf-8')
-for source_path in (CAPTURE, WORKSPACE):
-    digest = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
-    pattern = rf'("{re.escape(source_path)}": ")[0-9a-f]{{64}}(")'
-    context, count = re.subn(pattern, rf'\g<1>{digest}\g<2>', context)
-    if count != 1:
-        fail('operator-context', f'{source_path} hash entry count={count}')
-context_path.write_text(context, encoding='utf-8')
+Path("tools/sitecustomize.py").unlink(missing_ok=True)
+Path(".routing-shadow-bootstrap-trigger").unlink(missing_ok=True)
+subprocess.run(["make", "context-refresh"], check=True)
 
 if DIAGNOSTIC.exists():
     DIAGNOSTIC.unlink()
