@@ -122,6 +122,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_operation_run` | operation | no | high | Run a named preflight/action/postflight operation with rollback after failure. |
 | `grabowski_privileged_broker_status` | privileged-reference | yes | low | Inspect the root-owned privileged broker installation without executing it. |
 | `grabowski_task_start` | task | no | variable | Start a persistent local or fleet task in its own systemd unit. |
+| `grabowski_task_routing_shadow_seal` | task | no | medium | Seal one terminal direct-task routing-shadow case with explicit semantic outcome or abstention and evidence-bound execution provenance. |
 | `grabowski_task_status` | task | yes | low | Observe one persistent task and refresh its recorded state. |
 | `grabowski_task_logs` | task | yes | low | Read redacted journal output for one local or fleet task. |
 | `grabowski_task_cancel` | task | no | medium | Stop one task process group while retaining its persistent record. |

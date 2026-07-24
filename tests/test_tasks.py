@@ -49,6 +49,7 @@ if "mcp" not in sys.modules:
 
 import grabowski_command_identity as command_identity
 import grabowski_resources as resources
+import grabowski_operator_routing_shadow_capture as routing_shadow
 import grabowski_tasks as tasks
 import grabowski_task_reconcile as task_reconcile_cli
 
@@ -228,6 +229,169 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=UMask=0077", launch)
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
+
+    def test_task_start_captures_verified_direct_route_before_launch(self) -> None:
+        from tests.test_task_routing_shadow_capture import direct_route_evidence
+
+        capture_result = {
+            "schema_version": 1,
+            "status": "created",
+            "binding_status": "created",
+            "binding_id": "b" * 64,
+            "no_effect": dict(routing_shadow.NO_EFFECT),
+        }
+        order: list[str] = []
+
+        def capture_side_effect(**kwargs):
+            order.append("capture")
+            self.assertEqual(
+                "direct_operator", kwargs["route_evidence"]["actual_route"]
+            )
+            self.assertEqual(str(self.root), kwargs["cwd"])
+            self.assertEqual(60, kwargs["runtime_seconds"])
+            return capture_result
+
+        def dispatch_side_effect(*args, **kwargs):
+            order.append("launch")
+            return _launcher()
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", side_effect=dispatch_side_effect),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+            patch.object(
+                routing_shadow,
+                "capture_direct_task_start_best_effort",
+                side_effect=capture_side_effect,
+            ),
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "ok"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                route_evidence=direct_route_evidence(),
+            )
+
+        self.assertEqual("capture", order[0])
+        self.assertIn("launch", order)
+        self.assertEqual(capture_result, result["routing_shadow_capture"])
+        self.assertEqual(capture_result, result["audit"]["routing_shadow_capture"])
+    def test_task_start_capture_error_does_not_block_launch(self) -> None:
+        from tests.test_task_routing_shadow_capture import direct_route_evidence
+
+        capture_result = {
+            "schema_version": 1,
+            "status": "error",
+            "reason_code": "capture_error",
+            "binding_status": "not_created",
+            "no_effect": dict(routing_shadow.NO_EFFECT),
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+            patch.object(
+                routing_shadow,
+                "capture_direct_task_start_best_effort",
+                return_value=capture_result,
+            ),
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "ok"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                route_evidence=direct_route_evidence(),
+            )
+        self.assertTrue(dispatch.called)
+        self.assertEqual(capture_result, result["routing_shadow_capture"])
+        self.assertIn(result["task"]["state"], {"running", "completed"})
+    def test_task_start_rejects_non_direct_route_before_launch(self) -> None:
+        from tests.test_task_routing_shadow_capture import direct_route_evidence
+
+        invalid = direct_route_evidence()
+        invalid["actual_route"] = "workspace_with_contrast"
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "route evidence is invalid"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["/bin/echo", "ok"],
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                    route_evidence=invalid,
+                )
+        dispatch.assert_not_called()
+    def test_task_routing_shadow_seal_requires_terminal_compatible_provenance(
+        self,
+    ) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        sealed = {
+            "schema_version": 1,
+            "status": "created",
+            "record_id": "r" * 64,
+            "eligibility_id": "e" * 64,
+            "case_id": "c" * 64,
+            "record_schema_version": routing_shadow.RECORD_V3_SCHEMA_VERSION,
+            "no_effect": dict(routing_shadow.NO_EFFECT),
+        }
+        with (
+            patch.object(tasks, "_observe", return_value={"state": "completed"}),
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                routing_shadow, "seal_direct_task_case", return_value=sealed
+            ) as seal_call,
+        ):
+            result = tasks.grabowski_task_routing_shadow_seal(
+                task_id,
+                {
+                    "status": "abstained",
+                    "reason_code": "no_semantic_review",
+                    "observed_at": "2026-07-24T17:31:00Z",
+                },
+                [],
+                {
+                    "status": "completed",
+                    "observed_at": "2026-07-24T17:30:30Z",
+                    "evidence_refs": ["artifact:task-finalization"],
+                },
+                [],
+            )
+        self.assertEqual("completed", result["observed_task_state"])
+        self.assertEqual(sealed, result["sealed"])
+        seal_call.assert_called_once()
+
+        with patch.object(tasks, "_observe", return_value={"state": "completed"}):
+            with self.assertRaisesRegex(ValueError, "requires execution_provenance"):
+                tasks.grabowski_task_routing_shadow_seal(
+                    task_id,
+                    {
+                        "status": "abstained",
+                        "reason_code": "no_semantic_review",
+                        "observed_at": "2026-07-24T17:31:00Z",
+                    },
+                    [],
+                    {
+                        "status": "infrastructure_failure",
+                        "observed_at": "2026-07-24T17:30:30Z",
+                        "evidence_refs": ["artifact:task-finalization"],
+                    },
+                    [],
+                )
 
     def test_systemd_escape_argv_doubles_only_dollars_without_mutating_input(self) -> None:
         command = [

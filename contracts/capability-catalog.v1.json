@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "827fb2855e3d1778813910a959ac5f37520c00d4789aae1e9bd7238aa2366a29",
+  "capability_source_sha256": "b8bdc4f27abac3b8e19153ecf38184a6dad51bb76a6f59c58e145f84f188c16a",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "150e961ac8c80e5cdf7e6e2aa4d018ce05e3a300da12dcfc7445ab632c6017eb",
+  "contract_sha256": "529652211640cb92027a0622789740f93b028a683c8daa1a2a01acccd8e07ea6",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1161,6 +1161,20 @@
       "reversibility": "cancel-or-command-dependent",
       "risk_class": "variable",
       "tool": "grabowski_task_start"
+    },
+    {
+      "category": "task",
+      "description": "Seal one independently reviewed direct-task shadow outcome without routing effect.",
+      "effects": [
+        "state-create",
+        "audit-append"
+      ],
+      "id": "grabowski_task_routing_shadow_seal",
+      "purpose": "Seal one terminal direct-task routing-shadow case with explicit semantic outcome or abstention and evidence-bound execution provenance.",
+      "read_only": false,
+      "reversibility": "append-only-observation",
+      "risk_class": "medium",
+      "tool": "grabowski_task_routing_shadow_seal"
     },
     {
       "category": "task",

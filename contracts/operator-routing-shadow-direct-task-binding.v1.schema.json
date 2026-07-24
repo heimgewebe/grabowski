@@ -1,0 +1,273 @@
+{
+  "$id": "operator-routing-shadow-direct-task-binding.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "binding_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "created_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "no_effect": {
+      "additionalProperties": false,
+      "properties": {
+        "merge": { "const": false },
+        "policy": { "const": false },
+        "proposal_only": { "const": true },
+        "queue": { "const": false },
+        "routing": { "const": false },
+        "runtime": { "const": false }
+      },
+      "required": [
+        "proposal_only",
+        "routing",
+        "policy",
+        "queue",
+        "merge",
+        "runtime"
+      ],
+      "type": "object"
+    },
+    "plan_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "prospective": {
+      "additionalProperties": false,
+      "properties": {
+        "prospective_eligibility_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "status": { "const": "created" },
+        "workspace_case_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "prospective_eligibility_id",
+        "workspace_case_id"
+      ],
+      "type": "object"
+    },
+    "route_evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "actual_route": { "const": "direct_operator" },
+        "deviation_reason": {
+          "type": ["string", "null"],
+          "maxLength": 500
+        },
+        "evidence_complete": { "const": true },
+        "external_candidates": {
+          "maxItems": 0,
+          "type": "array"
+        },
+        "input_facts": {
+          "additionalProperties": false,
+          "properties": {
+            "architecture_hypotheses": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "available_external_agents": {
+              "maxItems": 0,
+              "type": "array"
+            },
+            "changed_file_estimate": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "concurrent_external_activity": { "const": false },
+            "connector_instability": { "type": "boolean" },
+            "decision_fork": { "type": "boolean" },
+            "expected_duration_minutes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "novelty": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "parallelization_candidate": { "type": "boolean" },
+            "risk_flags": {
+              "items": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 32,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "task_kind": {
+              "maxLength": 40,
+              "minLength": 1,
+              "type": "string"
+            },
+            "user_requested_external": { "const": false }
+          },
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "concurrent_external_activity",
+            "parallelization_candidate",
+            "decision_fork",
+            "architecture_hypotheses",
+            "user_requested_external",
+            "available_external_agents"
+          ],
+          "type": "object"
+        },
+        "parallel_writer_pilot": {
+          "additionalProperties": false,
+          "properties": {
+            "assessment_blockers": {
+              "items": { "type": "string", "maxLength": 500 },
+              "maxItems": 32,
+              "type": "array"
+            },
+            "eligible_for_assessment": { "type": "boolean" },
+            "execution_authorized": { "const": false },
+            "implementation_blockers": {
+              "items": { "type": "string", "maxLength": 500 },
+              "maxItems": 32,
+              "type": "array"
+            },
+            "minimum_estimated_minutes_per_shard": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "requested": { "type": "boolean" },
+            "required_shard_count": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "workspace_group_implemented": { "const": false }
+          },
+          "required": [
+            "requested",
+            "eligible_for_assessment",
+            "assessment_blockers",
+            "required_shard_count",
+            "minimum_estimated_minutes_per_shard",
+            "workspace_group_implemented",
+            "execution_authorized",
+            "implementation_blockers"
+          ],
+          "type": "object"
+        },
+        "recommendation_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "recommended_route": {
+          "maxLength": 40,
+          "minLength": 1,
+          "type": "string"
+        },
+        "risk_tier": {
+          "enum": ["R0", "R1", "R2", "R3"],
+          "type": "string"
+        },
+        "route_policy_version": {
+          "maxLength": 80,
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": { "const": 2 },
+        "score": {
+          "maximum": 20,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": { "const": "verified" }
+      },
+      "required": [
+        "schema_version",
+        "route_policy_version",
+        "risk_tier",
+        "parallel_writer_pilot",
+        "recommendation_id",
+        "score",
+        "recommended_route",
+        "actual_route",
+        "input_facts",
+        "external_candidates",
+        "deviation_reason",
+        "status",
+        "evidence_complete"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "operator-routing-shadow-direct-task-binding.v1"
+    },
+    "task_id": {
+      "pattern": "^[0-9a-f]{24}$",
+      "type": "string"
+    },
+    "task_identity": {
+      "additionalProperties": false,
+      "properties": {
+        "argv_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "cwd_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "host_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "resource_keys_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "runtime_seconds": {
+          "maximum": 604800,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host_sha256",
+        "argv_sha256",
+        "cwd_sha256",
+        "resource_keys_sha256",
+        "runtime_seconds"
+      ],
+      "type": "object"
+    },
+    "workspace_id": {
+      "pattern": "^gaw-direct-task-[0-9a-f]{24}$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "binding_id",
+    "task_id",
+    "workspace_id",
+    "plan_sha256",
+    "task_identity",
+    "route_evidence",
+    "prospective",
+    "created_at",
+    "no_effect"
+  ],
+  "title": "Grabowski operator routing shadow direct task binding v1",
+  "type": "object"
+}

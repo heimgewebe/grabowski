@@ -939,7 +939,11 @@ def _route_decision_for_policy(
     raise AgentWorkspaceError("route_evidence route policy version is unsupported")
 
 
-def _normalize_route_evidence(value: Any) -> dict[str, Any]:
+def _normalize_route_evidence(
+    value: Any, *, execution_surface: str = "workspace"
+) -> dict[str, Any]:
+    if execution_surface not in {"workspace", "direct_task"}:
+        raise AgentWorkspaceError("route evidence execution surface is invalid")
     if value is None:
         return {
             "schema_version": 1,
@@ -947,7 +951,11 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
             "recommendation_id": None,
             "score": None,
             "recommended_route": None,
-            "actual_route": "workspace_with_contrast",
+            "actual_route": (
+                "direct_operator"
+                if execution_surface == "direct_task"
+                else "workspace_with_contrast"
+            ),
             "input_facts": None,
             "external_candidates": [],
             "deviation_reason": None,
@@ -974,6 +982,8 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         }
     if set(value) != expected or schema_version not in {1, 2}:
         raise AgentWorkspaceError("route_evidence shape is invalid")
+    if execution_surface == "direct_task" and schema_version != 2:
+        raise AgentWorkspaceError("direct task route evidence requires schema_version=2")
     recommendation_id = _required_string(
         value.get("recommendation_id"),
         "route_evidence.recommendation_id",
@@ -1003,12 +1013,19 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
         schema_version == 2
         and route_policy_version == LEGACY_ROUTE_POLICY_VERSION_V21
     )
-    allowed_actual_routes = (
-        {"full_workspace", "workspace_with_contrast", "workspace_with_competition"}
-        if schema_version == 1 or legacy_schema2
-        else {"workspace_with_contrast", "workspace_with_competition"}
-    )
+    if execution_surface == "direct_task":
+        allowed_actual_routes = {"direct_operator"}
+    else:
+        allowed_actual_routes = (
+            {"full_workspace", "workspace_with_contrast", "workspace_with_competition"}
+            if schema_version == 1 or legacy_schema2
+            else {"workspace_with_contrast", "workspace_with_competition"}
+        )
     if actual not in allowed_actual_routes:
+        if execution_surface == "direct_task":
+            raise AgentWorkspaceError(
+                "direct task route evidence must use actual_route=direct_operator"
+            )
         raise AgentWorkspaceError(
             "agent workspace actual_route must be an advisory contrast route"
             if schema_version == 2 and not legacy_schema2
@@ -1061,23 +1078,29 @@ def _normalize_route_evidence(value: Any) -> dict[str, Any]:
     )
     if schema_version == 2:
         if route_policy_version == ROUTE_POLICY_VERSION:
-            if facts.get("user_requested_external") is not True:
-                raise AgentWorkspaceError(
-                    "direct-first agent workspace requires explicit external contrast request"
+            if execution_surface == "direct_task":
+                if facts.get("user_requested_external") is not False or candidates:
+                    raise AgentWorkspaceError(
+                        "direct task route evidence cannot contain advisory external candidates"
+                    )
+            else:
+                if facts.get("user_requested_external") is not True:
+                    raise AgentWorkspaceError(
+                        "direct-first agent workspace requires explicit external contrast request"
+                    )
+                if not candidates:
+                    raise AgentWorkspaceError(
+                        "direct-first agent workspace requires at least one advisory candidate"
+                    )
+                expected_actual = (
+                    "workspace_with_competition"
+                    if len(candidates) == 2
+                    else "workspace_with_contrast"
                 )
-            if not candidates:
-                raise AgentWorkspaceError(
-                    "direct-first agent workspace requires at least one advisory candidate"
-                )
-            expected_actual = (
-                "workspace_with_competition"
-                if len(candidates) == 2
-                else "workspace_with_contrast"
-            )
-            if actual != expected_actual:
-                raise AgentWorkspaceError(
-                    "agent workspace actual_route does not match advisory candidate count"
-                )
+                if actual != expected_actual:
+                    raise AgentWorkspaceError(
+                        "agent workspace actual_route does not match advisory candidate count"
+                    )
         if route_policy_version != decision["route_policy_version"]:
             raise AgentWorkspaceError(
                 "route_evidence route policy version is invalid"

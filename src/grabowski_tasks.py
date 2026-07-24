@@ -2895,6 +2895,7 @@ def grabowski_task_start(
     chronik_bureau_task_id: str = "",
     chronik_pr_number: int | None = None,
     runtime_python: bool = False,
+    route_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -2958,6 +2959,21 @@ def grabowski_task_start(
         if repository_resource is not None
         else None
     )
+    normalized_route_evidence: dict[str, Any] | None = None
+    if route_evidence is not None:
+        import grabowski_agent_workspace as agent_workspace
+
+        try:
+            normalized_route_evidence = agent_workspace._normalize_route_evidence(
+                route_evidence, execution_surface="direct_task"
+            )
+        except agent_workspace.AgentWorkspaceError as exc:
+            raise ValueError(f"direct task route evidence is invalid: {exc}") from exc
+        if (
+            normalized_route_evidence.get("status") != "verified"
+            or normalized_route_evidence.get("evidence_complete") is not True
+        ):
+            raise ValueError("direct task route evidence must be complete and verified")
     execution_backend, systemd_scope = _execution_contract(target, command)
     if (
         execution_backend == "systemd-root-broker"
@@ -2981,6 +2997,20 @@ def grabowski_task_start(
         cwd=working_directory,
         execution_backend=execution_backend,
     )
+    argv_sha256 = command_identity.argv_sha256(command)
+    routing_shadow_capture: dict[str, Any] | None = None
+    if normalized_route_evidence is not None:
+        import grabowski_operator_routing_shadow_capture as routing_shadow
+
+        routing_shadow_capture = routing_shadow.capture_direct_task_start_best_effort(
+            task_id=task_id,
+            route_evidence=normalized_route_evidence,
+            host=host,
+            argv_sha256=argv_sha256,
+            cwd=working_directory,
+            resource_keys=task_resources,
+            runtime_seconds=runtime,
+        )
     attempt = 1
     unit = _task_unit(task_id, attempt)
     now = _now()
@@ -2995,7 +3025,7 @@ def grabowski_task_start(
         "state": "launching",
         "resume_policy": policy,
         "argv_json": _canonical_json(command),
-        "argv_sha256": command_identity.argv_sha256(command),
+        "argv_sha256": argv_sha256,
         "cwd": working_directory,
         "runtime_seconds": runtime,
         "cpu_weight": cpu,
@@ -3040,7 +3070,7 @@ def grabowski_task_start(
     try:
         with _database_connection() as connection:
             connection.execute(
-            """
+                """
             INSERT INTO tasks(
                 task_id, host, unit, attempt, state, resume_policy,
                 argv_json, argv_sha256, cwd, runtime_seconds,
@@ -3101,9 +3131,14 @@ def grabowski_task_start(
             lease_result["expires_at_unix"] if lease_result else None
         ),
         "resource_lease_maintenance": lease_maintenance,
+        "routing_shadow_capture": routing_shadow_capture,
     }
     base._append_audit(audit)
-    return {"task": _public(stored), "audit": audit}
+    return {
+        "task": _public(stored),
+        "audit": audit,
+        "routing_shadow_capture": routing_shadow_capture,
+    }
 
 
 @mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
@@ -3128,6 +3163,75 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
     result["lease_maintenance"] = lease_maintenance
     return result
 
+
+@mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)
+def grabowski_task_routing_shadow_seal(
+    task_id: str,
+    outcome: dict[str, Any],
+    primary_evidence_refs: list[str],
+    execution_provenance: dict[str, Any],
+    semantic_assessments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Seal one independently reviewed direct-task shadow outcome without routing effect."""
+    record = _row(task_id)
+    observation = _observe(record)
+    effective_state = _effective_observed_state(record, observation["state"])
+    if not _is_terminal_state(effective_state):
+        raise RuntimeError("routing shadow outcome requires a terminal task")
+    if not isinstance(execution_provenance, dict):
+        raise ValueError("execution_provenance must be an object")
+    execution_status = execution_provenance.get("status")
+    if effective_state == "completed":
+        if execution_status != "completed":
+            raise ValueError(
+                "completed task requires execution_provenance.status=completed"
+            )
+    elif execution_status not in {"execution_aborted", "infrastructure_failure"}:
+        raise ValueError(
+            "non-completed terminal task requires abort or infrastructure provenance"
+        )
+    cohort_root = Path(
+        os.environ.get(
+            "GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT",
+            str(Path.home() / ".local/state/grabowski/operator-routing-shadow-cohort"),
+        )
+    ).expanduser()
+    operator._require_operator_mutation(
+        "durable_job",
+        path=str(cohort_root),
+        task_id=task_id,
+        owner_id=record.get("lease_owner_id"),
+        host=record["host"],
+    )
+    import grabowski_operator_routing_shadow_capture as routing_shadow
+
+    sealed = routing_shadow.seal_direct_task_case(
+        task_id=task_id,
+        outcome=outcome,
+        primary_evidence_refs=primary_evidence_refs,
+        execution_provenance=execution_provenance,
+        semantic_assessments=semantic_assessments,
+        root=cohort_root,
+    )
+    audit = {
+        "timestamp_unix": _now(),
+        "operation": "task-routing-shadow-seal",
+        "task_id": task_id,
+        "observed_task_state": effective_state,
+        "record_id": sealed.get("record_id"),
+        "eligibility_id": sealed.get("eligibility_id"),
+        "case_id": sealed.get("case_id"),
+        "status": sealed.get("status"),
+        "record_schema_version": sealed.get("record_schema_version"),
+        "no_effect": sealed.get("no_effect"),
+    }
+    base._append_audit(audit)
+    return {
+        "task_id": task_id,
+        "observed_task_state": effective_state,
+        "sealed": sealed,
+        "audit": audit,
+    }
 
 @mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
 def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:

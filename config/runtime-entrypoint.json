@@ -93,6 +93,7 @@
     "grabowski_operation_run",
     "grabowski_privileged_broker_status",
     "grabowski_task_start",
+    "grabowski_task_routing_shadow_seal",
     "grabowski_task_status",
     "grabowski_task_logs",
     "grabowski_task_cancel",
