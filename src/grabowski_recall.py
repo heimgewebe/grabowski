@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 try:
@@ -40,17 +42,31 @@ RECALL_DOES_NOT_ESTABLISH = (
     "policy_change",
     "operator_instruction_authority",
 )
+CHRONIK_HISTORY_DOES_NOT_ESTABLISH = (
+    "current_git_state",
+    "current_ci_state",
+    "current_runtime_state",
+    "safe_retry",
+)
+HISTORICAL_RECALL_DOES_NOT_ESTABLISH = tuple(
+    dict.fromkeys((*RECALL_DOES_NOT_ESTABLISH, *CHRONIK_HISTORY_DOES_NOT_ESTABLISH))
+)
+HISTORICAL_SOURCE_TRUST = "grabowski_validated_chronik_history"
+HISTORICAL_EVIDENCE_BINDING = "hash_bound_chronik_event"
+HISTORICAL_RULE_TRUST = "historical_observation_not_rule"
 SUPPORTED_ITEM_SOURCES = {
     "receipt",
     "pr",
     "bureau_task",
     "friction_record",
+    "chronik_event",
 }
 SOURCE_TO_EVIDENCE_TYPE = {
     "receipt": "receipt",
     "pr": "pr",
     "bureau_task": "bureau_task",
     "friction_record": "friction_record",
+    "chronik_event": "chronik_event",
 }
 SUPPORTED_SOURCE_KEYS = (
     "receipts",
@@ -63,6 +79,7 @@ SUPPORTED_EVIDENCE_TYPES = {
     "pr",
     "bureau_task",
     "friction_record",
+    "chronik_event",
 }
 
 
@@ -349,6 +366,192 @@ def export_operator_recall(sources: dict[str, Any], *, limit: int = 50) -> dict[
         "items": items,
         "heimlern_offline_learning": dict(HEIMLERN_OFFLINE_LEARNING_BOUNDARY),
         "does_not_establish": list(RECALL_DOES_NOT_ESTABLISH),
+    }
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _chronik_event_id(event: dict[str, Any]) -> str:
+    payload = dict(event)
+    payload.pop("event_id", None)
+    return "sha256:" + _sha256_json(payload)
+
+
+def _historical_display_text(value: Any, *, label: str, max_chars: int = 160) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    sanitized = "".join(
+        " " if ord(character) < 32 or ord(character) == 127 else character
+        for character in value
+    )
+    sanitized = " ".join(sanitized.split())
+    if not sanitized:
+        sanitized = "<non-printable>"
+    return sanitized[:max_chars]
+
+
+def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(event, dict):
+        raise ValueError("Chronik history event must be an object")
+    event_id = event.get("event_id")
+    if (
+        not isinstance(event_id, str)
+        or not event_id.startswith("sha256:")
+        or len(event_id) != 71
+        or any(character not in "0123456789abcdef" for character in event_id[7:])
+        or event_id != _chronik_event_id(event)
+    ):
+        raise ValueError("Chronik history event digest is invalid")
+    if event.get("schema_version") != "agent-run-event.v0":
+        raise ValueError("Chronik history event schema is invalid")
+    source = event.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("repo") != "heimgewebe/grabowski"
+        or source.get("component") != "grabowski"
+    ):
+        raise ValueError("Chronik history event source is invalid")
+    expected_results = {
+        "agent.run.started": "started",
+        "agent.run.completed": "completed",
+        "agent.run.blocked": "blocked",
+    }
+    kind = event.get("kind")
+    if kind not in expected_results:
+        raise ValueError("Chronik history event kind is invalid")
+    subject = event.get("subject")
+    data = event.get("data")
+    if not isinstance(subject, dict) or not isinstance(data, dict):
+        raise ValueError("Chronik history event payload is invalid")
+    if data.get("result") != expected_results[kind]:
+        raise ValueError("Chronik history event outcome is invalid")
+    operation = _bounded_text(data.get("operation"), label="Chronik history operation", max_chars=160)
+    task_class = _bounded_text(data.get("task_class"), label="Chronik history task_class", max_chars=160)
+    if subject.get("scope") == "repository":
+        target = _historical_display_text(subject.get("repo"), label="Chronik history repo")
+    elif subject.get("scope") == "host":
+        target = _historical_display_text(subject.get("host"), label="Chronik history host")
+    else:
+        raise ValueError("Chronik history event subject scope is invalid")
+    outcome = data["result"]
+    blocker = _optional_bounded_text(data.get("blocker_code"), max_chars=120)
+    result_text = f"Historical outcome: {outcome}."
+    if blocker:
+        result_text += f" Blocker: {blocker}."
+    topic = f"historical run: {target} / {operation}"[:120]
+    item = {
+        "schema_version": 1,
+        "kind": RECALL_KIND,
+        "source": "chronik_event",
+        "topic": topic,
+        "situation": _bounded_text(
+            f"Chronik recorded a historical Grabowski {task_class} run for {target}.",
+            label="situation",
+        ),
+        "attempt": _bounded_text(f"Historical operation: {operation}.", label="attempt"),
+        "result": _bounded_text(result_text, label="result"),
+        "learned_rule": "Historical outcome only; re-check current live state and authorization before acting.",
+        "learned_rule_trust": HISTORICAL_RULE_TRUST,
+        "evidence_refs": [
+            _evidence_ref("chronik_event", event_id, sha256=event_id.removeprefix("sha256:"))
+        ],
+        "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
+    }
+    return item
+
+
+def export_chronik_history_recall(
+    history_result: dict[str, Any], *, limit: int = 20
+) -> dict[str, Any]:
+    """Convert one validated Grabowski Chronik history receipt into bounded operator recall.
+
+    The input remains historical evidence only. This adapter deliberately does not
+    establish current Git, CI, runtime, retry, merge, routing, or policy truth.
+    """
+    if not isinstance(history_result, dict):
+        raise ValueError("Chronik history result must be an object")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_RECALL_LIMIT:
+        raise ValueError(f"limit must be between 1 and {MAX_RECALL_LIMIT}")
+    if history_result.get("kind") != "grabowski_chronik_history":
+        raise ValueError("Chronik history result kind is invalid")
+    if history_result.get("historical_only") is not True:
+        raise ValueError("Chronik history result is not historical-only")
+    claimed_digest = history_result.get("result_sha256")
+    unsigned = dict(history_result)
+    unsigned.pop("result_sha256", None)
+    if (
+        not isinstance(claimed_digest, str)
+        or len(claimed_digest) != 64
+        or any(character not in "0123456789abcdef" for character in claimed_digest)
+        or claimed_digest != _sha256_json(unsigned)
+    ):
+        raise ValueError("Chronik history result digest is invalid")
+    query = history_result.get("query")
+    if not isinstance(query, dict):
+        raise ValueError("Chronik history query is invalid")
+    claims = history_result.get("does_not_establish")
+    if (
+        not isinstance(claims, list)
+        or not all(isinstance(claim, str) for claim in claims)
+        or not set(CHRONIK_HISTORY_DOES_NOT_ESTABLISH).issubset(claims)
+    ):
+        raise ValueError("Chronik history truth exclusions are incomplete")
+    available = history_result.get("available") is True
+    raw_events = history_result.get("events")
+    if not isinstance(raw_events, list):
+        raise ValueError("Chronik history events must be a list")
+    if not available:
+        if raw_events:
+            raise ValueError("Unavailable Chronik history may not carry events")
+        failure = history_result.get("failure")
+        failure_code = failure.get("code") if isinstance(failure, dict) else None
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_operator_historical_recall",
+            "authority": "derived_historical_evidence",
+            "source_trust": HISTORICAL_SOURCE_TRUST,
+            "evidence_binding": HISTORICAL_EVIDENCE_BINDING,
+            "available": False,
+            "historical_only": True,
+            "query": dict(query),
+            "history_result_sha256": claimed_digest,
+            "returned": 0,
+            "items": [],
+            "failure_code": _optional_bounded_text(failure_code, max_chars=160),
+            "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
+        }
+    history_metadata = history_result.get("history")
+    if not isinstance(history_metadata, dict) or history_metadata.get("historical_only") is not True:
+        raise ValueError("Chronik history metadata is invalid")
+    event_ids = history_metadata.get("event_ids")
+    if not isinstance(event_ids, list) or event_ids != [event.get("event_id") for event in raw_events if isinstance(event, dict)]:
+        raise ValueError("Chronik history event_ids are unbound")
+    items = [_validated_chronik_event_recall(event) for event in raw_events[:limit]]
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_operator_historical_recall",
+        "authority": "derived_historical_evidence",
+        "source_trust": HISTORICAL_SOURCE_TRUST,
+        "evidence_binding": HISTORICAL_EVIDENCE_BINDING,
+        "available": True,
+        "historical_only": True,
+        "query": dict(query),
+        "history_result_sha256": claimed_digest,
+        "returned": len(items),
+        "items": items,
+        "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
     }
 
 

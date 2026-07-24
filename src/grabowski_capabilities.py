@@ -729,6 +729,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_operator_historical_recall": {
+        "category": "operator-recall",
+        "purpose": "Read evidence-bound operator recall derived from validated Chronik history.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_task_archive_list": {
         "category": "task-archive",
         "purpose": "List immutable task archive segments through a bounded manifest-verified catalog.",

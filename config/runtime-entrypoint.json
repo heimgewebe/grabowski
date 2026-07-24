@@ -100,6 +100,7 @@
     "grabowski_task_list",
     "grabowski_chronik_outbox_import",
     "grabowski_chronik_history",
+    "grabowski_operator_historical_recall",
     "grabowski_task_reconcile_check",
     "grabowski_task_reconcile_refresh",
     "grabowski_task_reconcile_resume",

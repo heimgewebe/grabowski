@@ -19,6 +19,7 @@ from typing import Any
 import grabowski_fleet as fleet
 import grabowski_mcp as base
 import grabowski_chronik as chronik
+import grabowski_recall as recall
 import grabowski_privileged as privileged
 import grabowski_recovery as recovery
 import grabowski_resources as resources
@@ -4544,3 +4545,31 @@ def grabowski_chronik_history(
             "history": history_metadata,
         }
     return _chronik_receipt(payload, field="result_sha256")
+
+
+@mcp.tool(name="grabowski_operator_historical_recall", annotations=READ_ONLY)
+def grabowski_operator_historical_recall(
+    repo: str = "",
+    host: str = "",
+    component: str = "",
+    subject_component: str = "",
+    operation: str = "",
+    task_class: str = "",
+    outcome: str = "",
+    since: str = "",
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Read evidence-bound operator recall derived from validated Chronik history."""
+    _require_operator_capability("durable_job")
+    history = grabowski_chronik_history(
+        repo=repo,
+        host=host,
+        component=component,
+        subject_component=subject_component,
+        operation=operation,
+        task_class=task_class,
+        outcome=outcome,
+        since=since,
+        limit=limit,
+    )
+    return recall.export_chronik_history_recall(history, limit=limit)
