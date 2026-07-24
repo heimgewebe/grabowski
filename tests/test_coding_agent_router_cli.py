@@ -109,7 +109,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(stored["pools"], {})
         self.assertEqual(stored["catalog"], fake_probe)
         self.assertEqual(stored["catalog_sha256"], validation["catalog_sha256"])
-        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v4")
+        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v5")
 
         status, readback = self._main(["status"])
         self.assertEqual(status, 0)
@@ -599,6 +599,78 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             cli._atomic_write_private_json(parent / "state.json", {"schema_version": 2})
         self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
         self.assertFalse((parent / "state.json").exists())
+
+
+    def test_openhands_auth_probe_is_secret_free_and_validates_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            auth = home / ".openhands" / "auth"
+            auth.mkdir(parents=True, mode=0o700)
+            auth.chmod(0o700)
+            path = auth / "openai_oauth.json"
+            path.write_text(json.dumps({
+                "type": "oauth",
+                "vendor": "openai",
+                "access_token": "not-returned",
+                "refresh_token": "not-returned",
+                "expires_at": 2_000_000,
+            }), encoding="utf-8")
+            path.chmod(0o600)
+            with mock.patch.object(Path, "read_text", side_effect=AssertionError("path read forbidden")):
+                status = cli._openhands_subscription_auth_status(home=home, now_ms=1_000_000)
+            self.assertEqual(status, {
+                "authenticated": True,
+                "provider": "openai",
+                "status": "valid",
+                "storage_mode_ok": True,
+            })
+            self.assertNotIn("token", json.dumps(status).lower())
+
+    def test_openhands_auth_probe_rejects_expired_or_unsafe_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            auth = home / ".openhands" / "auth"
+            auth.mkdir(parents=True, mode=0o700)
+            path = auth / "openai_oauth.json"
+            path.write_text(json.dumps({
+                "type": "oauth",
+                "vendor": "openai",
+                "access_token": "x",
+                "refresh_token": "y",
+                "expires_at": 1_000_000,
+            }), encoding="utf-8")
+            path.chmod(0o600)
+            expired = cli._openhands_subscription_auth_status(home=home, now_ms=1_000_000)
+            self.assertEqual(expired["status"], "expired")
+            path.chmod(0o644)
+            unsafe = cli._openhands_subscription_auth_status(home=home, now_ms=0)
+            self.assertEqual(unsafe["status"], "unsafe-storage")
+
+
+    def test_openhands_auth_probe_rejects_symlink_and_oversized_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            auth = home / ".openhands" / "auth"
+            auth.mkdir(parents=True, mode=0o700)
+            target = auth / "target.json"
+            target.write_text("{}", encoding="utf-8")
+            target.chmod(0o600)
+            (auth / "openai_oauth.json").symlink_to(target.name)
+            linked = cli._openhands_subscription_auth_status(home=home, now_ms=0)
+            self.assertFalse(linked["authenticated"])
+            self.assertIn(linked["status"], {"unreadable", "unsafe-storage"})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            auth = home / ".openhands" / "auth"
+            auth.mkdir(parents=True, mode=0o700)
+            path = auth / "openai_oauth.json"
+            path.write_bytes(b"x" * (64 * 1024 + 1))
+            path.chmod(0o600)
+            oversized = cli._openhands_subscription_auth_status(home=home, now_ms=0)
+            self.assertFalse(oversized["authenticated"])
+            self.assertIn(oversized["status"], {"invalid", "unsafe-storage"})
+
 
 
 if __name__ == "__main__":

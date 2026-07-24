@@ -300,7 +300,7 @@ def parse_processes(payload: dict[str, Any] | None) -> dict[str, Any]:
         command_class = "other"
         if workspace_id:
             command_class = "agent-workspace-pane"
-        elif executable in {"claude", "codex", "agy"}:
+        elif executable in {"claude", "codex", "agy", "opencode", "openhands"}:
             command_class = "coding-agent"
         elif "grabowski_operator" in arguments:
             command_class = "operator-runtime"

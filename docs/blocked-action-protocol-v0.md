@@ -16,7 +16,7 @@ Es etabliert keinen neuen Privilegienpfad, keine dauerhafte Agentenautonomie und
 
 ## Nutzer-Eskalationsgrenze
 
-Der Nutzer ist Entscheidungsinstanz, nicht Standard-Executor. Bei Plattformblockade muss ChatGPT zuerst interne Relay-Pfade nutzen: engeres Typed Tool, Grabowski Micro-Task, Codex, Claude, agy, lokale KI oder Patch-Relay. Nutzerkontakt ist Entscheidungseskalation, kein Ersatz fuer einen blockierten Griff.
+Der Nutzer ist Entscheidungsinstanz, nicht Standard-Executor. Bei Plattformblockade muss ChatGPT zuerst interne Relay-Pfade nutzen: engeres Typed Tool, Grabowski Micro-Task, Codex, Claude, Antigravity, OpenCode, OpenHands, lokale KI oder Patch-Relay. Nutzerkontakt ist Entscheidungseskalation, kein Ersatz fuer einen blockierten Griff.
 
 ## Nicht-Ziele
 
@@ -71,11 +71,11 @@ Danach wird nach Aufgabenklasse geroutet.
    - Externe Modelle sind standardmaessig aus und besitzen keine autoritative Writer-Rolle und keinen Kapazitaets-Fallback.
    - Auch bei expliziter Aktivierung erhalten sie keine Kopien dieses ChatGPT-Kontexts, sondern nur einen begrenzten, zweckgebundenen Review- oder Kontrastauftrag.
    - Zulassige Rollen sind unabhaengiger Review sowie ausdruecklich angeforderte isolierte Kontrast- oder Wettbewerbsprogrammierung.
-   - Auswahlprioritaet innerhalb dieser beratenden Rollen: **Claude -> Codex -> agy -> Cline**.
+   - Auswahlprioritaet innerhalb dieser beratenden Rollen: **Claude -> Codex -> Antigravity -> OpenCode -> OpenHands -> Cline**.
    - Ergebnisse bleiben advisory-only: keine automatische Patchuebernahme, kein Commit, kein Push, kein Merge und kein Deploy.
 
-6. **agy print / lokale KI**
-   - `agy --print` und lokale Modelle duerfen kurze beratende Denk-, Sortier- oder Kontrastgriffe liefern.
+6. **Antigravity, OpenCode, OpenHands / lokale KI**
+   - `agy --print` (Antigravity CLI) und lokale Modelle duerfen kurze beratende Denk-, Sortier- oder Kontrastgriffe liefern.
    - Sie sind weder Standardpfad fuer direkte Arbeit noch Ersatz bei grossem Umfang.
    - Jeder Griff endet mit einem begrenzten Receipt; Entscheidungen und Umsetzung bleiben bei ChatGPT/Grabowski.
 
@@ -83,9 +83,9 @@ Danach wird nach Aufgabenklasse geroutet.
    - Externe Reviewer pruefen nach einem operatorseitigen Plan, Diff oder Ergebnis Architektur, Sicherheit, Quellen, Failure Paths und Tests.
    - Default: lesen, bewerten, Risiken benennen; Befunde bleiben bis zur direkten Pruefung durch den Operator beratend.
 
-8. **tmux / agy Session**
+8. **tmux / Antigravity Session**
    - tmux ist Standard fuer vorhandene Sessions, Capture und Resume-Kontexte.
-   - agy ist fuer Session/Resume nur dann besser, wenn der Ruecknahmebeleg klarer ist.
+   - Antigravity ist fuer Session/Resume nur dann besser, wenn der Ruecknahmebeleg klarer ist.
 
 9. **Patch file relay**
    - Lokale Patchdateien werden mit `tools/operator_patch_relay.py` geprueft und bei expliziter Entscheidung angewendet.
@@ -106,7 +106,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | komplexer Code-/Repo-Slice | ChatGPT/Grabowski direkt | Auch grosse Implementierungen bleiben operatorseitig; externe Modelle duerfen nur Review oder ausdruecklichen Kontrast liefern | diff, changed files, Tests |
 | lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |
 | Review-/Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
-| interaktive Sessionfrage | tmux capture, agy bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
+| interaktive Sessionfrage | tmux capture, Antigravity bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
 | lokale Mikro-Reasoning-Frage | Ollama API mit qwen coder | lokal, billig und begrenzt | kurze Antwort oder Vorschlagsliste |
 
 ## Micro-Handoff Contract
@@ -117,7 +117,7 @@ Ein Micro-Handoff ist nur gueltig, wenn er diese Felder gedanklich oder maschine
 {
   "step_id": "unique-step-id",
   "operator": "chatgpt-grabowski",
-  "executor": "grabowski-task|codex|claude|agy|local-ai",
+  "executor": "grabowski-task|codex|claude|antigravity|opencode|openhands|local-ai",
   "intent": "one bounded action",
   "allowed_scope": ["repo:/home/alex/repos/example"],
   "forbidden": ["secrets", "live-deploy", "merge", "push unless explicitly requested"],
@@ -135,7 +135,7 @@ Nach jedem Micro-Handoff muss ein Receipt vorliegen. Minimal:
 ```json
 {
   "step_id": "unique-step-id",
-  "executor": "grabowski-task|codex|claude|agy|local-ai",
+  "executor": "grabowski-task|codex|claude|antigravity|opencode|openhands|local-ai",
   "state": "completed|failed|blocked|rejected",
   "changed_files": [],
   "exit_code": 0,
@@ -206,9 +206,9 @@ Claude ist eine bevorzugte unabhaengige Review- und Urteilsroute fuer schwierige
 
 Codex ist eine Review- und Kontrastroute fuer Code- und Repo-Slices. `review` ist der Normalfall; ein mutierender Gegenentwurf muss isoliert, ausdruecklich angefordert und auf Diff/Test begrenzt sein. Er besitzt keine Integrationsautoritaet.
 
-### agy
+### Antigravity
 
-agy vereinheitlicht externe Review- und Kontrastrouten und kann kurze beratende One-Shots liefern. Es ist kein Kapazitaetsersatz fuer direkte Operatorarbeit und darf keine autoritative Writerrolle erzeugen.
+Antigravity vereinheitlicht externe Review- und Kontrastrouten und kann kurze beratende One-Shots liefern. Es ist kein Kapazitaetsersatz fuer direkte Operatorarbeit und darf keine autoritative Writerrolle erzeugen.
 
 ### Cline
 

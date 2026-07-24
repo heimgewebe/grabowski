@@ -945,8 +945,22 @@ def _route_available(
             and auth.get("subscription_type") in CLAUDE_PLAN_TYPES
         ):
             return False, "Claude plan authentication is unavailable"
-    if harness == "agy" and model_arg not in providers.get("agy", {}).get("models", []):
-        return False, "Agy model is absent"
+    if harness == "antigravity":
+        antigravity = providers.get("antigravity", providers.get("agy", {}))
+        if model_arg not in antigravity.get("models", []):
+            return False, "Antigravity model is absent"
+    if harness == "opencode":
+        opencode = providers.get("opencode", {})
+        if opencode.get("free_model_verified") is not True:
+            return False, "OpenCode free model entitlement is unverified"
+        if model_arg not in opencode.get("models", []):
+            return False, "OpenCode model is absent"
+    if harness == "openhands":
+        openhands = providers.get("openhands", {})
+        if openhands.get("authenticated") is not True:
+            return False, "OpenHands authenticated model is unavailable"
+        if openhands.get("approval_mode") != "always-approve":
+            return False, "OpenHands always-approve contract is unavailable"
     if harness == "grok":
         grok = providers.get("grok", {})
         if grok.get("logged_in") is not True:

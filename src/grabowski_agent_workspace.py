@@ -121,7 +121,7 @@ ROUTE_RISK_FLAGS = frozenset({
     "data_migration", "privilege", "external_api", "cross_repo",
     "destructive", "user_data",
 })
-ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "agy", "codex"})
+ROUTE_EXTERNAL_AGENTS = frozenset({"claude", "antigravity", "opencode", "openhands", "codex"})
 LEGACY_ROUTE_EXTERNAL_AGENTS_V21 = frozenset({"claude", "agy"})
 LEGACY_ROUTE_POLICY_VERSION_V21 = "workspace-routing-v2.1"
 ROUTE_POLICY_VERSION = "direct-first-routing-v3.0"

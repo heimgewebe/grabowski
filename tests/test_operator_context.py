@@ -93,15 +93,15 @@ class OperatorContextTests(unittest.TestCase):
         )
         self.assertEqual(
             protocol["execution_priority"],
-            ["chatgpt_operator", "claude", "codex", "agy", "cline"],
+            ["chatgpt_operator", "claude", "codex", "antigravity", "opencode", "openhands", "cline"],
         )
         self.assertEqual(
             protocol["coding_agent_priority"],
-            ["claude", "codex", "agy", "cline"],
+            ["claude", "codex", "antigravity", "opencode", "openhands", "cline"],
         )
         self.assertEqual(
             protocol["review_and_contrast_agent_priority"],
-            ["claude", "codex", "agy", "cline"],
+            ["claude", "codex", "antigravity", "opencode", "openhands", "cline"],
         )
         self.assertEqual(
             protocol["coding_agent_priority_semantics"],

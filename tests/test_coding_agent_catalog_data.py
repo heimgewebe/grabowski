@@ -53,7 +53,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 catalog, validation = router._load_catalog()
         self.assertEqual(validation["catalog_source"], "deployment_catalog")
-        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v4")
+        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v5")
         self.assertNotIn("legacy", catalog)
 
     def test_catalog_path_without_override_gate_is_ignored(self) -> None:
@@ -66,7 +66,7 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=True):
                 catalog, validation = router._load_catalog()
         self.assertEqual(validation["catalog_source"], "deployment_catalog")
-        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v4")
+        self.assertEqual(catalog["catalog_version"], "direct-first-review-contrast-v5")
 
     def test_environment_override_remains_explicit_and_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,6 +104,18 @@ class CodingAgentCatalogDataTests(unittest.TestCase):
         self.assertEqual(body["catalog_path"], str(selection[0]))
         self.assertEqual(body["validation"]["catalog_source"], selection[1])
         self.assertEqual(selector.call_count, 1)
+
+
+    def test_canonical_harness_additions_are_embedded(self) -> None:
+        catalog, _ = router._load_catalog()
+        self.assertNotIn("agy", catalog["harnesses"])
+        self.assertEqual(catalog["harnesses"]["antigravity"]["binary"], "agy")
+        self.assertEqual(catalog["harnesses"]["openhands"]["approval_mode"], "always-approve")
+        routes = {item["id"]: item for item in catalog["routes"]}
+        self.assertEqual(routes["opencode-deepseek-v4-flash-free"]["harness"], "opencode")
+        self.assertIn("--auto", routes["opencode-deepseek-v4-flash-free"]["argv_prefix"])
+        self.assertEqual(routes["openhands-always-approve"]["harness"], "openhands")
+        self.assertIn("--always-approve", routes["openhands-always-approve"]["argv_prefix"])
 
 
 if __name__ == "__main__":

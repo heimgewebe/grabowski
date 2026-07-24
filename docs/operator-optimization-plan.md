@@ -114,7 +114,7 @@ Primary risk: emergency diagnosis becomes slower.
 
 ### Class E: Agent delegation control
 
-Purpose: keep Codex, Claude, agy, Ollama and Aider helpful without making them sovereign.
+Purpose: keep Codex, Claude, Antigravity, OpenCode, OpenHands, Ollama and Aider helpful without making them sovereign.
 
 Includes:
 
