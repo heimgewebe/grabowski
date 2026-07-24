@@ -42,7 +42,10 @@
       "additionalProperties": false,
       "properties": {
         "capture_path": {
-          "const": "agent_workspace_prestart"
+          "enum": [
+            "agent_workspace_prestart",
+            "direct_capture"
+          ]
         },
         "case_origin": {
           "enum": [
@@ -57,7 +60,25 @@
         "case_origin",
         "capture_path"
       ],
-      "type": "object"
+      "type": "object",
+      "allOf": [
+        {
+          "not": {
+            "properties": {
+              "case_origin": {
+                "const": "production"
+              },
+              "capture_path": {
+                "const": "direct_capture"
+              }
+            },
+            "required": [
+              "case_origin",
+              "capture_path"
+            ]
+          }
+        }
+      ]
     },
     "features": {
       "oneOf": [

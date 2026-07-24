@@ -55,15 +55,23 @@ def main(argv: list[str] | None = None) -> int:
         raise capture.ShadowCaptureError(
             "outcome input must contain outcome and primary_evidence_refs plus only optional execution_provenance and semantic_assessments"
         )
+    optional_observability = {}
+    if "execution_provenance" in outcome_input:
+        optional_observability["execution_provenance"] = outcome_input[
+            "execution_provenance"
+        ]
+    if "semantic_assessments" in outcome_input:
+        optional_observability["semantic_assessments"] = outcome_input[
+            "semantic_assessments"
+        ]
     result = capture.seal_prospective_case(
         prospective,
         manifest,
         eligible_task_id=args.task_id,
         outcome=outcome_input["outcome"],
         primary_evidence_refs=outcome_input["primary_evidence_refs"],
-        execution_provenance=outcome_input.get("execution_provenance"),
-        semantic_assessments=outcome_input.get("semantic_assessments"),
         root=args.root,
+        **optional_observability,
     )
     print(json.dumps(result, sort_keys=True))
     return 0
