@@ -1,0 +1,304 @@
+{
+  "$id": "operator-routing-shadow-eligibility.v3.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "canonical_route_evidence": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_identity_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "recommendation_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "route_evidence_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "enum": [
+            1,
+            2
+          ],
+          "type": "integer"
+        },
+        "source": {
+          "const": "agent-workspace-manifest"
+        }
+      },
+      "required": [
+        "source",
+        "schema_version",
+        "recommendation_id",
+        "route_evidence_sha256",
+        "manifest_identity_sha256"
+      ],
+      "type": "object"
+    },
+    "case_provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "capture_path": {
+          "const": "agent_workspace_prestart"
+        },
+        "case_origin": {
+          "enum": [
+            "production",
+            "test",
+            "synthetic",
+            "quarantined"
+          ]
+        }
+      },
+      "required": [
+        "case_origin",
+        "capture_path"
+      ],
+      "type": "object"
+    },
+    "eligibility_id": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "eligible_case": {
+      "additionalProperties": false,
+      "properties": {
+        "case_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "task_id": {
+          "pattern": "^[0-9a-f]{24}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "case_id"
+      ],
+      "type": "object"
+    },
+    "features": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "changed_file_estimate": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "connector_instability": {
+              "type": "boolean"
+            },
+            "expected_duration_minutes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "novelty": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "parallel_work": {
+              "type": "boolean"
+            },
+            "risk_flags": {
+              "items": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 32,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "task_kind": {
+              "maxLength": 40,
+              "minLength": 1,
+              "type": "string"
+            },
+            "user_requested_external": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "user_requested_external",
+            "parallel_work"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "architecture_hypotheses": {
+              "maximum": 4,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "changed_file_estimate": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "concurrent_external_activity": {
+              "type": "boolean"
+            },
+            "connector_instability": {
+              "type": "boolean"
+            },
+            "decision_fork": {
+              "type": "boolean"
+            },
+            "expected_duration_minutes": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "novelty": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "parallelization_candidate": {
+              "type": "boolean"
+            },
+            "risk_flags": {
+              "items": {
+                "maxLength": 32,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 32,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "risk_tier": {
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "task_kind": {
+              "maxLength": 40,
+              "minLength": 1,
+              "type": "string"
+            },
+            "user_requested_external": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "task_kind",
+            "changed_file_estimate",
+            "expected_duration_minutes",
+            "novelty",
+            "risk_flags",
+            "connector_instability",
+            "user_requested_external",
+            "risk_tier",
+            "concurrent_external_activity",
+            "parallelization_candidate",
+            "decision_fork",
+            "architecture_hypotheses"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "frozen_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "no_effect": {
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "const": false
+        },
+        "policy": {
+          "const": false
+        },
+        "proposal_only": {
+          "const": true
+        },
+        "queue": {
+          "const": false
+        },
+        "routing": {
+          "const": false
+        },
+        "runtime": {
+          "const": false
+        }
+      },
+      "required": [
+        "proposal_only",
+        "routing",
+        "policy",
+        "queue",
+        "merge",
+        "runtime"
+      ],
+      "type": "object"
+    },
+    "prospective_eligibility": {
+      "additionalProperties": false,
+      "properties": {
+        "frozen_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "plan_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "prospective_eligibility_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "operator-routing-shadow-prospective-eligibility.v2"
+        },
+        "workspace_case_id": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "workspace_id": {
+          "pattern": "^gaw-[a-z0-9][a-z0-9-]{7,79}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "prospective_eligibility_id",
+        "workspace_id",
+        "plan_sha256",
+        "workspace_case_id",
+        "frozen_at"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": "operator-routing-shadow-eligibility.v3"
+    }
+  },
+  "required": [
+    "schema_version",
+    "eligibility_id",
+    "prospective_eligibility",
+    "eligible_case",
+    "canonical_route_evidence",
+    "features",
+    "case_provenance",
+    "frozen_at",
+    "no_effect"
+  ],
+  "title": "Operator routing shadow eligibility receipt v3",
+  "type": "object"
+}

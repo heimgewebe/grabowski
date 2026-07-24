@@ -823,9 +823,18 @@ def write_create_only(path: Path, record: dict[str, Any]) -> None:
 PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION = (
     "operator-routing-shadow-prospective-eligibility.v1"
 )
+PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION = (
+    "operator-routing-shadow-prospective-eligibility.v2"
+)
 ELIGIBILITY_V2_SCHEMA_VERSION = "operator-routing-shadow-eligibility.v2"
+ELIGIBILITY_V3_SCHEMA_VERSION = "operator-routing-shadow-eligibility.v3"
 RECORD_V2_SCHEMA_VERSION = "operator-routing-shadow-record.v2"
+RECORD_V3_SCHEMA_VERSION = "operator-routing-shadow-record.v3"
 CAPTURE_ATTEMPT_SCHEMA_VERSION = "operator-routing-shadow-capture-attempt.v1"
+CASE_ORIGINS = {"production", "test", "synthetic", "quarantined"}
+CAPTURE_PATH = "agent_workspace_prestart"
+EXECUTION_STATUSES = {"completed", "execution_aborted", "infrastructure_failure"}
+EXECUTION_UNKNOWN_REASONS = {"not_observed", "ambiguous"}
 PROSPECTIVE_FIELDS = {
     "schema_version",
     "prospective_eligibility_id",
@@ -835,6 +844,7 @@ PROSPECTIVE_FIELDS = {
     "frozen_at",
     "no_effect",
 }
+PROSPECTIVE_V2_FIELDS = PROSPECTIVE_FIELDS | {"case_provenance"}
 ELIGIBILITY_V2_FIELDS = {
     "schema_version",
     "eligibility_id",
@@ -845,6 +855,7 @@ ELIGIBILITY_V2_FIELDS = {
     "frozen_at",
     "no_effect",
 }
+ELIGIBILITY_V3_FIELDS = ELIGIBILITY_V2_FIELDS | {"case_provenance"}
 RECORD_V2_FIELDS = {
     "schema_version",
     "record_id",
@@ -856,6 +867,11 @@ RECORD_V2_FIELDS = {
     "primary_evidence_refs",
     "captured_at",
     "no_effect",
+}
+RECORD_V3_FIELDS = RECORD_V2_FIELDS | {
+    "case_provenance",
+    "execution_provenance",
+    "semantic_assessments",
 }
 ATTEMPT_STATUSES = {"created", "duplicate", "rejected", "error"}
 
@@ -883,6 +899,8 @@ def _prove_prospective_binding(
     features: dict[str, Any],
     frozen_at: str,
     no_effect: dict[str, Any],
+    prospective_schema_version: str = PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+    case_provenance: dict[str, Any] | None = None,
 ) -> None:
     """Reconstruct the full prospective payload and prove its self-consistency.
 
@@ -910,7 +928,7 @@ def _prove_prospective_binding(
             "workspace_case_id is not bound to workspace, plan and route"
         )
     reconstructed = {
-        "schema_version": PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+        "schema_version": prospective_schema_version,
         "workspace_case": {
             "workspace_id": workspace_id,
             "plan_sha256": plan_sha256,
@@ -921,6 +939,10 @@ def _prove_prospective_binding(
         "frozen_at": frozen_at,
         "no_effect": no_effect,
     }
+    if prospective_schema_version == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
+        reconstructed["case_provenance"] = _normalize_case_provenance(case_provenance)
+    elif prospective_schema_version != PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION:
+        raise ShadowCaptureError("prospective schema version is unsupported")
     if _sha256_json(reconstructed) != prospective_eligibility_id:
         raise ShadowCaptureError(
             "prospective_eligibility_id does not match the reconstructed "
@@ -1040,6 +1062,172 @@ def validate_prospective_eligibility(receipt: Any) -> dict[str, Any]:
     return receipt
 
 
+def _normalize_case_provenance(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"case_origin", "capture_path"}:
+        raise ShadowCaptureError("case_provenance shape is invalid")
+    origin = value.get("case_origin")
+    if origin not in CASE_ORIGINS:
+        raise ShadowCaptureError("case_provenance.case_origin is invalid")
+    if value.get("capture_path") != CAPTURE_PATH:
+        raise ShadowCaptureError("case_provenance.capture_path is invalid")
+    return {"case_origin": origin, "capture_path": CAPTURE_PATH}
+
+
+def _normalize_execution_provenance(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {"status": "unknown", "reason_code": "not_observed"}
+    if not isinstance(value, dict):
+        raise ShadowCaptureError("execution_provenance must be an object")
+    status_value = value.get("status")
+    if status_value == "unknown":
+        if set(value) != {"status", "reason_code"}:
+            raise ShadowCaptureError("unknown execution_provenance shape is invalid")
+        reason = value.get("reason_code")
+        if reason not in EXECUTION_UNKNOWN_REASONS:
+            raise ShadowCaptureError("execution_provenance reason_code is invalid")
+        return {"status": "unknown", "reason_code": reason}
+    if status_value not in EXECUTION_STATUSES:
+        raise ShadowCaptureError("execution_provenance status is invalid")
+    if set(value) != {"status", "observed_at", "evidence_refs"}:
+        raise ShadowCaptureError("observed execution_provenance shape is invalid")
+    refs = _normalize_evidence_refs(value.get("evidence_refs"), reviewed=False, sort=True)
+    if not refs:
+        raise ShadowCaptureError("observed execution_provenance requires evidence_refs")
+    return {
+        "status": status_value,
+        "observed_at": _parse_timestamp(value.get("observed_at"), "execution_provenance.observed_at"),
+        "evidence_refs": refs,
+    }
+
+
+def _normalize_semantic_assessments(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 4:
+        raise ShadowCaptureError("semantic_assessments must be a list with at most 4 entries")
+    if len(value) == 1:
+        raise ShadowCaptureError(
+            "semantic_assessments must be empty or contain at least 2 independent assessments"
+        )
+    normalized: list[dict[str, Any]] = []
+    reviewer_ids: set[str] = set()
+    kinds: set[str] = set()
+    expected = {
+        "reviewer_pseudonym_sha256",
+        "kind",
+        "label",
+        "observed_at",
+        "review_authority",
+        "primary_evidence_refs",
+    }
+    for item in value:
+        if not isinstance(item, dict) or set(item) != expected:
+            raise ShadowCaptureError("semantic assessment shape is invalid")
+        reviewer_id = item.get("reviewer_pseudonym_sha256")
+        if not isinstance(reviewer_id, str) or SHA256_RE.fullmatch(reviewer_id) is None:
+            raise ShadowCaptureError("semantic assessment reviewer pseudonym is invalid")
+        if reviewer_id in reviewer_ids:
+            raise ShadowCaptureError("semantic assessments require distinct reviewer pseudonyms")
+        reviewer_ids.add(reviewer_id)
+        kind = item.get("kind")
+        label = item.get("label")
+        authority = item.get("review_authority")
+        if kind not in OUTCOME_KINDS or label not in OUTCOME_LABELS:
+            raise ShadowCaptureError("semantic assessment kind or label is invalid")
+        if authority not in REVIEW_AUTHORITIES:
+            raise ShadowCaptureError("semantic assessment review_authority is invalid")
+        kinds.add(kind)
+        normalized.append(
+            {
+                "reviewer_pseudonym_sha256": reviewer_id,
+                "kind": kind,
+                "label": label,
+                "observed_at": _parse_timestamp(item.get("observed_at"), "semantic_assessment.observed_at"),
+                "review_authority": authority,
+                "primary_evidence_refs": _normalize_evidence_refs(
+                    item.get("primary_evidence_refs"), reviewed=True, sort=True
+                ),
+            }
+        )
+    if len(kinds) > 1:
+        raise ShadowCaptureError("semantic assessments must address one outcome kind")
+    return sorted(normalized, key=lambda item: item["reviewer_pseudonym_sha256"])
+
+
+def build_prospective_eligibility_v2(
+    manifest: dict[str, Any],
+    *,
+    frozen_at: str,
+    case_origin: str,
+) -> dict[str, Any]:
+    """Freeze a new provenance-observable case without mutating v1 history."""
+    legacy = build_prospective_eligibility(manifest, frozen_at=frozen_at)
+    payload = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        "workspace_case": dict(legacy["workspace_case"]),
+        "canonical_route_evidence": dict(legacy["canonical_route_evidence"]),
+        "features": dict(legacy["features"]),
+        "case_provenance": _normalize_case_provenance(
+            {"case_origin": case_origin, "capture_path": CAPTURE_PATH}
+        ),
+        "frozen_at": legacy["frozen_at"],
+        "no_effect": dict(NO_EFFECT),
+    }
+    receipt = {"prospective_eligibility_id": _sha256_json(payload), **payload}
+    validate_prospective_eligibility_v2(receipt)
+    return receipt
+
+
+def validate_prospective_eligibility_v2(receipt: Any) -> dict[str, Any]:
+    if not isinstance(receipt, dict) or set(receipt) != PROSPECTIVE_V2_FIELDS:
+        raise ShadowCaptureError("prospective eligibility v2 receipt shape is invalid")
+    if receipt.get("schema_version") != PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
+        raise ShadowCaptureError("prospective eligibility v2 schema_version is invalid")
+    receipt_id = receipt.get("prospective_eligibility_id")
+    if not isinstance(receipt_id, str) or SHA256_RE.fullmatch(receipt_id) is None:
+        raise ShadowCaptureError("prospective_eligibility_id is invalid")
+    legacy_payload = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+        "workspace_case": receipt.get("workspace_case"),
+        "canonical_route_evidence": receipt.get("canonical_route_evidence"),
+        "features": receipt.get("features"),
+        "frozen_at": receipt.get("frozen_at"),
+        "no_effect": receipt.get("no_effect"),
+    }
+    validate_prospective_eligibility(
+        {"prospective_eligibility_id": _sha256_json(legacy_payload), **legacy_payload}
+    )
+    _normalize_case_provenance(receipt.get("case_provenance"))
+    payload = {key: receipt[key] for key in receipt if key != "prospective_eligibility_id"}
+    if _sha256_json(payload) != receipt_id:
+        raise ShadowCaptureError(
+            "prospective_eligibility_id does not match the canonical v2 payload"
+        )
+    return receipt
+
+
+def _validate_any_prospective(receipt: Any) -> dict[str, Any]:
+    schema_version = receipt.get("schema_version") if isinstance(receipt, dict) else None
+    if schema_version == PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION:
+        return validate_prospective_eligibility(receipt)
+    if schema_version == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
+        return validate_prospective_eligibility_v2(receipt)
+    raise ShadowCaptureError("unsupported prospective eligibility schema")
+
+
+def _legacy_projection_from_prospective_v2(receipt: dict[str, Any]) -> dict[str, Any]:
+    current = validate_prospective_eligibility_v2(receipt)
+    payload = {
+        "schema_version": PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION,
+        "workspace_case": dict(current["workspace_case"]),
+        "canonical_route_evidence": dict(current["canonical_route_evidence"]),
+        "features": dict(current["features"]),
+        "frozen_at": current["frozen_at"],
+        "no_effect": dict(current["no_effect"]),
+    }
+    return {"prospective_eligibility_id": _sha256_json(payload), **payload}
+
+
 def build_bound_eligibility_v2(
     prospective_receipt: dict[str, Any],
     manifest: dict[str, Any],
@@ -1048,6 +1236,8 @@ def build_bound_eligibility_v2(
 ) -> dict[str, Any]:
     """Bind a pre-start eligibility freeze to the later real Grabowski task identity."""
     prospective = validate_prospective_eligibility(prospective_receipt)
+    if prospective.get("schema_version") != PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION:
+        raise ShadowCaptureError("eligibility v2 requires prospective eligibility v1")
     if not isinstance(manifest, dict):
         raise ShadowCaptureError("manifest must be an object")
     workspace_case = prospective["workspace_case"]
@@ -1176,6 +1366,105 @@ def validate_bound_eligibility_v2(receipt: Any) -> dict[str, Any]:
         raise ShadowCaptureError(
             "eligibility_id does not match the canonical eligibility v2 payload"
         )
+    return receipt
+
+
+def build_bound_eligibility_v3(
+    prospective_receipt: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    eligible_task_id: str,
+) -> dict[str, Any]:
+    prospective = validate_prospective_eligibility_v2(prospective_receipt)
+    legacy = _legacy_projection_from_prospective_v2(prospective)
+    legacy_eligibility = build_bound_eligibility_v2(
+        legacy, manifest, eligible_task_id=eligible_task_id
+    )
+    workspace_case = prospective["workspace_case"]
+    payload = {
+        "schema_version": ELIGIBILITY_V3_SCHEMA_VERSION,
+        "prospective_eligibility": {
+            "schema_version": PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+            "prospective_eligibility_id": prospective["prospective_eligibility_id"],
+            "workspace_id": workspace_case["workspace_id"],
+            "plan_sha256": workspace_case["plan_sha256"],
+            "workspace_case_id": workspace_case["case_id"],
+            "frozen_at": prospective["frozen_at"],
+        },
+        "eligible_case": dict(legacy_eligibility["eligible_case"]),
+        "canonical_route_evidence": dict(legacy_eligibility["canonical_route_evidence"]),
+        "features": dict(legacy_eligibility["features"]),
+        "case_provenance": dict(prospective["case_provenance"]),
+        "frozen_at": prospective["frozen_at"],
+        "no_effect": dict(NO_EFFECT),
+    }
+    receipt = {"eligibility_id": _sha256_json(payload), **payload}
+    validate_bound_eligibility_v3(receipt)
+    return receipt
+
+
+def validate_bound_eligibility_v3(receipt: Any) -> dict[str, Any]:
+    if not isinstance(receipt, dict) or set(receipt) != ELIGIBILITY_V3_FIELDS:
+        raise ShadowCaptureError("eligibility v3 receipt shape is invalid")
+    if receipt.get("schema_version") != ELIGIBILITY_V3_SCHEMA_VERSION:
+        raise ShadowCaptureError("eligibility v3 schema_version is invalid")
+    eligibility_id = receipt.get("eligibility_id")
+    if not isinstance(eligibility_id, str) or SHA256_RE.fullmatch(eligibility_id) is None:
+        raise ShadowCaptureError("eligibility_id is invalid")
+    _, _, route_schema_version = _validate_case_and_route(
+        receipt.get("eligible_case"),
+        receipt.get("canonical_route_evidence"),
+        manifest_field="manifest_identity_sha256",
+    )
+    _validate_features(receipt.get("features"), route_schema_version=route_schema_version)
+    provenance = _normalize_case_provenance(receipt.get("case_provenance"))
+    if provenance != receipt.get("case_provenance"):
+        raise ShadowCaptureError("case_provenance is not normalized")
+    prospective = receipt.get("prospective_eligibility")
+    expected_ref = {
+        "schema_version",
+        "prospective_eligibility_id",
+        "workspace_id",
+        "plan_sha256",
+        "workspace_case_id",
+        "frozen_at",
+    }
+    if not isinstance(prospective, dict) or set(prospective) != expected_ref:
+        raise ShadowCaptureError("prospective eligibility v2 reference shape is invalid")
+    if prospective.get("schema_version") != PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
+        raise ShadowCaptureError("prospective eligibility v2 reference schema is invalid")
+    for field in ("prospective_eligibility_id", "plan_sha256", "workspace_case_id"):
+        value = prospective.get(field)
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise ShadowCaptureError(f"prospective eligibility v2 reference {field} is invalid")
+    workspace_id = prospective.get("workspace_id")
+    if not isinstance(workspace_id, str) or workspace.WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise ShadowCaptureError("prospective eligibility v2 workspace_id is invalid")
+    frozen_at = _parse_timestamp(receipt.get("frozen_at"), "frozen_at")
+    prospective_frozen_at = _parse_timestamp(
+        prospective.get("frozen_at"), "prospective_eligibility.frozen_at"
+    )
+    if frozen_at != receipt.get("frozen_at") or prospective_frozen_at != prospective.get("frozen_at"):
+        raise ShadowCaptureError("eligibility v3 timestamps are not normalized")
+    if frozen_at != prospective_frozen_at:
+        raise ShadowCaptureError("eligibility v3 must preserve prospective frozen_at")
+    if receipt.get("no_effect") != NO_EFFECT:
+        raise ShadowCaptureError("no_effect boundary is invalid")
+    _prove_prospective_binding(
+        workspace_id=workspace_id,
+        plan_sha256=prospective["plan_sha256"],
+        workspace_case_id=prospective["workspace_case_id"],
+        prospective_eligibility_id=prospective["prospective_eligibility_id"],
+        route_ref=receipt["canonical_route_evidence"],
+        features=receipt["features"],
+        frozen_at=frozen_at,
+        no_effect=receipt["no_effect"],
+        prospective_schema_version=PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        case_provenance=receipt["case_provenance"],
+    )
+    payload = {key: receipt[key] for key in receipt if key != "eligibility_id"}
+    if _sha256_json(payload) != eligibility_id:
+        raise ShadowCaptureError("eligibility_id does not match the canonical eligibility v3 payload")
     return receipt
 
 
@@ -1345,14 +1634,212 @@ def validate_shadow_record_v2(record: Any) -> dict[str, Any]:
     return record
 
 
+def build_shadow_record_v3(
+    eligibility_receipt: dict[str, Any],
+    *,
+    outcome: dict[str, Any],
+    primary_evidence_refs: list[str],
+    execution_provenance: dict[str, Any] | None,
+    semantic_assessments: list[dict[str, Any]] | None,
+    captured_at: str,
+) -> dict[str, Any]:
+    eligibility = validate_bound_eligibility_v3(eligibility_receipt)
+    normalized_outcome = _normalize_outcome(outcome)
+    refs = _normalize_evidence_refs(
+        primary_evidence_refs,
+        reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
+    )
+    execution = _normalize_execution_provenance(execution_provenance)
+    assessments = _normalize_semantic_assessments(semantic_assessments)
+    if assessments:
+        if normalized_outcome.get("status") != "reviewed":
+            raise ShadowCaptureError(
+                "semantic assessments require a reviewed primary outcome"
+            )
+        if assessments[0]["kind"] != normalized_outcome["kind"]:
+            raise ShadowCaptureError(
+                "semantic assessments must address the reviewed outcome kind"
+            )
+    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
+    frozen_at = eligibility["frozen_at"]
+    timeline_values = [("outcome observation", normalized_outcome["observed_at"])]
+    timeline_values.extend(
+        ("semantic assessment", item["observed_at"]) for item in assessments
+    )
+    if execution["status"] != "unknown":
+        timeline_values.append(("execution observation", execution["observed_at"]))
+    for label, observed_at in timeline_values:
+        if _timestamp_value(frozen_at) > _timestamp_value(observed_at):
+            raise ShadowCaptureError(f"eligibility must be frozen before {label}")
+        if _timestamp_value(observed_at) > _timestamp_value(normalized_captured_at):
+            raise ShadowCaptureError(f"{label} must not occur after capture sealing")
+    prospective = eligibility["prospective_eligibility"]
+    payload = {
+        "schema_version": RECORD_V3_SCHEMA_VERSION,
+        "eligibility": {
+            "schema_version": ELIGIBILITY_V3_SCHEMA_VERSION,
+            "eligibility_id": eligibility["eligibility_id"],
+            "prospective_eligibility_id": prospective["prospective_eligibility_id"],
+            "workspace_id": prospective["workspace_id"],
+            "plan_sha256": prospective["plan_sha256"],
+            "workspace_case_id": prospective["workspace_case_id"],
+            "frozen_at": frozen_at,
+        },
+        "eligible_case": dict(eligibility["eligible_case"]),
+        "canonical_route_evidence": dict(eligibility["canonical_route_evidence"]),
+        "features": dict(eligibility["features"]),
+        "case_provenance": dict(eligibility["case_provenance"]),
+        "outcome": normalized_outcome,
+        "primary_evidence_refs": refs,
+        "execution_provenance": execution,
+        "semantic_assessments": assessments,
+        "captured_at": normalized_captured_at,
+        "no_effect": dict(NO_EFFECT),
+    }
+    record = {"record_id": _sha256_json(payload), **payload}
+    validate_shadow_record_v3(record)
+    return record
+
+
+def validate_shadow_record_v3(record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict) or set(record) != RECORD_V3_FIELDS:
+        raise ShadowCaptureError("shadow record v3 shape is invalid")
+    if record.get("schema_version") != RECORD_V3_SCHEMA_VERSION:
+        raise ShadowCaptureError("shadow record v3 schema_version is invalid")
+    record_id = record.get("record_id")
+    if not isinstance(record_id, str) or SHA256_RE.fullmatch(record_id) is None:
+        raise ShadowCaptureError("record_id is invalid")
+    _, _, route_schema_version = _validate_case_and_route(
+        record.get("eligible_case"),
+        record.get("canonical_route_evidence"),
+        manifest_field="manifest_identity_sha256",
+    )
+    _validate_features(record.get("features"), route_schema_version=route_schema_version)
+    provenance = _normalize_case_provenance(record.get("case_provenance"))
+    if provenance != record.get("case_provenance"):
+        raise ShadowCaptureError("case_provenance is not normalized")
+    normalized_outcome = _normalize_outcome(record.get("outcome"))
+    if normalized_outcome != record.get("outcome"):
+        raise ShadowCaptureError("outcome is not normalized")
+    refs = _normalize_evidence_refs(
+        record.get("primary_evidence_refs"),
+        reviewed=normalized_outcome["status"] == "reviewed",
+        sort=True,
+    )
+    if refs != record.get("primary_evidence_refs"):
+        raise ShadowCaptureError("primary_evidence_refs is not normalized")
+    execution = _normalize_execution_provenance(record.get("execution_provenance"))
+    if execution != record.get("execution_provenance"):
+        raise ShadowCaptureError("execution_provenance is not normalized")
+    assessments = _normalize_semantic_assessments(record.get("semantic_assessments"))
+    if assessments != record.get("semantic_assessments"):
+        raise ShadowCaptureError("semantic_assessments are not normalized")
+    if assessments:
+        if normalized_outcome.get("status") != "reviewed":
+            raise ShadowCaptureError(
+                "semantic assessments require a reviewed primary outcome"
+            )
+        if assessments[0]["kind"] != normalized_outcome["kind"]:
+            raise ShadowCaptureError(
+                "semantic assessments must address the reviewed outcome kind"
+            )
+    eligibility = record.get("eligibility")
+    expected_ref = {
+        "schema_version",
+        "eligibility_id",
+        "prospective_eligibility_id",
+        "workspace_id",
+        "plan_sha256",
+        "workspace_case_id",
+        "frozen_at",
+    }
+    if not isinstance(eligibility, dict) or set(eligibility) != expected_ref:
+        raise ShadowCaptureError("eligibility v3 reference shape is invalid")
+    if eligibility.get("schema_version") != ELIGIBILITY_V3_SCHEMA_VERSION:
+        raise ShadowCaptureError("eligibility v3 reference schema is invalid")
+    for field in ("eligibility_id", "prospective_eligibility_id", "plan_sha256", "workspace_case_id"):
+        value = eligibility.get(field)
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise ShadowCaptureError(f"eligibility v3 reference {field} is invalid")
+    workspace_id = eligibility.get("workspace_id")
+    if not isinstance(workspace_id, str) or workspace.WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise ShadowCaptureError("eligibility v3 reference workspace_id is invalid")
+    frozen_at = _parse_timestamp(eligibility.get("frozen_at"), "eligibility.frozen_at")
+    captured_at = _parse_timestamp(record.get("captured_at"), "captured_at")
+    if frozen_at != eligibility.get("frozen_at") or captured_at != record.get("captured_at"):
+        raise ShadowCaptureError("record v3 timestamps are not normalized")
+    timeline_values = [("outcome observation", normalized_outcome["observed_at"])]
+    timeline_values.extend(("semantic assessment", item["observed_at"]) for item in assessments)
+    if execution["status"] != "unknown":
+        timeline_values.append(("execution observation", execution["observed_at"]))
+    for label, observed_at in timeline_values:
+        if _timestamp_value(frozen_at) > _timestamp_value(observed_at):
+            raise ShadowCaptureError(f"eligibility must be frozen before {label}")
+        if _timestamp_value(observed_at) > _timestamp_value(captured_at):
+            raise ShadowCaptureError(f"{label} must not occur after capture sealing")
+    if record.get("no_effect") != NO_EFFECT:
+        raise ShadowCaptureError("no_effect boundary is invalid")
+    _prove_prospective_binding(
+        workspace_id=workspace_id,
+        plan_sha256=eligibility["plan_sha256"],
+        workspace_case_id=eligibility["workspace_case_id"],
+        prospective_eligibility_id=eligibility["prospective_eligibility_id"],
+        route_ref=record["canonical_route_evidence"],
+        features=record["features"],
+        frozen_at=frozen_at,
+        no_effect=record["no_effect"],
+        prospective_schema_version=PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        case_provenance=record["case_provenance"],
+    )
+    reconstructed_eligibility = {
+        "schema_version": ELIGIBILITY_V3_SCHEMA_VERSION,
+        "prospective_eligibility": {
+            "schema_version": PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+            "prospective_eligibility_id": eligibility["prospective_eligibility_id"],
+            "workspace_id": workspace_id,
+            "plan_sha256": eligibility["plan_sha256"],
+            "workspace_case_id": eligibility["workspace_case_id"],
+            "frozen_at": frozen_at,
+        },
+        "eligible_case": record["eligible_case"],
+        "canonical_route_evidence": record["canonical_route_evidence"],
+        "features": record["features"],
+        "case_provenance": record["case_provenance"],
+        "frozen_at": frozen_at,
+        "no_effect": record["no_effect"],
+    }
+    if _sha256_json(reconstructed_eligibility) != eligibility["eligibility_id"]:
+        raise ShadowCaptureError("eligibility reference does not match the reconstructed eligibility v3 payload")
+    payload = {key: record[key] for key in record if key != "record_id"}
+    if _sha256_json(payload) != record_id:
+        raise ShadowCaptureError("record_id does not match the canonical record v3 payload")
+    return record
+
+
+def _validate_any_record(record: Any) -> dict[str, Any]:
+    schema_version = record.get("schema_version") if isinstance(record, dict) else None
+    if schema_version == RECORD_V2_SCHEMA_VERSION:
+        return validate_shadow_record_v2(record)
+    if schema_version == RECORD_V3_SCHEMA_VERSION:
+        return validate_shadow_record_v3(record)
+    raise ShadowCaptureError("unsupported sealed shadow record schema")
+
+
 def _validate_new_capture_payload(record: dict[str, Any]) -> None:
     schema_version = record.get("schema_version") if isinstance(record, dict) else None
     if schema_version == PROSPECTIVE_ELIGIBILITY_SCHEMA_VERSION:
         validate_prospective_eligibility(record)
+    elif schema_version == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION:
+        validate_prospective_eligibility_v2(record)
     elif schema_version == ELIGIBILITY_V2_SCHEMA_VERSION:
         validate_bound_eligibility_v2(record)
+    elif schema_version == ELIGIBILITY_V3_SCHEMA_VERSION:
+        validate_bound_eligibility_v3(record)
     elif schema_version == RECORD_V2_SCHEMA_VERSION:
         validate_shadow_record_v2(record)
+    elif schema_version == RECORD_V3_SCHEMA_VERSION:
+        validate_shadow_record_v3(record)
     elif schema_version == CAPTURE_ATTEMPT_SCHEMA_VERSION:
         _validate_capture_attempt(record)
     else:
@@ -1397,14 +1884,14 @@ def write_prospective_identity_idempotent(
     path: Path, receipt: dict[str, Any]
 ) -> tuple[dict[str, Any], bool]:
     """Preserve the first real freeze timestamp for one deterministic workspace case."""
-    validate_prospective_eligibility(receipt)
+    _validate_any_prospective(receipt)
     try:
         write_new_capture_create_only(path, receipt)
         return receipt, True
     except ShadowRecordExistsError:
         pass
     existing = _read_regular_json(path, label="existing prospective eligibility")
-    validate_prospective_eligibility(existing)
+    _validate_any_prospective(existing)
     if existing["workspace_case"] != receipt["workspace_case"]:
         raise ShadowCaptureError(
             "existing prospective eligibility conflicts with deterministic case identity"
@@ -1431,6 +1918,16 @@ def write_prospective_identity_idempotent(
         raise ShadowCaptureError(
             "existing prospective eligibility conflicts with deterministic case features"
         )
+    if (
+        existing.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
+        and receipt.get("schema_version") == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
+        and existing["case_provenance"] != receipt["case_provenance"]
+    ):
+        raise ShadowCaptureError(
+            "existing prospective eligibility conflicts with frozen case provenance"
+        )
+    # A pre-upgrade v1 freeze wins unchanged. Its missing provenance remains
+    # explicitly unobservable rather than being backfilled after the fact.
     return existing, False
 
 
@@ -1632,10 +2129,12 @@ def seal_prospective_case(
     primary_evidence_refs: list[str],
     root: Path,
     captured_at: str | None = None,
+    execution_provenance: dict[str, Any] | None = None,
+    semantic_assessments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Bind and seal one prospective case without deriving or changing its outcome."""
     prospective_dir, eligibility_dir, records_dir, _ = _cohort_directories(root)
-    prospective = validate_prospective_eligibility(prospective_receipt)
+    prospective = _validate_any_prospective(prospective_receipt)
     stored_path = prospective_dir / f"{prospective['workspace_case']['case_id']}.json"
     try:
         stored_path.lstat()
@@ -1646,14 +2145,27 @@ def seal_prospective_case(
     stored_prospective = _read_regular_json(
         stored_path, label="stored prospective eligibility"
     )
-    validate_prospective_eligibility(stored_prospective)
+    _validate_any_prospective(stored_prospective)
     if stored_prospective != prospective:
         raise ShadowCaptureError(
             "prospective eligibility does not match the create-only stored freeze"
         )
-    eligibility = build_bound_eligibility_v2(
-        stored_prospective, manifest, eligible_task_id=eligible_task_id
+    latest_contract = (
+        stored_prospective["schema_version"]
+        == PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION
     )
+    if latest_contract:
+        eligibility = build_bound_eligibility_v3(
+            stored_prospective, manifest, eligible_task_id=eligible_task_id
+        )
+    else:
+        if execution_provenance is not None or semantic_assessments is not None:
+            raise ShadowCaptureError(
+                "legacy prospective cases cannot be backfilled with v3 observability"
+            )
+        eligibility = build_bound_eligibility_v2(
+            stored_prospective, manifest, eligible_task_id=eligible_task_id
+        )
     case_id = eligibility["eligible_case"]["case_id"]
     eligibility_path = eligibility_dir / f"{case_id}.json"
     record_path = records_dir / f"{case_id}.json"
@@ -1664,10 +2176,9 @@ def seal_prospective_case(
         reviewed=normalized_outcome["status"] == "reviewed",
         sort=True,
     )
+    normalized_execution = _normalize_execution_provenance(execution_provenance)
+    normalized_assessments = _normalize_semantic_assessments(semantic_assessments)
 
-    # An already-sealed record is an idempotent duplicate: recognise it before
-    # building or mutating anything, so a reseal never re-derives a fresh
-    # capture timestamp and never rejects a valid duplicate on time ordering.
     try:
         record_path.lstat()
     except FileNotFoundError:
@@ -1677,14 +2188,21 @@ def seal_prospective_case(
             record_path, label="existing sealed shadow record"
         )
     if existing is not None:
-        validate_shadow_record_v2(existing)
-        if (
+        _validate_any_record(existing)
+        conflicts = (
             existing["eligible_case"] != eligibility["eligible_case"]
-            or existing["eligibility"]["eligibility_id"]
-            != eligibility["eligibility_id"]
+            or existing["eligibility"]["eligibility_id"] != eligibility["eligibility_id"]
             or existing["outcome"] != normalized_outcome
             or existing["primary_evidence_refs"] != refs
-        ):
+        )
+        if latest_contract:
+            conflicts = conflicts or (
+                existing.get("schema_version") != RECORD_V3_SCHEMA_VERSION
+                or existing.get("execution_provenance") != normalized_execution
+                or existing.get("semantic_assessments") != normalized_assessments
+                or existing.get("case_provenance") != eligibility["case_provenance"]
+            )
+        if conflicts:
             raise ShadowCaptureError(
                 "existing sealed shadow record conflicts with the requested case or outcome"
             )
@@ -1697,23 +2215,28 @@ def seal_prospective_case(
             "eligibility_created": eligibility_created,
             "eligibility_id": eligibility["eligibility_id"],
             "record_id": existing["record_id"],
+            "record_schema_version": existing["schema_version"],
             "case_id": case_id,
             "no_effect": dict(NO_EFFECT),
         }
 
-    # Fresh seal: fully build and validate the record (outcome, evidence and the
-    # freeze -> observe -> capture time ordering) in memory BEFORE mutating any
-    # persistent cohort state. An invalid outcome leaves no partial eligibility.
-    record = build_shadow_record_v2(
-        eligibility,
-        outcome=normalized_outcome,
-        primary_evidence_refs=refs,
-        captured_at=captured_at or _utc_now(),
-    )
+    if latest_contract:
+        record = build_shadow_record_v3(
+            eligibility,
+            outcome=normalized_outcome,
+            primary_evidence_refs=refs,
+            execution_provenance=normalized_execution,
+            semantic_assessments=normalized_assessments,
+            captured_at=captured_at or _utc_now(),
+        )
+    else:
+        record = build_shadow_record_v2(
+            eligibility,
+            outcome=normalized_outcome,
+            primary_evidence_refs=refs,
+            captured_at=captured_at or _utc_now(),
+        )
 
-    # A record I/O failure after this point leaves at most a valid eligibility
-    # partial result; a retry re-derives the identical eligibility (duplicate)
-    # and then completes the record, so the seal converges cleanly.
     eligibility_created = write_new_capture_idempotent(eligibility_path, eligibility)
     write_new_capture_create_only(record_path, record)
     return {
@@ -1722,10 +2245,10 @@ def seal_prospective_case(
         "eligibility_created": eligibility_created,
         "eligibility_id": eligibility["eligibility_id"],
         "record_id": record["record_id"],
+        "record_schema_version": record["schema_version"],
         "case_id": case_id,
         "no_effect": dict(NO_EFFECT),
     }
-
 
 def _capture_reason(exc: BaseException) -> str:
     text = str(exc).lower()
@@ -1745,6 +2268,7 @@ def capture_workspace_eligibility_best_effort(
     *,
     root: Path | None = None,
     frozen_at: str | None = None,
+    case_origin: str | None = None,
 ) -> dict[str, Any]:
     """Best-effort pre-start freeze. Never raises into workspace execution."""
     enabled = (
@@ -1770,7 +2294,14 @@ def capture_workspace_eligibility_best_effort(
     attempts_dir: Path | None = None
     try:
         prospective_dir, _, _, attempts_dir = _cohort_directories(cohort_root)
-        receipt = build_prospective_eligibility(manifest, frozen_at=attempted_at)
+        resolved_case_origin = (
+            case_origin
+            if case_origin is not None
+            else os.environ.get("GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "synthetic")
+        ).strip().lower()
+        receipt = build_prospective_eligibility_v2(
+            manifest, frozen_at=attempted_at, case_origin=resolved_case_origin
+        )
         case_id = receipt["workspace_case"]["case_id"]
         receipt, created = write_prospective_identity_idempotent(
             prospective_dir / f"{case_id}.json", receipt
