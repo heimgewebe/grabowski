@@ -1123,20 +1123,42 @@ def publish_text_artifact(
             "requires": ["expected_artifact_sha256", "expected_receipt_sha256"],
         },
     }
-    base._append_audit(
-        {
-            "timestamp_unix": int(time.time()),
-            "operation": "text-artifact-publish",
-            "profile": profile,
-            "artifact_id": artifact_id,
-            "repository_path_sha256": receipt["repository_path_sha256"],
-            "base_commit": base_sha,
-            "head_commit": head_sha,
-            "sha256": diff_sha256,
-            "size": size,
-            "receipt_sha256": receipt_sha256,
-        }
-    )
+    try:
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "text-artifact-publish",
+                "profile": profile,
+                "artifact_id": artifact_id,
+                "repository_path_sha256": receipt["repository_path_sha256"],
+                "base_commit": base_sha,
+                "head_commit": head_sha,
+                "sha256": diff_sha256,
+                "size": size,
+                "receipt_sha256": receipt_sha256,
+            }
+        )
+    except Exception as audit_error:
+        try:
+            shutil.rmtree(final_directory)
+            root_descriptor = os.open(
+                TEXT_ARTIFACT_ROOT, os.O_RDONLY | os.O_DIRECTORY
+            )
+            try:
+                os.fsync(root_descriptor)
+            finally:
+                os.close(root_descriptor)
+            if final_directory.exists():
+                raise ArtifactTransferError(
+                    "Text artifact audit failed and rollback was not durable"
+                )
+        except Exception as rollback_error:
+            raise ArtifactTransferError(
+                "Text artifact audit failed and rollback could not be verified"
+            ) from rollback_error
+        raise ArtifactTransferError(
+            "Text artifact audit failed; publication was rolled back"
+        ) from audit_error
     return result
 
 
@@ -1234,7 +1256,6 @@ def read_text_artifact(
             f"max_bytes must be between 1 and {MAX_TEXT_ARTIFACT_CHUNK_BYTES}"
         )
 
-    _ensure_private_directory(TEXT_ARTIFACT_ROOT)
     root_descriptor, root_identity = _open_private_directory_path(TEXT_ARTIFACT_ROOT)
     try:
         artifact_descriptor, artifact_identity = _open_private_directory_at(

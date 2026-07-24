@@ -589,6 +589,43 @@ class ArtifactTests(unittest.TestCase):
                 )
 
 
+    def test_text_artifact_read_missing_root_is_side_effect_free(self) -> None:
+        artifact_root = self.root / "missing-text-artifacts"
+        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError, "directory open failed"
+            ):
+                artifacts.read_text_artifact(
+                    "0" * 32,
+                    "1" * 64,
+                    "2" * 64,
+                )
+        self.assertFalse(artifact_root.exists())
+
+    def test_text_artifact_publish_rolls_back_when_audit_fails(self) -> None:
+        repository, base_commit, head_commit = self._repository_with_two_commits()
+        artifact_root = self.root / "text-artifacts"
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root),
+            patch.object(
+                artifacts.base,
+                "_append_audit",
+                side_effect=RuntimeError("audit unavailable"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError,
+                "audit failed; publication was rolled back",
+            ):
+                artifacts.publish_text_artifact(
+                    "git-diff.v1",
+                    str(repository),
+                    base_commit,
+                    head_commit,
+                )
+        self.assertTrue(artifact_root.is_dir())
+        self.assertEqual(list(artifact_root.iterdir()), [])
+
     def test_text_artifact_read_requires_pinned_receipt_hash(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()
         artifact_root = self.root / "text-artifacts"
