@@ -46,18 +46,38 @@ jobs:
           git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
           exit 1
       - name: Validate focused routing-shadow contracts
+        id: focused
         if: steps.patch.outcome == 'success'
-        run: python -m unittest tests.test_operator_routing_shadow_cohort tests.test_agent_workspace
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python -m unittest tests.test_operator_routing_shadow_cohort tests.test_agent_workspace > .routing-shadow-test-diagnostic.txt 2>&1
+          status=$?
+          cat .routing-shadow-test-diagnostic.txt
+          exit $status
+      - name: Persist focused-test diagnostic only
+        if: steps.focused.outcome == 'failure'
+        shell: bash
+        run: |
+          git restore .
+          git clean -fd -e .routing-shadow-test-diagnostic.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .routing-shadow-test-diagnostic.txt
+          git commit -m "chore: record routing-shadow focused-test diagnostic" || true
+          git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
+          exit 1
       - name: Validate repository
-        if: steps.patch.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success'
         run: make validate
       - name: Remove bootstrap files and commit validated patch
-        if: steps.patch.outcome == 'success'
+        if: steps.patch.outcome == 'success' && steps.focused.outcome == 'success'
         shell: bash
         run: |
           rm .github/workflows/operator-routing-shadow-hardening-bootstrap.yml
           rm tools/_bootstrap_routing_shadow_hardening.py
-          rm -f .routing-shadow-bootstrap-diagnostic.txt
+          rm -f .routing-shadow-bootstrap-diagnostic.txt .routing-shadow-test-diagnostic.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
