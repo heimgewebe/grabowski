@@ -16,9 +16,11 @@ jobs:
         with:
           ref: fix/operator-routing-shadow-observability-hardening-v1
           fetch-depth: 0
-      - name: Correct bootstrap guards
+      - name: Apply, validate, and commit guarded hardening
         shell: bash
         run: |
+          set -eu
+
           python - <<'PY'
           from pathlib import Path
           path = Path('tools/_bootstrap_routing_shadow_hardening.py')
@@ -36,17 +38,21 @@ jobs:
               text = text.replace(old, new)
           path.write_text(text, encoding='utf-8')
           PY
-      - name: Apply guarded hardening patch
-        id: patch
-        continue-on-error: true
-        run: python tools/_bootstrap_routing_shadow_hardening.py
-      - name: Restore v2 and scope timeline hardening to v3
-        id: scope_fix
-        if: steps.patch.outcome == 'success'
-        continue-on-error: true
-        shell: bash
-        run: |
-          python - <<'PY'
+
+          if ! python tools/_bootstrap_routing_shadow_hardening.py; then
+            cp .routing-shadow-bootstrap-diagnostic.txt /tmp/routing-shadow-bootstrap-diagnostic.txt
+            git restore .
+            git clean -fd
+            cp /tmp/routing-shadow-bootstrap-diagnostic.txt .routing-shadow-bootstrap-diagnostic.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .routing-shadow-bootstrap-diagnostic.txt
+            git commit -m "chore: record routing-shadow bootstrap diagnostic" || true
+            git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
+            exit 1
+          fi
+
+          if ! python - <<'PY' > /tmp/routing-shadow-scope-diagnostic.txt 2>&1
           from pathlib import Path
           import re
           import subprocess
@@ -102,53 +108,38 @@ jobs:
           current = current[:v3_match.start()] + v3_updated + current[v3_match.end():]
           path.write_text(current, encoding='utf-8')
           PY
-      - name: Persist patch diagnostic only
-        if: steps.patch.outcome == 'failure' || steps.scope_fix.outcome == 'failure'
-        shell: bash
-        run: |
-          printf 'patch_outcome=%s\nscope_fix_outcome=%s\n' "${{ steps.patch.outcome }}" "${{ steps.scope_fix.outcome }}" > /tmp/routing-shadow-bootstrap-diagnostic.txt
-          if [ -f .routing-shadow-bootstrap-diagnostic.txt ]; then cat .routing-shadow-bootstrap-diagnostic.txt >> /tmp/routing-shadow-bootstrap-diagnostic.txt; fi
-          git restore .
-          git clean -fd
-          cp /tmp/routing-shadow-bootstrap-diagnostic.txt .routing-shadow-bootstrap-diagnostic.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .routing-shadow-bootstrap-diagnostic.txt
-          git commit -m "chore: record routing-shadow bootstrap diagnostic" || true
-          git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
-          exit 1
-      - name: Validate repository through canonical gate
-        id: validate_patch
-        if: steps.patch.outcome == 'success' && steps.scope_fix.outcome == 'success'
-        continue-on-error: true
-        shell: bash
-        run: |
+          then
+            cp /tmp/routing-shadow-scope-diagnostic.txt /tmp/routing-shadow-bootstrap-diagnostic.txt
+            git restore .
+            git clean -fd
+            cp /tmp/routing-shadow-bootstrap-diagnostic.txt .routing-shadow-bootstrap-diagnostic.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .routing-shadow-bootstrap-diagnostic.txt
+            git commit -m "chore: record routing-shadow scope diagnostic" || true
+            git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
+            exit 1
+          fi
+
           set +e
-          make validate > .routing-shadow-validate-diagnostic.txt 2>&1
+          make validate > /tmp/routing-shadow-validate-diagnostic.txt 2>&1
           status=$?
-          cat .routing-shadow-validate-diagnostic.txt
-          exit $status
-      - name: Persist validation diagnostic only
-        if: steps.validate_patch.outcome == 'failure'
-        shell: bash
-        run: |
-          cp .routing-shadow-validate-diagnostic.txt /tmp/routing-shadow-validate-diagnostic.txt
-          git restore .
-          git clean -fd
-          cp /tmp/routing-shadow-validate-diagnostic.txt .routing-shadow-validate-diagnostic.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .routing-shadow-validate-diagnostic.txt
-          git commit -m "chore: record routing-shadow validation diagnostic" || true
-          git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
-          exit 1
-      - name: Remove bootstrap files and commit validated patch
-        if: steps.patch.outcome == 'success' && steps.scope_fix.outcome == 'success' && steps.validate_patch.outcome == 'success'
-        shell: bash
-        run: |
+          set -e
+          if [ "$status" -ne 0 ]; then
+            git restore .
+            git clean -fd
+            cp /tmp/routing-shadow-validate-diagnostic.txt .routing-shadow-validate-diagnostic.txt
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .routing-shadow-validate-diagnostic.txt
+            git commit -m "chore: record routing-shadow validation diagnostic" || true
+            git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
+            exit "$status"
+          fi
+
           rm .github/workflows/operator-routing-shadow-hardening-bootstrap.yml
           rm tools/_bootstrap_routing_shadow_hardening.py
-          rm -f .routing-shadow-bootstrap-diagnostic.txt .routing-shadow-test-diagnostic.txt .routing-shadow-validate-diagnostic.txt
+          rm -f .routing-shadow-bootstrap-diagnostic.txt .routing-shadow-test-diagnostic.txt .routing-shadow-validate-diagnostic.txt .routing-shadow-bootstrap-trigger
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
