@@ -957,22 +957,51 @@ def _acquire_checkout_resources(
 ) -> dict[str, Any]:
     durable_owner = _owner(owner_id)
     lease_owner = f"checkout-op:{uuid.uuid4().hex[:20]}"
-    return resources.acquire_resources(
-        lease_owner,
-        _checkout_resource_keys(
-            repo_common_dir,
-            checkout_path,
-            repo_path=repo_path,
-            branch=branch,
-        ),
-        purpose=purpose,
-        ttl_seconds=OPERATION_LEASE_TTL_SECONDS,
-        metadata={
-            **metadata,
-            "durable_owner_id": durable_owner,
-            "git_common_dir": str(repo_common_dir),
-        },
+    keys = _checkout_resource_keys(
+        repo_common_dir,
+        checkout_path,
+        repo_path=repo_path,
+        branch=branch,
     )
+    bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
+    bureau_key_set = set(bureau_keys)
+    non_bureau_keys = [key for key in keys if key not in bureau_key_set]
+    groups = [group for group in (bureau_keys, non_bureau_keys) if group]
+    lease_metadata = {
+        **metadata,
+        "durable_owner_id": durable_owner,
+        "git_common_dir": str(repo_common_dir),
+    }
+    acquisitions: list[dict[str, Any]] = []
+    acquired_keys: list[str] = []
+    try:
+        for group in groups:
+            acquired = resources.acquire_resources(
+                lease_owner,
+                group,
+                purpose=purpose,
+                ttl_seconds=OPERATION_LEASE_TTL_SECONDS,
+                metadata=lease_metadata,
+            )
+            acquisitions.append(acquired)
+            acquired_keys.extend(item["resource_key"] for item in acquired["leases"])
+    except Exception:
+        if acquired_keys:
+            resources.release_resources(lease_owner, acquired_keys)
+        raise
+    return {
+        "owner_id": lease_owner,
+        "leases": [
+            item
+            for acquisition in acquisitions
+            for item in acquisition["leases"]
+        ],
+        "acquisitions": acquisitions,
+        "resource_classes": {
+            "bureau": bureau_keys,
+            "non_bureau": non_bureau_keys,
+        },
+    }
 
 
 def _release_checkout_resources(lease: dict[str, Any]) -> dict[str, Any]:
