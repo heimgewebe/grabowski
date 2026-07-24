@@ -1,0 +1,33 @@
+name: Sync routing-shadow fix with current main
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  sync-main:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/operator-routing-shadow-observability-hardening-v1
+          fetch-depth: 0
+      - name: Merge current main, validate, and remove helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git merge --no-edit origin/main
+          make context-refresh
+          make validate
+          rm .github/workflows/routing-shadow-sync-main.yml
+          git add -A
+          git diff --cached --check
+          git commit -m "chore: remove routing-shadow main-sync helper"
+          git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
