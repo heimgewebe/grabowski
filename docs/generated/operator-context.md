@@ -90,6 +90,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_git` | version-control | no | variable | Run Git in one repository; generic push is limited to one explicit unprotected branch ref. |
 | `grabowski_git_branch` | version-control | no | medium | Create or switch local branches through a typed, audited branch operation. |
 | `grabowski_checkout_inventory` | checkout-lifecycle | yes | low | Return deterministic linked-checkout inventory with retention, task, process and resource coordination state. |
+| `grabowski_checkout_binding_reconciliation` | checkout-lifecycle | yes | low | Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority. |
 | `grabowski_checkout_retain` | checkout-lifecycle | no | medium | Assign explicit retention ownership to one temporary linked Git checkout. |
 | `grabowski_checkout_archive` | checkout-lifecycle | no | medium | Archive one clean temporary linked Git checkout by creating durable recovery refs without deleting branches. |
 | `grabowski_checkout_cleanup` | checkout-lifecycle | no | high | Plan or apply cleanup for an archived linked checkout; apply requires a persisted dry run. |

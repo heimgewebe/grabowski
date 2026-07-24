@@ -1076,6 +1076,18 @@ def _worktree_records(repo: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
     return top_level, common_dir, sorted(records, key=lambda item: item["path"])
 
 
+def observe_worktree_records(repo: str | Path) -> dict[str, Any]:
+    """Expose the canonical Git worktree records without lifecycle or mutation effects."""
+    repo_path = _resolve_repo(str(repo))
+    top_level, common_dir, records = _worktree_records(repo_path)
+    return {
+        "top_level": str(top_level),
+        "repo_common_dir": str(common_dir),
+        "worktrees": [dict(record) for record in records],
+        "read_only": True,
+    }
+
+
 def _worktree_status(record: dict[str, Any]) -> dict[str, Any]:
     path = Path(record["path"])
     if record.get("prunable") or not path.exists():

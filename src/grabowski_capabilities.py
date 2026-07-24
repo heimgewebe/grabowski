@@ -331,6 +331,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_checkout_binding_reconciliation": {
+        "category": "checkout-lifecycle",
+        "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "grabowski_checkout_retain": {
         "category": "checkout-lifecycle",
         "purpose": "Assign explicit retention ownership to one temporary linked Git checkout.",
