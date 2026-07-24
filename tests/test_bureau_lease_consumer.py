@@ -458,6 +458,172 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
         self.assertFalse(self.database.exists())
 
 
+class BureauManagedRuntimeTests(_BureauLeaseTestCase):
+    def _install_managed_runtime(self) -> tuple[Path, str, list[object]]:
+        source_commit = "c" * 40
+        release_id = f"{source_commit[:12]}-src123456789abc"
+        release = self.runtime / "releases" / release_id
+        package = release / "src/bureau"
+        package.mkdir(parents=True)
+        (release / "pyproject.toml").write_text(
+            "[project]\nname = 'bureau'\nversion = '0.2.1'\n", encoding="utf-8"
+        )
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "cli.py").write_text(
+            "def main(argv=None): return 0\n", encoding="utf-8"
+        )
+        (package / "lease_contract.py").write_text(
+            "LEASE_CONTRACT_SCHEMA_VERSION = 2\n", encoding="utf-8"
+        )
+        module = package / "runtime_identity.py"
+        module.write_text("SCHEMA_VERSION = 1\n", encoding="utf-8")
+        package_paths = bureau._managed_package_paths(release)
+        package_digest = bureau._managed_package_tree_sha256(package_paths)
+        snapshot = self.runtime / "registry-snapshots" / "current"
+        snapshot.mkdir(parents=True)
+        inventory = snapshot / ".bureau-runtime-snapshot.json"
+        inventory.write_text("{}\n", encoding="utf-8")
+        launcher = self.root / "bin/bureau"
+        launcher.parent.mkdir(parents=True)
+        manifest = {
+            "schema_version": 1,
+            "kind": "bureau_runtime_deployment",
+            "release_id": release_id,
+            "source_commit": source_commit,
+            "package_tree_sha256": package_digest,
+            "immutable_release_path": str(release),
+            "module_path": str(module),
+            "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
+            "canonical_registry_root": str(snapshot),
+            "canonical_registry_inventory_path": str(inventory),
+            "launcher_path": str(launcher),
+        }
+        manifest_path = self.runtime / "deployment-manifest.json"
+        manifest_raw = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        manifest_path.write_bytes(manifest_raw)
+        manifest_digest = hashlib.sha256(manifest_raw).hexdigest()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            f"expected_manifest_sha256 = '{manifest_digest}'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        patches = [
+            patch.object(bureau, "BUREAU_MANAGED_LAUNCHER", launcher),
+            patch.object(bureau, "BUREAU_CONTRACT_PYTHON", self.python),
+        ]
+        return launcher, source_commit, patches
+
+    def test_managed_runtime_is_preferred_and_invoked_via_bound_fd(self) -> None:
+        launcher, source_commit, patches = self._install_managed_runtime()
+        observed: list[tuple[list[str], dict[str, object]]] = []
+
+        def response(argv: list[str], **kwargs):
+            observed.append((argv, kwargs))
+            return self._response(argv)
+
+        with (
+            patches[0],
+            patches[1],
+            patch.object(bureau.subprocess, "run", side_effect=response),
+        ):
+            result = resources.acquire_resources(
+                "owner-a",
+                ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                purpose="task",
+                ttl_seconds=60,
+            )
+        argv, kwargs = observed[0]
+        self.assertEqual(argv[0], str(self.python.resolve()))
+        self.assertEqual(argv[1], "-I")
+        self.assertRegex(argv[2], r"^/proc/self/fd/[0-9]+$")
+        self.assertEqual(
+            tuple(kwargs["pass_fds"]),
+            (int(argv[2].rsplit("/", 1)[1]),),
+        )
+        self.assertIn("lease-contract", argv)
+        self.assertEqual(
+            result["bureau_contract"]["contract_release_commit"], source_commit
+        )
+        self.assertEqual(
+            result["bureau_contract"]["contract_executable_sha256"],
+            hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        )
+
+    def test_managed_launcher_must_bind_exact_manifest(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "expected_manifest_sha256 = '" + "0" * 64 + "'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.code, "contract-managed-launcher-binding-invalid"
+        )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_managed_package_drift_fails_before_invocation(self) -> None:
+        _launcher, _source_commit, patches = self._install_managed_runtime()
+        release = self.runtime / "releases" / ("c" * 12 + "-src123456789abc")
+        (release / "src/bureau/cli.py").write_text(
+            "def main(argv=None): return 1\n", encoding="utf-8"
+        )
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.code, "contract-managed-package-digest-invalid"
+        )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_managed_package_addition_during_check_fails_closed(self) -> None:
+        _launcher, _source_commit, patches = self._install_managed_runtime()
+        release = self.runtime / "releases" / ("c" * 12 + "-src123456789abc")
+
+        def mutate(argv: list[str], **kwargs):
+            result = self._response(argv)
+            (release / "src/bureau/added.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+            return result
+
+        with (
+            patches[0],
+            patches[1],
+            patch.object(bureau.subprocess, "run", side_effect=mutate),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "package-set-changed-during-check"
+            ):
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertFalse(self.database.exists())
+
+
 def _insert_lease_without_contract(
     database: Path,
     *,
