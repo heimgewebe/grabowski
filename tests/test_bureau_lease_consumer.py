@@ -87,13 +87,14 @@ class _BureauLeaseTestCase(unittest.TestCase):
             item.stop()
         self.temporary.cleanup()
 
-    @staticmethod
     def _response(
+        self,
         argv: list[str],
         *,
         healthy: bool = True,
         schema_version: int = 2,
         findings: list[dict[str, object]] | None = None,
+        enveloped: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         keys = [
             argv[index + 1]
@@ -128,6 +129,28 @@ class _BureauLeaseTestCase(unittest.TestCase):
             "expected_state": expected_state,
             "expected_boundary_present": bool(expected_head or expected_state),
         }
+        if enveloped:
+            payload = {
+                "schema_version": 1,
+                "result": payload,
+                "runtime_identity": {
+                    "schema_version": 1,
+                    "kind": "bureau_runtime_identity",
+                    "manifest": {
+                        "valid": True,
+                        "source_commit": self.release_commit,
+                    },
+                    "registry": {
+                        "available": True,
+                        "bureau_project": True,
+                        "dirty": False,
+                        "role": "canonical-runtime-snapshot",
+                        "head_equals_origin_main": True,
+                        "head": self.release_commit,
+                        "origin_main": self.release_commit,
+                    },
+                },
+            }
         return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
 
 
@@ -161,6 +184,63 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
         self.assertEqual(first["bureau_contract"]["phase"], "work")
         self.assertEqual(second["bureau_contract"]["phase"], "work")
         self.assertEqual(len(resources.list_resources()), 2)
+
+    def test_runtime_envelope_is_unwrapped_before_contract_validation(self) -> None:
+        with patch.object(
+            bureau.subprocess,
+            "run",
+            side_effect=lambda argv, **kwargs: self._response(
+                argv, enveloped=True
+            ),
+        ):
+            result = resources.acquire_resources(
+                "owner-a",
+                ["path:/home/alex/repos/bureau/registry/tasks/A-T001.json"],
+                purpose="task A",
+                ttl_seconds=60,
+            )
+        self.assertEqual(result["bureau_contract"]["phase"], "work")
+        self.assertEqual(
+            result["bureau_contract"]["contract_release_commit"],
+            self.release_commit,
+        )
+        self.assertEqual(len(resources.list_resources()), 1)
+
+    def test_runtime_envelope_rejects_unexpected_top_level_fields(self) -> None:
+        def response(argv: list[str], **kwargs):
+            result = self._response(argv, enveloped=True)
+            value = json.loads(result.stdout)
+            value["unexpected"] = True
+            return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
+
+        with patch.object(bureau.subprocess, "run", side_effect=response):
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(raised.exception.code, "contract-envelope-shape-invalid")
+        self.assertFalse(self.database.exists())
+
+    def test_runtime_envelope_rejects_dirty_registry_identity(self) -> None:
+        def response(argv: list[str], **kwargs):
+            result = self._response(argv, enveloped=True)
+            value = json.loads(result.stdout)
+            value["runtime_identity"]["registry"]["dirty"] = True
+            return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
+
+        with patch.object(bureau.subprocess, "run", side_effect=response):
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(raised.exception.code, "contract-runtime-registry-invalid")
+        self.assertFalse(self.database.exists())
 
     def test_contract_failure_happens_before_database_mutation(self) -> None:
         failed = subprocess.CompletedProcess(["bureau"], 2, "", "sensitive reason")
