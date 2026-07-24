@@ -178,6 +178,7 @@ class FakeGh:
             "allow_merge_commit": True,
             "allow_squash_merge": True,
             "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
         }
         self.repo_settings_returncode = repo_settings_returncode
         self.repo_settings_invalid_json = repo_settings_invalid_json
@@ -3847,6 +3848,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         execution = result["output"]["executions"][0]
         self.assertEqual("merge", execution["merge_policy"]["selected_method"])
         self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
+        self.assertEqual([], execution["automatic_platform_effects"])
+        self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
 
     def test_captain_run_uses_allowed_repository_merge_method(self) -> None:
         parameters = captain_parameters(
@@ -3872,6 +3875,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "allow_merge_commit": False,
                 "allow_squash_merge": True,
                 "allow_rebase_merge": True,
+                "delete_branch_on_merge": False,
             },
         )
 
@@ -3892,6 +3896,180 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("--squash", merge_call)
         self.assertNotIn("--merge", merge_call)
 
+    def test_captain_run_blocks_forbidden_automatic_branch_deletion(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "allow_merge_commit": True,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+                "delete_branch_on_merge": True,
+            },
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("blocked", result["output"]["decision"])
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(execution["execution_attempted"])
+        self.assertEqual(
+            ["automatic_effect_forbidden:branch-deletion"],
+            execution["effect_scope_decision"]["reasons"],
+        )
+        self.assertEqual(
+            "feat/captain",
+            execution["automatic_platform_effects"][0]["target"]["head_branch"],
+        )
+        action_receipt = result["output"]["actions"][0]["captain_receipt"]
+        self.assertEqual(
+            execution["automatic_platform_effects"],
+            action_receipt["automatic_platform_effects"],
+        )
+        self.assertEqual(
+            execution["effect_scope_decision"],
+            action_receipt["effect_scope_decision"],
+        )
+        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
+
+    def test_captain_run_blocks_unapproved_automatic_branch_deletion(self) -> None:
+        action = captain_action(
+            scope={
+                "allowed_effects": ["merge pull request 96 into main"],
+                "forbidden_effects": ["force-push"],
+                "boundaries": "single pull request in heimgewebe/grabowski",
+                "max_targets": 1,
+            }
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "allow_merge_commit": True,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+                "delete_branch_on_merge": True,
+            },
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertEqual(
+            ["automatic_effect_authorization_missing:branch-deletion"],
+            execution["effect_scope_decision"]["reasons"],
+        )
+        self.assertFalse(execution["execution_invoked"])
+        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
+
+    def test_captain_run_allows_explicitly_authorized_automatic_branch_deletion(self) -> None:
+        action = captain_action(
+            scope={
+                "allowed_effects": [
+                    "merge pull request 96 into main",
+                    "branch-deletion",
+                ],
+                "forbidden_effects": ["force-push"],
+                "boundaries": "single pull request in heimgewebe/grabowski",
+                "max_targets": 1,
+            }
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "allow_merge_commit": True,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+                "delete_branch_on_merge": True,
+            },
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
+        self.assertEqual(
+            ["branch-deletion"],
+            execution["effect_scope_decision"]["required_effect_authorizations"],
+        )
+        self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
+
     def test_captain_run_blocks_when_repository_merge_policy_is_unusable(self) -> None:
         matching_view = {
             "number": 96,
@@ -3910,6 +4088,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 FakeGh(view=matching_view, repo_settings={
                     "allow_merge_commit": True,
                     "allow_squash_merge": False,
+                    "delete_branch_on_merge": False,
                 }),
                 "repository_merge_policy_invalid_fields:allow_rebase_merge",
             ),
@@ -3918,6 +4097,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                     "allow_merge_commit": False,
                     "allow_squash_merge": False,
                     "allow_rebase_merge": False,
+                    "delete_branch_on_merge": False,
                 }),
                 "repository_all_merge_methods_disabled",
             ),
