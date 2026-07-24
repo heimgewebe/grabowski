@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
+import subprocess
 import stat
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -29,6 +33,21 @@ REMOTE_PATH_RE = re.compile(r"/[A-Za-z0-9._/+@=-]{1,4095}\Z")
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ERROR_INPUT_CHARS = 16 * 1024
 MAX_ERROR_DETAIL_CHARS = 2048
+TEXT_ARTIFACT_PROFILE = "git-diff.v1"
+TEXT_ARTIFACT_SCHEMA = "git-diff-artifact.v1"
+TEXT_ARTIFACT_ROOT = Path.home() / ".local/state/grabowski/text-artifacts"
+MAX_TEXT_ARTIFACT_BYTES = 32 * 1024 * 1024
+MAX_TEXT_ARTIFACT_CHUNK_BYTES = 256 * 1024
+MAX_TEXT_ARTIFACT_RECEIPT_BYTES = 64 * 1024
+ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
+COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+SAFE_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.txt\Z")
+_PRIVATE_KEY_BEGIN = "-----" + "BEGIN "
+_PRIVATE_KEY_END = "PRIVATE " + "KEY-----"
+_PRIVATE_KEY_MARKERS = tuple(
+    _PRIVATE_KEY_BEGIN + kind + _PRIVATE_KEY_END
+    for kind in ("OPENSSH ", "RSA ", "EC ", "")
+)
 _NO_DESTINATION_HASH = "-"
 _AUTHORIZATION_RE = re.compile(
     r"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)([^\s,;]+)"
@@ -563,6 +582,729 @@ def artifact_pull(
     }
 
 
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+        "utf-8"
+    )
+
+
+def _ensure_private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError("Text artifact root is not a regular directory")
+    if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise PermissionError("Text artifact root is not private and owner-controlled")
+
+
+def _private_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _private_directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _open_private_directory_path(path: Path) -> tuple[int, tuple[int, ...]]:
+    try:
+        descriptor = os.open(path, _private_directory_flags())
+    except OSError as exc:
+        raise ArtifactTransferError("Text artifact directory open failed") from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.lstat(path)
+        identity = _private_identity(opened)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or identity != _private_identity(linked)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise ArtifactTransferError(
+                "Text artifact directory is not one private owner-controlled directory"
+            )
+        return descriptor, identity
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_private_directory_at(
+    parent_descriptor: int,
+    name: str,
+) -> tuple[int, tuple[int, ...]]:
+    try:
+        descriptor = os.open(name, _private_directory_flags(), dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise ArtifactTransferError("Text artifact directory open failed") from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        identity = _private_identity(opened)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or identity != _private_identity(linked)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise ArtifactTransferError(
+                "Text artifact directory is not one private owner-controlled directory"
+            )
+        return descriptor, identity
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _verify_private_directory_path(
+    descriptor: int,
+    path: Path,
+    expected_identity: tuple[int, ...],
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.lstat(path)
+    except OSError as exc:
+        raise ArtifactTransferError("Text artifact directory changed while reading") from exc
+    if (
+        _private_identity(opened) != expected_identity
+        or _private_identity(linked) != expected_identity
+    ):
+        raise ArtifactTransferError("Text artifact directory changed while reading")
+
+
+def _verify_private_directory_at(
+    parent_descriptor: int,
+    name: str,
+    descriptor: int,
+    expected_identity: tuple[int, ...],
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise ArtifactTransferError("Text artifact directory changed while reading") from exc
+    if (
+        _private_identity(opened) != expected_identity
+        or _private_identity(linked) != expected_identity
+    ):
+        raise ArtifactTransferError("Text artifact directory changed while reading")
+
+
+def _open_private_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> tuple[int, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+    except OSError as exc:
+        raise ArtifactTransferError("Text artifact file open failed") from exc
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or _private_identity(opened) != _private_identity(linked)
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size > max_bytes
+        ):
+            raise ArtifactTransferError(
+                "Text artifact file is not one private owner-controlled regular file"
+            )
+        return descriptor, opened
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _verify_private_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    descriptor: int,
+    expected: os.stat_result,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+    except OSError as exc:
+        raise ArtifactTransferError("Text artifact file changed while reading") from exc
+    identity = _private_identity(expected)
+    if _private_identity(opened) != identity or _private_identity(linked) != identity:
+        raise ArtifactTransferError("Text artifact file changed while reading")
+
+
+def _read_private_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, str, int]:
+    descriptor, before = _open_private_regular_file_at(
+        directory_descriptor, name, max_bytes=max_bytes
+    )
+    try:
+        remaining = before.st_size
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        while remaining:
+            block = os.read(descriptor, min(remaining, 64 * 1024))
+            if not block:
+                raise ArtifactTransferError("Text artifact file ended before its declared size")
+            chunks.append(block)
+            digest.update(block)
+            remaining -= len(block)
+        data = b"".join(chunks)
+        _verify_private_regular_file_at(
+            directory_descriptor, name, descriptor, before
+        )
+        return data, digest.hexdigest(), before.st_size
+    finally:
+        os.close(descriptor)
+
+
+def _hash_and_read_private_regular_file_at(
+    directory_descriptor: int,
+    name: str,
+    *,
+    max_bytes: int,
+    offset: int,
+    chunk_size: int,
+) -> tuple[str, int, bytes]:
+    descriptor, before = _open_private_regular_file_at(
+        directory_descriptor, name, max_bytes=max_bytes
+    )
+    try:
+        remaining = before.st_size
+        digest = hashlib.sha256()
+        while remaining:
+            block = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not block:
+                raise ArtifactTransferError("Text artifact file ended before its declared size")
+            digest.update(block)
+            remaining -= len(block)
+        payload = os.pread(descriptor, min(chunk_size, before.st_size - offset), offset)
+        _verify_private_regular_file_at(
+            directory_descriptor, name, descriptor, before
+        )
+        return digest.hexdigest(), before.st_size, payload
+    finally:
+        os.close(descriptor)
+
+
+def _validate_commit_sha(value: str, label: str) -> str:
+    if not isinstance(value, str) or COMMIT_SHA_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a full lowercase Git commit SHA")
+    return value
+
+
+def _validate_artifact_id(value: str) -> str:
+    if not isinstance(value, str) or ARTIFACT_ID_RE.fullmatch(value) is None:
+        raise ValueError("artifact_id must be 32 lowercase hexadecimal characters")
+    return value
+
+
+def _run_git(
+    repository: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int = 60,
+    max_output_bytes: int = 64 * 1024,
+) -> bytes:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("Git is not installed")
+    completed = subprocess.run(
+        [git, "-C", str(repository), *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        check=False,
+        timeout=timeout_seconds,
+        env={
+            "HOME": str(operator.HOME),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+        },
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr[:max_output_bytes].decode("utf-8", errors="replace")
+        raise ArtifactTransferError(
+            f"Git command failed: {_redact_transfer_detail(detail)}"
+        )
+    if len(completed.stdout) > max_output_bytes:
+        raise ArtifactTransferError("Git metadata output exceeded its bound")
+    return completed.stdout
+
+
+def _resolve_git_repository(raw_path: str) -> Path:
+    repository = base._resolve_existing(raw_path, "read")
+    if base._path_is_secret(repository) or base._path_is_browser_profile(repository):
+        raise PermissionError("Text artifact export may not read protected roots")
+    if not repository.is_dir():
+        raise ValueError("repository must be a directory")
+    top_level = _run_git(
+        repository, ["rev-parse", "--show-toplevel"], max_output_bytes=4096
+    ).decode("utf-8").strip()
+    resolved = Path(top_level).resolve(strict=True)
+    if resolved != repository.resolve(strict=True):
+        raise ValueError("repository must name the Git worktree root exactly")
+    return resolved
+
+
+def _verify_commit(repository: Path, commit: str, label: str) -> str:
+    value = _validate_commit_sha(commit, label)
+    resolved = _run_git(
+        repository,
+        ["rev-parse", "--verify", f"{value}^{{commit}}"],
+        max_output_bytes=4096,
+    ).decode("ascii").strip()
+    if resolved != value:
+        raise RuntimeError(f"{label} did not resolve to the exact requested commit")
+    return value
+
+
+def _safe_slug(value: str, fallback: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
+    return (slug or fallback)[:80]
+
+
+def _artifact_filename(
+    repository: Path,
+    base_commit: str,
+    head_commit: str,
+    pull_request_number: int | None,
+) -> str:
+    name = _safe_slug(repository.name, "repository")
+    if pull_request_number is not None:
+        if isinstance(pull_request_number, bool) or not isinstance(
+            pull_request_number, int
+        ) or pull_request_number < 1:
+            raise ValueError("pull_request_number must be a positive integer")
+        filename = f"{name}-pr-{pull_request_number}-{head_commit[:12]}-diff.txt"
+    else:
+        filename = f"{name}-{base_commit[:12]}..{head_commit[:12]}-diff.txt"
+    if SAFE_FILENAME_RE.fullmatch(filename) is None:
+        raise RuntimeError("Generated text artifact filename is invalid")
+    return filename
+
+
+def _validate_diff_safety(data: bytes) -> str:
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ArtifactTransferError("Generated diff is not valid UTF-8") from exc
+    if "\x00" in text:
+        raise ArtifactTransferError("Generated diff contains NUL bytes")
+    if any(marker in text for marker in _PRIVATE_KEY_MARKERS):
+        raise PermissionError("Generated diff contains a private-key marker")
+    if _AUTHORIZATION_RE.search(text) is not None:
+        raise PermissionError("Generated diff contains an authorization credential")
+    if any(pattern.search(text) is not None for pattern in _TOKEN_PATTERNS):
+        raise PermissionError("Generated diff contains a high-confidence secret token")
+    return text
+
+
+def _write_git_diff(
+    repository: Path,
+    base_commit: str,
+    head_commit: str,
+    destination: Path,
+) -> int:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("Git is not installed")
+    stderr_path = destination.with_suffix(".stderr")
+    total = 0
+    process: subprocess.Popen[bytes] | None = None
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + 120
+    try:
+        with destination.open("xb", buffering=0) as output, stderr_path.open(
+            "xb", buffering=0
+        ) as error_output:
+            process = subprocess.Popen(
+                [
+                    git,
+                    "-c",
+                    "color.ui=false",
+                    "-c",
+                    "core.quotepath=true",
+                    "-C",
+                    str(repository),
+                    "diff",
+                    "--binary",
+                    "--full-index",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    base_commit,
+                    head_commit,
+                    "--",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=error_output,
+                shell=False,
+                close_fds=True,
+                env={
+                    "HOME": str(operator.HOME),
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GIT_NO_REPLACE_OBJECTS": "1",
+                },
+            )
+            if process.stdout is None:
+                raise RuntimeError("Git diff stdout is unavailable")
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Git diff generation timed out")
+                events = selector.select(timeout=min(1.0, remaining))
+                if not events:
+                    continue
+                for key, _ in events:
+                    block = os.read(key.fd, 1024 * 1024)
+                    if not block:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(block)
+                    if total > MAX_TEXT_ARTIFACT_BYTES:
+                        raise ArtifactTransferError(
+                            "Generated diff exceeds the size limit"
+                        )
+                    output.write(block)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Git diff generation timed out")
+            returncode = process.wait(timeout=remaining)
+            output.flush()
+            os.fsync(output.fileno())
+        if returncode != 0:
+            detail = stderr_path.read_bytes()[:64 * 1024].decode(
+                "utf-8", errors="replace"
+            )
+            raise ArtifactTransferError(
+                f"Git diff failed: {_redact_transfer_detail(detail)}"
+            )
+    except Exception:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        selector.close()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+        stderr_path.unlink(missing_ok=True)
+    return total
+
+
+def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(descriptor, "wb", buffering=0, closefd=False) as handle:
+            handle.write(data)
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def publish_text_artifact(
+    profile: str,
+    repository: str,
+    base_commit: str,
+    head_commit: str,
+    *,
+    pull_request_number: int | None = None,
+) -> dict[str, Any]:
+    if profile != TEXT_ARTIFACT_PROFILE:
+        raise ValueError(f"profile must be {TEXT_ARTIFACT_PROFILE}")
+    repo = _resolve_git_repository(repository)
+    base_sha = _verify_commit(repo, base_commit, "base_commit")
+    head_sha = _verify_commit(repo, head_commit, "head_commit")
+    filename = _artifact_filename(repo, base_sha, head_sha, pull_request_number)
+    _ensure_private_directory(TEXT_ARTIFACT_ROOT)
+    artifact_id = uuid.uuid4().hex
+    temporary_directory = TEXT_ARTIFACT_ROOT / f".{artifact_id}.tmp"
+    final_directory = TEXT_ARTIFACT_ROOT / artifact_id
+    os.mkdir(temporary_directory, 0o700)
+    diff_path = temporary_directory / filename
+    try:
+        size = _write_git_diff(repo, base_sha, head_sha, diff_path)
+        if size != diff_path.stat().st_size:
+            raise RuntimeError("Generated diff size changed unexpectedly")
+        os.chmod(diff_path, 0o600)
+        data = diff_path.read_bytes()
+        _validate_diff_safety(data)
+        diff_sha256, verified_size = _hash_file(diff_path)
+        if verified_size != size:
+            raise RuntimeError("Generated diff failed size verification")
+        generated_at = int(time.time())
+        receipt = {
+            "schema": TEXT_ARTIFACT_SCHEMA,
+            "profile": profile,
+            "artifact_id": artifact_id,
+            "repository": repo.name,
+            "repository_path_sha256": hashlib.sha256(
+                str(repo).encode("utf-8")
+            ).hexdigest(),
+            "base_commit": base_sha,
+            "head_commit": head_sha,
+            "pull_request_number": pull_request_number,
+            "filename": filename,
+            "diff_sha256": diff_sha256,
+            "byte_size": size,
+            "generated_at_unix": generated_at,
+            "encoding": "utf-8",
+            "format": "unified-diff",
+        }
+        receipt_bytes = _canonical_json_bytes(receipt)
+        receipt_path = temporary_directory / "receipt.json"
+        _atomic_write(receipt_path, receipt_bytes)
+        receipt_sha256, _ = _hash_file(receipt_path)
+        directory = os.open(temporary_directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        os.replace(temporary_directory, final_directory)
+        root_descriptor = os.open(TEXT_ARTIFACT_ROOT, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(root_descriptor)
+        finally:
+            os.close(root_descriptor)
+    except Exception:
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+        raise
+    result = {
+        **receipt,
+        "receipt_sha256": receipt_sha256,
+        "transport": {
+            "reader": "grabowski_text_artifact_read",
+            "encoding": "base64",
+            "max_chunk_bytes": MAX_TEXT_ARTIFACT_CHUNK_BYTES,
+            "requires": ["expected_artifact_sha256", "expected_receipt_sha256"],
+        },
+    }
+    base._append_audit(
+        {
+            "timestamp_unix": int(time.time()),
+            "operation": "text-artifact-publish",
+            "profile": profile,
+            "artifact_id": artifact_id,
+            "repository_path_sha256": receipt["repository_path_sha256"],
+            "base_commit": base_sha,
+            "head_commit": head_sha,
+            "sha256": diff_sha256,
+            "size": size,
+            "receipt_sha256": receipt_sha256,
+        }
+    )
+    return result
+
+
+def _validated_text_artifact_receipt(
+    receipt_bytes: bytes,
+    *,
+    artifact_id: str,
+) -> dict[str, Any]:
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactTransferError("Text artifact receipt is invalid") from exc
+    if not isinstance(receipt, dict) or receipt_bytes != _canonical_json_bytes(receipt):
+        raise ArtifactTransferError("Text artifact receipt is not canonical JSON")
+    required = {
+        "schema",
+        "profile",
+        "artifact_id",
+        "repository",
+        "repository_path_sha256",
+        "base_commit",
+        "head_commit",
+        "pull_request_number",
+        "filename",
+        "diff_sha256",
+        "byte_size",
+        "generated_at_unix",
+        "encoding",
+        "format",
+    }
+    if set(receipt) != required:
+        raise ArtifactTransferError("Text artifact receipt fields are invalid")
+    if (
+        receipt.get("schema") != TEXT_ARTIFACT_SCHEMA
+        or receipt.get("profile") != TEXT_ARTIFACT_PROFILE
+        or receipt.get("artifact_id") != artifact_id
+        or receipt.get("encoding") != "utf-8"
+        or receipt.get("format") != "unified-diff"
+    ):
+        raise ArtifactTransferError("Text artifact receipt binding is invalid")
+    repository = receipt.get("repository")
+    if not isinstance(repository, str) or not repository or len(repository) > 255:
+        raise ArtifactTransferError("Text artifact repository identity is invalid")
+    _validate_sha256(receipt.get("repository_path_sha256"), "repository_path_sha256")
+    _validate_commit_sha(receipt.get("base_commit"), "base_commit")
+    _validate_commit_sha(receipt.get("head_commit"), "head_commit")
+    pull_request_number = receipt.get("pull_request_number")
+    if pull_request_number is not None and (
+        isinstance(pull_request_number, bool)
+        or not isinstance(pull_request_number, int)
+        or pull_request_number < 1
+    ):
+        raise ArtifactTransferError("Text artifact pull request binding is invalid")
+    generated_at = receipt.get("generated_at_unix")
+    if isinstance(generated_at, bool) or not isinstance(generated_at, int) or generated_at < 1:
+        raise ArtifactTransferError("Text artifact timestamp is invalid")
+    filename = receipt.get("filename")
+    if not isinstance(filename, str) or SAFE_FILENAME_RE.fullmatch(filename) is None:
+        raise ArtifactTransferError("Text artifact filename is invalid")
+    declared_size = receipt.get("byte_size")
+    if (
+        isinstance(declared_size, bool)
+        or not isinstance(declared_size, int)
+        or not 0 <= declared_size <= MAX_TEXT_ARTIFACT_BYTES
+    ):
+        raise ArtifactTransferError("Text artifact size is invalid")
+    _validate_sha256(receipt.get("diff_sha256"), "diff_sha256")
+    return receipt
+
+
+def read_text_artifact(
+    artifact_id: str,
+    expected_artifact_sha256: str,
+    expected_receipt_sha256: str,
+    *,
+    offset: int = 0,
+    max_bytes: int = MAX_TEXT_ARTIFACT_CHUNK_BYTES,
+) -> dict[str, Any]:
+    identity = _validate_artifact_id(artifact_id)
+    expected_artifact = _validate_sha256(
+        expected_artifact_sha256, "expected_artifact_sha256"
+    )
+    expected_receipt = _validate_sha256(
+        expected_receipt_sha256, "expected_receipt_sha256"
+    )
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)
+        or max_bytes < 1
+        or max_bytes > MAX_TEXT_ARTIFACT_CHUNK_BYTES
+    ):
+        raise ValueError(
+            f"max_bytes must be between 1 and {MAX_TEXT_ARTIFACT_CHUNK_BYTES}"
+        )
+
+    _ensure_private_directory(TEXT_ARTIFACT_ROOT)
+    root_descriptor, root_identity = _open_private_directory_path(TEXT_ARTIFACT_ROOT)
+    try:
+        artifact_descriptor, artifact_identity = _open_private_directory_at(
+            root_descriptor, identity
+        )
+        try:
+            receipt_bytes, receipt_sha256, _ = _read_private_regular_file_at(
+                artifact_descriptor,
+                "receipt.json",
+                max_bytes=MAX_TEXT_ARTIFACT_RECEIPT_BYTES,
+            )
+            if receipt_sha256 != expected_receipt:
+                raise ArtifactTransferError(
+                    "Text artifact receipt hash precondition failed"
+                )
+            receipt = _validated_text_artifact_receipt(
+                receipt_bytes, artifact_id=identity
+            )
+            size = receipt["byte_size"]
+            if offset > size:
+                raise ValueError("offset exceeds artifact size")
+            diff_sha256, observed_size, payload = (
+                _hash_and_read_private_regular_file_at(
+                    artifact_descriptor,
+                    receipt["filename"],
+                    max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+                    offset=offset,
+                    chunk_size=max_bytes,
+                )
+            )
+            if (
+                diff_sha256 != receipt["diff_sha256"]
+                or diff_sha256 != expected_artifact
+                or observed_size != size
+            ):
+                raise ArtifactTransferError(
+                    "Text artifact integrity verification failed"
+                )
+            _verify_private_directory_at(
+                root_descriptor,
+                identity,
+                artifact_descriptor,
+                artifact_identity,
+            )
+        finally:
+            os.close(artifact_descriptor)
+        _verify_private_directory_path(
+            root_descriptor, TEXT_ARTIFACT_ROOT, root_identity
+        )
+    finally:
+        os.close(root_descriptor)
+
+    next_offset = offset + len(payload)
+    return {
+        "schema": "text-artifact-chunk.v1",
+        "artifact_id": artifact_id,
+        "filename": receipt["filename"],
+        "offset": offset,
+        "chunk_size": len(payload),
+        "chunk_sha256": hashlib.sha256(payload).hexdigest(),
+        "artifact_size": size,
+        "artifact_sha256": receipt["diff_sha256"],
+        "receipt_sha256": receipt_sha256,
+        "transport_encoding": "base64",
+        "content_encoding": "utf-8",
+        "payload_b64": base64.b64encode(payload).decode("ascii"),
+        "next_offset": next_offset if next_offset < size else None,
+    }
+
+
 def _audit_transfer(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "timestamp_unix": int(__import__("time").time()),
@@ -641,3 +1383,48 @@ def grabowski_artifact_pull(
         raise _transfer_error("pull", exc) from None
     base._append_audit(_audit_transfer(result))
     return result
+
+@mcp.tool(name="grabowski_text_artifact_publish", annotations=MUTATING)
+def grabowski_text_artifact_publish(
+    profile: str,
+    repository: str,
+    base_commit: str,
+    head_commit: str,
+    pull_request_number: int | None = None,
+) -> dict[str, Any]:
+    """Publish one immutable commit-bound UTF-8 text artifact and receipt."""
+    operator._require_operator_mutation(
+        "artifact_transfer", path=str(TEXT_ARTIFACT_ROOT), host="heim-pc"
+    )
+    try:
+        return publish_text_artifact(
+            profile,
+            repository,
+            base_commit,
+            head_commit,
+            pull_request_number=pull_request_number,
+        )
+    except Exception as exc:
+        raise _transfer_error("text publish", exc) from None
+
+
+@mcp.tool(name="grabowski_text_artifact_read", annotations=READ_ONLY)
+def grabowski_text_artifact_read(
+    artifact_id: str,
+    expected_artifact_sha256: str,
+    expected_receipt_sha256: str,
+    offset: int = 0,
+    max_bytes: int = MAX_TEXT_ARTIFACT_CHUNK_BYTES,
+) -> dict[str, Any]:
+    """Read one hash-pinned bounded chunk from a published text artifact."""
+    operator._require_operator_capability("artifact_transfer")
+    try:
+        return read_text_artifact(
+            artifact_id,
+            expected_artifact_sha256,
+            expected_receipt_sha256,
+            offset=offset,
+            max_bytes=max_bytes,
+        )
+    except Exception as exc:
+        raise _transfer_error("text read", exc) from None
