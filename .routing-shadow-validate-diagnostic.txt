@@ -81,9 +81,9 @@ ok
 test_base_drift_is_visible_and_blocks_collect (test_agent_workspace.AgentWorkspaceTests.test_base_drift_is_visible_and_blocks_collect) ... Preparing worktree (new branch 'feat/writer')
 ok
 test_binary_untracked_patch_is_byte_exact_and_applies (test_agent_workspace.AgentWorkspaceTests.test_binary_untracked_patch_is_byte_exact_and_applies) ... Preparing worktree (new branch 'feat/writer')
-Cloning into '/tmp/tmpfqbnrpre/binary-apply'...
+Cloning into '/tmp/tmp9tomewqu/binary-apply'...
 done.
-Note: switching to '7ba37a7bd3bcbecfd14c4ef4c7a5af8f9aa8908a'.
+Note: switching to '707b288378ca4e05bd7277f9aca5e3a3fdeaa74b'.
 
 You are in 'detached HEAD' state. You can look around, make experimental
 changes and commit them, and you can discard any commits you make in this
@@ -100,7 +100,7 @@ Or undo this operation with:
 
 Turn off this advice by setting config variable advice.detachedHead to false
 
-HEAD is now at 7ba37a7 base
+HEAD is now at 707b288 base
 ok
 test_bounded_capture_does_not_limit_child_file_size (test_agent_workspace.AgentWorkspaceTests.test_bounded_capture_does_not_limit_child_file_size) ... ok
 test_bounded_capture_does_not_wait_for_detached_pipe_holder (test_agent_workspace.AgentWorkspaceTests.test_bounded_capture_does_not_wait_for_detached_pipe_holder) ... ok
@@ -276,9 +276,9 @@ ok
 test_malformed_retry_state_blocks_status_and_retry_fail_closed (test_agent_workspace.AgentWorkspaceTests.test_malformed_retry_state_blocks_status_and_retry_fail_closed) ... Preparing worktree (new branch 'feat/writer')
 ok
 test_materialized_patch_applies_to_base_and_includes_untracked (test_agent_workspace.AgentWorkspaceTests.test_materialized_patch_applies_to_base_and_includes_untracked) ... Preparing worktree (new branch 'feat/writer')
-Cloning into '/tmp/tmpdep8_l9u/apply'...
+Cloning into '/tmp/tmp7gqf8ds0/apply'...
 done.
-Note: switching to 'c9653b95ab17002894d6d98a2306f0787ad4436f'.
+Note: switching to '1de2dff62eb0e8619358d8ce5c12142d5c53bd21'.
 
 You are in 'detached HEAD' state. You can look around, make experimental
 changes and commit them, and you can discard any commits you make in this
@@ -295,7 +295,7 @@ Or undo this operation with:
 
 Turn off this advice by setting config variable advice.detachedHead to false
 
-HEAD is now at c9653b9 base
+HEAD is now at 1de2dff base
 ok
 test_missing_bwrap_blocks_execution_but_not_argv_construction (test_agent_workspace.AgentWorkspaceTests.test_missing_bwrap_blocks_execution_but_not_argv_construction) ... ok
 test_missing_object_is_error_not_conflict (test_agent_workspace.AgentWorkspaceTests.test_missing_object_is_error_not_conflict) ... Preparing worktree (new branch 'feat/writer')
@@ -442,7 +442,7 @@ test_workspace_outcome_receipt_is_phase_bound_and_idempotent (test_agent_workspa
 ok
 test_workspace_outcome_with_route_and_role_receipts_is_complete_and_versioned (test_agent_workspace.AgentWorkspaceTests.test_workspace_outcome_with_route_and_role_receipts_is_complete_and_versioned) ... Preparing worktree (new branch 'feat/writer')
 ok
-test_workspace_shadow_capture_is_confined_to_test_state (test_agent_workspace.AgentWorkspaceTests.test_workspace_shadow_capture_is_confined_to_test_state) ... FAIL
+test_workspace_shadow_capture_is_confined_to_test_state (test_agent_workspace.AgentWorkspaceTests.test_workspace_shadow_capture_is_confined_to_test_state) ... ok
 test_worktree_cleanup_only_deletes_exact_clean_base_identity (test_agent_workspace.AgentWorkspaceTests.test_worktree_cleanup_only_deletes_exact_clean_base_identity) ... Preparing worktree (new branch 'feat/cleanup-exact')
 ok
 test_writer_attempt_history_rejects_extra_or_rebound_attempts (test_agent_workspace.AgentWorkspaceTests.test_writer_attempt_history_rejects_extra_or_rebound_attempts) ... Preparing worktree (new branch 'feat/writer')
@@ -814,7 +814,7 @@ test_generated_catalog_matches_canonical_source (test_coding_agent_catalog_data.
 test_atomic_write_uses_private_mode_without_path_chmod (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_atomic_write_uses_private_mode_without_path_chmod) ... ok
 test_command_output_is_rejected_before_unbounded_buffering (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_command_output_is_rejected_before_unbounded_buffering) ... ok
 test_command_timeout_terminates_the_child_process_group (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_command_timeout_terminates_the_child_process_group) ... ok
-test_history_mutation_fails_closed_and_records_bounded_failure (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_history_mutation_fails_closed_and_records_bounded_failure) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_history_mutation_fails_closed_and_records_bounded_failure (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_history_mutation_fails_closed_and_records_bounded_failure) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
 test_invalid_command_json_fails_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_invalid_command_json_fails_closed) ... ok
 test_lock_contention_is_a_clean_noop (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_lock_contention_is_a_clean_noop) ... ok
@@ -824,32 +824,32 @@ test_probe_validation_rejects_invalid_verified_pool_claims (test_coding_agent_pr
 test_probe_validation_rejects_plain_sha256_without_domain_binding (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_probe_validation_rejects_plain_sha256_without_domain_binding) ... ok
 test_probe_validation_rejects_tampered_scrub_claim_outside_digest (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_probe_validation_rejects_tampered_scrub_claim_outside_digest) ... ok
 test_probe_validation_rejects_unknown_fields_and_nonzero_execution_claims (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_probe_validation_rejects_unknown_fields_and_nonzero_execution_claims) ... ok
-test_router_digest_mismatch_fails_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_digest_mismatch_fails_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_router_digest_mismatch_fails_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_digest_mismatch_fails_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
-test_router_digest_pin_directory_fails_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_digest_pin_directory_fails_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_router_digest_pin_directory_fails_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_digest_pin_directory_fails_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
-test_router_digest_pin_special_mode_bits_fail_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_digest_pin_special_mode_bits_fail_closed) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
-{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
-{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_router_digest_pin_special_mode_bits_fail_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_digest_pin_special_mode_bits_fail_closed) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
-test_router_special_mode_bits_fail_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_special_mode_bits_fail_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
-{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
-{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_router_special_mode_bits_fail_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_special_mode_bits_fail_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+{"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
-test_router_symlink_is_rejected_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_symlink_is_rejected_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_router_symlink_is_rejected_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_router_symlink_is_rejected_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
 test_safe_unlink_tolerates_disappearance_after_lstat (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_safe_unlink_tolerates_disappearance_after_lstat) ... ok
-test_state_symlink_is_rejected_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_state_symlink_is_rejected_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_state_symlink_is_rejected_before_execution (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_state_symlink_is_rejected_before_execution) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
 test_state_validation_preserves_same_catalog_and_adds_only_verified_time (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_state_validation_preserves_same_catalog_and_adds_only_verified_time) ... ok
 test_state_validation_requires_exact_reset_after_catalog_change (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_state_validation_requires_exact_reset_after_catalog_change) ... ok
 test_success_preserves_history_scrubs_keys_and_writes_readback_receipt (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_success_preserves_history_scrubs_keys_and_writes_readback_receipt) ... ok
-test_tampered_probe_digest_fails_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_tampered_probe_digest_fails_closed) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:18Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_tampered_probe_digest_fails_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_tampered_probe_digest_fails_closed) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:40Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
 test_termination_does_not_reap_leader_before_final_group_kill (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_termination_does_not_reap_leader_before_final_group_kill) ... ok
 test_termination_preserves_descendant_grace_after_leader_exit (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_termination_preserves_descendant_grace_after_leader_exit) ... ok
 test_timeout_kills_term_resistant_descendant_after_leader_exit (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_timeout_kills_term_resistant_descendant_after_leader_exit) ... ok
-test_unreadable_state_fails_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_unreadable_state_fails_closed) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:46:23Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
+test_unreadable_state_fails_closed (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_unreadable_state_fails_closed) ... {"automatic_execution_authorized":false,"error":"probe_scheduler_failed_closed","error_type":"ProbeSchedulerError","failed_at":"2026-07-24T03:51:45Z","kind":"coding-agent-probe-scheduler-failure","model_invocations":0,"paid_api_requests_authorized":0,"schema_version":1,"status":"failed"}
 ok
 test_wait_for_positive_pid_tolerates_empty_existing_file (test_coding_agent_probe_scheduler.CodingAgentProbeSchedulerTests.test_wait_for_positive_pid_tolerates_empty_existing_file) ... ok
 test_service_is_metadata_only_hardened_and_state_scoped (test_coding_agent_probe_systemd_contract.CodingAgentProbeSystemdContractTests.test_service_is_metadata_only_hardened_and_state_scoped) ... ok
@@ -2414,8 +2414,84 @@ hint: 	git branch -m <name>
 hint:
 hint: Disable this message with "git config set advice.defaultBranchName false"
 ok
-test_operator_routing_shadow_capture (unittest.loader._FailedTest.test_operator_routing_shadow_capture) ... ERROR
-test_operator_routing_shadow_cohort (unittest.loader._FailedTest.test_operator_routing_shadow_cohort) ... ERROR
+test_abstention_is_explicit_and_may_have_no_primary_evidence (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_abstention_is_explicit_and_may_have_no_primary_evidence) ... ok
+test_create_only_writer_refuses_overwrite (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_create_only_writer_refuses_overwrite) ... ok
+test_eligibility_is_hash_bound_and_final_record_references_it (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_eligibility_is_hash_bound_and_final_record_references_it) ... ok
+test_generated_artifacts_validate_against_draft_2020_12_schemas (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_generated_artifacts_validate_against_draft_2020_12_schemas) ... ok
+test_missing_route_evidence_fails_closed (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_missing_route_evidence_fails_closed) ... ok
+test_operational_cli_rejects_caller_supplied_timestamps (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_operational_cli_rejects_caller_supplied_timestamps) ... usage: python3 -m unittest [-h] {freeze,seal} ...
+python3 -m unittest: error: unrecognized arguments: --frozen-at 2026-07-23T05:20:00Z
+usage: python3 -m unittest [-h] {freeze,seal} ...
+python3 -m unittest: error: unrecognized arguments: --captured-at 2026-07-23T05:30:00Z
+ok
+test_optional_draft_schema_validation_skips_without_jsonschema (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_optional_draft_schema_validation_skips_without_jsonschema) ... ok
+test_outcome_after_capture_sealing_is_rejected (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_outcome_after_capture_sealing_is_rejected) ... ok
+test_outcome_before_eligibility_freeze_is_rejected (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_outcome_before_eligibility_freeze_is_rejected) ... ok
+test_persisted_normalized_route_evidence_is_replayed_exactly (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_persisted_normalized_route_evidence_is_replayed_exactly) ... ok
+test_persisted_route_derived_field_tampering_fails_closed (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_persisted_route_derived_field_tampering_fails_closed) ... ok
+test_record_excludes_raw_manifest_private_content (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_record_excludes_raw_manifest_private_content) ... ok
+test_record_tampering_fails_hash_validation (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_record_tampering_fails_hash_validation) ... ok
+test_reviewed_outcome_requires_primary_evidence (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_reviewed_outcome_requires_primary_evidence) ... ok
+test_schema_contract_is_fail_closed_and_shadow_only (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_schema_contract_is_fail_closed_and_shadow_only) ... ok
+test_symlinked_input_file_is_rejected (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_symlinked_input_file_is_rejected) ... ok
+test_symlinked_output_parent_is_rejected (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_symlinked_output_parent_is_rejected) ... ok
+test_tampered_eligibility_receipt_fails_closed (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_tampered_eligibility_receipt_fails_closed) ... ok
+test_task_must_be_referenced_by_manifest (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_task_must_be_referenced_by_manifest) ... ok
+test_unhashable_risk_flag_fails_closed_with_capture_error (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_unhashable_risk_flag_fails_closed_with_capture_error) ... ok
+test_unknown_top_level_field_fails_closed (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_unknown_top_level_field_fails_closed) ... ok
+test_v1_route_evidence_preserves_legacy_feature_shape_without_inference (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_v1_route_evidence_preserves_legacy_feature_shape_without_inference) ... ok
+test_v2_route_evidence_is_reused_and_record_is_deterministic (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_v2_route_evidence_is_reused_and_record_is_deterministic) ... ok
+test_valid_unsorted_v1_evidence_order_remains_provable (test_operator_routing_shadow_capture.OperatorRoutingShadowCaptureTests.test_valid_unsorted_v1_evidence_order_remains_provable) ... ok
+test_abstention_remains_abstention (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_abstention_remains_abstention) ... ok
+test_attempt_audit_failure_does_not_undo_valid_freeze (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_attempt_audit_failure_does_not_undo_valid_freeze) ... ok
+test_bare_evidence_prefix_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_bare_evidence_prefix_is_rejected) ... ok
+test_best_effort_capture_rejects_incomplete_route_and_audits_attempt (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_best_effort_capture_rejects_incomplete_route_and_audits_attempt) ... ok
+test_binding_rejects_non_writer_task (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_binding_rejects_non_writer_task) ... ok
+test_capture_results_expose_defined_reason_code (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_capture_results_expose_defined_reason_code) ... ok
+test_case_identity_binds_full_route_evidence_not_only_recommendation (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_case_identity_binds_full_route_evidence_not_only_recommendation) ... ok
+test_conflicting_reseal_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_conflicting_reseal_is_rejected) ... ok
+test_create_only_publish_is_crash_safe_and_typed (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_create_only_publish_is_crash_safe_and_typed) ... ok
+test_direct_capture_cannot_claim_production_origin (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_direct_capture_cannot_claim_production_origin) ... ok
+test_disabled_capture_writes_nothing (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_disabled_capture_writes_nothing) ... ok
+test_evidence_order_is_canonical (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_evidence_order_is_canonical) ... ERROR
+test_forged_manifest_identity_with_consistent_lineage_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_forged_manifest_identity_with_consistent_lineage_is_rejected) ... ERROR
+test_forged_record_id_with_wrong_eligibility_id_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_forged_record_id_with_wrong_eligibility_id_is_rejected) ... ERROR
+test_hook_failure_never_raises_into_workspace_execution (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_hook_failure_never_raises_into_workspace_execution) ... ok
+test_invalid_outcome_leaves_no_partial_eligibility (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_invalid_outcome_leaves_no_partial_eligibility) ... ok
+test_latest_artifacts_validate_against_v3_schemas (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_latest_artifacts_validate_against_v3_schemas) ... ok
+test_latest_prospective_contract_freezes_case_origin (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_latest_prospective_contract_freezes_case_origin) ... FAIL
+test_latest_record_defaults_missing_quality_signals_to_explicit_unknown (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_latest_record_defaults_missing_quality_signals_to_explicit_unknown) ... ok
+test_latest_record_makes_disagreement_and_execution_failure_observable (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_latest_record_makes_disagreement_and_execution_failure_observable) ... ok
+test_legacy_prospective_history_remains_v2_sealable_without_backfill (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_legacy_prospective_history_remains_v2_sealable_without_backfill) ... ERROR
+test_new_artifacts_validate_against_draft_2020_12_schemas (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_new_artifacts_validate_against_draft_2020_12_schemas) ... ERROR
+test_no_effect_tampering_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_no_effect_tampering_is_rejected) ... ERROR
+test_noncanonical_offset_timestamp_rejected_and_builder_normalizes (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_noncanonical_offset_timestamp_rejected_and_builder_normalizes) ... ERROR
+test_parallel_workspaces_get_distinct_case_identity (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_parallel_workspaces_get_distinct_case_identity) ... ok
+test_partial_eligibility_then_record_failure_converges (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_partial_eligibility_then_record_failure_converges) ... ok
+test_private_manifest_data_never_enters_receipt_or_record (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_private_manifest_data_never_enters_receipt_or_record) ... ok
+test_private_manifest_fields_do_not_change_identity (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_private_manifest_fields_do_not_change_identity) ... ok
+test_prospective_freeze_preserves_route_schema_v1_and_v2 (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_prospective_freeze_preserves_route_schema_v1_and_v2) ... ok
+test_prospective_freeze_requires_no_bound_tasks (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_prospective_freeze_requires_no_bound_tasks) ... ok
+test_publish_failure_does_not_poison_final_slot (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_publish_failure_does_not_poison_final_slot) ... ok
+test_repeated_capture_attempts_are_bounded (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_repeated_capture_attempts_are_bounded) ... ok
+test_repeated_rejections_are_bounded (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_repeated_rejections_are_bounded) ... ok
+test_reseal_enriched_record_without_optional_fields_is_idempotent (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_reseal_enriched_record_without_optional_fields_is_idempotent) ... ok
+test_restart_reuses_first_freeze_for_same_case (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_restart_reuses_first_freeze_for_same_case) ... ok
+test_restart_reuses_first_freeze_when_manifest_metadata_changes (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_restart_reuses_first_freeze_when_manifest_metadata_changes) ... ok
+test_reviewed_outcome_without_primary_evidence_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_reviewed_outcome_without_primary_evidence_is_rejected) ... ok
+test_route_evidence_change_after_freeze_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_route_evidence_change_after_freeze_is_rejected) ... ok
+test_seal_rejects_valid_but_unstored_prospective_receipt (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_seal_rejects_valid_but_unstored_prospective_receipt) ... ok
+test_seal_restart_does_not_create_duplicate_record (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_seal_restart_does_not_create_duplicate_record) ... ok
+test_seal_retry_after_manifest_metadata_change_stays_duplicate (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_seal_retry_after_manifest_metadata_change_stays_duplicate) ... ok
+test_semantic_assessments_must_match_primary_outcome_kind (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_semantic_assessments_must_match_primary_outcome_kind) ... ok
+test_semantic_assessments_require_at_least_two_when_present (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_semantic_assessments_require_at_least_two_when_present) ... ok
+test_symlinked_cohort_root_is_rejected_without_following (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_symlinked_cohort_root_is_rejected_without_following) ... ok
+test_tampered_prospective_eligibility_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_tampered_prospective_eligibility_is_rejected) ... ok
+test_task_correctness_requires_terminal_execution_before_outcome (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_task_correctness_requires_terminal_execution_before_outcome) ... ok
+test_unattributed_direct_capture_defaults_to_synthetic_origin (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_unattributed_direct_capture_defaults_to_synthetic_origin) ... ok
+test_workspace_hook_is_before_writer_task_start (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_workspace_hook_is_before_writer_task_start) ... ok
+test_wrong_prospective_binding_in_eligibility_v2_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_wrong_prospective_binding_in_eligibility_v2_is_rejected) ... ok
+test_wrong_workspace_case_id_in_record_v2_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_wrong_workspace_case_id_in_record_v2_is_rejected) ... ERROR
 test_audit_chain_rejects_unhashed_record_after_v2_transition (test_operator_v2_runtime.OperatorV2RuntimeTests.test_audit_chain_rejects_unhashed_record_after_v2_transition) ... ok
 test_browser_profile_read_redacts_sensitive_text (test_operator_v2_runtime.OperatorV2RuntimeTests.test_browser_profile_read_redacts_sensitive_text) ... ok
 test_browser_profile_read_text_and_binary_metadata_only (test_operator_v2_runtime.OperatorV2RuntimeTests.test_browser_profile_read_text_and_binary_metadata_only) ... ok
@@ -2474,7 +2550,7 @@ test_workflow_uses_default_branch_comment_event_and_minimal_permissions (test_pr
 test_advisory_derived_status_is_also_forbidden_in_required_catalog (test_pr_review_gate_ci_hardening.ReviewEvidenceHardeningTests.test_advisory_derived_status_is_also_forbidden_in_required_catalog) ... ok
 test_audit_builder_binds_base_and_policy_version (test_pr_review_gate_ci_hardening.ReviewEvidenceHardeningTests.test_audit_builder_binds_base_and_policy_version) ... ok
 test_authorization_unknown_replaces_old_green_with_failure (test_pr_review_gate_ci_hardening.ReviewEvidenceHardeningTests.test_authorization_unknown_replaces_old_green_with_failure) ... {"automatic_execution_authorized":false,"kind":"coding-agent-probe-scheduler-receipt","schema_version":1,"status":"skipped-lock-busy"}
-{"api_key_environment_removed_count":7,"catalog_probe_sha256":"066aab56b559c368adede6a24a271e2bf1af566496d01a90e5863ca7ca52b671","completed_at":"2026-07-24T03:46:18Z","does_not_establish":["provider quota remaining beyond observed metadata","future route availability","execution authority"],"history_sha256":"7e8dd8cb9768f53a0970b966c7ff6e4ab5e3c17573f2e46fbb76d33fff70d46b","invocation_policy":"metadata-only","kind":"coding-agent-probe-scheduler-receipt","model_invocations":0,"observed_at":"2026-07-24T03:46:18Z","paid_api_requests_authorized":0,"router":"/tmp/tmpryxfkayv/agent-route","router_sha256":"656a2a59215eef59afa38b976b297613344e93ac6eaa2f5a50103ed706f7037e","router_sha256_pin":"/tmp/tmpryxfkayv/router.sha256","schema_version":1,"state":"/tmp/tmpryxfkayv/state.json","state_sha256_after":"23bc857ef922edc3f0c881ae270b86e7eecff34e84f60f61501c48adbbb94ca3","state_sha256_before":"20ab83b5c2b679e7fd89641eec32cb148550fb65c612dce1dcdda8ce39cd78cf","status":"ok","status_readback":{"automatic_execution_authorized":false,"catalog_fresh":true}}
+{"api_key_environment_removed_count":7,"catalog_probe_sha256":"121eca381831e449691467589a79dd5ea3ccce7ead2fc339d23f6c0ae7c27ffb","completed_at":"2026-07-24T03:51:40Z","does_not_establish":["provider quota remaining beyond observed metadata","future route availability","execution authority"],"history_sha256":"7e8dd8cb9768f53a0970b966c7ff6e4ab5e3c17573f2e46fbb76d33fff70d46b","invocation_policy":"metadata-only","kind":"coding-agent-probe-scheduler-receipt","model_invocations":0,"observed_at":"2026-07-24T03:51:40Z","paid_api_requests_authorized":0,"router":"/tmp/tmpffjj5tny/agent-route","router_sha256":"5bc889e78e1510196fcc1b9b945d35523face443dc1c09f07db80c77b4a36fcb","router_sha256_pin":"/tmp/tmpffjj5tny/router.sha256","schema_version":1,"state":"/tmp/tmpffjj5tny/state.json","state_sha256_after":"c7182070e77f648cb4e5592768ded1f276d1ba050dc23db576d455d3a7651f64","state_sha256_before":"20ab83b5c2b679e7fd89641eec32cb148550fb65c612dce1dcdda8ce39cd78cf","status":"ok","status_readback":{"automatic_execution_authorized":false,"catalog_fresh":true}}
 PASS: Deployment erfolgreich
 Repo-HEAD:       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 Release-ID:      new
@@ -2484,8 +2560,8 @@ Entry-Point:     python -m grabowski_mcp
 MCP-Protokoll:   2025-06-18
 Agent-Vertrag:  grabowski-agent-facing-contract-v1 5aae8c17ac22d57778b9f1cbe984d7ab0c9b0983446d4112bb897b8e27d48b21
 Runtime-PID:     200
-Runtime:         /tmp/tmp6bhkz789/grabowski-mcp
-Release:         /tmp/tmp6bhkz789/new
+Runtime:         /tmp/tmp228wj52y/grabowski-mcp
+Release:         /tmp/tmp228wj52y/new
 Legacy-Backup:   None
 PASS: Deployment erfolgreich
 Repo-HEAD:       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -2496,8 +2572,8 @@ Entry-Point:     python -m grabowski_mcp
 MCP-Protokoll:   2025-06-18
 Agent-Vertrag:  grabowski-agent-facing-contract-v1 5aae8c17ac22d57778b9f1cbe984d7ab0c9b0983446d4112bb897b8e27d48b21
 Runtime-PID:     200
-Runtime:         /tmp/tmpyp4infi1/grabowski-mcp
-Release:         /tmp/tmpyp4infi1/new
+Runtime:         /tmp/tmp0a2mxv78/grabowski-mcp
+Release:         /tmp/tmp0a2mxv78/new
 Legacy-Backup:   None
 PASS: Zwei-Dienste-Deployment erfolgreich
 Repo-HEAD:       aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -2512,22 +2588,22 @@ Release:         /release/new
 Watchdog-Assets: wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww
 Tunnel-Drain:    attempts=4 stable=3 final_queue=0 final_responses=10 workers_observed=10
 Legacy-Backup:   None
-{"competition_id": "gac-agy-competitor-1111111111-2222222222", "mode": "competitor", "ok": true, "patch_applies": false, "provider": "agy", "receipt": "/tmp/tmpctdlw0f9/candidate/receipt.json", "receipt_sha256": "ebd56751c06a37fa0bf110415439fe09e6583176e3c14f9731327906318f4235"}
+{"competition_id": "gac-agy-competitor-1111111111-2222222222", "mode": "competitor", "ok": true, "patch_applies": false, "provider": "agy", "receipt": "/tmp/tmpamagmsee/candidate/receipt.json", "receipt_sha256": "7a3a82240bd9fac7c3f5fdc0a3fe8ac2fcfc681eb1381e16bc1897b95e8725fc"}
 {"error": "denied"}
 {"host": "local", "remote_argv": ["printf", "ok"], "result": {"returncode": 0, "stderr": "", "stdout": "ok", "timed_out": false}, "roles": ["development"], "synchronous_contract": {"client_selected_output_limit_supported": false, "client_selected_timeout_supported": false, "server_owned_limits": true, "surface": "grabowski_fleet_cli"}, "transport": "local"}
-[2026-07-24T03:47:11.844337+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:11.847395+00:00] 127.0.0.1 "POST /v1/jobs HTTP/1.1" 202 -
-[2026-07-24T03:47:11.848577+00:00] 127.0.0.1 "GET /v1/jobs/job-http-0001 HTTP/1.1" 200 -
-[2026-07-24T03:47:11.869745+00:00] 127.0.0.1 "GET /v1/jobs/job-http-0001 HTTP/1.1" 200 -
-[2026-07-24T03:47:11.870760+00:00] 127.0.0.1 "GET /v1/jobs?limit=10 HTTP/1.1" 200 -
-[2026-07-24T03:47:12.374028+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:12.374889+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 403 -
-[2026-07-24T03:47:12.375578+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:12.376937+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
-[2026-07-24T03:47:12.377739+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:12.378407+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 200 -
-[2026-07-24T03:47:12.379241+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 409 -
-[2026-07-24T03:47:12.382002+00:00] 127.0.0.1 "POST /v1/jobs HTTP/1.1" 202 -
+[2026-07-24T03:52:33.975129+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:33.978149+00:00] 127.0.0.1 "POST /v1/jobs HTTP/1.1" 202 -
+[2026-07-24T03:52:33.979539+00:00] 127.0.0.1 "GET /v1/jobs/job-http-0001 HTTP/1.1" 200 -
+[2026-07-24T03:52:34.000917+00:00] 127.0.0.1 "GET /v1/jobs/job-http-0001 HTTP/1.1" 200 -
+[2026-07-24T03:52:34.001972+00:00] 127.0.0.1 "GET /v1/jobs?limit=10 HTTP/1.1" 200 -
+[2026-07-24T03:52:34.505788+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:34.506747+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 403 -
+[2026-07-24T03:52:34.507551+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:34.508891+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
+[2026-07-24T03:52:34.509711+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:34.510431+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 200 -
+[2026-07-24T03:52:34.511210+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 409 -
+[2026-07-24T03:52:34.513805+00:00] 127.0.0.1 "POST /v1/jobs HTTP/1.1" 202 -
 Ordnerauswahl abgebrochen; es wurde keine Freigabe gespeichert.
 Grabowski/Juno: Bitte genau einen Ordner auswählen.
 Es werden zunächst nur Zugriffsmetadaten und eine iPadOS-Freigabereferenz gespeichert.
@@ -2541,30 +2617,30 @@ Grabowski/Juno: Bitte genau einen Ordner auswählen.
 Es werden zunächst nur Zugriffsmetadaten und eine iPadOS-Freigabereferenz gespeichert.
 Der iPadOS-Dialog ist geöffnet. Dieses Skript blockiert Junos Hauptthread nicht (Vorgang bbbbbbbbbbbb).
 Nach Auswahl oder Abbruch erscheint eine lokale Bestätigung.
-[2026-07-24T03:47:13.193319+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:13.714913+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:13.733171+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:14.254391+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:14.273112+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:14.293360+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
-[2026-07-24T03:47:14.316028+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:14.335623+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:14.355973+00:00] 127.0.0.1 "POST /v1/jobs HTTP/1.1" 202 -
-[2026-07-24T03:47:14.575118+00:00] 127.0.0.1 "GET /v1/jobs/job-mcp-555e4e7a-0e5e-43b7-b1b3-cc2dbc96fc4d HTTP/1.1" 200 -
-[2026-07-24T03:47:14.595007+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:14.613847+00:00] 127.0.0.1 "GET /v1/jobs/job-mcp-555e4e7a-0e5e-43b7-b1b3-cc2dbc96fc4d HTTP/1.1" 200 -
-[2026-07-24T03:47:15.135254+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.156856+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.179133+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.200671+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
-[2026-07-24T03:47:16.218902+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.238291+00:00] 127.0.0.1 "GET /v1/jobs?limit=20 HTTP/1.1" 200 -
-[2026-07-24T03:47:16.759493+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.778295+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.797586+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 403 -
-[2026-07-24T03:47:16.815633+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
-[2026-07-24T03:47:16.834597+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
-[2026-07-24T03:47:16.853360+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:35.356785+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:35.876954+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:35.894860+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:36.414945+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:36.432770+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:36.456650+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
+[2026-07-24T03:52:36.475119+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:36.493668+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:36.513423+00:00] 127.0.0.1 "POST /v1/jobs HTTP/1.1" 202 -
+[2026-07-24T03:52:36.732252+00:00] 127.0.0.1 "GET /v1/jobs/job-mcp-ed7e0a7d-12ee-4d1a-82ab-9d96a306d858 HTTP/1.1" 200 -
+[2026-07-24T03:52:36.750620+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:36.768593+00:00] 127.0.0.1 "GET /v1/jobs/job-mcp-ed7e0a7d-12ee-4d1a-82ab-9d96a306d858 HTTP/1.1" 200 -
+[2026-07-24T03:52:37.288975+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.309166+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.333099+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.354318+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
+[2026-07-24T03:52:38.372167+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.390652+00:00] 127.0.0.1 "GET /v1/jobs?limit=20 HTTP/1.1" 200 -
+[2026-07-24T03:52:38.910578+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.928297+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.946246+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 403 -
+[2026-07-24T03:52:38.963795+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
+[2026-07-24T03:52:38.982767+00:00] 127.0.0.1 "POST /v1/pair HTTP/1.1" 201 -
+[2026-07-24T03:52:39.000424+00:00] 127.0.0.1 "GET /health HTTP/1.1" 200 -
 {
   "actor_permission": "write",
   "audit_sha256": null,
@@ -3415,24 +3491,24 @@ test_main_validates_before_deploying (test_self_deploy.ScheduledDeployRunnerTest
   "status_context": "Review evidence gate (advisory)",
   "verdict": "BLOCK"
 }
-{"canonical_repo": "/tmp/repository", "delay_seconds": 5, "expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "scheduled", "repo": "/tmp/repository", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784864852}
-{"expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "repository-preflight-complete", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784864852}
-{"completion_status": "complete", "phase": "complete", "release_id": "r", "repo_head": "ffffffffffffffffffffffffffffffffffffffff", "timestamp_unix": 1784864852}
+{"canonical_repo": "/tmp/repository", "delay_seconds": 5, "expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "scheduled", "repo": "/tmp/repository", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784865177}
+{"expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "repository-preflight-complete", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784865177}
+{"completion_status": "complete", "phase": "complete", "release_id": "r", "repo_head": "ffffffffffffffffffffffffffffffffffffffff", "timestamp_unix": 1784865177}
 ok
-test_main_writes_completed_receipt_after_live_manifest_verification (test_self_deploy.ScheduledDeployRunnerTests.test_main_writes_completed_receipt_after_live_manifest_verification) ... {"canonical_repo": "/tmp/repository", "delay_seconds": 5, "expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "scheduled", "repo": "/tmp/repository", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784864852}
-{"expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "repository-preflight-complete", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784864853}
-{"completion_status": "complete", "phase": "complete", "release_id": "release", "repo_head": "ffffffffffffffffffffffffffffffffffffffff", "timestamp_unix": 1784864853}
+test_main_writes_completed_receipt_after_live_manifest_verification (test_self_deploy.ScheduledDeployRunnerTests.test_main_writes_completed_receipt_after_live_manifest_verification) ... {"canonical_repo": "/tmp/repository", "delay_seconds": 5, "expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "scheduled", "repo": "/tmp/repository", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784865177}
+{"expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "repository-preflight-complete", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784865177}
+{"completion_status": "complete", "phase": "complete", "release_id": "release", "repo_head": "ffffffffffffffffffffffffffffffffffffffff", "timestamp_unix": 1784865177}
 ok
-test_main_writes_failed_receipt_for_runner_failure (test_self_deploy.ScheduledDeployRunnerTests.test_main_writes_failed_receipt_for_runner_failure) ... {"canonical_repo": "/tmp/repository", "delay_seconds": 5, "expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "scheduled", "repo": "/tmp/repository", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784864853}
-{"error": "preflight failed", "error_type": "RuntimeError", "phase": "failed", "timestamp_unix": 1784864853}
+test_main_writes_failed_receipt_for_runner_failure (test_self_deploy.ScheduledDeployRunnerTests.test_main_writes_failed_receipt_for_runner_failure) ... {"canonical_repo": "/tmp/repository", "delay_seconds": 5, "expected_head": "ffffffffffffffffffffffffffffffffffffffff", "phase": "scheduled", "repo": "/tmp/repository", "source_identity_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "source_kind": "canonical-main", "timestamp_unix": 1784865177}
+{"error": "preflight failed", "error_type": "RuntimeError", "phase": "failed", "timestamp_unix": 1784865177}
 ok
 test_make_deploy_schedules_not_direct_apply (test_self_deploy.ScheduledDeployRunnerTests.test_make_deploy_schedules_not_direct_apply) ... ok
 test_receipt_publish_failure_removes_visible_partial_finalization (test_self_deploy.ScheduledDeployRunnerTests.test_receipt_publish_failure_removes_visible_partial_finalization) ... ok
 test_repoground_managed_source_guard_rejects_direct_and_symlink_aliases (test_self_deploy.ScheduledDeployRunnerTests.test_repoground_managed_source_guard_rejects_direct_and_symlink_aliases) ... ok
-test_run_streamed_uses_sanitized_child_environment (test_self_deploy.ScheduledDeployRunnerTests.test_run_streamed_uses_sanitized_child_environment) ... {"argv": ["make", "validate"], "phase": "validate-start", "timestamp_unix": 1784864853}
-{"phase": "validate-complete", "returncode": 0, "timestamp_unix": 1784864853}
+test_run_streamed_uses_sanitized_child_environment (test_self_deploy.ScheduledDeployRunnerTests.test_run_streamed_uses_sanitized_child_environment) ... {"argv": ["make", "validate"], "phase": "validate-start", "timestamp_unix": 1784865177}
+{"phase": "validate-complete", "returncode": 0, "timestamp_unix": 1784865177}
 ok
-test_runner_rejects_repoground_managed_source_before_delay_or_commands (test_self_deploy.ScheduledDeployRunnerTests.test_runner_rejects_repoground_managed_source_before_delay_or_commands) ... {"error": "RepoGround-managed source repository cannot be used as a deploy source: /tmp/tmpa7m9qequ/.repoground-sources/heimgewebe__grabowski__main", "error_type": "RuntimeError", "phase": "failed", "timestamp_unix": 1784864853}
+test_runner_rejects_repoground_managed_source_before_delay_or_commands (test_self_deploy.ScheduledDeployRunnerTests.test_runner_rejects_repoground_managed_source_before_delay_or_commands) ... {"error": "RepoGround-managed source repository cannot be used as a deploy source: /tmp/tmp76akcwol/.repoground-sources/heimgewebe__grabowski__main", "error_type": "RuntimeError", "phase": "failed", "timestamp_unix": 1784865177}
 ok
 test_verify_live_manifest_rejects_missing_release_id (test_self_deploy.ScheduledDeployRunnerTests.test_verify_live_manifest_rejects_missing_release_id) ... ok
 test_verify_repository_accepts_detached_shared_worktree (test_self_deploy.ScheduledDeployRunnerTests.test_verify_repository_accepts_detached_shared_worktree) ... ok
@@ -3819,57 +3895,130 @@ test_surface_dispatches_successful_worktree_ensure_receipt (test_worktree_ensure
 test_surface_requires_mutation_permission (test_worktree_ensure.WorktreeEnsureTests.test_surface_requires_mutation_permission) ... ok
 
 ======================================================================
-ERROR: test_operator_routing_shadow_capture (unittest.loader._FailedTest.test_operator_routing_shadow_capture)
+ERROR: test_evidence_order_is_canonical (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_evidence_order_is_canonical)
 ----------------------------------------------------------------------
-ImportError: Failed to import test module: test_operator_routing_shadow_capture
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
-    module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
-    __import__(name)
-  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_capture.py", line 23, in <module>
-    SPEC.loader.exec_module(capture)
-  File "/home/runner/work/grabowski/grabowski/tools/operator_routing_shadow_capture.py", line 18, in <module>
-    import grabowski_operator_routing_shadow_capture as _capture_core  # noqa: E402
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1166, in <module>
-    execution_provenance: dict[str, Any] | None | object = _UNSET,
-                                                           ^^^^^^
-NameError: name '_UNSET' is not defined
-
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 1060, in test_evidence_order_is_canonical
+    first = capture.build_shadow_record_v2(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
 
 ======================================================================
-ERROR: test_operator_routing_shadow_cohort (unittest.loader._FailedTest.test_operator_routing_shadow_cohort)
+ERROR: test_forged_manifest_identity_with_consistent_lineage_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_forged_manifest_identity_with_consistent_lineage_is_rejected)
 ----------------------------------------------------------------------
-ImportError: Failed to import test module: test_operator_routing_shadow_cohort
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
-    module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
-    __import__(name)
-  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 13, in <module>
-    import grabowski_operator_routing_shadow_capture as capture
-  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1166, in <module>
-    execution_provenance: dict[str, Any] | None | object = _UNSET,
-                                                           ^^^^^^
-NameError: name '_UNSET' is not defined
-
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 883, in test_forged_manifest_identity_with_consistent_lineage_is_rejected
+    record = self._bound_record()
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 830, in _bound_record
+    return capture.build_shadow_record_v2(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
 
 ======================================================================
-FAIL: test_workspace_shadow_capture_is_confined_to_test_state (test_agent_workspace.AgentWorkspaceTests.test_workspace_shadow_capture_is_confined_to_test_state)
+ERROR: test_forged_record_id_with_wrong_eligibility_id_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_forged_record_id_with_wrong_eligibility_id_is_rejected)
 ----------------------------------------------------------------------
 Traceback (most recent call last):
-  File "/home/runner/work/grabowski/grabowski/tests/test_agent_workspace.py", line 1686, in test_workspace_shadow_capture_is_confined_to_test_state
-    self.assertEqual(result["status"], "created")
-AssertionError: 'error' != 'created'
-- error
-+ created
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 838, in test_forged_record_id_with_wrong_eligibility_id_is_rejected
+    record = self._bound_record()
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 830, in _bound_record
+    return capture.build_shadow_record_v2(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
 
+======================================================================
+ERROR: test_legacy_prospective_history_remains_v2_sealable_without_backfill (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_legacy_prospective_history_remains_v2_sealable_without_backfill)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 394, in test_legacy_prospective_history_remains_v2_sealable_without_backfill
+    sealed = capture.seal_prospective_case(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 2288, in seal_prospective_case
+    record = build_shadow_record_v2(
+             ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
+
+======================================================================
+ERROR: test_new_artifacts_validate_against_draft_2020_12_schemas (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_new_artifacts_validate_against_draft_2020_12_schemas)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 763, in test_new_artifacts_validate_against_draft_2020_12_schemas
+    record = capture.build_shadow_record_v2(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
+
+======================================================================
+ERROR: test_no_effect_tampering_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_no_effect_tampering_is_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 686, in test_no_effect_tampering_is_rejected
+    record = capture.build_shadow_record_v2(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
+
+======================================================================
+ERROR: test_noncanonical_offset_timestamp_rejected_and_builder_normalizes (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_noncanonical_offset_timestamp_rejected_and_builder_normalizes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 1047, in test_noncanonical_offset_timestamp_rejected_and_builder_normalizes
+    record = self._bound_record()
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 830, in _bound_record
+    return capture.build_shadow_record_v2(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
+
+======================================================================
+ERROR: test_wrong_workspace_case_id_in_record_v2_is_rejected (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_wrong_workspace_case_id_in_record_v2_is_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 865, in test_wrong_workspace_case_id_in_record_v2_is_rejected
+    record = self._bound_record()
+             ^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 830, in _bound_record
+    return capture.build_shadow_record_v2(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/grabowski/grabowski/src/grabowski_operator_routing_shadow_capture.py", line 1535, in build_shadow_record_v2
+    execution=execution,
+              ^^^^^^^^^
+NameError: name 'execution' is not defined. Did you mean: 'Exception'?
+
+======================================================================
+FAIL: test_latest_prospective_contract_freezes_case_origin (test_operator_routing_shadow_cohort.OperatorRoutingShadowCohortTests.test_latest_prospective_contract_freezes_case_origin)
+----------------------------------------------------------------------
+grabowski_operator_routing_shadow_capture.ShadowCaptureError: direct capture cannot claim production case provenance
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/runner/work/grabowski/grabowski/tests/test_operator_routing_shadow_cohort.py", line 211, in test_latest_prospective_contract_freezes_case_origin
+    with self.assertRaisesRegex(capture.ShadowCaptureError, "prospective_eligibility_id"):
+AssertionError: "prospective_eligibility_id" does not match "direct capture cannot claim production case provenance"
 
 ----------------------------------------------------------------------
-Ran 3208 tests in 112.240s
+Ran 3280 tests in 115.134s
 
-FAILED (failures=1, errors=2, skipped=2)
+FAILED (failures=1, errors=8, skipped=2)
 make: *** [Makefile:21: test] Error 1
