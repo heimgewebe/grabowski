@@ -17,12 +17,29 @@ jobs:
           ref: fix/operator-routing-shadow-observability-hardening-v1
           fetch-depth: 0
       - name: Apply guarded hardening patch
+        id: patch
+        continue-on-error: true
         run: python tools/_bootstrap_routing_shadow_hardening.py
+      - name: Persist patch diagnostic only
+        if: steps.patch.outcome == 'failure'
+        shell: bash
+        run: |
+          git restore .
+          git clean -fd -e .routing-shadow-bootstrap-diagnostic.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .routing-shadow-bootstrap-diagnostic.txt
+          git commit -m "chore: record routing-shadow bootstrap diagnostic" || true
+          git push origin HEAD:fix/operator-routing-shadow-observability-hardening-v1
+          exit 1
       - name: Validate focused routing-shadow contracts
+        if: steps.patch.outcome == 'success'
         run: python -m unittest tests.test_operator_routing_shadow_cohort tests.test_agent_workspace
       - name: Validate repository
+        if: steps.patch.outcome == 'success'
         run: make validate
       - name: Remove bootstrap files and commit validated patch
+        if: steps.patch.outcome == 'success'
         shell: bash
         run: |
           rm .github/workflows/operator-routing-shadow-hardening-bootstrap.yml
