@@ -732,7 +732,15 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertNotEqual(hashes[0], hashes[1])
 
     def _fresh_process_context_pack(
-        self, repo: str, *, hashseed: str
+        self,
+        repo: str,
+        *,
+        hashseed: str,
+        stem: str | None = None,
+        query: str | None = None,
+        query_payload: dict[str, object] | None = None,
+        k: int = 5,
+        max_snippets: int = 5,
     ) -> dict[str, object]:
         config = {
             "src_root": str(ROOT / "src"),
@@ -742,6 +750,11 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             "registry": str(self.state / "repoground-latest-complete-bundles.tsv"),
             "repo": repo,
             "task_profile": "basic_repo_question",
+            "stem": stem,
+            "query": query,
+            "query_payload": query_payload,
+            "k": k,
+            "max_snippets": max_snippets,
             "preflight": {"status": "pass", "answer_compliance_template": {}},
         }
         env = dict(os.environ, PYTHONHASHSEED=hashseed)
@@ -803,6 +816,321 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                 )
             hashes.append(first["determinism"]["content_sha256"])
         self.assertNotEqual(hashes[0], hashes[1])
+
+    @staticmethod
+    def _retrieval_payload(
+        repo_name: str, query_case: str, commit: str
+    ) -> dict[str, object]:
+        hits = []
+        for ordinal in range(2):
+            path = f"src/{repo_name.replace('-', '_')}_{query_case}_{ordinal}.py"
+            text = f"{repo_name}:{query_case}:bounded evidence {ordinal}"
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            hits.append(
+                {
+                    "chunk_id": digest[:20],
+                    "source_path": path,
+                    "score": 0.875 - ordinal * 0.125,
+                    "text_excerpt": text,
+                    "source_range": {
+                        "file_path": path,
+                        "start_line": 10 + ordinal * 10,
+                        "end_line": 12 + ordinal * 10,
+                        "content_sha256": digest,
+                    },
+                    "line_range": {
+                        "start_line": 10 + ordinal * 10,
+                        "end_line": 12 + ordinal * 10,
+                        "display": f"{10 + ordinal * 10}-{12 + ordinal * 10}",
+                    },
+                    "citation_id": f"cit_{digest[:16]}",
+                    "citation_status": "resolved",
+                    "citation_verified": True,
+                    "canonical_authority": {
+                        "authority": "canonical_brief_source",
+                        "artifact_role": "canonical_md",
+                    },
+                    "live_repo_address": {
+                        "status": "available",
+                        "path": path,
+                        "git_commit": commit,
+                    },
+                    "live_repo_address_status": "available",
+                }
+            )
+        return {
+            "kind": "repoground.query_existing_index",
+            "status": "available",
+            "query_result": {"count": len(hits), "results": []},
+            "resolved_evidence": {"hits": hits},
+            "mutation_boundary": {
+                "writes": [],
+                "read_paths_do_not_refresh": True,
+            },
+            "evidence_resolution_used": True,
+        }
+
+    @staticmethod
+    def _retrieval_axes(pack: dict[str, object]) -> dict[str, object]:
+        evidence = pack["bounded_evidence"]
+        assert isinstance(evidence, dict)
+        snippets = evidence["snippets"]
+        assert isinstance(snippets, list)
+        return {
+            "hit_identity_order": [
+                (
+                    item.get("ordinal"),
+                    item.get("chunk_id"),
+                    item.get("path"),
+                    item.get("citation_id"),
+                )
+                for item in snippets
+            ],
+            "scores": [item.get("score") for item in snippets],
+            "snippets": [item.get("text_excerpt") for item in snippets],
+            "ranges": evidence["ranges"],
+            "metadata": [
+                {
+                    "citation_status": item.get("citation_status"),
+                    "citation_verified": item.get("citation_verified"),
+                    "canonical_authority": item.get("canonical_authority"),
+                    "live_repo_address": item.get("live_repo_address"),
+                    "live_repo_address_status": item.get(
+                        "live_repo_address_status"
+                    ),
+                }
+                for item in snippets
+            ],
+            "shape_and_counts": {
+                key: evidence.get(key)
+                for key in (
+                    "normalized_query_shape",
+                    "hit_count",
+                    "result_count",
+                    "snippet_count",
+                    "range_count",
+                    "citation_count",
+                )
+            },
+        }
+
+    def test_context_pack_query_lane_is_stable_warm_and_cold_for_two_bundles_and_queries(
+        self,
+    ) -> None:
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+        cases = (
+            ("first-repo", "symbol_navigation"),
+            ("first-repo", "citation_ranges"),
+            ("second-repo", "symbol_navigation"),
+            ("second-repo", "citation_ranges"),
+        )
+        prepared: dict[str, tuple[str, str]] = {}
+        observed_hashes: list[str] = []
+
+        for repo_name, _query_case in cases:
+            if repo_name not in prepared:
+                _repo, head = self._git_repo(repo_name)
+                stem = f"{repo_name}-max-260701-1200"
+                self._write_bundle(stem, commit=head)
+                prepared[repo_name] = (stem, head)
+
+        for repo_name, query_case in cases:
+            with self.subTest(repo=repo_name, query=query_case):
+                stem, head = prepared[repo_name]
+                query = query_case.replace("_", " ")
+                query_payload = self._retrieval_payload(repo_name, query_case, head)
+                with (
+                    patch.object(
+                        mcp,
+                        "_repoground_agent_preflight",
+                        return_value=preflight,
+                    ),
+                    patch.object(
+                        mcp,
+                        "_repoground_query_existing_index",
+                        return_value=query_payload,
+                    ),
+                ):
+                    warm_first = mcp.repoground_context_pack(
+                        repo_name,
+                        stem=stem,
+                        query=query,
+                        k=2,
+                        max_snippets=2,
+                    )
+                    warm_second = mcp.repoground_context_pack(
+                        repo_name,
+                        stem=stem,
+                        query=query,
+                        k=2,
+                        max_snippets=2,
+                    )
+
+                cold_first = self._fresh_process_context_pack(
+                    repo_name,
+                    hashseed="0",
+                    stem=stem,
+                    query=query,
+                    query_payload=query_payload,
+                    k=2,
+                    max_snippets=2,
+                )
+                self._wait_for_next_utc_second(
+                    cold_first["context_ref"]["generated_at"]
+                )
+                cold_second = self._fresh_process_context_pack(
+                    repo_name,
+                    hashseed="12345",
+                    stem=stem,
+                    query=query,
+                    query_payload=query_payload,
+                    k=2,
+                    max_snippets=2,
+                )
+
+                packs = (warm_first, warm_second, cold_first, cold_second)
+                baseline = _without_volatile_fields(warm_first)
+                baseline_axes = self._retrieval_axes(warm_first)
+                for pack in packs:
+                    self.assertEqual(_without_volatile_fields(pack), baseline)
+                    self.assertEqual(self._retrieval_axes(pack), baseline_axes)
+                    self.assertEqual(
+                        pack["determinism"]["content_sha256"],
+                        _recomputed_content_sha256(pack),
+                    )
+                    retrieval = pack["determinism"]["retrieval_contract"]
+                    self.assertTrue(retrieval["requested"])
+                    self.assertEqual(retrieval["volatile_fields"], [])
+                    self.assertEqual(
+                        retrieval["ordering"], "upstream_order_preserved"
+                    )
+                    self.assertEqual(
+                        retrieval["score_handling"],
+                        "exact_json_value_no_normalization",
+                    )
+                    self.assertEqual(
+                        retrieval["runtime_scope"],
+                        "same_tested_grabowski_revision_and_dependency_environment",
+                    )
+                    self.assertEqual(
+                        retrieval["runtime_identity_binding"],
+                        "proof_only_not_payload_self_attested",
+                    )
+                    for dotted_path in retrieval["comparison_requires_equal"]:
+                        cursor = pack
+                        for component in dotted_path.split("."):
+                            self.assertIsInstance(cursor, dict)
+                            self.assertIn(component, cursor)
+                            cursor = cursor[component]
+                    self.assertEqual(
+                        retrieval["process_state_handling"],
+                        "cold_and_warm_must_match",
+                    )
+                    self.assertEqual(
+                        retrieval["runtime_metadata_fields"],
+                        ["context_ref.generated_at"],
+                    )
+                    self.assertEqual(retrieval["cache_metadata_fields"], [])
+                    self.assertEqual(
+                        retrieval["cache_state_handling"],
+                        "not_exposed_and_must_not_change_semantic_fields",
+                    )
+                    self.assertEqual(
+                        pack["bounded_evidence"]["max_snippets"], 2
+                    )
+                self.assertNotEqual(
+                    cold_first["context_ref"]["generated_at"],
+                    cold_second["context_ref"]["generated_at"],
+                )
+                observed_hashes.append(
+                    warm_first["determinism"]["content_sha256"]
+                )
+
+        self.assertEqual(len(set(observed_hashes)), len(cases))
+
+    def test_context_pack_query_lane_hash_exposes_each_semantic_drift_axis(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        stem = "demo-repo-max-260701-1200"
+        self._write_bundle(stem, commit=head)
+        preflight = {"status": "pass", "answer_compliance_template": {}}
+        baseline_payload = self._retrieval_payload(
+            "demo-repo", "semantic_drift", head
+        )
+
+        def pack_for(payload: dict[str, object]) -> dict[str, object]:
+            with (
+                patch.object(
+                    mcp,
+                    "_repoground_agent_preflight",
+                    return_value=preflight,
+                ),
+                patch.object(
+                    mcp,
+                    "_repoground_query_existing_index",
+                    return_value=payload,
+                ),
+            ):
+                return mcp.repoground_context_pack(
+                    "demo-repo",
+                    stem=stem,
+                    query="semantic drift",
+                    k=2,
+                    max_snippets=2,
+                )
+
+        baseline = pack_for(baseline_payload)
+        variants: dict[str, tuple[dict[str, object], str]] = {}
+
+        reordered = json.loads(json.dumps(baseline_payload))
+        reordered["resolved_evidence"]["hits"].reverse()
+        variants["hit_identity_order"] = (reordered, "hit_identity_order")
+
+        score_changed = json.loads(json.dumps(baseline_payload))
+        score_changed["resolved_evidence"]["hits"][0]["score"] = 0.876
+        variants["scores"] = (score_changed, "scores")
+
+        snippet_changed = json.loads(json.dumps(baseline_payload))
+        snippet_changed["resolved_evidence"]["hits"][0]["text_excerpt"] += " changed"
+        variants["snippets"] = (snippet_changed, "snippets")
+
+        range_changed = json.loads(json.dumps(baseline_payload))
+        range_changed["resolved_evidence"]["hits"][0]["source_range"][
+            "end_line"
+        ] += 1
+        variants["ranges"] = (range_changed, "ranges")
+
+        metadata_changed = json.loads(json.dumps(baseline_payload))
+        metadata_changed["resolved_evidence"]["hits"][0][
+            "citation_verified"
+        ] = False
+        variants["metadata"] = (metadata_changed, "metadata")
+
+        baseline_axes = self._retrieval_axes(baseline)
+        for label, (payload, expected_axis) in variants.items():
+            with self.subTest(axis=label):
+                changed = pack_for(payload)
+                changed_axes = self._retrieval_axes(changed)
+                self.assertNotEqual(
+                    changed["determinism"]["content_sha256"],
+                    baseline["determinism"]["content_sha256"],
+                )
+                self.assertNotEqual(
+                    _without_volatile_fields(changed),
+                    _without_volatile_fields(baseline),
+                )
+                self.assertNotEqual(
+                    changed_axes[expected_axis], baseline_axes[expected_axis]
+                )
+                self.assertEqual(
+                    changed["determinism"]["volatile_fields"],
+                    ["context_ref.generated_at"],
+                )
+                self.assertEqual(
+                    changed["determinism"]["retrieval_contract"][
+                        "volatile_fields"
+                    ],
+                    [],
+                )
 
     def test_context_pack_declares_hash_scope_and_withheld_authority(self) -> None:
         _repo, head = self._git_repo("demo-repo")

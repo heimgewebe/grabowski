@@ -8239,6 +8239,7 @@ def repoground_context_pack(
     bounded_evidence = {
         "query": query,
         "k": k if query else None,
+        "max_snippets": max_snippets if query else None,
         "normalized_query_shape": query_context.get("normalized_query_shape")
         or query_context.get("query_shape"),
         "resolved_evidence_status": evidence_status,
@@ -8356,6 +8357,48 @@ def repoground_context_pack(
         "hash_input": "json_sort_keys_compact_utf8",
         "hash_excluded_fields": ["context_ref.generated_at", "determinism"],
         "comparability_scope": "same_host_same_publication_paths",
+        "retrieval_contract": {
+            "schema_version": 1,
+            "requested": bool(query),
+            "comparison_requires_equal": [
+                "determinism.retrieval_contract.schema_version",
+                "repo",
+                "task_profile",
+                "context_ref.manifest_sha256",
+                "context_ref.bundle_commit",
+                "bounded_evidence.query",
+                "bounded_evidence.k",
+                "bounded_evidence.max_snippets",
+            ],
+            "semantic_fields": [
+                "bounded_evidence.normalized_query_shape",
+                "bounded_evidence.hit_count",
+                "bounded_evidence.result_count",
+                "bounded_evidence.snippets",
+                "bounded_evidence.ranges",
+            ],
+            "ordering": "upstream_order_preserved",
+            "score_handling": "exact_json_value_no_normalization",
+            "runtime_scope": (
+                "same_tested_grabowski_revision_and_dependency_environment"
+            ),
+            "runtime_identity_binding": "proof_only_not_payload_self_attested",
+            "process_state_handling": "cold_and_warm_must_match",
+            "runtime_metadata_fields": ["context_ref.generated_at"],
+            "cache_metadata_fields": [],
+            "cache_state_handling": (
+                "not_exposed_and_must_not_change_semantic_fields"
+            ),
+            "volatile_fields": [],
+            "does_not_establish": [
+                "retrieval_quality",
+                "ranking_correctness",
+                "query_completeness",
+                "semantic_equivalence_from_score_similarity",
+                "cross_grabowski_revision_determinism",
+                "cross_dependency_set_determinism",
+            ],
+        },
         "content_sha256": hashlib.sha256(
             json.dumps(
                 hashed_view,
@@ -8370,6 +8413,9 @@ def repoground_context_pack(
             "truth",
             "default_routing_authority",
             "byte_equality_across_hosts_or_paths",
+            "retrieval_quality",
+            "ranking_correctness",
+            "query_completeness",
         ],
     }
     return payload

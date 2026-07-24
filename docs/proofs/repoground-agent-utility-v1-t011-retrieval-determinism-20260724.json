@@ -1,0 +1,1294 @@
+{
+  "schema_version": 1,
+  "task_id": "REPOGROUND-AGENT-UTILITY-V1-T011",
+  "captured_at": "2026-07-24T09:07:34Z",
+  "base_main_commit": "de62d17e8c10e109d6f56de519c70f730127fc23",
+  "implementation_branch": "feat/repoground-agent-utility-v1-t011-retrieval-determinism",
+  "finding": {
+    "classification": "retrieval lane stable within the declared comparison scope",
+    "contract": "stable_except_declared_volatile_fields",
+    "declared_volatile_fields": [
+      "context_ref.generated_at"
+    ],
+    "retrieval_volatile_fields": [],
+    "comparison_scope": {
+      "host_and_paths": "same_host_same_publication_paths",
+      "required_equal_identity": [
+        "determinism.retrieval_contract.schema_version",
+        "repo",
+        "task_profile",
+        "context_ref.manifest_sha256",
+        "context_ref.bundle_commit",
+        "bounded_evidence.query",
+        "bounded_evidence.k",
+        "bounded_evidence.max_snippets"
+      ],
+      "runtime": "same_tested_grabowski_revision_and_dependency_environment",
+      "runtime_identity_binding": "proof_only_not_payload_self_attested"
+    },
+    "retrieval_axes": [
+      "hit identity and order",
+      "exact JSON score values",
+      "snippet text",
+      "resolved ranges",
+      "citation and source-address metadata",
+      "normalised query shape and result counts"
+    ],
+    "ordering": "upstream_order_preserved",
+    "score_handling": "exact_json_value_no_normalization",
+    "silent_normalisation_used": false,
+    "content_hash": {
+      "algorithm": "sha256",
+      "input": "json_sort_keys_compact_utf8",
+      "excluded_fields": [
+        "context_ref.generated_at",
+        "determinism"
+      ]
+    },
+    "process_state_handling": "cold_and_warm_must_match",
+    "runtime_metadata_fields": [
+      "context_ref.generated_at"
+    ],
+    "cache_metadata_fields": [],
+    "cache_state_handling": "not_exposed_and_must_not_change_semantic_fields"
+  },
+  "fresh_process_observations": {
+    "method": "two separate Python interpreter processes per query, different PYTHONHASHSEED values, and a changed UTC second",
+    "reproduction_entrypoint": "tests/repoground_context_pack_fresh_process_probe.py",
+    "bundle_count": 2,
+    "query_count": 4,
+    "queries_per_bundle": 2,
+    "all_bundles_fresh_and_commit_bound": true,
+    "all_cases_passed": true,
+    "observations": [
+      {
+        "repo": "heimgewebe/repoground",
+        "stem": "heimgewebe__repoground__main-max-260724-0508",
+        "manifest_sha256": "38418970cf7c6ea79f17ad68c37d285cab9dab8647d9563c7be46c78f209ae17",
+        "bundle_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+        "query": "project_read_result",
+        "k": 3,
+        "max_snippets": 3,
+        "process_count": 2,
+        "pythonhashseeds": [
+          "0",
+          "12345"
+        ],
+        "generated_at_values": [
+          "2026-07-24T09:03:51Z",
+          "2026-07-24T09:03:52Z"
+        ],
+        "content_sha256": "838e221a13b2f5cb6016589ba335af44f7e65d31981997d2417aac8b25f30fec",
+        "hit_identity_order": [
+          [
+            0,
+            "e6a1f28bba7004f0868d",
+            "merger/repoground/tests/test_response_projection.py",
+            "cit_0f7e01fa57909682"
+          ],
+          [
+            1,
+            "7a6eac854f314d1877ed",
+            "merger/repoground/core/response_projection.py",
+            "cit_ed2e3485ef91328b"
+          ],
+          [
+            2,
+            "04ef707cf06e46febb1c",
+            "merger/repoground/core/bundle_access.py",
+            "cit_6eec9b453bb8615b"
+          ]
+        ],
+        "scores": [
+          null,
+          null,
+          null
+        ],
+        "snippet_sha256": [
+          "d876222f506faf261fc458007061fdeb82353e9da0dcb871626d5eb2a7e9fc32",
+          "dccce99729c911f9f807af5edf2c4b94f81f5d9dd678c6c7878aae56d632e81d",
+          "65ae8ed8e254f7a762bab3068cf8f67c07724694ab6657ffea2f3fe2e3d40ff1"
+        ],
+        "ranges": [
+          {
+            "artifact_end_byte": 13759,
+            "artifact_end_line": 368,
+            "artifact_path": "merger/repoground/tests/test_response_projection.py",
+            "artifact_role": null,
+            "artifact_start_byte": 8183,
+            "artifact_start_line": 216,
+            "content_sha256": "4563e6235b1df853b4aa0b24d2a759a7c2d15c0fadbc646084cb552b8eca15f7",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 13759,
+            "end_line": 368,
+            "file_path": "merger/repoground/tests/test_response_projection.py",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 8183,
+            "start_line": 216
+          },
+          {
+            "artifact_end_byte": 10489,
+            "artifact_end_line": 265,
+            "artifact_path": "merger/repoground/core/response_projection.py",
+            "artifact_role": null,
+            "artifact_start_byte": 8176,
+            "artifact_start_line": 206,
+            "content_sha256": "ec29332b7559868d5c68e2b8ec971dd749e0285e6326284e91014d8d40257a1d",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 10489,
+            "end_line": 265,
+            "file_path": "merger/repoground/core/response_projection.py",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 8176,
+            "start_line": 206
+          },
+          {
+            "artifact_end_byte": 114323,
+            "artifact_end_line": 3096,
+            "artifact_path": "merger/repoground/core/bundle_access.py",
+            "artifact_role": null,
+            "artifact_start_byte": 106149,
+            "artifact_start_line": 2872,
+            "content_sha256": "cb7acf0dc75a3c9c6e18074391d9050212c291e0a18a93567a4622437be5c0fc",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 114323,
+            "end_line": 3096,
+            "file_path": "merger/repoground/core/bundle_access.py",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 106149,
+            "start_line": 2872
+          }
+        ],
+        "metadata": [
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_0f7e01fa57909682",
+              "range": {
+                "artifact_end_byte": 11925266,
+                "artifact_end_line": 287771,
+                "artifact_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 11919690,
+                "artifact_start_line": 287619,
+                "content_sha256": "4563e6235b1df853b4aa0b24d2a759a7c2d15c0fadbc646084cb552b8eca15f7",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 11925266,
+                "end_line": 287771,
+                "file_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 11919690,
+                "start_line": 287619
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "f95be91631a3d96a222771873005e60e0e4df338",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 368,
+              "git_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+              "git_dirty": false,
+              "path": "merger/repoground/tests/test_response_projection.py",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__repoground__main",
+              "repo_remote": "git@github.com:heimgewebe/repoground.git",
+              "start_line": 216,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_ed2e3485ef91328b",
+              "range": {
+                "artifact_end_byte": 7406738,
+                "artifact_end_line": 166630,
+                "artifact_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 7404425,
+                "artifact_start_line": 166571,
+                "content_sha256": "ec29332b7559868d5c68e2b8ec971dd749e0285e6326284e91014d8d40257a1d",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 7406738,
+                "end_line": 166630,
+                "file_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 7404425,
+                "start_line": 166571
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "abc3716b4a6e5d538639dd9e9eada9bba80e0f27",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 265,
+              "git_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+              "git_dirty": false,
+              "path": "merger/repoground/core/response_projection.py",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__repoground__main",
+              "repo_remote": "git@github.com:heimgewebe/repoground.git",
+              "start_line": 206,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_6eec9b453bb8615b",
+              "range": {
+                "artifact_end_byte": 6052352,
+                "artifact_end_line": 130268,
+                "artifact_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 6044178,
+                "artifact_start_line": 130044,
+                "content_sha256": "cb7acf0dc75a3c9c6e18074391d9050212c291e0a18a93567a4622437be5c0fc",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 6052352,
+                "end_line": 130268,
+                "file_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 6044178,
+                "start_line": 130044
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "b36df71f183016eab5c2c6aa6b15dd7e2425f4f1",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 3096,
+              "git_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+              "git_dirty": false,
+              "path": "merger/repoground/core/bundle_access.py",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__repoground__main",
+              "repo_remote": "git@github.com:heimgewebe/repoground.git",
+              "start_line": 2872,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          }
+        ],
+        "shape_and_counts": {
+          "citation_count": 3,
+          "hit_count": 3,
+          "normalized_query_shape": "source_citation_projection.items",
+          "range_count": 3,
+          "result_count": 3,
+          "snippet_count": 3
+        },
+        "checks": {
+          "available": true,
+          "cache_metadata_empty": true,
+          "cache_state_not_hidden": true,
+          "cold_warm_contract": true,
+          "comparison_paths_exist": true,
+          "content_sha256_equal": true,
+          "fresh": true,
+          "generated_at_differs": true,
+          "identity_bound": true,
+          "nonvolatile_structure_equal": true,
+          "retrieval_requested": true,
+          "retrieval_volatile_fields_empty": true,
+          "runtime_identity_honest": true,
+          "runtime_scope_bound": true,
+          "semantic_axes_equal": true
+        }
+      },
+      {
+        "repo": "heimgewebe/repoground",
+        "stem": "heimgewebe__repoground__main-max-260724-0508",
+        "manifest_sha256": "38418970cf7c6ea79f17ad68c37d285cab9dab8647d9563c7be46c78f209ae17",
+        "bundle_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+        "query": "response_projection",
+        "k": 3,
+        "max_snippets": 3,
+        "process_count": 2,
+        "pythonhashseeds": [
+          "0",
+          "12345"
+        ],
+        "generated_at_values": [
+          "2026-07-24T09:03:53Z",
+          "2026-07-24T09:03:54Z"
+        ],
+        "content_sha256": "ab41157bde2ddcaef856dcc764626531f56bccd27f6914d9525d81709e9e74fa",
+        "hit_identity_order": [
+          [
+            0,
+            "7a6eac854f314d1877ed",
+            "merger/repoground/core/response_projection.py",
+            "cit_ed2e3485ef91328b"
+          ],
+          [
+            1,
+            "c330531f900f0739ea0c",
+            "merger/repoground/tests/test_response_projection.py",
+            "cit_3696d28e31e7542d"
+          ],
+          [
+            2,
+            "7fd215e7cff210c18f8c",
+            "merger/repoground/core/agent_impact_adapter.py",
+            "cit_e677fa9e5c3f37a1"
+          ]
+        ],
+        "scores": [
+          null,
+          null,
+          null
+        ],
+        "snippet_sha256": [
+          "dccce99729c911f9f807af5edf2c4b94f81f5d9dd678c6c7878aae56d632e81d",
+          "5ad58355d6d534e38b2b6abc5a57522f308f5631c8e38caaeaf68b869509bc06",
+          "cfceb01568ed81d078bcdcfd01ec36fc24a4491c601953204462184b5b664529"
+        ],
+        "ranges": [
+          {
+            "artifact_end_byte": 10489,
+            "artifact_end_line": 265,
+            "artifact_path": "merger/repoground/core/response_projection.py",
+            "artifact_role": null,
+            "artifact_start_byte": 8176,
+            "artifact_start_line": 206,
+            "content_sha256": "ec29332b7559868d5c68e2b8ec971dd749e0285e6326284e91014d8d40257a1d",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 10489,
+            "end_line": 265,
+            "file_path": "merger/repoground/core/response_projection.py",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 8176,
+            "start_line": 206
+          },
+          {
+            "artifact_end_byte": 8183,
+            "artifact_end_line": 215,
+            "artifact_path": "merger/repoground/tests/test_response_projection.py",
+            "artifact_role": null,
+            "artifact_start_byte": 0,
+            "artifact_start_line": 1,
+            "content_sha256": "63292c054c05873d067cf26bd2478a9ece6ce3eb6b4b3077bb875237e97ae936",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 8183,
+            "end_line": 215,
+            "file_path": "merger/repoground/tests/test_response_projection.py",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 0,
+            "start_line": 1
+          },
+          {
+            "artifact_end_byte": 12722,
+            "artifact_end_line": 354,
+            "artifact_path": "merger/repoground/core/agent_impact_adapter.py",
+            "artifact_role": null,
+            "artifact_start_byte": 8192,
+            "artifact_start_line": 242,
+            "content_sha256": "6463f48509d1b9b54c3c01042575fa56ae2de3d680bfba7d78efba59f4230f1d",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 12722,
+            "end_line": 354,
+            "file_path": "merger/repoground/core/agent_impact_adapter.py",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 8192,
+            "start_line": 242
+          }
+        ],
+        "metadata": [
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_ed2e3485ef91328b",
+              "range": {
+                "artifact_end_byte": 7406738,
+                "artifact_end_line": 166630,
+                "artifact_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 7404425,
+                "artifact_start_line": 166571,
+                "content_sha256": "ec29332b7559868d5c68e2b8ec971dd749e0285e6326284e91014d8d40257a1d",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 7406738,
+                "end_line": 166630,
+                "file_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 7404425,
+                "start_line": 166571
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "abc3716b4a6e5d538639dd9e9eada9bba80e0f27",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 265,
+              "git_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+              "git_dirty": false,
+              "path": "merger/repoground/core/response_projection.py",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__repoground__main",
+              "repo_remote": "git@github.com:heimgewebe/repoground.git",
+              "start_line": 206,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_3696d28e31e7542d",
+              "range": {
+                "artifact_end_byte": 11919690,
+                "artifact_end_line": 287618,
+                "artifact_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 11911507,
+                "artifact_start_line": 287404,
+                "content_sha256": "63292c054c05873d067cf26bd2478a9ece6ce3eb6b4b3077bb875237e97ae936",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 11919690,
+                "end_line": 287618,
+                "file_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 11911507,
+                "start_line": 287404
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "f95be91631a3d96a222771873005e60e0e4df338",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 215,
+              "git_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+              "git_dirty": false,
+              "path": "merger/repoground/tests/test_response_projection.py",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__repoground__main",
+              "repo_remote": "git@github.com:heimgewebe/repoground.git",
+              "start_line": 1,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_e677fa9e5c3f37a1",
+              "range": {
+                "artifact_end_byte": 5658346,
+                "artifact_end_line": 119856,
+                "artifact_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 5653816,
+                "artifact_start_line": 119744,
+                "content_sha256": "6463f48509d1b9b54c3c01042575fa56ae2de3d680bfba7d78efba59f4230f1d",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 5658346,
+                "end_line": 119856,
+                "file_path": "heimgewebe__repoground__main-max-260724-0508_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 5653816,
+                "start_line": 119744
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "068aa300f98b61ac8e7ef1a69289f70f3243ee40",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 354,
+              "git_commit": "b45a16e5975d404ef1cffd5b824840229e346cf0",
+              "git_dirty": false,
+              "path": "merger/repoground/core/agent_impact_adapter.py",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__repoground__main",
+              "repo_remote": "git@github.com:heimgewebe/repoground.git",
+              "start_line": 242,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          }
+        ],
+        "shape_and_counts": {
+          "citation_count": 3,
+          "hit_count": 3,
+          "normalized_query_shape": "source_citation_projection.items",
+          "range_count": 3,
+          "result_count": 3,
+          "snippet_count": 3
+        },
+        "checks": {
+          "available": true,
+          "cache_metadata_empty": true,
+          "cache_state_not_hidden": true,
+          "cold_warm_contract": true,
+          "comparison_paths_exist": true,
+          "content_sha256_equal": true,
+          "fresh": true,
+          "generated_at_differs": true,
+          "identity_bound": true,
+          "nonvolatile_structure_equal": true,
+          "retrieval_requested": true,
+          "retrieval_volatile_fields_empty": true,
+          "runtime_identity_honest": true,
+          "runtime_scope_bound": true,
+          "semantic_axes_equal": true
+        }
+      },
+      {
+        "repo": "heimgewebe/weltgewebe",
+        "stem": "heimgewebe__weltgewebe__main-max-260724-0806",
+        "manifest_sha256": "dad41d374b03eafd5fd6b7bf1e07e9352ad5e5182b28762a299d6bc072275770",
+        "bundle_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+        "query": "Idempotency-Key",
+        "k": 3,
+        "max_snippets": 3,
+        "process_count": 2,
+        "pythonhashseeds": [
+          "0",
+          "12345"
+        ],
+        "generated_at_values": [
+          "2026-07-24T09:03:55Z",
+          "2026-07-24T09:03:56Z"
+        ],
+        "content_sha256": "eb0a25ee35f5b3277ec15a45f93bbaa56114f652ea10ffd69eb6c2a1e02cadc7",
+        "hit_identity_order": [
+          [
+            0,
+            "6f7175b208e3cc77c126",
+            "apps/api/tests/db_node_conversations.rs",
+            "cit_a4faf75a1e59acd3"
+          ],
+          [
+            1,
+            "5cd560a23863078d44bc",
+            "apps/api/src/routes/conversations.rs",
+            "cit_89110a030d962c95"
+          ],
+          [
+            2,
+            "8d3e5b2eb8933393bc60",
+            "apps/api/tests/db_node_conversations.rs",
+            "cit_1bd58b253521299f"
+          ]
+        ],
+        "scores": [
+          null,
+          null,
+          null
+        ],
+        "snippet_sha256": [
+          "b0d7ab507937b54742f5e4093e5769116d146dbb2b96499ac0a86b7161ca8b9c",
+          "1026394ba351982555c3b8c8d70117f0a9ef32b39589474e3363e347eede1e40",
+          "67d77e2189a951e3d9ad88465858a8f84aa529f0e05be9e48f4409d093a6d67c"
+        ],
+        "ranges": [
+          {
+            "artifact_end_byte": 32724,
+            "artifact_end_line": 997,
+            "artifact_path": "apps/api/tests/db_node_conversations.rs",
+            "artifact_role": null,
+            "artifact_start_byte": 24533,
+            "artifact_start_line": 772,
+            "content_sha256": "6204f01356af4dcf70e5b492d9eb0835c5211724fa4c8cad29885e825b0d9f35",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 32724,
+            "end_line": 997,
+            "file_path": "apps/api/tests/db_node_conversations.rs",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 24533,
+            "start_line": 772
+          },
+          {
+            "artifact_end_byte": 24499,
+            "artifact_end_line": 728,
+            "artifact_path": "apps/api/src/routes/conversations.rs",
+            "artifact_role": null,
+            "artifact_start_byte": 16321,
+            "artifact_start_line": 506,
+            "content_sha256": "98a29a75bdc0d7eb32c9e1fc5603bce2d3c1d5bf3aa1612b401eed778fe6c764",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 24499,
+            "end_line": 728,
+            "file_path": "apps/api/src/routes/conversations.rs",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 16321,
+            "start_line": 506
+          },
+          {
+            "artifact_end_byte": 38225,
+            "artifact_end_line": 1171,
+            "artifact_path": "apps/api/tests/db_node_conversations.rs",
+            "artifact_role": null,
+            "artifact_start_byte": 32724,
+            "artifact_start_line": 998,
+            "content_sha256": "a849a163681d1ea677e869eee56f4575c7c169ddb4ab83b59588f0a6c0dcbbef",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 38225,
+            "end_line": 1171,
+            "file_path": "apps/api/tests/db_node_conversations.rs",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 32724,
+            "start_line": 998
+          }
+        ],
+        "metadata": [
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_a4faf75a1e59acd3",
+              "range": {
+                "artifact_end_byte": 3156378,
+                "artifact_end_line": 80328,
+                "artifact_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 3148187,
+                "artifact_start_line": 80103,
+                "content_sha256": "6204f01356af4dcf70e5b492d9eb0835c5211724fa4c8cad29885e825b0d9f35",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 3156378,
+                "end_line": 80328,
+                "file_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 3148187,
+                "start_line": 80103
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "f4ca345dac16aa9801f6d1365699b2106ceb1b64",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 997,
+              "git_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+              "git_dirty": false,
+              "path": "apps/api/tests/db_node_conversations.rs",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__weltgewebe__main",
+              "repo_remote": "git@github.com:heimgewebe/weltgewebe.git",
+              "start_line": 772,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_89110a030d962c95",
+              "range": {
+                "artifact_end_byte": 1778539,
+                "artifact_end_line": 42525,
+                "artifact_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 1770361,
+                "artifact_start_line": 42303,
+                "content_sha256": "98a29a75bdc0d7eb32c9e1fc5603bce2d3c1d5bf3aa1612b401eed778fe6c764",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 1778539,
+                "end_line": 42525,
+                "file_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 1770361,
+                "start_line": 42303
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "dcee2b8d155c770e4a8bb23e1bac24bc9440f2f9",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 728,
+              "git_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+              "git_dirty": false,
+              "path": "apps/api/src/routes/conversations.rs",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__weltgewebe__main",
+              "repo_remote": "git@github.com:heimgewebe/weltgewebe.git",
+              "start_line": 506,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_1bd58b253521299f",
+              "range": {
+                "artifact_end_byte": 3161879,
+                "artifact_end_line": 80502,
+                "artifact_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 3156378,
+                "artifact_start_line": 80329,
+                "content_sha256": "a849a163681d1ea677e869eee56f4575c7c169ddb4ab83b59588f0a6c0dcbbef",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 3161879,
+                "end_line": 80502,
+                "file_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 3156378,
+                "start_line": 80329
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "f4ca345dac16aa9801f6d1365699b2106ceb1b64",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 1171,
+              "git_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+              "git_dirty": false,
+              "path": "apps/api/tests/db_node_conversations.rs",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__weltgewebe__main",
+              "repo_remote": "git@github.com:heimgewebe/weltgewebe.git",
+              "start_line": 998,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          }
+        ],
+        "shape_and_counts": {
+          "citation_count": 3,
+          "hit_count": 3,
+          "normalized_query_shape": "source_citation_projection.items",
+          "range_count": 3,
+          "result_count": 3,
+          "snippet_count": 3
+        },
+        "checks": {
+          "available": true,
+          "cache_metadata_empty": true,
+          "cache_state_not_hidden": true,
+          "cold_warm_contract": true,
+          "comparison_paths_exist": true,
+          "content_sha256_equal": true,
+          "fresh": true,
+          "generated_at_differs": true,
+          "identity_bound": true,
+          "nonvolatile_structure_equal": true,
+          "retrieval_requested": true,
+          "retrieval_volatile_fields_empty": true,
+          "runtime_identity_honest": true,
+          "runtime_scope_bound": true,
+          "semantic_axes_equal": true
+        }
+      },
+      {
+        "repo": "heimgewebe/weltgewebe",
+        "stem": "heimgewebe__weltgewebe__main-max-260724-0806",
+        "manifest_sha256": "dad41d374b03eafd5fd6b7bf1e07e9352ad5e5182b28762a299d6bc072275770",
+        "bundle_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+        "query": "domain_conversations",
+        "k": 3,
+        "max_snippets": 3,
+        "process_count": 2,
+        "pythonhashseeds": [
+          "0",
+          "12345"
+        ],
+        "generated_at_values": [
+          "2026-07-24T09:03:57Z",
+          "2026-07-24T09:03:58Z"
+        ],
+        "content_sha256": "f68250e82ee8a54bb2df209c17fb1d323ad5908e466150afb4a6bf1cc5a0d56b",
+        "hit_identity_order": [
+          [
+            0,
+            "0072919788a0efb279c9",
+            "apps/api/migrations/20260722000005_governance_conversation_target.down.sql",
+            "cit_f712091ea3d988c7"
+          ],
+          [
+            1,
+            "b1cac030f908940675d5",
+            "apps/api/migrations/20260722000005_governance_conversation_target.up.sql",
+            "cit_fc9d37c9b8abebc4"
+          ],
+          [
+            2,
+            "f5499333835a364ea363",
+            "apps/api/tests/db_governance_conversation_target.rs",
+            "cit_a0e2a526a7e69fd7"
+          ]
+        ],
+        "scores": [
+          null,
+          null,
+          null
+        ],
+        "snippet_sha256": [
+          "8edcf17244e217e5c8d619671862f8293ae619b4db5af849d97072077fdd7b42",
+          "09c48224fe0c7fe9cd011e6feae805592a2901f37828a10214aed8b1369fe932",
+          "4187d2c2beb2ccaa1961d00a8cfa74200b8e01cd51caf88e0255b9f1cc6aac90"
+        ],
+        "ranges": [
+          {
+            "artifact_end_byte": 2997,
+            "artifact_end_line": 81,
+            "artifact_path": "apps/api/migrations/20260722000005_governance_conversation_target.down.sql",
+            "artifact_role": null,
+            "artifact_start_byte": 0,
+            "artifact_start_line": 1,
+            "content_sha256": "1d44d8d5685acf8c2be8583a6fe2644c10f6be3fb396cdb0bedcf0037f4d7b7a",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 2997,
+            "end_line": 81,
+            "file_path": "apps/api/migrations/20260722000005_governance_conversation_target.down.sql",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 0,
+            "start_line": 1
+          },
+          {
+            "artifact_end_byte": 4998,
+            "artifact_end_line": 163,
+            "artifact_path": "apps/api/migrations/20260722000005_governance_conversation_target.up.sql",
+            "artifact_role": null,
+            "artifact_start_byte": 0,
+            "artifact_start_line": 1,
+            "content_sha256": "c3328eff8a5a55c71e96f20734cdf35af351b0da3d55cb4918a3fbe5cac1375e",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 4998,
+            "end_line": 163,
+            "file_path": "apps/api/migrations/20260722000005_governance_conversation_target.up.sql",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 0,
+            "start_line": 1
+          },
+          {
+            "artifact_end_byte": 16331,
+            "artifact_end_line": 486,
+            "artifact_path": "apps/api/tests/db_governance_conversation_target.rs",
+            "artifact_role": null,
+            "artifact_start_byte": 8182,
+            "artifact_start_line": 254,
+            "content_sha256": "bcf68a10af1c23642e02953f83d8974f98c01b08f84d55c8e80c2e24fef7345e",
+            "coordinate_basis": "artifact_bytes",
+            "end_byte": 16331,
+            "end_line": 486,
+            "file_path": "apps/api/tests/db_governance_conversation_target.rs",
+            "source_end_line": null,
+            "source_file_path": null,
+            "source_start_line": null,
+            "start_byte": 8182,
+            "start_line": 254
+          }
+        ],
+        "metadata": [
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_f712091ea3d988c7",
+              "range": {
+                "artifact_end_byte": 856468,
+                "artifact_end_line": 17190,
+                "artifact_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 853471,
+                "artifact_start_line": 17110,
+                "content_sha256": "1d44d8d5685acf8c2be8583a6fe2644c10f6be3fb396cdb0bedcf0037f4d7b7a",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 856468,
+                "end_line": 17190,
+                "file_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 853471,
+                "start_line": 17110
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "2349a647f8bc685db4fa7aa3b9fbb13d5f762357",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 81,
+              "git_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+              "git_dirty": false,
+              "path": "apps/api/migrations/20260722000005_governance_conversation_target.down.sql",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__weltgewebe__main",
+              "repo_remote": "git@github.com:heimgewebe/weltgewebe.git",
+              "start_line": 1,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_fc9d37c9b8abebc4",
+              "range": {
+                "artifact_end_byte": 862824,
+                "artifact_end_line": 17384,
+                "artifact_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 857826,
+                "artifact_start_line": 17222,
+                "content_sha256": "c3328eff8a5a55c71e96f20734cdf35af351b0da3d55cb4918a3fbe5cac1375e",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 862824,
+                "end_line": 17384,
+                "file_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 857826,
+                "start_line": 17222
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "06aaf5d8a6a575c881834a8b34486620bf403fbf",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 163,
+              "git_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+              "git_dirty": false,
+              "path": "apps/api/migrations/20260722000005_governance_conversation_target.up.sql",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__weltgewebe__main",
+              "repo_remote": "git@github.com:heimgewebe/weltgewebe.git",
+              "start_line": 1,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          },
+          {
+            "canonical_authority": {
+              "artifact_role": "canonical_md",
+              "authority": "canonical_brief_source",
+              "citation_id": "cit_a0e2a526a7e69fd7",
+              "range": {
+                "artifact_end_byte": 3092013,
+                "artifact_end_line": 78468,
+                "artifact_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "artifact_role": null,
+                "artifact_start_byte": 3083864,
+                "artifact_start_line": 78236,
+                "content_sha256": "bcf68a10af1c23642e02953f83d8974f98c01b08f84d55c8e80c2e24fef7345e",
+                "coordinate_basis": "artifact_bytes",
+                "end_byte": 3092013,
+                "end_line": 78468,
+                "file_path": "heimgewebe__weltgewebe__main-max-260724-0806_merge.md",
+                "source_end_line": null,
+                "source_file_path": null,
+                "source_start_line": null,
+                "start_byte": 3083864,
+                "start_line": 78236
+              }
+            },
+            "citation_status": "resolved",
+            "citation_verified": null,
+            "live_repo_address": {
+              "authority": "source_address_convenience",
+              "blob_hash_algorithm": "git-sha1",
+              "blob_hash_basis": "source_worktree_file_content",
+              "blob_sha1": "a71a2e14fcb42995016de124c745b5fe995a14a1",
+              "canonical_authority_preserved": true,
+              "does_not_establish": [
+                "canonical_content",
+                "freshness_against_remote",
+                "runtime_correctness",
+                "merge_readiness"
+              ],
+              "end_line": 486,
+              "git_commit": "ab482e69b6e6d03b0d6b121065a2e330a28b8489",
+              "git_dirty": false,
+              "path": "apps/api/tests/db_governance_conversation_target.rs",
+              "provenance_status": "present",
+              "reason": "snapshot_git_provenance_present",
+              "repo_id": "heimgewebe__weltgewebe__main",
+              "repo_remote": "git@github.com:heimgewebe/weltgewebe.git",
+              "start_line": 254,
+              "status": "available"
+            },
+            "live_repo_address_status": "available"
+          }
+        ],
+        "shape_and_counts": {
+          "citation_count": 3,
+          "hit_count": 3,
+          "normalized_query_shape": "source_citation_projection.items",
+          "range_count": 3,
+          "result_count": 3,
+          "snippet_count": 3
+        },
+        "checks": {
+          "available": true,
+          "cache_metadata_empty": true,
+          "cache_state_not_hidden": true,
+          "cold_warm_contract": true,
+          "comparison_paths_exist": true,
+          "content_sha256_equal": true,
+          "fresh": true,
+          "generated_at_differs": true,
+          "identity_bound": true,
+          "nonvolatile_structure_equal": true,
+          "retrieval_requested": true,
+          "retrieval_volatile_fields_empty": true,
+          "runtime_identity_honest": true,
+          "runtime_scope_bound": true,
+          "semantic_axes_equal": true
+        }
+      }
+    ]
+  },
+  "test_evidence": {
+    "edit_task": {
+      "task_id": "759cccaf6c1b4e4da7ee1a35",
+      "lifecycle_receipt_sha256": "53739563fc036963cbebafea78329781b187e5bec1ad3d36a6f645699fb96366",
+      "result": "completed"
+    },
+    "focused_suite": {
+      "command": "python3 -m unittest tests.test_repoground_bundles",
+      "task_id": "be7a34c6652a4e4a9c85aeb3",
+      "lifecycle_receipt_sha256": "b5bfeb48d3e30cbcc457a9ffd25a62330a7aeb2b24166d1fbc5d5cc33ac94ba7",
+      "result": "67 tests, ok after review correction"
+    },
+    "live_probe": {
+      "task_id": "831656a5615142cf8aa8b430",
+      "lifecycle_receipt_sha256": "e0d7a33cd6068e673a8dd0878812852f5c8ea5ecedf3b02074c4ec036d99e78b",
+      "result": "4 query cases, all pass; every comparison path exists"
+    },
+    "cold_and_warm_matrix": {
+      "test": "test_context_pack_query_lane_is_stable_warm_and_cold_for_two_bundles_and_queries",
+      "bundle_count": 2,
+      "queries_per_bundle": 2,
+      "warm_calls_per_case": 2,
+      "fresh_processes_per_case": 2,
+      "asserted_axes": [
+        "hit_identity_order",
+        "scores",
+        "snippets",
+        "ranges",
+        "metadata",
+        "shape_and_counts"
+      ]
+    },
+    "semantic_drift_detection": {
+      "test": "test_context_pack_query_lane_hash_exposes_each_semantic_drift_axis",
+      "mutations_detected": [
+        "hit order",
+        "score",
+        "snippet text",
+        "range end line",
+        "citation verification metadata"
+      ],
+      "asserts_content_sha256_changes": true,
+      "asserts_structural_axis_changes": true
+    },
+    "git_diff_check": "pass",
+    "python_compile": "pass",
+    "generated_context_refresh": {
+      "command": "make context-refresh",
+      "task_id": "b72adf76d7894b91bbfcf512",
+      "lifecycle_receipt_sha256": "c91423a36c0b783ece1df2e2f275791fb92d2697f0e70eca38da49863c9e2ad0",
+      "result": "pass after final source change"
+    },
+    "lint": {
+      "ruff_check": "pass with only the repository-preexisting E402 import-layout exception ignored",
+      "ruff_format_probe": "pass",
+      "whole_file_format_note": "src/grabowski_mcp.py and tests/test_repoground_bundles.py are not globally ruff-formatted on the base commit; no unrelated whole-file rewrite was applied"
+    },
+    "acceptance_audit": {
+      "task_id": "7db9ebd901374f36ad0a4562",
+      "lifecycle_receipt_sha256": "970d0c8b58f3eb04132f83541c203bea0bc1a625d158321af6caec435002cb98",
+      "result": "all acceptance-condition assertions passed"
+    },
+    "full_validation": {
+      "command": "make validate",
+      "task_id": "632e5ed796cd4ebbb2494081",
+      "lifecycle_receipt_sha256": "32d53f655dcfd5e03aaaabc850eca4b9e65b943796179ea3e32f9fb247e82e4e",
+      "result": "3299 tests passed; 5 skipped; policy, context, publication profiles, locks, tooling venv, and secret scan passed"
+    }
+  },
+  "does_not_establish": [
+    "retrieval_quality",
+    "ranking_correctness",
+    "query_completeness",
+    "semantic_equivalence_from_hash_equality",
+    "truth",
+    "default_routing_authority",
+    "byte_equality_across_hosts_or_paths",
+    "future_runtime_stability after code, index, dependency, or publication identity changes",
+    "test_sufficiency",
+    "cross_grabowski_revision_determinism",
+    "cross_dependency_set_determinism"
+  ],
+  "review_evidence": {
+    "result": "pass_after_correction",
+    "finding_fixed": "comparison_requires_equal named nonexistent profile instead of task_profile",
+    "regression_guard": "each declared comparison path is now asserted to exist in every warm and cold payload",
+    "remaining_high_or_medium_findings": []
+  }
+}

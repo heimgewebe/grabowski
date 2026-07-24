@@ -3,8 +3,9 @@
 Started as a child process by tests/test_repoground_bundles.py so the
 determinism contract can be observed across real process boundaries instead of
 across repeated in-process calls. The single argument is a JSON object that
-binds the child to an already-materialised bundle fixture; the child performs no
-fixture setup of its own.
+binds the child to an already-materialised bundle fixture. Query-lane tests may
+also bind an immutable synthetic query result; the child performs no fixture
+setup or result normalisation of its own.
 """
 
 from __future__ import annotations
@@ -68,7 +69,36 @@ def main(argv: list[str]) -> int:
 
         mcp._repoground_agent_preflight = _fixed_preflight
 
-    payload = mcp.repoground_context_pack(config["repo"], config["task_profile"])
+    query_payload = config.get("query_payload")
+    if query_payload is not None:
+        expected_query = config.get("query")
+        expected_k = config.get("k", 5)
+
+        def _fixed_query(
+            _manifest,
+            query,
+            *,
+            k,
+            filters,
+            resolve_evidence,
+            project_sources,
+        ):
+            if query != expected_query or k != expected_k:
+                raise RuntimeError("fresh-process query binding mismatch")
+            if filters != {} or not resolve_evidence or not project_sources:
+                raise RuntimeError("fresh-process query mode mismatch")
+            return json.loads(json.dumps(query_payload))
+
+        mcp._repoground_query_existing_index = _fixed_query
+
+    payload = mcp.repoground_context_pack(
+        config["repo"],
+        config["task_profile"],
+        stem=config.get("stem"),
+        query=config.get("query"),
+        k=config.get("k", 5),
+        max_snippets=config.get("max_snippets", 5),
+    )
     sys.stdout.write(json.dumps(payload, sort_keys=True))
     return 0
 
