@@ -130,7 +130,7 @@ def stored_prospective(
 ) -> dict:
     candidate = manifest if manifest is not None else pre_task_manifest()
     result = capture.capture_workspace_eligibility_best_effort(
-        candidate, root=root, frozen_at=frozen_at
+        candidate, root=root, frozen_at=frozen_at, case_origin="test"
     )
     if result["status"] not in {"created", "duplicate"}:
         raise AssertionError(f"failed to store prospective receipt: {result}")
@@ -138,7 +138,217 @@ def stored_prospective(
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def semantic_assessments() -> list[dict]:
+    return [
+        {
+            "reviewer_pseudonym_sha256": "1" * 64,
+            "kind": "task_correctness",
+            "label": "success",
+            "observed_at": "2026-07-23T05:28:00Z",
+            "review_authority": "diff_bound_review",
+            "primary_evidence_refs": ["diff-review:one"],
+        },
+        {
+            "reviewer_pseudonym_sha256": "2" * 64,
+            "kind": "task_correctness",
+            "label": "failure",
+            "observed_at": "2026-07-23T05:28:30Z",
+            "review_authority": "operator_decision",
+            "primary_evidence_refs": ["operator-decision:two"],
+        },
+    ]
+
+
+def execution_failure_provenance() -> dict:
+    return {
+        "status": "infrastructure_failure",
+        "observed_at": "2026-07-23T05:27:00Z",
+        "evidence_refs": ["artifact:execution-receipt"],
+    }
+
+
 class OperatorRoutingShadowCohortTests(unittest.TestCase):
+    def test_unattributed_direct_capture_defaults_to_synthetic_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {}, clear=True
+        ):
+            root = Path(tmp) / "cohort"
+            result = capture.capture_workspace_eligibility_best_effort(
+                pre_task_manifest(), root=root, frozen_at=FROZEN_AT
+            )
+            receipt = json.loads(
+                (root / "prospective" / f"{result['workspace_case_id']}.json").read_text()
+            )
+            self.assertEqual(receipt["case_provenance"]["case_origin"], "synthetic")
+
+    def test_latest_prospective_contract_freezes_case_origin(self) -> None:
+        receipt = capture.build_prospective_eligibility_v2(
+            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="test"
+        )
+        self.assertEqual(
+            receipt["schema_version"],
+            capture.PROSPECTIVE_ELIGIBILITY_V2_SCHEMA_VERSION,
+        )
+        self.assertEqual(receipt["case_provenance"]["case_origin"], "test")
+        tampered = copy.deepcopy(receipt)
+        tampered["case_provenance"]["case_origin"] = "production"
+        with self.assertRaisesRegex(capture.ShadowCaptureError, "prospective_eligibility_id"):
+            capture.validate_prospective_eligibility_v2(tampered)
+
+    def test_latest_record_makes_disagreement_and_execution_failure_observable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cohort"
+            result = capture.capture_workspace_eligibility_best_effort(
+                pre_task_manifest(), root=root, frozen_at=FROZEN_AT, case_origin="test"
+            )
+            receipt = json.loads(
+                (root / "prospective" / f"{result['workspace_case_id']}.json").read_text()
+            )
+            sealed = capture.seal_prospective_case(
+                receipt,
+                bound_manifest(),
+                eligible_task_id=TASK_ID,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                execution_provenance=execution_failure_provenance(),
+                semantic_assessments=semantic_assessments(),
+                root=root,
+                captured_at=CAPTURED_AT,
+            )
+            record = json.loads(
+                (root / "records" / f"{sealed['case_id']}.json").read_text()
+            )
+            self.assertEqual(record["schema_version"], capture.RECORD_V3_SCHEMA_VERSION)
+            self.assertEqual(record["execution_provenance"]["status"], "infrastructure_failure")
+            self.assertEqual(
+                {item["label"] for item in record["semantic_assessments"]},
+                {"success", "failure"},
+            )
+            self.assertEqual(len(record["semantic_assessments"]), 2)
+
+    def test_semantic_assessments_require_at_least_two_when_present(self) -> None:
+        prospective = capture.build_prospective_eligibility_v2(
+            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="test"
+        )
+        eligibility = capture.build_bound_eligibility_v3(
+            prospective, bound_manifest(), eligible_task_id=TASK_ID
+        )
+        with self.assertRaisesRegex(capture.ShadowCaptureError, "at least 2"):
+            capture.build_shadow_record_v3(
+                eligibility,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                execution_provenance=None,
+                semantic_assessments=semantic_assessments()[:1],
+                captured_at=CAPTURED_AT,
+            )
+
+    def test_semantic_assessments_must_match_primary_outcome_kind(self) -> None:
+        prospective = capture.build_prospective_eligibility_v2(
+            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="test"
+        )
+        eligibility = capture.build_bound_eligibility_v3(
+            prospective, bound_manifest(), eligible_task_id=TASK_ID
+        )
+        assessments = semantic_assessments()
+        for item in assessments:
+            item["kind"] = "decision_quality"
+        with self.assertRaisesRegex(capture.ShadowCaptureError, "reviewed outcome kind"):
+            capture.build_shadow_record_v3(
+                eligibility,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                execution_provenance=None,
+                semantic_assessments=assessments,
+                captured_at=CAPTURED_AT,
+            )
+
+    def test_latest_artifacts_validate_against_v3_schemas(self) -> None:
+        try:
+            from jsonschema import Draft202012Validator, FormatChecker
+        except ModuleNotFoundError:
+            self.skipTest("optional jsonschema runtime dependency is unavailable")
+        prospective = capture.build_prospective_eligibility_v2(
+            pre_task_manifest(), frozen_at=FROZEN_AT, case_origin="production"
+        )
+        eligibility = capture.build_bound_eligibility_v3(
+            prospective, bound_manifest(), eligible_task_id=TASK_ID
+        )
+        record = capture.build_shadow_record_v3(
+            eligibility,
+            outcome=reviewed_outcome(),
+            primary_evidence_refs=["github-ci:run:123"],
+            execution_provenance=execution_failure_provenance(),
+            semantic_assessments=semantic_assessments(),
+            captured_at=CAPTURED_AT,
+        )
+        samples = {
+            "operator-routing-shadow-prospective-eligibility.v2.schema.json": prospective,
+            "operator-routing-shadow-eligibility.v3.schema.json": eligibility,
+            "operator-routing-shadow-record.v3.schema.json": record,
+        }
+        format_checker = FormatChecker()
+        for filename, sample in samples.items():
+            schema = json.loads(
+                (Path(__file__).resolve().parents[1] / "contracts" / filename).read_text()
+            )
+            Draft202012Validator.check_schema(schema)
+            Draft202012Validator(schema, format_checker=format_checker).validate(sample)
+
+    def test_latest_record_defaults_missing_quality_signals_to_explicit_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cohort"
+            receipt = stored_prospective(root)
+            sealed = capture.seal_prospective_case(
+                receipt,
+                bound_manifest(),
+                eligible_task_id=TASK_ID,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                root=root,
+                captured_at=CAPTURED_AT,
+            )
+            record = json.loads(
+                (root / "records" / f"{sealed['case_id']}.json").read_text()
+            )
+            self.assertEqual(record["execution_provenance"], {"status": "unknown", "reason_code": "not_observed"})
+            self.assertEqual(record["semantic_assessments"], [])
+
+    def test_legacy_prospective_history_remains_v2_sealable_without_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cohort"
+            receipt = capture.build_prospective_eligibility(
+                pre_task_manifest(), frozen_at=FROZEN_AT
+            )
+            prospective_dir, _, _, _ = capture._cohort_directories(root)
+            capture.write_prospective_identity_idempotent(
+                prospective_dir / f"{receipt['workspace_case']['case_id']}.json", receipt
+            )
+            sealed = capture.seal_prospective_case(
+                receipt,
+                bound_manifest(),
+                eligible_task_id=TASK_ID,
+                outcome=reviewed_outcome(),
+                primary_evidence_refs=["github-ci:run:123"],
+                root=root,
+                captured_at=CAPTURED_AT,
+            )
+            record = json.loads(
+                (root / "records" / f"{sealed['case_id']}.json").read_text()
+            )
+            self.assertEqual(record["schema_version"], capture.RECORD_V2_SCHEMA_VERSION)
+            with self.assertRaisesRegex(capture.ShadowCaptureError, "cannot be backfilled"):
+                capture.seal_prospective_case(
+                    receipt,
+                    bound_manifest(),
+                    eligible_task_id=TASK_ID,
+                    outcome=reviewed_outcome(),
+                    primary_evidence_refs=["github-ci:run:123"],
+                    execution_provenance=execution_failure_provenance(),
+                    root=root,
+                    captured_at=CAPTURED_AT,
+                )
+
     def test_prospective_freeze_requires_no_bound_tasks(self) -> None:
         with self.assertRaisesRegex(
             capture.ShadowCaptureError, "before workspace tasks"
@@ -851,7 +1061,10 @@ class OperatorRoutingShadowCohortTests(unittest.TestCase):
 
             def flaky(path: Path, record: dict) -> None:
                 if (
-                    record.get("schema_version") == capture.RECORD_V2_SCHEMA_VERSION
+                    record.get("schema_version") in {
+                        capture.RECORD_V2_SCHEMA_VERSION,
+                        capture.RECORD_V3_SCHEMA_VERSION,
+                    }
                     and not state["failed"]
                 ):
                     state["failed"] = True

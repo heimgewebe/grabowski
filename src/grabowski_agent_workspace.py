@@ -5123,7 +5123,12 @@ def _capture_routing_shadow_prospective_best_effort(
     try:
         import grabowski_operator_routing_shadow_capture as shadow_capture
 
-        result = shadow_capture.capture_workspace_eligibility_best_effort(manifest)
+        result = shadow_capture.capture_workspace_eligibility_best_effort(
+            manifest,
+            case_origin=os.environ.get(
+                "GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN", "production"
+            ),
+        )
     except Exception:
         result = {
             "schema_version": 1,

@@ -155,3 +155,12 @@ Diese Stufe etabliert ausdrücklich nicht:
 - autonome Policy-Promotion.
 
 Diese Fragen benötigen getrennte Readiness- und Offline-Evaluationsentscheidungen.
+
+
+## Observability-Vertrag v3
+
+Neue prospektive Fälle verwenden `operator-routing-shadow-prospective-eligibility.v2`. Der Freeze bindet `case_provenance.case_origin` (`production`, `test`, `synthetic` oder `quarantined`) per Hash, bevor ein Task-Outcome existiert. Bestehende v1-Prospektiv-Receipts und ihre v2-Eligibility-/Record-Kette bleiben unverändert lesbar; fehlende Provenienz historischer Records bleibt ausdrücklich unbeobachtbar und wird nie nachträglich ergänzt.
+
+Ein v2-Prospektiv-Receipt wird an `operator-routing-shadow-eligibility.v3` gebunden und als `operator-routing-shadow-record.v3` versiegelt. Record v3 hält das semantische Outcome getrennt von `execution_provenance` (`completed`, `execution_aborted`, `infrastructure_failure` oder explizit `unknown`) und kann entweder keine oder zwei bis vier unabhängig pseudonymisierte semantische Bewertungen derselben Outcome-Art binden. Unterschiedliche `reviewer_pseudonym_sha256` machen Review-Abweichungen messbar, ohne Namen, Prompts, Transkripte, private Notizen oder unbeschränkte argv zu speichern. Fehlende Bewertungen und fehlende Ausführungsbeobachtung werden als leere Liste beziehungsweise `unknown` dargestellt, niemals als Übereinstimmung oder Erfolg.
+
+Diese Erweiterung bleibt reine Capture-Beobachtbarkeit. Sie trainiert kein Modell, ändert weder Routing noch Queue- oder Policy-Zustand, trifft keine Laufzeitentscheidung für den beobachteten Task und autorisiert `OPERATOR-ML-READINESS-V1-T002` nicht. Sie macht ausschließlich die Qualitätssignale messbar, die für eine spätere erneute T004-Prüfung erforderlich sind.

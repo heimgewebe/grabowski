@@ -45,9 +45,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     manifest = capture._read_regular_json(args.manifest, label="manifest")
     outcome_input = capture._read_regular_json(args.outcome, label="outcome")
-    if set(outcome_input) != {"outcome", "primary_evidence_refs"}:
+    allowed = {
+        "outcome",
+        "primary_evidence_refs",
+        "execution_provenance",
+        "semantic_assessments",
+    }
+    if not {"outcome", "primary_evidence_refs"}.issubset(outcome_input) or not set(outcome_input).issubset(allowed):
         raise capture.ShadowCaptureError(
-            "outcome input must contain exactly outcome and primary_evidence_refs"
+            "outcome input must contain outcome and primary_evidence_refs plus only optional execution_provenance and semantic_assessments"
         )
     result = capture.seal_prospective_case(
         prospective,
@@ -55,6 +61,8 @@ def main(argv: list[str] | None = None) -> int:
         eligible_task_id=args.task_id,
         outcome=outcome_input["outcome"],
         primary_evidence_refs=outcome_input["primary_evidence_refs"],
+        execution_provenance=outcome_input.get("execution_provenance"),
+        semantic_assessments=outcome_input.get("semantic_assessments"),
         root=args.root,
     )
     print(json.dumps(result, sort_keys=True))

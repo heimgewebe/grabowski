@@ -282,7 +282,10 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.shadow_cohort_root = self.root / "routing-shadow-cohort"
         self.shadow_cohort_env_patch = mock.patch.dict(
             os.environ,
-            {"GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT": str(self.shadow_cohort_root)},
+            {
+                "GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT": str(self.shadow_cohort_root),
+                "GRABOWSKI_ROUTING_SHADOW_CASE_ORIGIN": "test",
+            },
         )
         self.shadow_cohort_env_patch.start()
         self.addCleanup(self.shadow_cohort_env_patch.stop)
