@@ -90,16 +90,18 @@ jobs:
               r'(?:(?!\ndef ).)*?'
               r'    prospective = eligibility\["prospective_eligibility"\]'
           )
-          replacement = '''    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")
-    frozen_at = eligibility["frozen_at"]
-    _validate_v3_timeline(
-        frozen_at=frozen_at,
-        outcome=normalized_outcome,
-        execution=execution,
-        assessments=assessments,
-        captured_at=normalized_captured_at,
-    )
-    prospective = eligibility["prospective_eligibility"]'''
+          replacement = (
+              '    normalized_captured_at = _parse_timestamp(captured_at, "captured_at")\n'
+              '    frozen_at = eligibility["frozen_at"]\n'
+              '    _validate_v3_timeline(\n'
+              '        frozen_at=frozen_at,\n'
+              '        outcome=normalized_outcome,\n'
+              '        execution=execution,\n'
+              '        assessments=assessments,\n'
+              '        captured_at=normalized_captured_at,\n'
+              '    )\n'
+              '    prospective = eligibility["prospective_eligibility"]'
+          )
           v3_updated, count = re.subn(
               timeline_pattern, replacement, v3, count=1, flags=re.S
           )
