@@ -135,6 +135,8 @@
     "grabowski_artifact_stat",
     "grabowski_artifact_push",
     "grabowski_artifact_pull",
+    "grabowski_text_artifact_publish",
+    "grabowski_text_artifact_read",
     "grabowski_browser_worker_start",
     "grabowski_browser_worker_stored_form_action",
     "grabowski_browser_worker_status",

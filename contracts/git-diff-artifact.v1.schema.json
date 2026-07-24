@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "git-diff-artifact.v1.schema.json",
+  "title": "Git diff artifact receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "profile", "artifact_id", "repository",
+    "repository_path_sha256", "base_commit", "head_commit",
+    "pull_request_number", "filename", "diff_sha256", "byte_size",
+    "generated_at_unix", "encoding", "format"
+  ],
+  "properties": {
+    "schema": {"const": "git-diff-artifact.v1"},
+    "profile": {"const": "git-diff.v1"},
+    "artifact_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+    "repository": {"type": "string", "minLength": 1, "maxLength": 255},
+    "repository_path_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "base_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "head_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "pull_request_number": {"type": ["integer", "null"], "minimum": 1},
+    "filename": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,199}\\.txt$"},
+    "diff_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "byte_size": {"type": "integer", "minimum": 0, "maximum": 33554432},
+    "generated_at_unix": {"type": "integer", "minimum": 1},
+    "encoding": {"const": "utf-8"},
+    "format": {"const": "unified-diff"}
+  }
+}
