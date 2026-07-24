@@ -304,7 +304,7 @@ else:
             "observed_at": "2026-07-20T11:00:00Z",
             "harnesses": {},
             "providers": {},
-            "verified_quota_pools": ["grok-com"],
+            "verified_quota_pools": ["opencode-free", "openhands-account"],
             "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
@@ -314,17 +314,24 @@ else:
             **self.initial,
             "pools": {
                 "pool": {"status": "available"},
-                "grok-com": {"status": "unknown"},
+                "grok-com": {
+                    "status": "unknown",
+                    "verified_at": "2026-07-19T00:00:00Z",
+                },
                 "jules-account": {
                     "status": "unknown",
                     "verified_at": "2026-07-19T00:00:00Z",
                 },
+                "opencode-free": {"status": "unknown"},
+                "openhands-account": {"status": "unknown"},
             },
         }
         after = json.loads(json.dumps(before))
         after["catalog"] = probe
-        after["pools"]["grok-com"]["verified_at"] = probe["observed_at"]
+        after["pools"]["grok-com"].pop("verified_at")
         after["pools"]["jules-account"].pop("verified_at")
+        after["pools"]["opencode-free"]["verified_at"] = probe["observed_at"]
+        after["pools"]["openhands-account"]["verified_at"] = probe["observed_at"]
         SCHEDULER.validate_state_after_probe(before, after, probe)
 
         tampered = json.loads(json.dumps(after))
@@ -333,6 +340,20 @@ else:
             SCHEDULER.ProbeSchedulerError, "beyond verified timestamps"
         ):
             SCHEDULER.validate_state_after_probe(before, tampered, probe)
+
+    def test_probe_validation_accepts_all_canonical_verified_pools(self) -> None:
+        probe = {
+            "schema_version": 2,
+            "observed_at": SCHEDULER.iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": list(SCHEDULER.PROBE_VERIFIABLE_QUOTA_POOLS),
+            "api_key_environment_scrubbed": list(TEST_SCRUBBED_ENV),
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        probe["catalog_probe_sha256"] = SCHEDULER.probe_digest(probe)
+        SCHEDULER.validate_probe(probe)
 
     def test_state_validation_requires_exact_reset_after_catalog_change(self) -> None:
         probe = {

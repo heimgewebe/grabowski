@@ -375,12 +375,17 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "catalog_sha256": validation["catalog_sha256"],
             "catalog": {},
             "pools": {
-                "grok-com": {"status": "available"},
+                "grok-com": {
+                    "status": "available",
+                    "verified_at": "2026-07-19T00:00:00Z",
+                },
                 "claude-pro": {"status": "unknown"},
                 "jules-account": {
                     "status": "unknown",
                     "verified_at": "2026-07-19T00:00:00Z",
                 },
+                "opencode-free": {"status": "unknown"},
+                "openhands-account": {"status": "unknown"},
             },
             "routes": {"route": {"runs": 2}},
             "history": {"marker": 1},
@@ -392,7 +397,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             "observed_at": observed_at,
             "harnesses": {},
             "providers": {},
-            "verified_quota_pools": ["grok-com"],
+            "verified_quota_pools": ["opencode-free", "openhands-account"],
             "api_key_environment_scrubbed": [],
             "model_invocations": 0,
             "paid_api_requests_authorized": 0,
@@ -402,9 +407,47 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         stored = json.loads(self.state.read_text(encoding="utf-8"))
         self.assertEqual(stored["history"], initial["history"])
         self.assertEqual(stored["routes"], initial["routes"])
-        self.assertEqual(stored["pools"]["grok-com"]["verified_at"], observed_at)
-        self.assertNotIn("verified_at", stored["pools"]["claude-pro"])
+        self.assertNotIn("verified_at", stored["pools"]["grok-com"])
         self.assertNotIn("verified_at", stored["pools"]["jules-account"])
+        self.assertEqual(
+            stored["pools"]["opencode-free"]["verified_at"], observed_at
+        )
+        self.assertEqual(
+            stored["pools"]["openhands-account"]["verified_at"], observed_at
+        )
+        self.assertNotIn("verified_at", stored["pools"]["claude-pro"])
+
+    def test_probe_rejects_unknown_verified_pool_without_rewrite(self) -> None:
+        _, validation = router._load_catalog()
+        initial = {
+            "schema_version": 2,
+            "updated_at": cli._iso_now(),
+            "catalog_sha256": validation["catalog_sha256"],
+            "catalog": {},
+            "pools": {},
+            "routes": {},
+            "history": {"marker": 1},
+        }
+        self.state.write_text(json.dumps(initial), encoding="utf-8")
+        os.chmod(self.state, 0o600)
+        probe = {
+            "schema_version": 2,
+            "observed_at": cli._iso_now(),
+            "harnesses": {},
+            "providers": {},
+            "verified_quota_pools": ["unknown-pool"],
+            "api_key_environment_scrubbed": [],
+            "model_invocations": 0,
+            "paid_api_requests_authorized": 0,
+        }
+        probe["catalog_probe_sha256"] = cli._probe_digest(probe)
+        with self.assertRaisesRegex(
+            cli.CodingAgentRouterCliError, "verified_quota_pools"
+        ):
+            cli._write_probe(probe, validation)
+        self.assertEqual(
+            json.loads(self.state.read_text(encoding="utf-8")), initial
+        )
 
     def test_observe_rejects_malformed_existing_counters_without_rewrite(self) -> None:
         _, validation = router._load_catalog()

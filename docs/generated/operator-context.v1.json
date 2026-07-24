@@ -2790,7 +2790,7 @@
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
       "src/grabowski_coding_agent_catalog_data.py": "4553516be290d92884f04acd2abd060b24111865d80849a343710baa202cf724",
       "src/grabowski_coding_agent_router.py": "bd7abd4ce1da4748617129688b8b74428d962964ed2b840e695629259c061435",
-      "src/grabowski_coding_agent_router_cli.py": "eb49c2a1ba132700d607fd62ce4fd6313eee8b520f1d8aadbcd251cadb9dbaae",
+      "src/grabowski_coding_agent_router_cli.py": "63da90132104d8efcdf678d7286a2f0bb8001aa15605aecdbc009a87f88deb3e",
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_convergence.py": "34499a7982324e24563a393712067248a4c570a0111b29c3ac4647bdba172eb6",

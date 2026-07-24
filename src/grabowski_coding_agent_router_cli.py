@@ -35,6 +35,12 @@ PROBE_DIGEST_FIELDS = (
     "model_invocations",
     "paid_api_requests_authorized",
 )
+PROBE_VERIFIABLE_QUOTA_POOLS = (
+    "grok-com",
+    "jules-account",
+    "opencode-free",
+    "openhands-account",
+)
 SENSITIVE_PROBE_FIELD_TOKENS = (
     "password",
     "passwd",
@@ -719,7 +725,7 @@ def _write_probe_locked(probe: dict[str, Any], validation: dict[str, Any]) -> No
         or any(not isinstance(pool_id, str) for pool_id in verified_pools)
         or len(set(verified_pools)) != len(verified_pools)
         or any(
-            pool_id not in {"grok-com", "jules-account"}
+            pool_id not in PROBE_VERIFIABLE_QUOTA_POOLS
             for pool_id in verified_pools
         )
     ):
@@ -727,7 +733,7 @@ def _write_probe_locked(probe: dict[str, Any], validation: dict[str, Any]) -> No
     state = _load_mutable_state(str(validation["catalog_sha256"]))
     state["catalog"] = probe
     state["catalog_sha256"] = validation["catalog_sha256"]
-    for pool_id in ("grok-com", "jules-account"):
+    for pool_id in PROBE_VERIFIABLE_QUOTA_POOLS:
         pool = state["pools"].get(pool_id)
         if pool_id in verified_pools:
             state["pools"].setdefault(pool_id, {})["verified_at"] = observed_at
