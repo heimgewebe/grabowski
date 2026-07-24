@@ -169,6 +169,10 @@ class RepositoryContractTests(unittest.TestCase):
                 {
                     "source": "tools/maintain_runtime_state.py",
                     "destination": "tools/maintain_runtime_state.py",
+                },
+                {
+                    "source": "tools/external_programming_candidate.py",
+                    "destination": "tools/external_programming_candidate.py",
                 }
             ],
         )

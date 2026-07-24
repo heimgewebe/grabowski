@@ -2793,7 +2793,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "4ebda163e193835b1f60a5551595589ddb339a3a849b526d058811977fab7072"
+      "sha256": "47832b4ac08d2d9cd68ddfc1497226c55ceece6afbdd4957b43ccc3299e79a49"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
