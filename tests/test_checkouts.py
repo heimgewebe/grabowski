@@ -123,6 +123,40 @@ class CheckoutLifecycleTests(unittest.TestCase):
         raw = Path(self._git("rev-parse", "--git-common-dir").stdout.strip())
         return (self.repo / raw).resolve() if not raw.is_absolute() else raw.resolve()
 
+    def _managed_binding(
+        self,
+        *,
+        owner: str = "owner-a",
+        retention_seconds: int = 3600,
+    ) -> dict[str, object]:
+        common_dir = self._common_dir()
+        retained_until = int(time.time()) + retention_seconds
+        binding = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id=owner,
+            purpose="managed lifecycle fixture",
+            source_kind="bureau_task",
+            source_id="GRABOWSKI-OPERATOR-SURFACE-V1-T095",
+            artifact_class="implementation_worktree",
+            retention_until_unix=retained_until,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        checkouts._upsert_retention(
+            checkout_key=str(binding["checkout_key"]),
+            repo_common_dir=common_dir,
+            repo_path=self.repo,
+            checkout_path=self.checkout,
+            owner_id=owner,
+            purpose="managed lifecycle fixture",
+            retention_until_unix=retained_until,
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        return binding
+
     def test_parent_directory_is_not_a_checkout_process_scope(self) -> None:
         parent = self.root
         self.assertFalse(
@@ -1008,6 +1042,163 @@ class CheckoutLifecycleTests(unittest.TestCase):
         git_file.symlink_to(target)
         with self.assertRaisesRegex(PermissionError, "Symlinked"):
             self._archive()
+
+    def test_inventory_called_from_linked_checkout_uses_canonical_repo_identity(self) -> None:
+        _top_level, _common_dir, records = checkouts._worktree_records(self.checkout)
+        linked = next(item for item in records if item["path"] == str(self.checkout))
+        self.assertEqual(linked["repo_path"], str(self.repo.resolve()))
+
+    def test_managed_active_binding_with_effective_retention_is_consistent(self) -> None:
+        self._managed_binding()
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        decision = linked["lifecycle_decision"]
+        self.assertEqual(linked["lifecycle_state"], "retained")
+        self.assertTrue(decision["binding_present"])
+        self.assertEqual(decision["binding_phase"], "active")
+        self.assertTrue(decision["binding_consistent"])
+        self.assertEqual(decision["binding_drift_reasons"], [])
+
+    def test_managed_active_binding_with_expired_retention_requires_attention(self) -> None:
+        binding = self._managed_binding()
+        expired = int(time.time()) - 1
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                (expired, binding["checkout_key"]),
+            )
+            connection.execute(
+                "UPDATE retention SET retention_until_unix=? WHERE checkout_key=?",
+                (expired, binding["checkout_key"]),
+            )
+            connection.commit()
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        decision = linked["lifecycle_decision"]
+        self.assertEqual(linked["lifecycle_state"], "managed_active_attention")
+        self.assertTrue(decision["binding_consistent"])
+        self.assertFalse(decision["retention_active"])
+        self.assertFalse(linked["cleanup_candidate"])
+
+    def test_completed_retained_binding_is_terminal_and_not_cleanup_candidate(self) -> None:
+        binding = self._managed_binding()
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        self.assertEqual(linked["lifecycle_state"], "completed_retained")
+        self.assertEqual(linked["lifecycle_decision"]["binding_phase"], "completed_retained")
+        self.assertTrue(linked["lifecycle_decision"]["binding_consistent"])
+        self.assertFalse(linked["cleanup_candidate"])
+
+    def test_archived_binding_without_matching_archive_is_fail_closed(self) -> None:
+        binding = self._managed_binding()
+        checkouts._mark_checkout_archived(
+            str(binding["checkout_key"]), "owner-a", int(time.time())
+        )
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        decision = linked["lifecycle_decision"]
+        self.assertEqual(linked["lifecycle_state"], "managed_lifecycle_drift")
+        self.assertFalse(decision["binding_consistent"])
+        self.assertIn(
+            "archived-binding-without-matching-open-archive",
+            decision["binding_drift_reasons"],
+        )
+        self.assertFalse(linked["cleanup_candidate"])
+
+    def test_matching_archived_binding_preserves_existing_grace_contract(self) -> None:
+        self._managed_binding()
+        self._archive(aged=False)
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        decision = linked["lifecycle_decision"]
+        self.assertEqual(linked["lifecycle_state"], "archived_grace")
+        self.assertEqual(decision["binding_phase"], "archived")
+        self.assertTrue(decision["binding_consistent"])
+        self.assertFalse(linked["cleanup_candidate"])
+
+    def test_unknown_managed_phase_is_lifecycle_drift(self) -> None:
+        binding = self._managed_binding()
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET phase='future_phase' WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            )
+            connection.commit()
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        self.assertEqual(linked["lifecycle_state"], "managed_lifecycle_drift")
+        self.assertIn(
+            "binding-phase-unsupported",
+            linked["lifecycle_decision"]["binding_drift_reasons"],
+        )
+
+    def test_managed_branch_owner_and_terminal_head_drift_are_explicit(self) -> None:
+        binding = self._managed_binding()
+        checkouts._mark_checkout_completed_retained(
+            checkout_key=str(binding["checkout_key"]),
+            owner_id="owner-a",
+            expected_head="b" * 40,
+            expected_branch="topic",
+        )
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE retention SET owner_id='owner-b' WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            )
+            connection.execute(
+                "UPDATE lifecycle_bindings SET expected_branch='other-topic' WHERE checkout_key=?",
+                (binding["checkout_key"],),
+            )
+            connection.commit()
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
+        reasons = linked["lifecycle_decision"]["binding_drift_reasons"]
+        self.assertEqual(linked["lifecycle_state"], "managed_lifecycle_drift")
+        self.assertIn("binding-expected-branch-mismatch", reasons)
+        self.assertIn("binding-retention-owner-mismatch", reasons)
+        self.assertIn("terminal-binding-head-mismatch", reasons)
+        self.assertFalse(linked["cleanup_candidate"])
 
     def test_lifecycle_source_has_no_forced_filesystem_deletion(self) -> None:
         source = (SRC / "grabowski_checkouts.py").read_text(encoding="utf-8")

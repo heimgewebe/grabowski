@@ -64,7 +64,21 @@ def checkout(
     is_main: bool = False,
     cleanup_candidate: bool = False,
     lifecycle_state: str = "active",
+    binding_owner: str | None = None,
+    binding_phase: str | None = None,
+    binding_consistent: bool = True,
+    retention_active: bool = False,
+    drift_reasons: list[str] | None = None,
 ) -> dict:
+    binding = (
+        {
+            "owner_id": binding_owner,
+            "phase": binding_phase,
+            "source": {"kind": "bureau-task", "id": "T095"},
+        }
+        if binding_owner is not None
+        else None
+    )
     return {
         "checkout_key": key,
         "path": path,
@@ -81,8 +95,15 @@ def checkout(
             ],
             "processes": processes or [],
         },
-        "lifecycle": {"state": lifecycle_state},
+        "lifecycle": {"state": lifecycle_state, "binding": binding},
         "lifecycle_state": lifecycle_state,
+        "lifecycle_decision": {
+            "binding_present": binding is not None,
+            "binding_phase": binding_phase,
+            "binding_consistent": binding_consistent,
+            "binding_drift_reasons": drift_reasons or [],
+            "retention_active": retention_active,
+        },
         "cleanup_candidate": cleanup_candidate,
     }
 
@@ -564,6 +585,172 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(len(attached), 1)
         self.assertEqual(attached[0]["binding_status"], "ambiguous")
         self.assertEqual(set(attached[0]["related_work_ids"]), {"task:taska", "task:taskb"})
+
+    def test_managed_active_checkout_with_retention_is_active(self) -> None:
+        owner = "operator:managed-active"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-active",
+                            "/home/alex/repos/.worktrees/managed-active",
+                            lifecycle_state="retained",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=True,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["work_id"], f"operation:{owner}")
+        self.assertEqual(group["projection_state"], "active")
+        binding_ref = next(
+            ref for ref in group["authority_refs"]
+            if ref["source"] == "checkout-lifecycle-binding"
+        )
+        self.assertEqual(binding_ref["phase"], "active")
+        self.assertTrue(binding_ref["consistent"])
+
+    def test_managed_active_checkout_without_retention_is_blocking(self) -> None:
+        owner = "operator:managed-expired"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-expired",
+                            "/home/alex/repos/.worktrees/managed-expired",
+                            lifecycle_state="managed_active_attention",
+                            binding_owner=owner,
+                            binding_phase="active",
+                            retention_active=False,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn(
+            "managed-active-lifecycle-attention", group["action_reasons"]
+        )
+
+    def test_managed_lifecycle_drift_is_fail_closed_and_explained(self) -> None:
+        owner = "operator:managed-drift"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-drift",
+                            "/home/alex/repos/.worktrees/managed-drift",
+                            lifecycle_state="managed_lifecycle_drift",
+                            binding_owner=owner,
+                            binding_phase="archived",
+                            binding_consistent=False,
+                            drift_reasons=[
+                                "archived-binding-without-matching-open-archive"
+                            ],
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("managed-lifecycle-drift", group["action_reasons"])
+        self.assertIn(
+            "archived-binding-without-matching-open-archive",
+            group["action_reasons"],
+        )
+
+    def test_dirty_managed_drift_remains_blocking_despite_exact_live_lease(self) -> None:
+        owner = "operator:dirty-managed-drift"
+        path = "/home/alex/repos/.worktrees/dirty-managed-drift"
+        result = project(
+            resources_payload={
+                "leases": [lease(owner, f"path:{path}")],
+                "count": 1,
+                "truncated": False,
+            },
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "dirty-managed-drift",
+                            path,
+                            dirty=True,
+                            owner_ids=[owner],
+                            binding_owner=owner,
+                            binding_phase="active",
+                            binding_consistent=False,
+                            drift_reasons=["binding-retention-owner-mismatch"],
+                        )
+                    ],
+                }
+            ],
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("managed-lifecycle-drift", group["action_reasons"])
+        self.assertIn("binding-retention-owner-mismatch", group["action_reasons"])
+
+    def test_archived_cleanup_candidate_is_closed_not_cleaned_without_task(self) -> None:
+        owner = "operator:archived-cleanup"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "archived-cleanup",
+                            "/home/alex/repos/.worktrees/archived-cleanup",
+                            cleanup_candidate=True,
+                            lifecycle_state="cleanup_candidate",
+                            binding_owner=owner,
+                            binding_phase="archived",
+                            binding_consistent=True,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["convergence_stage"], "closed-not-cleaned")
+        self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
+
+    def test_completed_retained_checkout_is_prioritized_closed_not_cleaned(self) -> None:
+        owner = "operator:managed-terminal"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-terminal",
+                            "/home/alex/repos/.worktrees/managed-terminal",
+                            lifecycle_state="completed_retained",
+                            binding_owner=owner,
+                            binding_phase="completed_retained",
+                            binding_consistent=True,
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "terminal_archived")
+        self.assertIn("closed-not-cleaned", group["action_reasons"])
+        self.assertEqual(group["convergence_stage"], "closed-not-cleaned")
+        self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
 
     def test_pagination_is_snapshot_bound_and_deterministic(self) -> None:
         tasks = [task("task1", updated=30), task("task2", updated=20)]
