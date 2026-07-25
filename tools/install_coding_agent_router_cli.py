@@ -21,7 +21,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tools" / "agent-route"
+SCHEDULER_SOURCE = ROOT / "tools" / "coding_agent_probe_scheduler.py"
 DEFAULT_TARGET = Path.home() / "bin" / "agent-route"
+DEFAULT_SCHEDULER_TARGET = (
+    Path.home()
+    / ".local"
+    / "libexec"
+    / "grabowski"
+    / "coding_agent_probe_scheduler.py"
+)
 DEFAULT_PIN = (
     Path.home()
     / ".config"
@@ -366,7 +374,9 @@ def _verify_installed(target: Path) -> dict[str, Any]:
     return recommendation
 
 
-def _expected(runtime_python: Path) -> tuple[bytes, bytes, str]:
+def _expected(
+    runtime_python: Path,
+) -> tuple[bytes, bytes, str, bytes, str]:
     if not runtime_python.is_absolute():
         raise InstallError("runtime Python path must be absolute")
     template = SOURCE.read_text(encoding="utf-8")
@@ -377,12 +387,51 @@ def _expected(runtime_python: Path) -> tuple[bytes, bytes, str]:
         marker, f"runtime_python={shlex.quote(str(runtime_python))}", 1
     )
     wrapper = rendered.encode("utf-8")
-    digest = _sha256(wrapper)
-    return wrapper, f"{digest}\n".encode("ascii"), digest
+    scheduler = SCHEDULER_SOURCE.read_bytes()
+    if (
+        not scheduler.startswith(b"#!/usr/bin/env python3\n")
+        or len(scheduler) > MAX_INSTALL_FILE_BYTES
+    ):
+        raise InstallError("versioned probe scheduler source is invalid")
+    wrapper_digest = _sha256(wrapper)
+    scheduler_digest = _sha256(scheduler)
+    return (
+        wrapper,
+        f"{wrapper_digest}\n".encode("ascii"),
+        wrapper_digest,
+        scheduler,
+        scheduler_digest,
+    )
 
 
-def check(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
-    wrapper, pin_bytes, digest = _expected(runtime_python)
+def _verify_scheduler_installed(
+    scheduler_target: Path, scheduler: bytes
+) -> None:
+    installed = _safe_existing(scheduler_target)
+    if (
+        not installed.present
+        or installed.data != scheduler
+        or stat.S_IMODE(installed.mode) != 0o755
+    ):
+        raise InstallError("installed probe scheduler failed exact readback")
+
+
+def _validate_distinct_install_targets(*paths: Path) -> None:
+    normalized = {os.path.abspath(path) for path in paths}
+    if len(normalized) != len(paths):
+        raise InstallError("coding-agent install targets must be distinct")
+
+
+def check(
+    target: Path,
+    pin: Path,
+    runtime_python: Path,
+    scheduler_target: Path = DEFAULT_SCHEDULER_TARGET,
+) -> dict[str, Any]:
+    _validate_distinct_install_targets(target, pin, scheduler_target)
+    wrapper, pin_bytes, digest, scheduler, scheduler_digest = _expected(
+        runtime_python
+    )
     try:
         _validate_parent(target.parent)
     except FileNotFoundError:
@@ -395,6 +444,12 @@ def check(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
         pin_state = ExistingFile(False)
     else:
         pin_state = _safe_existing(pin)
+    try:
+        _validate_parent(scheduler_target.parent)
+    except FileNotFoundError:
+        scheduler_state = ExistingFile(False)
+    else:
+        scheduler_state = _safe_existing(scheduler_target)
     runtime = _verify_runtime(runtime_python)
     installed = (
         target_state.present
@@ -403,30 +458,47 @@ def check(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
         and pin_state.present
         and pin_state.data == pin_bytes
         and stat.S_IMODE(pin_state.mode) == 0o600
+        and scheduler_state.present
+        and scheduler_state.data == scheduler
+        and stat.S_IMODE(scheduler_state.mode) == 0o755
     )
     return {
         "schema_version": 1,
         "kind": "coding-agent-router-cli-install-check",
         "installed": installed,
         "wrapper_sha256": digest,
+        "scheduler_sha256": scheduler_digest,
+        "scheduler_target": str(scheduler_target),
         "runtime_catalog_sha256": runtime.get("catalog_sha256"),
         "runtime_catalog_source": runtime.get("catalog_source"),
         "automatic_execution_authorized": False,
     }
 
 
-def apply(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
-    wrapper, pin_bytes, digest = _expected(runtime_python)
+def apply(
+    target: Path,
+    pin: Path,
+    runtime_python: Path,
+    scheduler_target: Path = DEFAULT_SCHEDULER_TARGET,
+) -> dict[str, Any]:
+    _validate_distinct_install_targets(target, pin, scheduler_target)
+    wrapper, pin_bytes, digest, scheduler, scheduler_digest = _expected(
+        runtime_python
+    )
     runtime = _verify_runtime(runtime_python)
     with _exclusive_install_lock(pin):
         _safe_parent(target, 0o700)
         _safe_parent(pin, 0o700)
+        _safe_parent(scheduler_target, 0o700)
         previous_target = _safe_existing(target)
         previous_pin = _safe_existing(pin)
+        previous_scheduler = _safe_existing(scheduler_target)
         try:
+            _atomic_write(scheduler_target, scheduler, 0o755)
             _atomic_write(target, wrapper, 0o755)
             _atomic_write(pin, pin_bytes, 0o600)
             recommendation = _verify_installed(target)
+            _verify_scheduler_installed(scheduler_target, scheduler)
             if recommendation.get("catalog_sha256") != runtime.get("catalog_sha256"):
                 raise InstallError(
                     "installed router catalog identity differs from verified runtime"
@@ -436,17 +508,23 @@ def apply(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
             rollback_items = (
                 (pin, previous_pin, pin_bytes, 0o600),
                 (target, previous_target, wrapper, 0o755),
+                (
+                    scheduler_target,
+                    previous_scheduler,
+                    scheduler,
+                    0o755,
+                ),
             )
-            for path, previous, expected_data, expected_mode in rollback_items:
+            for item_path, previous, expected_data, expected_mode in rollback_items:
                 try:
                     _restore_owned_publication(
-                        path,
+                        item_path,
                         previous,
                         expected_data=expected_data,
                         expected_mode=expected_mode,
                     )
                 except BaseException as exc:
-                    errors.append(f"{path}:{type(exc).__name__}")
+                    errors.append(f"{item_path}:{type(exc).__name__}")
             if errors:
                 raise InstallError(
                     "router install failed and rollback was incomplete"
@@ -457,6 +535,8 @@ def apply(target: Path, pin: Path, runtime_python: Path) -> dict[str, Any]:
         "kind": "coding-agent-router-cli-install-receipt",
         "status": "installed",
         "wrapper_sha256": digest,
+        "scheduler_sha256": scheduler_digest,
+        "scheduler_target": str(scheduler_target),
         "runtime_catalog_sha256": runtime.get("catalog_sha256"),
         "runtime_catalog_source": runtime.get("catalog_source"),
         "runtime_python": str(runtime_python),
@@ -482,6 +562,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--target", type=Path, default=DEFAULT_TARGET)
     result.add_argument("--pin", type=Path, default=DEFAULT_PIN)
     result.add_argument(
+        "--scheduler-target", type=Path, default=DEFAULT_SCHEDULER_TARGET
+    )
+    result.add_argument(
         "--runtime-python", type=Path, default=DEFAULT_RUNTIME_PYTHON
     )
     return result
@@ -491,9 +574,19 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         output = (
-            check(arguments.target, arguments.pin, arguments.runtime_python)
+            check(
+                arguments.target,
+                arguments.pin,
+                arguments.runtime_python,
+                arguments.scheduler_target,
+            )
             if arguments.check
-            else apply(arguments.target, arguments.pin, arguments.runtime_python)
+            else apply(
+                arguments.target,
+                arguments.pin,
+                arguments.runtime_python,
+                arguments.scheduler_target,
+            )
         )
         print(json.dumps(output, sort_keys=True, separators=(",", ":")))
         return 0

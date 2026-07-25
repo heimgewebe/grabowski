@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 import stat
 import sys
@@ -24,6 +23,9 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.target = self.root / "bin" / "agent-route"
         self.pin = self.root / "config" / "router.sha256"
+        self.scheduler = (
+            self.root / "libexec" / "coding_agent_probe_scheduler.py"
+        )
         self.runtime = self.root / "runtime-python"
         self.runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.runtime.chmod(0o755)
@@ -44,6 +46,16 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def _apply(self) -> dict:
+        return INSTALLER.apply(
+            self.target, self.pin, self.runtime, self.scheduler
+        )
+
+    def _check(self) -> dict:
+        return INSTALLER.check(
+            self.target, self.pin, self.runtime, self.scheduler
+        )
+
     def test_apply_installs_wrapper_and_private_pin(self) -> None:
         with (
             mock.patch.object(INSTALLER, "_verify_runtime", return_value=self.validation),
@@ -51,8 +63,10 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
                 INSTALLER, "_verify_installed", return_value=self.recommendation
             ),
         ):
-            receipt = INSTALLER.apply(self.target, self.pin, self.runtime)
-        wrapper, _pin_bytes, _digest = INSTALLER._expected(self.runtime)
+            receipt = self._apply()
+        wrapper, _pin_bytes, _digest, scheduler, scheduler_digest = (
+            INSTALLER._expected(self.runtime)
+        )
         self.assertEqual(self.target.read_bytes(), wrapper)
         self.assertIn(str(self.runtime), self.target.read_text(encoding="utf-8"))
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o755)
@@ -61,6 +75,10 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             self.pin.read_text(encoding="ascii"),
             INSTALLER._sha256(wrapper) + "\n",
         )
+        self.assertEqual(self.scheduler.read_bytes(), scheduler)
+        self.assertEqual(stat.S_IMODE(self.scheduler.stat().st_mode), 0o755)
+        self.assertEqual(receipt["scheduler_sha256"], scheduler_digest)
+        self.assertEqual(receipt["scheduler_target"], str(self.scheduler))
         self.assertEqual(receipt["status"], "installed")
         self.assertEqual(receipt["readback"]["controller"], "grabowski-primary")
         self.assertFalse(receipt["automatic_execution_authorized"])
@@ -75,6 +93,9 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
         self.pin.parent.mkdir(parents=True)
         self.pin.write_bytes(b"old-pin\n")
         self.pin.chmod(0o600)
+        self.scheduler.parent.mkdir(parents=True)
+        self.scheduler.write_bytes(b"old-scheduler")
+        self.scheduler.chmod(0o700)
         with (
             mock.patch.object(INSTALLER, "_verify_runtime", return_value=self.validation),
             mock.patch.object(
@@ -84,11 +105,13 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             ),
         ):
             with self.assertRaisesRegex(INSTALLER.InstallError, "readback failed"):
-                INSTALLER.apply(self.target, self.pin, self.runtime)
+                self._apply()
         self.assertEqual(self.target.read_bytes(), b"old-target")
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o700)
         self.assertEqual(self.pin.read_bytes(), b"old-pin\n")
         self.assertEqual(stat.S_IMODE(self.pin.stat().st_mode), 0o600)
+        self.assertEqual(self.scheduler.read_bytes(), b"old-scheduler")
+        self.assertEqual(stat.S_IMODE(self.scheduler.stat().st_mode), 0o700)
 
     def test_concurrent_drift_is_preserved_and_reported_during_rollback(self) -> None:
         self.target.parent.mkdir(parents=True)
@@ -97,6 +120,9 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
         self.pin.parent.mkdir(parents=True)
         self.pin.write_bytes(b"old-pin\n")
         self.pin.chmod(0o600)
+        self.scheduler.parent.mkdir(parents=True)
+        self.scheduler.write_bytes(b"old-scheduler")
+        self.scheduler.chmod(0o700)
 
         def drift_then_fail(_target: Path) -> dict:
             self.target.write_bytes(b"external-drift")
@@ -114,20 +140,23 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 INSTALLER.InstallError, "rollback was incomplete"
             ):
-                INSTALLER.apply(self.target, self.pin, self.runtime)
+                self._apply()
         self.assertEqual(self.target.read_bytes(), b"external-drift")
         self.assertEqual(self.pin.read_bytes(), b"old-pin\n")
+        self.assertEqual(self.scheduler.read_bytes(), b"old-scheduler")
 
     def test_check_reports_exact_install_state(self) -> None:
         with mock.patch.object(
             INSTALLER, "_verify_runtime", return_value=self.validation
         ):
-            missing = INSTALLER.check(self.target, self.pin, self.runtime)
+            missing = self._check()
         self.assertFalse(missing["installed"])
         self.assertFalse(self.target.parent.exists())
         self.assertFalse(self.pin.parent.exists())
         self.target.parent.mkdir(parents=True)
-        wrapper, _pin_bytes, _digest = INSTALLER._expected(self.runtime)
+        wrapper, _pin_bytes, _digest, scheduler, scheduler_digest = (
+            INSTALLER._expected(self.runtime)
+        )
         self.target.write_bytes(wrapper)
         self.target.chmod(0o755)
         self.pin.parent.mkdir(parents=True)
@@ -136,11 +165,21 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             encoding="ascii",
         )
         self.pin.chmod(0o600)
+        self.scheduler.parent.mkdir(parents=True)
+        self.scheduler.write_bytes(scheduler)
+        self.scheduler.chmod(0o755)
         with mock.patch.object(
             INSTALLER, "_verify_runtime", return_value=self.validation
         ):
-            current = INSTALLER.check(self.target, self.pin, self.runtime)
+            current = self._check()
         self.assertTrue(current["installed"])
+        self.assertEqual(current["scheduler_sha256"], scheduler_digest)
+        self.scheduler.write_bytes(b"scheduler-drift")
+        with mock.patch.object(
+            INSTALLER, "_verify_runtime", return_value=self.validation
+        ):
+            drifted = self._check()
+        self.assertFalse(drifted["installed"])
 
     def test_symlink_target_is_rejected_before_replace(self) -> None:
         real = self.root / "real"
@@ -151,8 +190,38 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             INSTALLER, "_verify_runtime", return_value=self.validation
         ):
             with self.assertRaisesRegex(INSTALLER.InstallError, "unsafe existing file"):
-                INSTALLER.apply(self.target, self.pin, self.runtime)
+                self._apply()
         self.assertEqual(real.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(self.scheduler.exists())
+
+    def test_symlink_scheduler_is_rejected_before_any_replace(self) -> None:
+        real = self.root / "real-scheduler"
+        real.write_text("keep", encoding="utf-8")
+        self.scheduler.parent.mkdir(parents=True)
+        self.scheduler.symlink_to(real)
+        with mock.patch.object(
+            INSTALLER, "_verify_runtime", return_value=self.validation
+        ):
+            with self.assertRaisesRegex(
+                INSTALLER.InstallError, "unsafe existing file"
+            ):
+                self._apply()
+        self.assertEqual(real.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(self.target.exists())
+        self.assertFalse(self.pin.exists())
+
+    def test_colliding_scheduler_target_is_rejected_before_effect(self) -> None:
+        with mock.patch.object(
+            INSTALLER, "_verify_runtime", return_value=self.validation
+        ):
+            with self.assertRaisesRegex(
+                INSTALLER.InstallError, "install targets must be distinct"
+            ):
+                INSTALLER.apply(
+                    self.target, self.pin, self.runtime, self.target
+                )
+        self.assertFalse(self.target.exists())
+        self.assertFalse(self.pin.exists())
 
     def test_world_writable_parent_is_rejected_before_install(self) -> None:
         self.target.parent.mkdir(parents=True)
@@ -161,9 +230,10 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             INSTALLER, "_verify_runtime", return_value=self.validation
         ):
             with self.assertRaisesRegex(INSTALLER.InstallError, "unsafe parent"):
-                INSTALLER.apply(self.target, self.pin, self.runtime)
+                self._apply()
         self.assertFalse(self.target.exists())
         self.assertFalse(self.pin.exists())
+        self.assertFalse(self.scheduler.exists())
 
     def test_symlink_parent_is_rejected_before_install(self) -> None:
         real_parent = self.root / "real-bin"
@@ -173,7 +243,7 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
             INSTALLER, "_verify_runtime", return_value=self.validation
         ):
             with self.assertRaisesRegex(INSTALLER.InstallError, "unsafe parent"):
-                INSTALLER.apply(self.target, self.pin, self.runtime)
+                self._apply()
         self.assertFalse((real_parent / "agent-route").exists())
 
     def test_apply_rolls_back_when_installed_catalog_identity_differs(self) -> None:
@@ -185,15 +255,19 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
         self.pin.parent.mkdir(parents=True)
         self.pin.write_bytes(previous_pin)
         self.pin.chmod(0o600)
+        self.scheduler.parent.mkdir(parents=True)
+        self.scheduler.write_bytes(b"old-scheduler")
+        self.scheduler.chmod(0o700)
         mismatched = {**self.recommendation, "catalog_sha256": "b" * 64}
         with (
             mock.patch.object(INSTALLER, "_verify_runtime", return_value=self.validation),
             mock.patch.object(INSTALLER, "_verify_installed", return_value=mismatched),
         ):
             with self.assertRaisesRegex(INSTALLER.InstallError, "catalog identity differs"):
-                INSTALLER.apply(self.target, self.pin, self.runtime)
+                self._apply()
         self.assertEqual(self.target.read_bytes(), previous_target)
         self.assertEqual(self.pin.read_bytes(), previous_pin)
+        self.assertEqual(self.scheduler.read_bytes(), b"old-scheduler")
 
     def test_verification_output_limit_is_enforced_while_child_is_running(self) -> None:
         with mock.patch.object(INSTALLER, "MAX_VERIFY_OUTPUT_BYTES", 1024):
