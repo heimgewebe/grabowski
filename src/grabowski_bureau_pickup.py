@@ -532,6 +532,19 @@ def _normalize_nonconflict_proofs(value: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _normalize_registry_root(value: Any) -> str:
+    raw = Path(_text(value, label="registry_root", maximum=4096)).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("registry_root must be absolute")
+    try:
+        resolved = raw.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("registry_root must resolve to an existing directory") from exc
+    if not resolved.is_dir():
+        raise ValueError("registry_root must resolve to an existing directory")
+    return str(resolved)
+
+
 def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
@@ -547,6 +560,7 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
         "create_workspace",
         "repository_scope_manifests",
         "nonconflict_proofs",
+        "registry_root",
     }
     extra = sorted(set(request) - allowed)
     if extra:
@@ -560,6 +574,9 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
         request.get("approval_source", "grabowski_bureau_pickup_execute"),
         label="approval_source",
         maximum=512,
+    )
+    registry_root = _normalize_registry_root(
+        request.get("registry_root", str(bureau.BUREAU_ROOT))
     )
     resource = request.get("resource")
     if resource is not None:
@@ -580,6 +597,7 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
         "kind": kind,
         "base_dir": base_dir,
         "approval_source": approval_source,
+        "registry_root": registry_root,
         "lease_ttl_seconds": _ttl(request.get("lease_ttl_seconds", 900)),
         "create_workspace": create_workspace,
         "repository_scope_manifests": _normalize_scope_manifests(
@@ -591,12 +609,20 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _bureau_arguments(command: str) -> list[str]:
-    return ["--json", "--json-envelope", command]
+def _bureau_arguments(command: str, *, registry_root: str) -> list[str]:
+    return [
+        "--root",
+        registry_root,
+        "--json",
+        "--json-envelope",
+        command,
+    ]
 
 
 def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
-    arguments = _bureau_arguments("claim-intent")
+    arguments = _bureau_arguments(
+        "claim-intent", registry_root=request["registry_root"]
+    )
     arguments.extend(["--worker", request["worker_id"]])
     arguments.extend(["--kind", request["kind"]])
     arguments.extend(["--task-id", request["task_id"]])
@@ -846,7 +872,9 @@ def _commit_claim(
     intent: dict[str, Any], request: dict[str, Any], run_dir: Path
 ) -> dict[str, Any]:
     intent_path = run_dir / "intent.json"
-    arguments = _bureau_arguments("claim-commit")
+    arguments = _bureau_arguments(
+        "claim-commit", registry_root=request["registry_root"]
+    )
     arguments.extend(["--intent", str(intent_path)])
     if intent["required_resource_keys"]:
         lease_path = _lease_binding(intent, run_dir)
@@ -863,9 +891,14 @@ def _commit_claim(
     )
 
 
-def _coordination_status(run_id: str) -> dict[str, Any]:
+def _coordination_status(run_id: str, *, registry_root: str) -> dict[str, Any]:
     return bureau._invoke_bureau(
-        [*_bureau_arguments("claim-coordination-status"), run_id]
+        [
+            *_bureau_arguments(
+                "claim-coordination-status", registry_root=registry_root
+            ),
+            run_id,
+        ]
     )
 
 
@@ -878,10 +911,16 @@ def _definitive_missing_run(payload: dict[str, Any]) -> bool:
 
 
 def _recover_after_commit(
-    intent: dict[str, Any], acquisition: dict[str, Any], run_dir: Path
+    intent: dict[str, Any],
+    acquisition: dict[str, Any],
+    run_dir: Path,
+    *,
+    registry_root: str,
 ) -> dict[str, Any]:
     try:
-        status = _coordination_status(intent["run_id"])
+        status = _coordination_status(
+            intent["run_id"], registry_root=registry_root
+        )
         _write_bound_json(run_dir / "commit-readback.json", status)
     except Exception as exc:
         failure = {
@@ -932,16 +971,18 @@ def _recover_after_commit(
 @mcp.tool(name="grabowski_bureau_pickup_execute", annotations=MUTATING)
 def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
     """Coordinate one Bureau claim with owner-bound Grabowski leases and recovery."""
-    operator._require_operator_mutation("terminal_execute")
-    operator._require_operator_mutation("resource_lease")
     normalized = _normalize_request(request)
+    operator._require_operator_mutation(
+        "terminal_execute", path=normalized["registry_root"]
+    )
+    operator._require_operator_mutation("resource_lease")
     request_sha256 = _sha256(normalized)
     intent_payload = _claim_intent(normalized)
     intent, existing = _validate_intent_result(intent_payload, normalized)
     run_dir = _run_directory(intent["run_id"])
     if existing:
-        stored_request = _read_bound_json(
-            run_dir / "request.json", label="request"
+        stored_request = _normalize_request(
+            _read_bound_json(run_dir / "request.json", label="request")
         )
         if stored_request != normalized:
             raise BureauPickupError("existing-assignment-request-mismatch")
@@ -954,7 +995,9 @@ def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
         _validate_acquisition(acquisition)
         if acquisition.get("claim_intent_sha256") != intent["intent_sha256"]:
             raise BureauPickupError("existing-assignment-acquisition-mismatch")
-        coordination = _coordination_status(intent["run_id"])
+        coordination = _coordination_status(
+            intent["run_id"], registry_root=normalized["registry_root"]
+        )
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup",
@@ -1030,7 +1073,24 @@ def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
             task_id=intent["task_id"],
         )
         return result
-    recovered = _recover_after_commit(intent, acquisition, run_dir)
+    if (
+        commit.get("effect_started") is False
+        and commit.get("ambiguity") is not True
+    ) or commit.get("status") == "explicit-registry-root-required":
+        recovered = {
+            "status": "commit-not-applied",
+            "commit": commit,
+            "compensation": _compensate_acquisitions(
+                intent["lease_owner_id"], acquisition["groups"], run_dir
+            ),
+        }
+    else:
+        recovered = _recover_after_commit(
+            intent,
+            acquisition,
+            run_dir,
+            registry_root=normalized["registry_root"],
+        )
     result = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup",
@@ -1048,7 +1108,14 @@ def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
         run_id=intent["run_id"],
         task_id=intent["task_id"],
     )
-    return result
+    if recovered["status"] == "recovered":
+        return result
+    code = (
+        "claim-commit-not-applied"
+        if recovered["status"] == "commit-not-applied"
+        else "claim-commit-recovery-required"
+    )
+    raise BureauPickupError(code, details={"result": result})
 
 
 def _journal_available(run_id: str) -> bool:
@@ -1066,13 +1133,30 @@ def _journal_available(run_id: str) -> bool:
     return True
 
 
+def _registry_root_for_run(run_id: str) -> str:
+    default = _normalize_registry_root(str(bureau.BUREAU_ROOT))
+    if not _journal_available(run_id):
+        return default
+    try:
+        stored = _read_bound_json(
+            STATE_ROOT / "runs" / run_id / "request.json", label="request"
+        )
+    except BureauPickupError as exc:
+        if exc.code == "request-missing":
+            return default
+        raise
+    return _normalize_registry_root(stored.get("registry_root", default))
+
+
 @mcp.tool(name="grabowski_bureau_pickup_status", annotations=READ_ONLY)
 def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
     """Read one coordinated Bureau run and its owner-bound lease state."""
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
     if RUN_ID_RE.fullmatch(normalized_run_id) is None:
         raise ValueError("run_id is invalid")
-    payload = _coordination_status(normalized_run_id)
+    payload = _coordination_status(
+        normalized_run_id, registry_root=_registry_root_for_run(normalized_run_id)
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup_status",
@@ -1151,9 +1235,12 @@ def _verify_release_binding(
 @mcp.tool(name="grabowski_bureau_pickup_release", annotations=MUTATING)
 def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     """Release exactly one terminal coordinated run's unchanged Grabowski leases."""
-    operator._require_operator_mutation("terminal_execute")
-    operator._require_operator_mutation("resource_lease")
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
+    registry_root = _registry_root_for_run(normalized_run_id)
+    operator._require_operator_mutation(
+        "terminal_execute", path=registry_root
+    )
+    operator._require_operator_mutation("resource_lease")
     run_dir = _run_directory(normalized_run_id)
     acquisition = _read_bound_json(run_dir / "acquisition.json", label="acquisition")
     _validate_acquisition(acquisition)
@@ -1177,7 +1264,9 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
                 ),
                 "journal": str(run_dir),
             }
-    status = _coordination_status(normalized_run_id)
+    status = _coordination_status(
+        normalized_run_id, registry_root=registry_root
+    )
     _write_bound_json(run_dir / "terminal-readback.json", status)
     owner_id, keys = _verify_release_binding(
         normalized_run_id, status, acquisition

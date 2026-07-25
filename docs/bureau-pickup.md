@@ -4,6 +4,8 @@
 
 Bureau remains authoritative for task eligibility, run identity, reservations, worktree identity and terminal state. Grabowski remains authoritative for live resource leases. The adapter does not claim distributed ACID semantics; it implements a bounded two-phase transition with append-only private evidence, authoritative readback and compensation.
 
+Every request is bound to one existing absolute Bureau registry root. The default is the canonical clean Bureau repository root. Claim intent, claim commit, recovery status, terminal status and release reuse that same normalized root, and the operator mutation gate is evaluated against it. The root is stored in the private request journal so an exact retry cannot silently switch Registry truth. Journals created before this field existed remain bound to the canonical default root.
+
 ## Integration state
 
 The module declares three canonical MCP tools: `grabowski_bureau_pickup_execute`, `grabowski_bureau_pickup_status` and `grabowski_bureau_pickup_release`. The production runtime imports the module for registration, the deployment manifest includes the module and tools, and the capability catalogue classifies execute and release as operator-gated effects while status remains read-only. These source declarations do not establish that a particular runtime release has already been deployed; deployment identity and live tool readback remain separate evidence.
@@ -12,26 +14,27 @@ The module declares three canonical MCP tools: `grabowski_bureau_pickup_execute`
 
 `grabowski_bureau_pickup_execute`:
 
-1. requests a read-only, approved Bureau `claim-intent`;
-2. validates task, worker, run, owner, expiry and exact resource keys;
-3. writes immutable private request and intent artifacts;
-4. acquires Bureau resources, broad repository resources and remaining resources in explicit groups under `bureau-run:<run_id>`;
-5. binds every lease metadata set to `task_id`, `run_id` and `claim_intent_sha256`;
-6. requires a complete Grabowski scope manifest for every broad repository lease;
-7. commits the exact intent and live lease binding through Bureau, optionally creating the planned workspace;
-8. reads the canonical Bureau run after any unclear commit result;
-9. compensates acquired leases only when Bureau authoritatively reports that the run does not exist;
-10. compensates the current acquisition group as well when snapshot validation or immutable journaling fails after the lease database commit.
+1. normalizes the exact Bureau registry root and checks operator mutation authority for that path;
+2. requests a read-only, approved Bureau `claim-intent` against that root;
+3. validates task, worker, run, owner, expiry and exact resource keys;
+4. writes immutable private request and intent artifacts;
+5. acquires Bureau resources, broad repository resources and remaining resources in explicit groups under `bureau-run:<run_id>`;
+6. binds every lease metadata set to `task_id`, `run_id` and `claim_intent_sha256`;
+7. requires a complete Grabowski scope manifest for every broad repository lease;
+8. commits the exact intent and live lease binding through the same Bureau root, optionally creating the planned workspace;
+9. reads the canonical Bureau run through the same root after any unclear commit result;
+10. compensates all acquired leases when the commit is authoritatively known not to have started or Bureau authoritatively reports that the run does not exist;
+11. compensates the current acquisition group as well when snapshot validation or immutable journaling fails after the lease database commit.
 
-A transport timeout never proves that the claim was absent. Ambiguous states retain their leases and return `recovery-required`. An exact retry may recover an existing assignment only when the stored request, intent digest and acquisition journal all match; an unjournaled assignment remains foreign and fails closed.
+A transport timeout never proves that the claim was absent. Ambiguous states retain their leases and raise `claim-commit-recovery-required` with the structured recovery result. A definitely unapplied commit compensates its own acquisitions and raises `claim-commit-not-applied`. An exact retry may recover an existing assignment only when the stored request, registry root, intent digest and acquisition journal all match; an unjournaled assignment remains foreign and fails closed.
 
 ## Status and release
 
-`grabowski_bureau_pickup_status` reads Bureau coordination state without creating or changing private journal paths.
+`grabowski_bureau_pickup_status` reads Bureau coordination state without creating or changing private journal paths. It uses the registry root stored for the run, or the canonical default for historical journals and runs without local journal evidence.
 
 `grabowski_bureau_pickup_release` requires:
 
-- a terminal Bureau run;
+- a terminal Bureau run read through the root bound to the run;
 - an intact acquisition journal digest;
 - exact owner, resource-set and claim-intent binding;
 - unchanged lease metadata identity for every lease still present.
@@ -51,4 +54,5 @@ The adapter does not establish:
 - permission to release foreign leases;
 - workspace cleanup authority;
 - safety of retrying an ambiguous commit without a fresh readback;
-- absence of resource conflicts outside the live Grabowski lease database.
+- absence of resource conflicts outside the live Grabowski lease database;
+- validity or mutability of a caller-selected Registry root beyond the separate Bureau and operator gates.
