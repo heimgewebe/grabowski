@@ -360,6 +360,7 @@ class ReadSurfaceTests(unittest.TestCase):
                 view="standard", top_limit=5
             )
         self.assertEqual(result["projection_kind"], "audit_projection.v1")
+        self.assertEqual(result["signal_projection"]["projection_kind"], "audit-signal.v1")
         self.assertEqual(result["source_binding"]["record_count"], len(records))
         self.assertEqual(result["source_binding"]["last_record_sha256"], "f" * 64)
         self.assertEqual(

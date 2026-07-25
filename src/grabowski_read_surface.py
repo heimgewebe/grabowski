@@ -15,6 +15,7 @@ from pydantic import Field
 
 import grabowski_capabilities as capabilities
 import grabowski_mcp as base
+import grabowski_audit_signal as audit_signal
 import grabowski_consumer_surface as consumer_surface
 import grabowski_operator_core as operator
 import grabowski_runtime_extensions as runtime_extensions
@@ -390,6 +391,8 @@ def _audit_failure_reasons(record: dict[str, Any]) -> set[str]:
         reasons.add("outcome_unknown")
     if record.get("launcher_outcome_unknown") is True:
         reasons.add("launcher_outcome_unknown")
+    if record.get("recovery_required") is True:
+        reasons.add("recovery_required")
     if record.get("effect_started") is False:
         reasons.add("effect_not_started")
     if record.get("bureau_status") in AUDIT_BUREAU_FAILURE_STATUSES:
@@ -627,6 +630,7 @@ def _audit_findings_sha256(
     all_time: dict[str, Any],
     candidates: list[dict[str, Any]],
     warnings: list[dict[str, Any]],
+    signal_projection: dict[str, Any],
 ) -> str:
     def semantic_window(value: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -638,6 +642,7 @@ def _audit_findings_sha256(
         "windows": [semantic_window(item) for item in windows],
         "all_time": semantic_window(all_time),
         "candidate_patterns": candidates,
+        "signal_projection": audit_signal.findings_payload(signal_projection),
         "warnings": [
             item
             for item in warnings
@@ -794,6 +799,12 @@ def grabowski_audit_projection(
         view=selected_view,
     )
     candidates = _audit_projection_candidates(private_windows["7d"])
+    signal_projection = audit_signal.build_projection(
+        prepared_records,
+        as_of_unix=as_of_unix,
+        audit_source_binding=binding,
+        runtime_status_provider=getattr(base, "grabowski_status", None),
+    )
     advanced = (
         after.get("last_record_sha256") != binding["last_record_sha256"]
         or after.get("total_records") != binding["record_count"]
@@ -847,6 +858,7 @@ def grabowski_audit_projection(
         "windows": windows,
         "all_time": all_time,
         "candidate_patterns": candidates,
+        "signal_projection": signal_projection,
         "warnings": warnings,
         "recommended_next_action": (
             "inspect ambiguous execution outcomes before retries"
@@ -880,6 +892,7 @@ def grabowski_audit_projection(
         all_time_private,
         candidates,
         warnings,
+        signal_projection,
     )
     payload["projection_sha256"] = hashlib.sha256(
         consumer_surface.canonical_json_bytes(payload)
