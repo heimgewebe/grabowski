@@ -7099,7 +7099,9 @@ def _path_identity(value: str) -> str:
 
 
 def _workspace_cleanup_owner(workspace_id: str) -> str:
-    return checkouts._owner(f"agent-workspace-cleanup:{workspace_id}")
+    # Cleanup is the terminal phase of the workspace checkout ownership.
+    # A second owner would turn its active retention into foreign retention.
+    return checkouts._owner(f"agent-workspace:{workspace_id}")
 
 
 def _valid_workspace_cleanup_receipt(value: Any) -> bool:
