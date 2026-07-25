@@ -158,13 +158,15 @@ class NtfyDispatchTests(TestCase):
 
     def test_renders_all_canonical_event_classes_without_sensitive_payloads(self) -> None:
         cases = {
-            "blocked_operation": ("blocked", "4"),
-            "recovery": ("Recovery", "4"),
-            "service_failure": ("failed", "5"),
-            "long_run_completed": ("finished", "3"),
-            "owner_decision": ("decision required", "4"),
+            "blocked_operation": ("operation blocked", "blocked", "4"),
+            "recovery": ("recovery", "Recovery", "4"),
+            "service_failure": ("service failure", "failed", "5"),
+            "long_run_completed": ("run completed", "finished", "3"),
+            "owner_decision": ("decision required", "decision required", "4"),
         }
-        for event_class, (needle, priority) in cases.items():
+        self.assertEqual(len(ntfy.EVENT_CLASSES), 5)
+        titles = set()
+        for event_class, (title_needle, body_needle, priority) in cases.items():
             with self.subTest(event_class=event_class):
                 rendered = ntfy.render_notification({
                     "event_class": event_class,
@@ -177,18 +179,80 @@ class NtfyDispatchTests(TestCase):
                 })
                 self.assertEqual(rendered["event_class"], event_class)
                 self.assertEqual(rendered["correlation_id"], "corr-12345678")
-                self.assertIn(needle, rendered["body"])
+                self.assertIn(title_needle, rendered["title"])
+                self.assertIn(body_needle, rendered["body"])
                 self.assertEqual(rendered["priority"], priority)
                 self.assertNotIn("secret", rendered["body"])
+                titles.add(rendered["title"])
+        self.assertEqual(len(titles), 5)
 
-    def test_unknown_event_class_falls_back_to_long_run_completed(self) -> None:
+    def test_missing_event_class_preserves_legacy_long_run_rendering(self) -> None:
         rendered = ntfy.render_notification({
-            "event_class": "unknown",
             "job_id": "1234567890abcdef",
             "terminal_status": "succeeded",
         })
         self.assertEqual(rendered["event_class"], "long_run_completed")
         self.assertIn("90abcdef", rendered["body"])
+
+    def test_declared_unsupported_event_class_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ntfy.NotificationContractError, "unsupported_event_class"):
+            ntfy.render_notification({
+                "event_class": "unknown",
+                "job_id": "1234567890abcdef",
+                "terminal_status": "succeeded",
+            })
+
+    def test_unsafe_or_unbounded_supported_values_are_rejected(self) -> None:
+        cases = [
+            ({"correlation_id": "bad\nvalue"}, "invalid_correlation_id"),
+            ({"terminal_status": "x" * 65}, "invalid_status"),
+            ({"event_class": "service_failure", "service": "bad service"}, "invalid_service"),
+        ]
+        for override, reason in cases:
+            row = {
+                "event_class": "long_run_completed",
+                "correlation_id": "corr-12345678",
+                "terminal_status": "succeeded",
+            }
+            row.update(override)
+            with self.subTest(reason=reason), self.assertRaisesRegex(
+                ntfy.NotificationContractError, reason
+            ):
+                ntfy.render_notification(row)
+
+    def test_unsupported_class_preserves_pending_truth_and_returns_evidence(self) -> None:
+        unsupported = {
+            "unit": "grabowski-job-unsupported.service",
+            "event_class": "typo_failure",
+            "correlation_id": "corr-unsupported",
+            "requested_channels": ["ntfy"],
+            "receipt_sha256": "a" * 64,
+        }
+        healthy = {
+            "unit": "grabowski-job-healthy.service",
+            "event_class": "long_run_completed",
+            "correlation_id": "corr-healthy",
+            "terminal_status": "succeeded",
+            "requested_channels": ["ntfy"],
+            "receipt_sha256": "b" * 64,
+        }
+
+        def publisher(_topic: str, row: dict[str, object]) -> int:
+            ntfy.render_notification(row)
+            return 200
+
+        with mock.patch.object(
+            ntfy,
+            "_notification_list",
+            return_value={"invalid_receipts": [], "notifications": [unsupported, healthy]},
+        ), mock.patch.object(ntfy, "_notification_ack") as ack:
+            result = ntfy.dispatch(topic="x" * 32, publisher=publisher)
+
+        self.assertEqual(result["status"], "delivery_failed")
+        self.assertEqual(result["error_type"], "NotificationContractError")
+        self.assertEqual(result["reason"], "unsupported_event_class")
+        self.assertEqual(result["delivered"], 1)
+        ack.assert_called_once_with(healthy["unit"], healthy["receipt_sha256"])
 
     def test_publish_payload_excludes_sensitive_fields(self) -> None:
         row = {
@@ -228,6 +292,10 @@ class NtfyDispatchTests(TestCase):
         self.assertNotIn("secret-command", payload)
         self.assertNotIn("bbbb", payload)
         self.assertNotIn("cccc", payload)
+        headers = {key.lower(): value for key, value in captured["headers"].items()}
+        self.assertEqual(headers["title"], "Grabowski: run completed")
+        self.assertEqual(headers["x-grabowski-event-class"], "long_run_completed")
+        self.assertEqual(headers["x-grabowski-correlation-id"], "1234567890abcdef")
 
 
 class NtfyFinalizerTriggerTests(TestCase):
