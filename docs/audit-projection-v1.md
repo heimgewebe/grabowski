@@ -22,3 +22,18 @@ The projection is useful for recurrence and prioritization, not causality. Audit
 ## Nightly integration
 
 The planned `OPERATOR-INTEGRATION-LOOP-V1-T006` digest should consume this projection together with runtime health, task state, live leases, friction summary and execution-governor summary. Unchanged findings should be deduplicated by `findings_sha256`. `source_binding.snapshot_sha256` remains the provenance identity for the exact source snapshot and must not prevent deduplication when only the chain head advances. No derived pattern may create or mutate a task automatically.
+
+
+## Canonical audit signals
+
+The projection embeds one `audit-signal.v1` subprojection instead of adding another MCP tool or persistent index. It always returns the same five ordered signals over a seven-day observation window:
+
+1. `uncertain_outcome` — direct `outcome_unknown`, `launcher_outcome_unknown`, or `recovery_required` evidence from the verified audit chain.
+2. `contract_contradiction` — unresolved structured contract errors plus narrowly labelled projection/receipt mismatch friction. Heuristic matches remain explicitly marked and never decide which producer or consumer is wrong.
+3. `transition_gap` — an explicit audit intent whose matching completion operation is absent after a five-minute grace period. Pairing is FIFO inside the same operation family and therefore does not claim exact cross-operation identity when no transaction identifier was logged.
+4. `repeated_blockade` — at least three unresolved policy-gate friction events for the same bounded operation in the window. Repetition is evidence for improving gate preparation, not for bypassing policy.
+5. `stale_attention` — an unresolved connector-snapshot friction event that predates a later fresh, matched runtime client-snapshot receipt. It is only a closeout candidate and is never resolved automatically.
+
+Each signal is `clear`, `observed`, or `indeterminate`; carries bounded evidence references, evidence quality, explicit non-claims, and a recommended next action; and is bound to the audit snapshot, friction snapshot, and runtime client-snapshot receipt that were actually observed. Missing or invalid auxiliary evidence produces `indeterminate` rather than a false clear state.
+
+`contracts/audit-signal.v1.schema.json` fixes the order and shape. The nested signal findings hash excludes clock-bound presentation fields but changes with semantic signal findings. The parent audit findings hash incorporates the signal findings, so nightly deduplication cannot silently ignore a changed signal state.

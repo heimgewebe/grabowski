@@ -1,0 +1,331 @@
+{
+  "$defs": {
+    "contractContradiction": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signal"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "contract_contradiction"
+            }
+          }
+        }
+      ]
+    },
+    "repeatedBlockade": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signal"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "repeated_blockade"
+            }
+          }
+        }
+      ]
+    },
+    "signal": {
+      "additionalProperties": false,
+      "properties": {
+        "count": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "details": {
+          "type": "object"
+        },
+        "does_not_establish": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "evidence_quality": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "evidence_refs_truncated": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "observed_count": {
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "none",
+            "medium",
+            "high",
+            "critical",
+            "unknown"
+          ]
+        },
+        "status": {
+          "enum": [
+            "clear",
+            "observed",
+            "indeterminate"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "severity",
+        "count",
+        "observed_count",
+        "evidence_refs",
+        "evidence_refs_truncated",
+        "evidence_quality",
+        "recommended_action",
+        "details",
+        "does_not_establish"
+      ],
+      "type": "object"
+    },
+    "staleAttention": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signal"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "stale_attention"
+            }
+          }
+        }
+      ]
+    },
+    "transitionGap": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signal"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "transition_gap"
+            }
+          }
+        }
+      ]
+    },
+    "uncertainOutcome": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/signal"
+        },
+        {
+          "properties": {
+            "id": {
+              "const": "uncertain_outcome"
+            }
+          }
+        }
+      ]
+    }
+  },
+  "$id": "audit-signal.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "as_of_unix": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "authority": {
+      "const": "derived_read_only_projection"
+    },
+    "does_not_establish": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "findings_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "projection_kind": {
+      "const": "audit-signal.v1"
+    },
+    "projection_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "recommended_next_action": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "signals": {
+      "items": false,
+      "maxItems": 5,
+      "minItems": 5,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/uncertainOutcome"
+        },
+        {
+          "$ref": "#/$defs/contractContradiction"
+        },
+        {
+          "$ref": "#/$defs/transitionGap"
+        },
+        {
+          "$ref": "#/$defs/repeatedBlockade"
+        },
+        {
+          "$ref": "#/$defs/staleAttention"
+        }
+      ],
+      "type": "array"
+    },
+    "source_binding": {
+      "additionalProperties": false,
+      "properties": {
+        "audit_last_record_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "audit_snapshot_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "friction_snapshot_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime_client_snapshot_receipt_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "audit_snapshot_sha256",
+        "audit_last_record_sha256",
+        "friction_snapshot_sha256",
+        "runtime_client_snapshot_receipt_sha256"
+      ],
+      "type": "object"
+    },
+    "source_health": {
+      "additionalProperties": false,
+      "properties": {
+        "audit_chain_verified": {
+          "type": "boolean"
+        },
+        "client_snapshot_fresh_and_matched": {
+          "type": "boolean"
+        },
+        "client_snapshot_receipt_valid": {
+          "type": "boolean"
+        },
+        "client_snapshot_timestamp_valid": {
+          "type": "boolean"
+        },
+        "friction_available": {
+          "type": "boolean"
+        },
+        "friction_integrity_valid": {
+          "type": "boolean"
+        },
+        "friction_recent_window_complete": {
+          "type": "boolean"
+        },
+        "runtime_healthy": {
+          "type": "boolean"
+        },
+        "runtime_status_available": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "audit_chain_verified",
+        "friction_available",
+        "friction_integrity_valid",
+        "friction_recent_window_complete",
+        "runtime_status_available",
+        "runtime_healthy",
+        "client_snapshot_fresh_and_matched",
+        "client_snapshot_timestamp_valid",
+        "client_snapshot_receipt_valid"
+      ],
+      "type": "object"
+    },
+    "window": {
+      "additionalProperties": false,
+      "properties": {
+        "end_unix": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "label": {
+          "const": "7d"
+        },
+        "start_unix": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "label",
+        "start_unix",
+        "end_unix"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "projection_kind",
+    "authority",
+    "as_of_unix",
+    "window",
+    "source_binding",
+    "source_health",
+    "signals",
+    "recommended_next_action",
+    "does_not_establish",
+    "findings_sha256",
+    "projection_sha256"
+  ],
+  "title": "Grabowski audit signal projection v1",
+  "type": "object"
+}
