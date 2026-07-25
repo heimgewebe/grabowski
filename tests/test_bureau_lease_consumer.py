@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -459,6 +460,34 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
 
 
 class BureauManagedRuntimeTests(_BureauLeaseTestCase):
+    def test_regular_file_snapshot_rejects_path_replacement_during_read(
+        self,
+    ) -> None:
+        path = self.root / "bound-runtime-file.py"
+        displaced = self.root / "bound-runtime-file.original.py"
+        replacement = self.root / "bound-runtime-file.replacement.py"
+        path.write_bytes(b"A" * 70000)
+        replacement.write_bytes(b"B" * 70000)
+        real_read = os.read
+        swapped = False
+
+        def swap_after_first_read(descriptor: int, size: int) -> bytes:
+            nonlocal swapped
+            chunk = real_read(descriptor, size)
+            if not swapped:
+                path.rename(displaced)
+                replacement.rename(path)
+                swapped = True
+            return chunk
+
+        with patch.object(bureau.os, "read", side_effect=swap_after_first_read):
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                bureau._regular_file_snapshot(path, label="test-runtime-file")
+        self.assertTrue(swapped)
+        self.assertEqual(raised.exception.code, "test-runtime-file-changed-during-read")
+        self.assertEqual(displaced.read_bytes(), b"A" * 70000)
+        self.assertEqual(path.read_bytes(), b"B" * 70000)
+
     def _install_managed_runtime(self) -> tuple[Path, str, list[object]]:
         source_commit = "c" * 40
         release_id = f"{source_commit[:12]}-src123456789abc"
@@ -507,6 +536,8 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         launcher.write_text(
             "#!/usr/bin/env python3\n"
             "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path('{manifest_path}')\n"
             f"expected_manifest_sha256 = '{manifest_digest}'\n",
             encoding="utf-8",
         )
@@ -553,6 +584,34 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
             hashlib.sha256(launcher.read_bytes()).hexdigest(),
         )
 
+    def test_managed_launcher_rejects_duplicate_digest_assignment(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime()
+        manifest_path = self.runtime / "deployment-manifest.json"
+        manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path('{manifest_path}')\n"
+            f"expected_manifest_sha256 = '{manifest_digest}'\n"
+            f"expected_manifest_sha256 = '{manifest_digest}'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.code, "contract-managed-launcher-binding-invalid"
+        )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
     def test_managed_launcher_must_bind_exact_manifest(self) -> None:
         launcher, _source_commit, patches = self._install_managed_runtime()
         launcher.write_text(
@@ -572,6 +631,58 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
                 )
         self.assertEqual(
             raised.exception.code, "contract-managed-launcher-binding-invalid"
+        )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_managed_release_symlink_alias_is_rejected(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime()
+        release = self.runtime / "releases" / ("c" * 12 + "-src123456789abc")
+        alias = self.runtime / "release-alias"
+        alias.symlink_to(release, target_is_directory=True)
+        manifest_path = self.runtime / "deployment-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["immutable_release_path"] = str(alias)
+        manifest_raw = json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        manifest_path.write_bytes(manifest_raw)
+        manifest_digest = hashlib.sha256(manifest_raw).hexdigest()
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path('{manifest_path}')\n"
+            f"expected_manifest_sha256 = '{manifest_digest}'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(raised.exception.code, "contract-managed-runtime-path-invalid")
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_managed_unbound_importable_file_fails_before_invocation(self) -> None:
+        _launcher, _source_commit, patches = self._install_managed_runtime()
+        release = self.runtime / "releases" / ("c" * 12 + "-src123456789abc")
+        (release / "src/bureau/cli.pyc").write_bytes(b"unbound bytecode")
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.code, "contract-managed-package-entry-invalid"
         )
         run.assert_not_called()
         self.assertFalse(self.database.exists())
