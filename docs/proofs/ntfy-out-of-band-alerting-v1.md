@@ -10,7 +10,7 @@ The dispatcher exposes one canonical, redacted notification rendering contract f
 - `long_run_completed`
 - `owner_decision`
 
-Every outbound request carries `X-Grabowski-Event-Class` and `X-Grabowski-Correlation-Id`. Delivery remains fail-closed: the durable outbox receipt is acknowledged only after a 2xx ntfy response.
+Every class has a deterministic title, body, priority and tag set. Every outbound request carries bounded, control-character-free `X-Grabowski-Event-Class` and `X-Grabowski-Correlation-Id` headers. Missing class metadata retains legacy long-run rendering; an explicitly unsupported class or unsafe supported value is rejected with structured evidence and remains pending. Delivery remains fail-closed: the durable outbox receipt is acknowledged only after a 2xx ntfy response.
 
 ## Boundary
 
