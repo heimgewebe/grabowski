@@ -40,6 +40,7 @@ from mcp.types import ToolAnnotations
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
+import grabowski_system_map
 import grabowski_blockades as blockade_policy
 import grabowski_blockade_store as blockade_store
 
@@ -4977,8 +4978,11 @@ def _operator_system_overview(
             "freshness": "receipt-bound per operation",
         },
     }
+    component_map = grabowski_system_map.build_component_map(
+        runtime_healthy=runtime_healthy, client_snapshot=client_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
+    )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "operator_ready": operator_ready,
         "readiness": {
             "runtime_ready": runtime_healthy,
@@ -5000,6 +5004,7 @@ def _operator_system_overview(
         "leases": leases,
         "operator_obligations": obligations,
         "source_registry": source_registry,
+        "component_map": component_map,
         "component_errors": errors,
         "recommended_next_action": next_action,
         "does_not_establish": [
