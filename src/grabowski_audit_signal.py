@@ -32,14 +32,13 @@ AUDIT_CONTRADICTION_OPERATION_TERMS = (
     "result",
     "schema",
 )
-AUDIT_CONTRADICTION_SYMPTOM_TERMS = (
+AUDIT_CONTRADICTION_STRONG_TERMS = (
     "contradict",
     "inconsistent",
     "mismatch",
-    "reported",
-    "simultaneously",
     "widerspr",
 )
+AUDIT_CONTRADICTION_DUAL_REPORT_MARKERS = ("while", "simultaneously")
 
 
 def _label(value: Any, *, fallback: str = "unknown") -> str:
@@ -273,7 +272,10 @@ def _audit_contract_contradiction_kind(event: dict[str, Any]) -> str | None:
     operation = str(event.get("operation") or "").lower()
     symptom = str(event.get("symptom") or "").lower()
     contradiction_language = any(
-        term in symptom for term in AUDIT_CONTRADICTION_SYMPTOM_TERMS
+        term in symptom for term in AUDIT_CONTRADICTION_STRONG_TERMS
+    ) or (
+        "reported" in symptom
+        and any(marker in symptom for marker in AUDIT_CONTRADICTION_DUAL_REPORT_MARKERS)
     )
     if (
         event.get("failure_class") == "contract_error"
