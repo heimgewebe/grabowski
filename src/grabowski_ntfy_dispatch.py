@@ -15,6 +15,7 @@ import grabowski_operator_core as operator
 TOPIC_PATH = Path.home() / ".config/grabowski/ntfy-topic"
 SERVER = "https://ntfy.sh"
 CHANNEL = "ntfy"
+EVENT_CLASSES = frozenset({"blocked_operation", "recovery", "service_failure", "long_run_completed", "owner_decision"})
 LOCK_PATH = Path.home() / ".local/state/grabowski/ntfy-dispatch.lock"
 
 
@@ -30,19 +31,68 @@ def load_topic(path: Path = TOPIC_PATH) -> str:
     return topic
 
 
+def event_class(row: dict[str, Any]) -> str:
+    declared = str(row.get("event_class") or "").strip()
+    if declared in EVENT_CLASSES:
+        return declared
+    return "long_run_completed"
+
+
+def render_notification(row: dict[str, Any]) -> dict[str, str]:
+    kind = event_class(row)
+    correlation_id = str(
+        row.get("correlation_id")
+        or row.get("notification_id")
+        or row.get("job_id")
+        or "unknown"
+    )
+    short_id = correlation_id[-8:]
+    status = str(row.get("terminal_status") or row.get("status") or "unknown")
+    service = str(row.get("service") or "unknown")
+    messages = {
+        "blocked_operation": f"Operation {short_id} blocked: {status}",
+        "recovery": f"Recovery {short_id}: {status}",
+        "service_failure": f"Service {service} failed: {status}",
+        "long_run_completed": f"Grabowski job {short_id} finished: {status}",
+        "owner_decision": f"Owner decision required: {short_id}",
+    }
+    priorities = {
+        "blocked_operation": "4",
+        "recovery": "4",
+        "service_failure": "5",
+        "long_run_completed": "3",
+        "owner_decision": "4",
+    }
+    tags = {
+        "blocked_operation": "warning,robot",
+        "recovery": "lifebuoy,robot",
+        "service_failure": "rotating_light,robot",
+        "long_run_completed": "white_check_mark,robot",
+        "owner_decision": "question,robot",
+    }
+    return {
+        "event_class": kind,
+        "correlation_id": correlation_id,
+        "body": messages[kind],
+        "priority": priorities[kind],
+        "tags": tags[kind],
+    }
+
+
 def publish(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
-    job_id = str(row.get("job_id") or "unknown")
-    terminal_status = str(row.get("terminal_status") or "unknown")
-    body = f"Grabowski job {job_id[-8:]} finished: {terminal_status}".encode("utf-8")
+    rendered = render_notification(row)
+    body = rendered["body"].encode("utf-8")
     request = urllib.request.Request(
         f"{server}/{topic}",
         data=body,
         method="POST",
         headers={
             "Title": "Grabowski",
-            "Priority": "3",
-            "Tags": "robot",
-            "User-Agent": "grabowski-ntfy-dispatch/1",
+            "Priority": rendered["priority"],
+            "Tags": rendered["tags"],
+            "X-Grabowski-Event-Class": rendered["event_class"],
+            "X-Grabowski-Correlation-Id": rendered["correlation_id"],
+            "User-Agent": "grabowski-ntfy-dispatch/2",
         },
     )
     with urllib.request.urlopen(request, timeout=10) as response:
