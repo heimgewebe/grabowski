@@ -29,6 +29,10 @@ MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
 FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
 EARLY_DISPATCHER_SAMPLE_COUNT = 2
 EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS = 0.05
+DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS = (5, 10, 20)
+DEPLOYMENT_CONTENTION_MAX_ATTEMPTS = (
+    len(DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS) + 1
+)
 
 
 class DeploymentContentionDeferred(RuntimeError):
@@ -559,6 +563,83 @@ def deployment_contention_preflight(
     return {**material, "evidence_sha256": canonical_json_sha256(material)}
 
 
+def wait_for_deployment_window(
+    *,
+    repo: Path,
+    canonical_repo: Path,
+    source_kind: str,
+    expected_head: str,
+    source_identity_sha256: str,
+) -> dict[str, Any]:
+    """Retry only explicit contention deferrals before validation begins."""
+    max_attempts = DEPLOYMENT_CONTENTION_MAX_ATTEMPTS
+    for attempt in range(1, max_attempts + 1):
+        verify_repository(repo, canonical_repo, source_kind, expected_head)
+        emit(
+            "repository-preflight-complete",
+            expected_head=expected_head,
+            source_kind=source_kind,
+            source_identity_sha256=source_identity_sha256,
+            contention_attempt=attempt,
+            contention_max_attempts=max_attempts,
+        )
+        contention = deployment_contention_preflight(
+            expected_head=expected_head,
+            source_identity_sha256=source_identity_sha256,
+        )
+        decision = contention.get("decision")
+        retry_delay_seconds = (
+            DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS[attempt - 1]
+            if attempt <= len(DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS)
+            else None
+        )
+        observation = {
+            **contention,
+            "contention_attempt": attempt,
+            "contention_max_attempts": max_attempts,
+            "retry_delay_seconds": (
+                retry_delay_seconds if decision == "defer" else None
+            ),
+        }
+        emit("deployment-contention-preflight-complete", **observation)
+        if decision == "proceed":
+            return observation
+        if decision != "defer":
+            raise RuntimeError(
+                "deployment contention preflight returned an invalid decision"
+            )
+        if retry_delay_seconds is None:
+            emit(
+                "deployment-contention-retry-exhausted",
+                contention_attempt=attempt,
+                contention_max_attempts=max_attempts,
+                expected_head=expected_head,
+                source_identity_sha256=source_identity_sha256,
+                evidence_sha256=contention.get("evidence_sha256"),
+                lock_state=contention.get("lock", {}).get("state"),
+                dispatcher_state=contention.get("dispatcher", {}).get("state"),
+            )
+            raise DeploymentContentionDeferred(
+                "deployment contention preflight exhausted its bounded retries: "
+                f"attempts={max_attempts}, "
+                f"lock={contention.get('lock', {}).get('state')}, "
+                f"dispatcher={contention.get('dispatcher', {}).get('state')}"
+            )
+        emit(
+            "deployment-contention-deferred",
+            contention_attempt=attempt,
+            contention_max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            expected_head=expected_head,
+            source_identity_sha256=source_identity_sha256,
+            evidence_sha256=contention.get("evidence_sha256"),
+            lock_state=contention.get("lock", {}).get("state"),
+            dispatcher_state=contention.get("dispatcher", {}).get("state"),
+        )
+        time.sleep(retry_delay_seconds)
+    raise AssertionError("unreachable deployment contention retry state")
+
+
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
     process = subprocess.Popen(argv, cwd=cwd, env=child_environment(), stdin=subprocess.DEVNULL, stdout=None, stderr=None, start_new_session=True)
@@ -628,29 +709,13 @@ def main() -> int:
             delay_seconds=args.delay_seconds,
         )
         time.sleep(args.delay_seconds)
-        verify_repository(
-            repo,
-            args.canonical_repo,
-            args.source_kind,
-            args.expected_head,
-        )
-        emit(
-            "repository-preflight-complete",
-            expected_head=args.expected_head,
+        wait_for_deployment_window(
+            repo=repo,
+            canonical_repo=args.canonical_repo,
             source_kind=args.source_kind,
-            source_identity_sha256=args.source_identity_sha256,
-        )
-        contention = deployment_contention_preflight(
             expected_head=args.expected_head,
             source_identity_sha256=args.source_identity_sha256,
         )
-        emit("deployment-contention-preflight-complete", **contention)
-        if contention["decision"] != "proceed":
-            raise DeploymentContentionDeferred(
-                "deployment contention preflight deferred validation: "
-                f"lock={contention['lock'].get('state')}, "
-                f"dispatcher={contention['dispatcher'].get('state')}"
-            )
         run_streamed(["make", "validate"], cwd=repo, timeout_seconds=1_200, phase="validate")
         verify_repository(
             repo,
