@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import fcntl
 import importlib.util
 import json
 import os
@@ -639,6 +640,71 @@ class DeployRuntimeTests(unittest.TestCase):
             with patch.object(deploy_runtime, "repo_dirty", return_value=True):
                 with self.assertRaisesRegex(deploy_runtime.DeployError, "Arbeitsbaum"):
                     deploy_runtime.verify_apply_snapshot_unchanged(ROOT, snapshot, release)
+
+    def test_lock_observation_does_not_create_missing_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            lock = state_root / "deploy.lock"
+            observed = deploy_runtime.observe_deployment_lock_availability(
+                lock, state_root=state_root
+            )
+            self.assertEqual(observed["state"], "available")
+            self.assertEqual(observed["reason"], "lock-file-absent")
+            self.assertFalse(observed["lock_file_present"])
+            self.assertFalse(lock.exists())
+
+    def test_lock_observation_reports_held_lock_without_rewriting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            lock = state_root / "deploy.lock"
+            original = b'{"pid": 42}\n'
+            lock.write_bytes(original)
+            lock.chmod(0o600)
+            descriptor = os.open(lock, os.O_RDWR | os.O_CLOEXEC)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed = deploy_runtime.observe_deployment_lock_availability(
+                    lock, state_root=state_root
+                )
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            self.assertEqual(observed["state"], "busy")
+            self.assertEqual(observed["reason"], "lock-held")
+            self.assertEqual(lock.read_bytes(), original)
+
+    def test_lock_observation_reports_available_private_lock_without_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            lock = state_root / "deploy.lock"
+            original = b'{"pid": 42}\n'
+            lock.write_bytes(original)
+            lock.chmod(0o600)
+            observed = deploy_runtime.observe_deployment_lock_availability(
+                lock, state_root=state_root
+            )
+            self.assertEqual(observed["state"], "available")
+            self.assertEqual(
+                observed["reason"],
+                "lock-acquired-and-released-without-write",
+            )
+            self.assertEqual(lock.read_bytes(), original)
+
+    def test_lock_observation_fails_closed_on_mode_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory)
+            lock = state_root / "deploy.lock"
+            lock.write_text("{}\n", encoding="utf-8")
+            lock.chmod(0o644)
+            observed = deploy_runtime.observe_deployment_lock_availability(
+                lock, state_root=state_root
+            )
+            self.assertEqual(observed["state"], "unknown")
+            self.assertEqual(
+                observed["reason"],
+                "lock-file-not-private-owner-controlled-regular-file",
+            )
+            self.assertEqual(lock.stat().st_mode & 0o777, 0o644)
 
     def test_deployment_lock_is_released_after_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

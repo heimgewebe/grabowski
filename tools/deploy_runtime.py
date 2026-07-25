@@ -785,6 +785,149 @@ def snapshot_from_worktree(repo: Path) -> Snapshot:
     )
 
 
+def observe_deployment_lock_availability(
+    lock_path: Path,
+    *,
+    state_root: Path = DEFAULT_STATE_ROOT,
+) -> dict[str, Any]:
+    """Observe the canonical deploy lock without creating or rewriting it."""
+    observed_at_unix_ns = time.time_ns()
+    base = {
+        "schema_version": 1,
+        "kind": "grabowski_deployment_lock_observation",
+        "observed_at_unix_ns": observed_at_unix_ns,
+        "lock_path_sha256": hashlib.sha256(
+            os.fsencode(os.path.abspath(os.fspath(lock_path.expanduser())))
+        ).hexdigest(),
+        "does_not_establish": [
+            "that_the_lock_remains_available_after_observation",
+            "deployment_authority",
+            "permission_to_remove_or_rewrite_the_lock",
+        ],
+    }
+
+    def result(
+        state: str,
+        reason: str,
+        *,
+        lock_file_present: bool | None,
+        error_type: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            **base,
+            "state": state,
+            "reason": reason,
+            "lock_file_present": lock_file_present,
+            "error_type": error_type,
+        }
+
+    try:
+        if state_root.is_symlink():
+            return result(
+                "unknown",
+                "state-root-symlink",
+                lock_file_present=None,
+            )
+        state_root_real = state_root.expanduser().resolve(strict=True)
+        root_stat = state_root_real.stat()
+        if not statmod.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != os.getuid():
+            return result(
+                "unknown",
+                "state-root-not-owner-controlled-directory",
+                lock_file_present=None,
+            )
+        safe_lock = normalize_managed_path(lock_path, allowed_root=state_root_real)
+        if safe_lock.parent != state_root_real or safe_lock.is_symlink():
+            return result(
+                "unknown",
+                "lock-path-not-canonical",
+                lock_file_present=None,
+            )
+    except (OSError, DeployError) as exc:
+        return result(
+            "unknown",
+            "lock-path-validation-failed",
+            lock_file_present=None,
+            error_type=type(exc).__name__,
+        )
+
+    dir_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        dir_flags |= os.O_DIRECTORY
+    try:
+        dir_fd = os.open(state_root_real, dir_flags)
+    except OSError as exc:
+        return result(
+            "unknown",
+            "state-root-open-failed",
+            lock_file_present=None,
+            error_type=type(exc).__name__,
+        )
+    fd: int | None = None
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(safe_lock.name, flags, dir_fd=dir_fd)
+        except FileNotFoundError:
+            return result(
+                "available",
+                "lock-file-absent",
+                lock_file_present=False,
+            )
+        except OSError as exc:
+            return result(
+                "unknown",
+                "lock-open-failed",
+                lock_file_present=None,
+                error_type=type(exc).__name__,
+            )
+        opened = os.fstat(fd)
+        try:
+            linked = os.stat(safe_lock.name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            return result(
+                "unknown",
+                "lock-link-read-failed",
+                lock_file_present=True,
+                error_type=type(exc).__name__,
+            )
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+            or linked.st_dev != opened.st_dev
+            or linked.st_ino != opened.st_ino
+            or linked.st_nlink != 1
+        ):
+            return result(
+                "unknown",
+                "lock-file-not-private-owner-controlled-regular-file",
+                lock_file_present=True,
+            )
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return result(
+                "busy",
+                "lock-held",
+                lock_file_present=True,
+            )
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return result(
+                "available",
+                "lock-acquired-and-released-without-write",
+                lock_file_present=True,
+            )
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(dir_fd)
+
+
 @contextmanager
 def deployment_lock(
     lock_path: Path,
