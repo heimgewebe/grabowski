@@ -252,6 +252,16 @@ class AuditSignalTests(unittest.TestCase):
         schema = json.loads(
             (ROOT / "contracts/audit-signal.v1.schema.json").read_text(encoding="utf-8")
         )
+        self.assertFalse(schema["properties"]["source_binding"]["additionalProperties"])
+        self.assertEqual(
+            set(schema["properties"]["source_binding"]["required"]),
+            set(schema["properties"]["source_binding"]["properties"]),
+        )
+        self.assertFalse(schema["properties"]["source_health"]["additionalProperties"])
+        self.assertEqual(
+            set(schema["properties"]["source_health"]["required"]),
+            set(schema["properties"]["source_health"]["properties"]),
+        )
         refs = [item["$ref"] for item in schema["properties"]["signals"]["prefixItems"]]
         self.assertEqual(
             refs,
