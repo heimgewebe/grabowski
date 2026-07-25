@@ -254,6 +254,12 @@
         "client_snapshot_fresh_and_matched": {
           "type": "boolean"
         },
+        "client_snapshot_receipt_valid": {
+          "type": "boolean"
+        },
+        "client_snapshot_timestamp_valid": {
+          "type": "boolean"
+        },
         "friction_available": {
           "type": "boolean"
         },
@@ -277,7 +283,9 @@
         "friction_recent_window_complete",
         "runtime_status_available",
         "runtime_healthy",
-        "client_snapshot_fresh_and_matched"
+        "client_snapshot_fresh_and_matched",
+        "client_snapshot_timestamp_valid",
+        "client_snapshot_receipt_valid"
       ],
       "type": "object"
     },

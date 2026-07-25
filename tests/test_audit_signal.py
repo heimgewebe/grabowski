@@ -248,6 +248,92 @@ class AuditSignalTests(unittest.TestCase):
         self.assertEqual(stale["status"], "indeterminate")
         self.assertEqual(stale["evidence_quality"], "live_runtime_not_clean")
 
+    def test_stale_attention_requires_valid_snapshot_timestamp(self) -> None:
+        _, _, stale = signal._audit_friction_signals(
+            {
+                "available": True,
+                "integrity_valid": True,
+                "has_more": False,
+                "events": [],
+            },
+            {
+                "available": True,
+                "healthy": True,
+                "runtime_matches_contract": True,
+                "client_snapshot_observable": True,
+                "client_snapshot_fresh": True,
+                "client_snapshot_matched": True,
+                "client_snapshot_created_at_unix": None,
+            },
+            start_unix=1_800_000_000 - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=1_800_000_000,
+        )
+        self.assertEqual(stale["status"], "indeterminate")
+        self.assertEqual(
+            stale["evidence_quality"], "runtime_snapshot_timestamp_unavailable"
+        )
+        self.assertIsNone(stale["count"])
+
+    def test_stale_attention_requires_snapshot_receipt(self) -> None:
+        _, _, stale = signal._audit_friction_signals(
+            {
+                "available": True,
+                "integrity_valid": True,
+                "has_more": False,
+                "events": [],
+            },
+            {
+                "available": True,
+                "healthy": True,
+                "runtime_matches_contract": True,
+                "client_snapshot_observable": True,
+                "client_snapshot_fresh": True,
+                "client_snapshot_matched": True,
+                "client_snapshot_created_at_unix": 1_800_000_000,
+                "client_snapshot_receipt_sha256": None,
+            },
+            start_unix=1_800_000_000 - signal.AUDIT_SIGNAL_WINDOW_SECONDS,
+            end_unix=1_800_000_000,
+        )
+        self.assertEqual(stale["status"], "indeterminate")
+        self.assertEqual(
+            stale["evidence_quality"], "runtime_snapshot_receipt_unavailable"
+        )
+        self.assertIsNone(stale["count"])
+
+    def test_unavailable_friction_source_does_not_claim_complete_window(self) -> None:
+        with patch.dict(sys.modules, {"grabowski_friction": None}, clear=False):
+            result = signal.build_projection(
+                [],
+                as_of_unix=1_800_000_000,
+                audit_source_binding={
+                    "snapshot_sha256": "a" * 64,
+                    "last_record_sha256": None,
+                },
+                runtime_status_provider=None,
+            )
+        self.assertFalse(result["source_health"]["friction_available"])
+        self.assertFalse(result["source_health"]["friction_integrity_valid"])
+        self.assertFalse(result["source_health"]["friction_recent_window_complete"])
+        self.assertNotEqual(result["recommended_next_action"], "none")
+
+    def test_client_snapshot_health_requires_observable_snapshot(self) -> None:
+        runtime_status = {
+            "healthy": True,
+            "tool_contract": {
+                "runtime_matches_deployment_contract": True,
+                "client_snapshot_observable": False,
+                "client_snapshot": {"fresh": True, "matched": True},
+            },
+        }
+        result = signal.build_projection(
+            [],
+            as_of_unix=1_800_000_000,
+            audit_source_binding={},
+            runtime_status_provider=lambda **kwargs: runtime_status,
+        )
+        self.assertFalse(result["source_health"]["client_snapshot_fresh_and_matched"])
+
     def test_schema_fixes_signal_order(self) -> None:
         schema = json.loads(
             (ROOT / "contracts/audit-signal.v1.schema.json").read_text(encoding="utf-8")

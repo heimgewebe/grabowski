@@ -47,6 +47,22 @@ def _label(value: Any, *, fallback: str = "unknown") -> str:
     return value if AUDIT_PROJECTION_LABEL_RE.fullmatch(value) else "<redacted>"
 
 
+def _audit_sha256_valid(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _runtime_snapshot_timestamp_valid(value: Any, *, end_unix: int) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= end_unix + AUDIT_FUTURE_TOLERANCE_SECONDS
+    )
+
+
 def _audit_record_ref(record: dict[str, Any]) -> str | None:
     value = record.get("record_sha256")
     if (
@@ -303,6 +319,124 @@ def _audit_friction_window_complete(source: dict[str, Any], *, start_unix: int) 
     return bool(timestamps and min(timestamps) <= start_unix)
 
 
+def _audit_stale_attention_signal(
+    events: list[dict[str, Any]],
+    runtime_source: dict[str, Any],
+    *,
+    window_complete: bool,
+    end_unix: int,
+) -> dict[str, Any]:
+    if runtime_source.get("available") is not True:
+        return {
+            "status": "indeterminate",
+            "severity": "unknown",
+            "count": None,
+            "observed_count": None,
+            "evidence_refs": [],
+            "evidence_quality": "runtime_status_unavailable",
+            "recommended_action": "restore live runtime observation before classifying attention as stale",
+            "details": {"reason": runtime_source.get("reason")},
+        }
+
+    runtime_contract_clean = bool(
+        runtime_source.get("healthy") is True
+        and runtime_source.get("runtime_matches_contract") is True
+        and runtime_source.get("client_snapshot_observable") is True
+        and runtime_source.get("client_snapshot_fresh") is True
+        and runtime_source.get("client_snapshot_matched") is True
+    )
+    if not runtime_contract_clean:
+        return {
+            "status": "indeterminate",
+            "severity": "unknown",
+            "count": None,
+            "observed_count": None,
+            "evidence_refs": [],
+            "evidence_quality": "live_runtime_not_clean",
+            "recommended_action": "restore a healthy contract-matched runtime snapshot before classifying attention as stale",
+            "details": {
+                "live_runtime_clean": False,
+                "window_complete": window_complete,
+                "reason": "runtime_or_client_snapshot_not_healthy_fresh_and_matched",
+            },
+        }
+
+    snapshot_created = runtime_source.get("client_snapshot_created_at_unix")
+    if not _runtime_snapshot_timestamp_valid(snapshot_created, end_unix=end_unix):
+        return {
+            "status": "indeterminate",
+            "severity": "unknown",
+            "count": None,
+            "observed_count": None,
+            "evidence_refs": [],
+            "evidence_quality": "runtime_snapshot_timestamp_unavailable",
+            "recommended_action": "restore a valid client snapshot timestamp before classifying attention as stale",
+            "details": {
+                "live_runtime_clean": False,
+                "window_complete": window_complete,
+                "reason": "client_snapshot_created_at_unix_missing_or_invalid",
+            },
+        }
+
+    snapshot_receipt = runtime_source.get("client_snapshot_receipt_sha256")
+    if not _audit_sha256_valid(snapshot_receipt):
+        return {
+            "status": "indeterminate",
+            "severity": "unknown",
+            "count": None,
+            "observed_count": None,
+            "evidence_refs": [],
+            "evidence_quality": "runtime_snapshot_receipt_unavailable",
+            "recommended_action": "restore a valid client snapshot receipt before classifying attention as stale",
+            "details": {
+                "live_runtime_clean": False,
+                "window_complete": window_complete,
+                "reason": "client_snapshot_receipt_sha256_missing_or_invalid",
+            },
+        }
+
+    stale_candidates = [
+        event
+        for event in events
+        if event.get("kind") == "connector_snapshot"
+        and _audit_event_unresolved(event)
+        and isinstance(event.get("recorded_at_unix"), int)
+        and event["recorded_at_unix"] < snapshot_created
+    ]
+    stale_refs = [
+        f"friction-event:{event['event_id']}"
+        for event in stale_candidates
+        if isinstance(event.get("event_id"), str) and event.get("event_id")
+    ]
+    return {
+        "status": (
+            "observed"
+            if stale_candidates
+            else ("clear" if window_complete else "indeterminate")
+        ),
+        "severity": (
+            "medium" if stale_candidates else ("none" if window_complete else "unknown")
+        ),
+        "count": len(stale_candidates),
+        "observed_count": len(stale_candidates),
+        "evidence_refs": stale_refs,
+        "evidence_quality": "friction_event_bound_to_later_fresh_matched_client_snapshot",
+        "recommended_action": (
+            "review and close or reopen each candidate with the current runtime receipt"
+            if stale_candidates
+            else "none"
+        ),
+        "details": {
+            "live_runtime_clean": True,
+            "client_snapshot_created_at_unix": snapshot_created,
+            "client_snapshot_receipt_sha256": snapshot_receipt,
+            "candidate_semantics": "closeout review only; no automatic resolution",
+            "window_complete": window_complete,
+            "count_semantics": "exact" if window_complete else "lower_bound",
+        },
+    }
+
+
 def _audit_friction_signals(
     source: dict[str, Any],
     runtime_source: dict[str, Any],
@@ -437,88 +571,12 @@ def _audit_friction_signals(
         },
     }
 
-    runtime_clean = bool(
-        runtime_source.get("available") is True
-        and runtime_source.get("healthy") is True
-        and runtime_source.get("runtime_matches_contract") is True
-        and runtime_source.get("client_snapshot_observable") is True
-        and runtime_source.get("client_snapshot_fresh") is True
-        and runtime_source.get("client_snapshot_matched") is True
+    stale_attention = _audit_stale_attention_signal(
+        events,
+        runtime_source,
+        window_complete=window_complete,
+        end_unix=end_unix,
     )
-    snapshot_created = runtime_source.get("client_snapshot_created_at_unix")
-    stale_candidates: list[dict[str, Any]] = []
-    if runtime_clean and isinstance(snapshot_created, int):
-        stale_candidates = [
-            event
-            for event in events
-            if event.get("kind") == "connector_snapshot"
-            and _audit_event_unresolved(event)
-            and isinstance(event.get("recorded_at_unix"), int)
-            and event["recorded_at_unix"] < snapshot_created
-        ]
-    stale_refs = [
-        f"friction-event:{event['event_id']}"
-        for event in stale_candidates
-        if isinstance(event.get("event_id"), str) and event.get("event_id")
-    ]
-    if runtime_source.get("available") is not True:
-        stale_attention = {
-            "status": "indeterminate",
-            "severity": "unknown",
-            "count": None,
-            "observed_count": None,
-            "evidence_refs": [],
-            "evidence_quality": "runtime_status_unavailable",
-            "recommended_action": "restore live runtime observation before classifying attention as stale",
-            "details": {"reason": runtime_source.get("reason")},
-        }
-    elif not runtime_clean:
-        stale_attention = {
-            "status": "indeterminate",
-            "severity": "unknown",
-            "count": None,
-            "observed_count": None,
-            "evidence_refs": [],
-            "evidence_quality": "live_runtime_not_clean",
-            "recommended_action": "restore a healthy contract-matched runtime snapshot before classifying attention as stale",
-            "details": {
-                "live_runtime_clean": False,
-                "window_complete": window_complete,
-                "reason": "runtime_or_client_snapshot_not_healthy_fresh_and_matched",
-            },
-        }
-    else:
-        stale_attention = {
-            "status": (
-                "observed"
-                if stale_candidates
-                else ("clear" if window_complete else "indeterminate")
-            ),
-            "severity": (
-                "medium"
-                if stale_candidates
-                else ("none" if window_complete else "unknown")
-            ),
-            "count": len(stale_candidates),
-            "observed_count": len(stale_candidates),
-            "evidence_refs": stale_refs,
-            "evidence_quality": "friction_event_bound_to_later_fresh_matched_client_snapshot",
-            "recommended_action": (
-                "review and close or reopen each candidate with the current runtime receipt"
-                if stale_candidates
-                else "none"
-            ),
-            "details": {
-                "live_runtime_clean": runtime_clean,
-                "client_snapshot_created_at_unix": snapshot_created,
-                "client_snapshot_receipt_sha256": runtime_source.get(
-                    "client_snapshot_receipt_sha256"
-                ),
-                "candidate_semantics": "closeout review only; no automatic resolution",
-                "window_complete": window_complete,
-                "count_semantics": "exact" if window_complete else "lower_bound",
-            },
-        }
     return contradiction, repeated_blockade, stale_attention
 
 
@@ -654,19 +712,35 @@ def build_projection(
         repeated_blockade,
         stale_attention,
     ]
+    friction_available = friction_source.get("available") is True
+    friction_integrity_valid = friction_source.get("integrity_valid") is True
+    friction_recent_window_complete = bool(
+        friction_available
+        and friction_integrity_valid
+        and _audit_friction_window_complete(friction_source, start_unix=start_unix)
+    )
+    client_snapshot_timestamp_valid = _runtime_snapshot_timestamp_valid(
+        runtime_source.get("client_snapshot_created_at_unix"), end_unix=as_of_unix
+    )
+    client_snapshot_receipt_valid = _audit_sha256_valid(
+        runtime_source.get("client_snapshot_receipt_sha256")
+    )
     source_health = {
         "audit_chain_verified": True,
-        "friction_available": friction_source.get("available") is True,
-        "friction_integrity_valid": friction_source.get("integrity_valid") is True,
-        "friction_recent_window_complete": _audit_friction_window_complete(
-            friction_source, start_unix=start_unix
-        ),
+        "friction_available": friction_available,
+        "friction_integrity_valid": friction_integrity_valid,
+        "friction_recent_window_complete": friction_recent_window_complete,
         "runtime_status_available": runtime_source.get("available") is True,
         "runtime_healthy": runtime_source.get("healthy") is True,
         "client_snapshot_fresh_and_matched": bool(
-            runtime_source.get("client_snapshot_fresh") is True
+            runtime_source.get("client_snapshot_observable") is True
+            and runtime_source.get("client_snapshot_fresh") is True
             and runtime_source.get("client_snapshot_matched") is True
+            and client_snapshot_timestamp_valid
+            and client_snapshot_receipt_valid
         ),
+        "client_snapshot_timestamp_valid": client_snapshot_timestamp_valid,
+        "client_snapshot_receipt_valid": client_snapshot_receipt_valid,
     }
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -695,7 +769,15 @@ def build_projection(
                 if signal["status"] == "observed"
                 and signal["recommended_action"] != "none"
             ),
-            "none",
+            next(
+                (
+                    signal["recommended_action"]
+                    for signal in signals
+                    if signal["status"] == "indeterminate"
+                    and signal["recommended_action"] != "none"
+                ),
+                "none",
+            ),
         ),
         "does_not_establish": [
             "causality",
