@@ -9419,6 +9419,7 @@ def grip_run(
         {
             "_server_runtime_actor_identity",
             "_server_task_lease_delegation",
+            "_server_operator_lease_delegation",
         }.intersection(raw_parameters)
     )
     if reserved_server_parameters:
@@ -9479,6 +9480,31 @@ def grip_run(
                     grabowski_merge_guard.issue_server_task_lease_delegation(
                         actor_identity,
                         task_evidence,
+                        captain_request_sha256_value=(
+                            grabowski_merge_guard.captain_request_sha256(
+                                dispatch_parameters
+                            )
+                        ),
+                    )
+                )
+            elif (
+                isinstance(requested_lease_owner, str)
+                and re.fullmatch(
+                    r"operator:[A-Za-z0-9._:@-]{1,119}", requested_lease_owner
+                )
+                is not None
+            ):
+                import grabowski_resources
+
+                operator_evidence = (
+                    grabowski_resources.operator_lease_delegation_evidence(
+                        requested_lease_owner
+                    )
+                )
+                dispatch_parameters["_server_operator_lease_delegation"] = (
+                    grabowski_merge_guard.issue_server_operator_lease_delegation(
+                        actor_identity,
+                        operator_evidence,
                         captain_request_sha256_value=(
                             grabowski_merge_guard.captain_request_sha256(
                                 dispatch_parameters
