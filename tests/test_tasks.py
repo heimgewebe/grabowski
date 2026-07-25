@@ -374,6 +374,17 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("completed", result["observed_task_state"])
         self.assertEqual(sealed, result["sealed"])
         seal_call.assert_called_once()
+        record = tasks._row(task_id)
+        self.assertEqual(
+            routing_shadow.build_direct_task_identity(
+                host=str(record["host"]),
+                argv_sha256=str(record["argv_sha256"]),
+                cwd=str(record["cwd"]),
+                resource_keys=tasks._record_resource_keys(record),
+                runtime_seconds=int(record["runtime_seconds"]),
+            ),
+            seal_call.call_args.kwargs["authoritative_task_identity"],
+        )
 
         with patch.object(tasks, "_observe", return_value={"state": "completed"}):
             with self.assertRaisesRegex(ValueError, "requires execution_provenance"):
@@ -392,6 +403,37 @@ class TaskTests(unittest.TestCase):
                     },
                     [],
                 )
+
+    def test_task_routing_shadow_seal_rejects_missing_direct_binding(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        cohort_root = self.root / "routing-shadow-cohort"
+        with (
+            patch.object(tasks, "_observe", return_value={"state": "completed"}),
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.dict(
+                os.environ,
+                {"GRABOWSKI_ROUTING_SHADOW_COHORT_ROOT": str(cohort_root)},
+            ),
+        ):
+            with self.assertRaises(routing_shadow.ShadowCaptureError):
+                tasks.grabowski_task_routing_shadow_seal(
+                    task_id,
+                    {
+                        "status": "abstained",
+                        "reason_code": "no_semantic_review",
+                        "observed_at": "2026-07-24T17:31:00Z",
+                    },
+                    [],
+                    {
+                        "status": "completed",
+                        "observed_at": "2026-07-24T17:30:30Z",
+                        "evidence_refs": ["artifact:task-finalization"],
+                    },
+                    [],
+                )
+        self.assertFalse((cohort_root / "eligibility").exists())
+        self.assertFalse((cohort_root / "records").exists())
 
     def test_systemd_escape_argv_doubles_only_dollars_without_mutating_input(self) -> None:
         command = [

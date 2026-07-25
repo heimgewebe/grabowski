@@ -109,6 +109,27 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
             frozen_at=frozen_at or self.frozen_at,
         )
 
+    def _authoritative_identity(
+        self,
+        *,
+        host: str = "heim-pc",
+        argv_sha256: str | None = None,
+        cwd: str = "/private/operator/worktree",
+        resource_keys: list[str] | None = None,
+        runtime_seconds: int = 60,
+    ) -> dict[str, object]:
+        return capture.build_direct_task_identity(
+            host=host,
+            argv_sha256=argv_sha256 or "2" * 64,
+            cwd=cwd,
+            resource_keys=(
+                ["repo:/private/operator/worktree"]
+                if resource_keys is None
+                else resource_keys
+            ),
+            runtime_seconds=runtime_seconds,
+        )
+
     def test_direct_route_replay_is_surface_bound(self) -> None:
         normalized = workspace._normalize_route_evidence(
             self.route, execution_surface="direct_task"
@@ -169,7 +190,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
         route = capture._validated_route_evidence(
             self.route, execution_surface="direct_task"
         )
-        identity = capture._direct_task_identity(
+        identity = capture.build_direct_task_identity(
             host="heim-pc",
             argv_sha256="2" * 64,
             cwd="/private/operator/worktree",
@@ -228,6 +249,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
                 "evidence_refs": ["artifact:task-finalization"],
             },
             semantic_assessments=[],
+            authoritative_task_identity=self._authoritative_identity(),
             root=self.root,
             captured_at="2026-07-24T17:32:00Z",
         )
@@ -270,10 +292,51 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
                     "evidence_refs": ["artifact:task-finalization"],
                 },
                 semantic_assessments=[],
+                authoritative_task_identity=self._authoritative_identity(),
                 root=self.root,
                 captured_at="2026-07-24T17:32:00Z",
             )
         self.assertEqual([], list((self.root / "records").iterdir()))
+
+    def test_direct_task_seal_rejects_authoritative_identity_drift_before_publication(
+        self,
+    ) -> None:
+        self._capture()
+        variants = {
+            "host_sha256": self._authoritative_identity(host="other-host"),
+            "argv_sha256": self._authoritative_identity(argv_sha256="3" * 64),
+            "cwd_sha256": self._authoritative_identity(cwd="/other/worktree"),
+            "resource_keys_sha256": self._authoritative_identity(
+                resource_keys=["repo:/other/worktree"]
+            ),
+            "runtime_seconds": self._authoritative_identity(runtime_seconds=61),
+        }
+        for field, identity in variants.items():
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    capture.ShadowCaptureError,
+                    f"authoritative task identity: {field}",
+                ):
+                    capture.seal_direct_task_case(
+                        task_id=self.task_id,
+                        outcome={
+                            "status": "abstained",
+                            "reason_code": "no_semantic_review",
+                            "observed_at": "2026-07-24T17:31:00Z",
+                        },
+                        primary_evidence_refs=[],
+                        execution_provenance={
+                            "status": "completed",
+                            "observed_at": "2026-07-24T17:30:30Z",
+                            "evidence_refs": ["artifact:task-finalization"],
+                        },
+                        semantic_assessments=[],
+                        authoritative_task_identity=identity,
+                        root=self.root,
+                        captured_at="2026-07-24T17:32:00Z",
+                    )
+                self.assertEqual([], list((self.root / "eligibility").iterdir()))
+                self.assertEqual([], list((self.root / "records").iterdir()))
 
     def test_direct_task_case_seals_only_explicit_outcome(self) -> None:
         self._capture()
@@ -291,6 +354,7 @@ class DirectTaskRoutingShadowTests(unittest.TestCase):
                 "evidence_refs": ["artifact:task-finalization"],
             },
             semantic_assessments=[],
+            authoritative_task_identity=self._authoritative_identity(),
             root=self.root,
             captured_at="2026-07-24T17:32:00Z",
         )
