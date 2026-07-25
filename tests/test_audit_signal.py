@@ -127,6 +127,23 @@ class AuditSignalTests(unittest.TestCase):
         self.assertNotIn("producer and consumer contract mismatch", encoded)
         self.assertNotIn("gate evidence missing", encoded)
 
+    def test_contract_contradiction_requires_conflict_language(self) -> None:
+        normal = {
+            "failure_class": "contract_error",
+            "kind": "ci_contract",
+            "operation": "contract_validation",
+            "symptom": "validator reported a missing generated file",
+        }
+        dual = {
+            **normal,
+            "symptom": "receipt reported released while envelope simultaneously reported retained",
+        }
+        self.assertIsNone(signal._audit_contract_contradiction_kind(normal))
+        self.assertEqual(
+            signal._audit_contract_contradiction_kind(dual),
+            "structured_contract_mismatch",
+        )
+
     def test_transition_completion_closes_gap(self) -> None:
         now = 1_800_000_000
         result = signal._audit_transition_gap_signal(
