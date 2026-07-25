@@ -150,6 +150,7 @@ Die Schnittstelle leitet kein Outcome aus Lifecycle-Status ab. Das Outcome-Input
 - Freeze nach finaler argv-Bindung und Operator-Mutationsprüfung, aber vor Lease, Task-DB und Prozessstart;
 - ein Capture-Fehler bleibt im Taskstart-Beleg sichtbar, darf den Task aber nicht blockieren;
 - die unveränderliche `operator-routing-shadow-direct-task-binding.v1` speichert keine rohen Host-, argv-, cwd- oder Ressourcenwerte, sondern ausschließlich ihre SHA-256-Identitäten;
+- vor jeder Versiegelung werden Host, `argv_sha256`, Arbeitsverzeichnis, normalisierte Ressourcenmenge und Laufzeit aus dem autoritativen terminalen Taskdatensatz erneut in dieselbe Identität überführt und exakt mit der create-only Bindung verglichen; jede Abweichung blockiert vor Eligibility- und Record-Publikation;
 - wiederholte identische Starts konvergieren auf dieselbe Bindung; wechselnde Attempt-IDs sind nicht Teil ihrer Identität;
 - ein späterer Taskfehler bleibt als prospektiver unversiegelter Fall sichtbar und darf nicht aus der Kohorte verschwinden.
 

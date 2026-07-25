@@ -2554,7 +2554,7 @@ def _direct_task_workspace_id(task_id: str) -> str:
         raise ShadowCaptureError("direct task workspace identity is invalid")
     return workspace_id
 
-def _direct_task_identity(
+def build_direct_task_identity(
     *,
     host: str,
     argv_sha256: str,
@@ -2562,6 +2562,7 @@ def _direct_task_identity(
     resource_keys: list[str],
     runtime_seconds: int,
 ) -> dict[str, Any]:
+    """Build the privacy-minimized identity bound to one direct task."""
     if not isinstance(host, str) or not 1 <= len(host) <= 255:
         raise ShadowCaptureError("direct task host is invalid")
     if not isinstance(argv_sha256, str) or SHA256_RE.fullmatch(argv_sha256) is None:
@@ -2701,6 +2702,34 @@ def validate_direct_task_binding(value: Any) -> dict[str, Any]:
         raise ShadowCaptureError("direct task binding_id is invalid")
     return value
 
+
+def validate_direct_task_binding_task_identity(
+    binding: Any, authoritative_task_identity: Any
+) -> dict[str, Any]:
+    """Fail closed when a frozen binding differs from current task truth."""
+    validated = validate_direct_task_binding(binding)
+    expected_fields = {
+        "host_sha256",
+        "argv_sha256",
+        "cwd_sha256",
+        "resource_keys_sha256",
+        "runtime_seconds",
+    }
+    if (
+        not isinstance(authoritative_task_identity, dict)
+        or set(authoritative_task_identity) != expected_fields
+    ):
+        raise ShadowCaptureError("authoritative direct task identity shape is invalid")
+    current = {key: authoritative_task_identity[key] for key in sorted(expected_fields)}
+    frozen = validated["task_identity"]
+    drift_fields = [key for key in sorted(expected_fields) if frozen[key] != current[key]]
+    if drift_fields:
+        raise ShadowCaptureError(
+            "direct task binding does not match authoritative task identity: "
+            + ",".join(drift_fields)
+        )
+    return validated
+
 def _write_direct_task_binding_idempotent(
     path: Path, binding: dict[str, Any]
 ) -> tuple[dict[str, Any], bool]:
@@ -2755,7 +2784,7 @@ def capture_direct_task_start_best_effort(
         route = _validated_route_evidence(
             route_evidence, execution_surface="direct_task"
         )
-        identity = _direct_task_identity(
+        identity = build_direct_task_identity(
             host=host,
             argv_sha256=argv_sha256,
             cwd=cwd,
@@ -2838,6 +2867,7 @@ def seal_direct_task_case(
     primary_evidence_refs: list[str],
     execution_provenance: dict[str, Any] | None,
     semantic_assessments: list[dict[str, Any]] | None,
+    authoritative_task_identity: dict[str, Any],
     root: Path | None = None,
     captured_at: str | None = None,
 ) -> dict[str, Any]:
@@ -2853,7 +2883,10 @@ def seal_direct_task_case(
         raise ShadowCaptureError(
             "reviewed direct task outcome requires at least 2 independent semantic assessments"
         )
-    binding = read_direct_task_binding(task_id, root=cohort_root)
+    binding = validate_direct_task_binding_task_identity(
+        read_direct_task_binding(task_id, root=cohort_root),
+        authoritative_task_identity,
+    )
     prospective_dir, _, _, _ = _cohort_directories(cohort_root)
     prospective = _read_regular_json(
         prospective_dir / f"{binding['prospective']['workspace_case_id']}.json",

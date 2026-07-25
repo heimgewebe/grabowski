@@ -3205,12 +3205,20 @@ def grabowski_task_routing_shadow_seal(
     )
     import grabowski_operator_routing_shadow_capture as routing_shadow
 
+    authoritative_task_identity = routing_shadow.build_direct_task_identity(
+        host=str(record["host"]),
+        argv_sha256=str(record["argv_sha256"]),
+        cwd=str(record["cwd"]),
+        resource_keys=_record_resource_keys(record),
+        runtime_seconds=int(record["runtime_seconds"]),
+    )
     sealed = routing_shadow.seal_direct_task_case(
         task_id=task_id,
         outcome=outcome,
         primary_evidence_refs=primary_evidence_refs,
         execution_provenance=execution_provenance,
         semantic_assessments=semantic_assessments,
+        authoritative_task_identity=authoritative_task_identity,
         root=cohort_root,
     )
     audit = {
