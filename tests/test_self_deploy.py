@@ -91,6 +91,33 @@ if SCHEDULER_SPEC is None or SCHEDULER_SPEC.loader is None:
 SCHEDULER = importlib.util.module_from_spec(SCHEDULER_SPEC)
 SCHEDULER_SPEC.loader.exec_module(SCHEDULER)
 
+
+def _dispatcher_metrics(
+    *,
+    queue: float = 0.0,
+    workers: float = 0.0,
+    polled: float = 7.0,
+    enqueued: float = 7.0,
+    responses: float = 7.0,
+    process_start: float = 100.0,
+) -> dict[str, float]:
+    return {
+        "commands_queue_length": queue,
+        "dispatcher_worker_pool_occupancy": workers,
+        "commands_polled_total": polled,
+        "commands_enqueued_total": enqueued,
+        "commands_final_responses_total": responses,
+        "process_start_time_seconds": process_start,
+    }
+
+
+def _contention_result(*, decision: str = "proceed") -> dict[str, object]:
+    return {
+        "decision": decision,
+        "lock": {"state": "available" if decision == "proceed" else "busy"},
+        "dispatcher": {"state": "idle"},
+    }
+
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
@@ -1088,10 +1115,153 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "invalid branch state"):
                     RUNNER.verify_repository(repo, repo, "canonical-main", expected)
 
+    def test_dispatcher_contention_observation_accepts_two_stable_idle_samples(self) -> None:
+        metrics = _dispatcher_metrics()
+        with patch.object(
+            RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+        ), patch.object(
+            RUNNER.deploy_dual,
+            "_parse_tunnel_drain_metrics",
+            side_effect=[metrics.copy(), metrics.copy()],
+        ), patch.object(RUNNER.time, "sleep") as sleep:
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "idle")
+        self.assertEqual(observed["reason"], "two-stable-idle-samples")
+        self.assertEqual(len(observed["samples"]), 2)
+        sleep.assert_called_once_with(
+            RUNNER.EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS
+        )
+
+    def test_dispatcher_contention_observation_reports_worker_activity(self) -> None:
+        metrics = _dispatcher_metrics(workers=1.0)
+        with patch.object(
+            RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+        ), patch.object(
+            RUNNER.deploy_dual,
+            "_parse_tunnel_drain_metrics",
+            side_effect=[metrics.copy(), metrics.copy()],
+        ), patch.object(RUNNER.time, "sleep"):
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "busy")
+        self.assertEqual(observed["reason"], "dispatcher-work-observed")
+        self.assertEqual(
+            observed["busy_samples"][0]["mismatch"][
+                "dispatcher_worker_pool_occupancy"
+            ],
+            1.0,
+        )
+
+    def test_dispatcher_contention_observation_fails_closed_on_generation_drift(self) -> None:
+        with patch.object(
+            RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+        ), patch.object(
+            RUNNER.deploy_dual,
+            "_parse_tunnel_drain_metrics",
+            side_effect=[
+                _dispatcher_metrics(process_start=100.0),
+                _dispatcher_metrics(process_start=101.0),
+            ],
+        ), patch.object(RUNNER.time, "sleep"):
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "unknown")
+        self.assertEqual(observed["reason"], "dispatcher-generation-drift")
+
+    def test_dispatcher_contention_observation_fails_closed_on_counter_regression(self) -> None:
+        with patch.object(
+            RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+        ), patch.object(
+            RUNNER.deploy_dual,
+            "_parse_tunnel_drain_metrics",
+            side_effect=[
+                _dispatcher_metrics(polled=8.0, enqueued=8.0, responses=8.0),
+                _dispatcher_metrics(polled=7.0, enqueued=7.0, responses=7.0),
+            ],
+        ), patch.object(RUNNER.time, "sleep"):
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "unknown")
+        self.assertEqual(observed["reason"], "dispatcher-counter-regression")
+        self.assertIn("commands_polled_total", observed["regressed_counters"])
+
+    def test_dispatcher_contention_observation_detects_completed_activity_between_samples(self) -> None:
+        with patch.object(
+            RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+        ), patch.object(
+            RUNNER.deploy_dual,
+            "_parse_tunnel_drain_metrics",
+            side_effect=[
+                _dispatcher_metrics(polled=7.0, enqueued=7.0, responses=7.0),
+                _dispatcher_metrics(polled=8.0, enqueued=8.0, responses=8.0),
+            ],
+        ), patch.object(RUNNER.time, "sleep"):
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "busy")
+        self.assertEqual(observed["reason"], "dispatcher-activity-between-samples")
+
+    def test_dispatcher_contention_observation_fails_closed_without_metrics(self) -> None:
+        with patch.object(RUNNER.deploy_dual.core, "http_text", return_value=None):
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "unknown")
+        self.assertEqual(observed["reason"], "metrics-unavailable")
+
+    def test_contention_preflight_is_hash_bound_and_preserves_final_gates(self) -> None:
+        lock = {"state": "available", "observed_at_unix_ns": 1}
+        dispatcher = {"state": "idle", "observed_at_unix_ns": 2}
+        with patch.object(
+            RUNNER.deploy_core,
+            "observe_deployment_lock_availability",
+            return_value=lock,
+        ), patch.object(
+            RUNNER, "observe_tunnel_dispatcher_contention", return_value=dispatcher
+        ), patch.object(RUNNER.time, "time_ns", return_value=3):
+            result = RUNNER.deployment_contention_preflight(
+                expected_head="a" * 40,
+                source_identity_sha256="b" * 64,
+            )
+        material = {
+            key: value for key, value in result.items() if key != "evidence_sha256"
+        }
+        self.assertEqual(
+            result["evidence_sha256"], RUNNER.canonical_json_sha256(material)
+        )
+        self.assertEqual(result["decision"], "proceed")
+        self.assertFalse(result["validation_started"])
+        self.assertTrue(result["final_lock_and_drain_gates_required"])
+
+    def test_main_defers_before_validator_when_contention_is_observed(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        argv = [
+            "runner",
+            "--repo",
+            str(repo),
+            "--canonical-repo",
+            str(repo),
+            "--source-kind",
+            "canonical-main",
+            "--source-identity-sha256",
+            "0" * 64,
+            "--expected-head",
+            expected,
+            "--delay-seconds",
+            "5",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER, "verify_repository"
+        ) as verify, patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(decision="defer"),
+        ), patch.object(RUNNER, "run_streamed") as streamed:
+            self.assertEqual(RUNNER.main(), 1)
+        verify.assert_called_once()
+        streamed.assert_not_called()
+
     def test_main_validates_before_deploying(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(verify.call_count, 2)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
@@ -1195,7 +1365,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         repo = Path("/tmp/repository")
         expected = "f" * 40
         binding = {"expected_head": expected}
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "write_finalization_receipt") as write:
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "write_finalization_receipt") as write:
             self.assertEqual(RUNNER.main(), 0)
         write.assert_called_once_with(
             binding,

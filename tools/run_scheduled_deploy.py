@@ -10,8 +10,16 @@ import re
 import selectors
 import signal
 import subprocess
+import sys
 import time
 from typing import Any
+
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+import deploy_runtime as deploy_core
+import deploy_runtime_dual as deploy_dual
 
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 SOURCE_KINDS = frozenset({"canonical-main", "detached-worktree"})
@@ -19,6 +27,14 @@ MAX_CAPTURE_BYTES = 65_536
 MAX_MANIFEST_BYTES = 2_000_000
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
 FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+EARLY_DISPATCHER_SAMPLE_COUNT = 2
+EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS = 0.05
+
+
+class DeploymentContentionDeferred(RuntimeError):
+    """The cheap read-only preflight observed contention or uncertainty."""
+
+
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
 FINALIZATION_ENV = {
     "job_id": "GRABOWSKI_JOB_ID",
@@ -377,6 +393,172 @@ def verify_repository(
         raise RuntimeError("source repository is dirty")
 
 
+def observe_tunnel_dispatcher_contention() -> dict[str, Any]:
+    """Observe two bounded samples without draining, stopping, or signalling."""
+    observed_at_unix_ns = time.time_ns()
+    nonclaims = [
+        "that_the_dispatcher_remains_idle_after_observation",
+        "permission_to_stop_or_signal_dispatcher_work",
+        "replacement_of_the_final_stable_drain_gate",
+    ]
+    samples: list[dict[str, Any]] = []
+    for index in range(EARLY_DISPATCHER_SAMPLE_COUNT):
+        sample_time_ns = time.time_ns()
+        metrics_text = deploy_dual.core.http_text(deploy_dual.TUNNEL_METRICS_URL)
+        if metrics_text is None:
+            return {
+                "schema_version": 1,
+                "kind": "grabowski_tunnel_dispatcher_contention_observation",
+                "observed_at_unix_ns": observed_at_unix_ns,
+                "state": "unknown",
+                "reason": "metrics-unavailable",
+                "samples": samples,
+                "does_not_establish": nonclaims,
+            }
+        try:
+            observed = deploy_dual._parse_tunnel_drain_metrics(metrics_text)
+        except deploy_dual.core.DeployError as exc:
+            return {
+                "schema_version": 1,
+                "kind": "grabowski_tunnel_dispatcher_contention_observation",
+                "observed_at_unix_ns": observed_at_unix_ns,
+                "state": "unknown",
+                "reason": "metrics-invalid",
+                "error_type": type(exc).__name__,
+                "error_phase": exc.phase,
+                "samples": samples,
+                "does_not_establish": nonclaims,
+            }
+        samples.append(
+            {
+                "observed_at_unix_ns": sample_time_ns,
+                "metrics": {name: observed[name] for name in sorted(observed)},
+                "stability": deploy_dual._tunnel_drain_stability_snapshot(observed),
+            }
+        )
+        if index + 1 < EARLY_DISPATCHER_SAMPLE_COUNT:
+            time.sleep(EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS)
+
+    first = samples[0]
+    last = samples[-1]
+    first_stability = first["stability"]
+    last_stability = last["stability"]
+    if (
+        first_stability["process_start_time_seconds"]
+        != last_stability["process_start_time_seconds"]
+    ):
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_tunnel_dispatcher_contention_observation",
+            "observed_at_unix_ns": observed_at_unix_ns,
+            "state": "unknown",
+            "reason": "dispatcher-generation-drift",
+            "samples": samples,
+            "does_not_establish": nonclaims,
+        }
+    regressed = {
+        name: {
+            "first": first_stability[name],
+            "last": last_stability[name],
+        }
+        for name in deploy_dual.TUNNEL_DRAIN_COUNTER_NAMES
+        if last_stability[name] < first_stability[name]
+    }
+    if regressed:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_tunnel_dispatcher_contention_observation",
+            "observed_at_unix_ns": observed_at_unix_ns,
+            "state": "unknown",
+            "reason": "dispatcher-counter-regression",
+            "regressed_counters": regressed,
+            "samples": samples,
+            "does_not_establish": nonclaims,
+        }
+
+    busy_samples: list[dict[str, Any]] = []
+    for sample in samples:
+        metrics = sample["metrics"]
+        mismatch = deploy_dual._tunnel_drain_idle_mismatch(metrics)
+        workers = metrics[deploy_dual.TUNNEL_DRAIN_WORKER_GAUGE_NAME]
+        if workers != 0:
+            mismatch[deploy_dual.TUNNEL_DRAIN_WORKER_GAUGE_NAME] = workers
+        if mismatch:
+            busy_samples.append(
+                {
+                    "observed_at_unix_ns": sample["observed_at_unix_ns"],
+                    "mismatch": mismatch,
+                }
+            )
+    if busy_samples:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_tunnel_dispatcher_contention_observation",
+            "observed_at_unix_ns": observed_at_unix_ns,
+            "state": "busy",
+            "reason": "dispatcher-work-observed",
+            "busy_samples": busy_samples,
+            "samples": samples,
+            "does_not_establish": nonclaims,
+        }
+    if first_stability != last_stability:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_tunnel_dispatcher_contention_observation",
+            "observed_at_unix_ns": observed_at_unix_ns,
+            "state": "busy",
+            "reason": "dispatcher-activity-between-samples",
+            "samples": samples,
+            "does_not_establish": nonclaims,
+        }
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_tunnel_dispatcher_contention_observation",
+        "observed_at_unix_ns": observed_at_unix_ns,
+        "state": "idle",
+        "reason": "two-stable-idle-samples",
+        "samples": samples,
+        "does_not_establish": nonclaims,
+    }
+
+
+def deployment_contention_preflight(
+    *,
+    expected_head: str,
+    source_identity_sha256: str,
+) -> dict[str, Any]:
+    lock = deploy_core.observe_deployment_lock_availability(
+        deploy_core.DEFAULT_LOCK_FILE,
+        state_root=deploy_core.DEFAULT_STATE_ROOT,
+    )
+    dispatcher = observe_tunnel_dispatcher_contention()
+    decision = (
+        "proceed"
+        if lock.get("state") == "available"
+        and dispatcher.get("state") == "idle"
+        else "defer"
+    )
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_runtime_deploy_contention_preflight",
+        "expected_head": expected_head,
+        "source_identity_sha256": source_identity_sha256,
+        "observed_at_unix_ns": time.time_ns(),
+        "lock": lock,
+        "dispatcher": dispatcher,
+        "decision": decision,
+        "validation_started": False,
+        "final_lock_and_drain_gates_required": True,
+        "does_not_establish": [
+            "that_contention_will_not_appear_later",
+            "deployment_authority",
+            "permission_to_interrupt_foreign_work",
+            "replacement_of_post_validation_mutation_gates",
+        ],
+    }
+    return {**material, "evidence_sha256": canonical_json_sha256(material)}
+
+
 def run_streamed(argv: list[str], *, cwd: Path, timeout_seconds: int, phase: str) -> None:
     emit(f"{phase}-start", argv=argv)
     process = subprocess.Popen(argv, cwd=cwd, env=child_environment(), stdin=subprocess.DEVNULL, stdout=None, stderr=None, start_new_session=True)
@@ -458,6 +640,17 @@ def main() -> int:
             source_kind=args.source_kind,
             source_identity_sha256=args.source_identity_sha256,
         )
+        contention = deployment_contention_preflight(
+            expected_head=args.expected_head,
+            source_identity_sha256=args.source_identity_sha256,
+        )
+        emit("deployment-contention-preflight-complete", **contention)
+        if contention["decision"] != "proceed":
+            raise DeploymentContentionDeferred(
+                "deployment contention preflight deferred validation: "
+                f"lock={contention['lock'].get('state')}, "
+                f"dispatcher={contention['dispatcher'].get('state')}"
+            )
         run_streamed(["make", "validate"], cwd=repo, timeout_seconds=1_200, phase="validate")
         verify_repository(
             repo,
