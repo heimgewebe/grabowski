@@ -286,16 +286,11 @@ def _artifact_evidence(
     }
     if set(receipt) != required:
         raise MergeDeliveryError("text artifact receipt fields are invalid")
-    receipt_repository = receipt.get("repository")
-    accepted_repository_identities = {
-        repository,
-        repository.split("/", 1)[1],
-    }
     if (
         receipt.get("schema") != TEXT_ARTIFACT_SCHEMA
         or receipt.get("profile") != TEXT_ARTIFACT_PROFILE
         or receipt.get("artifact_id") != artifact_id
-        or receipt_repository not in accepted_repository_identities
+        or receipt.get("repository") != repository
         or receipt.get("base_commit") != base_sha
         or receipt.get("head_commit") != head_sha
         or receipt.get("pull_request_number") != pull_request
@@ -635,8 +630,18 @@ def verify_merge_delivery(
         diff_sha256=expected_diff_sha256,
         artifact_root=artifact_root or TEXT_ARTIFACT_ROOT,
     )
-    if artifact_info["repository_path_sha256"] != receipt["artifact_repository_path_sha256"]:
-        raise MergeDeliveryError("artifact repository path binding drifted")
+    expected_artifact_binding = {
+        "artifact_repository_path_sha256": artifact_info["repository_path_sha256"],
+        "artifact_filename": artifact_info["filename"],
+        "artifact_byte_size": artifact_info["byte_size"],
+        "artifact_created_at_unix_ns": artifact_info["generated_at_unix"]
+        * 1_000_000_000,
+    }
+    for field, expected_value in expected_artifact_binding.items():
+        if receipt.get(field) != expected_value:
+            raise MergeDeliveryError(
+                f"merge-delivery receipt {field} drifted from the text artifact"
+            )
     return {**info, "receipt_path": str(receipt_path), "durable": True}
 
 

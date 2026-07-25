@@ -12,7 +12,7 @@ The receipt binds one repository, pull request, base commit, head commit and com
 ## Required sequence
 
 1. Read the current pull-request head, base and complete GitHub diff.
-2. Publish the complete diff through `grabowski_text_artifact_publish` with profile `git-diff.v1`.
+2. Publish the complete diff through `grabowski_text_artifact_publish` with profile `git-diff.v1`; when a pull-request number is bound, the publisher first verifies the live GitHub base/head identity and stores the exact raw `gh pr diff` bytes used by the merge guard.
 3. Transfer the real UTF-8 `.txt` file into the user-visible download surface.
 4. Expose the concrete download link to the user.
 5. Only after that visible delivery, call `grabowski_merge_delivery_record` with the exact link and the artifact receipt.
@@ -28,7 +28,7 @@ The private create-only receipt records:
 - repository and pull-request number;
 - full base and head commit SHAs;
 - complete diff SHA-256;
-- artifact id, artifact SHA-256, artifact-receipt SHA-256, canonical owner/repository identity (with read-only legacy-name compatibility), local repository-path SHA-256, filename and byte size;
+- artifact id, artifact SHA-256, artifact-receipt SHA-256, exact canonical owner/repository identity, local repository-path SHA-256, filename and byte size; legacy bare repository names may remain readable on the separate artifact surface but cannot authorize a merge delivery;
 - artifact creation time and delivery-confirmation time;
 - delivery channel and a private delivery reference plus its SHA-256;
 - one-hour expiry, Unix realtime clock domain and explicit GitHub timestamp uncertainty;
@@ -36,7 +36,7 @@ The private create-only receipt records:
 
 The receipt and the underlying artifact are owner-controlled regular files. Symlinks, hard links, permissive modes, changed files, malformed canonical JSON, hash drift and stale receipts fail closed.
 
-The one-hour validity window deliberately forces delivery to happen after the final CI and review cycle, close to merge dispatch. A changed PR head or diff invalidates the delivery. An expired receipt for an unchanged PR requires a newly published artifact with a new artifact id and a new visible delivery; the create-only store retains the old receipt instead of replacing it.
+The one-hour validity window bounds the time between recorded delivery and merge dispatch. It does not by itself establish ordering after CI or review; those remain independent head-bound gates. A changed PR head or diff invalidates the delivery. An expired receipt for an unchanged PR requires a newly published artifact with a new artifact id and a new visible delivery; the create-only store retains the old receipt instead of replacing it.
 
 ## Parallel merge serialization
 

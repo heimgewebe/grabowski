@@ -7,7 +7,6 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
 
 import grabowski_merge_delivery as delivery
 
@@ -108,6 +107,21 @@ class MergeDeliveryTests(unittest.TestCase):
         parameters.update(overrides)
         return delivery.record_merge_delivery(**parameters)
 
+    def tamper_stored_receipt(
+        self, result: dict[str, object], *, field: str, value: object
+    ) -> dict[str, object]:
+        receipt = dict(result["receipt"])
+        receipt[field] = value
+        raw = delivery.canonical_json_bytes(receipt)
+        receipt_path = Path(result["receipt_path"])
+        receipt_path.write_bytes(raw)
+        os.chmod(receipt_path, 0o600)
+        return {
+            **result,
+            "receipt": receipt,
+            "receipt_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+
     def verify(self, result, **overrides):
         parameters = {
             "receipt": result["receipt"],
@@ -124,7 +138,7 @@ class MergeDeliveryTests(unittest.TestCase):
         parameters.update(overrides)
         return delivery.verify_merge_delivery(**parameters)
 
-    def test_legacy_repository_name_receipt_remains_readable(self) -> None:
+    def test_legacy_repository_name_cannot_authorize_merge_delivery(self) -> None:
         receipt_path = self.artifact_root / ARTIFACT_ID / "receipt.json"
         receipt = json.loads(receipt_path.read_text())
         receipt["repository"] = "grabowski"
@@ -133,10 +147,12 @@ class MergeDeliveryTests(unittest.TestCase):
         os.chmod(receipt_path, 0o600)
         legacy_receipt_sha256 = hashlib.sha256(raw).hexdigest()
 
-        result = self.record(artifact_receipt_sha256=legacy_receipt_sha256)
-        verified = self.verify(result)
-
-        self.assertTrue(verified["durable"])
+        with self.assertRaisesRegex(
+            delivery.MergeDeliveryError,
+            "text artifact receipt does not match the merge binding",
+        ):
+            self.record(artifact_receipt_sha256=legacy_receipt_sha256)
+        self.assertFalse(self.delivery_root.exists())
 
     def test_record_and_verify_exact_delivery(self) -> None:
         result = self.record()
@@ -211,6 +227,42 @@ class MergeDeliveryTests(unittest.TestCase):
         )
         self.assertTrue(verified["durable"])
         self.assertEqual(second_artifact_id, verified["artifact_id"])
+
+    def test_receipt_filename_must_match_text_artifact(self) -> None:
+        result = self.record()
+        tampered = self.tamper_stored_receipt(
+            result,
+            field="artifact_filename",
+            value="different-valid-name.txt",
+        )
+        with self.assertRaisesRegex(
+            delivery.MergeDeliveryError, "artifact_filename drifted"
+        ):
+            self.verify(tampered)
+
+    def test_receipt_byte_size_must_match_text_artifact(self) -> None:
+        result = self.record()
+        tampered = self.tamper_stored_receipt(
+            result,
+            field="artifact_byte_size",
+            value=result["receipt"]["artifact_byte_size"] + 1,
+        )
+        with self.assertRaisesRegex(
+            delivery.MergeDeliveryError, "artifact_byte_size drifted"
+        ):
+            self.verify(tampered)
+
+    def test_receipt_creation_time_must_match_text_artifact(self) -> None:
+        result = self.record()
+        tampered = self.tamper_stored_receipt(
+            result,
+            field="artifact_created_at_unix_ns",
+            value=result["receipt"]["artifact_created_at_unix_ns"] - 1_000_000_000,
+        )
+        with self.assertRaisesRegex(
+            delivery.MergeDeliveryError, "artifact_created_at_unix_ns drifted"
+        ):
+            self.verify(tampered)
 
     def test_artifact_mutation_after_delivery_is_rejected(self) -> None:
         result = self.record()
