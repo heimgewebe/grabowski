@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import json
 import sqlite3
 import sys
@@ -1957,6 +1958,363 @@ class ResourceTests(unittest.TestCase):
         self.assertNotIn("metadata", result["leases"][0])
         self.assertIn("metadata_sha256", result["leases"][0])
         self.assertNotIn("private", str(audit.call_args.args[0]))
+
+    def _operator_terminal_evidence(
+        self, *, status: str = "success"
+    ) -> dict[str, object]:
+        material: dict[str, object] = {
+            "schema_version": 1,
+            "kind": "grabowski_captain_operator_lease_terminal_evidence",
+            "status": status,
+            "guard_owner_id": "captain-merge:test-operator",
+            "dispatch_called": status == "success",
+            "execution_invoked": status == "success",
+            "verification_passed": status == "success",
+            "observed_at_unix_ns": time.time_ns(),
+        }
+        return {
+            **material,
+            "terminal_evidence_sha256": merge_guard._sha256_json(material),
+        }
+
+    def _operator_delegation(
+        self, evidence: dict[str, object], *, digest: str = "d" * 64
+    ) -> dict[str, object]:
+        return {**evidence, "delegation_sha256": digest}
+
+    def _operator_authority_resource_key(self, owner: str) -> str:
+        return (
+            "gate:operator-lease-authority:"
+            + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+        )
+
+    def _operator_authority_gate(
+        self,
+        owner: str,
+        evidence: dict[str, object],
+        *,
+        guard_owner: str = "captain-merge:test-operator",
+        delegation_sha256: str = "d" * 64,
+    ) -> str:
+        resource_keys = evidence["resource_keys"]
+        authority_key = self._operator_authority_resource_key(owner)
+        resources.acquire_resources(
+            guard_owner,
+            [authority_key],
+            purpose="test direct Operator authority",
+            ttl_seconds=120,
+            metadata={
+                "operator_lease_delegation": {
+                    "lease_owner_id_sha256": hashlib.sha256(
+                        owner.encode("utf-8")
+                    ).hexdigest(),
+                    "resource_keys_sha256": merge_guard._sha256_json(
+                        resource_keys
+                    ),
+                    "lease_bindings_sha256": evidence[
+                        "lease_bindings_sha256"
+                    ],
+                    "delegation_sha256": delegation_sha256,
+                }
+            },
+        )
+        return authority_key
+
+    def test_operator_lease_delegation_evidence_binds_complete_live_set(self) -> None:
+        owner = "operator:test-direct-owner"
+        keys = ["component:operator-a", "component:operator-b"]
+        resources.acquire_resources(
+            owner, keys, purpose="direct Operator work", ttl_seconds=120
+        )
+
+        evidence = resources.operator_lease_delegation_evidence(owner)
+
+        self.assertEqual(owner, evidence["lease_owner_id"])
+        self.assertEqual(keys, evidence["resource_keys"])
+        self.assertEqual(2, len(evidence["lease_snapshots"]))
+        self.assertEqual(
+            evidence["lease_bindings_sha256"],
+            merge_guard._sha256_json(evidence["lease_snapshots"]),
+        )
+        with self.assertRaisesRegex(ValueError, "complete current owner lease set"):
+            resources.operator_lease_delegation_evidence(owner, [keys[0]])
+        with self.assertRaisesRegex(ValueError, "direct Operator lease owner"):
+            resources.operator_lease_delegation_evidence("captain-test-owner")
+
+    def test_operator_lease_terminal_convergence_releases_exact_and_replays(self) -> None:
+        owner = "operator:test-terminal-owner"
+        keys = ["component:operator-terminal-a", "component:operator-terminal-b"]
+        resources.acquire_resources(
+            owner, keys, purpose="direct Operator work", ttl_seconds=120
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        terminal = self._operator_terminal_evidence()
+        delegation_sha256 = "d" * 64
+        authority_key = self._operator_authority_gate(
+            owner, evidence, delegation_sha256=delegation_sha256
+        )
+
+        result = resources.reconcile_delegated_operator_leases(
+            owner,
+            evidence["lease_snapshots"],
+            expected_lease_bindings_sha256=evidence["lease_bindings_sha256"],
+            delegation_sha256=delegation_sha256,
+            authority_resource_key=authority_key,
+            terminal_source=terminal,
+        )
+
+        self.assertTrue(result["converged"])
+        self.assertEqual(keys, [item["resource_key"] for item in result["released"]])
+        self.assertEqual([], resources.list_resources(owner_id=owner))
+
+        resources.release_resources(
+            "captain-merge:test-operator", [authority_key]
+        )
+        replay = resources.reconcile_delegated_operator_leases(
+            owner,
+            evidence["lease_snapshots"],
+            expected_lease_bindings_sha256=evidence["lease_bindings_sha256"],
+            delegation_sha256=delegation_sha256,
+            authority_resource_key=authority_key,
+            terminal_source=terminal,
+        )
+        self.assertTrue(replay["converged"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(keys, replay["already_absent"])
+
+    def test_operator_lease_terminal_convergence_requires_bound_authority_gate(self) -> None:
+        owner = "operator:test-missing-authority"
+        key = "component:operator-missing-authority"
+        resources.acquire_resources(
+            owner, [key], purpose="direct Operator work", ttl_seconds=120
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        authority_key = self._operator_authority_resource_key(owner)
+
+        with self.assertRaisesRegex(ValueError, "authority gate is not live"):
+            resources.reconcile_delegated_operator_leases(
+                owner,
+                evidence["lease_snapshots"],
+                expected_lease_bindings_sha256=evidence[
+                    "lease_bindings_sha256"
+                ],
+                delegation_sha256="d" * 64,
+                authority_resource_key=authority_key,
+                terminal_source=self._operator_terminal_evidence(),
+            )
+        self.assertIsNotNone(resources.inspect_resource(key))
+
+        self._operator_authority_gate(
+            owner, evidence, delegation_sha256="e" * 64
+        )
+        with self.assertRaisesRegex(ValueError, "authority gate binding mismatch"):
+            resources.reconcile_delegated_operator_leases(
+                owner,
+                evidence["lease_snapshots"],
+                expected_lease_bindings_sha256=evidence[
+                    "lease_bindings_sha256"
+                ],
+                delegation_sha256="d" * 64,
+                authority_resource_key=authority_key,
+                terminal_source=self._operator_terminal_evidence(),
+            )
+        self.assertIsNotNone(resources.inspect_resource(key))
+
+    def test_operator_lease_terminal_convergence_retains_drift_and_growth(self) -> None:
+        owner = "operator:test-drift-owner"
+        key = "component:operator-drift"
+        resources.acquire_resources(
+            owner, [key], purpose="direct Operator work", ttl_seconds=120
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        resources.renew_resources(owner, [key], ttl_seconds=180)
+
+        drift = resources.reconcile_delegated_operator_leases(
+            owner,
+            evidence["lease_snapshots"],
+            expected_lease_bindings_sha256=evidence["lease_bindings_sha256"],
+            delegation_sha256="d" * 64,
+            authority_resource_key=self._operator_authority_resource_key(owner),
+            terminal_source=self._operator_terminal_evidence(),
+        )
+        self.assertFalse(drift["converged"])
+        self.assertEqual("lease_changed", drift["retained"][0]["reason"])
+        self.assertIsNotNone(resources.inspect_resource(key))
+
+        fresh = resources.operator_lease_delegation_evidence(owner)
+        extra = "component:operator-growth"
+        resources.acquire_resources(
+            owner, [extra], purpose="late direct Operator work", ttl_seconds=120
+        )
+        growth = resources.reconcile_delegated_operator_leases(
+            owner,
+            fresh["lease_snapshots"],
+            expected_lease_bindings_sha256=fresh["lease_bindings_sha256"],
+            delegation_sha256="d" * 64,
+            authority_resource_key=self._operator_authority_resource_key(owner),
+            terminal_source=self._operator_terminal_evidence(),
+        )
+        self.assertFalse(growth["converged"])
+        self.assertEqual("owner_lease_set_changed", growth["retained"][0]["reason"])
+        self.assertIsNotNone(growth["unexpected_owner_resource_keys_sha256"])
+        self.assertIsNotNone(resources.inspect_resource(key))
+        self.assertIsNotNone(resources.inspect_resource(extra))
+
+    def test_operator_lease_delegation_rejects_owner_held_authority_gate(self) -> None:
+        owner = "operator:test-reserved-authority"
+        authority_key = (
+            "gate:operator-lease-authority:"
+            + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+        )
+        resources.acquire_resources(
+            owner,
+            [authority_key],
+            purpose="invalid preheld authority",
+            ttl_seconds=120,
+        )
+
+        with self.assertRaisesRegex(ValueError, "reserved delegation authority gate"):
+            resources.operator_lease_delegation_evidence(owner)
+        self.assertIsNotNone(resources.inspect_resource(authority_key))
+
+    def test_operator_merge_delegation_requires_target_bound_lease(self) -> None:
+        repository = self.root / "operator-target-repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        changed_path.parent.mkdir()
+        changed_path.write_text("x", encoding="utf-8")
+        owner = "operator:test-unrelated-owner"
+        resources.acquire_resources(
+            owner,
+            ["component:unrelated-direct-operator-work"],
+            purpose="unrelated direct Operator work",
+            ttl_seconds=120,
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        metadata = {
+            "merge_guard": {
+                "head_sha": "a" * 40,
+                "diff_sha256": "b" * 64,
+                "base_branch": "main",
+                "head_branch": "feat/work",
+            }
+        }
+
+        with self.assertRaisesRegex(ValueError, "do not bind the merge target"):
+            resources.acquire_merge_guard_resources(
+                "captain-merge:operator-target",
+                owner,
+                guard_keys,
+                repository=str(repository),
+                changed_paths=[str(changed_path)],
+                purpose="target-bound direct Operator guard",
+                ttl_seconds=60,
+                metadata=metadata,
+                delegated_operator=self._operator_delegation(evidence),
+            )
+        self.assertIsNotNone(
+            resources.inspect_resource("component:unrelated-direct-operator-work")
+        )
+
+    def test_operator_merge_authority_gate_serializes_parallel_adoption(self) -> None:
+        repository = self.root / "operator-authority-repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        changed_path.parent.mkdir()
+        changed_path.write_text("x", encoding="utf-8")
+        owner = "operator:test-authority-owner"
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        head_key = next(
+            key
+            for key in guard_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(":" + WORK_BRANCH_ID)
+        )
+        resources.acquire_resources(
+            owner, [head_key], purpose="direct Operator work", ttl_seconds=120
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        metadata = {
+            "merge_guard": {
+                "head_sha": "a" * 40,
+                "diff_sha256": "b" * 64,
+                "base_branch": "main",
+                "head_branch": "feat/work",
+            }
+        }
+
+        first = resources.acquire_merge_guard_resources(
+            "captain-merge:operator-authority-first",
+            owner,
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="direct Operator authority guard",
+            ttl_seconds=60,
+            metadata=metadata,
+            delegated_operator=self._operator_delegation(evidence),
+        )
+
+        authority_key = first["delegated_operator_authority_key"]
+        self.assertIsNotNone(authority_key)
+        authority_lease = resources.inspect_resource(authority_key)
+        self.assertIsNotNone(authority_lease)
+        self.assertEqual(
+            "captain-merge:operator-authority-first",
+            authority_lease["owner_id"],
+        )
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_merge_guard_resources(
+                "captain-merge:operator-authority-second",
+                owner,
+                guard_keys,
+                repository=str(repository),
+                changed_paths=[str(changed_path)],
+                purpose="parallel direct Operator authority guard",
+                ttl_seconds=60,
+                metadata=metadata,
+                delegated_operator=self._operator_delegation(evidence),
+            )
+        resources.release_resources(
+            "captain-merge:operator-authority-first",
+            first["held_resource_keys"],
+        )
+        self.assertIsNone(resources.inspect_resource(authority_key))
+        self.assertIsNotNone(resources.inspect_resource(head_key))
+
+    def test_operator_lease_terminal_convergence_rejects_missing_terminal_evidence(self) -> None:
+        owner = "operator:test-terminal-evidence"
+        key = "component:operator-terminal-evidence"
+        resources.acquire_resources(
+            owner, [key], purpose="direct Operator work", ttl_seconds=120
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        terminal = self._operator_terminal_evidence()
+        terminal["terminal_evidence_sha256"] = "0" * 64
+
+        with self.assertRaisesRegex(ValueError, "terminal evidence digest"):
+            resources.reconcile_delegated_operator_leases(
+                owner,
+                evidence["lease_snapshots"],
+                expected_lease_bindings_sha256=evidence["lease_bindings_sha256"],
+                delegation_sha256="d" * 64,
+                authority_resource_key=self._operator_authority_resource_key(owner),
+                terminal_source=terminal,
+            )
+        self.assertIsNotNone(resources.inspect_resource(key))
 
 if __name__ == "__main__":
     unittest.main()

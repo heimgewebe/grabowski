@@ -255,6 +255,9 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
                 server_task_lease_delegation=parameters.get(
                     "_server_task_lease_delegation"
                 ),
+                server_operator_lease_delegation=parameters.get(
+                    "_server_operator_lease_delegation"
+                ),
             )
             execution_result: dict[str, Any] = {
                 "action": "pr-merge",

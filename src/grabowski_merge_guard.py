@@ -60,10 +60,45 @@ _SERVER_TASK_DELEGATION_KEYS = frozenset(
         "proof_sha256",
     }
 )
+_SERVER_OPERATOR_DELEGATION_SCHEMA_VERSION = 1
+_SERVER_OPERATOR_DELEGATION_KIND = "grabowski_server_operator_lease_delegation"
+_SERVER_OPERATOR_DELEGATION_TTL_SECONDS = 300
+_LEASE_SNAPSHOT_KEYS = frozenset(
+    {
+        "resource_key",
+        "owner_id",
+        "acquired_at_unix",
+        "updated_at_unix",
+        "expires_at_unix",
+        "metadata_sha256",
+    }
+)
+_SERVER_OPERATOR_DELEGATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "actor_owner_id",
+        "actor_identity_sha256",
+        "lease_owner_id",
+        "resource_keys",
+        "resource_keys_sha256",
+        "lease_snapshots",
+        "lease_bindings_sha256",
+        "captain_request_sha256",
+        "issued_at_unix",
+        "expires_at_unix",
+        "proof_sha256",
+    }
+)
 _SERVER_RESERVED_PARAMETER_KEYS = frozenset(
-    {"_server_runtime_actor_identity", "_server_task_lease_delegation"}
+    {
+        "_server_runtime_actor_identity",
+        "_server_task_lease_delegation",
+        "_server_operator_lease_delegation",
+    }
 )
 _TASK_OWNER_RE = re.compile(r"task:([0-9a-f]{24})\Z")
+_DIRECT_OPERATOR_OWNER_RE = re.compile(r"operator:[A-Za-z0-9._:@-]{1,119}\Z")
 
 
 def _canonical_json(value: Any) -> str:
@@ -357,6 +392,186 @@ def verify_server_task_lease_delegation(
     }
 
 
+
+def issue_server_operator_lease_delegation(
+    actor_identity: dict[str, Any],
+    lease_evidence: dict[str, Any],
+    *,
+    captain_request_sha256_value: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    actor = verify_server_runtime_actor_identity(actor_identity, now_unix=now_unix)
+    if _SHA256_RE.fullmatch(captain_request_sha256_value) is None:
+        raise ValueError("captain request digest is invalid")
+    expected_evidence_keys = {
+        "schema_version",
+        "kind",
+        "lease_owner_id",
+        "resource_keys",
+        "resource_keys_sha256",
+        "lease_snapshots",
+        "lease_bindings_sha256",
+        "minimum_expires_at_unix",
+        "observed_at_unix",
+    }
+    if not isinstance(lease_evidence, dict) or set(lease_evidence) != expected_evidence_keys:
+        raise ValueError("Operator delegation evidence shape is invalid")
+    if lease_evidence.get("schema_version") != 1:
+        raise ValueError("Operator delegation evidence schema is invalid")
+    if lease_evidence.get("kind") != "grabowski_live_operator_lease_delegation_evidence":
+        raise ValueError("Operator delegation evidence kind is invalid")
+    lease_owner_id = lease_evidence.get("lease_owner_id")
+    if not isinstance(lease_owner_id, str) or _DIRECT_OPERATOR_OWNER_RE.fullmatch(lease_owner_id) is None:
+        raise ValueError("Operator delegation lease owner is invalid")
+    resource_keys = lease_evidence.get("resource_keys")
+    if (
+        not isinstance(resource_keys, list)
+        or not resource_keys
+        or len(resource_keys) > 64
+        or any(not isinstance(key, str) or not key for key in resource_keys)
+        or resource_keys != sorted(set(resource_keys))
+    ):
+        raise ValueError("Operator delegation resource keys are invalid")
+    resource_keys_sha256 = _sha256_json(resource_keys)
+    if lease_evidence.get("resource_keys_sha256") != resource_keys_sha256:
+        raise ValueError("Operator delegation resource key digest is invalid")
+    raw_snapshots = lease_evidence.get("lease_snapshots")
+    if (
+        not isinstance(raw_snapshots, list)
+        or len(raw_snapshots) != len(resource_keys)
+        or any(not isinstance(item, dict) or set(item) != _LEASE_SNAPSHOT_KEYS for item in raw_snapshots)
+    ):
+        raise ValueError("Operator delegation lease snapshots are invalid")
+    lease_snapshots = [dict(item) for item in raw_snapshots]
+    if [item["resource_key"] for item in lease_snapshots] != resource_keys:
+        raise ValueError("Operator delegation lease snapshot keys are invalid")
+    if any(item["owner_id"] != lease_owner_id for item in lease_snapshots):
+        raise ValueError("Operator delegation lease snapshot owner mismatch")
+    for snapshot in lease_snapshots:
+        if not isinstance(snapshot["metadata_sha256"], str) or _SHA256_RE.fullmatch(snapshot["metadata_sha256"]) is None:
+            raise ValueError("Operator delegation metadata digest is invalid")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            value = snapshot[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"Operator delegation {field} is invalid")
+    lease_bindings_sha256 = _sha256_json(lease_snapshots)
+    if lease_evidence.get("lease_bindings_sha256") != lease_bindings_sha256:
+        raise ValueError("Operator delegation lease binding digest is invalid")
+    current = int(time.time()) if now_unix is None else int(now_unix)
+    minimum_expiry = lease_evidence.get("minimum_expires_at_unix")
+    observed_at = lease_evidence.get("observed_at_unix")
+    if not isinstance(minimum_expiry, int) or isinstance(minimum_expiry, bool):
+        raise ValueError("Operator delegation minimum lease expiry is invalid")
+    if not isinstance(observed_at, int) or isinstance(observed_at, bool) or observed_at < 0:
+        raise ValueError("Operator delegation observation time is invalid")
+    expires_at = min(
+        current + _SERVER_OPERATOR_DELEGATION_TTL_SECONDS,
+        int(actor["expires_at_unix"]),
+        minimum_expiry,
+    )
+    if expires_at <= current:
+        raise ValueError("Operator delegation has no live validity window")
+    payload: dict[str, Any] = {
+        "schema_version": _SERVER_OPERATOR_DELEGATION_SCHEMA_VERSION,
+        "kind": _SERVER_OPERATOR_DELEGATION_KIND,
+        "actor_owner_id": actor["owner_id"],
+        "actor_identity_sha256": actor["identity_sha256"],
+        "lease_owner_id": lease_owner_id,
+        "resource_keys": resource_keys,
+        "resource_keys_sha256": resource_keys_sha256,
+        "lease_snapshots": lease_snapshots,
+        "lease_bindings_sha256": lease_bindings_sha256,
+        "captain_request_sha256": captain_request_sha256_value,
+        "issued_at_unix": current,
+        "expires_at_unix": expires_at,
+    }
+    payload["proof_sha256"] = hmac.new(
+        _SERVER_ACTOR_SECRET,
+        _canonical_json(payload).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return payload
+
+
+def verify_server_operator_lease_delegation(
+    value: Any,
+    *,
+    actor_identity: dict[str, Any],
+    captain_request_sha256_value: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    actor = verify_server_runtime_actor_identity(actor_identity, now_unix=now_unix)
+    if not isinstance(value, dict) or set(value) != _SERVER_OPERATOR_DELEGATION_KEYS:
+        raise ValueError("server Operator lease delegation shape is invalid")
+    if value.get("schema_version") != _SERVER_OPERATOR_DELEGATION_SCHEMA_VERSION:
+        raise ValueError("server Operator lease delegation schema is invalid")
+    if value.get("kind") != _SERVER_OPERATOR_DELEGATION_KIND:
+        raise ValueError("server Operator lease delegation kind is invalid")
+    lease_owner_id = value.get("lease_owner_id")
+    if not isinstance(lease_owner_id, str) or _DIRECT_OPERATOR_OWNER_RE.fullmatch(lease_owner_id) is None:
+        raise ValueError("server Operator lease delegation owner is invalid")
+    if value.get("actor_owner_id") != actor["owner_id"]:
+        raise ValueError("server Operator lease delegation actor owner mismatch")
+    if value.get("actor_identity_sha256") != actor["identity_sha256"]:
+        raise ValueError("server Operator lease delegation actor identity mismatch")
+    if value.get("captain_request_sha256") != captain_request_sha256_value:
+        raise ValueError("server Operator lease delegation captain request mismatch")
+    resource_keys = value.get("resource_keys")
+    if (
+        not isinstance(resource_keys, list)
+        or not resource_keys
+        or len(resource_keys) > 64
+        or any(not isinstance(key, str) or not key for key in resource_keys)
+        or resource_keys != sorted(set(resource_keys))
+        or value.get("resource_keys_sha256") != _sha256_json(resource_keys)
+    ):
+        raise ValueError("server Operator lease delegation resource keys are invalid")
+    raw_snapshots = value.get("lease_snapshots")
+    if (
+        not isinstance(raw_snapshots, list)
+        or len(raw_snapshots) != len(resource_keys)
+        or any(not isinstance(item, dict) or set(item) != _LEASE_SNAPSHOT_KEYS for item in raw_snapshots)
+    ):
+        raise ValueError("server Operator lease delegation snapshots are invalid")
+    lease_snapshots = [dict(item) for item in raw_snapshots]
+    if [item["resource_key"] for item in lease_snapshots] != resource_keys:
+        raise ValueError("server Operator lease delegation snapshot keys are invalid")
+    if any(item["owner_id"] != lease_owner_id for item in lease_snapshots):
+        raise ValueError("server Operator lease delegation snapshot owner mismatch")
+    if value.get("lease_bindings_sha256") != _sha256_json(lease_snapshots):
+        raise ValueError("server Operator lease delegation binding digest is invalid")
+    issued_at = value.get("issued_at_unix")
+    expires_at = value.get("expires_at_unix")
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        raise ValueError("server Operator lease delegation issue time is invalid")
+    if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+        raise ValueError("server Operator lease delegation expiry is invalid")
+    if expires_at <= issued_at or expires_at - issued_at > _SERVER_OPERATOR_DELEGATION_TTL_SECONDS:
+        raise ValueError("server Operator lease delegation lifetime is invalid")
+    current = int(time.time()) if now_unix is None else int(now_unix)
+    if issued_at > current + 5 or expires_at < current:
+        raise ValueError("server Operator lease delegation is not current")
+    unsigned = {key: value[key] for key in value if key != "proof_sha256"}
+    expected_proof = hmac.new(
+        _SERVER_ACTOR_SECRET,
+        _canonical_json(unsigned).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    proof = value.get("proof_sha256")
+    if not isinstance(proof, str) or not hmac.compare_digest(proof, expected_proof):
+        raise ValueError("server Operator lease delegation proof is invalid")
+    return {
+        "lease_owner_id": lease_owner_id,
+        "resource_keys": resource_keys,
+        "resource_keys_sha256": value["resource_keys_sha256"],
+        "lease_snapshots": lease_snapshots,
+        "lease_bindings_sha256": value["lease_bindings_sha256"],
+        "captain_request_sha256": captain_request_sha256_value,
+        "delegation_sha256": _sha256_json(value),
+        "issued_at_unix": issued_at,
+        "expires_at_unix": expires_at,
+    }
+
 def _merge_guard_identifier(namespace: str, value: str) -> str:
     if not isinstance(namespace, str) or not namespace:
         raise ValueError("merge guard identifier namespace is required")
@@ -472,6 +687,7 @@ class CaptainMergeGuardRunner:
         lease_owner_id: str,
         server_actor_identity: dict[str, Any] | None = None,
         server_task_lease_delegation: dict[str, Any] | None = None,
+        server_operator_lease_delegation: dict[str, Any] | None = None,
     ) -> None:
         self.repo_path = repo_path.resolve()
         self.action = action
@@ -485,6 +701,8 @@ class CaptainMergeGuardRunner:
         self.server_actor_identity_error = False
         self.server_task_lease_delegation: dict[str, Any] | None = None
         self.server_task_lease_delegation_error = False
+        self.server_operator_lease_delegation: dict[str, Any] | None = None
+        self.server_operator_lease_delegation_error = False
         if server_actor_identity is not None:
             try:
                 verified_actor = verify_server_runtime_actor_identity(server_actor_identity)
@@ -513,6 +731,41 @@ class CaptainMergeGuardRunner:
                             self.server_task_lease_delegation = verified_delegation
                             self.lease_owner_id = str(verified_delegation["lease_owner_id"])
                             self.lease_owner_source = "server-runtime-task-delegation-v1"
+                if server_operator_lease_delegation is not None:
+                    if server_task_lease_delegation is not None:
+                        self.lease_owner_id = ""
+                        self.server_operator_lease_delegation_error = True
+                    else:
+                        try:
+                            verified_operator_delegation = (
+                                verify_server_operator_lease_delegation(
+                                    server_operator_lease_delegation,
+                                    actor_identity=server_actor_identity,
+                                    captain_request_sha256_value=captain_request_sha256(
+                                        parameters
+                                    ),
+                                )
+                            )
+                        except ValueError:
+                            self.lease_owner_id = ""
+                            self.server_operator_lease_delegation_error = True
+                        else:
+                            if (
+                                verified_operator_delegation["lease_owner_id"]
+                                != lease_owner_id
+                            ):
+                                self.lease_owner_id = ""
+                                self.server_operator_lease_delegation_error = True
+                            else:
+                                self.server_operator_lease_delegation = (
+                                    verified_operator_delegation
+                                )
+                                self.lease_owner_id = str(
+                                    verified_operator_delegation["lease_owner_id"]
+                                )
+                                self.lease_owner_source = (
+                                    "server-runtime-operator-delegation-v1"
+                                )
         self.owner_id: str | None = None
         self.resource_keys: list[str] = []
         self.held_resource_keys: list[str] = []
@@ -531,6 +784,8 @@ class CaptainMergeGuardRunner:
             does_not_establish.append("server_authenticated_lease_owner_identity")
         if self.server_task_lease_delegation is not None:
             does_not_establish.append("task_creator_identity")
+        if self.server_operator_lease_delegation is not None:
+            does_not_establish.append("identity_of_original_lease_creator")
         self.receipt: dict[str, Any] = {
             "schema_version": 1,
             "kind": "grabowski_captain_merge_lease_guard",
@@ -552,14 +807,34 @@ class CaptainMergeGuardRunner:
                     else None
                 ),
                 "delegation_sha256": (
-                    self.server_task_lease_delegation.get("delegation_sha256")
-                    if self.server_task_lease_delegation is not None
-                    else None
+                    (
+                        self.server_task_lease_delegation
+                        or self.server_operator_lease_delegation
+                        or {}
+                    ).get("delegation_sha256")
                 ),
                 "delegation_expires_at_unix": (
-                    self.server_task_lease_delegation.get("expires_at_unix")
+                    (
+                        self.server_task_lease_delegation
+                        or self.server_operator_lease_delegation
+                        or {}
+                    ).get("expires_at_unix")
+                ),
+                "delegation_kind": (
+                    "task"
                     if self.server_task_lease_delegation is not None
-                    else None
+                    else (
+                        "direct_operator"
+                        if self.server_operator_lease_delegation is not None
+                        else None
+                    )
+                ),
+                "delegated_resource_keys_sha256": (
+                    (
+                        self.server_task_lease_delegation
+                        or self.server_operator_lease_delegation
+                        or {}
+                    ).get("resource_keys_sha256")
                 ),
             },
             "does_not_establish": does_not_establish,
@@ -664,11 +939,19 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_server_actor_identity_invalid")
         if self.server_task_lease_delegation_error:
             errors.append("merge_guard_server_task_lease_delegation_invalid")
+        if self.server_operator_lease_delegation_error:
+            errors.append("merge_guard_server_operator_lease_delegation_invalid")
         if (
             _TASK_OWNER_RE.fullmatch(self.requested_lease_owner_id) is not None
             and self.server_task_lease_delegation is None
         ):
             errors.append("merge_guard_server_task_lease_delegation_required")
+        if (
+            _DIRECT_OPERATOR_OWNER_RE.fullmatch(self.requested_lease_owner_id)
+            is not None
+            and self.server_operator_lease_delegation is None
+        ):
+            errors.append("merge_guard_server_operator_lease_delegation_required")
         if _OWNER_RE.fullmatch(self.lease_owner_id) is None:
             errors.append("merge_guard_lease_owner_invalid")
         if _SHA40_RE.fullmatch(expected_head) is None:
@@ -1034,6 +1317,7 @@ class CaptainMergeGuardRunner:
                 ttl_seconds=_MERGE_GUARD_TTL_SECONDS,
                 metadata=metadata,
                 delegated_task=self.server_task_lease_delegation,
+                delegated_operator=self.server_operator_lease_delegation,
             )
         except Exception as exc:
             self.receipt["status"] = "blocked_by_live_lease"
@@ -1041,6 +1325,7 @@ class CaptainMergeGuardRunner:
             self.receipt["resource_keys"] = self.resource_keys
             raise RuntimeError("merge lease guard acquisition failed") from exc
 
+        self.resource_keys = list(self.acquisition["resource_keys"])
         self.held_resource_keys = list(self.acquisition["held_resource_keys"])
         lease_snapshot = {
             "observed_leases": self.acquisition["observed_leases"],
@@ -1077,6 +1362,33 @@ class CaptainMergeGuardRunner:
                     if self.acquisition.get("delegated_task_id") is not None
                     else None
                 ),
+                "delegated_operator_resource_keys_sha256": (
+                    _sha256_json(
+                        self.acquisition.get("delegated_operator_resource_keys", [])
+                    )
+                    if self.acquisition.get("delegated_operator_lease_owner_id")
+                    is not None
+                    else None
+                ),
+                "delegated_operator_target_resource_keys_sha256": (
+                    _sha256_json(
+                        self.acquisition.get(
+                            "delegated_operator_target_resource_keys", []
+                        )
+                    )
+                    if self.acquisition.get("delegated_operator_lease_owner_id")
+                    is not None
+                    else None
+                ),
+                "delegated_operator_lease_bindings_sha256": self.acquisition.get(
+                    "delegated_operator_lease_bindings_sha256"
+                ),
+                "delegated_operator_delegation_sha256": self.acquisition.get(
+                    "delegated_operator_delegation_sha256"
+                ),
+                "delegated_operator_authority_key": self.acquisition.get(
+                    "delegated_operator_authority_key"
+                ),
             }
         )
         revalidation_errors = self._revalidate_dispatch_bindings(bindings)
@@ -1093,6 +1405,33 @@ class CaptainMergeGuardRunner:
         self.receipt["dispatch_called"] = True
         self.dispatch_called = True
         return self.github_runner(repo_path, args)
+
+    def _delegated_operator_terminal_evidence(
+        self, execution_result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if self.server_operator_lease_delegation is None or self.owner_id is None:
+            return None
+        if execution_result.get("verification_passed") is True:
+            status = "success"
+        elif (
+            self.acquisition is not None
+            and not self.dispatch_called
+            and not bool(execution_result.get("remote_mutation_observed"))
+        ):
+            status = "authoritative_abort"
+        else:
+            return None
+        material: dict[str, Any] = {
+            "schema_version": 1,
+            "kind": "grabowski_captain_operator_lease_terminal_evidence",
+            "status": status,
+            "guard_owner_id": self.owner_id,
+            "dispatch_called": self.dispatch_called,
+            "execution_invoked": bool(execution_result.get("execution_invoked")),
+            "verification_passed": execution_result.get("verification_passed") is True,
+            "observed_at_unix_ns": int(self.receipt["completed_at_unix_ns"]),
+        }
+        return {**material, "terminal_evidence_sha256": _sha256_json(material)}
 
     def finalize(self, execution_result: dict[str, Any]) -> None:
         import grabowski_resources as resources
@@ -1121,6 +1460,74 @@ class CaptainMergeGuardRunner:
         if self.acquisition is not None and self.owner_id is not None:
             cleanup_failures: list[str] = []
             release_failed = False
+            delegated_operator_owner = self.acquisition.get(
+                "delegated_operator_lease_owner_id"
+            )
+            if delegated_operator_owner is not None:
+                terminal_evidence = self._delegated_operator_terminal_evidence(
+                    execution_result
+                )
+                if terminal_evidence is None:
+                    retained_keys = self.acquisition.get(
+                        "delegated_operator_resource_keys", []
+                    )
+                    self.receipt["delegated_operator_lease_convergence"] = {
+                        "schema_version": 1,
+                        "kind": "grabowski_delegated_operator_lease_convergence",
+                        "owner_id_sha256": hashlib.sha256(
+                            str(delegated_operator_owner).encode("utf-8")
+                        ).hexdigest(),
+                        "resource_keys_sha256": _sha256_json(retained_keys),
+                        "lease_bindings_sha256": self.acquisition.get(
+                            "delegated_operator_lease_bindings_sha256"
+                        ),
+                        "status": "retained_missing_terminal_evidence",
+                        "released_count": 0,
+                        "retained_count": len(retained_keys),
+                        "does_not_establish": [
+                            "terminal_success",
+                            "permission_to_release_changed_lease",
+                            "permission_to_release_foreign_lease",
+                        ],
+                    }
+                else:
+                    self.receipt["delegated_operator_terminal_evidence"] = (
+                        terminal_evidence
+                    )
+                    try:
+                        convergence = resources.reconcile_delegated_operator_leases(
+                            str(delegated_operator_owner),
+                            self.acquisition.get(
+                                "delegated_operator_lease_snapshots", []
+                            ),
+                            expected_lease_bindings_sha256=str(
+                                self.acquisition.get(
+                                    "delegated_operator_lease_bindings_sha256", ""
+                                )
+                            ),
+                            delegation_sha256=str(
+                                self.acquisition.get(
+                                    "delegated_operator_delegation_sha256", ""
+                                )
+                            ),
+                            authority_resource_key=str(
+                                self.acquisition.get(
+                                    "delegated_operator_authority_key", ""
+                                )
+                            ),
+                            terminal_source=terminal_evidence,
+                        )
+                        self.receipt["delegated_operator_lease_convergence"] = (
+                            convergence
+                        )
+                    except Exception as exc:
+                        cleanup_failures.append(
+                            "delegated Operator lease convergence failed"
+                        )
+                        self.receipt[
+                            "delegated_operator_lease_convergence_error"
+                        ] = f"{type(exc).__name__}:{exc}"
+
             released: dict[str, Any] | None = None
             try:
                 released = resources.release_resources(

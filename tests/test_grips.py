@@ -6310,6 +6310,424 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("blocked_by_live_lease", guard["status"])
         self.assertIn("delegated task lease is not live", guard["errors"][0])
 
+    def test_server_operator_lease_delegation_is_request_bound_and_short_lived(self) -> None:
+        class Session:
+            pass
+
+        owner = "operator:test-signed-owner"
+        resource_keys = ["component:test-operator-delegation"]
+        snapshots = [
+            {
+                "resource_key": resource_keys[0],
+                "owner_id": owner,
+                "acquired_at_unix": 90,
+                "updated_at_unix": 90,
+                "expires_at_unix": 150,
+                "metadata_sha256": "b" * 64,
+            }
+        ]
+        evidence = {
+            "schema_version": 1,
+            "kind": "grabowski_live_operator_lease_delegation_evidence",
+            "lease_owner_id": owner,
+            "resource_keys": resource_keys,
+            "resource_keys_sha256": merge_guard._sha256_json(resource_keys),
+            "lease_snapshots": snapshots,
+            "lease_bindings_sha256": merge_guard._sha256_json(snapshots),
+            "minimum_expires_at_unix": 150,
+            "observed_at_unix": 100,
+        }
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner", now_unix=100
+        )
+        delegation = merge_guard.issue_server_operator_lease_delegation(
+            actor,
+            evidence,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+
+        verified = merge_guard.verify_server_operator_lease_delegation(
+            delegation,
+            actor_identity=actor,
+            captain_request_sha256_value="c" * 64,
+            now_unix=100,
+        )
+        self.assertEqual(owner, verified["lease_owner_id"])
+        self.assertEqual(150, verified["expires_at_unix"])
+        self.assertEqual(snapshots, verified["lease_snapshots"])
+        with self.assertRaisesRegex(ValueError, "captain request mismatch"):
+            merge_guard.verify_server_operator_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="d" * 64,
+                now_unix=100,
+            )
+        with self.assertRaisesRegex(ValueError, "not current"):
+            merge_guard.verify_server_operator_lease_delegation(
+                delegation,
+                actor_identity=actor,
+                captain_request_sha256_value="c" * 64,
+                now_unix=151,
+            )
+
+    def test_atomic_merge_guard_rejects_unsigned_direct_operator_owner(self) -> None:
+        class Session:
+            pass
+
+        owner = "operator:test-unsigned-owner"
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        parameters["_server_runtime_actor_identity"] = (
+            merge_guard.issue_server_runtime_actor_identity(
+                Session(), profile="trusted-owner"
+            )
+        )
+        gh = FakeGh()
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_before_guard", guard["status"])
+        self.assertIn(
+            "merge_guard_server_operator_lease_delegation_required",
+            guard["errors"],
+        )
+        self.assertEqual([], gh.calls)
+
+    def test_atomic_merge_guard_accepts_and_converges_direct_operator_lease(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        head_key = next(
+            key
+            for key in guard_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(
+                ":"
+                + merge_guard._merge_guard_identifier("branch", "feat/captain")
+            )
+        )
+        owner = "operator:test-direct-captain"
+        resources.acquire_resources(
+            owner,
+            [head_key],
+            purpose="direct Operator branch work",
+            ttl_seconds=600,
+        )
+        lease_evidence = resources.operator_lease_delegation_evidence(owner)
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        delegation = merge_guard.issue_server_operator_lease_delegation(
+            actor,
+            lease_evidence,
+            captain_request_sha256_value=merge_guard.captain_request_sha256(
+                parameters
+            ),
+        )
+        parameters["_server_operator_lease_delegation"] = delegation
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertEqual(
+            "server-runtime-operator-delegation-v1", guard["lease_owner_source"]
+        )
+        self.assertEqual(
+            "direct_operator", guard["lease_owner_binding"]["delegation_kind"]
+        )
+        self.assertTrue(
+            guard["delegated_operator_lease_convergence"]["converged"]
+        )
+        self.assertEqual(
+            "success", guard["delegated_operator_terminal_evidence"]["status"]
+        )
+        self.assertIsNone(resources.inspect_resource(head_key))
+        self.assertNotIn(
+            delegation["proof_sha256"], json.dumps(guard, sort_keys=True)
+        )
+        self.assertEqual(1, len([call for call in gh.calls if call[:2] == ("pr", "merge")]))
+
+    def test_atomic_merge_guard_converges_direct_operator_lease_on_authoritative_abort(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        head_key = next(
+            key
+            for key in guard_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(
+                ":"
+                + merge_guard._merge_guard_identifier("branch", "feat/captain")
+            )
+        )
+        owner = "operator:test-direct-abort"
+        resources.acquire_resources(
+            owner,
+            [head_key],
+            purpose="direct Operator branch work",
+            ttl_seconds=600,
+        )
+        lease_evidence = resources.operator_lease_delegation_evidence(owner)
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_operator_lease_delegation"] = (
+            merge_guard.issue_server_operator_lease_delegation(
+                actor,
+                lease_evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        good = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        drifted = dict(good, baseRefOid="a" * 40)
+        gh = FakeGh(view_sequence=[good, good, drifted])
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual(
+            "authoritative_abort",
+            guard["delegated_operator_terminal_evidence"]["status"],
+        )
+        self.assertTrue(
+            guard["delegated_operator_lease_convergence"]["converged"]
+        )
+        self.assertIsNone(resources.inspect_resource(head_key))
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_retains_direct_operator_lease_on_ambiguous_dispatch(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        head_key = next(
+            key
+            for key in guard_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(
+                ":"
+                + merge_guard._merge_guard_identifier("branch", "feat/captain")
+            )
+        )
+        owner = "operator:test-direct-ambiguous"
+        resources.acquire_resources(
+            owner, [head_key], purpose="direct Operator work", ttl_seconds=600
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_operator_lease_delegation"] = (
+            merge_guard.issue_server_operator_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            merge_exception=True,
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        convergence = guard["delegated_operator_lease_convergence"]
+        self.assertEqual(
+            "retained_missing_terminal_evidence", convergence["status"]
+        )
+        self.assertEqual(0, convergence["released_count"])
+        self.assertIsNotNone(resources.inspect_resource(head_key))
+
+    def test_atomic_merge_guard_rejects_direct_operator_snapshot_drift(self) -> None:
+        class Session:
+            pass
+
+        local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            local_repo,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=96,
+            base="main",
+            head="feat/captain",
+        )
+        head_key = next(
+            key
+            for key in guard_keys
+            if key.startswith("component:github-branch:")
+            and key.endswith(
+                ":"
+                + merge_guard._merge_guard_identifier("branch", "feat/captain")
+            )
+        )
+        owner = "operator:test-direct-drift"
+        resources.acquire_resources(
+            owner, [head_key], purpose="direct Operator work", ttl_seconds=600
+        )
+        evidence = resources.operator_lease_delegation_evidence(owner)
+        parameters = authorized_captain_run_parameters()
+        parameters["execution_intent"]["context"]["lease_owner_id"] = owner
+        parameters["execution_intent"] = captain_execution_intent(
+            parameters, context=parameters["execution_intent"]["context"]
+        )
+        actor = merge_guard.issue_server_runtime_actor_identity(
+            Session(), profile="trusted-owner"
+        )
+        parameters["_server_runtime_actor_identity"] = actor
+        parameters["_server_operator_lease_delegation"] = (
+            merge_guard.issue_server_operator_lease_delegation(
+                actor,
+                evidence,
+                captain_request_sha256_value=merge_guard.captain_request_sha256(
+                    parameters
+                ),
+            )
+        )
+        resources.renew_resources(owner, [head_key], ttl_seconds=700)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("blocked_by_live_lease", guard["status"])
+        self.assertIn("snapshot changed", guard["errors"][0])
+        self.assertIsNotNone(resources.inspect_resource(head_key))
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
     def test_atomic_merge_guard_prefers_server_actor_to_caller_lease_owner(self) -> None:
         class Session:
             pass

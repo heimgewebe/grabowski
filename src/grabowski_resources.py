@@ -48,6 +48,7 @@ RESOURCE_KINDS = {
     "gate",
 }
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
+DIRECT_OPERATOR_OWNER_RE = re.compile(r"operator:[A-Za-z0-9._:@-]{1,119}\Z")
 SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -2346,6 +2347,295 @@ def task_lease_delegation_evidence(
     }
 
 
+
+def operator_lease_delegation_evidence(
+    owner_id: str,
+    resource_keys: Iterable[str] | None = None,
+    *,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Return the complete live lease snapshot for one direct Operator owner."""
+    owner = _owner(owner_id)
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError("direct Operator lease owner is invalid")
+    now = _now() if now_unix is None else int(now_unix)
+    with _database() as connection:
+        rows = connection.execute(
+            "SELECT * FROM leases WHERE owner_id=? AND expires_at_unix>? ORDER BY resource_key",
+            (owner, now),
+        ).fetchall()
+    owner_keys = [str(row["resource_key"]) for row in rows]
+    if not owner_keys:
+        raise ValueError("direct Operator owner has no live leases")
+    if len(owner_keys) > 64:
+        raise ValueError("direct Operator owner has more than 64 live leases")
+    if any(key.startswith("gate:operator-lease-authority:") for key in owner_keys):
+        raise ValueError(
+            "direct Operator owner holds a reserved delegation authority gate"
+        )
+    keys = owner_keys if resource_keys is None else normalize_resource_keys(resource_keys)
+    if keys != owner_keys:
+        raise ValueError("direct Operator lease set does not match the complete current owner lease set")
+    snapshots: list[dict[str, Any]] = []
+    minimum_expiry: int | None = None
+    for row in rows:
+        metadata = _row_metadata(row)
+        _, observed_metadata_sha256 = _metadata(metadata)
+        if row["metadata_sha256"] != observed_metadata_sha256:
+            raise ValueError("direct Operator lease metadata integrity mismatch")
+        snapshot = {key: row[key] for key in LEASE_SNAPSHOT_KEYS}
+        snapshots.append(snapshot)
+        expiry = int(row["expires_at_unix"])
+        minimum_expiry = expiry if minimum_expiry is None else min(minimum_expiry, expiry)
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_live_operator_lease_delegation_evidence",
+        "lease_owner_id": owner,
+        "resource_keys": keys,
+        "resource_keys_sha256": hashlib.sha256(
+            _canonical_json(keys).encode("utf-8")
+        ).hexdigest(),
+        "lease_snapshots": snapshots,
+        "lease_bindings_sha256": hashlib.sha256(
+            _canonical_json(snapshots).encode("utf-8")
+        ).hexdigest(),
+        "minimum_expires_at_unix": minimum_expiry,
+        "observed_at_unix": now,
+    }
+
+
+def reconcile_delegated_operator_leases(
+    owner_id: str,
+    expected_lease_snapshots: Iterable[Mapping[str, Any]],
+    *,
+    expected_lease_bindings_sha256: str,
+    delegation_sha256: str,
+    authority_resource_key: str,
+    terminal_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Release only unchanged delegated Operator leases after exact terminal evidence."""
+    owner = _owner(owner_id)
+    if DIRECT_OPERATOR_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError("direct Operator lease owner is invalid")
+    snapshots = [dict(item) for item in expected_lease_snapshots]
+    if (
+        not snapshots
+        or len(snapshots) > 64
+        or any(set(item) != LEASE_SNAPSHOT_KEYS for item in snapshots)
+        or [item["resource_key"] for item in snapshots]
+        != sorted({str(item["resource_key"]) for item in snapshots})
+    ):
+        raise ValueError("delegated Operator lease snapshots are invalid")
+    if any(item["owner_id"] != owner for item in snapshots):
+        raise ValueError("delegated Operator lease snapshot owner mismatch")
+    for snapshot in snapshots:
+        if (
+            not isinstance(snapshot["resource_key"], str)
+            or not isinstance(snapshot["metadata_sha256"], str)
+            or SHA256_RE.fullmatch(snapshot["metadata_sha256"]) is None
+        ):
+            raise ValueError("delegated Operator lease snapshot digest is invalid")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            value = snapshot[field]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    f"delegated Operator lease snapshot {field} is invalid"
+                )
+    observed_bindings_sha256 = hashlib.sha256(
+        _canonical_json(snapshots).encode("utf-8")
+    ).hexdigest()
+    if (
+        SHA256_RE.fullmatch(expected_lease_bindings_sha256) is None
+        or observed_bindings_sha256 != expected_lease_bindings_sha256
+    ):
+        raise ValueError("delegated Operator lease binding digest mismatch")
+    if SHA256_RE.fullmatch(delegation_sha256) is None:
+        raise ValueError("delegated Operator delegation digest is invalid")
+    expected_authority_key = (
+        "gate:operator-lease-authority:"
+        + hashlib.sha256(owner.encode("utf-8")).hexdigest()
+    )
+    if authority_resource_key != expected_authority_key:
+        raise ValueError("delegated Operator authority resource is invalid")
+    source = dict(terminal_source)
+    required_source_keys = {
+        "schema_version",
+        "kind",
+        "status",
+        "guard_owner_id",
+        "dispatch_called",
+        "execution_invoked",
+        "verification_passed",
+        "observed_at_unix_ns",
+        "terminal_evidence_sha256",
+    }
+    if set(source) != required_source_keys:
+        raise ValueError("delegated Operator terminal evidence shape is invalid")
+    if source.get("schema_version") != 1 or source.get("kind") != "grabowski_captain_operator_lease_terminal_evidence":
+        raise ValueError("delegated Operator terminal evidence contract is invalid")
+    if source.get("status") not in {"success", "authoritative_abort"}:
+        raise ValueError("delegated Operator terminal evidence is not authoritative")
+    if source.get("status") == "success" and source.get("verification_passed") is not True:
+        raise ValueError("delegated Operator success evidence is inconsistent")
+    if source.get("status") == "authoritative_abort" and (
+        source.get("dispatch_called") is not False
+        or source.get("verification_passed") is not False
+    ):
+        raise ValueError("delegated Operator abort evidence is inconsistent")
+    if OWNER_RE.fullmatch(str(source.get("guard_owner_id", ""))) is None:
+        raise ValueError("delegated Operator terminal guard owner is invalid")
+    for field in ("dispatch_called", "execution_invoked", "verification_passed"):
+        if not isinstance(source.get(field), bool):
+            raise ValueError(f"delegated Operator terminal {field} is invalid")
+    observed_at_unix_ns = source.get("observed_at_unix_ns")
+    if not isinstance(observed_at_unix_ns, int) or isinstance(observed_at_unix_ns, bool) or observed_at_unix_ns < 1:
+        raise ValueError("delegated Operator terminal observation time is invalid")
+    unsigned_source = {key: source[key] for key in source if key != "terminal_evidence_sha256"}
+    terminal_evidence_sha256 = hashlib.sha256(
+        _canonical_json(unsigned_source).encode("utf-8")
+    ).hexdigest()
+    if source.get("terminal_evidence_sha256") != terminal_evidence_sha256:
+        raise ValueError("delegated Operator terminal evidence digest is invalid")
+
+    released: list[dict[str, Any]] = []
+    already_absent: list[str] = []
+    retained: list[dict[str, str]] = []
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            current_owner_rows = connection.execute(
+                "SELECT * FROM leases WHERE owner_id=? ORDER BY resource_key",
+                (owner,),
+            ).fetchall()
+            expected_keys = [str(item["resource_key"]) for item in snapshots]
+            now = _now()
+            current_live_owner_keys = [
+                str(row["resource_key"])
+                for row in current_owner_rows
+                if int(row["expires_at_unix"]) > now
+            ]
+            unexpected_owner_keys = sorted(
+                set(current_live_owner_keys) - set(expected_keys)
+            )
+            if unexpected_owner_keys:
+                retained.extend(
+                    {"resource_key": key, "reason": "owner_lease_set_changed"}
+                    for key in expected_keys
+                )
+                connection.commit()
+                return {
+                    "schema_version": 1,
+                    "kind": "grabowski_delegated_operator_lease_convergence",
+                    "owner_id": owner,
+                    "resource_keys_sha256": hashlib.sha256(
+                        _canonical_json(expected_keys).encode("utf-8")
+                    ).hexdigest(),
+                    "lease_bindings_sha256": observed_bindings_sha256,
+                    "delegation_sha256": delegation_sha256,
+                    "authority_resource_key_sha256": hashlib.sha256(
+                        authority_resource_key.encode("utf-8")
+                    ).hexdigest(),
+                    "terminal_evidence_sha256": terminal_evidence_sha256,
+                    "released": [],
+                    "already_absent": [],
+                    "retained": retained,
+                    "unexpected_owner_resource_keys_sha256": hashlib.sha256(
+                        _canonical_json(unexpected_owner_keys).encode("utf-8")
+                    ).hexdigest(),
+                    "converged": False,
+                    "idempotent_replay": False,
+                    "does_not_establish": [
+                        "identity_of_original_lease_creator",
+                        "permission_to_release_changed_lease",
+                        "permission_to_release_foreign_lease",
+                    ],
+                }
+            for snapshot in snapshots:
+                key = str(snapshot["resource_key"])
+                row = connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()
+                if row is None:
+                    already_absent.append(key)
+                    continue
+                current = {field: row[field] for field in LEASE_SNAPSHOT_KEYS}
+                if row["owner_id"] != owner:
+                    retained.append({"resource_key": key, "reason": "owner_changed"})
+                    continue
+                if current != snapshot:
+                    retained.append({"resource_key": key, "reason": "lease_changed"})
+                    continue
+                released.append(_public(row))
+            if released:
+                authority_row = connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?",
+                    (authority_resource_key,),
+                ).fetchone()
+                if (
+                    authority_row is None
+                    or authority_row["owner_id"] != source["guard_owner_id"]
+                    or int(authority_row["expires_at_unix"]) <= _now()
+                ):
+                    raise ValueError(
+                        "delegated Operator authority gate is not live for the guard"
+                    )
+                authority_metadata = _row_metadata(authority_row)
+                _, authority_metadata_sha256 = _metadata(authority_metadata)
+                if authority_row["metadata_sha256"] != authority_metadata_sha256:
+                    raise ValueError(
+                        "delegated Operator authority gate metadata integrity mismatch"
+                    )
+                authority_binding = authority_metadata.get(
+                    "operator_lease_delegation"
+                )
+                expected_authority_binding = {
+                    "lease_owner_id_sha256": hashlib.sha256(
+                        owner.encode("utf-8")
+                    ).hexdigest(),
+                    "resource_keys_sha256": hashlib.sha256(
+                        _canonical_json(expected_keys).encode("utf-8")
+                    ).hexdigest(),
+                    "lease_bindings_sha256": observed_bindings_sha256,
+                    "delegation_sha256": delegation_sha256,
+                }
+                if authority_binding != expected_authority_binding:
+                    raise ValueError(
+                        "delegated Operator authority gate binding mismatch"
+                    )
+                connection.executemany(
+                    "DELETE FROM leases WHERE resource_key=? AND owner_id=?",
+                    [(item["resource_key"], owner) for item in released],
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_delegated_operator_lease_convergence",
+        "owner_id": owner,
+        "resource_keys_sha256": hashlib.sha256(
+            _canonical_json([item["resource_key"] for item in snapshots]).encode("utf-8")
+        ).hexdigest(),
+        "lease_bindings_sha256": observed_bindings_sha256,
+        "delegation_sha256": delegation_sha256,
+        "authority_resource_key_sha256": hashlib.sha256(
+            authority_resource_key.encode("utf-8")
+        ).hexdigest(),
+        "terminal_evidence_sha256": terminal_evidence_sha256,
+        "released": released,
+        "already_absent": already_absent,
+        "retained": retained,
+        "unexpected_owner_resource_keys_sha256": None,
+        "converged": not retained,
+        "idempotent_replay": not released and len(already_absent) == len(snapshots),
+        "does_not_establish": [
+            "identity_of_original_lease_creator",
+            "permission_to_release_changed_lease",
+            "permission_to_release_foreign_lease",
+        ],
+    }
+
 def acquire_merge_guard_resources(
     guard_owner_id: str,
     lease_owner_id: str,
@@ -2357,18 +2647,25 @@ def acquire_merge_guard_resources(
     ttl_seconds: int = 300,
     metadata: dict[str, Any] | None = None,
     delegated_task: dict[str, Any] | None = None,
+    delegated_operator: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     guard_owner = _owner(guard_owner_id)
     lease_owner = _owner(lease_owner_id)
     if guard_owner == lease_owner:
         raise ValueError("merge guard owner must be distinct from lease owner")
     keys = normalize_resource_keys(resource_keys)
+    effect_resource_keys = list(keys)
     lease_purpose = _purpose(purpose)
     ttl = _ttl(ttl_seconds)
     delegated_task_id: str | None = None
     delegated_resource_keys: list[str] = []
     delegated_bindings_sha256: str | None = None
     delegated_expires_at_unix: int | None = None
+    delegated_operator_snapshots: list[dict[str, Any]] = []
+    delegated_operator_authority_key: str | None = None
+    delegated_operator_delegation_sha256: str | None = None
+    if delegated_task is not None and delegated_operator is not None:
+        raise ValueError("task and direct Operator delegations are mutually exclusive")
     if delegated_task is not None:
         required = {
             "task_id",
@@ -2412,6 +2709,75 @@ def acquire_merge_guard_resources(
         ):
             raise ValueError("delegated task lease expiry is invalid")
         delegated_expires_at_unix = delegated_expiry
+    if delegated_operator is not None:
+        required = {
+            "lease_owner_id",
+            "resource_keys",
+            "resource_keys_sha256",
+            "lease_snapshots",
+            "lease_bindings_sha256",
+            "delegation_sha256",
+        }
+        if not isinstance(delegated_operator, dict) or not required.issubset(delegated_operator):
+            raise ValueError("delegated Operator binding is invalid")
+        if DIRECT_OPERATOR_OWNER_RE.fullmatch(lease_owner) is None:
+            raise ValueError("delegated Operator owner is invalid")
+        if delegated_operator.get("lease_owner_id") != lease_owner:
+            raise ValueError("delegated Operator owner does not match lease owner")
+        delegated_resource_keys = normalize_resource_keys(
+            delegated_operator.get("resource_keys")
+        )
+        expected_keys_sha256 = hashlib.sha256(
+            _canonical_json(delegated_resource_keys).encode("utf-8")
+        ).hexdigest()
+        if delegated_operator.get("resource_keys_sha256") != expected_keys_sha256:
+            raise ValueError("delegated Operator resource key digest is invalid")
+        raw_snapshots = delegated_operator.get("lease_snapshots")
+        if (
+            not isinstance(raw_snapshots, list)
+            or len(raw_snapshots) != len(delegated_resource_keys)
+            or any(not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS for item in raw_snapshots)
+        ):
+            raise ValueError("delegated Operator lease snapshots are invalid")
+        delegated_operator_snapshots = [dict(item) for item in raw_snapshots]
+        if [item["resource_key"] for item in delegated_operator_snapshots] != delegated_resource_keys:
+            raise ValueError("delegated Operator lease snapshot keys are invalid")
+        if any(item["owner_id"] != lease_owner for item in delegated_operator_snapshots):
+            raise ValueError("delegated Operator lease snapshot owner mismatch")
+        delegated_operator_delegation_sha256 = delegated_operator.get(
+            "delegation_sha256"
+        )
+        if (
+            not isinstance(delegated_operator_delegation_sha256, str)
+            or SHA256_RE.fullmatch(delegated_operator_delegation_sha256) is None
+        ):
+            raise ValueError("delegated Operator delegation digest is invalid")
+        delegated_bindings_sha256 = delegated_operator.get("lease_bindings_sha256")
+        if (
+            not isinstance(delegated_bindings_sha256, str)
+            or SHA256_RE.fullmatch(delegated_bindings_sha256) is None
+            or delegated_bindings_sha256
+            != hashlib.sha256(
+                _canonical_json(delegated_operator_snapshots).encode("utf-8")
+            ).hexdigest()
+        ):
+            raise ValueError("delegated Operator lease binding digest is invalid")
+        delegated_expiry = delegated_operator.get(
+            "expires_at_unix",
+            delegated_operator.get("minimum_expires_at_unix"),
+        )
+        if (
+            not isinstance(delegated_expiry, int)
+            or isinstance(delegated_expiry, bool)
+            or delegated_expiry < 1
+        ):
+            raise ValueError("delegated Operator lease expiry is invalid")
+        delegated_expires_at_unix = delegated_expiry
+        delegated_operator_authority_key = (
+            "gate:operator-lease-authority:"
+            + hashlib.sha256(lease_owner.encode("utf-8")).hexdigest()
+        )
+        keys = normalize_resource_keys([*keys, delegated_operator_authority_key])
     repository_path = Path(repository).expanduser()
     if not repository_path.is_absolute():
         raise ValueError("merge guard repository must be absolute")
@@ -2437,13 +2803,24 @@ def acquire_merge_guard_resources(
     if not isinstance(guard_metadata, dict):
         raise ValueError("merge guard metadata is required")
     guard_metadata = dict(guard_metadata)
-    guard_metadata["effect_resource_keys"] = keys
+    guard_metadata["effect_resource_keys"] = effect_resource_keys
     guard_metadata["effect_resource_keys_sha256"] = hashlib.sha256(
-        _canonical_json(keys).encode("utf-8")
+        _canonical_json(effect_resource_keys).encode("utf-8")
     ).hexdigest()
     guard_metadata["local_resource_repository"] = canonical_repository
     guard_metadata["local_changed_paths"] = relative_changed_paths
     normalized_metadata["merge_guard"] = guard_metadata
+    if delegated_operator is not None:
+        normalized_metadata["operator_lease_delegation"] = {
+            "lease_owner_id_sha256": hashlib.sha256(
+                lease_owner.encode("utf-8")
+            ).hexdigest(),
+            "resource_keys_sha256": hashlib.sha256(
+                _canonical_json(delegated_resource_keys).encode("utf-8")
+            ).hexdigest(),
+            "lease_bindings_sha256": delegated_bindings_sha256,
+            "delegation_sha256": delegated_operator_delegation_sha256,
+        }
     guarded_branches = _merge_guard_branch_names(normalized_metadata)
     if guarded_branches is None:
         raise ValueError(
@@ -2457,7 +2834,7 @@ def acquire_merge_guard_resources(
     now = _now()
     expires = now + ttl
     if delegated_expires_at_unix is not None and delegated_expires_at_unix <= now:
-        raise ValueError("delegated task lease authority is expired")
+        raise ValueError("delegated lease authority is expired")
     task_adoption_expires = (
         expires
         if delegated_expires_at_unix is None
@@ -2571,7 +2948,43 @@ def acquire_merge_guard_resources(
                 ).hexdigest()
                 if observed_bindings_sha256 != delegated_bindings_sha256:
                     raise ValueError("delegated task lease bindings changed")
+            if delegated_operator is not None:
+                operator_rows = [row for row in rows if row["owner_id"] == lease_owner]
+                operator_keys = [str(row["resource_key"]) for row in operator_rows]
+                if operator_keys != delegated_resource_keys:
+                    raise ValueError(
+                        "delegated Operator lease set changed after signing"
+                    )
+                operator_by_key = {row["resource_key"]: row for row in operator_rows}
+                observed_operator_snapshots: list[dict[str, Any]] = []
+                for expected_snapshot in delegated_operator_snapshots:
+                    delegated_key = str(expected_snapshot["resource_key"])
+                    delegated_row = operator_by_key.get(delegated_key)
+                    if delegated_row is None:
+                        raise ValueError(
+                            f"delegated Operator lease is not live: {delegated_key}"
+                        )
+                    delegated_metadata = _row_metadata(delegated_row)
+                    _, observed_delegated_sha256 = _metadata(delegated_metadata)
+                    if delegated_row["metadata_sha256"] != observed_delegated_sha256:
+                        raise ValueError(
+                            f"delegated Operator lease metadata integrity mismatch: {delegated_key}"
+                        )
+                    observed_snapshot = {
+                        field: delegated_row[field] for field in LEASE_SNAPSHOT_KEYS
+                    }
+                    if observed_snapshot != expected_snapshot:
+                        raise ValueError(
+                            f"delegated Operator lease snapshot changed: {delegated_key}"
+                        )
+                    observed_operator_snapshots.append(observed_snapshot)
+                observed_bindings_sha256 = hashlib.sha256(
+                    _canonical_json(observed_operator_snapshots).encode("utf-8")
+                ).hexdigest()
+                if observed_bindings_sha256 != delegated_bindings_sha256:
+                    raise ValueError("delegated Operator lease bindings changed")
             existing_owned_keys: set[str] = set()
+            delegated_operator_target_keys: set[str] = set()
             for row in rows:
                 row_key = row["resource_key"]
                 row_metadata = _row_metadata(row)
@@ -2632,13 +3045,26 @@ def acquire_merge_guard_resources(
                 snapshot = _public(row)
                 observed.append(snapshot)
                 same_lease_owner = row["owner_id"] == lease_owner
+                if (
+                    delegated_operator is not None
+                    and same_lease_owner
+                    and row_key in delegated_resource_keys
+                ):
+                    delegated_operator_target_keys.add(str(row_key))
                 if same_lease_owner:
+                    if (
+                        delegated_operator_authority_key is not None
+                        and row_key == delegated_operator_authority_key
+                    ):
+                        raise ResourceConflict(
+                            row_key, row["owner_id"], row["expires_at_unix"]
+                        )
                     if row_key.startswith("gate:github-merge:"):
                         raise ResourceConflict(
                             row_key, row["owner_id"], row["expires_at_unix"]
                         )
                     if (
-                        delegated_task_id is not None
+                        (delegated_task_id is not None or delegated_operator is not None)
                         and row_key not in delegated_resource_keys
                     ):
                         raise ResourceConflict(
@@ -2651,6 +3077,10 @@ def acquire_merge_guard_resources(
                     row_key, row["owner_id"], row["expires_at_unix"]
                 )
 
+            if delegated_operator is not None and not delegated_operator_target_keys:
+                raise ValueError(
+                    "delegated Operator leases do not bind the merge target"
+                )
             keys_to_acquire = [
                 key for key in keys if key not in existing_owned_keys
             ]
@@ -2711,8 +3141,33 @@ def acquire_merge_guard_resources(
         "held_resource_keys": held_keys,
         "resource_keys": keys,
         "delegated_task_id": delegated_task_id,
-        "delegated_task_resource_keys": delegated_resource_keys,
+        "delegated_task_resource_keys": (
+            delegated_resource_keys if delegated_task_id is not None else []
+        ),
         "task_authority_adoption": task_adoption,
+        "delegated_operator_lease_owner_id": (
+            lease_owner if delegated_operator is not None else None
+        ),
+        "delegated_operator_resource_keys": (
+            delegated_resource_keys if delegated_operator is not None else []
+        ),
+        "delegated_operator_target_resource_keys": (
+            sorted(delegated_operator_target_keys)
+            if delegated_operator is not None
+            else []
+        ),
+        "delegated_operator_lease_snapshots": (
+            delegated_operator_snapshots if delegated_operator is not None else []
+        ),
+        "delegated_operator_lease_bindings_sha256": (
+            delegated_bindings_sha256 if delegated_operator is not None else None
+        ),
+        "delegated_operator_delegation_sha256": (
+            delegated_operator_delegation_sha256
+            if delegated_operator is not None
+            else None
+        ),
+        "delegated_operator_authority_key": delegated_operator_authority_key,
     }
 
 

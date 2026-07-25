@@ -750,6 +750,96 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     "reserved server parameter", blocked_task["output"]["error"]
                 )
 
+                operator_owner = "operator:test-mcp-delegation"
+                operator_parameters = dict(valid_parameters)
+                operator_parameters["execution_intent"] = {
+                    "context": {"lease_owner_id": operator_owner}
+                }
+                operator_keys = ["component:test-direct-operator"]
+                observed_at = int(__import__("time").time())
+                operator_snapshots = [
+                    {
+                        "resource_key": operator_keys[0],
+                        "owner_id": operator_owner,
+                        "acquired_at_unix": observed_at - 1,
+                        "updated_at_unix": observed_at - 1,
+                        "expires_at_unix": observed_at + 60,
+                        "metadata_sha256": "c" * 64,
+                    }
+                ]
+                operator_evidence = {
+                    "schema_version": 1,
+                    "kind": "grabowski_live_operator_lease_delegation_evidence",
+                    "lease_owner_id": operator_owner,
+                    "resource_keys": operator_keys,
+                    "resource_keys_sha256": (
+                        grabowski_mcp.grabowski_merge_guard._sha256_json(operator_keys)
+                    ),
+                    "lease_snapshots": operator_snapshots,
+                    "lease_bindings_sha256": (
+                        grabowski_mcp.grabowski_merge_guard._sha256_json(
+                            operator_snapshots
+                        )
+                    ),
+                    "minimum_expires_at_unix": observed_at + 60,
+                    "observed_at_unix": observed_at,
+                }
+                fake_resources = types.SimpleNamespace(
+                    operator_lease_delegation_evidence=lambda owner: (
+                        operator_evidence if owner == operator_owner else None
+                    )
+                )
+                with (
+                    patch.dict(
+                        sys.modules, {"grabowski_resources": fake_resources}
+                    ),
+                    patch.object(
+                        grabowski_mcp.grabowski_grips,
+                        "grip_run",
+                        return_value={"ok": True},
+                    ) as operator_run,
+                ):
+                    operator_result = grabowski_mcp.grip_run(
+                        "captain-run", operator_parameters, ctx=RequestContext()
+                    )
+                self.assertEqual({"ok": True}, operator_result)
+                operator_dispatched = operator_run.call_args.args[1]
+                operator_actor = operator_dispatched[
+                    "_server_runtime_actor_identity"
+                ]
+                operator_delegation = operator_dispatched[
+                    "_server_operator_lease_delegation"
+                ]
+                verified_operator = (
+                    grabowski_mcp.grabowski_merge_guard.verify_server_operator_lease_delegation(
+                        operator_delegation,
+                        actor_identity=operator_actor,
+                        captain_request_sha256_value=(
+                            grabowski_mcp.grabowski_merge_guard.captain_request_sha256(
+                                operator_dispatched
+                            )
+                        ),
+                    )
+                )
+                self.assertEqual(
+                    operator_owner, verified_operator["lease_owner_id"]
+                )
+
+                spoofed_operator = dict(operator_parameters)
+                spoofed_operator["_server_operator_lease_delegation"] = (
+                    operator_delegation
+                )
+                blocked_operator = grabowski_mcp.grip_run(
+                    "captain-run", spoofed_operator, ctx=RequestContext()
+                )
+                self.assertEqual(
+                    "blocked", blocked_operator["receipt"]["status"]
+                )
+                self.assertIn(
+                    "reserved server parameter",
+                    blocked_operator["output"]["error"],
+                )
+
                 unavailable = grabowski_mcp.grip_run(
                     "captain-run", valid_parameters, ctx=None
                 )
