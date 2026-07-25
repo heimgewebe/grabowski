@@ -16,8 +16,11 @@ class BureauPickupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
+        self.registry_root = self.root / "bureau"
+        self.registry_root.mkdir()
         self.patches = [
             mock.patch.object(pickup, "STATE_ROOT", self.root / "state"),
+            mock.patch.object(pickup.bureau, "BUREAU_ROOT", self.registry_root),
             mock.patch.object(pickup.operator, "_require_operator_mutation"),
             mock.patch.object(pickup.bureau, "_audit"),
         ]
@@ -245,12 +248,45 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(metadata["task_id"], intent["task_id"])
         self.assertEqual(metadata["run_id"], intent["run_id"])
         self.assertEqual(metadata["claim_intent_sha256"], intent["intent_sha256"])
-        self.assertIn("--workspace", invoke.call_args_list[1].args[0])
+        intent_argv = invoke.call_args_list[0].args[0]
+        commit_argv = invoke.call_args_list[1].args[0]
+        for argv in (intent_argv, commit_argv):
+            root_index = argv.index("--root")
+            self.assertEqual(argv[root_index + 1], str(self.registry_root))
+        self.assertIn("--workspace", commit_argv)
         run_dir = Path(result["journal"])
         self.assertTrue((run_dir / "intent.json").is_file())
         self.assertTrue((run_dir / "acquisition.json").is_file())
         self.assertTrue((run_dir / "commit-result.json").is_file())
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
+
+    def test_relative_registry_root_is_rejected_before_any_effect(self) -> None:
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(ValueError, "registry_root must be absolute"):
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(registry_root="relative/bureau")
+                )
+        invoke.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_claim_intent_root_refusal_precedes_lease_acquisition(self) -> None:
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "explicit-registry-root-required"},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-not-ready"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(invoke.call_count, 1)
+        acquire.assert_not_called()
 
     def test_repository_scope_is_required_before_any_acquisition(self) -> None:
         key = "repo:/tmp/repository"
@@ -405,6 +441,43 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(result["status"], "recovered")
         release.assert_not_called()
 
+    def test_pre_effect_commit_refusal_compensates_and_raises(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {
+                        "status": "explicit-registry-root-required",
+                        "effect_started": False,
+                        "ambiguity": False,
+                    },
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ) as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-not-applied"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            raised.exception.details["result"]["status"], "commit-not-applied"
+        )
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
     def test_definitive_missing_run_compensates_after_commit_failure(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
@@ -430,8 +503,13 @@ class BureauPickupTests(unittest.TestCase):
                 return_value={"released": [lease]},
             ) as release,
         ):
-            result = pickup.grabowski_bureau_pickup_execute(self.request())
-        self.assertEqual(result["status"], "commit-not-applied")
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-not-applied"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            raised.exception.details["result"]["status"], "commit-not-applied"
+        )
         release.assert_called_once_with(intent["lease_owner_id"], [key])
 
     def create_acquisition_journal(self, intent, lease):
@@ -664,7 +742,11 @@ class BureauPickupTests(unittest.TestCase):
             ),
             mock.patch.object(pickup.resources, "release_resources") as release,
         ):
-            result = pickup.grabowski_bureau_pickup_execute(self.request())
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-recovery-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        result = raised.exception.details["result"]
         self.assertEqual(result["status"], "recovery-required")
         self.assertEqual(
             result["recovery"]["lease_owner_id"], intent["lease_owner_id"]
