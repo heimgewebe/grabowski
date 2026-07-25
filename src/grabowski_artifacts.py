@@ -983,15 +983,27 @@ def _validate_diff_safety(data: bytes) -> str:
     return text
 
 
-def _write_git_diff(
-    repository: Path,
-    base_commit: str,
-    head_commit: str,
+def _diff_environment() -> dict[str, str]:
+    return {
+        "HOME": str(operator.HOME),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GH_PAGER": "cat",
+        "PAGER": "cat",
+        "NO_COLOR": "1",
+    }
+
+
+def _write_bounded_diff_command(
+    argv: list[str],
     destination: Path,
+    *,
+    label: str,
 ) -> int:
-    git = shutil.which("git")
-    if git is None:
-        raise RuntimeError("Git is not installed")
     stderr_path = destination.with_suffix(".stderr")
     total = 0
     process: subprocess.Popen[bytes] | None = None
@@ -1002,46 +1014,22 @@ def _write_git_diff(
             "xb", buffering=0
         ) as error_output:
             process = subprocess.Popen(
-                [
-                    git,
-                    "-c",
-                    "color.ui=false",
-                    "-c",
-                    "core.quotepath=true",
-                    "-C",
-                    str(repository),
-                    "diff",
-                    "--binary",
-                    "--full-index",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    base_commit,
-                    head_commit,
-                    "--",
-                ],
+                argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=error_output,
                 shell=False,
                 close_fds=True,
-                env={
-                    "HOME": str(operator.HOME),
-                    "LANG": "C.UTF-8",
-                    "LC_ALL": "C.UTF-8",
-                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                    "GIT_CONFIG_NOSYSTEM": "1",
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "GIT_NO_REPLACE_OBJECTS": "1",
-                },
+                env=_diff_environment(),
             )
             if process.stdout is None:
-                raise RuntimeError("Git diff stdout is unavailable")
+                raise RuntimeError(f"{label} stdout is unavailable")
             os.set_blocking(process.stdout.fileno(), False)
             selector.register(process.stdout, selectors.EVENT_READ)
             while selector.get_map():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("Git diff generation timed out")
+                    raise TimeoutError(f"{label} generation timed out")
                 events = selector.select(timeout=min(1.0, remaining))
                 if not events:
                     continue
@@ -1058,7 +1046,7 @@ def _write_git_diff(
                     output.write(block)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError("Git diff generation timed out")
+                raise TimeoutError(f"{label} generation timed out")
             returncode = process.wait(timeout=remaining)
             output.flush()
             os.fsync(output.fileno())
@@ -1067,7 +1055,7 @@ def _write_git_diff(
                 "utf-8", errors="replace"
             )
             raise ArtifactTransferError(
-                f"Git diff failed: {_redact_transfer_detail(detail)}"
+                f"{label} failed: {_redact_transfer_detail(detail)}"
             )
     except Exception:
         if process is not None and process.poll() is None:
@@ -1081,6 +1069,114 @@ def _write_git_diff(
             process.stdout.close()
         stderr_path.unlink(missing_ok=True)
     return total
+
+
+def _write_git_diff(
+    repository: Path,
+    base_commit: str,
+    head_commit: str,
+    destination: Path,
+) -> int:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("Git is not installed")
+    return _write_bounded_diff_command(
+        [
+            git,
+            "-c",
+            "color.ui=false",
+            "-c",
+            "core.quotepath=true",
+            "-C",
+            str(repository),
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-textconv",
+            base_commit,
+            head_commit,
+            "--",
+        ],
+        destination,
+        label="Git diff",
+    )
+
+
+def _write_github_pr_diff(
+    repository_identity: str,
+    pull_request_number: int,
+    base_commit: str,
+    head_commit: str,
+    destination: Path,
+) -> int:
+    gh = shutil.which("gh")
+    if gh is None:
+        raise RuntimeError("GitHub CLI is not installed")
+    view_argv = [
+        gh,
+        "pr",
+        "view",
+        str(pull_request_number),
+        "--repo",
+        repository_identity,
+        "--json",
+        "number,baseRefOid,headRefOid",
+    ]
+    try:
+        viewed = subprocess.run(
+            view_argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+            close_fds=True,
+            env=_diff_environment(),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ArtifactTransferError(
+            f"GitHub pull-request identity read failed: {type(exc).__name__}"
+        ) from None
+    if viewed.returncode != 0:
+        raise ArtifactTransferError(
+            "GitHub pull-request identity read failed: "
+            + _redact_transfer_detail(viewed.stderr)
+        )
+    if len(viewed.stdout.encode("utf-8")) > 64 * 1024:
+        raise ArtifactTransferError(
+            "GitHub pull-request identity output exceeds the size limit"
+        )
+    try:
+        identity = json.loads(viewed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ArtifactTransferError(
+            "GitHub pull-request identity is not valid JSON"
+        ) from exc
+    expected_identity = {
+        "number": pull_request_number,
+        "baseRefOid": base_commit,
+        "headRefOid": head_commit,
+    }
+    if not isinstance(identity, dict) or {
+        key: identity.get(key) for key in expected_identity
+    } != expected_identity:
+        raise ArtifactTransferError(
+            "GitHub pull-request identity does not match the requested base and head"
+        )
+    return _write_bounded_diff_command(
+        [
+            gh,
+            "pr",
+            "diff",
+            str(pull_request_number),
+            "--repo",
+            repository_identity,
+        ],
+        destination,
+        label="GitHub pull-request diff",
+    )
 
 
 def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
@@ -1187,7 +1283,16 @@ def _publish_text_artifact_locked(
     os.mkdir(temporary_directory, 0o700)
     diff_path = temporary_directory / filename
     try:
-        size = _write_git_diff(repo, base_sha, head_sha, diff_path)
+        if pull_request_number is None:
+            size = _write_git_diff(repo, base_sha, head_sha, diff_path)
+        else:
+            size = _write_github_pr_diff(
+                repository_identity,
+                pull_request_number,
+                base_sha,
+                head_sha,
+                diff_path,
+            )
         if size != diff_path.stat().st_size:
             raise RuntimeError("Generated diff size changed unexpectedly")
         os.chmod(diff_path, 0o600)

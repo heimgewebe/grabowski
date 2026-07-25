@@ -142,6 +142,7 @@
     "grabowski_artifact_pull",
     "grabowski_text_artifact_publish",
     "grabowski_text_artifact_read",
+    "grabowski_merge_delivery_record",
     "grabowski_browser_worker_start",
     "grabowski_browser_worker_stored_form_action",
     "grabowski_browser_worker_status",
@@ -223,6 +224,14 @@
     {
       "module": "grabowski_grip_orchestration",
       "source": "src/grabowski_grip_orchestration.py"
+    },
+    {
+      "module": "grabowski_merge_delivery",
+      "source": "src/grabowski_merge_delivery.py"
+    },
+    {
+      "module": "grabowski_merge_delivery_surface",
+      "source": "src/grabowski_merge_delivery_surface.py"
     },
     {
       "module": "grabowski_merge_guard",

@@ -137,6 +137,7 @@ class FakeGh:
         view_sequence: list[dict[str, object]] | None = None,
         view_results: list[object] | None = None,
         repo_settings: dict[str, object] | None = None,
+        repo_settings_sequence: list[dict[str, object]] | None = None,
         repo_settings_returncode: int = 0,
         repo_settings_invalid_json: bool = False,
         diff_text: str = "captain-diff\n",
@@ -157,6 +158,10 @@ class FakeGh:
         }
         self.view.setdefault("baseRefOid", "e" * 40)
         self.view.setdefault("headRefName", "feat/captain")
+        self.view.setdefault(
+            "headRepository", {"nameWithOwner": "heimgewebe/grabowski"}
+        )
+        self.view.setdefault("isCrossRepository", False)
         self.view.setdefault("changedFiles", 1)
         self.view.setdefault(
             "files", [{"path": "src/changed.py", "changeType": "MODIFIED"}]
@@ -180,6 +185,7 @@ class FakeGh:
             "allow_rebase_merge": True,
             "delete_branch_on_merge": False,
         }
+        self.repo_settings_sequence = list(repo_settings_sequence or [])
         self.repo_settings_returncode = repo_settings_returncode
         self.repo_settings_invalid_json = repo_settings_invalid_json
         self.merged = False
@@ -211,7 +217,12 @@ class FakeGh:
                 return {"returncode": self.repo_settings_returncode, "stdout": "", "stderr": "repo policy failed"}
             if self.repo_settings_invalid_json:
                 return {"returncode": 0, "stdout": "{", "stderr": ""}
-            return {"returncode": 0, "stdout": json.dumps(self.repo_settings), "stderr": ""}
+            settings = (
+                self.repo_settings_sequence.pop(0)
+                if self.repo_settings_sequence
+                else self.repo_settings
+            )
+            return {"returncode": 0, "stdout": json.dumps(settings), "stderr": ""}
         if argv[:2] == ["pr", "create"]:
             return {"returncode": 0, "stdout": str(self.view["url"]), "stderr": ""}
         if argv[:2] == ["pr", "edit"]:
@@ -242,6 +253,11 @@ class FakeGh:
             if self.view_sequence:
                 self.view = dict(self.view_sequence.pop(0))
                 self.view.setdefault("baseRefOid", "e" * 40)
+                self.view.setdefault("headRefName", "feat/captain")
+                self.view.setdefault(
+                    "headRepository", {"nameWithOwner": "heimgewebe/grabowski"}
+                )
+                self.view.setdefault("isCrossRepository", False)
                 self.view.setdefault("changedFiles", 1)
                 self.view.setdefault(
                     "files", [{"path": "src/changed.py", "changeType": "MODIFIED"}]
@@ -3098,6 +3114,68 @@ CAPTAIN_DIFF_TEXT = "captain-diff\n"
 CAPTAIN_DIFF = hashlib.sha256(CAPTAIN_DIFF_TEXT.encode("utf-8")).hexdigest()
 
 
+def captain_delivery_receipt(
+    *,
+    repository: str = "heimgewebe/grabowski",
+    pull_request: int = 96,
+    base_sha: str = CAPTAIN_BASE_SHA,
+    head_sha: str = CAPTAIN_HEAD,
+    diff_sha256: str = CAPTAIN_DIFF,
+) -> tuple[dict[str, object], str]:
+    delivered_ns = time.time_ns()
+    binding = {
+        "repository": repository,
+        "pull_request": pull_request,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
+    }
+    reference = "sandbox:/mnt/data/grabowski-pr-96-diff.txt"
+    receipt: dict[str, object] = {
+        "schema": grips.grabowski_merge_delivery.MERGE_DELIVERY_SCHEMA,
+        "kind": "user-visible-diff-delivery",
+        **binding,
+        "artifact_id": "c" * 32,
+        "artifact_sha256": diff_sha256,
+        "artifact_receipt_sha256": "d" * 64,
+        "artifact_repository_path_sha256": "e" * 64,
+        "artifact_filename": "grabowski-pr-96-diff.txt",
+        "artifact_byte_size": len(CAPTAIN_DIFF_TEXT.encode("utf-8")),
+        "artifact_created_at_unix_ns": delivered_ns - 1_000_000_000,
+        "delivery_channel": "chat-download",
+        "delivery_reference": reference,
+        "delivery_reference_sha256": hashlib.sha256(reference.encode("utf-8")).hexdigest(),
+        "delivery_confirmed_at_unix_ns": delivered_ns,
+        "expires_at_unix_ns": delivered_ns + grips.grabowski_merge_delivery.MAX_DELIVERY_AGE_SECONDS * 1_000_000_000,
+        "clock_domain": "unix-realtime",
+        "ordering_uncertainty_ns": grips.grabowski_merge_delivery.GITHUB_TIMESTAMP_UNCERTAINTY_NS,
+        "binding_sha256": grips.grabowski_merge_delivery.sha256_json(binding),
+        "does_not_establish": list(grips.grabowski_merge_delivery._DOES_NOT_ESTABLISH),
+    }
+    receipt_sha256 = hashlib.sha256(
+        grips.grabowski_merge_delivery.canonical_json_bytes(receipt)
+    ).hexdigest()
+    return receipt, receipt_sha256
+
+
+def rebind_captain_delivery(parameters: dict[str, object]) -> None:
+    actions = parameters.get("actions")
+    target = (
+        actions[0].get("target", {})
+        if isinstance(actions, list) and actions and isinstance(actions[0], dict)
+        else {}
+    )
+    receipt, receipt_sha256 = captain_delivery_receipt(
+        repository=str(target.get("repo", "heimgewebe/grabowski")),
+        pull_request=int(target.get("pr", 96)),
+        base_sha=str(parameters.get("expected_base_sha", CAPTAIN_BASE_SHA)),
+        head_sha=str(parameters.get("expected_head", CAPTAIN_HEAD)),
+        diff_sha256=str(parameters.get("diff_sha256", CAPTAIN_DIFF)),
+    )
+    parameters["merge_delivery_receipt"] = receipt
+    parameters["merge_delivery_receipt_sha256"] = receipt_sha256
+
+
 def captain_action(**overrides) -> dict[str, object]:
     action: dict[str, object] = {
         "action": "pr-merge",
@@ -3124,6 +3202,7 @@ def captain_action(**overrides) -> dict[str, object]:
 
 def captain_parameters(actions: list[dict[str, object]] | None = None, **overrides) -> dict[str, object]:
     source = str(overrides.get("status_projection_source", "bureau status-projection"))
+    delivery_receipt, delivery_receipt_sha256 = captain_delivery_receipt()
     projection = {
         "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
         "source": source,
@@ -3140,6 +3219,8 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "expected_head": CAPTAIN_HEAD,
         "expected_base_sha": CAPTAIN_BASE_SHA,
         "diff_sha256": CAPTAIN_DIFF,
+        "merge_delivery_receipt": delivery_receipt,
+        "merge_delivery_receipt_sha256": delivery_receipt_sha256,
         "execution_authority": {"granted_by": "alex", "reference": "captain decision record 2026-07-07"},
         "review_evidence": {
             "schema_version": 1,
@@ -3197,6 +3278,7 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
             "actions_sha256": action["actions_sha256"],
             "status_projection_sha256": grips.sha256_json(parameters["status_projection"]),
             "diff_sha256": parameters.get("diff_sha256"),
+            "merge_delivery_receipt_sha256": parameters.get("merge_delivery_receipt_sha256"),
             "review_evidence_sha256": grips.sha256_json(parameters["review_evidence"]),
             "ci_evidence_sha256": grips.sha256_json(parameters["ci_evidence"]),
             "authorization_sha256": grips._captain_execution_intent_authorization_sha256(parameters),
@@ -3238,7 +3320,40 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self._resource_db_patch.start()
 
+
+        def verified_delivery(receipt, **kwargs):
+            accepted = {
+                key: value
+                for key, value in kwargs.items()
+                if key
+                in {
+                    "expected_repository",
+                    "expected_pull_request",
+                    "expected_base_sha",
+                    "expected_head_sha",
+                    "expected_diff_sha256",
+                    "expected_receipt_sha256",
+                    "now_ns",
+                }
+            }
+            info = grips.grabowski_merge_delivery.validate_delivery_receipt_snapshot(
+                receipt, **accepted
+            )
+            return {
+                **info,
+                "durable": True,
+                "receipt_path": "/test/merge-delivery.json",
+            }
+
+        self._delivery_verify_patch = patch.object(
+            grips.grabowski_merge_delivery,
+            "verify_merge_delivery",
+            side_effect=verified_delivery,
+        )
+        self._delivery_verify_patch.start()
+
     def tearDown(self) -> None:
+        self._delivery_verify_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 
@@ -3897,7 +4012,16 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertNotIn("--merge", merge_call)
 
     def test_captain_run_blocks_forbidden_automatic_branch_deletion(self) -> None:
+        action = captain_action(
+            scope={
+                "allowed_effects": ["merge pull request 96 into main"],
+                "forbidden_effects": ["force-push", "branch-deletion"],
+                "boundaries": "single pull request in heimgewebe/grabowski",
+                "max_targets": 1,
+            }
+        )
         parameters = captain_parameters(
+            [action],
             trusted_owner_mode=True,
             autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
             allow_execution=True,
@@ -3942,9 +4066,22 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             ["automatic_effect_forbidden:branch-deletion"],
             execution["effect_scope_decision"]["reasons"],
         )
+        effect_target = execution["automatic_platform_effects"][0]["target"]
         self.assertEqual(
-            "feat/captain",
-            execution["automatic_platform_effects"][0]["target"]["head_branch"],
+            {
+                "base_repository": "heimgewebe/grabowski",
+                "pull_request": 96,
+                "repository": "heimgewebe/grabowski",
+                "ref": "refs/heads/feat/captain",
+                "head_branch": "feat/captain",
+                "head_oid": CAPTAIN_HEAD,
+                "cross_repository": False,
+            },
+            effect_target,
+        )
+        self.assertEqual(
+            execution["configured_automatic_platform_effects"],
+            execution["automatic_platform_effects"],
         )
         action_receipt = result["output"]["actions"][0]["captain_receipt"]
         self.assertEqual(
@@ -4070,6 +4207,138 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertTrue(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
+    def test_captain_run_blocks_unbound_automatic_branch_deletion_target(self) -> None:
+        action = captain_action(
+            scope={
+                "allowed_effects": [
+                    "merge pull request 96 into main",
+                    "branch-deletion",
+                ],
+                "forbidden_effects": ["force-push"],
+                "boundaries": "single pull request in heimgewebe/grabowski",
+                "max_targets": 1,
+            }
+        )
+        parameters = captain_parameters(
+            [action],
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "headRepository": None,
+                "isCrossRepository": False,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            repo_settings={
+                "allow_merge_commit": True,
+                "allow_squash_merge": True,
+                "allow_rebase_merge": True,
+                "delete_branch_on_merge": True,
+            },
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        execution = result["output"]["executions"][0]
+        self.assertIn(
+            "automatic_effect_target_unbound:branch-deletion",
+            execution["effect_scope_decision"]["reasons"],
+        )
+        self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
+
+    def test_captain_run_blocks_repository_policy_drift_before_merge_dispatch(self) -> None:
+        action = captain_action(
+            scope={
+                "allowed_effects": [
+                    "merge pull request 96 into main",
+                    "branch-deletion",
+                ],
+                "forbidden_effects": ["force-push"],
+                "boundaries": "single pull request in heimgewebe/grabowski",
+                "max_targets": 1,
+            }
+        )
+        policy_false = {
+            "allow_merge_commit": True,
+            "allow_squash_merge": True,
+            "allow_rebase_merge": True,
+            "delete_branch_on_merge": False,
+        }
+        policy_true = {**policy_false, "delete_branch_on_merge": True}
+        for initial, final in ((policy_false, policy_true), (policy_true, policy_false)):
+            with self.subTest(
+                initial_delete=initial["delete_branch_on_merge"],
+                final_delete=final["delete_branch_on_merge"],
+            ):
+                parameters = captain_parameters(
+                    [action],
+                    trusted_owner_mode=True,
+                    autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+                    allow_execution=True,
+                )
+                parameters.pop("human_authorization")
+                parameters.pop("execution_authority")
+                parameters["execution_intent"] = captain_execution_intent(parameters)
+                gh = FakeGh(
+                    view={
+                        "number": 96,
+                        "state": "OPEN",
+                        "baseRefName": "main",
+                        "headRefName": "feat/captain",
+                        "headRefOid": CAPTAIN_HEAD,
+                        "isDraft": False,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                    },
+                    repo_settings_sequence=[initial, final],
+                )
+
+                result = grips.grip_run(
+                    "captain-run",
+                    parameters,
+                    profile="captain",
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=gh,
+                )
+
+                self.assertEqual("blocked", result["receipt"]["status"])
+                execution = result["output"]["executions"][0]
+                self.assertFalse(execution["execution_invoked"])
+                self.assertFalse(execution["execution_attempted"])
+                self.assertFalse(execution["verification_passed"])
+                self.assertIn(
+                    "merge_guard_repository_policy_drift",
+                    execution["merge_lease_guard"]["errors"],
+                )
+                self.assertEqual(
+                    "blocked_after_guard_revalidation_released",
+                    execution["merge_lease_guard"]["status"],
+                )
+                self.assertFalse(
+                    any(call[:2] == ("pr", "merge") for call in gh.calls)
+                )
+
     def test_captain_run_blocks_when_repository_merge_policy_is_unusable(self) -> None:
         matching_view = {
             "number": 96,
@@ -4124,6 +4393,12 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 execution = result["output"]["executions"][0]
                 self.assertFalse(execution["execution_invoked"])
                 self.assertFalse(execution["execution_attempted"])
+                self.assertEqual([], execution["configured_automatic_platform_effects"])
+                self.assertEqual([], execution["automatic_platform_effects"])
+                self.assertEqual(
+                    "not_evaluated",
+                    execution["effect_scope_decision"]["decision"],
+                )
                 self.assertIn(expected, execution["verification_error"])
                 self.assertFalse(any(call[:2] == ("pr", "merge") for call in gh.calls))
 
@@ -6139,6 +6414,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         parameters = authorized_captain_run_parameters()
         parameters["diff_sha256"] = hashlib.sha256(raw_diff).hexdigest()
         parameters["review_evidence"]["diff_sha256"] = parameters["diff_sha256"]
+        rebind_captain_delivery(parameters)
         parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(view={
             "number": 96, "state": "OPEN", "baseRefName": "main",
@@ -6196,6 +6472,8 @@ class CaptainAuthorityPathTests(unittest.TestCase):
     def test_atomic_merge_guard_rejects_empty_live_diff(self) -> None:
         parameters = authorized_captain_run_parameters()
         parameters["diff_sha256"] = hashlib.sha256(b"").hexdigest()
+        rebind_captain_delivery(parameters)
+        parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(diff_text="")
         gh.view.update({
             "number": 96,
@@ -6230,6 +6508,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         })
 
         def exploding_executor(repo, action, supplied_parameters, guarded_runner):
+            policy_jq = "{" + ",".join(
+                grips.CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS
+            ) + "}"
+            guarded_runner(
+                repo,
+                [
+                    "api",
+                    "repos/heimgewebe/grabowski",
+                    "--jq",
+                    policy_jq,
+                ],
+            )
             guarded_runner(repo, ["pr", "merge", "96"])
             raise RuntimeError("executor exploded after guarded dispatch")
 
@@ -6640,11 +6930,182 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertTrue(guard["external_merge_observed"])
         self.assertFalse(guard["contract_satisfied"])
         self.assertFalse(guard["dispatch_called"])
+        reconciliation = execution["external_merge_reconciliation"]
+        self.assertEqual("delivery_after_merge", reconciliation["ordering"])
+        self.assertFalse(
+            reconciliation["pre_merge_delivery_contract_satisfied"]
+        )
+        self.assertTrue(reconciliation["post_merge_exposure_is_not_equivalent"])
         self.assertEqual(
             "external_merge_observed_after_merge_guard_block",
             execution["verification_error"],
         )
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+
+    def test_blocks_missing_user_visible_diff_delivery(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("merge_delivery_receipt")
+        parameters.pop("merge_delivery_receipt_sha256")
+
+        result = self.run_captain(parameters)
+
+        self.assert_blocked_gate_reason(
+            result,
+            "diff-delivery-recorded",
+            "merge_delivery_receipt_missing",
+        )
+
+    def test_blocks_stale_user_visible_diff_delivery(self) -> None:
+        parameters = captain_parameters()
+        receipt = dict(parameters["merge_delivery_receipt"])
+        receipt["artifact_created_at_unix_ns"] = 1_000_000_000
+        receipt["delivery_confirmed_at_unix_ns"] = 2_000_000_000
+        receipt["expires_at_unix_ns"] = (
+            2_000_000_000
+            + grips.grabowski_merge_delivery.MAX_DELIVERY_AGE_SECONDS
+            * 1_000_000_000
+        )
+        parameters["merge_delivery_receipt"] = receipt
+        parameters["merge_delivery_receipt_sha256"] = hashlib.sha256(
+            grips.grabowski_merge_delivery.canonical_json_bytes(receipt)
+        ).hexdigest()
+
+        result = self.run_captain(parameters)
+
+        self.assert_blocked_gate_reason(
+            result,
+            "diff-delivery-recorded",
+            "merge-delivery receipt is stale",
+        )
+
+    def test_blocks_delivery_bound_to_another_diff(self) -> None:
+        parameters = captain_parameters()
+        receipt = dict(parameters["merge_delivery_receipt"])
+        receipt["diff_sha256"] = "f" * 64
+        receipt["artifact_sha256"] = "f" * 64
+        receipt["binding_sha256"] = grips.grabowski_merge_delivery.sha256_json(
+            {
+                "repository": receipt["repository"],
+                "pull_request": receipt["pull_request"],
+                "base_sha": receipt["base_sha"],
+                "head_sha": receipt["head_sha"],
+                "diff_sha256": receipt["diff_sha256"],
+            }
+        )
+        parameters["merge_delivery_receipt"] = receipt
+        parameters["merge_delivery_receipt_sha256"] = hashlib.sha256(
+            grips.grabowski_merge_delivery.canonical_json_bytes(receipt)
+        ).hexdigest()
+
+        result = self.run_captain(parameters)
+
+        self.assert_blocked_gate_reason(
+            result,
+            "diff-delivery-recorded",
+            "merge-delivery receipt diff_sha256 mismatch",
+        )
+
+    def test_captain_run_blocks_when_durable_delivery_readback_fails(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh()
+        with patch.object(
+            grips.grabowski_merge_delivery,
+            "verify_merge_delivery",
+            side_effect=grips.grabowski_merge_delivery.MergeDeliveryError(
+                "durable receipt unavailable"
+            ),
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        self.assertIn(
+            "merge_delivery_receipt_durable_verification_failed",
+            execution["preflight_errors"],
+        )
+        self.assertFalse(execution["execution_invoked"])
+        self.assertEqual([], gh.calls)
+
+    def test_atomic_merge_guard_blocks_delivery_drift_before_dispatch(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            }
+        )
+        calls = 0
+
+        def drifting_delivery(receipt, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls >= 3:
+                raise grips.grabowski_merge_delivery.MergeDeliveryError(
+                    "delivery receipt changed before dispatch"
+                )
+            accepted = {
+                key: value
+                for key, value in kwargs.items()
+                if key
+                in {
+                    "expected_repository",
+                    "expected_pull_request",
+                    "expected_base_sha",
+                    "expected_head_sha",
+                    "expected_diff_sha256",
+                    "expected_receipt_sha256",
+                    "now_ns",
+                }
+            }
+            info = grips.grabowski_merge_delivery.validate_delivery_receipt_snapshot(
+                receipt, **accepted
+            )
+            return {
+                **info,
+                "durable": True,
+                "receipt_path": "/test/merge-delivery.json",
+            }
+
+        with patch.object(
+            grips.grabowski_merge_delivery,
+            "verify_merge_delivery",
+            side_effect=drifting_delivery,
+        ):
+            result = grips.grip_run(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                command_runner=FakeGit(),
+                github_runner=gh,
+            )
+
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertEqual("blocked_after_guard_revalidation_released", guard["status"])
+        self.assertTrue(
+            any(
+                "merge_guard_dispatch_delivery_revalidation_failed" in error
+                for error in guard["errors"]
+            )
+        )
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
 
 class CaptainExecutionIntentTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -6656,7 +7117,39 @@ class CaptainExecutionIntentTests(unittest.TestCase):
         )
         self._resource_db_patch.start()
 
+        def verified_delivery(receipt, **kwargs):
+            accepted = {
+                key: value
+                for key, value in kwargs.items()
+                if key
+                in {
+                    "expected_repository",
+                    "expected_pull_request",
+                    "expected_base_sha",
+                    "expected_head_sha",
+                    "expected_diff_sha256",
+                    "expected_receipt_sha256",
+                    "now_ns",
+                }
+            }
+            info = grips.grabowski_merge_delivery.validate_delivery_receipt_snapshot(
+                receipt, **accepted
+            )
+            return {
+                **info,
+                "durable": True,
+                "receipt_path": "/test/merge-delivery.json",
+            }
+
+        self._delivery_verify_patch = patch.object(
+            grips.grabowski_merge_delivery,
+            "verify_merge_delivery",
+            side_effect=verified_delivery,
+        )
+        self._delivery_verify_patch.start()
+
     def tearDown(self) -> None:
+        self._delivery_verify_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 

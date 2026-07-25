@@ -12,6 +12,7 @@ import grabowski_fleet
 import grabowski_juno
 import grabowski_juno_storage
 import grabowski_artifacts
+import grabowski_merge_delivery_surface
 import grabowski_agent_workspace
 import grabowski_agent_workspace_observer
 import grabowski_operations
@@ -63,6 +64,39 @@ def grabowski_checkout_binding_reconciliation(
         cursor=cursor,
     )
 
+
+
+@mcp.tool(name="grabowski_merge_delivery_record", annotations=grabowski_operator_core.MUTATING)
+def grabowski_merge_delivery_record(
+    repository: str,
+    pull_request: int,
+    base_sha: str,
+    head_sha: str,
+    diff_sha256: str,
+    artifact_id: str,
+    artifact_sha256: str,
+    artifact_receipt_sha256: str,
+    delivery_channel: str,
+    delivery_reference: str,
+) -> dict[str, object]:
+    """Record one durable, exact user-visible diff delivery before merge."""
+    grabowski_operator_core._require_operator_mutation(
+        "artifact_transfer",
+        path=str(grabowski_merge_delivery_surface.delivery.MERGE_DELIVERY_ROOT),
+        host="heim-pc",
+    )
+    return grabowski_merge_delivery_surface.grabowski_merge_delivery_record(
+        repository,
+        pull_request,
+        base_sha,
+        head_sha,
+        diff_sha256,
+        artifact_id,
+        artifact_sha256,
+        artifact_receipt_sha256,
+        delivery_channel,
+        delivery_reference,
+    )
 
 def main() -> None:
     grabowski_operator_core.main()

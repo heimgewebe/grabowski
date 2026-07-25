@@ -402,6 +402,29 @@
         "tool": "grabowski_bureau_task_review"
       }
     },
+    "grabowski_checkout_binding_reconciliation": {
+      "evidence_refs": [
+        "issue:heimgewebe/grabowski#434",
+        "tests:tests/test_checkout_binding_reconciler.py",
+        "tests:tests/test_current_work.py"
+      ],
+      "exception_detail": {
+        "claim": "This tool owns only bounded read-only comparison between the existing checkout lifecycle store and canonical Git observations.",
+        "evidence": "Immutable-or-copied SQLite snapshots, canonical worktree records, snapshot-bound pagination and regression tests preserve fail-closed behavior without mutation authority."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Extending checkout inventory or Current Work alone was rejected because callers need one typed reconciliation result with explicit absence-versus-unobservability semantics and a snapshot-bound cursor.",
+      "rationale": "Durable bindings can survive physical worktrees; a distinct read-only surface exposes that contradiction without treating absence, retention or archive evidence as cleanup proof.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "checkout-lifecycle",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_checkout_binding_reconciliation"
+      }
+    },
     "grabowski_chronik_history": {
       "evidence_refs": [
         "bureau:CCM-V1-T002",
@@ -594,6 +617,33 @@
         "tool": "grabowski_juno_status"
       }
     },
+    "grabowski_merge_delivery_record": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T048",
+        "docs:merge-delivery-v1.md",
+        "tests:tests/test_merge_delivery.py",
+        "tests:tests/test_grips.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only create-only confirmation that one already published exact Git diff was exposed through a user-visible delivery reference before merge.",
+        "evidence": "The receipt revalidates the private git-diff.v1 artifact and payload, binds repository, PR, base, head and full diff SHA-256, records comparable timestamps, expires after one hour and grants no merge, review or CI authority."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A typed generic file or merge operation was rejected because delivery confirmation must remain temporally and cryptographically separate from both artifact creation and irreversible merge dispatch; otherwise one actor could manufacture retrospective compliance.",
+      "rationale": "User-visible delivery is a distinct append-only evidence boundary. It must be created only after the concrete download reference has been exposed and independently revalidated by Captain and the atomic merge guard.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "artifact",
+        "effects": [
+          "local-file-create",
+          "receipt-create"
+        ],
+        "read_only": null,
+        "reversibility": "receipt-retention-dependent",
+        "risk_class": "high",
+        "tool": "grabowski_merge_delivery_record"
+      }
+    },
     "grabowski_operator_blockade_disarm": {
       "evidence_refs": [
         "bureau:GRABOWSKI-KILL-SWITCH-RECOVERY-V1-T001",
@@ -778,16 +828,16 @@
       "operation_alternative_considered": "Extending task status or task start was rejected because observation and execution must not gain authority to append independently reviewed semantic outcomes. A generic file or terminal operation would lose typed binding, terminal-state, provenance and no-effect validation.",
       "rationale": "Prospective inclusion and semantic outcome sealing are intentionally separate authorities. A dedicated narrow tool preserves that separation while allowing real direct tasks to contribute reviewable cohort evidence without granting model, routing, queue, merge, deploy or policy authority.",
       "tool_contract": {
-        "tool": "grabowski_task_routing_shadow_seal",
-        "category": "task",
         "authority_class": "mutation",
-        "risk_class": "medium",
-        "read_only": false,
+        "category": "task",
         "effects": [
           "audit-append",
           "state-create"
         ],
-        "reversibility": "append-only-observation"
+        "read_only": false,
+        "reversibility": "append-only-observation",
+        "risk_class": "medium",
+        "tool": "grabowski_task_routing_shadow_seal"
       }
     },
     "grabowski_text_artifact_publish": {
@@ -1353,29 +1403,6 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "repoground_range_get"
-      }
-    },
-    "grabowski_checkout_binding_reconciliation": {
-      "evidence_refs": [
-        "issue:heimgewebe/grabowski#434",
-        "tests:tests/test_checkout_binding_reconciler.py",
-        "tests:tests/test_current_work.py"
-      ],
-      "exception_detail": {
-        "claim": "This tool owns only bounded read-only comparison between the existing checkout lifecycle store and canonical Git observations.",
-        "evidence": "Immutable-or-copied SQLite snapshots, canonical worktree records, snapshot-bound pagination and regression tests preserve fail-closed behavior without mutation authority."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Extending checkout inventory or Current Work alone was rejected because callers need one typed reconciliation result with explicit absence-versus-unobservability semantics and a snapshot-bound cursor.",
-      "rationale": "Durable bindings can survive physical worktrees; a distinct read-only surface exposes that contradiction without treating absence, retention or archive evidence as cleanup proof.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "checkout-lifecycle",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_checkout_binding_reconciliation"
       }
     }
   },

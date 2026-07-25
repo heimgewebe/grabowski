@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "dfb4d0f2fe8c79cc29e641593da380ff595e58ca0c27cd6dd379096ba77d0cea",
+  "capability_source_sha256": "fec4bb0449fbd372663a7001db12103326d27cf43b252b8c0a182c6bcf7a504b",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "22ef10c4985bd960e4aa8215b3f0df11d013be9e8b261b295034d99dcc213386",
+  "contract_sha256": "803614b8965e943b2602dba6712e0417a714bdcd8a645c9dcd9e65cd1811e495",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1791,6 +1791,20 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_text_artifact_read"
+    },
+    {
+      "category": "artifact",
+      "description": "Record one durable, exact user-visible diff delivery before merge.",
+      "effects": [
+        "local-file-create",
+        "receipt-create"
+      ],
+      "id": "grabowski_merge_delivery_record",
+      "purpose": "Record one durable, exact user-visible diff delivery before a possible PR merge.",
+      "read_only": null,
+      "reversibility": "receipt-retention-dependent",
+      "risk_class": "high",
+      "tool": "grabowski_merge_delivery_record"
     },
     {
       "category": "browser-worker",

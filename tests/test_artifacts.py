@@ -531,7 +531,29 @@ class ArtifactTests(unittest.TestCase):
     def test_text_artifact_publish_and_chunked_read_are_hash_bound(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()
         artifact_root = self.root / "text-artifacts"
-        with patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root):
+        def write_github_diff(
+            repository_identity: str,
+            pull_request_number: int,
+            expected_base: str,
+            expected_head: str,
+            destination: Path,
+        ) -> int:
+            self.assertEqual("example-owner/repository", repository_identity)
+            self.assertEqual(17, pull_request_number)
+            self.assertEqual(base_commit, expected_base)
+            self.assertEqual(head_commit, expected_head)
+            return artifacts._write_git_diff(
+                repository, expected_base, expected_head, destination
+            )
+
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", artifact_root),
+            patch.object(
+                artifacts,
+                "_write_github_pr_diff",
+                side_effect=write_github_diff,
+            ) as github_writer,
+        ):
             result = artifacts.publish_text_artifact(
                 "git-diff.v1",
                 str(repository),
@@ -539,6 +561,7 @@ class ArtifactTests(unittest.TestCase):
                 head_commit,
                 pull_request_number=17,
             )
+            github_writer.assert_called_once()
             self.assertEqual(result["schema"], "git-diff-artifact.v1")
             self.assertEqual(result["repository"], "example-owner/repository")
             self.assertTrue(result["filename"].endswith("-diff.txt"))
@@ -565,6 +588,95 @@ class ArtifactTests(unittest.TestCase):
             self.assertEqual(data.decode("utf-8").encode("utf-8"), data)
             self.assertIn(b"-first", data)
             self.assertIn(b"+second", data)
+
+    def test_github_pr_diff_writer_binds_exact_remote_base_and_head(self) -> None:
+        destination = self.root / "github-pr.diff"
+        view = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "number": 17,
+                    "baseRefOid": "a" * 40,
+                    "headRefOid": "b" * 40,
+                }
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(artifacts.shutil, "which", return_value="/usr/bin/gh"),
+            patch.object(artifacts.subprocess, "run", return_value=view) as identity_read,
+            patch.object(
+                artifacts, "_write_bounded_diff_command", return_value=123
+            ) as writer,
+        ):
+            size = artifacts._write_github_pr_diff(
+                "example-owner/repository",
+                17,
+                "a" * 40,
+                "b" * 40,
+                destination,
+            )
+        self.assertEqual(123, size)
+        self.assertEqual(
+            [
+                "/usr/bin/gh",
+                "pr",
+                "view",
+                "17",
+                "--repo",
+                "example-owner/repository",
+                "--json",
+                "number,baseRefOid,headRefOid",
+            ],
+            identity_read.call_args.args[0],
+        )
+        self.assertEqual(
+            [
+                "/usr/bin/gh",
+                "pr",
+                "diff",
+                "17",
+                "--repo",
+                "example-owner/repository",
+            ],
+            writer.call_args.args[0],
+        )
+        self.assertEqual(destination, writer.call_args.args[1])
+        self.assertEqual("GitHub pull-request diff", writer.call_args.kwargs["label"])
+
+    def test_github_pr_diff_writer_rejects_remote_head_drift(self) -> None:
+        destination = self.root / "github-pr.diff"
+        view = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "number": 17,
+                    "baseRefOid": "a" * 40,
+                    "headRefOid": "c" * 40,
+                }
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(artifacts.shutil, "which", return_value="/usr/bin/gh"),
+            patch.object(artifacts.subprocess, "run", return_value=view),
+            patch.object(artifacts, "_write_bounded_diff_command") as writer,
+        ):
+            with self.assertRaisesRegex(
+                artifacts.ArtifactTransferError,
+                "does not match the requested base and head",
+            ):
+                artifacts._write_github_pr_diff(
+                    "example-owner/repository",
+                    17,
+                    "a" * 40,
+                    "b" * 40,
+                    destination,
+                )
+        writer.assert_not_called()
+        self.assertFalse(destination.exists())
 
     def test_text_artifact_accepts_https_origin_identity(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()

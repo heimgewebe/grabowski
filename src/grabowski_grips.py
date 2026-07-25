@@ -20,6 +20,7 @@ import grabowski_convergence
 import grabowski_client_snapshot
 import grabowski_operator_obligation
 import grabowski_worktree_ensure
+import grabowski_merge_delivery
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -523,6 +524,7 @@ CAPTAIN_GATE_IDS = (
     "execution-authority-present",
     "review-evidence-present",
     "diff-bound",
+    "diff-delivery-recorded",
     "ci-green",
     "autonomy-policy",
     "human-authorization-present",
@@ -582,6 +584,7 @@ CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
     "actions_sha256",
     "status_projection_sha256",
     "diff_sha256",
+    "merge_delivery_receipt_sha256",
     "review_evidence_sha256",
     "ci_evidence_sha256",
     "authorization_sha256",
@@ -4731,6 +4734,85 @@ def _captain_diff_bound_gate(parameters: dict[str, Any]) -> dict[str, Any]:
     return _captain_gate("diff-bound", "pass", "decision is bound to one reviewed diff hash")
 
 
+def _captain_merge_delivery_gate(
+    parameters: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    targets = [
+        action.get("target")
+        for action in actions
+        if action.get("action") == "pr-merge"
+        and isinstance(action.get("target"), dict)
+    ]
+    if not targets:
+        return _captain_gate(
+            "diff-delivery-recorded",
+            "pass",
+            "user-visible diff delivery is not applicable because no pr-merge action is requested",
+        )
+    if len(targets) != 1:
+        return _captain_gate(
+            "diff-delivery-recorded",
+            "blocked",
+            "one delivery receipt can bind exactly one pr-merge action",
+            ["merge_delivery_target_count_invalid"],
+        )
+    receipt = parameters.get("merge_delivery_receipt")
+    receipt_sha256 = parameters.get("merge_delivery_receipt_sha256")
+    expected_head = parameters.get("expected_head")
+    expected_base_sha = parameters.get("expected_base_sha")
+    expected_diff = parameters.get("diff_sha256")
+    target = targets[0]
+    if not isinstance(receipt, dict) or not receipt:
+        return _captain_gate(
+            "diff-delivery-recorded",
+            "blocked",
+            "a durable user-visible diff delivery receipt is required before merge",
+            ["merge_delivery_receipt_missing"],
+        )
+    if not _is_sha256_hex(receipt_sha256):
+        return _captain_gate(
+            "diff-delivery-recorded",
+            "blocked",
+            "merge_delivery_receipt_sha256 is missing or invalid",
+            ["merge_delivery_receipt_sha256_missing_or_invalid"],
+        )
+    if (
+        not _is_hex_sha(expected_head, lengths=(40,))
+        or not _is_hex_sha(expected_base_sha, lengths=(40,))
+        or not _is_sha256_hex(expected_diff)
+    ):
+        return _captain_gate(
+            "diff-delivery-recorded",
+            "blocked",
+            "merge-delivery binding cannot be checked without exact base, head and diff identities",
+            ["merge_delivery_binding_unverifiable"],
+        )
+    try:
+        info = grabowski_merge_delivery.validate_delivery_receipt_snapshot(
+            receipt,
+            expected_repository=str(target.get("repo", "")),
+            expected_pull_request=target.get("pr"),
+            expected_base_sha=str(expected_base_sha),
+            expected_head_sha=str(expected_head),
+            expected_diff_sha256=str(expected_diff),
+            expected_receipt_sha256=str(receipt_sha256),
+        )
+    except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
+        return _captain_gate(
+            "diff-delivery-recorded",
+            "blocked",
+            "the user-visible diff delivery receipt is invalid, stale or bound to another target",
+            [f"merge_delivery_receipt_invalid:{type(exc).__name__}:{exc}"],
+        )
+    return _captain_gate(
+        "diff-delivery-recorded",
+        "pass",
+        "a fresh delivery receipt binds the downloadable artifact to the same repository, PR, base, head and diff; user opening is not claimed",
+        info,
+    )
+
+
 def _captain_ci_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
     evidence = _captain_evidence_object(parameters, "ci_evidence")
     if evidence is None:
@@ -4896,7 +4978,13 @@ def _captain_action_record(
         "does_not_establish": list(does_not_establish),
     }
     if execution_result is not None:
-        for key in ("automatic_platform_effects", "effect_scope_decision"):
+        for key in (
+            "configured_automatic_platform_effects",
+            "automatic_platform_effects",
+            "effect_scope_decision",
+            "merge_delivery",
+            "external_merge_reconciliation",
+        ):
             if key in execution_result:
                 captain_receipt[key] = execution_result[key]
         captain_receipt["execution_result_sha256"] = sha256_json(execution_result)
@@ -4946,6 +5034,7 @@ def _captain_authority_gates(
         _captain_execution_authority_gate(parameters, actions),
         _captain_review_evidence_gate(parameters, actions),
         _captain_diff_bound_gate(parameters),
+        _captain_merge_delivery_gate(parameters, actions),
         _captain_ci_gate(parameters, actions),
         _captain_autonomy_policy_gate(parameters, actions),
         _captain_human_authorization_gate(parameters, actions),
@@ -5019,10 +5108,16 @@ def _captain_execution_intent_expected_evidence(
     review = parameters.get("review_evidence")
     ci = parameters.get("ci_evidence")
     diff = parameters.get("diff_sha256")
+    merge_delivery_receipt_sha256 = parameters.get("merge_delivery_receipt_sha256")
     return {
         "actions_sha256": _captain_actions_sha256(actions),
         "status_projection_sha256": sha256_json(projection) if isinstance(projection, dict) and projection else None,
         "diff_sha256": diff if _is_sha256_hex(diff) else None,
+        "merge_delivery_receipt_sha256": (
+            merge_delivery_receipt_sha256
+            if _is_sha256_hex(merge_delivery_receipt_sha256)
+            else None
+        ),
         "review_evidence_sha256": sha256_json(review) if isinstance(review, dict) and review else None,
         "ci_evidence_sha256": sha256_json(ci) if isinstance(ci, dict) and ci else None,
         "authorization_sha256": _captain_execution_intent_authorization_sha256(parameters),
@@ -5239,7 +5334,7 @@ def _captain_pr_view(
         "--repo",
         repo_slug,
         "--json",
-        "number,state,mergedAt,mergeCommit,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
+        "number,state,mergedAt,mergeCommit,headRefName,headRefOid,headRepository,isCrossRepository,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
     ]
     try:
         view_result = github_runner(repo_path, view_args)
@@ -5454,6 +5549,25 @@ CAPTAIN_PR_MERGE_AUTOMATIC_EFFECT_BRANCH_DELETION = "branch-deletion"
 CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS = tuple(
     field for _method, field, _flag in CAPTAIN_PR_MERGE_METHOD_PREFERENCE
 ) + ("delete_branch_on_merge",)
+CAPTAIN_EFFECT_SCOPE_MATCHING = "exact_casefolded_token"
+CAPTAIN_EFFECT_SCOPE_DOES_NOT_ESTABLISH = (
+    "that_github_will_apply_the_configured_effect",
+    "permission_to_change_repository_settings",
+    "permission_to_restore_or_delete_branches_outside_the_merge",
+)
+
+
+def _captain_effect_scope_not_evaluated() -> dict[str, Any]:
+    return {
+        "decision": "not_evaluated",
+        "reasons": ["automatic_effect_scope_not_evaluated"],
+        "configured_automatic_effects": [],
+        "required_effect_authorizations": [],
+        "allowed_effects": [],
+        "forbidden_effects": [],
+        "matching": CAPTAIN_EFFECT_SCOPE_MATCHING,
+        "does_not_establish": list(CAPTAIN_EFFECT_SCOPE_DOES_NOT_ESTABLISH),
+    }
 
 
 def _captain_repository_merge_policy(
@@ -5462,11 +5576,12 @@ def _captain_repository_merge_policy(
     *,
     repo_slug: str,
 ) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    policy_jq = "{" + ",".join(CAPTAIN_REPOSITORY_MERGE_POLICY_BOOLEAN_FIELDS) + "}"
     policy_args = [
         "api",
         f"repos/{repo_slug}",
         "--jq",
-        "{allow_merge_commit,allow_squash_merge,allow_rebase_merge,delete_branch_on_merge}",
+        policy_jq,
     ]
     try:
         policy_result = github_runner(repo_path, policy_args)
@@ -5541,6 +5656,15 @@ def _captain_pr_merge_effect_scope_decision(
     pre_view: dict[str, Any],
 ) -> dict[str, Any]:
     configured_effects: list[dict[str, Any]] = []
+    head_repository_value = pre_view.get("headRepository")
+    head_repository = (
+        head_repository_value.get("nameWithOwner")
+        if isinstance(head_repository_value, dict)
+        else None
+    )
+    head_branch = pre_view.get("headRefName")
+    head_oid = _normalize_40_sha(pre_view.get("headRefOid"))
+    is_cross_repository = pre_view.get("isCrossRepository")
     if merge_policy["settings"]["delete_branch_on_merge"]:
         configured_effects.append(
             {
@@ -5549,7 +5673,19 @@ def _captain_pr_merge_effect_scope_decision(
                 "source": "github_repository_setting",
                 "setting": "delete_branch_on_merge",
                 "configured": True,
-                "target": {"head_branch": pre_view.get("headRefName")},
+                "target": {
+                    "base_repository": action["target"].get("repo"),
+                    "pull_request": action["target"].get("pr"),
+                    "repository": head_repository,
+                    "ref": (
+                        f"refs/heads/{head_branch}"
+                        if isinstance(head_branch, str) and head_branch
+                        else None
+                    ),
+                    "head_branch": head_branch,
+                    "head_oid": head_oid,
+                    "cross_repository": is_cross_repository,
+                },
                 "application": "after successful merge when GitHub considers the head branch eligible",
             }
         )
@@ -5557,6 +5693,15 @@ def _captain_pr_merge_effect_scope_decision(
     allowed = _captain_effect_scope_tokens(scope.get("allowed_effects"))
     forbidden = _captain_effect_scope_tokens(scope.get("forbidden_effects"))
     reasons: list[str] = []
+    if configured_effects and (
+        not isinstance(head_repository, str)
+        or CAPTAIN_REPO_SLUG_RE.fullmatch(head_repository) is None
+        or not isinstance(head_branch, str)
+        or not head_branch
+        or head_oid is None
+        or not isinstance(is_cross_repository, bool)
+    ):
+        reasons.append("automatic_effect_target_unbound:branch-deletion")
     for effect in configured_effects:
         effect_name = str(effect["effect"])
         canonical = effect_name.casefold()
@@ -5573,12 +5718,8 @@ def _captain_pr_merge_effect_scope_decision(
         ],
         "allowed_effects": sorted(allowed),
         "forbidden_effects": sorted(forbidden),
-        "matching": "exact_casefolded_token",
-        "does_not_establish": [
-            "that_github_will_apply_the_configured_effect",
-            "permission_to_change_repository_settings",
-            "permission_to_restore_or_delete_branches_outside_the_merge",
-        ],
+        "matching": CAPTAIN_EFFECT_SCOPE_MATCHING,
+        "does_not_establish": list(CAPTAIN_EFFECT_SCOPE_DOES_NOT_ESTABLISH),
     }
 
 
@@ -5610,8 +5751,38 @@ def _run_captain_pr_merge(
         "command_returned": False,
         "remote_mutation_observed": False,
         "preflight_passed": False,
+        "preflight_errors": [],
+        "configured_automatic_platform_effects": [],
+        "automatic_platform_effects": [],
+        "effect_scope_decision": _captain_effect_scope_not_evaluated(),
         "verification_passed": False,
     }
+    try:
+        delivery_info = grabowski_merge_delivery.verify_merge_delivery(
+            parameters.get("merge_delivery_receipt"),
+            expected_repository=repo_slug,
+            expected_pull_request=target["pr"],
+            expected_base_sha=expected_base_sha,
+            expected_head_sha=expected_head,
+            expected_diff_sha256=str(parameters.get("diff_sha256", "")),
+            expected_receipt_sha256=str(
+                parameters.get("merge_delivery_receipt_sha256", "")
+            ),
+        )
+    except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
+        execution_result["merge_delivery"] = {
+            "valid": False,
+            "error": f"{type(exc).__name__}:{exc}",
+        }
+        execution_result["preflight_errors"].append(
+            "merge_delivery_receipt_durable_verification_failed"
+        )
+        execution_result["verification_error"] = (
+            "durable user-visible diff delivery could not be revalidated; "
+            "merge not attempted"
+        )
+        return execution_result
+    execution_result["merge_delivery"] = delivery_info
     pre_view, preflight_summary, preflight_errors = _captain_pr_merge_preflight_view(
         repo_path,
         github_runner,
@@ -5624,12 +5795,26 @@ def _run_captain_pr_merge(
     execution_result["pre_view"] = pre_view
     execution_result["preflight_view_summary"] = preflight_summary
     if pre_view is None:
-        execution_result["preflight_errors"] = preflight_errors
+        execution_result["preflight_errors"].extend(preflight_errors)
         detail = "; ".join(preflight_errors) if preflight_errors else "pr_pre_execution_view_failed"
         execution_result["verification_error"] = f"pre-execution PR view failed; merge not attempted: {detail}"
         return execution_result
     if preflight_errors:
-        execution_result["preflight_errors"] = preflight_errors
+        execution_result["preflight_errors"].extend(preflight_errors)
+        if "pr_already_merged_before_execution" in preflight_errors:
+            merged_at = _parse_captain_projection_generated_at(
+                pre_view.get("mergedAt")
+            )
+            merged_at_unix_ns = (
+                int(merged_at.timestamp() * 1_000_000_000)
+                if merged_at is not None
+                else None
+            )
+            execution_result["external_merge_reconciliation"] = (
+                grabowski_merge_delivery.github_merge_ordering(
+                    delivery_info, merged_at_unix_ns
+                )
+            )
         execution_result["verification_error"] = "pre-execution PR state did not match the bound target; merge not attempted"
         return execution_result
     merge_policy, merge_policy_query, merge_policy_errors = _captain_repository_merge_policy(
@@ -5640,7 +5825,7 @@ def _run_captain_pr_merge(
     execution_result["merge_policy_query"] = merge_policy_query
     execution_result["merge_policy"] = merge_policy
     if merge_policy_errors or merge_policy is None:
-        execution_result["preflight_errors"] = merge_policy_errors
+        execution_result["preflight_errors"].extend(merge_policy_errors)
         detail = "; ".join(merge_policy_errors) if merge_policy_errors else "repository_merge_policy_unavailable"
         execution_result["verification_error"] = f"repository merge policy unavailable; merge not attempted: {detail}"
         return execution_result
@@ -5649,13 +5834,13 @@ def _run_captain_pr_merge(
         merge_policy,
         pre_view,
     )
-    execution_result["automatic_platform_effects"] = effect_scope_decision[
-        "configured_automatic_effects"
-    ]
+    configured_effects = effect_scope_decision["configured_automatic_effects"]
+    execution_result["configured_automatic_platform_effects"] = configured_effects
+    execution_result["automatic_platform_effects"] = configured_effects
     execution_result["effect_scope_decision"] = effect_scope_decision
     if effect_scope_decision["decision"] != "passed":
         effect_errors = list(effect_scope_decision["reasons"])
-        execution_result["preflight_errors"] = effect_errors
+        execution_result.setdefault("preflight_errors", []).extend(effect_errors)
         detail = "; ".join(effect_errors)
         execution_result["verification_error"] = (
             "repository automatic effects exceed the bound action scope; "

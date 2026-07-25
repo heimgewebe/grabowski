@@ -12,6 +12,8 @@ import time
 from typing import Any
 import weakref
 
+import grabowski_merge_delivery
+
 
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -516,6 +518,8 @@ class CaptainMergeGuardRunner:
         self.held_resource_keys: list[str] = []
         self.acquisition: dict[str, Any] | None = None
         self.dispatch_called = False
+        self.repository_policy_args: list[str] | None = None
+        self.repository_policy_snapshot: dict[str, bool] | None = None
         does_not_establish = [
             "merge_authority",
             "review_completeness",
@@ -565,6 +569,92 @@ class CaptainMergeGuardRunner:
             self.receipt["status"] = "blocked_before_guard"
             self.receipt["errors"] = list(self.static_errors)
 
+    def _is_repository_policy_query(self, args: list[str]) -> bool:
+        target_repo = str(self.action["target"].get("repo", ""))
+        return (
+            len(args) == 4
+            and args[0] == "api"
+            and args[1] == f"repos/{target_repo}"
+            and args[2] == "--jq"
+            and isinstance(args[3], str)
+            and args[3].startswith("{")
+            and args[3].endswith("}")
+        )
+
+    def _repository_policy_snapshot_info(
+        self,
+        result: Any,
+        *,
+        command: list[str],
+    ) -> tuple[dict[str, bool] | None, dict[str, Any], list[str]]:
+        info = _merge_guard_result_info(result)
+        evidence = {
+            "command": ["gh", *command],
+            "returncode": info["returncode"],
+            "stdout_sha256": hashlib.sha256(info["stdout"].encode("utf-8")).hexdigest(),
+            "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
+        }
+        errors: list[str] = []
+        if info["returncode"] != 0:
+            errors.append("merge_guard_repository_policy_query_failed")
+            return None, evidence, errors
+        try:
+            raw = json.loads(info["stdout"])
+        except json.JSONDecodeError:
+            errors.append("merge_guard_repository_policy_invalid_json")
+            return None, evidence, errors
+        if (
+            not isinstance(raw, dict)
+            or not raw
+            or any(not isinstance(key, str) or not isinstance(value, bool) for key, value in raw.items())
+        ):
+            errors.append("merge_guard_repository_policy_invalid_shape")
+            return None, evidence, errors
+        snapshot = {key: raw[key] for key in sorted(raw)}
+        evidence["settings"] = snapshot
+        evidence["settings_sha256"] = _sha256_json(snapshot)
+        return snapshot, evidence, errors
+
+    def _capture_repository_policy_snapshot(
+        self,
+        args: list[str],
+        result: Any,
+    ) -> None:
+        snapshot, evidence, errors = self._repository_policy_snapshot_info(
+            result,
+            command=args,
+        )
+        evidence["errors"] = list(errors)
+        self.receipt["repository_policy_snapshot"] = evidence
+        self.repository_policy_args = list(args)
+        self.repository_policy_snapshot = snapshot
+
+    def _revalidate_repository_policy(self) -> list[str]:
+        if self.repository_policy_args is None or self.repository_policy_snapshot is None:
+            errors = ["merge_guard_repository_policy_snapshot_missing"]
+            self.receipt["repository_policy_revalidation"] = {"errors": errors}
+            return errors
+        try:
+            raw = self.github_runner(self.repo_path, list(self.repository_policy_args))
+        except Exception as exc:
+            errors = [f"merge_guard_repository_policy_revalidation_exception:{type(exc).__name__}"]
+            self.receipt["repository_policy_revalidation"] = {
+                "command": ["gh", *self.repository_policy_args],
+                "errors": errors,
+            }
+            return errors
+        snapshot, evidence, errors = self._repository_policy_snapshot_info(
+            raw,
+            command=self.repository_policy_args,
+        )
+        evidence["initial_settings_sha256"] = _sha256_json(self.repository_policy_snapshot)
+        if not errors and snapshot != self.repository_policy_snapshot:
+            errors.append("merge_guard_repository_policy_drift")
+        evidence["matched"] = not errors
+        evidence["errors"] = list(errors)
+        self.receipt["repository_policy_revalidation"] = evidence
+        return errors
+
     def _static_binding_errors(self) -> list[str]:
         expected_head = str(self.parameters.get("expected_head", ""))
         expected_base_sha = str(self.parameters.get("expected_base_sha", ""))
@@ -587,6 +677,17 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_expected_base_sha_invalid")
         if _SHA256_RE.fullmatch(expected_diff) is None:
             errors.append("merge_guard_expected_diff_sha256_invalid")
+        delivery_receipt = self.parameters.get("merge_delivery_receipt")
+        delivery_receipt_sha256 = self.parameters.get(
+            "merge_delivery_receipt_sha256"
+        )
+        if not isinstance(delivery_receipt, dict) or not delivery_receipt:
+            errors.append("merge_guard_delivery_receipt_missing")
+        if (
+            not isinstance(delivery_receipt_sha256, str)
+            or _SHA256_RE.fullmatch(delivery_receipt_sha256) is None
+        ):
+            errors.append("merge_guard_delivery_receipt_sha256_invalid")
         replay_fields = sorted(_MERGE_GUARD_REPLAY_PARAMETERS.intersection(self.parameters))
         if replay_fields:
             errors.append("merge_guard_cached_snapshot_input_forbidden:" + ",".join(replay_fields))
@@ -603,6 +704,28 @@ class CaptainMergeGuardRunner:
         errors = list(self.static_errors)
         if errors:
             return None, errors
+        try:
+            delivery_info = grabowski_merge_delivery.verify_merge_delivery(
+                self.parameters.get("merge_delivery_receipt"),
+                expected_repository=repo_slug,
+                expected_pull_request=pr_number,
+                expected_base_sha=expected_base_sha,
+                expected_head_sha=expected_head,
+                expected_diff_sha256=expected_diff,
+                expected_receipt_sha256=str(
+                    self.parameters.get("merge_delivery_receipt_sha256", "")
+                ),
+            )
+        except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
+            errors.append(
+                f"merge_guard_delivery_receipt_invalid:{type(exc).__name__}:{exc}"
+            )
+            self.receipt["merge_delivery"] = {
+                "valid": False,
+                "error_type": type(exc).__name__,
+            }
+            return None, errors
+        self.receipt["merge_delivery"] = delivery_info
 
         view_args = [
             "pr",
@@ -748,6 +871,11 @@ class CaptainMergeGuardRunner:
             "head_sha": expected_head,
             "diff_sha256": live_diff_sha256,
             "execution_intent_sha256": self.execution_intent_sha256,
+            "merge_delivery_receipt_sha256": delivery_info["receipt_sha256"],
+            "merge_delivery_binding_sha256": delivery_info["binding_sha256"],
+            "merge_delivery_confirmed_at_unix_ns": delivery_info[
+                "delivery_confirmed_at_unix_ns"
+            ],
             "changed_paths": changed_paths,
             "changed_paths_sha256": _sha256_json(changed_paths),
         }
@@ -755,6 +883,33 @@ class CaptainMergeGuardRunner:
 
     def _revalidate_dispatch_bindings(self, bindings: dict[str, Any]) -> list[str]:
         target = self.action["target"]
+        errors: list[str] = []
+        try:
+            delivery_info = grabowski_merge_delivery.verify_merge_delivery(
+                self.parameters.get("merge_delivery_receipt"),
+                expected_repository=str(target["repo"]),
+                expected_pull_request=int(target["pr"]),
+                expected_base_sha=str(bindings["expected_base_sha"]),
+                expected_head_sha=str(bindings["head_sha"]),
+                expected_diff_sha256=str(bindings["diff_sha256"]),
+                expected_receipt_sha256=str(
+                    bindings["merge_delivery_receipt_sha256"]
+                ),
+            )
+        except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
+            errors.append(
+                f"merge_guard_dispatch_delivery_revalidation_failed:{type(exc).__name__}:{exc}"
+            )
+            self.receipt["dispatch_delivery_revalidation"] = {
+                "valid": False,
+                "error_type": type(exc).__name__,
+            }
+        else:
+            self.receipt["dispatch_delivery_revalidation"] = delivery_info
+            if delivery_info["binding_sha256"] != bindings[
+                "merge_delivery_binding_sha256"
+            ]:
+                errors.append("merge_guard_dispatch_delivery_binding_drift")
         view_args = [
             "pr",
             "view",
@@ -764,7 +919,6 @@ class CaptainMergeGuardRunner:
             "--json",
             "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
         ]
-        errors: list[str] = []
         try:
             raw = self.github_runner(self.repo_path, view_args)
         except Exception as exc:
@@ -819,7 +973,10 @@ class CaptainMergeGuardRunner:
 
     def __call__(self, repo_path: Path, args: list[str]) -> dict[str, Any]:
         if args[:2] != ["pr", "merge"]:
-            return self.github_runner(repo_path, args)
+            result = self.github_runner(repo_path, args)
+            if self._is_repository_policy_query(args):
+                self._capture_repository_policy_snapshot(args, result)
+            return result
         if self.receipt["status"] != "not_reached":
             raise RuntimeError("merge lease guard permits exactly one merge dispatch")
         observed_at_ns = time.time_ns()
@@ -923,6 +1080,7 @@ class CaptainMergeGuardRunner:
             }
         )
         revalidation_errors = self._revalidate_dispatch_bindings(bindings)
+        revalidation_errors.extend(self._revalidate_repository_policy())
         if revalidation_errors:
             self.receipt["status"] = "blocked_after_guard_revalidation"
             self.receipt["contract_satisfied"] = False
@@ -946,6 +1104,18 @@ class CaptainMergeGuardRunner:
         self.receipt["external_merge_observed"] = bool(
             execution_result.get("remote_mutation_observed") and not self.dispatch_called
         )
+        if self.receipt["external_merge_observed"]:
+            verified_pr = execution_result.get("verified_pr")
+            merged_at_unix_ns = grabowski_merge_delivery.github_timestamp_unix_ns(
+                verified_pr.get("mergedAt")
+                if isinstance(verified_pr, dict)
+                else None
+            )
+            reconciliation = grabowski_merge_delivery.github_merge_ordering(
+                self.receipt.get("merge_delivery", {}), merged_at_unix_ns
+            )
+            self.receipt["external_merge_reconciliation"] = reconciliation
+            execution_result["external_merge_reconciliation"] = reconciliation
         self.receipt["merge_command_returncode"] = execution_result.get("merge_returncode")
         self.receipt["post_merge_verification_passed"] = execution_result.get("verification_passed") is True
         if self.acquisition is not None and self.owner_id is not None:

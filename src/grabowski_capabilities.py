@@ -876,6 +876,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_merge_delivery_record": {
+        "category": "artifact",
+        "purpose": "Record one durable, exact user-visible diff delivery before a possible PR merge.",
+        "risk_class": "high",
+        "effects": ["local-file-create", "receipt-create"],
+        "reversibility": "receipt-retention-dependent",
+    },
 }
 
 
