@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import time
 import uuid
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 import grabowski_fleet as fleet
 import grabowski_mcp as base
@@ -39,9 +41,13 @@ TEXT_ARTIFACT_ROOT = Path.home() / ".local/state/grabowski/text-artifacts"
 MAX_TEXT_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_TEXT_ARTIFACT_CHUNK_BYTES = 256 * 1024
 MAX_TEXT_ARTIFACT_RECEIPT_BYTES = 64 * 1024
+MAX_RETAINED_TEXT_ARTIFACTS = 128
+MAX_RETAINED_TEXT_ARTIFACT_BYTES = 512 * 1024 * 1024
 ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}\.txt\Z")
+REPOSITORY_ID_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?[^:/\s]+:(?P<path>[^?#]+)\Z")
 _PRIVATE_KEY_BEGIN = "-----" + "BEGIN "
 _PRIVATE_KEY_END = "PRIVATE " + "KEY-----"
 _PRIVATE_KEY_MARKERS = tuple(
@@ -892,6 +898,50 @@ def _verify_commit(repository: Path, commit: str, label: str) -> str:
     return value
 
 
+def _repository_identity_from_remote(remote: str) -> str:
+    if not isinstance(remote, str):
+        raise ValueError("origin remote must be text")
+    value = remote.strip()
+    if not value or "\x00" in value or value != remote.strip("\r\n"):
+        raise ValueError("origin remote is not canonical")
+    path: str | None = None
+    if "://" in value:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"git", "http", "https", "ssh"} or not parsed.hostname:
+            raise ValueError("origin remote must be a network Git URL")
+        if parsed.password is not None or parsed.query or parsed.fragment:
+            raise ValueError("origin remote may not contain credentials or URL suffixes")
+        path = parsed.path
+    else:
+        match = SCP_REMOTE_RE.fullmatch(value)
+        if match is not None:
+            path = match.group("path")
+    if path is None:
+        raise ValueError("origin remote must identify owner/repository")
+    normalized = path.strip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[:-4]
+    parts = normalized.split("/")
+    if len(parts) != 2:
+        raise ValueError("origin remote must identify exactly owner/repository")
+    identity = "/".join(parts)
+    if REPOSITORY_ID_RE.fullmatch(identity) is None:
+        raise ValueError("origin remote owner/repository identity is invalid")
+    return identity
+
+
+def _canonical_repository_identity(repository: Path) -> str:
+    try:
+        remote = _run_git(
+            repository,
+            ["remote", "get-url", "origin"],
+            max_output_bytes=4096,
+        ).decode("utf-8", errors="strict")
+    except (ArtifactTransferError, UnicodeDecodeError) as exc:
+        raise ValueError("repository must define one canonical origin remote") from exc
+    return _repository_identity_from_remote(remote)
+
+
 def _safe_slug(value: str, fallback: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-._")
     return (slug or fallback)[:80]
@@ -1046,7 +1096,76 @@ def _atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def publish_text_artifact(
+def _text_artifact_storage_usage(*, excluded_name: str) -> tuple[int, int]:
+    root_descriptor, root_identity = _open_private_directory_path(TEXT_ARTIFACT_ROOT)
+    artifact_count = 0
+    total_bytes = 0
+    try:
+        for name in os.listdir(root_descriptor):
+            if name == excluded_name:
+                continue
+            if ARTIFACT_ID_RE.fullmatch(name) is None:
+                raise ArtifactTransferError(
+                    "Text artifact root contains an unmanaged entry"
+                )
+            artifact_descriptor, artifact_identity = _open_private_directory_at(
+                root_descriptor, name
+            )
+            try:
+                receipt_bytes, receipt_sha256, receipt_size = (
+                    _read_private_regular_file_at(
+                        artifact_descriptor,
+                        "receipt.json",
+                        max_bytes=MAX_TEXT_ARTIFACT_RECEIPT_BYTES,
+                    )
+                )
+                receipt = _validated_text_artifact_receipt(
+                    receipt_bytes, artifact_id=name
+                )
+                expected_entries = {"receipt.json", receipt["filename"]}
+                if set(os.listdir(artifact_descriptor)) != expected_entries:
+                    raise ArtifactTransferError(
+                        "Text artifact directory contains unmanaged entries"
+                    )
+                diff_sha256, observed_size, _ = (
+                    _hash_and_read_private_regular_file_at(
+                        artifact_descriptor,
+                        receipt["filename"],
+                        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+                        offset=0,
+                        chunk_size=0,
+                    )
+                )
+                if (
+                    diff_sha256 != receipt["diff_sha256"]
+                    or observed_size != receipt["byte_size"]
+                ):
+                    raise ArtifactTransferError(
+                        "Text artifact retention inventory failed integrity verification"
+                    )
+                if receipt_sha256 != hashlib.sha256(receipt_bytes).hexdigest():
+                    raise ArtifactTransferError(
+                        "Text artifact retention receipt verification failed"
+                    )
+                artifact_count += 1
+                total_bytes += receipt_size + observed_size
+                _verify_private_directory_at(
+                    root_descriptor,
+                    name,
+                    artifact_descriptor,
+                    artifact_identity,
+                )
+            finally:
+                os.close(artifact_descriptor)
+        _verify_private_directory_path(
+            root_descriptor, TEXT_ARTIFACT_ROOT, root_identity
+        )
+    finally:
+        os.close(root_descriptor)
+    return artifact_count, total_bytes
+
+
+def _publish_text_artifact_locked(
     profile: str,
     repository: str,
     base_commit: str,
@@ -1059,6 +1178,7 @@ def publish_text_artifact(
     repo = _resolve_git_repository(repository)
     base_sha = _verify_commit(repo, base_commit, "base_commit")
     head_sha = _verify_commit(repo, head_commit, "head_commit")
+    repository_identity = _canonical_repository_identity(repo)
     filename = _artifact_filename(repo, base_sha, head_sha, pull_request_number)
     _ensure_private_directory(TEXT_ARTIFACT_ROOT)
     artifact_id = uuid.uuid4().hex
@@ -1081,7 +1201,7 @@ def publish_text_artifact(
             "schema": TEXT_ARTIFACT_SCHEMA,
             "profile": profile,
             "artifact_id": artifact_id,
-            "repository": repo.name,
+            "repository": repository_identity,
             "repository_path_sha256": hashlib.sha256(
                 str(repo).encode("utf-8")
             ).hexdigest(),
@@ -1099,6 +1219,17 @@ def publish_text_artifact(
         receipt_path = temporary_directory / "receipt.json"
         _atomic_write(receipt_path, receipt_bytes)
         receipt_sha256, _ = _hash_file(receipt_path)
+        retained_count, retained_bytes = _text_artifact_storage_usage(
+            excluded_name=temporary_directory.name
+        )
+        if (
+            retained_count + 1 > MAX_RETAINED_TEXT_ARTIFACTS
+            or retained_bytes + size + len(receipt_bytes)
+            > MAX_RETAINED_TEXT_ARTIFACT_BYTES
+        ):
+            raise ArtifactTransferError(
+                "Text artifact retention capacity is exhausted"
+            )
         directory = os.open(temporary_directory, os.O_RDONLY | os.O_DIRECTORY)
         try:
             os.fsync(directory)
@@ -1160,6 +1291,49 @@ def publish_text_artifact(
             "Text artifact audit failed; publication was rolled back"
         ) from audit_error
     return result
+
+
+def publish_text_artifact(
+    profile: str,
+    repository: str,
+    base_commit: str,
+    head_commit: str,
+    *,
+    pull_request_number: int | None = None,
+) -> dict[str, Any]:
+    # Keep invalid requests side-effect free before the store lock is created.
+    if profile != TEXT_ARTIFACT_PROFILE:
+        raise ValueError(f"profile must be {TEXT_ARTIFACT_PROFILE}")
+    repo = _resolve_git_repository(repository)
+    _verify_commit(repo, base_commit, "base_commit")
+    _verify_commit(repo, head_commit, "head_commit")
+    _canonical_repository_identity(repo)
+    _ensure_private_directory(TEXT_ARTIFACT_ROOT)
+    store_descriptor, store_identity = _open_private_directory_path(
+        TEXT_ARTIFACT_ROOT
+    )
+    try:
+        try:
+            fcntl.flock(
+                store_descriptor,
+                fcntl.LOCK_EX | fcntl.LOCK_NB,
+            )
+        except BlockingIOError as exc:
+            raise ArtifactTransferError(
+                "Text artifact store is busy with another publication"
+            ) from exc
+        _verify_private_directory_path(
+            store_descriptor, TEXT_ARTIFACT_ROOT, store_identity
+        )
+        return _publish_text_artifact_locked(
+            profile,
+            repository,
+            base_commit,
+            head_commit,
+            pull_request_number=pull_request_number,
+        )
+    finally:
+        os.close(store_descriptor)
 
 
 def _validated_text_artifact_receipt(
