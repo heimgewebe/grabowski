@@ -12,6 +12,8 @@ import time
 from typing import Any
 import weakref
 
+import grabowski_merge_delivery
+
 
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -675,6 +677,17 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_expected_base_sha_invalid")
         if _SHA256_RE.fullmatch(expected_diff) is None:
             errors.append("merge_guard_expected_diff_sha256_invalid")
+        delivery_receipt = self.parameters.get("merge_delivery_receipt")
+        delivery_receipt_sha256 = self.parameters.get(
+            "merge_delivery_receipt_sha256"
+        )
+        if not isinstance(delivery_receipt, dict) or not delivery_receipt:
+            errors.append("merge_guard_delivery_receipt_missing")
+        if (
+            not isinstance(delivery_receipt_sha256, str)
+            or _SHA256_RE.fullmatch(delivery_receipt_sha256) is None
+        ):
+            errors.append("merge_guard_delivery_receipt_sha256_invalid")
         replay_fields = sorted(_MERGE_GUARD_REPLAY_PARAMETERS.intersection(self.parameters))
         if replay_fields:
             errors.append("merge_guard_cached_snapshot_input_forbidden:" + ",".join(replay_fields))
@@ -691,6 +704,28 @@ class CaptainMergeGuardRunner:
         errors = list(self.static_errors)
         if errors:
             return None, errors
+        try:
+            delivery_info = grabowski_merge_delivery.verify_merge_delivery(
+                self.parameters.get("merge_delivery_receipt"),
+                expected_repository=repo_slug,
+                expected_pull_request=pr_number,
+                expected_base_sha=expected_base_sha,
+                expected_head_sha=expected_head,
+                expected_diff_sha256=expected_diff,
+                expected_receipt_sha256=str(
+                    self.parameters.get("merge_delivery_receipt_sha256", "")
+                ),
+            )
+        except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
+            errors.append(
+                f"merge_guard_delivery_receipt_invalid:{type(exc).__name__}:{exc}"
+            )
+            self.receipt["merge_delivery"] = {
+                "valid": False,
+                "error_type": type(exc).__name__,
+            }
+            return None, errors
+        self.receipt["merge_delivery"] = delivery_info
 
         view_args = [
             "pr",
@@ -836,6 +871,11 @@ class CaptainMergeGuardRunner:
             "head_sha": expected_head,
             "diff_sha256": live_diff_sha256,
             "execution_intent_sha256": self.execution_intent_sha256,
+            "merge_delivery_receipt_sha256": delivery_info["receipt_sha256"],
+            "merge_delivery_binding_sha256": delivery_info["binding_sha256"],
+            "merge_delivery_confirmed_at_unix_ns": delivery_info[
+                "delivery_confirmed_at_unix_ns"
+            ],
             "changed_paths": changed_paths,
             "changed_paths_sha256": _sha256_json(changed_paths),
         }
@@ -843,6 +883,33 @@ class CaptainMergeGuardRunner:
 
     def _revalidate_dispatch_bindings(self, bindings: dict[str, Any]) -> list[str]:
         target = self.action["target"]
+        errors: list[str] = []
+        try:
+            delivery_info = grabowski_merge_delivery.verify_merge_delivery(
+                self.parameters.get("merge_delivery_receipt"),
+                expected_repository=str(target["repo"]),
+                expected_pull_request=int(target["pr"]),
+                expected_base_sha=str(bindings["expected_base_sha"]),
+                expected_head_sha=str(bindings["head_sha"]),
+                expected_diff_sha256=str(bindings["diff_sha256"]),
+                expected_receipt_sha256=str(
+                    bindings["merge_delivery_receipt_sha256"]
+                ),
+            )
+        except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
+            errors.append(
+                f"merge_guard_dispatch_delivery_revalidation_failed:{type(exc).__name__}:{exc}"
+            )
+            self.receipt["dispatch_delivery_revalidation"] = {
+                "valid": False,
+                "error_type": type(exc).__name__,
+            }
+        else:
+            self.receipt["dispatch_delivery_revalidation"] = delivery_info
+            if delivery_info["binding_sha256"] != bindings[
+                "merge_delivery_binding_sha256"
+            ]:
+                errors.append("merge_guard_dispatch_delivery_binding_drift")
         view_args = [
             "pr",
             "view",
@@ -852,7 +919,6 @@ class CaptainMergeGuardRunner:
             "--json",
             "number,state,headRefName,headRefOid,baseRefName,baseRefOid,isDraft,mergeable,mergeStateStatus",
         ]
-        errors: list[str] = []
         try:
             raw = self.github_runner(self.repo_path, view_args)
         except Exception as exc:
@@ -1038,6 +1104,18 @@ class CaptainMergeGuardRunner:
         self.receipt["external_merge_observed"] = bool(
             execution_result.get("remote_mutation_observed") and not self.dispatch_called
         )
+        if self.receipt["external_merge_observed"]:
+            verified_pr = execution_result.get("verified_pr")
+            merged_at_unix_ns = grabowski_merge_delivery.github_timestamp_unix_ns(
+                verified_pr.get("mergedAt")
+                if isinstance(verified_pr, dict)
+                else None
+            )
+            reconciliation = grabowski_merge_delivery.github_merge_ordering(
+                self.receipt.get("merge_delivery", {}), merged_at_unix_ns
+            )
+            self.receipt["external_merge_reconciliation"] = reconciliation
+            execution_result["external_merge_reconciliation"] = reconciliation
         self.receipt["merge_command_returncode"] = execution_result.get("merge_returncode")
         self.receipt["post_merge_verification_passed"] = execution_result.get("verification_passed") is True
         if self.acquisition is not None and self.owner_id is not None:
