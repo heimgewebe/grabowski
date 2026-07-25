@@ -206,9 +206,79 @@
       "type": "array"
     },
     "source_binding": {
+      "additionalProperties": false,
+      "properties": {
+        "audit_last_record_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "audit_snapshot_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "friction_snapshot_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime_client_snapshot_receipt_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "audit_snapshot_sha256",
+        "audit_last_record_sha256",
+        "friction_snapshot_sha256",
+        "runtime_client_snapshot_receipt_sha256"
+      ],
       "type": "object"
     },
     "source_health": {
+      "additionalProperties": false,
+      "properties": {
+        "audit_chain_verified": {
+          "type": "boolean"
+        },
+        "client_snapshot_fresh_and_matched": {
+          "type": "boolean"
+        },
+        "friction_available": {
+          "type": "boolean"
+        },
+        "friction_integrity_valid": {
+          "type": "boolean"
+        },
+        "friction_recent_window_complete": {
+          "type": "boolean"
+        },
+        "runtime_healthy": {
+          "type": "boolean"
+        },
+        "runtime_status_available": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "audit_chain_verified",
+        "friction_available",
+        "friction_integrity_valid",
+        "friction_recent_window_complete",
+        "runtime_status_available",
+        "runtime_healthy",
+        "client_snapshot_fresh_and_matched"
+      ],
       "type": "object"
     },
     "window": {
