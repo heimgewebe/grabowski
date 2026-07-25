@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -7,11 +8,14 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 from typing import Any, Iterable
 
 BUREAU_REPOSITORY_ROOT = Path("/home/alex/repos/bureau")
 BUREAU_WORKTREE_ROOT = Path("/home/alex/repos/.bureau-worktrees")
 BUREAU_RUNTIME_ROOT = Path("/home/alex/.local/share/bureau")
+BUREAU_MANAGED_LAUNCHER = Path("/home/alex/.local/bin/bureau")
+BUREAU_CONTRACT_PYTHON = Path(sys.executable)
 BUREAU_CONTRACT_EXECUTABLE = BUREAU_RUNTIME_ROOT / "venv/bin/bureau"
 BROAD_BUREAU_REPOSITORY_KEY = f"repo:{BUREAU_REPOSITORY_ROOT}"
 BUREAU_MERGE_GATE_KEY = f"path:{BUREAU_REPOSITORY_ROOT}/.bureau-scopes/merge-main"
@@ -22,10 +26,13 @@ BUREAU_RUNTIME_SERVICE_KEY = "service:bureau-status-capsule"
 CONTRACT_SCHEMA_VERSION = 2
 CONTRACT_KIND = "bureau_lease_diagnostics"
 CONTRACT_TIMEOUT_SECONDS = 5
+MAX_CONTRACT_FILE_BYTES = 16 * 1024 * 1024
 MAX_EFFECT_GATE_TTL_SECONDS = 300
 _ALLOWED_PHASES = {"work", "worktree-admin", "merge", "emergency-recovery"}
 _RELEASE_DIRECTORY_RE = re.compile(r"^venv-(?P<commit>[0-9a-f]{40})$")
 _EXPECTED_HEAD_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MANAGED_LAUNCHER_MARKER = b"# managed-by: heimgewebe-bureau-runtime-v1\n"
 _CONTRACT_MODULE_NAMES = ("bureau.cli", "bureau.lease_contract")
 _CONTRACT_WRAPPER = r"""
 import hashlib
@@ -172,25 +179,94 @@ def _safe_environment() -> dict[str, str]:
     }
 
 
-def _regular_file_identity(path: Path, *, label: str) -> dict[str, Any]:
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _regular_file_snapshot(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_CONTRACT_FILE_BYTES,
+) -> tuple[dict[str, Any], bytes]:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise BureauLeaseContractError(f"{label}-nofollow-unavailable")
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        metadata = path.lstat()
-        raw = path.read_bytes()
+        descriptor = os.open(path, flags)
     except OSError as exc:
         raise BureauLeaseContractError(
             f"{label}-unavailable",
             details={"error_type": type(exc).__name__},
         ) from None
-    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-        raise BureauLeaseContractError(f"{label}-not-regular")
-    return {
-        "path": str(path),
-        "device": metadata.st_dev,
-        "inode": metadata.st_ino,
-        "size": metadata.st_size,
-        "mtime_ns": metadata.st_mtime_ns,
-        "sha256": hashlib.sha256(raw).hexdigest(),
-    }
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise BureauLeaseContractError(f"{label}-not-regular")
+        if before.st_size > max_bytes:
+            raise BureauLeaseContractError(f"{label}-too-large")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        linked = path.lstat()
+    except BureauLeaseContractError:
+        raise
+    except OSError as exc:
+        raise BureauLeaseContractError(
+            f"{label}-read-failed",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if len(raw) > max_bytes:
+        raise BureauLeaseContractError(f"{label}-too-large")
+    if (
+        _metadata_identity(before) != _metadata_identity(after)
+        or _metadata_identity(after) != _metadata_identity(linked)
+        or len(raw) != after.st_size
+        or not stat.S_ISREG(linked.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+    ):
+        raise BureauLeaseContractError(f"{label}-changed-during-read")
+    return (
+        {
+            "path": str(path),
+            "device": after.st_dev,
+            "inode": after.st_ino,
+            "mode": after.st_mode,
+            "nlink": after.st_nlink,
+            "uid": after.st_uid,
+            "gid": after.st_gid,
+            "size": after.st_size,
+            "mtime_ns": after.st_mtime_ns,
+            "ctime_ns": after.st_ctime_ns,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+        raw,
+    )
+
+
+def _regular_file_identity(path: Path, *, label: str) -> dict[str, Any]:
+    identity, _raw = _regular_file_snapshot(path, label=label)
+    return identity
 
 
 def _contract_module_path(release_root: Path, module_name: str) -> Path:
@@ -266,7 +342,352 @@ def _package_sha256(identities: dict[str, dict[str, Any]]) -> str:
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
+def _managed_package_paths(release_root: Path) -> dict[str, Path]:
+    pyproject = release_root / "pyproject.toml"
+    package_root = release_root / "src/bureau"
+    if (
+        release_root.is_symlink()
+        or not release_root.is_dir()
+        or pyproject.is_symlink()
+        or not pyproject.is_file()
+        or package_root.is_symlink()
+        or not package_root.is_dir()
+    ):
+        raise BureauLeaseContractError("contract-managed-package-layout-invalid")
+    candidates = [pyproject]
+    for entry in sorted(package_root.rglob("*")):
+        try:
+            linked = entry.lstat()
+            resolved = entry.resolve(strict=True)
+        except OSError as exc:
+            raise BureauLeaseContractError(
+                "contract-managed-package-entry-unavailable",
+                details={"error_type": type(exc).__name__},
+            ) from None
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or resolved != entry
+            or not _path_is_within(resolved, release_root)
+        ):
+            raise BureauLeaseContractError(
+                "contract-managed-package-entry-invalid",
+                details={"relative_path": entry.relative_to(release_root).as_posix()},
+            )
+        if stat.S_ISDIR(linked.st_mode):
+            continue
+        if not stat.S_ISREG(linked.st_mode) or entry.suffix != ".py":
+            raise BureauLeaseContractError(
+                "contract-managed-package-entry-invalid",
+                details={"relative_path": entry.relative_to(release_root).as_posix()},
+            )
+        candidates.append(entry)
+    paths: dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise BureauLeaseContractError(
+                "contract-managed-package-file-unavailable",
+                details={"error_type": type(exc).__name__},
+            ) from None
+        if (
+            resolved != candidate
+            or candidate.is_symlink()
+            or not candidate.is_file()
+            or not _path_is_within(resolved, release_root)
+        ):
+            raise BureauLeaseContractError("contract-managed-package-file-invalid")
+        paths[candidate.relative_to(release_root).as_posix()] = resolved
+    if len(paths) < 2:
+        raise BureauLeaseContractError("contract-managed-package-empty")
+    return paths
+
+
+def _managed_package_snapshot(
+    paths: dict[str, Path],
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    digest = hashlib.sha256()
+    identities: dict[str, dict[str, Any]] = {}
+    for relative in sorted(paths):
+        identity, content = _regular_file_snapshot(
+            paths[relative], label="contract-package-file"
+        )
+        identities[relative] = identity
+        raw_relative = relative.encode("utf-8")
+        digest.update(len(raw_relative).to_bytes(4, "big"))
+        digest.update(raw_relative)
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    return digest.hexdigest(), identities
+
+
+def _managed_package_tree_sha256(paths: dict[str, Path]) -> str:
+    digest, _identities = _managed_package_snapshot(paths)
+    return digest
+
+
+def _literal_launcher_assignment(tree: ast.Module, name: str) -> ast.expr:
+    matches: list[ast.expr] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == name:
+            matches.append(node.value)
+    if len(matches) != 1:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"assignment": name, "count": len(matches)},
+        )
+    return matches[0]
+
+
+def _parse_managed_launcher_binding(
+    launcher_raw: bytes, launcher_path: Path
+) -> tuple[Path, str]:
+    if _MANAGED_LAUNCHER_MARKER not in launcher_raw[:512]:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "marker-missing"},
+        )
+    try:
+        launcher_text = launcher_raw.decode("utf-8")
+        tree = ast.parse(launcher_text, filename=str(launcher_path), mode="exec")
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "syntax-invalid", "error_type": type(exc).__name__},
+        ) from None
+    manifest_expr = _literal_launcher_assignment(tree, "manifest_path")
+    digest_expr = _literal_launcher_assignment(tree, "expected_manifest_sha256")
+    if not (
+        isinstance(manifest_expr, ast.Call)
+        and isinstance(manifest_expr.func, ast.Name)
+        and manifest_expr.func.id == "Path"
+        and len(manifest_expr.args) == 1
+        and not manifest_expr.keywords
+        and isinstance(manifest_expr.args[0], ast.Constant)
+        and isinstance(manifest_expr.args[0].value, str)
+    ):
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-path-expression-invalid"},
+        )
+    if not (
+        isinstance(digest_expr, ast.Constant)
+        and isinstance(digest_expr.value, str)
+        and _SHA256_RE.fullmatch(digest_expr.value)
+    ):
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-digest-expression-invalid"},
+        )
+    return Path(manifest_expr.args[0].value), digest_expr.value
+
+
+def _managed_contract_runtime() -> dict[str, Any]:
+    manifest_path = BUREAU_RUNTIME_ROOT / "deployment-manifest.json"
+    manifest_identity, manifest_raw = _regular_file_snapshot(
+        manifest_path, label="contract-runtime-manifest"
+    )
+    try:
+        manifest = json.loads(manifest_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BureauLeaseContractError(
+            "contract-runtime-manifest-invalid",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if not isinstance(manifest, dict):
+        raise BureauLeaseContractError("contract-runtime-manifest-invalid")
+    if (
+        manifest.get("schema_version") != 1
+        or manifest.get("kind") != "bureau_runtime_deployment"
+    ):
+        raise BureauLeaseContractError("contract-runtime-manifest-contract-invalid")
+    source_commit = manifest.get("source_commit")
+    release_id = manifest.get("release_id")
+    if (
+        not isinstance(source_commit, str)
+        or _EXPECTED_HEAD_RE.fullmatch(source_commit) is None
+        or not isinstance(release_id, str)
+        or not release_id.startswith(f"{source_commit[:12]}-src")
+    ):
+        raise BureauLeaseContractError("contract-runtime-manifest-identity-invalid")
+    try:
+        runtime_root = BUREAU_RUNTIME_ROOT.resolve(strict=True)
+        configured = BUREAU_MANAGED_LAUNCHER
+        executable = configured.resolve(strict=True)
+        release_value = Path(manifest["immutable_release_path"])
+        module_value = Path(manifest["module_path"])
+        launcher_value = Path(manifest["launcher_path"])
+        if not all(
+            value.is_absolute()
+            for value in (release_value, module_value, launcher_value)
+        ):
+            raise BureauLeaseContractError(
+                "contract-managed-runtime-path-not-absolute"
+            )
+        release_root = release_value.resolve(strict=True)
+        module_path = module_value.resolve(strict=True)
+        configured_manifest_path = launcher_value.resolve(strict=True)
+        python_launcher = BUREAU_CONTRACT_PYTHON
+        python_interpreter = python_launcher.resolve(strict=True)
+        python_environment = python_launcher.parent.parent / "pyvenv.cfg"
+    except (OSError, KeyError, TypeError) as exc:
+        raise BureauLeaseContractError(
+            "contract-managed-runtime-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    releases_root = runtime_root / "releases"
+    if (
+        BUREAU_RUNTIME_ROOT.is_symlink()
+        or runtime_root != BUREAU_RUNTIME_ROOT
+        or configured.is_symlink()
+        or executable != configured
+        or launcher_value.is_symlink()
+        or configured_manifest_path != launcher_value
+        or configured_manifest_path != executable
+        or release_value.is_symlink()
+        or release_root != release_value
+        or release_root.parent != releases_root
+        or release_root.name != release_id
+        or module_value.is_symlink()
+        or module_path != module_value
+        or module_path != release_root / "src/bureau/runtime_identity.py"
+        or not _path_is_within(module_path, release_root)
+        or not os.access(executable, os.X_OK)
+        or not python_launcher.is_absolute()
+        or not os.access(python_launcher, os.X_OK)
+        or python_environment.is_symlink()
+        or not python_environment.is_file()
+    ):
+        raise BureauLeaseContractError("contract-managed-runtime-path-invalid")
+    module_identity, module_raw = _regular_file_snapshot(
+        module_path, label="contract-bureau-runtime-identity"
+    )
+    module_sha256 = manifest.get("module_sha256")
+    if (
+        not isinstance(module_sha256, str)
+        or hashlib.sha256(module_raw).hexdigest() != module_sha256
+    ):
+        raise BureauLeaseContractError("contract-managed-module-digest-invalid")
+    launcher_identity, launcher_raw = _regular_file_snapshot(
+        executable, label="contract-contract-executable"
+    )
+    configured_manifest, configured_manifest_sha256 = (
+        _parse_managed_launcher_binding(launcher_raw, executable)
+    )
+    expected_manifest_sha256 = manifest_identity["sha256"]
+    if (
+        configured_manifest != manifest_path
+        or configured_manifest_sha256 != expected_manifest_sha256
+    ):
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-binding-mismatch"},
+        )
+    package_paths = _managed_package_paths(release_root)
+    observed_package_tree_sha256, package_identities = _managed_package_snapshot(
+        package_paths
+    )
+    package_tree_sha256 = manifest.get("package_tree_sha256")
+    if (
+        not isinstance(package_tree_sha256, str)
+        or observed_package_tree_sha256 != package_tree_sha256
+    ):
+        raise BureauLeaseContractError("contract-managed-package-digest-invalid")
+    component_paths = {
+        "contract_executable": executable,
+        "runtime_manifest": manifest_path,
+        "python_interpreter": python_interpreter,
+        "python_environment": python_environment,
+        "bureau_runtime_identity": module_path,
+    }
+    identities = {
+        "contract_executable": launcher_identity,
+        "runtime_manifest": manifest_identity,
+        "python_interpreter": _regular_file_identity(
+            python_interpreter, label="contract-python-interpreter"
+        ),
+        "python_environment": _regular_file_identity(
+            python_environment, label="contract-python-environment"
+        ),
+        "bureau_runtime_identity": module_identity,
+    }
+    return {
+        "runtime_kind": "managed-manifest",
+        "configured": configured,
+        "configured_target": executable,
+        "release_root": release_root,
+        "release_commit": source_commit,
+        "python_launcher": python_launcher,
+        "python_launcher_target": python_interpreter,
+        "module_paths": {},
+        "component_paths": component_paths,
+        "identities": identities,
+        "package_paths": package_paths,
+        "package_identities": package_identities,
+        "managed_package_tree_sha256": package_tree_sha256,
+    }
+
+
 def _contract_runtime() -> dict[str, Any]:
+    manifest_path = BUREAU_RUNTIME_ROOT / "deployment-manifest.json"
+    if manifest_path.exists():
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise BureauLeaseContractError("contract-runtime-manifest-not-regular")
+        return _managed_contract_runtime()
+    return _legacy_contract_runtime()
+
+
+def _descriptor_identity(descriptor: int) -> dict[str, Any]:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise BureauLeaseContractError("contract-launcher-descriptor-not-regular")
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < metadata.st_size:
+        chunk = os.pread(descriptor, min(65536, metadata.st_size - offset), offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    if offset != metadata.st_size:
+        raise BureauLeaseContractError("contract-launcher-descriptor-short-read")
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "sha256": digest.hexdigest(),
+    }
+
+
+def _open_bound_launcher(runtime: dict[str, Any]) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise BureauLeaseContractError("contract-launcher-nofollow-unavailable")
+    try:
+        descriptor = os.open(
+            runtime["configured"], os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+        )
+    except OSError as exc:
+        raise BureauLeaseContractError(
+            "contract-launcher-open-failed",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    try:
+        observed = _descriptor_identity(descriptor)
+        expected = runtime["identities"]["contract_executable"]
+        for key in ("device", "inode", "size", "mtime_ns", "sha256"):
+            if observed[key] != expected[key]:
+                raise BureauLeaseContractError("contract-launcher-descriptor-mismatch")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _legacy_contract_runtime() -> dict[str, Any]:
     configured = BUREAU_CONTRACT_EXECUTABLE
     if not configured.is_absolute():
         raise BureauLeaseContractError("contract-executable-not-absolute")
@@ -334,6 +755,7 @@ def _contract_runtime() -> dict[str, Any]:
             details={"error_type": type(exc).__name__},
         ) from None
     return {
+        "runtime_kind": "legacy-venv",
         "configured": configured,
         "configured_target": configured_target,
         "release_root": release_root,
@@ -369,13 +791,35 @@ def _assert_contract_runtime_unchanged(runtime: dict[str, Any]) -> None:
             raise BureauLeaseContractError(
                 "contract-component-changed-during-check", details={"component": name}
             )
-    for relative, path in runtime["package_paths"].items():
-        observed = _regular_file_identity(path, label="contract-package-file-readback")
-        if observed != runtime["package_identities"][relative]:
+    if runtime["runtime_kind"] == "managed-manifest":
+        observed_paths = _managed_package_paths(runtime["release_root"])
+        if set(observed_paths) != set(runtime["package_paths"]):
             raise BureauLeaseContractError(
-                "contract-package-changed-during-check",
-                details={"relative_path": relative},
+                "contract-package-set-changed-during-check"
             )
+        observed_digest, observed_identities = _managed_package_snapshot(
+            observed_paths
+        )
+        if observed_digest != runtime["managed_package_tree_sha256"]:
+            raise BureauLeaseContractError(
+                "contract-package-tree-changed-during-check"
+            )
+        for relative, observed in observed_identities.items():
+            if observed != runtime["package_identities"][relative]:
+                raise BureauLeaseContractError(
+                    "contract-package-changed-during-check",
+                    details={"relative_path": relative},
+                )
+    else:
+        for relative, path in runtime["package_paths"].items():
+            observed = _regular_file_identity(
+                path, label="contract-package-file-readback"
+            )
+            if observed != runtime["package_identities"][relative]:
+                raise BureauLeaseContractError(
+                    "contract-package-changed-during-check",
+                    details={"relative_path": relative},
+                )
 
 
 def _json_object(raw: str) -> dict[str, Any]:
@@ -462,41 +906,53 @@ def enforce_bureau_lease_contract(
         name: identity["sha256"]
         for name, identity in runtime["identities"].items()
     }
-    wrapper_binding = json.dumps(
-        {
-            "module_paths": {
-                name: str(path) for name, path in runtime["module_paths"].items()
-            },
-            "package_files": {
-                relative: {
-                    "path": str(runtime["package_paths"][relative]),
-                    "sha256": identity["sha256"],
-                }
-                for relative, identity in runtime["package_identities"].items()
-            },
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    argv = [
-        str(runtime["python_launcher"]),
-        "-I",
-        "-c",
-        _CONTRACT_WRAPPER,
-        wrapper_binding,
-        "--json",
-        "lease-contract",
-    ]
+    contract_arguments = ["--json", "lease-contract"]
     for key in keys:
-        argv.extend(["--resource-key", key])
-    argv.extend(["--phase", phase, "--ttl-seconds", str(ttl_seconds)])
+        contract_arguments.extend(["--resource-key", key])
+    contract_arguments.extend(["--phase", phase, "--ttl-seconds", str(ttl_seconds)])
     if justification is not None:
-        argv.extend(["--justification", _sha256_token(justification)])
+        contract_arguments.extend(["--justification", _sha256_token(justification)])
     if expected_head is not None:
-        argv.extend(["--expected-head", expected_head])
+        contract_arguments.extend(["--expected-head", expected_head])
     if expected_state is not None:
-        argv.extend(["--expected-state", _sha256_token(expected_state)])
+        contract_arguments.extend(["--expected-state", _sha256_token(expected_state)])
+    descriptor = -1
     try:
+        if runtime["runtime_kind"] == "legacy-venv":
+            wrapper_binding = json.dumps(
+                {
+                    "module_paths": {
+                        name: str(path) for name, path in runtime["module_paths"].items()
+                    },
+                    "package_files": {
+                        relative: {
+                            "path": str(runtime["package_paths"][relative]),
+                            "sha256": identity["sha256"],
+                        }
+                        for relative, identity in runtime["package_identities"].items()
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            argv = [
+                str(runtime["python_launcher"]),
+                "-I",
+                "-c",
+                _CONTRACT_WRAPPER,
+                wrapper_binding,
+                *contract_arguments,
+            ]
+            pass_fds: tuple[int, ...] = ()
+        else:
+            descriptor = _open_bound_launcher(runtime)
+            argv = [
+                str(runtime["python_launcher"]),
+                "-I",
+                f"/proc/self/fd/{descriptor}",
+                *contract_arguments,
+            ]
+            pass_fds = (descriptor,)
         completed = subprocess.run(
             argv,
             check=False,
@@ -504,12 +960,16 @@ def enforce_bureau_lease_contract(
             text=True,
             timeout=CONTRACT_TIMEOUT_SECONDS,
             env=_safe_environment(),
+            pass_fds=pass_fds,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BureauLeaseContractError(
             "contract-invocation-failed",
             details={"error_type": type(exc).__name__},
         ) from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     _assert_contract_runtime_unchanged(runtime)
     stdout_sha256 = hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest()
     stderr_sha256 = hashlib.sha256(completed.stderr.encode("utf-8")).hexdigest()
