@@ -82,15 +82,16 @@
       "evidence_refs": [
         "bureau:OPERATOR-INTEGRATION-LOOP-V1-T006",
         "docs:audit-projection-v1.md",
-        "tests:test_read_surface.py"
+        "tests:test_read_surface.py",
+        "contract:audit-signal.v1"
       ],
       "exception_detail": {
-        "claim": "The tool owns one bounded source-bound projection over the verified tamper-evident audit chain and exposes no raw-record query or mutation authority.",
-        "evidence": "Fixed 24-hour, 7-day, 30-day and all-time windows; chain-head binding; path-free aggregate output; proposal-only patterns; field projection; invalid-chain refusal; concurrent-advance warning; focused tests."
+        "claim": "The tool owns one bounded source-bound projection over the verified audit chain and embeds the canonical audit-signal.v1 synthesis without adding another tool or persistent truth store.",
+        "evidence": "Fixed rolling windows, chain-head binding, path-free aggregates, exactly five ordered evidence-qualified signals, auxiliary-source integrity gates, proposal-only recommendations and focused tests."
       },
       "justification_kind": "material_call_shape",
       "operation_alternative_considered": "The generic text reader and terminal surfaces were rejected because callers would need broad private-path access, custom parsing and repeated full-chain reads, while runtime health exposes only integrity and capacity rather than operational trends.",
-      "rationale": "A single typed read collapses many broad audit reads into one bounded, secret-free and source-bound result suitable for the operator and the planned nightly diagnostic digest.",
+      "rationale": "A single typed read collapses broad audit reads and now correlates verified audit transitions with bounded friction and live snapshot evidence. Extending the existing projection avoids another MCP tool and preserves the no-second-truth contract.",
       "tool_contract": {
         "authority_class": "read",
         "category": "operations-observability",
