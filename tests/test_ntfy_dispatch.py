@@ -155,6 +155,41 @@ class NtfyDispatchTests(TestCase):
         self.assertEqual(result["unit"], failed["unit"])
         ack.assert_called_once_with(healthy["unit"], healthy["receipt_sha256"])
 
+
+    def test_renders_all_canonical_event_classes_without_sensitive_payloads(self) -> None:
+        cases = {
+            "blocked_operation": ("blocked", "4"),
+            "recovery": ("Recovery", "4"),
+            "service_failure": ("failed", "5"),
+            "long_run_completed": ("finished", "3"),
+            "owner_decision": ("decision required", "4"),
+        }
+        for event_class, (needle, priority) in cases.items():
+            with self.subTest(event_class=event_class):
+                rendered = ntfy.render_notification({
+                    "event_class": event_class,
+                    "correlation_id": "corr-12345678",
+                    "status": "blocked",
+                    "terminal_status": "succeeded",
+                    "service": "probe.service",
+                    "note": "secret",
+                    "argv": ["secret-command"],
+                })
+                self.assertEqual(rendered["event_class"], event_class)
+                self.assertEqual(rendered["correlation_id"], "corr-12345678")
+                self.assertIn(needle, rendered["body"])
+                self.assertEqual(rendered["priority"], priority)
+                self.assertNotIn("secret", rendered["body"])
+
+    def test_unknown_event_class_falls_back_to_long_run_completed(self) -> None:
+        rendered = ntfy.render_notification({
+            "event_class": "unknown",
+            "job_id": "1234567890abcdef",
+            "terminal_status": "succeeded",
+        })
+        self.assertEqual(rendered["event_class"], "long_run_completed")
+        self.assertIn("90abcdef", rendered["body"])
+
     def test_publish_payload_excludes_sensitive_fields(self) -> None:
         row = {
             "job_id": "1234567890abcdef",
