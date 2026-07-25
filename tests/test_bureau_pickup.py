@@ -174,6 +174,7 @@ class BureauPickupTests(unittest.TestCase):
             "worker_id": "operator-test",
             "capabilities": ["repository", "shell"],
             "task_id": "TEST-T001",
+            "registry_root": str(self.root / "registry"),
             "base_dir": str(self.root / "worktrees"),
             "lease_ttl_seconds": 300,
             "create_workspace": True,
@@ -217,6 +218,18 @@ class BureauPickupTests(unittest.TestCase):
             "reclaimed_from_owner": None,
         }
 
+    def test_execute_requires_explicit_registry_root_before_effects(self) -> None:
+        request = self.request()
+        request.pop("registry_root")
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(ValueError, "registry_root"):
+                pickup.grabowski_bureau_pickup_execute(request)
+        invoke.assert_not_called()
+        acquire.assert_not_called()
+
     def test_execute_claims_after_exact_lease_acquisition(self) -> None:
         intent = self.intent()
         lease = self.lease(
@@ -245,6 +258,9 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(metadata["task_id"], intent["task_id"])
         self.assertEqual(metadata["run_id"], intent["run_id"])
         self.assertEqual(metadata["claim_intent_sha256"], intent["intent_sha256"])
+        for call in invoke.call_args_list:
+            arguments = call.args[0]
+            self.assertEqual(arguments[:2], ["--root", self.request()["registry_root"]])
         self.assertIn("--workspace", invoke.call_args_list[1].args[0])
         run_dir = Path(result["journal"])
         self.assertTrue((run_dir / "intent.json").is_file())

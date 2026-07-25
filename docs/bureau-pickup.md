@@ -10,16 +10,18 @@ The module declares three canonical MCP tools: `grabowski_bureau_pickup_execute`
 
 ## Execute path
 
-`grabowski_bureau_pickup_execute`:
+`grabowski_bureau_pickup_execute` requires an absolute `registry_root` that identifies the clean, writable Bureau task worktree used for both intent and commit. `base_dir` remains only the parent directory for an optional planned workspace. Missing root binding fails before any Bureau call or Grabowski lease acquisition.
 
-1. requests a read-only, approved Bureau `claim-intent`;
+The tool:
+
+1. requests a read-only, approved Bureau `claim-intent` against that exact Registry root;
 2. validates task, worker, run, owner, expiry and exact resource keys;
 3. writes immutable private request and intent artifacts;
 4. acquires Bureau resources, broad repository resources and remaining resources in explicit groups under `bureau-run:<run_id>`;
 5. binds every lease metadata set to `task_id`, `run_id` and `claim_intent_sha256`;
 6. requires a complete Grabowski scope manifest for every broad repository lease;
-7. commits the exact intent and live lease binding through Bureau, optionally creating the planned workspace;
-8. reads the canonical Bureau run after any unclear commit result;
+7. commits the exact intent and live lease binding through Bureau against the same Registry root, optionally creating the planned workspace;
+8. reads the Bureau run against the journal-bound Registry root after any unclear commit result;
 9. compensates acquired leases only when Bureau authoritatively reports that the run does not exist;
 10. compensates the current acquisition group as well when snapshot validation or immutable journaling fails after the lease database commit.
 
