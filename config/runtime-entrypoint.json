@@ -254,6 +254,10 @@
       "source": "src/grabowski_capabilities.py"
     },
     {
+      "module": "grabowski_audit_signal",
+      "source": "src/grabowski_audit_signal.py"
+    },
+    {
       "module": "grabowski_read_surface",
       "source": "src/grabowski_read_surface.py"
     },
