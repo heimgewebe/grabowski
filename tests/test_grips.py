@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -708,6 +708,9 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "branch-publish",
+                "bureau-pickup-execute",
+                "bureau-pickup-release",
+                "bureau-pickup-status",
                 "captain-preflight",
                 "captain-run",
                 "connector-snapshot-bind",
@@ -833,6 +836,9 @@ class GripFoundationTests(unittest.TestCase):
 
         self.assertEqual("observer", surface["profile"])
         self.assertFalse(by_name["branch-publish"]["availability"]["available"])
+        self.assertFalse(by_name["bureau-pickup-execute"]["availability"]["available"])
+        self.assertTrue(by_name["bureau-pickup-status"]["availability"]["available"])
+        self.assertFalse(by_name["bureau-pickup-release"]["availability"]["available"])
         self.assertFalse(by_name["captain-preflight"]["availability"]["available"])
         self.assertFalse(by_name["captain-run"]["availability"]["available"])
         self.assertTrue(by_name["repo-orient"]["availability"]["available"])
@@ -8714,3 +8720,201 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
         self.assertEqual("high", spec["risk"])
         self.assertEqual("mutating", spec["effect"])
         self.assertNotIn("worktree-hygiene-reconcile", grips.MECHANIC_NORMAL_GRIPS)
+
+
+class FakeBureauPickupError(RuntimeError):
+    def __init__(self, code: str, *, details: dict[str, object] | None = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.details = details or {}
+
+    def as_dict(self) -> dict[str, object]:
+        return {"code": self.code, "details": self.details}
+
+
+class BureauPickupGripTests(unittest.TestCase):
+    RUN_ID = "BUR-RUN-20260725T081705Z-0dd626f9ac"
+
+    def pickup(self) -> Mock:
+        module = Mock()
+        module.BureauPickupError = FakeBureauPickupError
+        return module
+
+    def test_status_grip_is_read_only_and_dispatches_to_typed_adapter(self) -> None:
+        expected = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_status",
+            "run_id": self.RUN_ID,
+            "coordination": {"status": "coordinated", "lease": {"status": "active-bound"}},
+            "journal_available": True,
+        }
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_status.return_value = expected
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-status",
+                {"run_id": self.RUN_ID},
+                profile="observer",
+            )
+        pickup.grabowski_bureau_pickup_status.assert_called_once_with(self.RUN_ID)
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("passed", result["output"]["receipt_status"])
+
+    def test_execute_requires_mutation_permission_before_dispatch(self) -> None:
+        pickup = self.pickup()
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-execute",
+                {"request": {"task_id": "TASK-1"}},
+                profile="operator",
+                allow_mutation=False,
+            )
+        pickup.grabowski_bureau_pickup_execute.assert_not_called()
+        self.assertEqual("blocked", result["receipt"]["status"])
+
+    def test_execute_success_is_receipt_bound(self) -> None:
+        output = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup",
+            "status": "claimed",
+            "run_id": self.RUN_ID,
+            "journal": "/private/run",
+        }
+        request = {"task_id": "TASK-1", "registry_root": "/srv/bureau"}
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_execute.return_value = output
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-execute",
+                {"request": request},
+                profile="operator",
+                allow_mutation=True,
+            )
+        pickup.grabowski_bureau_pickup_execute.assert_called_once_with(request)
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("claimed", result["output"]["status"])
+
+    def test_execute_incomplete_success_result_fails_closed(self) -> None:
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_execute.return_value = {
+            "status": "claimed",
+            "run_id": self.RUN_ID,
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-execute",
+                {"request": {"task_id": "TASK-1"}},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("incomplete success result", result["output"]["error"])
+
+    def test_status_incomplete_projection_is_blocked(self) -> None:
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_status.return_value = {
+            "run_id": self.RUN_ID,
+            "coordination": {"status": "coordinated"},
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-status",
+                {"run_id": self.RUN_ID},
+                profile="observer",
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["bureau_pickup_status_incomplete"], result["output"]["blocked_reasons"]
+        )
+
+    def test_execute_recovery_required_is_blocked_with_structured_result(self) -> None:
+        structured = {"status": "recovery-required", "run_id": self.RUN_ID}
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_execute.side_effect = FakeBureauPickupError(
+            "claim-commit-recovery-required", details={"result": structured}
+        )
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-execute",
+                {"request": {"task_id": "TASK-1"}},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(structured, result["output"]["result"])
+        self.assertEqual(
+            ["claim_commit_recovery_required"], result["output"]["blocked_reasons"]
+        )
+
+    def test_execute_not_applied_is_failed_with_compensation_evidence(self) -> None:
+        structured = {
+            "status": "commit-not-applied",
+            "run_id": self.RUN_ID,
+            "compensation": {"released": ["path:/tmp/bureau"]},
+        }
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_execute.side_effect = FakeBureauPickupError(
+            "claim-commit-not-applied", details={"result": structured}
+        )
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-execute",
+                {"request": {"task_id": "TASK-1"}},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertEqual(structured, result["output"]["result"])
+
+    def test_release_invalid_post_state_fails_closed(self) -> None:
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_release.return_value = {
+            "status": "unknown",
+            "run_id": self.RUN_ID,
+            "owner_id": f"bureau-run:{self.RUN_ID}",
+            "resource_keys": [],
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-release",
+                {"run_id": self.RUN_ID},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", result["receipt"]["status"])
+        self.assertIn("invalid post-state", result["output"]["error"])
+
+    def test_release_success_and_rejection_are_explicit(self) -> None:
+        output = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_release",
+            "status": "already-released",
+            "run_id": self.RUN_ID,
+            "owner_id": f"bureau-run:{self.RUN_ID}",
+            "resource_keys": ["path:/tmp/bureau"],
+        }
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_release.return_value = output
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            passed = grips.grip_run(
+                "bureau-pickup-release",
+                {"run_id": self.RUN_ID},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", passed["receipt"]["status"])
+        self.assertEqual("already-released", passed["output"]["status"])
+
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_release.side_effect = FakeBureauPickupError(
+            "run-still-active", details={"state": "running"}
+        )
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            blocked = grips.grip_run(
+                "bureau-pickup-release",
+                {"run_id": self.RUN_ID},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", blocked["receipt"]["status"])
+        self.assertEqual("run-still-active", blocked["output"]["error"])

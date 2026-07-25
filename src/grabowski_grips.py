@@ -243,6 +243,48 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="task_closeout_archive",
     ),
+    "bureau-pickup-execute": GripSpec(
+        name="bureau-pickup-execute",
+        version="1.0",
+        summary="Execute one Registry-root-bound coordinated Bureau pickup through the typed adapter.",
+        effect=MUTATING,
+        required_parameters=("request",),
+        acceptance_ids=(
+            "typed-request",
+            "registry-root-bound",
+            "lease-journal-bound",
+            "commit-outcome-explicit",
+        ),
+        runner="bureau_pickup_execute",
+    ),
+    "bureau-pickup-status": GripSpec(
+        name="bureau-pickup-status",
+        version="1.0",
+        summary="Read one coordinated Bureau pickup and its owner-bound lease state.",
+        effect=READ_ONLY,
+        required_parameters=("run_id",),
+        acceptance_ids=(
+            "run-id-bound",
+            "authoritative-status-read",
+            "lease-state-visible",
+            "no-mutation",
+        ),
+        runner="bureau_pickup_status",
+    ),
+    "bureau-pickup-release": GripSpec(
+        name="bureau-pickup-release",
+        version="1.0",
+        summary="Release only one terminal coordinated pickup's unchanged owner-bound leases.",
+        effect=MUTATING,
+        required_parameters=("run_id",),
+        acceptance_ids=(
+            "run-id-bound",
+            "terminal-readback-bound",
+            "exact-owner-resources",
+            "idempotent-release",
+        ),
+        runner="bureau_pickup_release",
+    ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
         version="1.0",
@@ -419,6 +461,9 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "task-attention-decision",
         "task-attention-reconciliation",
         "task-closeout-archive",
+        "bureau-pickup-execute",
+        "bureau-pickup-status",
+        "bureau-pickup-release",
         "connector-snapshot-bind",
         "convergence-assess",
         "gate-evidence-preflight",
@@ -449,6 +494,9 @@ GRIP_SURFACE_TARGETS = {
     "task-attention-decision": "one create-only current-attempt attention decision",
     "task-attention-reconciliation": "bounded attention-task evidence classification",
     "task-closeout-archive": "one retention-eligible terminal task archive and current projection switch",
+    "bureau-pickup-execute": "one Registry-root-bound coordinated Bureau pickup execution",
+    "bureau-pickup-status": "one coordinated Bureau pickup status and lease projection",
+    "bureau-pickup-release": "one terminal coordinated pickup lease release",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
@@ -468,6 +516,17 @@ GRIP_SURFACE_TARGETS = {
 GRIP_SURFACE_RECOVERY_PATHS = {
     READ_ONLY: "rerun the grip with the same inputs; no local recovery should be required",
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
+}
+GRIP_RECOVERY_PATHS_BY_NAME = {
+    "bureau-pickup-execute": (
+        "read bureau-pickup-status for the exact run; retain owner-bound leases on ambiguity; "
+        "retry only after a named status change or use bureau-pickup-release after terminal readback"
+    ),
+    "bureau-pickup-status": "rerun the same read-only status grip against the exact run id",
+    "bureau-pickup-release": (
+        "read bureau-pickup-status for the exact run and inspect the release receipt; "
+        "never substitute generic resource release or force-release"
+    ),
 }
 MECHANIC_NORMAL_GRIPS = frozenset(
     {
@@ -2132,6 +2191,223 @@ def _runtime_deploy_self_expected_argv_sha256(
         source_identity_sha256=source_identity_sha256,
     )
     return grabowski_self_deploy._deploy_command_sha256(command)
+
+
+def _bureau_pickup_module() -> Any:
+    try:
+        import grabowski_bureau_pickup
+    except ImportError as exc:
+        raise GripActionError("typed Bureau pickup adapter is unavailable") from exc
+
+    return grabowski_bureau_pickup
+
+
+def _bureau_pickup_error_output(
+    exc: Any,
+    *,
+    receipt_status: str,
+    blocked_reason: str,
+) -> dict[str, Any]:
+    output: dict[str, Any] = {
+        "receipt_status": receipt_status,
+        "error": exc.code,
+        "error_detail": exc.as_dict(),
+    }
+    result = exc.details.get("result")
+    if isinstance(result, dict):
+        output["result"] = result
+    if receipt_status == "blocked":
+        output["decision"] = "blocked"
+        output["blocked_reasons"] = [blocked_reason]
+    return output
+
+
+def _run_bureau_pickup_execute(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    request = parameters.get("request")
+    if not isinstance(request, dict):
+        _check(receipt, "typed-request", "fail", "request must be an object")
+        raise GripPreflightError("request must be an object")
+    _check(receipt, "typed-request", "pass", "typed pickup request")
+    pickup = _bureau_pickup_module()
+    try:
+        output = pickup.grabowski_bureau_pickup_execute(request)
+    except ValueError as exc:
+        _check(receipt, "registry-root-bound", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except pickup.BureauPickupError as exc:
+        _check(receipt, "commit-outcome-explicit", "fail", exc.code)
+        if exc.code == "claim-commit-not-applied":
+            return _bureau_pickup_error_output(
+                exc,
+                receipt_status="failed",
+                blocked_reason="claim_commit_not_applied",
+            )
+        return _bureau_pickup_error_output(
+            exc,
+            receipt_status="blocked",
+            blocked_reason=(
+                "claim_commit_recovery_required"
+                if exc.code == "claim-commit-recovery-required"
+                else "bureau_pickup_rejected"
+            ),
+        )
+    status = output.get("status")
+    journal = output.get("journal")
+    run_id = output.get("run_id")
+    valid_status = status in {
+        "claimed",
+        "existing-assignment",
+        "existing-terminal",
+        "recovered",
+    }
+    valid_journal = isinstance(journal, str) and bool(journal)
+    valid_run = isinstance(run_id, str) and bool(run_id)
+    _check(receipt, "registry-root-bound", "pass", "validated by typed pickup adapter")
+    _check(
+        receipt,
+        "lease-journal-bound",
+        "pass" if valid_journal and valid_run else "fail",
+        str(journal or "missing"),
+    )
+    _check(
+        receipt,
+        "commit-outcome-explicit",
+        "pass" if valid_status else "fail",
+        str(status or "missing"),
+    )
+    if not (valid_status and valid_journal and valid_run):
+        return {
+            "receipt_status": "failed",
+            "error": "bureau pickup adapter returned an incomplete success result",
+            "adapter_output": output,
+        }
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_bureau_pickup_status(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    run_id = parameters.get("run_id")
+    pickup = _bureau_pickup_module()
+    try:
+        output = pickup.grabowski_bureau_pickup_status(run_id)
+    except ValueError as exc:
+        _check(receipt, "run-id-bound", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except pickup.BureauPickupError as exc:
+        _check(receipt, "authoritative-status-read", "fail", exc.code)
+        return _bureau_pickup_error_output(
+            exc, receipt_status="blocked", blocked_reason="bureau_pickup_status_unavailable"
+        )
+    coordination = output.get("coordination")
+    run_matches = output.get("run_id") == run_id and isinstance(run_id, str)
+    coordination_valid = isinstance(coordination, dict) and isinstance(
+        coordination.get("status"), str
+    )
+    lease_visible = coordination_valid and isinstance(coordination.get("lease"), dict)
+    _check(
+        receipt,
+        "run-id-bound",
+        "pass" if run_matches else "fail",
+        str(output.get("run_id")),
+    )
+    _check(
+        receipt,
+        "authoritative-status-read",
+        "pass" if coordination_valid else "fail",
+        str(coordination.get("status") if isinstance(coordination, dict) else "missing"),
+    )
+    _check(
+        receipt,
+        "lease-state-visible",
+        "pass" if lease_visible else "fail",
+        "present" if lease_visible else "missing",
+    )
+    _check(receipt, "no-mutation", "pass", "read-only typed adapter")
+    if not (run_matches and coordination_valid and lease_visible):
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["bureau_pickup_status_incomplete"],
+            "error": "typed Bureau pickup status omitted required authoritative fields",
+            "adapter_output": output,
+        }
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_bureau_pickup_release(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    run_id = parameters.get("run_id")
+    pickup = _bureau_pickup_module()
+    try:
+        output = pickup.grabowski_bureau_pickup_release(run_id)
+    except ValueError as exc:
+        _check(receipt, "run-id-bound", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except pickup.BureauPickupError as exc:
+        _check(receipt, "terminal-readback-bound", "fail", exc.code)
+        return _bureau_pickup_error_output(
+            exc,
+            receipt_status="failed" if exc.code == "lease-release-incomplete" else "blocked",
+            blocked_reason="bureau_pickup_release_rejected",
+        )
+    status = output.get("status")
+    run_matches = output.get("run_id") == run_id and isinstance(run_id, str)
+    owner_id = output.get("owner_id")
+    resource_keys = output.get("resource_keys")
+    release_valid = status in {"released", "already-released"}
+    binding_valid = (
+        isinstance(owner_id, str)
+        and owner_id == f"bureau-run:{run_id}"
+        and isinstance(resource_keys, list)
+        and resource_keys == sorted(set(resource_keys))
+    )
+    _check(
+        receipt,
+        "run-id-bound",
+        "pass" if run_matches else "fail",
+        str(output.get("run_id")),
+    )
+    _check(
+        receipt,
+        "terminal-readback-bound",
+        "pass" if release_valid else "fail",
+        str(status or "missing"),
+    )
+    _check(
+        receipt,
+        "exact-owner-resources",
+        "pass" if binding_valid else "fail",
+        f"owner={owner_id}; resources={len(resource_keys) if isinstance(resource_keys, list) else 'invalid'}",
+    )
+    _check(
+        receipt,
+        "idempotent-release",
+        "pass" if release_valid else "fail",
+        str(status or "missing"),
+    )
+    if not (run_matches and release_valid and binding_valid):
+        return {
+            "receipt_status": "failed",
+            "error": "bureau pickup release returned an invalid post-state",
+            "adapter_output": output,
+        }
+    return {**output, "receipt_status": "passed"}
 
 
 def _run_connector_snapshot_bind(
@@ -6601,6 +6877,9 @@ _RUNNERS = {
     "task_attention_decision": _run_task_attention_decision,
     "task_attention_reconciliation": _run_task_attention_reconciliation,
     "task_closeout_archive": _run_task_closeout_archive,
+    "bureau_pickup_execute": _run_bureau_pickup_execute,
+    "bureau_pickup_status": _run_bureau_pickup_status,
+    "bureau_pickup_release": _run_bureau_pickup_release,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "convergence_assess": _run_convergence_assess,
     "gate_evidence_preflight": _run_gate_evidence_preflight,
@@ -6721,7 +7000,9 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
         "effect": spec.effect,
         "effect_class": "read-only" if spec.effect == READ_ONLY else "mutating",
         "risk": GRIP_RISK_LEVELS.get(spec.name, "medium"),
-        "recovery_path": GRIP_SURFACE_RECOVERY_PATHS[spec.effect],
+        "recovery_path": GRIP_RECOVERY_PATHS_BY_NAME.get(
+            spec.name, GRIP_SURFACE_RECOVERY_PATHS[spec.effect]
+        ),
         "preconditions": [
             f"required parameters: {required}",
             "grip name is present in GRIP_SURFACE_ALLOWLIST",
