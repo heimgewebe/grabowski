@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import importlib
 import json
 import os
 import re
@@ -13,15 +14,34 @@ from typing import Any, Callable
 
 import grabowski_operator_core as operator
 
+try:
+    alert_outbox = importlib.import_module("grabowski_alert_outbox")
+except ModuleNotFoundError as exc:
+    if exc.name != "grabowski_alert_outbox":
+        raise
+    alert_outbox = None
+
 TOPIC_PATH = Path.home() / ".config/grabowski/ntfy-topic"
 SERVER = "https://ntfy.sh"
 CHANNEL = "ntfy"
-EVENT_CLASSES = frozenset({"blocked_operation", "recovery", "service_failure", "long_run_completed", "owner_decision"})
+EVENT_CLASSES = frozenset(
+    {
+        "blocked_operation",
+        "recovery",
+        "service_failure",
+        "long_run_completed",
+        "owner_decision",
+    }
+)
 SAFE_TOKEN_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:@+-]*\Z")
 MAX_CORRELATION_ID_CHARS = 128
 MAX_STATUS_CHARS = 64
 MAX_SERVICE_CHARS = 96
 LOCK_PATH = Path.home() / ".local/state/grabowski/ntfy-dispatch.lock"
+
+
+class NotificationContractError(ValueError):
+    pass
 
 
 def load_topic(path: Path = TOPIC_PATH) -> str:
@@ -34,10 +54,6 @@ def load_topic(path: Path = TOPIC_PATH) -> str:
     if len(topic) < 32 or not topic.isalnum():
         raise RuntimeError("ntfy topic is invalid")
     return topic
-
-
-class NotificationContractError(ValueError):
-    pass
 
 
 def _safe_token(value: Any, *, field: str, fallback: str, max_length: int) -> str:
@@ -120,12 +136,15 @@ def render_notification(row: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def publish(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
-    rendered = render_notification(row)
-    body = rendered["body"].encode("utf-8")
+def _publish_rendered(
+    topic: str,
+    rendered: dict[str, str],
+    *,
+    server: str,
+) -> int:
     request = urllib.request.Request(
         f"{server}/{topic}",
-        data=body,
+        data=rendered["body"].encode("utf-8"),
         method="POST",
         headers={
             "Title": rendered["title"],
@@ -138,6 +157,42 @@ def publish(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         return int(response.status)
+
+
+def publish(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
+    return _publish_rendered(topic, render_notification(row), server=server)
+
+
+def _alert_render_row(row: dict[str, Any]) -> dict[str, Any]:
+    if alert_outbox is None:
+        raise RuntimeError("alert outbox support is unavailable")
+    candidate = dict(row)
+    candidate.pop("file_sha256", None)
+    alert_outbox.validate_alert(candidate)
+    fields = candidate.get("fields")
+    if not isinstance(fields, dict):
+        raise NotificationContractError("invalid_alert_fields")
+    kind = str(candidate.get("event_class") or "")
+    status_by_class = {
+        "blocked_operation": fields.get("outcome") or "blocked",
+        "recovery": fields.get("operation") or "completed",
+        "service_failure": fields.get("error_type") or "failed",
+        "long_run_completed": fields.get("outcome") or "completed",
+    }
+    return {
+        "event_class": kind,
+        "correlation_id": candidate.get("correlation_id"),
+        "status": status_by_class.get(kind, "recorded"),
+        "service": candidate.get("subject") or "grabowski",
+    }
+
+
+def publish_alert(topic: str, row: dict[str, Any], *, server: str = SERVER) -> int:
+    return _publish_rendered(
+        topic,
+        render_notification(_alert_render_row(row)),
+        server=server,
+    )
 
 
 def _notification_list(*, limit: int, state: str) -> dict[str, Any]:
@@ -172,17 +227,21 @@ def dispatch(
         try:
             status = publisher(topic, row)
         except NotificationContractError as exc:
-            failures.append({
-                "unit": unit,
-                "error_type": type(exc).__name__,
-                "reason": str(exc),
-            })
+            failures.append(
+                {
+                    "unit": unit,
+                    "error_type": type(exc).__name__,
+                    "reason": str(exc),
+                }
+            )
             continue
         except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
-            failures.append({
-                "unit": unit,
-                "error_type": type(exc).__name__,
-            })
+            failures.append(
+                {
+                    "unit": unit,
+                    "error_type": type(exc).__name__,
+                }
+            )
             continue
         if status < 200 or status >= 300:
             failures.append({"unit": unit, "http_status": status})
@@ -203,13 +262,93 @@ def dispatch(
     return {"status": "ok", "delivered": delivered, "skipped": skipped}
 
 
+def dispatch_alerts(
+    *,
+    topic: str,
+    publisher: Callable[[str, dict[str, Any]], int] = publish_alert,
+    limit: int = 50,
+) -> dict[str, Any]:
+    if alert_outbox is None:
+        return {
+            "status": "ok",
+            "delivered": 0,
+            "reason": "alert_outbox_unavailable",
+            "does_not_establish": ["alert_outbox_empty"],
+        }
+    listed = alert_outbox.list_alerts(limit=limit, state="queued")
+    if listed.get("invalid_receipts"):
+        return {"status": "blocked", "reason": "invalid_alert_outbox_receipts"}
+
+    delivered = 0
+    failures: list[dict[str, Any]] = []
+    contract_errors = (
+        NotificationContractError,
+        alert_outbox.AlertOutboxError,
+        alert_outbox.AlertOutboxInputError,
+    )
+    for row in listed.get("alerts", []):
+        alert_id = str(row.get("alert_id") or "")
+        receipt_sha256 = str(row.get("receipt_sha256") or "")
+        try:
+            status = publisher(topic, row)
+        except contract_errors as exc:
+            failure = {
+                "alert_id": alert_id,
+                "error_type": type(exc).__name__,
+            }
+            if isinstance(exc, NotificationContractError):
+                failure["reason"] = str(exc)
+            failures.append(failure)
+            continue
+        except (OSError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            failures.append(
+                {
+                    "alert_id": alert_id,
+                    "error_type": type(exc).__name__,
+                }
+            )
+            continue
+        if status < 200 or status >= 300:
+            failures.append({"alert_id": alert_id, "http_status": status})
+            continue
+
+        alert_outbox.acknowledge_alert(alert_id, receipt_sha256, status)
+        delivered += 1
+
+    if failures:
+        result: dict[str, Any] = {
+            "status": "delivery_failed",
+            "delivered": delivered,
+            "failed": len(failures),
+        }
+        result.update(failures[0])
+        return result
+    return {"status": "ok", "delivered": delivered}
+
+
+def _combined_status(*results: dict[str, Any]) -> str:
+    statuses = {str(result.get("status") or "delivery_failed") for result in results}
+    if "blocked" in statuses:
+        return "blocked"
+    if statuses == {"ok"}:
+        return "ok"
+    return "delivery_failed"
+
+
 def main() -> int:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        result = dispatch(topic=load_topic())
+        topic = load_topic()
+        job_result = dispatch(topic=topic)
+        alert_result = dispatch_alerts(topic=topic)
+        result = {
+            "status": _combined_status(job_result, alert_result),
+            "job_notifications": job_result,
+            "alerts": alert_result,
+        }
     finally:
         os.close(descriptor)
     print(json.dumps(result, sort_keys=True))

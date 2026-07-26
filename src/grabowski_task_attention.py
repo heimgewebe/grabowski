@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,13 @@ from typing import Any, Iterator
 import grabowski_consumer_surface as consumer_surface
 import grabowski_private_io as private_io
 import grabowski_tasks as tasks
+
+try:
+    alert_outbox = importlib.import_module("grabowski_alert_outbox")
+except ModuleNotFoundError as exc:
+    if exc.name != "grabowski_alert_outbox":
+        raise
+    alert_outbox = None
 
 
 SCHEMA_VERSION = 1
@@ -615,6 +623,30 @@ def _decision_path(binding: dict[str, Any]) -> Path:
     return _state_root() / f"{binding['task_id']}.a{binding['attempt']}.json"
 
 
+def _schedule_owner_decision_alert(
+    binding: dict[str, Any],
+    decision: dict[str, Any],
+) -> None:
+    if alert_outbox is None:
+        return
+    try:
+        alert_outbox.enqueue_and_schedule(
+            event_class="owner_decision",
+            producer="task_attention",
+            correlation_key=f"{binding['task_id']}:a{binding['attempt']}",
+            deduplication_key=str(decision["receipt_sha256"]),
+            subject="task",
+            fields={
+                "attempt": str(binding["attempt"]),
+                "decision": str(decision["decision"]),
+            },
+        )
+    except Exception:
+        # Alert publication and dispatch are advisory side effects. A failure
+        # must not rewrite or invalidate the authoritative decision receipt.
+        return
+
+
 def _validate_decision_record(
     value: dict[str, Any],
     *,
@@ -763,6 +795,7 @@ def record_decision(parameters: dict[str, Any]) -> dict[str, Any]:
             raise TaskAttentionConflictError(
                 "task attention decision already exists with different material"
             )
+    _schedule_owner_decision_alert(binding, winner)
     return {
         "schema_version": SCHEMA_VERSION,
         "created": created,

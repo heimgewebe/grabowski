@@ -25,6 +25,12 @@ class OperatorObligationTests(unittest.TestCase):
         )
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        self.alerts = patch.object(
+            obligation.alert_outbox,
+            "enqueue_and_schedule",
+        )
+        self.alerts.start()
+        self.addCleanup(self.alerts.stop)
 
     @staticmethod
     def _open_parameters(obligation_id: str = "goo-example-work-0001") -> dict[str, object]:
@@ -275,6 +281,54 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertEqual(first["close_file_sha256"], second["close_file_sha256"])
         close_path = self.root / "goo-example-work-0001" / "close.json"
         self.assertEqual(stat.S_IMODE(close_path.stat().st_mode), 0o600)
+
+    def test_terminal_close_alerts_are_narrow_and_dispatch_failure_is_advisory(
+        self,
+    ) -> None:
+        completed_id = "goo-completed-alert-0002"
+        blocked_id = "goo-blocked-alert-0003"
+        obligation.open_obligation(self._open_parameters(completed_id))
+        obligation.open_obligation(self._open_parameters(blocked_id))
+        with patch.object(
+            obligation.alert_outbox,
+            "enqueue_and_schedule",
+            side_effect=RuntimeError("dispatcher unavailable"),
+        ) as enqueue:
+            completed = obligation.close_obligation(
+                {
+                    "obligation_id": completed_id,
+                    "outcome": "completed",
+                    "evidence": self._passed_evidence(),
+                }
+            )
+            blocked = obligation.close_obligation(
+                {
+                    "obligation_id": blocked_id,
+                    "outcome": "blocked",
+                    "evidence": [],
+                    "blockers": [
+                        {
+                            "code": "foreign-lease",
+                            "detail": "Exact overlap remains active.",
+                            "reference": "lease:owner-17",
+                            "sha256": "3" * 64,
+                        }
+                    ],
+                    "next_action": "Recheck the lease.",
+                }
+            )
+
+        self.assertEqual("completed", completed["state"])
+        self.assertEqual("blocked", blocked["state"])
+        self.assertEqual(2, enqueue.call_count)
+        self.assertEqual(
+            ["long_run_completed", "blocked_operation"],
+            [call.kwargs["event_class"] for call in enqueue.call_args_list],
+        )
+        self.assertEqual(
+            [completed_id, blocked_id],
+            [call.kwargs["correlation_key"] for call in enqueue.call_args_list],
+        )
 
     def test_reopening_same_obligation_preserves_terminal_state(self) -> None:
         parameters = self._open_parameters()
