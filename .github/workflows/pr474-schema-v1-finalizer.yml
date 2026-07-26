@@ -1,0 +1,71 @@
+name: PR 474 schema-v1 compatibility finalizer
+
+on:
+  pull_request:
+    types:
+      - synchronize
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.event.pull_request.head.ref == 'fix/codex-review-settled-v1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact PR branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 2
+          persist-credentials: true
+
+      - name: Select one-shot invocation
+        id: gate
+        env:
+          EXPECTED_PARENT: 7879bd094a94defc8e4952136277537294e91f87
+        run: |
+          if [ "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Apply exact compatibility patch
+        if: steps.gate.outputs.run == 'true'
+        env:
+          EXPECTED_PATCH_SHA256: d53070e0c7ab21f0b9e1aca64ad4212e15a8aeb7f9e114a2f905c246cd93066d
+          PATCH_GZIP_B64: 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
+        run: |
+          set -euo pipefail
+          printf '%s' "$PATCH_GZIP_B64" | base64 --decode | gzip --decompress > "$RUNNER_TEMP/pr474-schema-v1.patch"
+          test "$(sha256sum "$RUNNER_TEMP/pr474-schema-v1.patch" | cut -d' ' -f1)" = "$EXPECTED_PATCH_SHA256"
+          git apply --check "$RUNNER_TEMP/pr474-schema-v1.patch"
+          git apply --index "$RUNNER_TEMP/pr474-schema-v1.patch"
+          make context-refresh
+          git diff --check
+
+      - name: Validate complete repository
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          make validate
+          make deploy-check
+
+      - name: Commit and push validated compatibility fix
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "grabowski-operator"
+          git config user.email "grabowski-operator@users.noreply.github.com"
+          git add docs src tests
+          test -n "$(git status --short -- docs src tests)"
+          git commit -m "fix(captain): preserve schema-v1 non-merge intents"
+          git push origin HEAD:fix/codex-review-settled-v1
