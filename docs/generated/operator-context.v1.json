@@ -2253,7 +2253,7 @@
       "automatic_deploy",
       "free_shell_as_default_path",
       "durable_agent_autonomy",
-      "steuerboard_report_action_approval"
+      "reposkop_report_action_approval"
     ],
     "execution_priority": [
       "chatgpt_operator",
@@ -2293,7 +2293,7 @@
       "patch_fallback": "chatgpt_operator_direct",
       "patch_file_relay": "operator_patch_relay",
       "quick_light_reasoning": "chatgpt_operator_direct",
-      "repo_state_context": "steuerboard_operator_report",
+      "repo_state_context": "reposkop_target_bound_report",
       "security_or_architecture_review": "chatgpt_operator_plus_external_independent_review",
       "session_resume": "chatgpt_operator_direct",
       "shell_or_git_grip": "grabowski_task"
@@ -2896,7 +2896,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "e4c0f065e0947f7d9571ec8954bf628b8b106e201c568c553265881f2a73076c"
+      "sha256": "c036ac1909ec2ffc45332f8e44c1c2e9f4ae776411f9a31149f5d71433be2a87"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
@@ -2915,7 +2915,7 @@
       "src/grabowski_agent_competition.py": "3e2e05f224c51967a47c95bc9eb541bdf40ed1f938c114f5e5ca146c47f84c71",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "64ab6d834f39aa7cacba725c870e4b3d161454b6fbfdd46b5ed13697dd2e60c9",
+      "src/grabowski_agent_workspace.py": "1e29280af5c4b5d38f410802f6e544531ae4ba6a16aefe521cbdee340ad1587b",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "e819dd4a314e8e7cf8da784b6a5bddda4fce3d00837583ce36905c5513db94f3",
@@ -2930,7 +2930,7 @@
       "src/grabowski_bureau_pickup.py": "8ee4894269234e83128eb06e7054bb850c834d4ecfbc11877a7fa542eea53051",
       "src/grabowski_capabilities.py": "fec4bb0449fbd372663a7001db12103326d27cf43b252b8c0a182c6bcf7a504b",
       "src/grabowski_checkout_binding_reconciler.py": "ba83ce460f9988ffec920ce7c50dde91f2316a9f91be116bfc7abd26b8722153",
-      "src/grabowski_checkouts.py": "45a76abdc97a986da6b3b19ea65874969f91f3cdbf055c9c5d2c65d5baf5625f",
+      "src/grabowski_checkouts.py": "6fb1b94b58f4b511954cdc18fe894f2ef5b14deeea443153e10a370f325fde11",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
       "src/grabowski_coding_agent_catalog_data.py": "4553516be290d92884f04acd2abd060b24111865d80849a343710baa202cf724",
@@ -2944,7 +2944,7 @@
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
       "src/grabowski_friction.py": "236ce1e84a01166bfcc0775a126f207202e179668921569c0c6b843884b6fbe1",
       "src/grabowski_grip_orchestration.py": "0f69fc3eeadc69609e49b3f3654c0a882380c9412d21592f24448a812fa4657e",
-      "src/grabowski_grips.py": "b74b63d80f5253b814c6091608b1b9e2cf088abab8201d9067e3058fc2fc5d92",
+      "src/grabowski_grips.py": "d8740ce3381c4cf4282c1edc9862ca754ec53401e070b726757356843f721d21",
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
@@ -2965,7 +2965,7 @@
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
       "src/grabowski_operator.py": "4db64a321dc135762fc7ee26e030bf2070deab14eadfb0787e7cae45ccaaff2b",
       "src/grabowski_operator_obligation.py": "0f027a808cf5ea211f7f37468c12c34576fcff39c568f08743f791903c673a2f",
-      "src/grabowski_operator_relay.py": "4099f2679b4c0af47296bcd26ed881d08d0f4049799ce97a5b8b7cac92d1bad1",
+      "src/grabowski_operator_relay.py": "3f314d82bb6c3c7b91eff774b487088e25ec44372512d50936eb18f199eaa02c",
       "src/grabowski_operator_routing_shadow_capture.py": "1fa2d18cd459873eab3a2535b6e48df5363ae151a24914fbd7693020c29da5b0",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",

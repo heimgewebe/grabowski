@@ -8,12 +8,16 @@ Der Adapter stellt den in Bureau definierten Operator-Intake-Vertrag als schmale
 
 | Werkzeug | Wirkung |
 |---|---|
-| `grabowski_bureau_candidate_record` | Hängt einen quellgebundenen Kandidaten idempotent an das Bureau Live Register an. |
+| `grabowski_bureau_candidate_record` | Hängt einen quellgebundenen Kandidaten oder eine append-only Korrektur idempotent an das Bureau Live Register an. |
 | `grabowski_bureau_candidate_assess` | Bewertet einen Kandidaten read-only gegen aktuelle Registry- und Live-Register-Wahrheit. |
 | `grabowski_bureau_task_propose` | Erzeugt ein digestgebundenes privates Proposal-Artefakt; Registry und Queue bleiben unverändert. |
 | `grabowski_bureau_task_review` | Prüft exakt den angegebenen Proposal-Digest und erzeugt `reviewed_plan`-Approval-Evidenz; Reviewzeitpunkt kommt ausschließlich aus Bureau. |
 | `grabowski_bureau_task_publish_preview` | Validiert ein Proposal und liefert die exakt benötigten Publikationsressourcen ohne Wirkung. |
 | `grabowski_bureau_task_publish` | Erwirbt zwei exakte Kurzleasen, publiziert Branch und Pull Request und gibt Leases nur nach eindeutigem Ausgang frei. |
+
+## Kandidaten-Refinement
+
+`grabowski_bureau_candidate_record` transportiert optional `supersedes_event_id` unverändert im digestgebundenen Request. Typprüfung, Aktualität, Kandidatenzugehörigkeit und Supersession-Zulässigkeit entscheidet ausschließlich der append-only Bureau-Live-Register-Vertrag; der Adapter bewahrt dessen wirkungsfreie Fehler- und Readback-Semantik ohne eigene Domänenentscheidung.
 
 ## Vertrauensgrenzen
 
