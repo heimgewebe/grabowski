@@ -1,0 +1,28 @@
+name: PR 474 source export
+
+on:
+  push:
+    branches:
+      - fix/codex-review-settled-v1
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact pushed commit
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build source archive
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/pr474-source.tar.gz" .
+      - name: Upload source archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr474-source-${{ github.sha }}
+          path: ${{ runner.temp }}/pr474-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
