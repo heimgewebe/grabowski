@@ -83,13 +83,21 @@ jobs:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set +e
-          python3 tools/codex_review_settlement.py \
-            --repository "$GITHUB_REPOSITORY" \
-            --pr "$PR_NUMBER" \
-            --require \
-            --json \
-            request > codex-review-request.json
-          rc=$?
+          if [ ! -f tools/codex_review_settlement.py ]; then
+            jq -nc \
+              --arg error trusted_evaluator_missing_on_default_branch \
+              '{requested:false,errors:[$error]}' \
+              > codex-review-request.json
+            rc=2
+          else
+            python3 tools/codex_review_settlement.py \
+              --repository "$GITHUB_REPOSITORY" \
+              --pr "$PR_NUMBER" \
+              --require \
+              --json \
+              request > codex-review-request.json
+            rc=$?
+          fi
           set -e
           cat codex-review-request.json
           echo "returncode=$rc" >> "$GITHUB_OUTPUT"
@@ -102,13 +110,21 @@ jobs:
           REQUEST_RETURN_CODE: ${{ steps.request.outputs.returncode || '0' }}
         run: |
           set +e
-          python3 tools/codex_review_settlement.py \
-            --repository "$GITHUB_REPOSITORY" \
-            --pr "$PR_NUMBER" \
-            --require \
-            --json \
-            evaluate > codex-review-settlement.json
-          rc=$?
+          if [ ! -f tools/codex_review_settlement.py ]; then
+            jq -nc \
+              --arg error trusted_evaluator_missing_on_default_branch \
+              '{status:"block",settled:false,errors:[$error]}' \
+              > codex-review-settlement.json
+            rc=2
+          else
+            python3 tools/codex_review_settlement.py \
+              --repository "$GITHUB_REPOSITORY" \
+              --pr "$PR_NUMBER" \
+              --require \
+              --json \
+              evaluate > codex-review-settlement.json
+            rc=$?
+          fi
           set -e
           cat codex-review-settlement.json
           status="$(jq -r '.status // "block"' codex-review-settlement.json)"
