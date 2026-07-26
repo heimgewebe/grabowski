@@ -116,6 +116,85 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertTrue(result["blocking"])
         self.assertIn("checkout_absence_as_cleanup_proof", result["does_not_establish"])
 
+    def test_cleaned_archived_binding_is_terminal_nonblocking(self) -> None:
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                latest_archive={
+                    "archive_id": "archive-clean",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": HEAD,
+                    "branch": "topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": 2,
+                    "cleanup_plan_id": "plan-clean",
+                },
+            ),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "archived_cleaned")
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["reasons"], [])
+        self.assertEqual(
+            result["recommended_next_step"],
+            "use_cleaned_archive_lifecycle_projection",
+        )
+        self.assertIn(
+            "checkout_absence_as_cleanup_proof", result["does_not_establish"]
+        )
+
+    def test_cleaned_archive_requires_complete_cleanup_evidence(self) -> None:
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                latest_archive={
+                    "archive_id": "archive-incomplete",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": HEAD,
+                    "branch": "topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": 2,
+                    "cleanup_plan_id": None,
+                },
+            ),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertTrue(result["blocking"])
+        self.assertIn("binding-archive-cleanup-plan-missing", result["reasons"])
+
+    def test_cleaned_archive_with_live_worktree_is_blocking_drift(self) -> None:
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                latest_archive={
+                    "archive_id": "archive-clean",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": HEAD,
+                    "branch": "topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": 2,
+                    "cleanup_plan_id": "plan-clean",
+                },
+            ),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertTrue(result["blocking"])
+        self.assertIn("cleaned-archive-worktree-still-present", result["reasons"])
+
     def test_missing_binding_identity_is_blocking_drift(self) -> None:
         for field in (
             "checkout_key",
@@ -591,6 +670,48 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
             self.assertEqual(result["bindings"][0]["state"], "bound_present")
             self.assertEqual(result["attention"], [])
             self.assertTrue(result["pagination"]["snapshot_bound"])
+
+    def test_live_cleaned_archive_without_worktree_is_nonblocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(
+                path,
+                checkout_key="key-a",
+                checkout_path=CHECKOUT,
+                phase="archived",
+            )
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO archives(
+                        archive_id, checkout_key, repo_common_dir, repo_path,
+                        checkout_path, head, branch, owner_id, purpose,
+                        retention_until_unix, recovery_refs_json, manifest_path,
+                        created_at_unix, cleaned_at_unix, cleanup_plan_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "archive-clean", "key-a", COMMON, REPO, CHECKOUT, HEAD,
+                        "topic", "operator:test", "test", 9999999999, "[]",
+                        "/tmp/archive-clean.json", 1, 2, "plan-clean",
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            with mock.patch(
+                "grabowski_checkout_binding_reconciler.checkouts.observe_worktree_records",
+                return_value=observed_repo(),
+            ):
+                result = reconcile_checkout_bindings(db_path=path)
+            row = result["bindings"][0]
+            self.assertEqual(row["state"], "archived_cleaned")
+            self.assertFalse(row["blocking"])
+            self.assertEqual(result["blocking_count"], 0)
+            self.assertEqual(result["attention"], [])
+            self.assertEqual(result["summary"]["archived_cleaned"], 1)
 
     def test_repository_observation_failure_is_blocking_not_orphaned(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

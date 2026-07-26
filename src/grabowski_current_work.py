@@ -989,6 +989,7 @@ def _add_binding_reconciliation(
     """Attach only blocking reconciliation evidence without duplicating present checkouts."""
     supported_states = {
         "bound_present",
+        "archived_cleaned",
         "orphaned_binding",
         "repository_unobservable",
         "binding_identity_drift",
@@ -1019,10 +1020,10 @@ def _add_binding_reconciliation(
             raise CurrentWorkProjectionError(
                 "checkout binding reconciliation reasons are invalid"
             )
-        if state == "bound_present":
+        if state in {"bound_present", "archived_cleaned"}:
             if blocking or reasons_raw:
                 raise CurrentWorkProjectionError(
-                    "bound_present reconciliation must be non-blocking and drift-free"
+                    f"{state} reconciliation must be non-blocking and drift-free"
                 )
             continue
         if not blocking:

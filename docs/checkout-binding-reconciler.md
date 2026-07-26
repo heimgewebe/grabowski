@@ -13,13 +13,14 @@ Die Ausgabe ist auf höchstens 100 Datensätze je Seite begrenzt. Der Cursor ist
 ## Zustände
 
 - `bound_present`: Binding und Worktree-Identität stimmen überein.
-- `orphaned_binding`: Das Repository ist beobachtbar, aber für das Binding existiert kein aktueller Git-Worktree-Record.
+- `archived_cleaned`: Das Repository ist beobachtbar, der Worktree fehlt und ein identitätsgleiches `archived`-Binding besitzt einen vollständigen Archive-Record mit `cleaned_at_unix` und `cleanup_plan_id`. Der Zustand ist terminal und nicht blockierend.
+- `orphaned_binding`: Das Repository ist beobachtbar, aber für das Binding existiert weder ein aktueller Git-Worktree-Record noch vollständige Cleanup-Evidenz.
 - `repository_unobservable`: Der Repository-Zustand konnte nicht autoritativ beobachtet werden.
 - `binding_identity_drift`: Checkout-Key, Common-Dir, Repository-Pfad, Checkout-Pfad, Branch, Owner oder terminaler Head widersprechen sich.
 
 ## Current Work und Attention
 
-`bound_present` erzeugt keine zweite Current-Work-Zeile. Blockierende Reconciliation-Ergebnisse werden an eine bereits vorhandene `checkout:<key>`-Gruppe angehängt. Fehlt ein physischer Checkout, entsteht eine ungebundene `checkout-binding:<key>`-Gruppe. Diese Projektion ist Aufmerksamkeitsevidenz, keine Checkout- oder Eigentumsautorität.
+`bound_present` und `archived_cleaned` erzeugen keine zweite Current-Work-Zeile. Blockierende Reconciliation-Ergebnisse werden an eine bereits vorhandene `checkout:<key>`-Gruppe angehängt. Fehlt ein physischer Checkout ohne vollständige Cleanup-Evidenz, entsteht eine ungebundene `checkout-binding:<key>`-Gruppe. Diese Projektion ist Aufmerksamkeitsevidenz, keine Checkout- oder Eigentumsautorität.
 
 Die direkte Tool-Antwort enthält zusätzlich eine begrenzte `attention`-Projektion für die Datensätze der aktuellen Seite und `attention_total_count` für den vollständigen Snapshot. Sie erzeugt oder verändert keine dauerhafte Attention-Entscheidung.
 
@@ -34,4 +35,4 @@ Die Projektion ist rein beobachtend. Insbesondere begründen weder ein fehlender
 - automatischer Terminalisierung oder
 - Reparatur fremder Bindings.
 
-Aktive Bindings ohne Worktree bleiben blockierend. Fehlende Pflichtidentität, unbekannte Lifecycle-Phasen, fehlende Worktree-Keys und doppelte Checkout-Keys werden als `binding_identity_drift` behandelt; es gibt kein „last row wins“. Ein nicht gesetzter Branch bleibt zulässig, wenn Binding und Worktree darin übereinstimmen. Terminale Head-Identität wird exakt geprüft; Head-Bewegung in `active` bleibt zulässig. Ergebnisse sind deterministisch sortiert und Evidenz ist begrenzt.
+Aktive Bindings ohne Worktree bleiben blockierend. Checkout-Abwesenheit allein terminalisiert nichts. `archived_cleaned` verlangt zusätzlich einen identitätsgleichen Archive-Record, einen positiven Cleanup-Zeitpunkt und eine gebundene Cleanup-Plan-ID; unvollständige Cleanup-Evidenz oder ein weiterhin vorhandener Worktree werden blockierende Identitätsdrift. Fehlende Pflichtidentität, unbekannte Lifecycle-Phasen, fehlende Worktree-Keys und doppelte Checkout-Keys werden ebenfalls als `binding_identity_drift` behandelt; es gibt kein „last row wins“. Ein nicht gesetzter Branch bleibt zulässig, wenn Binding und Worktree darin übereinstimmen. Terminale Head-Identität wird exakt geprüft; Head-Bewegung in `active` bleibt zulässig. Ergebnisse sind deterministisch sortiert und Evidenz ist begrenzt.

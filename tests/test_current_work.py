@@ -1241,6 +1241,22 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             )
         )
 
+    def test_archived_cleaned_reconciliation_does_not_project_work(self) -> None:
+        result = project(
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-cleaned",
+                        "state": "archived_cleaned",
+                        "blocking": False,
+                        "reasons": [],
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(result["count"], 0)
+
     def test_orphaned_binding_projects_one_blocking_current_work_group(self) -> None:
         result = project(
             reconciliation_payload={
