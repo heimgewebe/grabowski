@@ -2139,6 +2139,51 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:refresh.service"))
 
+    def test_reconcile_refresh_isolates_retired_host_and_continues(self) -> None:
+        retired = self._start()["task"]
+        healthy = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET host='heimserver' WHERE task_id=?",
+                (retired["task_id"],),
+            )
+            connection.commit()
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            if record["host"] == "heimserver":
+                raise ValueError("Unknown fleet host: heimserver")
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            result = tasks.reconcile_tasks_refresh()
+
+        self.assertEqual(result["scanned"], 2)
+        self.assertEqual(len(result["blocked"]), 1)
+        self.assertEqual(result["blocked"][0]["task_id"], retired["task_id"])
+        self.assertEqual(
+            result["blocked"][0]["reason_class"],
+            "host_retired_or_unregistered",
+        )
+        self.assertEqual([item["task_id"] for item in result["refreshed"]], [healthy["task_id"]])
+
+    def test_reconcile_skips_fully_converged_terminal_tasks(self) -> None:
+        started = self._start()["task"]
+        tasks._set_state(
+            started["task_id"],
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with patch.object(tasks, "_reconcile_observation") as observe:
+            result = tasks.reconcile_tasks_check()
+        self.assertEqual(result["scanned"], 0)
+        observe.assert_not_called()
+
     def test_reconcile_resume_requires_reason(self) -> None:
         with self.assertRaisesRegex(ValueError, "reason is required"):
             tasks.reconcile_tasks_resume()

@@ -3425,21 +3425,35 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
 
 
 def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
+    candidate_states = {
+        "launching",
+        "running",
+        "outcome_unknown",
+        "interrupted",
+        "failed",
+        "timed_out",
+        "signalled",
+    }
     if task_id:
         record = _row(task_id)
-        return (
-            [record]
-            if record["state"]
-            in {"launching", "running", "outcome_unknown", "interrupted", "failed", "timed_out", "signalled"}
-            else []
-        )
-    _recover_pending_task_terminalizations()
-    with _database_connection() as connection:
-        rows = connection.execute(
-            "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown', 'interrupted', 'failed', 'timed_out', 'signalled') "
-            "ORDER BY created_at_unix, task_id"
-        ).fetchall()
-    return [dict(row) for row in rows]
+        rows = [record] if record["state"] in candidate_states else []
+    else:
+        _recover_pending_task_terminalizations()
+        with _database_connection() as connection:
+            selected = connection.execute(
+                "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown', 'interrupted', 'failed', 'timed_out', 'signalled') "
+                "ORDER BY created_at_unix, task_id"
+            ).fetchall()
+        rows = [dict(row) for row in selected]
+
+    candidates: list[dict[str, Any]] = []
+    for record in rows:
+        if _is_terminal_state(str(record["state"])):
+            terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+            if terminal_valid and lease_valid:
+                continue
+        candidates.append(record)
+    return candidates
 
 
 def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
@@ -3472,6 +3486,48 @@ def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
         and set(requested) == set(revoked)
     )
     return terminal_valid, lease_valid
+
+
+def _reconcile_observation(record: dict[str, Any]) -> dict[str, Any]:
+    terminal_valid, _ = _terminal_convergence_evidence(record)
+    if _is_terminal_state(str(record["state"])) and terminal_valid:
+        return {
+            "state": record["state"],
+            "properties": {},
+            "probe": None,
+            "observer": {
+                "kind": "terminal-evidence-v1",
+                "execution_backend": _execution_backend(record),
+                "systemd_scope": _systemd_scope(record),
+            },
+            "observed_at_unix": _now(),
+            "terminal_evidence_reused": True,
+        }
+    return _observe(record)
+
+
+def _unknown_fleet_host_error(exc: ValueError) -> bool:
+    return str(exc).startswith("Unknown fleet host: ")
+
+
+def _reconcile_unknown_host(record: dict[str, Any], exc: ValueError) -> dict[str, Any]:
+    current_state = str(record["state"])
+    return {
+        "task_id": record["task_id"],
+        "host": record["host"],
+        "unit": record["unit"],
+        "authoritative_unit": _authoritative_unit(record),
+        "execution_backend": _execution_backend(record),
+        "systemd_scope": _systemd_scope(record),
+        "current_state": current_state,
+        "resume_policy": record["resume_policy"],
+        "reason": f"host retired or unregistered: {_redact_reason(str(exc))}",
+        "reason_class": "host_retired_or_unregistered",
+        "retryable": False,
+        "automatic_resume_allowed": False,
+        "owner_decision_required": not _is_terminal_state(current_state),
+        "terminal_evidence_required": not _is_terminal_state(current_state),
+    }
 
 
 def _terminal_convergence_classification(
@@ -3603,9 +3659,14 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     blocked: list[dict[str, Any]] = []
     for record in rows:
         try:
-            observation = _observe(record)
+            observation = _reconcile_observation(record)
         except PermissionError as exc:
             blocked.append(_reconcile_observe_denial(record, exc))
+            continue
+        except ValueError as exc:
+            if not _unknown_fleet_host_error(exc):
+                raise
+            blocked.append(_reconcile_unknown_host(record, exc))
             continue
         classification = _terminal_convergence_classification(record, observation)
         item = {
@@ -3652,9 +3713,14 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
     denied: list[dict[str, Any]] = []
     for record in rows:
         try:
-            observation = _observe(record)
+            observation = _reconcile_observation(record)
         except PermissionError as exc:
             denied.append(_reconcile_observe_denial(record, exc))
+            continue
+        except ValueError as exc:
+            if not _unknown_fleet_host_error(exc):
+                raise
+            denied.append(_reconcile_unknown_host(record, exc))
             continue
         effective_state = _effective_observed_state(record, observation["state"])
         lease_maintenance = _maintain_record_resources(record, effective_state)
@@ -3703,9 +3769,14 @@ def reconcile_tasks_resume(
     blocked: list[dict[str, Any]] = []
     for record in rows:
         try:
-            observation = _observe(record)
+            observation = _reconcile_observation(record)
         except PermissionError as exc:
             blocked.append(_reconcile_observe_denial(record, exc))
+            continue
+        except ValueError as exc:
+            if not _unknown_fleet_host_error(exc):
+                raise
+            blocked.append(_reconcile_unknown_host(record, exc))
             continue
         effective_state = _effective_observed_state(record, observation["state"])
         lease_maintenance = _maintain_record_resources(record, effective_state)
