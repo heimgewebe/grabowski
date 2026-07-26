@@ -3424,7 +3424,11 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     return {"task": _public(stored), "audit": audit}
 
 
-def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
+def _reconcile_candidate_rows(
+    task_id: str = "",
+    *,
+    include_converged_terminal: bool = False,
+) -> list[dict[str, Any]]:
     candidate_states = {
         "launching",
         "running",
@@ -3448,7 +3452,10 @@ def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
 
     candidates: list[dict[str, Any]] = []
     for record in rows:
-        if _is_terminal_state(str(record["state"])):
+        if (
+            not include_converged_terminal
+            and _is_terminal_state(str(record["state"]))
+        ):
             terminal_valid, lease_valid = _terminal_convergence_evidence(record)
             if terminal_valid and lease_valid:
                 continue
@@ -3765,7 +3772,10 @@ def reconcile_tasks_resume(
         raise ValueError("max_resumes must be between 1 and 50")
     if not isinstance(reason, str) or not reason.strip():
         raise ValueError("reason is required for task reconcile resume")
-    rows = _reconcile_candidate_rows(task_id)
+    rows = _reconcile_candidate_rows(
+        task_id,
+        include_converged_terminal=True,
+    )
     refreshed: list[dict[str, Any]] = []
     released: list[str] = []
     resumed: list[dict[str, Any]] = []

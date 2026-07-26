@@ -2172,6 +2172,35 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual([item["task_id"] for item in result["refreshed"]], [healthy["task_id"]])
 
+    def test_reconcile_resume_keeps_converged_retry_safe_failure_eligible(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET resume_policy='retry-safe' WHERE task_id=?",
+                (started["task_id"],),
+            )
+            connection.commit()
+        tasks._set_state(
+            started["task_id"],
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        successor = {"task_id": "f" * 24, "state": "running"}
+        with patch.object(
+            tasks,
+            "_terminal_retry_successor",
+            return_value=successor,
+        ) as retry:
+            result = tasks.reconcile_tasks_resume(
+                task_id=started["task_id"],
+                max_resumes=1,
+                reason="bounded retry proof",
+            )
+        self.assertEqual(result["scanned"], 1)
+        self.assertEqual(result["resumed"], [successor])
+        self.assertEqual(result["blocked"], [])
+        retry.assert_called_once()
+
     def test_reconcile_retired_host_terminal_without_evidence_stays_blocked(self) -> None:
         retired = self._start()["task"]
         with sqlite3.connect(self.database) as connection:
