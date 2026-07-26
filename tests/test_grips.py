@@ -3279,6 +3279,7 @@ def captain_codex_review_evidence(
 def captain_codex_reaction_evidence(
     *,
     review_tier: str = "high_critical",
+    closing: str = "Hooray!",
 ) -> dict[str, object]:
     evidence = captain_codex_review_evidence(review_tier=review_tier)
     evidence["completion"] = {
@@ -3302,9 +3303,10 @@ def captain_codex_clean_comment(
     head: str = CAPTAIN_HEAD,
     comment_id: int = 205,
     body: str | None = None,
+    closing: str = "Hooray!",
 ) -> dict[str, object]:
     clean_body = body or (
-        "Codex Review: Didn't find any major issues. Hooray!\n\n"
+        f"Codex Review: Didn't find any major issues. {closing}\n\n"
         f"**Reviewed commit:** `{head[:10]}`\n\n"
         "<details><summary>About Codex</summary></details>"
     )
@@ -3322,12 +3324,13 @@ def captain_codex_clean_comment_evidence(
     *,
     head: str = CAPTAIN_HEAD,
     review_tier: str = "high_critical",
+    closing: str = "Hooray!",
 ) -> dict[str, object]:
     evidence = captain_codex_review_evidence(
         head=head,
         review_tier=review_tier,
     )
-    comment = captain_codex_clean_comment(head=head)
+    comment = captain_codex_clean_comment(head=head, closing=closing)
     body = str(comment["body"])
     evidence["completion"] = {
         "mode": "clean_comment",
@@ -6776,6 +6779,45 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "status"
             ],
         )
+
+    def test_atomic_merge_guard_accepts_on_a_roll_clean_comment(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence(
+            closing="You're on a roll."
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        base_state = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(base_state["request_comment"])
+        clean_comment = captain_codex_clean_comment(closing="You're on a roll.")
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, clean_comment]],
+            review_pages=[[]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
 
     def test_atomic_merge_guard_blocks_clean_comment_body_drift(self) -> None:
         parameters = authorized_captain_run_parameters()

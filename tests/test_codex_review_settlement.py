@@ -78,10 +78,11 @@ def codex_clean_comment(
     comment_id: int = 2101,
     created_at: str = REVIEW_TIME,
     reviewed_prefix: str | None = None,
+    closing: str = "Hooray!",
 ) -> dict:
     prefix = reviewed_prefix if reviewed_prefix is not None else head[:10]
     body = (
-        "Codex Review: Didn't find any major issues. Hooray!\n\n"
+        f"Codex Review: Didn't find any major issues. {closing}\n\n"
         f"**Reviewed commit:** `{prefix}`\n\n"
         "<details><summary>About Codex</summary></details>"
     )
@@ -181,6 +182,20 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(2101, completion["comment_id"])
         self.assertEqual(HEAD[:10], completion["reviewed_commit_prefix"])
         self.assertEqual("CLEAN", completion["state"])
+
+    def test_on_a_roll_clean_result_comment_settles_current_head(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment(closing="You're on a roll.")
+        state["comments"] = connection(
+            [request_comment(), clean],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+        self.assertEqual("clean_comment", result["evidence"]["completion"]["mode"])
 
     def test_clean_result_comment_for_other_head_does_not_settle(self) -> None:
         state = base_state()
