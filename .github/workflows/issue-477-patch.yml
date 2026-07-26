@@ -4,9 +4,13 @@ name: Apply issue 477 watchdog patch
 on:
   push:
     branches: [fix/watchdog-stale-poll-restart-v1]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
+  pull-requests: read
 
 concurrency:
   group: issue-477-watchdog-patch
