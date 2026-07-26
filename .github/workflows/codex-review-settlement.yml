@@ -86,6 +86,7 @@ jobs:
           python3 tools/codex_review_settlement.py \
             --repository "$GITHUB_REPOSITORY" \
             --pr "$PR_NUMBER" \
+            --require \
             --json \
             request > codex-review-request.json
           rc=$?
@@ -104,6 +105,7 @@ jobs:
           python3 tools/codex_review_settlement.py \
             --repository "$GITHUB_REPOSITORY" \
             --pr "$PR_NUMBER" \
+            --require \
             --json \
             evaluate > codex-review-settlement.json
           rc=$?

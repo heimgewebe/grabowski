@@ -1307,7 +1307,6 @@ def _codex_review_evidence_errors(
     expected_base_sha: str | None,
     expected_repo: str | None,
     expected_pr: int | None,
-    expected_review_tier: str | None,
 ) -> list[str]:
     if not isinstance(evidence, dict):
         return ["codex review evidence must be a structured object"]
@@ -1354,8 +1353,6 @@ def _codex_review_evidence_errors(
         "high_critical",
     }:
         errors.append("review_tier is missing or invalid")
-    elif expected_review_tier is not None and review_tier != expected_review_tier:
-        errors.append("review_tier does not match self-review evidence")
     request = evidence.get("request")
     request_time: datetime | None = None
     if not isinstance(request, dict):
@@ -5484,7 +5481,6 @@ def _captain_codex_review_gate(
             if isinstance(expected_pr, int) and not isinstance(expected_pr, bool)
             else None
         ),
-        expected_review_tier=review_tier if isinstance(review_tier, str) else None,
     )
     errors.extend(
         _captain_evidence_digest_binding_errors(

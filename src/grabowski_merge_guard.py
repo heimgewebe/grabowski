@@ -1242,32 +1242,46 @@ class CaptainMergeGuardRunner:
                 else:
                     errors.append("merge_guard_codex_review_missing")
         elif mode == "reaction":
-            reactions = self._codex_api_json(
+            reaction_pages = self._codex_api_json(
                 [
                     "api",
-                    f"repos/{repository}/issues/comments/{request_comment_id}/reactions",
+                    "--paginate",
+                    "--slurp",
+                    (
+                        f"repos/{repository}/issues/comments/{request_comment_id}"
+                        "/reactions?per_page=100"
+                    ),
                 ],
                 label="reaction",
                 observations=observations,
                 errors=errors,
             )
+            reactions: list[dict[str, Any]] = []
+            if (
+                not isinstance(reaction_pages, list)
+                or any(not isinstance(page, list) for page in reaction_pages)
+            ):
+                errors.append("merge_guard_codex_reaction_pages_invalid")
+            elif len(reaction_pages) != 1:
+                errors.append("merge_guard_codex_reactions_truncated")
+            elif any(not isinstance(item, dict) for item in reaction_pages[0]):
+                errors.append("merge_guard_codex_reaction_item_invalid")
+            else:
+                reactions = [dict(item) for item in reaction_pages[0]]
             matching_reactions: list[dict[str, Any]] = []
-            if isinstance(reactions, list):
-                for reaction in reactions:
-                    if not isinstance(reaction, dict):
-                        continue
-                    actor = _github_actor(reaction.get("user"))
-                    created = _github_datetime(reaction.get("created_at"))
-                    if (
-                        actor in _CODEX_REVIEW_ACTORS
-                        and reaction.get("content") == "+1"
-                        and created is not None
-                        and request_time is not None
-                        and created >= request_time
-                    ):
-                        matching_reactions.append(
-                            {**reaction, "_actor": actor, "_created": created}
-                        )
+            for reaction in reactions:
+                actor = _github_actor(reaction.get("user"))
+                created = _github_datetime(reaction.get("created_at"))
+                if (
+                    actor in _CODEX_REVIEW_ACTORS
+                    and reaction.get("content") == "+1"
+                    and created is not None
+                    and request_time is not None
+                    and created >= request_time
+                ):
+                    matching_reactions.append(
+                        {**reaction, "_actor": actor, "_created": created}
+                    )
             expected_completion_time = _github_datetime(completion.get("submitted_at"))
             matching = [
                 item

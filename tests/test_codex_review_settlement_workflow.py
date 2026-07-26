@@ -45,6 +45,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
         self.assertNotIn("        if:", request_section)
         self.assertIn("tools/codex_review_settlement.py", request_section)
+        self.assertIn("--require", request_section)
         self.assertIn("request > codex-review-request.json", request_section)
 
     def test_status_is_diagnostic_and_exactly_named(self) -> None:
@@ -58,7 +59,11 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("description: Pull request number", self.text)
         self.assertIn('if [ "$EVENT_NAME" = "workflow_dispatch" ]', self.text)
         self.assertIn('pr="$INPUT_PR"', self.text)
-        self.assertIn("evaluate > codex-review-settlement.json", self.text)
+        evaluate_section = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        self.assertIn("--require", evaluate_section)
+        self.assertIn("evaluate > codex-review-settlement.json", evaluate_section)
 
 
 if __name__ == "__main__":
