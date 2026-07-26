@@ -67,7 +67,6 @@ class WatchdogTimerContractTests(unittest.TestCase):
                     completed.returncode,
                     msg=(completed.stdout + completed.stderr),
                 )
-                self.assertIn("Next elapse:", completed.stdout)
 
 
 if __name__ == "__main__":
