@@ -367,6 +367,56 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(result["status"], "recorded")
         self.assertEqual(request_path.stem, result["adapter_request_sha256"])
 
+    def test_candidate_record_carries_valid_refinement_binding(self) -> None:
+        request = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:refinement:2",
+            "title": "Refined candidate",
+            "source_kind": "conversation",
+            "desired_outcome": "Refine the existing candidate",
+            "supersedes_event_id": 31,
+        }
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={
+                "kind": "bureau_candidate_record_result",
+                "status": "recorded",
+            },
+        ) as invoke:
+            result = intake.grabowski_bureau_candidate_record(request)
+        request_path = Path(invoke.call_args.args[0][-1])
+        self.assertEqual(json.loads(request_path.read_text()), request)
+        self.assertEqual(result["status"], "recorded")
+        self.assertEqual(request_path.stem, result["adapter_request_sha256"])
+
+    def test_candidate_record_preserves_bureau_refinement_failure(self) -> None:
+        request = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:invalid-refinement",
+            "title": "Invalid refinement",
+            "source_kind": "conversation",
+            "desired_outcome": "Reject an invalid predecessor binding",
+            "supersedes_event_id": True,
+        }
+        failure = {
+            "schema_version": 1,
+            "kind": "bureau_operator_intake_failure",
+            "status": "failed",
+            "code": "supersedes-event-id-invalid",
+            "effect_started": False,
+            "retryable": False,
+            "ambiguity": False,
+            "required_readback": [],
+        }
+        with mock.patch.object(intake, "_invoke_bureau", return_value=failure) as invoke:
+            result = intake.grabowski_bureau_candidate_record(request)
+        request_path = Path(invoke.call_args.args[0][-1])
+        self.assertEqual(json.loads(request_path.read_text()), request)
+        self.assertEqual(result["code"], "supersedes-event-id-invalid")
+        self.assertFalse(result["effect_started"])
+        self.assertFalse(result["ambiguity"])
+
     def test_candidate_assess_requires_exactly_one_selector(self) -> None:
         with self.assertRaises(ValueError):
             intake.grabowski_bureau_candidate_assess()
