@@ -3389,6 +3389,17 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("blocked", output["status"])
         self.assertEqual("blocked", output["receipt_status"])
         self.assertEqual(["captain_preflight_does_not_execute; use captain-run for execution"], output["blocked_reasons"])
+        self.assertEqual(
+            [
+                {
+                    "code": "captain_preflight_does_not_execute",
+                    "message": "captain_preflight_does_not_execute; use captain-run for execution",
+                    "phase": "preflight",
+                    "severity": "error",
+                }
+            ],
+            output["errors"],
+        )
         self.assertEqual("blocked", result["receipt"]["status"])
         action = output["actions"][0]
         self.assertEqual("not-performed", action["execution"])
@@ -8958,4 +8969,34 @@ class CaptainTypedEnvelopeTests(unittest.TestCase):
         self.assertEqual(action["scope"], action["envelope"]["scope"])
         self.assertEqual("2026-07-26T00:00:00Z", action["envelope"]["created_at"])
         self.assertEqual(grips._captain_action_sha256(action), action["action_sha256"])
+
+
+
+class CaptainStructuredErrorTests(unittest.TestCase):
+    def test_error_records_are_stable_ordered_and_json_shaped(self) -> None:
+        records = grips._captain_error_records(
+            ["allow_execution_required", "base_sha does not match expected_base_sha"],
+            phase="preflight",
+        )
+        self.assertEqual(
+            ["allow_execution_required", "base_sha_does_not_match_expected_base_sha"],
+            [record["code"] for record in records],
+        )
+        self.assertEqual(["preflight", "preflight"], [record["phase"] for record in records])
+        self.assertTrue(all(record["severity"] == "error" for record in records))
+        self.assertEqual(
+            ["allow_execution_required", "base_sha does not match expected_base_sha"],
+            [record["message"] for record in records],
+        )
+
+    def test_gate_errors_are_the_source_of_compatibility_reasons(self) -> None:
+        gates = [
+            grips._captain_gate("status-projection-fresh", "blocked", "projection unavailable", ["fresh_status_projection_unavailable"]),
+            grips._captain_gate("scope-bound", "pass", "scope is valid"),
+        ]
+        errors = grips._captain_blocked_errors(gates)
+        self.assertEqual([record["message"] for record in errors], grips._captain_blocked_reasons(gates))
+        self.assertEqual("fresh_status_projection_unavailable", errors[0]["code"])
+        self.assertEqual("gate", errors[0]["phase"])
+        self.assertEqual({"gate_id": "status-projection-fresh"}, errors[0]["context"])
 

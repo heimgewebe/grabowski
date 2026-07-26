@@ -5392,17 +5392,64 @@ def _captain_authority_gates(
     return gates, projection_info
 
 
-def _captain_blocked_reasons(gates: list[dict[str, Any]]) -> list[str]:
-    blocked_reasons: list[str] = []
+@dataclass(frozen=True)
+class CaptainErrorRecord:
+    code: str
+    message: str
+    phase: str
+    severity: str = "error"
+    context: dict[str, Any] | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+            "phase": self.phase,
+            "severity": self.severity,
+        }
+        if self.context:
+            record["context"] = self.context
+        return record
+
+
+def _captain_error_code(message: str) -> str:
+    candidate = message.strip().split(";", 1)[0].split(":", 1)[0].strip()
+    normalized = re.sub(r"[^a-z0-9_]+", "_", candidate.lower()).strip("_")
+    return normalized or "captain_error"
+
+
+def _captain_error_records(
+    reasons: list[str],
+    *,
+    phase: str,
+    severity: str = "error",
+    context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    return [
+        CaptainErrorRecord(
+            code=_captain_error_code(str(reason)),
+            message=str(reason),
+            phase=phase,
+            severity=severity,
+            context=context,
+        ).to_json()
+        for reason in reasons
+    ]
+
+
+def _captain_blocked_errors(gates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
     for gate in gates:
         if gate["status"] == "pass":
             continue
         details = gate.get("details")
-        if isinstance(details, list) and details:
-            blocked_reasons.extend(str(entry) for entry in details)
-        else:
-            blocked_reasons.append(f"{gate['id']}: {gate['reason']}")
-    return blocked_reasons
+        reasons = [str(entry) for entry in details] if isinstance(details, list) and details else [f"{gate['id']}: {gate['reason']}"]
+        records.extend(_captain_error_records(reasons, phase="gate", context={"gate_id": str(gate["id"])}))
+    return records
+
+
+def _captain_blocked_reasons(gates: list[dict[str, Any]]) -> list[str]:
+    return [record["message"] for record in _captain_blocked_errors(gates)]
 
 
 def _captain_intent_canonical_hex_status(value: Any, *, length: int) -> str:
