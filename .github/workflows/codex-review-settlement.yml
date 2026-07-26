@@ -126,6 +126,19 @@ jobs:
             rc=$?
           fi
           set -e
+          if ! jq -e '
+            type == "object"
+            and (.status | type == "string")
+            and (.settled | type == "boolean")
+            and (.errors | type == "array")
+          ' codex-review-settlement.json > /dev/null 2>&1; then
+            jq -nc \
+              --arg error trusted_evaluator_output_invalid \
+              '{status:"block",settled:false,errors:[$error]}' \
+              > codex-review-settlement.invalid.json
+            mv codex-review-settlement.invalid.json codex-review-settlement.json
+            rc=2
+          fi
           cat codex-review-settlement.json
           status="$(jq -r '.status // "block"' codex-review-settlement.json)"
           if [ "$REQUEST_RETURN_CODE" != "0" ]; then
