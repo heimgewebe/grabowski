@@ -2595,6 +2595,10 @@
         "source": "src/grabowski_mcp.py"
       },
       {
+        "module": "grabowski_system_map",
+        "source": "src/grabowski_system_map.py"
+      },
+      {
         "module": "grabowski_client_snapshot",
         "source": "src/grabowski_client_snapshot.py"
       },
@@ -2900,7 +2904,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "abd9c5d99e083f11c51c443796b0169092312d734eea05db14a1888ce8f6dceb"
+      "sha256": "6f131762f6355d8b01f248612aeba5754f5df7a0aa9b3eb8314492434afd04cd"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2948,7 +2952,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "627924cae1c4b4c68c55f8e46f14b2105fda6818523b7923da325c1fc82cc67f",
+      "src/grabowski_mcp.py": "041dd0e7b8859db31baeff7b03572be7e1332fa4785e733f5b8bb5d327c1aa08",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "02678c8d02fb82abd918e7e65e113e4f0bf0252f2a79ee26be180f0dcbde5fe7",
       "src/grabowski_merge_guard.py": "a1c973d7cca930ac4c6ec56b0aaf4f2bc88f9c65f21ef9670e375f70be24be63",
@@ -2972,6 +2976,7 @@
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
+      "src/grabowski_system_map.py": "86eb6fe760aea800052d74b7c45ff3986adc130c6e3a78954cd65a472565a7de",
       "src/grabowski_task_attention.py": "fb7c62a50d6a1b0ec7eb33c9733121dc7024dc0a077ae8210aaaa4adf53cf81b",
       "src/grabowski_task_reconcile.py": "ae2c0ee8244fc574cfb645ad2902109d9061c6245cfc5448981eec1ddf09f789",
       "src/grabowski_tasks.py": "0d5836065dffc5bcb8a2579f78837390ba1e5b3f4319d96a2a65503a7ef95f32",
