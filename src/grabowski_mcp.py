@@ -7675,7 +7675,9 @@ def _repoground_query_snippets(
 
         resolved_ranges = _repoground_list_of_dicts(payload.get("resolved_ranges"))
         if resolved_ranges:
-            for ordinal, hit in enumerate(resolved_ranges[:max_snippets]):
+            for ordinal, hit in enumerate(resolved_ranges):
+                if len(snippets) >= max_snippets:
+                    break
                 text = _repoground_text_excerpt(hit.get("text_excerpt"))
                 if not text:
                     continue
@@ -8155,19 +8157,38 @@ def repoground_query(
             resolve_evidence=True,
             project_sources=True,
         )
-        route = "filtered_text_retrieval"
-        intent = {"kind": "filtered_text_retrieval"}
-        retrieval = {
-            "raw_query": query,
-            "fts_query": None,
-            "strategy": "exact_and_filtered",
-            "match_count": None,
-        }
-        budget = {
-            "max_context_tokens": max_context_tokens,
-            "approx_context_chars_used": 0,
-            "truncated": False,
-        }
+        filtered_available = repoground_result.get("status") == "available"
+        route = str(repoground_result.get("route") or "filtered_text_retrieval")
+        intent = (
+            repoground_result.get("intent")
+            if isinstance(repoground_result.get("intent"), dict)
+            else {"kind": route}
+        )
+        observed_retrieval = repoground_result.get("retrieval")
+        if isinstance(observed_retrieval, dict):
+            retrieval = dict(observed_retrieval)
+            retrieval.setdefault("raw_query", query)
+            retrieval.setdefault("fts_query", None)
+            retrieval.setdefault("match_count", None)
+            retrieval.setdefault(
+                "strategy", "exact_and_filtered" if filtered_available else "none"
+            )
+        else:
+            retrieval = {
+                "raw_query": query,
+                "fts_query": None,
+                "strategy": "exact_and_filtered" if filtered_available else "none",
+                "match_count": None,
+            }
+        budget = (
+            repoground_result.get("budget")
+            if isinstance(repoground_result.get("budget"), dict)
+            else {
+                "max_context_tokens": max_context_tokens,
+                "approx_context_chars_used": 0,
+                "truncated": False,
+            }
+        )
     else:
         repoground_result = _repoground_agent_query(
             manifest_path,
