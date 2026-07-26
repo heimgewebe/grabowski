@@ -1991,3 +1991,83 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CaptainAuditTrailTests(unittest.TestCase):
+    class Session:
+        pass
+
+    class RequestContext:
+        session = None
+
+    def setUp(self) -> None:
+        self.RequestContext.session = self.Session()
+
+    def test_audit_material_binds_target_and_context_without_exposing_context(self) -> None:
+        parameters = {
+            "actions": [
+                {
+                    "action": "pr-merge",
+                    "target": {
+                        "repository": "heimgewebe/grabowski",
+                        "pull_request": 468,
+                        "expected_head": "a" * 40,
+                        "base": "main",
+                    },
+                }
+            ],
+            "execution_intent": {"context": {"lease_owner_id": "operator:test", "secret": "do-not-log"}},
+        }
+        material = grabowski_mcp._captain_audit_action_material(parameters)
+        self.assertEqual("pr-merge", material["action"])
+        self.assertEqual("a" * 40, material["expected_head"])
+        self.assertEqual("main", material["expected_base"])
+        self.assertEqual(64, len(material["target_sha256"]))
+        self.assertEqual(64, len(material["context_sha256"]))
+        self.assertNotIn("do-not-log", json.dumps(material, sort_keys=True))
+
+    def test_verified_append_rejects_invalid_post_append_chain(self) -> None:
+        with (
+            patch.object(grabowski_mcp, "_append_audit") as append,
+            patch.object(grabowski_mcp, "_verify_audit_log", return_value={"valid": False, "last_record_sha256": None}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                grabowski_mcp._append_verified_captain_audit({"operation": "test"})
+        append.assert_called_once_with({"operation": "test"})
+
+    def test_intent_audit_failure_blocks_before_grip_dispatch(self) -> None:
+        parameters = {"actions": [], "session_escalation": {"target": {}, "reason": "test"}}
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(grabowski_mcp, "_session_grip_policy_decision", return_value={"allowed": True, "session_profile": {"profile": "test"}}),
+            patch.object(grabowski_mcp.grabowski_merge_guard, "issue_server_runtime_actor_identity", return_value={"identity": "server"}),
+            patch.object(grabowski_mcp, "_captain_audit_intent", side_effect=RuntimeError("audit unavailable")),
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run") as run,
+        ):
+            result = grabowski_mcp.grip_run(
+                "captain-run", parameters, profile="captain", allow_mutation=True, ctx=self.RequestContext()
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn("captain audit intent unavailable", result["output"]["error"])
+        run.assert_not_called()
+
+    def test_successful_dispatch_returns_intent_and_completion_audit_refs(self) -> None:
+        parameters = {"actions": [], "session_escalation": {"target": {}, "reason": "test"}}
+        grip_result = {"receipt": {"status": "blocked", "receipt_sha256": "c" * 64, "output_sha256": "d" * 64}, "output": {}}
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(grabowski_mcp, "_session_grip_policy_decision", return_value={"allowed": True, "session_profile": {"profile": "test"}}),
+            patch.object(grabowski_mcp.grabowski_merge_guard, "issue_server_runtime_actor_identity", return_value={"identity": "server"}),
+            patch.object(grabowski_mcp, "_captain_audit_intent", return_value={"audit_chain_valid": True, "audit_record_sha256": "a" * 64}),
+            patch.object(grabowski_mcp, "_captain_audit_completion", return_value={"audit_chain_valid": True, "audit_record_sha256": "b" * 64}) as completion,
+            patch.object(grabowski_mcp.grabowski_grips, "grip_run", return_value=grip_result),
+        ):
+            result = grabowski_mcp.grip_run(
+                "captain-run", parameters, profile="captain", allow_mutation=True, ctx=self.RequestContext()
+            )
+        self.assertEqual("complete", result["captain_audit"]["status"])
+        self.assertEqual("a" * 64, result["captain_audit"]["intent"]["audit_record_sha256"])
+        self.assertEqual("b" * 64, result["captain_audit"]["completion"]["audit_record_sha256"])
+        self.assertEqual("a" * 64, completion.call_args.kwargs["intent_audit_sha256"])
