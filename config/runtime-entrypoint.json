@@ -330,6 +330,10 @@
       "source": "src/grabowski_task_attention.py"
     },
     {
+      "module": "grabowski_terminal_convergence",
+      "source": "src/grabowski_terminal_convergence.py"
+    },
+    {
       "module": "grabowski_chronik",
       "source": "src/grabowski_chronik.py"
     },

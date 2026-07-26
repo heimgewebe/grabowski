@@ -15,6 +15,7 @@ from typing import Any, Iterator
 import grabowski_consumer_surface as consumer_surface
 import grabowski_private_io as private_io
 import grabowski_tasks as tasks
+import grabowski_terminal_convergence as terminal_convergence
 
 try:
     alert_outbox = importlib.import_module("grabowski_alert_outbox")
@@ -1702,18 +1703,22 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
     records from the operational attention projection. Missing, stale or invalid
     evidence therefore fails open into current attention rather than hiding work.
     """
-    current_by_task: dict[str, dict[str, Any]] = {}
+    validated_records: list[dict[str, Any]] = []
     for value in records:
         if not isinstance(value, dict):
             raise TaskAttentionInputError("current attention records must be objects")
         record = dict(value)
         if record.get("state") not in ATTENTION_STATES:
             raise TaskAttentionInputError("current attention record has a non-attention state")
-        binding = _task_binding(record)
-        task_id = binding["task_id"]
-        if task_id in current_by_task:
-            raise TaskAttentionIntegrityError("current attention projection contains duplicate task ids")
-        current_by_task[task_id] = record
+        _task_binding(record)
+        validated_records.append(record)
+    try:
+        convergence = terminal_convergence.converge_attention_records(validated_records)
+    except terminal_convergence.TerminalConvergenceError as exc:
+        raise TaskAttentionIntegrityError(str(exc)) from exc
+    current_by_task = {
+        str(record["task_id"]): record for record in convergence["current"]
+    }
 
     excluded_task_ids: set[str] = set()
     decision_classification_counts: dict[str, int] = {}
@@ -1758,17 +1763,30 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
         ],
         "excluded_task_ids": sorted(excluded_task_ids),
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
+        "attention_convergence_counts": convergence["classification_counts"],
+        "attention_converged_bindings": [
+            {
+                "task_id": item["task_id"],
+                "attempt": item["attempt"],
+                "lifecycle_receipt_sha256": item.get("lifecycle_receipt_sha256"),
+                "classification": item["convergence_classification"],
+            }
+            for item in convergence["historical"]
+        ],
     }
     return {
         "status": "verified",
         "evidence_error": None,
         "projection_sha256": _sha256_json(projection_material),
-        "raw_attention_count": raw_attention_count,
+        "raw_attention_count": convergence["raw_count"],
+        "deduplicated_attention_count": raw_attention_count,
         "current_attention_count": current_attention_count,
         "excluded_attention_count": len(excluded_task_ids),
         "excluded_classification_counts": excluded_counts,
         "decision_candidate_count": decision_candidate_count,
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
+        "attention_convergence_counts": convergence["classification_counts"],
+        "converged_attention_count": convergence["converged_count"],
         "excluded_task_ids": excluded_task_ids,
         "scope": "current_task_projection_after_valid_attention_decisions",
         "raw_scope": "current_task_projection_before_attention_decisions",
