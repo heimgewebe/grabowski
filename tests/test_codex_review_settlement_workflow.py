@@ -6,6 +6,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "codex-review-settlement.yml"
+REFRESH_WORKFLOW = (
+    ROOT / ".github" / "workflows" / "codex-review-settlement-refresh.yml"
+)
 
 
 class CodexReviewSettlementWorkflowTests(unittest.TestCase):
@@ -64,6 +67,48 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         )[1].split("      - name: Publish settlement status\n", 1)[0]
         self.assertIn("--require", evaluate_section)
         self.assertIn("evaluate > codex-review-settlement.json", evaluate_section)
+
+
+class CodexReviewSettlementRefreshWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = REFRESH_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_refresh_is_scheduled_and_manually_dispatchable(self) -> None:
+        self.assertIn("  schedule:\n", self.text)
+        self.assertIn('    - cron: "*/15 * * * *"\n', self.text)
+        self.assertIn("  workflow_dispatch:\n", self.text)
+
+    def test_refresh_permissions_only_allow_trusted_dispatch(self) -> None:
+        self.assertIn("  actions: write\n", self.text)
+        self.assertIn("  contents: read\n", self.text)
+        self.assertIn("  pull-requests: read\n", self.text)
+        self.assertNotIn("  contents: write\n", self.text)
+        self.assertNotIn("  issues: write\n", self.text)
+        self.assertNotIn("  statuses: write\n", self.text)
+
+    def test_refresh_does_not_checkout_or_execute_pull_request_code(self) -> None:
+        self.assertNotIn("actions/checkout", self.text)
+        self.assertNotIn("github.event.pull_request.head", self.text)
+        self.assertNotIn("tools/codex_review_settlement.py", self.text)
+
+    def test_refresh_bounds_open_pull_request_inventory(self) -> None:
+        self.assertIn("gh pr list", self.text)
+        self.assertIn("--state open", self.text)
+        self.assertIn("--limit 101", self.text)
+        self.assertIn('"${#pull_requests[@]}" -gt 100', self.text)
+        self.assertIn("refusing a truncated refresh", self.text)
+
+    def test_refresh_dispatches_default_branch_settlement_workflow(self) -> None:
+        self.assertIn(
+            "gh workflow run codex-review-settlement.yml", self.text
+        )
+        self.assertIn('--ref "$DEFAULT_BRANCH"', self.text)
+        self.assertIn('-f "pr=$pr"', self.text)
+        self.assertIn(
+            "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+            self.text,
+        )
 
 
 if __name__ == "__main__":
