@@ -694,23 +694,45 @@ def probe_component(
         if not tunnel_identity_ok(proc_root, pid, profile):
             reasons.append("tunnel-identity-mismatch")
         try:
-            if not get_probe(health_url, "live", http_timeout):
-                reasons.append("health-failed")
-            if not get_probe(ready_url, "ready", http_timeout):
-                reasons.append("readiness-failed")
+            live_ok = get_probe(health_url, "live", http_timeout)
+            ready_ok = get_probe(ready_url, "ready", http_timeout)
             poll_failure = control_plane_poll_probe(
                 metrics_url, http_timeout, control_plane_poll_max_age
             )
+            if not live_ok:
+                reasons.append("health-failed")
             if poll_failure in {
                 "control-plane-metrics-unavailable",
                 "control-plane-poll-missing",
                 "control-plane-poll-timestamp-invalid",
             } and not reasons:
+                indeterminate_reasons = []
+                if not ready_ok:
+                    indeterminate_reasons.append("readiness-failed")
+                indeterminate_reasons.append(poll_failure)
                 return ProbeResult(
-                    "indeterminate", (poll_failure,), pid, age, start_ticks
+                    "indeterminate",
+                    tuple(indeterminate_reasons),
+                    pid,
+                    age,
+                    start_ticks,
                 )
             if poll_failure is not None:
                 reasons.append(poll_failure)
+            if not ready_ok:
+                # Readiness may legitimately drop while the dispatcher applies
+                # backpressure. A live process with a fresh control-plane poll is
+                # degraded but not restartable: restarting it destroys in-flight
+                # work and can create a self-amplifying restart loop.
+                if not reasons:
+                    return ProbeResult(
+                        "indeterminate",
+                        ("readiness-failed",),
+                        pid,
+                        age,
+                        start_ticks,
+                    )
+                reasons.append("readiness-failed")
         except WatchdogError as exc:
             return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
     else:

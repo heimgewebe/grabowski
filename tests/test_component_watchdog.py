@@ -356,6 +356,80 @@ class ControlPlanePollProbeTests(unittest.TestCase):
                 self.assertEqual("indeterminate", result.status)
                 self.assertEqual((failure,), result.reasons)
 
+    def test_readiness_failure_with_live_and_fresh_poll_is_indeterminate(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "321",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+            patch.object(watchdog, "get_probe", side_effect=[True, False]),
+            patch.object(watchdog, "control_plane_poll_probe", return_value=None),
+        ):
+            result = watchdog.probe_component(
+                component="tunnel",
+                service="tunnel-client-grabowski.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url=watchdog.DEFAULT_HEALTH_URL,
+                ready_url=watchdog.DEFAULT_READY_URL,
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(("readiness-failed",), result.reasons)
+
+    def test_readiness_failure_with_stale_poll_remains_restartable(self) -> None:
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                return_value={
+                    "LoadState": "loaded",
+                    "ActiveState": "active",
+                    "SubState": "running",
+                    "MainPID": "321",
+                },
+            ),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+            patch.object(watchdog, "get_probe", side_effect=[True, False]),
+            patch.object(
+                watchdog,
+                "control_plane_poll_probe",
+                return_value="control-plane-poll-stale",
+            ),
+        ):
+            result = watchdog.probe_component(
+                component="tunnel",
+                service="tunnel-client-grabowski.service",
+                runtime_root=Path("/runtime"),
+                module="grabowski_operator",
+                profile="grabowski",
+                host="127.0.0.1",
+                port=18181,
+                health_url=watchdog.DEFAULT_HEALTH_URL,
+                ready_url=watchdog.DEFAULT_READY_URL,
+                startup_grace=20,
+                http_timeout=2,
+            )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(
+            ("control-plane-poll-stale", "readiness-failed"), result.reasons
+        )
+
     def test_stale_poll_is_unhealthy_and_enters_restart_path(self) -> None:
         with (
             patch.object(
