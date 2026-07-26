@@ -3525,8 +3525,11 @@ def _reconcile_unknown_host(record: dict[str, Any], exc: ValueError) -> dict[str
         "reason_class": "host_retired_or_unregistered",
         "retryable": False,
         "automatic_resume_allowed": False,
-        "owner_decision_required": not _is_terminal_state(current_state),
-        "terminal_evidence_required": not _is_terminal_state(current_state),
+        # This path is reached only when no reusable terminal evidence exists.
+        # A retired host cannot provide a fresh observation, so the record must
+        # remain explicitly blocked until an owner supplies bounded closeout evidence.
+        "owner_decision_required": True,
+        "terminal_evidence_required": True,
     }
 
 

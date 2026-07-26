@@ -2172,6 +2172,28 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual([item["task_id"] for item in result["refreshed"]], [healthy["task_id"]])
 
+    def test_reconcile_retired_host_terminal_without_evidence_stays_blocked(self) -> None:
+        retired = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET host='heimserver', state='failed' WHERE task_id=?",
+                (retired["task_id"],),
+            )
+            connection.commit()
+
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            side_effect=ValueError("Unknown fleet host: heimserver"),
+        ):
+            result = tasks.reconcile_tasks_refresh()
+
+        self.assertEqual(result["scanned"], 1)
+        self.assertEqual(result["refreshed"], [])
+        self.assertEqual(result["blocked"][0]["task_id"], retired["task_id"])
+        self.assertTrue(result["blocked"][0]["owner_decision_required"])
+        self.assertTrue(result["blocked"][0]["terminal_evidence_required"])
+
     def test_reconcile_skips_fully_converged_terminal_tasks(self) -> None:
         started = self._start()["task"]
         tasks._set_state(
