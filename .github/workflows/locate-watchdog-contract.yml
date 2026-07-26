@@ -21,6 +21,7 @@ jobs:
           import base64
           import json
           import os
+          import urllib.parse
           import urllib.request
 
           token = os.environ["GH_TOKEN"]
@@ -37,29 +38,26 @@ jobs:
               with urllib.request.urlopen(request, timeout=20) as response:
                   return json.load(response)
 
-          tree = get(
-              f"https://api.github.com/repos/{repository}/git/trees/{revision}?recursive=1"
+          query = urllib.parse.quote(
+              f'DurableSystemdContractTests repo:{repository}'
           )
-          needles = (
-              "class DurableSystemdContractTests",
-              "test_watchdog_cadence_matches_probe_cost",
-          )
+          result = get(f"https://api.github.com/search/code?q={query}&per_page=20")
+          items = result.get("items", [])
+          if not items:
+              raise SystemExit("contract not found")
           matches = 0
-          for item in tree.get("tree", []):
-              path = item.get("path", "")
-              if (
-                  item.get("type") != "blob"
-                  or not path.startswith("tests/")
-                  or not path.endswith(".py")
-              ):
-                  continue
-              blob = get(item["url"])
-              if blob.get("encoding") != "base64":
-                  continue
-              text = base64.b64decode(blob["content"]).decode("utf-8")
+          for item in items:
+              path = item["path"]
+              content = get(
+                  f"https://api.github.com/repos/{repository}/contents/{path}?ref={revision}"
+              )
+              text = base64.b64decode(content["content"]).decode("utf-8")
               lines = text.splitlines()
               for index, line in enumerate(lines):
-                  if not any(needle in line for needle in needles):
+                  if (
+                      "class DurableSystemdContractTests" not in line
+                      and "test_watchdog_cadence_matches_probe_cost" not in line
+                  ):
                       continue
                   matches += 1
                   start = max(0, index - 8)
@@ -68,5 +66,5 @@ jobs:
                   for number in range(start, end):
                       print(f"{number + 1:04d}: {lines[number]}")
           if matches == 0:
-              raise SystemExit("contract not found")
+              raise SystemExit("contract declarations not found")
           PY
