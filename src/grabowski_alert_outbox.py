@@ -50,6 +50,10 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 FIELD_VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._:=@/+\-\[\]]{0,159}\Z")
 ALERT_FILE_RE = re.compile(r"(?P<alert_id>[0-9a-f]{32})\.json\Z")
 ACK_FILE_RE = re.compile(r"(?P<alert_id>[0-9a-f]{32})\.ack\.json\Z")
+PRIVATE_IO_TEMP_RE = re.compile(
+    r"\.(?:[0-9a-f]{32}\.json|[0-9a-f]{32}\.ack\.json)"
+    r"\.[1-9][0-9]*\.[0-9a-f]{32}\.tmp\Z"
+)
 SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)"
     r"\s*[:=]\s*[^\s,;]+"
@@ -236,7 +240,10 @@ def _validate_alert(value: dict[str, Any]) -> dict[str, Any]:
         raise AlertOutboxIntegrityError("alert receipt fields are invalid")
     if value["schema_version"] != SCHEMA_VERSION or value["kind"] != ALERT_KIND:
         raise AlertOutboxIntegrityError("alert receipt schema is invalid")
-    if not isinstance(value["alert_id"], str) or ID_RE.fullmatch(value["alert_id"]) is None:
+    if (
+        not isinstance(value["alert_id"], str)
+        or ID_RE.fullmatch(value["alert_id"]) is None
+    ):
         raise AlertOutboxIntegrityError("alert id is invalid")
     if (
         not isinstance(value["correlation_id"], str)
@@ -317,7 +324,11 @@ def _validate_ack(
     ):
         raise AlertOutboxIntegrityError("alert acknowledgement binding is invalid")
     status = value["http_status"]
-    if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status < 300:
+    if (
+        isinstance(status, bool)
+        or not isinstance(status, int)
+        or not 200 <= status < 300
+    ):
         raise AlertOutboxIntegrityError("alert acknowledgement HTTP status is invalid")
     _validate_timestamp(value["acknowledged_at"], label="alert acknowledged_at")
     payload = {key: item for key, item in value.items() if key != "ack_sha256"}
@@ -407,7 +418,10 @@ def acknowledge_alert(
 ) -> dict[str, Any]:
     if not isinstance(alert_id, str) or ID_RE.fullmatch(alert_id) is None:
         raise AlertOutboxInputError("alert_id is invalid")
-    if not isinstance(receipt_sha256, str) or SHA256_RE.fullmatch(receipt_sha256) is None:
+    if (
+        not isinstance(receipt_sha256, str)
+        or SHA256_RE.fullmatch(receipt_sha256) is None
+    ):
         raise AlertOutboxInputError("receipt_sha256 is invalid")
     if (
         isinstance(http_status, bool)
@@ -494,6 +508,12 @@ def list_alerts(*, state: str = "queued", limit: int = 50) -> dict[str, Any]:
         if match is None:
             ack_match = ACK_FILE_RE.fullmatch(path.name)
             if ack_match is None:
+                # The create-only private-I/O primitive publishes through a
+                # short-lived, exact-format temporary file in this directory.
+                # A concurrent producer must not make a valid queue appear
+                # corrupt while that file is being fsynced and linked.
+                if PRIVATE_IO_TEMP_RE.fullmatch(path.name) is not None:
+                    continue
                 invalid.append({"name": path.name, "error": "unexpected_entry"})
             elif ack_match.group("alert_id") not in alert_ids:
                 invalid.append({"name": path.name, "error": "orphan_acknowledgement"})

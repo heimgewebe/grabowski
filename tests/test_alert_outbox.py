@@ -149,7 +149,9 @@ class AlertOutboxTests(unittest.TestCase):
         listed = outbox.list_alerts(state="queued")
 
         self.assertEqual([], listed["alerts"])
-        self.assertEqual("AlertOutboxIntegrityError", listed["invalid_receipts"][0]["error"])
+        self.assertEqual(
+            "AlertOutboxIntegrityError", listed["invalid_receipts"][0]["error"]
+        )
 
     def test_limit_does_not_hide_invalid_or_orphan_receipts(self) -> None:
         self._enqueue(deduplication_key="first")
@@ -169,7 +171,25 @@ class AlertOutboxTests(unittest.TestCase):
             {item["error"] for item in listed["invalid_receipts"]},
         )
 
-    def test_dispatch_scheduling_uses_existing_entrypoint_and_is_fail_soft(self) -> None:
+    def test_private_io_temporary_entry_does_not_block_queue_scan(self) -> None:
+        queued = self._enqueue()
+        alert = queued["alert"]
+        temporary = self.root / (
+            f".{alert['alert_id']}.json.{os.getpid()}.{'a' * 32}.tmp"
+        )
+        temporary.write_text("partial", encoding="utf-8")
+        os.chmod(temporary, 0o600)
+
+        listed = outbox.list_alerts(state="queued")
+
+        self.assertEqual([], listed["invalid_receipts"])
+        self.assertEqual(
+            [alert["alert_id"]], [row["alert_id"] for row in listed["alerts"]]
+        )
+
+    def test_dispatch_scheduling_uses_existing_entrypoint_and_is_fail_soft(
+        self,
+    ) -> None:
         completed = Mock(returncode=0)
         with patch.object(outbox.subprocess, "run", return_value=completed) as run:
             self.assertTrue(outbox.schedule_dispatch("a" * 32))
@@ -195,11 +215,14 @@ class AlertDispatchTests(unittest.TestCase):
             "alert_id": "a" * 32,
             "receipt_sha256": "b" * 64,
         }
-        with patch.object(
-            ntfy.alert_outbox,
-            "list_alerts",
-            return_value={"alerts": [row], "invalid_receipts": []},
-        ), patch.object(ntfy.alert_outbox, "acknowledge_alert") as acknowledge:
+        with (
+            patch.object(
+                ntfy.alert_outbox,
+                "list_alerts",
+                return_value={"alerts": [row], "invalid_receipts": []},
+            ),
+            patch.object(ntfy.alert_outbox, "acknowledge_alert") as acknowledge,
+        ):
             failed = ntfy.dispatch_alerts(
                 topic="x" * 32,
                 publisher=lambda _topic, _row: 503,
@@ -214,15 +237,46 @@ class AlertDispatchTests(unittest.TestCase):
         self.assertEqual("ok", delivered["status"])
         acknowledge.assert_called_once_with("a" * 32, "b" * 64, 201)
 
+    def test_acknowledgement_failure_is_structured_and_retryable(self) -> None:
+        row = {
+            "alert_id": "a" * 32,
+            "receipt_sha256": "b" * 64,
+        }
+        with (
+            patch.object(
+                ntfy.alert_outbox,
+                "list_alerts",
+                return_value={"alerts": [row], "invalid_receipts": []},
+            ),
+            patch.object(
+                ntfy.alert_outbox,
+                "acknowledge_alert",
+                side_effect=RuntimeError("ack write failed"),
+            ),
+        ):
+            result = ntfy.dispatch_alerts(
+                topic="x" * 32,
+                publisher=lambda _topic, _row: 201,
+            )
+
+        self.assertEqual("delivery_failed", result["status"])
+        self.assertEqual(0, result["delivered"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("acknowledgement", result["phase"])
+        self.assertEqual("RuntimeError", result["error_type"])
+
     def test_invalid_alert_receipt_blocks_dispatch(self) -> None:
-        with patch.object(
-            ntfy.alert_outbox,
-            "list_alerts",
-            return_value={
-                "alerts": [],
-                "invalid_receipts": [{"name": "bad", "error": "invalid"}],
-            },
-        ), patch.object(ntfy.alert_outbox, "acknowledge_alert") as acknowledge:
+        with (
+            patch.object(
+                ntfy.alert_outbox,
+                "list_alerts",
+                return_value={
+                    "alerts": [],
+                    "invalid_receipts": [{"name": "bad", "error": "invalid"}],
+                },
+            ),
+            patch.object(ntfy.alert_outbox, "acknowledge_alert") as acknowledge,
+        ):
             result = ntfy.dispatch_alerts(
                 topic="x" * 32,
                 publisher=Mock(return_value=200),

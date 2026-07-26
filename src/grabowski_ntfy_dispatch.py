@@ -312,7 +312,19 @@ def dispatch_alerts(
             failures.append({"alert_id": alert_id, "http_status": status})
             continue
 
-        alert_outbox.acknowledge_alert(alert_id, receipt_sha256, status)
+        try:
+            alert_outbox.acknowledge_alert(alert_id, receipt_sha256, status)
+        except Exception as exc:
+            # HTTP acceptance without a durable append-only acknowledgement
+            # must remain retryable and must not crash the shared dispatcher.
+            failures.append(
+                {
+                    "alert_id": alert_id,
+                    "phase": "acknowledgement",
+                    "error_type": type(exc).__name__,
+                }
+            )
+            continue
         delivered += 1
 
     if failures:
