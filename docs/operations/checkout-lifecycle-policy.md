@@ -29,12 +29,12 @@ Expiry alone does not stop a row from counting. It stops counting only after the
 
 Closing an Agent Workspace records the final writer head and transitions its managed checkout from `active` to `completed_retained`. Cleanup remains a separate explicit operation.
 
-Cleanup is two-stage, but no longer time-delayed:
+Cleanup is two-stage and uses two explicit top-level attempts, but is no longer time-delayed:
 
-1. create a durable recovery archive and retain the linked checkout;
-2. immediately create a fresh exact cleanup plan and, only if all blockers remain clear, apply it.
+1. create a durable recovery archive, retain the linked checkout and return `archived_ready_for_cleanup`;
+2. immediately create a fresh exact cleanup plan and, in a separate invocation, apply it only if all blockers remain clear.
 
-A matching fresh archive is reported as `cleanup_candidate` unless active coordination blocks it. Recovery paths and direct callers still cannot bypass the archive, exact checkout identity, clean-state, owner, recovery-ref, coordination, dry-run and plan-hash checks.
+A matching fresh archive is reported as `cleanup_candidate` unless active coordination blocks it. The archive and destructive removal are never performed in the same top-level attempt. Recovery paths and direct callers still cannot bypass the archive, exact checkout identity, clean-state, owner, recovery-ref, coordination, dry-run and plan-hash checks.
 
 Cleanup-plan schema 2 keeps `archive_age_seconds` visible as a compatibility observation but does not treat the continuously changing age as authorization material. `archive_grace_seconds` remains present with value `0`, and `archive_grace_elapsed` remains `true`, so existing consumers can migrate without a schema break. The plan hash binds the immutable `archive_created_at_unix`, the declared exclusion list and every other plan field, including checkout identity, archive, recovery refs, retention, coordination blockers, command and rollback data. Any change outside the single declared observational age field invalidates the dry-run. Schema-1 dry-runs are intentionally stale after the upgrade and must be recreated.
 

@@ -9372,7 +9372,11 @@ def grabowski_agent_workspace_cleanup(
             reusable_archive_id = None
             if (
                 isinstance(prior_intent, dict)
-                and prior_intent.get("state") in {"failed", "waiting_grace"}
+                and prior_intent.get("state") in {
+                    "failed",
+                    "waiting_grace",
+                    "archived_ready",
+                }
                 and prior_intent.get("writer_worktree") == plan["writer_worktree"]
                 and prior_intent.get("writer_branch") == plan["checkout"]["branch"]
                 and prior_intent.get("writer_head") == plan["checkout"]["head"]
@@ -9473,6 +9477,7 @@ def grabowski_agent_workspace_cleanup(
         }
 
     archive_id = reusable_archive_id
+    archive_attempted_this_invocation = archive_id is None
     effect_mutation_ambiguous = False
     try:
         with _lock(identifier):
@@ -9727,6 +9732,56 @@ def grabowski_agent_workspace_cleanup(
                 _workspace_lifecycle_effect_release(archive_effect)
 
         archive_record = checkouts._load_archive(str(archive_id))
+        if archive_attempted_this_invocation:
+            with _lock(identifier):
+                current_manifest = _manifest(identifier)
+                current_intent = current_manifest.get("workspace_cleanup_intent")
+                if (
+                    not isinstance(current_intent, dict)
+                    or current_intent.get("intent_id") != intent["intent_id"]
+                ):
+                    raise AgentWorkspaceActionError(
+                        "workspace cleanup intent changed after archive completion"
+                    )
+                current_intent.update(
+                    {
+                        "state": "archived_ready",
+                        "archive_id": archive_id,
+                        "archive_created_at_unix": archive_record["created_at_unix"],
+                        "cleanup_available_at_unix": archive_record["created_at_unix"],
+                        "updated_at": _utc(),
+                    }
+                )
+                current_manifest["workspace_cleanup_intent"] = current_intent
+                _append_workspace_event(
+                    current_manifest,
+                    "workspace_cleanup_archive_ready",
+                    outcome="ready",
+                    evidence={
+                        "intent_id": intent["intent_id"],
+                        "archive_id": archive_id,
+                        "archive_created_at_unix": archive_record["created_at_unix"],
+                        "cleanup_available_at_unix": archive_record["created_at_unix"],
+                        "requires_fresh_cleanup_plan": True,
+                        "workspace_archive_effect_receipt_sha256": (
+                            archive_effect_reference.get("receipt_sha256")
+                            if isinstance(archive_effect_reference, dict)
+                            else None
+                        ),
+                    },
+                )
+                _write_manifest(current_manifest)
+            return {
+                "workspace_id": identifier,
+                "state": "archived_ready_for_cleanup",
+                "idempotent": False,
+                "archive_id": archive_id,
+                "archive_created_at_unix": archive_record["created_at_unix"],
+                "cleanup_available_at_unix": archive_record["created_at_unix"],
+                "requires_fresh_cleanup_plan": True,
+                "worktree_preserved": True,
+                "lifecycle_effect": archive_effect_reference,
+            }
 
         dry_run = checkouts.grabowski_checkout_cleanup(
             repo=plan["repository"],

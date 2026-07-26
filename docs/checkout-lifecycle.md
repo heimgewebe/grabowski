@@ -63,6 +63,8 @@ Die Phasen werden read-only wie folgt projiziert:
   archivierungspflichtig sichtbar.
 - `archived` gelangt mit passendem offenem Recovery-Archiv unmittelbar in
   `archived_blocked` oder `cleanup_candidate`; eine zeitbasierte Grace existiert nicht.
+- Agent-Workspace-Cleanup archiviert und entfernt nie im selben Top-Level-Aufruf:
+  Nach `archived_ready_for_cleanup` folgt ohne Wartezeit ein frischer Plan und ein zweiter Aufruf.
 - Unbekannte Phase oder widersprüchliche Path-, Repository-, Branch-, Owner-,
   Head-, Retention- oder Archivdaten werden `managed_lifecycle_drift`.
 
