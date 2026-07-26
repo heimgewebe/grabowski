@@ -597,29 +597,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertTrue(linked["lifecycle_decision"]["retention_active"])
         self.assertFalse(linked["cleanup_candidate"])
 
-    def test_inventory_waits_for_archive_grace_before_cleanup_candidate(self) -> None:
+    def test_inventory_marks_fresh_archive_as_cleanup_candidate(self) -> None:
         archive_result = self._archive(aged=False)
-        inventory = checkouts.checkout_inventory(
-            self.repo,
-            include_processes=False,
-            include_tasks=False,
-            include_resources=False,
-        )
-        linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
-        self.assertEqual(linked["lifecycle_state"], "archived_grace")
-        self.assertFalse(linked["cleanup_candidate"])
-        self.assertFalse(linked["lifecycle_decision"]["archive_grace_elapsed"])
-        archive = archive_result["archive"]
-        assert isinstance(archive, dict)
-        with checkouts._database() as connection:
-            connection.execute(
-                "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
-                (
-                    int(time.time()) - checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-                    archive["archive_id"],
-                ),
-            )
-            connection.commit()
         inventory = checkouts.checkout_inventory(
             self.repo,
             include_processes=False,
@@ -630,19 +609,30 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(linked["lifecycle_state"], "cleanup_candidate")
         self.assertEqual(linked["hygiene_mark"], "obsolete")
         self.assertTrue(linked["cleanup_candidate"])
-        self.assertTrue(linked["lifecycle_decision"]["requires_cleanup_dry_run"])
+        decision = linked["lifecycle_decision"]
+        self.assertEqual(decision["archive_grace_seconds"], 0)
+        self.assertTrue(decision["archive_grace_elapsed"])
+        self.assertTrue(decision["requires_cleanup_dry_run"])
+        self.assertEqual(
+            linked["lifecycle"]["latest_archive"]["archive_id"],
+            archive_result["archive"]["archive_id"],
+        )
 
-    def test_cleanup_dry_run_rejects_fresh_archive(self) -> None:
+    def test_cleanup_dry_run_accepts_fresh_archive(self) -> None:
         archive = self._archive(aged=False)["archive"]
         assert isinstance(archive, dict)
-        with self.assertRaisesRegex(RuntimeError, "grace has not elapsed"):
-            checkouts.grabowski_checkout_cleanup(
-                str(self.repo),
-                str(self.checkout),
-                "owner-a",
-                dry_run=True,
-                archive_id=str(archive["archive_id"]),
-            )
+        dry_run = checkouts.grabowski_checkout_cleanup(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            dry_run=True,
+            archive_id=str(archive["archive_id"]),
+            expected_head=self.head,
+            expected_branch="topic",
+        )
+        self.assertTrue(dry_run["plan"]["safe_to_apply"])
+        self.assertEqual(dry_run["plan"]["archive_grace_seconds"], 0)
+        self.assertGreaterEqual(dry_run["plan"]["archive_age_seconds"], 0)
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         archive = self._archive()["archive"]
@@ -722,8 +712,8 @@ class CheckoutLifecycleTests(unittest.TestCase):
             dry_run["plan"]["plan_hash_excludes"],
             ["archive_age_seconds"],
         )
-        self.assertEqual(dry_run["plan"]["archive_age_seconds"], 86_500)
-        self.assertEqual(applied["plan"]["archive_age_seconds"], 86_501)
+        self.assertEqual(dry_run["plan"]["archive_age_seconds"], 100)
+        self.assertEqual(applied["plan"]["archive_age_seconds"], 101)
         self.assertEqual(
             dry_run["plan"]["plan_sha256"],
             applied["plan"]["plan_sha256"],
@@ -1131,7 +1121,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         self.assertFalse(linked["cleanup_candidate"])
 
-    def test_matching_archived_binding_preserves_existing_grace_contract(self) -> None:
+    def test_matching_archived_binding_is_immediately_cleanup_candidate(self) -> None:
         self._managed_binding()
         self._archive(aged=False)
         inventory = checkouts.checkout_inventory(
@@ -1142,10 +1132,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
         decision = linked["lifecycle_decision"]
-        self.assertEqual(linked["lifecycle_state"], "archived_grace")
+        self.assertEqual(linked["lifecycle_state"], "cleanup_candidate")
         self.assertEqual(decision["binding_phase"], "archived")
         self.assertTrue(decision["binding_consistent"])
-        self.assertFalse(linked["cleanup_candidate"])
+        self.assertTrue(decision["archive_grace_elapsed"])
+        self.assertEqual(decision["archive_grace_seconds"], 0)
+        self.assertTrue(linked["cleanup_candidate"])
 
     def test_unknown_managed_phase_is_lifecycle_drift(self) -> None:
         binding = self._managed_binding()
