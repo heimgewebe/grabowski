@@ -9727,62 +9727,6 @@ def grabowski_agent_workspace_cleanup(
                 _workspace_lifecycle_effect_release(archive_effect)
 
         archive_record = checkouts._load_archive(str(archive_id))
-        archive_age_seconds = max(
-            0, _now() - int(archive_record["created_at_unix"])
-        )
-        if archive_age_seconds < checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS:
-            with _lock(identifier):
-                current_manifest = _manifest(identifier)
-                current_intent = current_manifest.get("workspace_cleanup_intent")
-                if (
-                    not isinstance(current_intent, dict)
-                    or current_intent.get("intent_id") != intent["intent_id"]
-                ):
-                    raise AgentWorkspaceActionError(
-                        "workspace cleanup intent changed during archive grace"
-                    )
-                current_intent.update(
-                    {
-                        "state": "waiting_grace",
-                        "archive_id": archive_id,
-                        "archive_created_at_unix": archive_record["created_at_unix"],
-                        "archive_age_seconds": archive_age_seconds,
-                        "archive_grace_seconds": (
-                            checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-                        ),
-                        "updated_at": _utc(),
-                    }
-                )
-                current_manifest["workspace_cleanup_intent"] = current_intent
-                _append_workspace_event(
-                    current_manifest,
-                    "workspace_cleanup_archive_grace",
-                    outcome="waiting",
-                    evidence={
-                        "intent_id": intent["intent_id"],
-                        "archive_id": archive_id,
-                        "archive_age_seconds": archive_age_seconds,
-                        "archive_grace_seconds": (
-                            checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-                        ),
-                        "workspace_archive_effect_receipt_sha256": (
-                            archive_effect_reference.get("receipt_sha256")
-                            if isinstance(archive_effect_reference, dict)
-                            else None
-                        ),
-                    },
-                )
-                _write_manifest(current_manifest)
-            return {
-                "workspace_id": identifier,
-                "state": "archived_waiting_grace",
-                "idempotent": False,
-                "archive_id": archive_id,
-                "archive_age_seconds": archive_age_seconds,
-                "archive_grace_seconds": checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-                "worktree_preserved": True,
-                "lifecycle_effect": archive_effect_reference,
-            }
 
         dry_run = checkouts.grabowski_checkout_cleanup(
             repo=plan["repository"],

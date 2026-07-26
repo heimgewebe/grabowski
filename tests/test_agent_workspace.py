@@ -5263,36 +5263,14 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
             plan = report["plans"][0]
             self.assertTrue(plan["eligible"])
-            waiting = workspace.grabowski_agent_workspace_cleanup(
+            result = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
                 plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
-            self.assertEqual(waiting["state"], "archived_waiting_grace")
-            self.assertTrue(self.git.writer.exists())
-            with workspace.checkouts._database() as connection:
-                connection.execute(
-                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
-                    (
-                        int(time.time())
-                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-                        waiting["archive_id"],
-                    ),
-                )
-                connection.commit()
-            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
-                [manifest["workspace_id"]]
-            )["plans"][0]
-            self.assertTrue(refreshed["eligible"])
-            self.assertNotEqual(refreshed["plan_sha256"], plan["plan_sha256"])
-            result = workspace.grabowski_agent_workspace_cleanup(
-                manifest["workspace_id"],
-                refreshed["plan_sha256"],
-                "archive-and-remove-worktree",
-            )
             replay = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
-                refreshed["plan_sha256"],
+                plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
         self.assertEqual(result["state"], "cleaned")
@@ -5376,22 +5354,22 @@ class AgentWorkspaceTests(unittest.TestCase):
                 )
 
             self.assertEqual(archive_calls, 1)
-            self.assertEqual(result["state"], "archived_waiting_grace")
-            self.assertTrue(self.git.writer.exists())
-            effect = result["lifecycle_effect"]
+            self.assertEqual(result["state"], "cleaned")
+            self.assertFalse(self.git.writer.exists())
+            effect = result["lifecycle_effects"]["workspace_archive"]
             self.assertEqual(effect["status"], "succeeded")
             self.assertTrue(effect["execution_id"].endswith(":reconcile"))
             self.assertEqual(effect["supersedes"]["status"], "recovery_required")
             self.assertFalse(effect["supersedes"]["blind_retry_allowed"])
             self.assertTrue(Path(effect["supersedes"]["receipt_path"]).is_file())
             persisted = workspace._manifest(manifest["workspace_id"])
-            intent = persisted["workspace_cleanup_intent"]
-            self.assertEqual(intent["state"], "waiting_grace")
+            self.assertNotIn("workspace_cleanup_intent", persisted)
+            receipt = persisted["workspace_cleanup_receipt"]
             self.assertEqual(
-                intent["lifecycle_effects"]["workspace_archive"]["receipt_sha256"],
+                receipt["lifecycle_effects"]["workspace_archive"]["receipt_sha256"],
                 effect["receipt_sha256"],
             )
-            self.assertEqual(intent["archive_id"], result["archive_id"])
+            self.assertEqual(receipt["archive_id"], result["archive"]["archive_id"])
 
     def test_cleanup_retention_unknown_requires_recovery_and_blocks_blind_retry(self) -> None:
         manifest = self._closed_cleanup_manifest()
@@ -5415,25 +5393,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
-            waiting = workspace.grabowski_agent_workspace_cleanup(
-                manifest["workspace_id"],
-                plan["plan_sha256"],
-                "archive-and-remove-worktree",
-            )
-            with workspace.checkouts._database() as connection:
-                connection.execute(
-                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
-                    (
-                        int(time.time())
-                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-                        waiting["archive_id"],
-                    ),
-                )
-                connection.commit()
-            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
-                [manifest["workspace_id"]]
-            )["plans"][0]
-
             def fail_apply(*args, **kwargs):
                 if kwargs.get("dry_run") is True:
                     return original_cleanup(*args, **kwargs)
@@ -5449,7 +5408,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 ):
                     workspace.grabowski_agent_workspace_cleanup(
                         manifest["workspace_id"],
-                        refreshed["plan_sha256"],
+                        plan["plan_sha256"],
                         "archive-and-remove-worktree",
                     )
 
@@ -5501,25 +5460,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
-            waiting = workspace.grabowski_agent_workspace_cleanup(
-                manifest["workspace_id"],
-                plan["plan_sha256"],
-                "archive-and-remove-worktree",
-            )
-            with workspace.checkouts._database() as connection:
-                connection.execute(
-                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
-                    (
-                        int(time.time())
-                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-                        waiting["archive_id"],
-                    ),
-                )
-                connection.commit()
-            refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
-                [manifest["workspace_id"]]
-            )["plans"][0]
-
             def apply_then_raise(*args, **kwargs):
                 result = original_cleanup(*args, **kwargs)
                 if kwargs.get("dry_run") is False:
@@ -5536,7 +5476,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 ):
                     workspace.grabowski_agent_workspace_cleanup(
                         manifest["workspace_id"],
-                        refreshed["plan_sha256"],
+                        plan["plan_sha256"],
                         "archive-and-remove-worktree",
                     )
             self.assertFalse(self.git.writer.exists())
@@ -5552,7 +5492,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             ) as cleanup:
                 reconciled = workspace.grabowski_agent_workspace_cleanup(
                     manifest["workspace_id"],
-                    refreshed["plan_sha256"],
+                    plan["plan_sha256"],
                     "archive-and-remove-worktree",
                 )
             cleanup.assert_not_called()
