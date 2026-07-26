@@ -1,6 +1,7 @@
 name: diagnose-watchdog-pr
 
 on:
+  pull_request:
   push:
     branches:
       - fix/watchdog-poll-recovery-v1
