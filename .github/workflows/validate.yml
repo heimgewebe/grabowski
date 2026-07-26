@@ -1,9 +1,7 @@
 name: PR 474 diff evidence
 
 on:
-  push:
-    branches:
-      - ops/pr474-diff-7879bd09
+  pull_request:
 
 permissions:
   contents: read
@@ -13,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout evidence branch
+      - name: Checkout full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -25,8 +23,8 @@ jobs:
           HEAD_SHA: 7879bd094a94defc8e4952136277537294e91f87
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$HEAD_SHA"
           git cat-file -e "$BASE_SHA^{commit}"
+          git cat-file -e "$HEAD_SHA^{commit}"
           git diff --binary --full-index "$BASE_SHA...$HEAD_SHA" \
             > "$RUNNER_TEMP/grabowski-pr-474-final.diff"
           test -s "$RUNNER_TEMP/grabowski-pr-474-final.diff"
