@@ -4560,9 +4560,103 @@ def _captain_attach_action_digests(actions: list[dict[str, Any]]) -> list[dict[s
     return actions
 
 
+@dataclass(frozen=True)
+class CaptainActionEnvelope:
+    index: int
+    action: str
+    target: dict[str, Any]
+    scope: dict[str, Any]
+    risk: dict[str, Any]
+    target_change_required: bool
+    target_change: dict[str, Any] | None
+    irreversibility_record: dict[str, Any] | None
+    receipt_path: str
+    evidence_schema: dict[str, Any]
+    target_findings: tuple[str, ...] = ()
+    scope_findings: tuple[str, ...] = ()
+    risk_findings: tuple[str, ...] = ()
+    target_change_findings: tuple[str, ...] = ()
+    created_at: str = ""
+
+    def digest_material(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "index": self.index,
+            "role": "captain",
+            "action": self.action,
+            "high_impact": True,
+            "target": self.target,
+            "scope": self.scope,
+            "target_change_required": self.target_change_required,
+            "target_change": self.target_change,
+            "risk": self.risk,
+            "irreversibility_record": self.irreversibility_record,
+            "receipt_path": self.receipt_path,
+        }
+
+    @property
+    def target_sha256(self) -> str:
+        return _captain_target_sha256(self.target)
+
+    @property
+    def action_sha256(self) -> str:
+        return sha256_json(self.digest_material())
+
+    def to_action(self, *, actions_sha256: str) -> dict[str, Any]:
+        envelope = {
+            **self.digest_material(),
+            "created_at": self.created_at,
+            "target_sha256": self.target_sha256,
+            "action_sha256": self.action_sha256,
+            "actions_sha256": actions_sha256,
+        }
+        return {
+            "index": self.index,
+            "action": self.action,
+            "high_impact": True,
+            "role": "captain",
+            "target": self.target,
+            "scope": self.scope,
+            "target_findings": list(self.target_findings),
+            "scope_findings": list(self.scope_findings),
+            "risk_findings": list(self.risk_findings),
+            "target_change_findings": list(self.target_change_findings),
+            "risk": self.risk,
+            "recovery_path": self.risk.get("recovery_path"),
+            "irreversibility": self.risk.get("irreversibility"),
+            "requires_status_projection": True,
+            "target_change_required": self.target_change_required,
+            "target_change": self.target_change,
+            "irreversibility_record": self.irreversibility_record,
+            "evidence_schema": self.evidence_schema,
+            "receipt_path": self.receipt_path,
+            "execution": "not-performed",
+            "target_sha256": self.target_sha256,
+            "action_sha256": self.action_sha256,
+            "actions_sha256": actions_sha256,
+            "envelope": envelope,
+        }
+
+
 def _captain_mapping_or_empty(item: dict[str, Any], key: str) -> dict[str, Any]:
     value = item.get(key)
     return value if isinstance(value, dict) else {}
+
+
+def _captain_serialize_actions(actions: list[CaptainActionEnvelope]) -> list[dict[str, Any]]:
+    actions_sha256 = sha256_json(
+        [
+            {
+                "index": action.index,
+                "action": action.action,
+                "action_sha256": action.action_sha256,
+                "target_sha256": action.target_sha256,
+            }
+            for action in actions
+        ]
+    )
+    return [action.to_action(actions_sha256=actions_sha256) for action in actions]
+
 
 def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool = False) -> list[dict[str, Any]]:
     value = parameters.get("actions")
@@ -4570,7 +4664,7 @@ def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool
         raise GripPreflightError("actions must be a non-empty list")
     if len(value) > CAPTAIN_MAX_ACTIONS:
         raise GripPreflightError(f"actions may contain at most {CAPTAIN_MAX_ACTIONS} entries")
-    actions: list[dict[str, Any]] = []
+    actions: list[CaptainActionEnvelope] = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise GripPreflightError(f"actions[{index}] must be an object")
@@ -4644,45 +4738,25 @@ def _captain_actions(parameters: dict[str, Any], *, gate_native_validation: bool
             raise GripPreflightError(target_change_findings[0])
         receipt_path = _relative_receipt_path(item.get("receipt_path"), context=f"actions[{index}]")
         actions.append(
-            {
-                "index": index,
-                "action": action_name,
-                "high_impact": True,
-                "role": "captain",
-                "target": target,
-                "scope": scope,
-                "target_findings": target_findings,
-                "scope_findings": scope_findings,
-                "risk_findings": risk_findings,
-                "target_change_findings": target_change_findings,
-                "risk": risk,
-                "recovery_path": risk.get("recovery_path"),
-                "irreversibility": risk.get("irreversibility"),
-                "requires_status_projection": True,
-                "target_change_required": target_change_required,
-                "target_change": target_change,
-                "irreversibility_record": irreversibility_record,
-                "evidence_schema": _captain_action_evidence_schema(action_name, target, risk),
-                "receipt_path": receipt_path,
-                "execution": "not-performed",
-                "envelope": {
-                    "schema_version": 1,
-                    "index": index,
-                    "role": "captain",
-                    "action": action_name,
-                    "high_impact": True,
-                    "target": target,
-                    "scope": scope,
-                    "target_change_required": target_change_required,
-                    "target_change": target_change,
-                    "risk": risk,
-                    "irreversibility_record": irreversibility_record,
-                    "receipt_path": receipt_path,
-                    "created_at": utc_now(),
-                },
-            }
+            CaptainActionEnvelope(
+                index=index,
+                action=action_name,
+                target=target,
+                scope=scope,
+                risk=risk,
+                target_change_required=target_change_required,
+                target_change=target_change,
+                irreversibility_record=irreversibility_record if isinstance(irreversibility_record, dict) else None,
+                receipt_path=receipt_path,
+                evidence_schema=_captain_action_evidence_schema(action_name, target, risk),
+                target_findings=tuple(target_findings),
+                scope_findings=tuple(scope_findings),
+                risk_findings=tuple(risk_findings),
+                target_change_findings=tuple(target_change_findings),
+                created_at=utc_now(),
+            )
         )
-    return _captain_attach_action_digests(actions)
+    return _captain_serialize_actions(actions)
 
 
 def _captain_gate(gate_id: str, status: str, reason: str, details: Any = None) -> dict[str, Any]:
