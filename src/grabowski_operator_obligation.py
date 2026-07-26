@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,11 @@ import time
 from typing import Any, Iterator
 
 import grabowski_private_io as private_io
+
+try:
+    alert_outbox = importlib.import_module("grabowski_alert_outbox")
+except ModuleNotFoundError:
+    alert_outbox = None
 
 
 SCHEMA_VERSION = 1
@@ -402,6 +408,30 @@ def _ensure_private_directory(path: Path, *, create: bool) -> None:
 
 def _record_path(obligation_id: str, name: str) -> Path:
     return _state_root() / obligation_id / name
+
+
+def _schedule_close_alert(close_record: dict[str, Any]) -> None:
+    if alert_outbox is None:
+        return
+    event_class = {
+        "blocked": "blocked_operation",
+        "completed": "long_run_completed",
+    }.get(close_record["outcome"])
+    if event_class is None:
+        return
+    try:
+        alert_outbox.enqueue_and_schedule(
+            event_class=event_class,
+            producer="operator_obligation",
+            correlation_key=str(close_record["obligation_id"]),
+            deduplication_key=str(close_record["record_sha256"]),
+            subject="operator_obligation",
+            fields={"outcome": str(close_record["outcome"])},
+        )
+    except Exception:
+        # The immutable close record remains authoritative when the advisory
+        # alert path cannot publish or schedule its dispatcher.
+        return
 
 
 def _read_private_json(path: Path) -> tuple[dict[str, Any], str]:
@@ -895,6 +925,7 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         _validate_close_record(winner, open_record=open_record, open_file_sha256=open_file_sha256)
         if winner["material_sha256"] != material_sha256:
             raise OperatorObligationConflictError("operator obligation already has a different terminal close")
+    _schedule_close_alert(winner)
     status = status_obligation(obligation_id)
     return {
         **status,

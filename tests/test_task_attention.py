@@ -88,6 +88,7 @@ class TaskAttentionTests(unittest.TestCase):
             patch.object(tasks, "TASK_OUTCOMES_DIR", self.outcomes),
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
             patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
+            patch.object(attention.alert_outbox, "enqueue_and_schedule"),
             patch.dict(
                 os.environ,
                 {
@@ -227,6 +228,28 @@ class TaskAttentionTests(unittest.TestCase):
         stored = tasks._row(str(record["task_id"]))
         self.assertEqual("failed", stored["state"])
         self.assertEqual(1, stored["attempt"])
+
+    def test_authoritative_decision_schedules_deduplicated_owner_alert(self) -> None:
+        record = self._failed_task()
+        with patch.object(
+            attention.alert_outbox,
+            "enqueue_and_schedule",
+            side_effect=RuntimeError("dispatcher unavailable"),
+        ) as enqueue:
+            result = attention.record_decision(
+                self._parameters(record, decision="deferred")
+            )
+
+        self.assertTrue(result["created"])
+        enqueue.assert_called_once()
+        parameters = enqueue.call_args.kwargs
+        self.assertEqual("owner_decision", parameters["event_class"])
+        self.assertEqual("task_attention", parameters["producer"])
+        self.assertEqual(result["receipt_sha256"], parameters["deduplication_key"])
+        self.assertEqual(
+            f"{record['task_id']}:a{record['attempt']}",
+            parameters["correlation_key"],
+        )
 
     def test_different_material_conflicts_without_replacement(self) -> None:
         record = self._failed_task()
