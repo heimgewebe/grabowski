@@ -11,7 +11,7 @@ import tempfile
 import types
 from typing import get_args
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -1227,10 +1227,8 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertFalse(result["validation_started"])
         self.assertTrue(result["final_lock_and_drain_gates_required"])
 
-    def test_main_defers_before_validator_when_contention_is_observed(self) -> None:
-        repo = Path("/tmp/repository")
-        expected = "f" * 40
-        argv = [
+    def _runner_argv(self, repo: Path, expected: str) -> list[str]:
+        return [
             "runner",
             "--repo",
             str(repo),
@@ -1245,17 +1243,127 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             "--delay-seconds",
             "5",
         ]
-        with patch.object(sys, "argv", argv), patch.object(
+
+    def test_main_retries_only_contention_and_then_succeeds(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
             RUNNER, "load_finalization_binding", return_value=None
-        ), patch.object(RUNNER.time, "sleep"), patch.object(
+        ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
+            RUNNER, "verify_repository"
+        ) as verify, patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            side_effect=[
+                _contention_result(decision="defer"),
+                _contention_result(decision="defer"),
+                _contention_result(),
+            ],
+        ) as preflight, patch.object(
+            RUNNER, "run_streamed"
+        ) as streamed, patch.object(
+            RUNNER,
+            "verify_live_manifest",
+            return_value={
+                "release_id": "r",
+                "repo_head": expected,
+                "completion_status": "complete",
+            },
+        ):
+            self.assertEqual(RUNNER.main(), 0)
+        self.assertEqual(preflight.call_count, 3)
+        self.assertEqual(verify.call_count, 4)
+        self.assertEqual(sleep.call_args_list, [call(5), call(5), call(10)])
+        self.assertEqual(streamed.call_count, 2)
+
+    def test_main_fails_after_bounded_contention_retries(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
             RUNNER, "verify_repository"
         ) as verify, patch.object(
             RUNNER,
             "deployment_contention_preflight",
             return_value=_contention_result(decision="defer"),
-        ), patch.object(RUNNER, "run_streamed") as streamed:
+        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+            self.assertEqual(RUNNER.main(), 1)
+        self.assertEqual(
+            preflight.call_count, RUNNER.DEPLOYMENT_CONTENTION_MAX_ATTEMPTS
+        )
+        self.assertEqual(
+            verify.call_count, RUNNER.DEPLOYMENT_CONTENTION_MAX_ATTEMPTS
+        )
+        self.assertEqual(
+            sleep.call_args_list, [call(5), call(5), call(10), call(20)]
+        )
+        streamed.assert_not_called()
+
+    def test_main_revalidates_identity_before_each_contention_retry(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
+            RUNNER,
+            "verify_repository",
+            side_effect=[None, RuntimeError("HEAD drift")],
+        ) as verify, patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(decision="defer"),
+        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+            self.assertEqual(RUNNER.main(), 1)
+        self.assertEqual(verify.call_count, 2)
+        preflight.assert_called_once()
+        self.assertEqual(sleep.call_args_list, [call(5), call(5)])
+        streamed.assert_not_called()
+
+    def test_main_does_not_retry_non_contention_failure(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
+            RUNNER, "verify_repository"
+        ) as verify, patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            side_effect=RuntimeError("metrics probe failed"),
+        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
             self.assertEqual(RUNNER.main(), 1)
         verify.assert_called_once()
+        preflight.assert_called_once()
+        self.assertEqual(sleep.call_args_list, [call(5)])
+        streamed.assert_not_called()
+
+    def test_main_does_not_retry_invalid_contention_decision(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(RUNNER.time, "sleep") as sleep, patch.object(
+            RUNNER, "verify_repository"
+        ) as verify, patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(decision="unknown"),
+        ) as preflight, patch.object(RUNNER, "run_streamed") as streamed:
+            self.assertEqual(RUNNER.main(), 1)
+        verify.assert_called_once()
+        preflight.assert_called_once()
+        self.assertEqual(sleep.call_args_list, [call(5)])
         streamed.assert_not_called()
 
     def test_main_validates_before_deploying(self) -> None:

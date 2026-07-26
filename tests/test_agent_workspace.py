@@ -5249,6 +5249,15 @@ class AgentWorkspaceTests(unittest.TestCase):
             mock.patch.object(workspace.operator, "_require_operator_capability"),
         ]
         with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9], patches[10], patches[11]:
+            workspace.checkouts.grabowski_checkout_retain(
+                repo=manifest["repository"],
+                checkout_path=manifest["writer_worktree"],
+                owner_id=manifest["resources"]["owner_id"],
+                purpose="active workspace retention",
+                retention_until_unix=int(time.time()) + 3600,
+                expected_head=self.git.base,
+                expected_branch=manifest["writer_branch"],
+            )
             report = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )
@@ -6662,7 +6671,7 @@ class AgentWorkspaceTests(unittest.TestCase):
         self.assertEqual(blocker["workspace_ids"], [shared["workspace_id"]])
 
 
-    def test_cleanup_owner_is_derived_and_not_caller_controlled(self) -> None:
+    def test_cleanup_owner_continues_workspace_identity_and_is_not_caller_controlled(self) -> None:
         manifest = self._closed_cleanup_manifest()
         observed: dict[str, str] = {}
 
@@ -6682,7 +6691,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             plan = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
-        expected = f"agent-workspace-cleanup:{manifest['workspace_id']}"
+        expected = manifest["resources"]["owner_id"]
         self.assertEqual(plan["owner_id"], expected)
         self.assertEqual(observed["owner_id"], expected)
 

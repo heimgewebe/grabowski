@@ -107,10 +107,18 @@ dem Start:
 - vorhandener versionierter Runner `tools/run_scheduled_deploy.py`,
 - Verzögerung zwischen 5 und 60 Sekunden.
 
-Der gestartete Job wartet kurz, prüft den Checkout erneut, führt `make validate`
-aus und ruft danach den direkten Apply-Zielpfad `make deploy-apply` auf. Damit
-ist ein Operator-/Tunnel-Neustart nicht mehr an den Lebenszyklus des
-aufrufenden Connector-Requests gebunden.
+Der gestartete Job wartet kurz und prüft den Checkout vor jedem frühen
+Contention-Preflight erneut. Ausschließlich die explizite Preflight-Entscheidung
+`defer` wird nach dem festen, versionierten Zeitplan 5, 10 und 20 Sekunden
+wiederholt; nach höchstens vier Versuchen endet der Job mit dem Fehlertyp
+`DeploymentContentionDeferred` fail-closed. Identitätsdrift, ungültige Entscheidungen und alle anderen Fehler
+brechen ohne weiteren Versuch ab. Erst nach einem freien Preflight führt der
+Runner `make validate` und danach den direkten Apply-Zielpfad
+`make deploy-apply` aus. Jede Vertagung enthält Versuch, Grenze, Wartezeit,
+Head-, Source- und Preflight-Bindung; der create-only Finalisierungsbeleg bildet
+nur den eindeutigen Endzustand des Jobs ab. Damit ist ein Operator-/Tunnel-
+Neustart nicht mehr an den Lebenszyklus des aufrufenden Connector-Requests
+gebunden.
 
 Der direkte Apply bleibt absichtlich als eigenes Ziel erhalten:
 
