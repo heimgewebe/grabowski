@@ -104,7 +104,7 @@ def operator_relay_protocol() -> dict[str, Any]:
             "patch_file_relay": "operator_patch_relay",
             "patch_fallback": "chatgpt_operator_direct",
             "audit": "grabowski_git",
-            "repo_state_context": "steuerboard_operator_report",
+            "repo_state_context": "reposkop_target_bound_report",
         },
         "does_not_establish": [
             "new_privileges",
@@ -113,6 +113,6 @@ def operator_relay_protocol() -> dict[str, Any]:
             "automatic_deploy",
             "free_shell_as_default_path",
             "durable_agent_autonomy",
-            "steuerboard_report_action_approval",
+            "reposkop_report_action_approval",
         ],
     }
