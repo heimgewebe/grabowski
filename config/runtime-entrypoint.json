@@ -190,6 +190,10 @@
       "source": "src/grabowski_mcp.py"
     },
     {
+      "module": "grabowski_system_map",
+      "source": "src/grabowski_system_map.py"
+    },
+    {
       "module": "grabowski_client_snapshot",
       "source": "src/grabowski_client_snapshot.py"
     },
