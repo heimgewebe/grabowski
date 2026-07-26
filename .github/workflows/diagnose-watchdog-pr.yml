@@ -1,0 +1,55 @@
+name: diagnose-watchdog-pr
+
+on:
+  push:
+    branches:
+      - fix/watchdog-poll-recovery-v1
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: catalog-data-check
+        continue-on-error: true
+        run: make catalog-data-check
+      - name: syntax
+        continue-on-error: true
+        run: make syntax
+      - name: test
+        continue-on-error: true
+        run: make test
+      - name: policy
+        continue-on-error: true
+        run: make policy
+      - name: tool-surface-budget
+        continue-on-error: true
+        run: make tool-surface-budget
+      - name: context-check
+        continue-on-error: true
+        run: make context-check
+      - name: profiles-check
+        continue-on-error: true
+        run: make profiles-check
+      - name: runtime-lock
+        continue-on-error: true
+        run: make runtime-lock
+      - name: deploy-tooling-check
+        continue-on-error: true
+        run: make deploy-tooling-check
+      - name: secrets
+        continue-on-error: true
+        run: make secrets
