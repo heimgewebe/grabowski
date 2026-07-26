@@ -1,4 +1,5 @@
 from __future__ import annotations
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
@@ -141,6 +142,8 @@ class FakeGh:
         repo_settings_returncode: int = 0,
         repo_settings_invalid_json: bool = False,
         diff_text: str = "captain-diff\n",
+        codex_state: dict[str, object] | None = None,
+        codex_state_sequence: list[dict[str, object]] | None = None,
     ):
         self.existing = existing
         self.failure = failure
@@ -167,6 +170,19 @@ class FakeGh:
             "files", [{"path": "src/changed.py", "changeType": "MODIFIED"}]
         )
         self.diff_text = diff_text
+        codex_seed_view = (
+            dict(view_sequence[0])
+            if codex_state is None and view_sequence
+            else self.view
+        )
+        self.codex_state = deepcopy(
+            codex_state
+            if codex_state is not None
+            else captain_codex_live_state(codex_seed_view, diff_text=diff_text)
+        )
+        self.codex_state_sequence = [
+            deepcopy(item) for item in (codex_state_sequence or [])
+        ]
         self.view_failure_after_merge = view_failure_after_merge
         self.post_merge_view = post_merge_view or {}
         self.post_merge_view_failures = post_merge_view_failures
@@ -212,6 +228,32 @@ class FakeGh:
             else:
                 value = [self.existing]
             return {"returncode": 0, "stdout": json.dumps(value), "stderr": ""}
+        if argv[:2] == ["api", "graphql"]:
+            state = (
+                self.codex_state_sequence[0]
+                if self.codex_state_sequence
+                else self.codex_state
+            )
+            payload = state.get("threads") if isinstance(state, dict) else None
+            if self.codex_state_sequence:
+                self.codex_state = deepcopy(self.codex_state_sequence.pop(0))
+            return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+        if argv[:1] == ["api"] and len(argv) >= 2:
+            state = (
+                self.codex_state_sequence[0]
+                if self.codex_state_sequence
+                else self.codex_state
+            )
+            endpoint = argv[1]
+            if "/issues/comments/" in endpoint and endpoint.endswith("/reactions"):
+                payload = state.get("reactions") if isinstance(state, dict) else None
+                return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+            if "/issues/comments/" in endpoint:
+                payload = state.get("request_comment") if isinstance(state, dict) else None
+                return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+            if "/pulls/" in endpoint and "/reviews/" in endpoint:
+                payload = state.get("review") if isinstance(state, dict) else None
+                return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
         if argv[:1] == ["api"]:
             if self.repo_settings_returncode != 0:
                 return {"returncode": self.repo_settings_returncode, "stdout": "", "stderr": "repo policy failed"}
@@ -3120,6 +3162,174 @@ CAPTAIN_DIFF_TEXT = "captain-diff\n"
 CAPTAIN_DIFF = hashlib.sha256(CAPTAIN_DIFF_TEXT.encode("utf-8")).hexdigest()
 
 
+def captain_codex_request_material(
+    *,
+    head: str = CAPTAIN_HEAD,
+    diff_sha256: str = CAPTAIN_DIFF,
+    repo: str = "heimgewebe/grabowski",
+    pr: int = 96,
+) -> tuple[dict[str, object], str]:
+    request_core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "grabowski_codex_review_request",
+        "repo": repo,
+        "pr": pr,
+        "head_sha": head,
+        "diff_sha256": diff_sha256,
+    }
+    payload = {
+        **request_core,
+        "request_id": grips.sha256_json(request_core)[:32],
+    }
+    body = (
+        "@codex review\n\n"
+        "Please review the exact current pull-request head. Grabowski will accept only "
+        "a Codex result bound to the head and diff recorded below.\n\n"
+        "<!-- grabowski-codex-review-request:v1\n"
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n-->"
+    )
+    return payload, body
+
+
+def captain_codex_review_evidence(
+    *,
+    head: str = CAPTAIN_HEAD,
+    base_sha: str = CAPTAIN_BASE_SHA,
+    diff_sha256: str = CAPTAIN_DIFF,
+    review_tier: str = "high_critical",
+    repo: str = "heimgewebe/grabowski",
+    pr: int = 96,
+    thread_ids: list[str] | None = None,
+) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    request_time = "2026-07-26T08:00:00Z"
+    completion_time = "2026-07-26T08:01:00Z"
+    request_payload, request_body = captain_codex_request_material(
+        head=head, diff_sha256=diff_sha256, repo=repo, pr=pr
+    )
+    review_body = "reviewed"
+    current_threads = sorted(set(thread_ids or []))
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "github_codex_review_settlement",
+        "generated_at": now.isoformat(),
+        "repo": repo,
+        "pr": pr,
+        "head_sha": head,
+        "base_sha": base_sha,
+        "diff_sha256": diff_sha256,
+        "required": True,
+        "required_reason": ["test high-critical review"],
+        "review_tier": review_tier,
+        "request": {
+            "comment_id": 101,
+            "request_id": request_payload["request_id"],
+            "created_at": request_time,
+            "actor": "github-actions[bot]",
+            "author_association": "NONE",
+            "body_sha256": hashlib.sha256(request_body.encode("utf-8")).hexdigest(),
+        },
+        "completion": {
+            "mode": "review",
+            "review_id": 202,
+            "actor": "chatgpt-codex-connector[bot]",
+            "state": "COMMENTED",
+            "submitted_at": completion_time,
+            "body_sha256": hashlib.sha256(review_body.encode("utf-8")).hexdigest(),
+            "url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
+            "accepted_state": True,
+            "blocking_state": False,
+        },
+        "finding_count": len(current_threads),
+        "thread_ids": current_threads,
+        "thread_ids_sha256": grips.sha256_json(current_threads),
+        "unresolved_thread_ids": [],
+        "unresolved_thread_ids_sha256": grips.sha256_json([]),
+        "all_findings_triaged": True,
+        "settled": True,
+        "status": "pass",
+        "errors": [],
+        "does_not_establish": [
+            "semantic_correctness_of_codex_findings",
+            "merge_authority",
+        ],
+    }
+    return {**core, "evidence_sha256": grips.sha256_json(core)}
+
+
+def captain_codex_live_state(
+    view: dict[str, object],
+    *,
+    diff_text: str = CAPTAIN_DIFF_TEXT,
+    threads: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    head = str(view.get("headRefOid") or CAPTAIN_HEAD)
+    pr = int(view.get("number") or 96)
+    diff_sha256 = hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+    _, request_body = captain_codex_request_material(
+        head=head, diff_sha256=diff_sha256, pr=pr
+    )
+    return {
+        "request_comment": {
+            "id": 101,
+            "body": request_body,
+            "created_at": "2026-07-26T08:00:00Z",
+            "author_association": "NONE",
+            "user": {"login": "github-actions[bot]"},
+        },
+        "review": {
+            "id": 202,
+            "state": "COMMENTED",
+            "body": "reviewed",
+            "submitted_at": "2026-07-26T08:01:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": head,
+        },
+        "reactions": [],
+        "threads": {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": deepcopy(threads or []),
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            }
+        },
+    }
+
+
+def captain_codex_review_exception(
+    *,
+    head: str = CAPTAIN_HEAD,
+    diff_sha256: str = CAPTAIN_DIFF,
+    expires_delta: timedelta = timedelta(hours=1),
+) -> dict[str, object]:
+    now = datetime.now(timezone.utc)
+    core: dict[str, object] = {
+        "schema_version": 1,
+        "kind": "grabowski_codex_review_exception",
+        "generated_at": now.isoformat(),
+        "expires_at": (now + expires_delta).isoformat(),
+        "repo": "heimgewebe/grabowski",
+        "pr": 96,
+        "head_sha": head,
+        "diff_sha256": diff_sha256,
+        "approved_by": "alex",
+        "reason": "Codex unavailable during a bounded incident window",
+    }
+    return {**core, "exception_sha256": grips.sha256_json(core)}
+
+
 def captain_delivery_receipt(
     *,
     repository: str = "heimgewebe/grabowski",
@@ -3180,6 +3390,21 @@ def rebind_captain_delivery(parameters: dict[str, object]) -> None:
     )
     parameters["merge_delivery_receipt"] = receipt
     parameters["merge_delivery_receipt_sha256"] = receipt_sha256
+    if isinstance(parameters.get("codex_review_evidence"), dict):
+        review = parameters.get("review_evidence")
+        review_tier = (
+            str(review.get("review_tier"))
+            if isinstance(review, dict) and review.get("review_tier")
+            else "high_critical"
+        )
+        parameters["codex_review_evidence"] = captain_codex_review_evidence(
+            head=str(parameters.get("expected_head", CAPTAIN_HEAD)),
+            base_sha=str(parameters.get("expected_base_sha", CAPTAIN_BASE_SHA)),
+            diff_sha256=str(parameters.get("diff_sha256", CAPTAIN_DIFF)),
+            review_tier=review_tier,
+            repo=str(target.get("repo", "heimgewebe/grabowski")),
+            pr=int(target.get("pr", 96)),
+        )
 
 
 def captain_action(**overrides) -> dict[str, object]:
@@ -3249,6 +3474,7 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
             "self_review_gate_valid": True,
             "tuning_signal": "observe",
         },
+        "codex_review_evidence": captain_codex_review_evidence(),
         "ci_evidence": {"state": "passed", "head_sha": CAPTAIN_HEAD, "source": "github-actions"},
         "human_authorization": {"authorized_by": "alex", "statement": "manual captain decision still pending"},
     }
@@ -3286,6 +3512,12 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
             "diff_sha256": parameters.get("diff_sha256"),
             "merge_delivery_receipt_sha256": parameters.get("merge_delivery_receipt_sha256"),
             "review_evidence_sha256": grips.sha256_json(parameters["review_evidence"]),
+            "codex_review_evidence_sha256": grips.sha256_json(
+                parameters.get("codex_review_evidence")
+            ),
+            "codex_review_exception_sha256": grips.sha256_json(
+                parameters.get("codex_review_exception")
+            ),
             "ci_evidence_sha256": grips.sha256_json(parameters["ci_evidence"]),
             "authorization_sha256": grips._captain_execution_intent_authorization_sha256(parameters),
         },
@@ -3773,6 +4005,99 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         result = self.run_captain(parameters)
 
         self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
+
+    def test_high_critical_merge_blocks_missing_codex_review_evidence(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("codex_review_evidence")
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "codex-review-settled")
+        self.assertEqual("blocked", gate["status"])
+        self.assertIn("codex_review_evidence_missing", result["output"]["blocked_reasons"])
+
+    def test_standard_merge_does_not_require_codex_review_by_default(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["review_tier"] = "standard"
+        parameters["review_evidence"]["minimum_review_iterations"] = 2
+        parameters["review_evidence"]["actual_review_iterations"] = 2
+        parameters.pop("codex_review_evidence")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("pass", self.gate(result, "codex-review-settled")["status"])
+
+    def test_explicit_codex_requirement_blocks_standard_merge_without_evidence(self) -> None:
+        parameters = captain_parameters(codex_review_required=True)
+        parameters["review_evidence"]["review_tier"] = "standard"
+        parameters["review_evidence"]["minimum_review_iterations"] = 2
+        parameters["review_evidence"]["actual_review_iterations"] = 2
+        parameters.pop("codex_review_evidence")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "codex-review-settled")["status"])
+        self.assertIn("codex_review_evidence_missing", result["output"]["blocked_reasons"])
+
+    def test_codex_review_evidence_for_other_head_blocks(self) -> None:
+        parameters = captain_parameters()
+        evidence = captain_codex_review_evidence(head="d" * 40)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "codex-review-settled")["status"])
+        self.assertIn("head_sha does not match expected value", result["output"]["blocked_reasons"])
+
+    def test_codex_review_unresolved_thread_blocks(self) -> None:
+        parameters = captain_parameters()
+        evidence = captain_codex_review_evidence()
+        evidence["finding_count"] = 1
+        evidence["thread_ids"] = ["PRRT_test"]
+        evidence["thread_ids_sha256"] = grips.sha256_json(["PRRT_test"])
+        evidence["unresolved_thread_ids"] = ["PRRT_test"]
+        evidence["unresolved_thread_ids_sha256"] = grips.sha256_json(["PRRT_test"])
+        core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "codex-review-settled")["status"])
+        self.assertIn("unresolved_thread_ids must be empty", result["output"]["blocked_reasons"])
+
+    def test_valid_codex_review_exception_is_bounded_and_passes(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("codex_review_evidence")
+        parameters["codex_review_exception"] = captain_codex_review_exception()
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("pass", self.gate(result, "codex-review-settled")["status"])
+
+    def test_expired_codex_review_exception_blocks(self) -> None:
+        parameters = captain_parameters()
+        parameters.pop("codex_review_evidence")
+        parameters["codex_review_exception"] = captain_codex_review_exception(
+            expires_delta=timedelta(minutes=-1)
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "codex-review-settled")["status"])
+        self.assertIn("codex review exception is expired", result["output"]["blocked_reasons"])
+
+    def test_codex_review_evidence_and_exception_are_mutually_exclusive(self) -> None:
+        parameters = captain_parameters(
+            codex_review_exception=captain_codex_review_exception()
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        result = self.run_captain(parameters)
+
+        self.assertEqual("blocked", self.gate(result, "codex-review-settled")["status"])
+        self.assertIn(
+            "codex_review_evidence_exception_ambiguous",
+            result["output"]["blocked_reasons"],
+        )
 
     def test_blocks_review_evidence_for_other_head(self) -> None:
         parameters = captain_parameters()
@@ -5708,8 +6033,21 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(schema["head_binding"], {"parameter": "expected_head", "required": True})
         self.assertEqual(schema["base_sha_binding"], {"parameter": "expected_base_sha", "required": True})
         self.assertEqual(schema["diff_binding"], {"parameter": "diff_sha256", "required": True})
-        self.assertLessEqual({"status_projection", "review_evidence", "ci_evidence", "human_authorization"}, evidence_names)
+        self.assertLessEqual(
+            {
+                "status_projection",
+                "review_evidence",
+                "codex_review_evidence",
+                "ci_evidence",
+                "human_authorization",
+            },
+            evidence_names,
+        )
         review_evidence = next(item for item in schema["required_evidence"] if item["name"] == "review_evidence")
+        codex_review_evidence = next(
+            item for item in schema["required_evidence"]
+            if item["name"] == "codex_review_evidence"
+        )
         ci_evidence = next(item for item in schema["required_evidence"] if item["name"] == "ci_evidence")
         self.assertIn("diff_sha256", review_evidence["required_fields"])
         self.assertIn("repo", review_evidence["required_fields"])
@@ -5717,6 +6055,12 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("generated_at", review_evidence["required_fields"])
         self.assertIn("review_tier", review_evidence["required_fields"])
         self.assertIn("expected_head", review_evidence["binds"])
+        self.assertEqual(
+            codex_review_evidence["required_when"],
+            "review_evidence.review_tier_is_high_critical_or_codex_review_required_is_true",
+        )
+        self.assertIn("completion", codex_review_evidence["required_fields"])
+        self.assertIn("expected_head", codex_review_evidence["binds"])
         self.assertIn("state", ci_evidence["required_fields"])
         self.assertEqual(ci_evidence["required_values"], {"state": "passed"})
         self.assertIn("expected_head", ci_evidence["binds"])
@@ -5985,7 +6329,72 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertLessEqual(guard["dispatch_at_unix_ns"], guard["completed_at_unix_ns"])
         self.assertRegex(guard["lease_snapshot_sha256"], r"[0-9a-f]{64}\Z")
         self.assertRegex(guard["receipt_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertEqual(
+            "settled", guard["initial_codex_review_revalidation"]["status"]
+        )
+        self.assertEqual(
+            "settled", guard["dispatch_codex_review_revalidation"]["status"]
+        )
         self.assertEqual([], resources.list_resources())
+
+    def test_atomic_merge_guard_blocks_codex_thread_opened_after_initial_review(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        initial = captain_codex_live_state(view)
+        late_thread = {
+            "id": "PRRT_late",
+            "isResolved": False,
+            "comments": {
+                "nodes": [
+                    {
+                        "databaseId": 303,
+                        "createdAt": "2026-07-26T08:02:00Z",
+                        "author": {"login": "chatgpt-codex-connector[bot]"},
+                        "commit": {"oid": CAPTAIN_HEAD},
+                        "pullRequestReview": {"databaseId": 202},
+                    }
+                ],
+                "pageInfo": {"hasNextPage": False},
+            },
+        }
+        drifted = captain_codex_live_state(view, threads=[late_thread])
+        gh = FakeGh(
+            view=view,
+            diff_text=CAPTAIN_DIFF_TEXT,
+            codex_state_sequence=[initial, drifted],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertTrue(execution["merge_guard_cleanup_passed"])
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            execution["merge_lease_guard"]["status"],
+        )
+        self.assertIn(
+            "merge_guard_codex_unresolved_threads_present",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_default_github_runner_preserves_partial_stderr_on_timeout(self) -> None:
         timeout = grips.subprocess.TimeoutExpired(
@@ -6855,7 +7264,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "number": 96, "state": "OPEN", "baseRefName": "main",
             "baseRefOid": CAPTAIN_BASE_SHA, "headRefOid": CAPTAIN_HEAD,
             "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
-        })
+        }, diff_text=raw_diff.decode("utf-8"))
 
         def raw_runner(repo: Path, argv: list[str]) -> dict[str, object]:
             result = gh(repo, argv)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -22,6 +23,40 @@ _MERGE_GUARD_TTL_SECONDS = 300
 _MERGE_GUARD_MAX_CHANGED_PATHS = 100
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
 _MERGE_GUARD_REPLAY_PARAMETERS = frozenset({"merge_lease_snapshot", "merge_guard_receipt"})
+_CODEX_REVIEW_ACTORS = frozenset({
+    "chatgpt-codex-connector",
+    "chatgpt-codex-connector[bot]",
+})
+_CODEX_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+_CODEX_REQUEST_RE = re.compile(
+    r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
+    re.DOTALL,
+)
+_CODEX_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 100) {
+            nodes {
+              databaseId
+              createdAt
+              author { login }
+              commit { oid }
+              pullRequestReview { databaseId }
+            }
+            pageInfo { hasNextPage }
+          }
+        }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+}
+""".strip()
 _SERVER_ACTOR_SCHEMA_VERSION = 1
 _SERVER_ACTOR_KIND = "grabowski_server_runtime_actor_identity"
 _SERVER_ACTOR_TTL_SECONDS = 300
@@ -675,6 +710,31 @@ def _merge_guard_result_info(result: Any) -> dict[str, Any]:
     }
 
 
+def _github_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _github_actor(value: Any) -> str:
+    if isinstance(value, dict):
+        login = value.get("login")
+        if isinstance(login, str):
+            return login.strip().lower()
+    if isinstance(value, str):
+        return value.strip().lower()
+    return ""
+
+
 class CaptainMergeGuardRunner:
     def __init__(
         self,
@@ -930,6 +990,441 @@ class CaptainMergeGuardRunner:
         self.receipt["repository_policy_revalidation"] = evidence
         return errors
 
+    def _codex_api_json(
+        self,
+        args: list[str],
+        *,
+        label: str,
+        observations: list[dict[str, Any]],
+        errors: list[str],
+    ) -> Any | None:
+        try:
+            raw = self.github_runner(self.repo_path, args)
+        except Exception as exc:
+            errors.append(
+                f"merge_guard_codex_{label}_exception:{type(exc).__name__}"
+            )
+            observations.append(
+                {
+                    "label": label,
+                    "command": ["gh", *args],
+                    "exception_type": type(exc).__name__,
+                }
+            )
+            return None
+        info = _merge_guard_result_info(raw)
+        observation = {
+            "label": label,
+            "command": ["gh", *args],
+            "returncode": info["returncode"],
+            "stdout_sha256": hashlib.sha256(
+                info["stdout"].encode("utf-8")
+            ).hexdigest(),
+            "stderr_sha256": hashlib.sha256(
+                info["stderr"].encode("utf-8")
+            ).hexdigest(),
+        }
+        observations.append(observation)
+        if info["returncode"] != 0:
+            errors.append(f"merge_guard_codex_{label}_query_failed")
+            return None
+        try:
+            return json.loads(info["stdout"])
+        except json.JSONDecodeError:
+            errors.append(f"merge_guard_codex_{label}_invalid_json")
+            return None
+
+    def _revalidate_codex_review(
+        self,
+        bindings: dict[str, Any],
+        *,
+        phase: str,
+    ) -> list[str]:
+        errors: list[str] = []
+        observations: list[dict[str, Any]] = []
+        review_evidence = self.parameters.get("review_evidence")
+        review_tier = (
+            review_evidence.get("review_tier")
+            if isinstance(review_evidence, dict)
+            else None
+        )
+        required = (
+            review_tier == "high_critical"
+            or self.parameters.get("codex_review_required") is True
+        )
+        evidence = self.parameters.get("codex_review_evidence")
+        exception = self.parameters.get("codex_review_exception")
+        receipt_key = f"{phase}_codex_review_revalidation"
+        receipt: dict[str, Any] = {
+            "required": required,
+            "review_tier": review_tier,
+            "evidence_sha256": (
+                _sha256_json(evidence) if isinstance(evidence, dict) else None
+            ),
+            "exception_sha256": (
+                _sha256_json(exception) if isinstance(exception, dict) else None
+            ),
+            "observations": observations,
+            "errors": errors,
+        }
+        self.receipt[receipt_key] = receipt
+        if evidence is not None and exception is not None:
+            errors.append("merge_guard_codex_evidence_exception_ambiguous")
+            receipt["status"] = "blocked"
+            return errors
+        if exception is not None:
+            if not isinstance(exception, dict):
+                errors.append("merge_guard_codex_exception_malformed")
+            else:
+                expires_at = _github_datetime(exception.get("expires_at"))
+                if expires_at is None:
+                    errors.append("merge_guard_codex_exception_expiry_invalid")
+                elif expires_at <= datetime.now(timezone.utc):
+                    errors.append("merge_guard_codex_exception_expired")
+                if exception.get("head_sha") != bindings.get("head_sha"):
+                    errors.append("merge_guard_codex_exception_head_drift")
+                if exception.get("diff_sha256") != bindings.get("diff_sha256"):
+                    errors.append("merge_guard_codex_exception_diff_drift")
+                if str(exception.get("repo", "")).lower() != str(
+                    bindings.get("repository", "")
+                ).lower():
+                    errors.append("merge_guard_codex_exception_repo_drift")
+                if exception.get("pr") != bindings.get("pull_request"):
+                    errors.append("merge_guard_codex_exception_pr_drift")
+            receipt["status"] = "blocked" if errors else "exception_current"
+            return errors
+        if evidence is None:
+            if required:
+                errors.append("merge_guard_codex_evidence_missing")
+                receipt["status"] = "blocked"
+            else:
+                receipt["status"] = "not_required"
+            return errors
+        if not isinstance(evidence, dict):
+            errors.append("merge_guard_codex_evidence_malformed")
+            receipt["status"] = "blocked"
+            return errors
+
+        repository = str(bindings.get("repository", "")).lower()
+        pr_number = int(bindings.get("pull_request", 0))
+        head_sha = str(bindings.get("head_sha", ""))
+        diff_sha256 = str(bindings.get("diff_sha256", ""))
+        base_sha = str(bindings.get("base_sha", ""))
+        if str(evidence.get("repo", "")).lower() != repository:
+            errors.append("merge_guard_codex_evidence_repo_drift")
+        if evidence.get("pr") != pr_number:
+            errors.append("merge_guard_codex_evidence_pr_drift")
+        if evidence.get("head_sha") != head_sha:
+            errors.append("merge_guard_codex_evidence_head_drift")
+        if evidence.get("diff_sha256") != diff_sha256:
+            errors.append("merge_guard_codex_evidence_diff_drift")
+        if evidence.get("base_sha") != base_sha:
+            errors.append("merge_guard_codex_evidence_base_drift")
+        request = evidence.get("request")
+        completion = evidence.get("completion")
+        if not isinstance(request, dict) or not isinstance(completion, dict):
+            errors.append("merge_guard_codex_evidence_shape_invalid")
+            receipt["status"] = "blocked"
+            return errors
+        request_comment_id = request.get("comment_id")
+        if (
+            isinstance(request_comment_id, bool)
+            or not isinstance(request_comment_id, int)
+            or request_comment_id <= 0
+        ):
+            errors.append("merge_guard_codex_request_comment_id_invalid")
+            receipt["status"] = "blocked"
+            return errors
+
+        request_payload = self._codex_api_json(
+            [
+                "api",
+                f"repos/{repository}/issues/comments/{request_comment_id}",
+            ],
+            label="request_comment",
+            observations=observations,
+            errors=errors,
+        )
+        request_time: datetime | None = None
+        if isinstance(request_payload, dict):
+            request_body = request_payload.get("body")
+            live_request_actor = _github_actor(request_payload.get("user"))
+            live_association = request_payload.get("author_association")
+            request_time = _github_datetime(request_payload.get("created_at"))
+            if not isinstance(request_body, str):
+                errors.append("merge_guard_codex_request_body_missing")
+            else:
+                if hashlib.sha256(request_body.encode("utf-8")).hexdigest() != request.get(
+                    "body_sha256"
+                ):
+                    errors.append("merge_guard_codex_request_body_drift")
+                marker = _CODEX_REQUEST_RE.search(request_body)
+                marker_payload: Any = None
+                if marker is not None:
+                    try:
+                        marker_payload = json.loads(marker.group(1))
+                    except json.JSONDecodeError:
+                        marker_payload = None
+                request_core = {
+                    "schema_version": 1,
+                    "kind": "grabowski_codex_review_request",
+                    "repo": repository,
+                    "pr": pr_number,
+                    "head_sha": head_sha,
+                    "diff_sha256": diff_sha256,
+                }
+                expected_marker = {
+                    **request_core,
+                    "request_id": _sha256_json(request_core)[:32],
+                }
+                if marker_payload != expected_marker:
+                    errors.append("merge_guard_codex_request_marker_drift")
+                if request.get("request_id") != expected_marker["request_id"]:
+                    errors.append("merge_guard_codex_request_id_drift")
+            if live_request_actor != str(request.get("actor", "")).lower():
+                errors.append("merge_guard_codex_request_actor_drift")
+            if (
+                live_association not in _CODEX_REQUEST_ASSOCIATIONS
+                and live_request_actor != "github-actions[bot]"
+            ):
+                errors.append("merge_guard_codex_request_actor_untrusted")
+            expected_request_time = _github_datetime(request.get("created_at"))
+            if (
+                request_time is None
+                or expected_request_time is None
+                or request_time != expected_request_time
+            ):
+                errors.append("merge_guard_codex_request_time_drift")
+        else:
+            errors.append("merge_guard_codex_request_comment_missing")
+
+        mode = completion.get("mode")
+        completion_time: datetime | None = None
+        if mode == "review":
+            review_id = completion.get("review_id")
+            if (
+                isinstance(review_id, bool)
+                or not isinstance(review_id, int)
+                or review_id <= 0
+            ):
+                errors.append("merge_guard_codex_review_id_invalid")
+            else:
+                review_payload = self._codex_api_json(
+                    [
+                        "api",
+                        f"repos/{repository}/pulls/{pr_number}/reviews/{review_id}",
+                    ],
+                    label="review",
+                    observations=observations,
+                    errors=errors,
+                )
+                if isinstance(review_payload, dict):
+                    actor = _github_actor(review_payload.get("user"))
+                    state = str(review_payload.get("state") or "").upper()
+                    body = str(review_payload.get("body") or "")
+                    completion_time = _github_datetime(
+                        review_payload.get("submitted_at")
+                    )
+                    if actor not in _CODEX_REVIEW_ACTORS:
+                        errors.append("merge_guard_codex_review_actor_untrusted")
+                    if actor != str(completion.get("actor", "")).lower():
+                        errors.append("merge_guard_codex_review_actor_drift")
+                    if state not in {"APPROVED", "COMMENTED"}:
+                        errors.append("merge_guard_codex_review_state_blocking")
+                    if state != completion.get("state"):
+                        errors.append("merge_guard_codex_review_state_drift")
+                    if review_payload.get("commit_id") != head_sha:
+                        errors.append("merge_guard_codex_review_head_drift")
+                    if hashlib.sha256(body.encode("utf-8")).hexdigest() != completion.get(
+                        "body_sha256"
+                    ):
+                        errors.append("merge_guard_codex_review_body_drift")
+                else:
+                    errors.append("merge_guard_codex_review_missing")
+        elif mode == "reaction":
+            reactions = self._codex_api_json(
+                [
+                    "api",
+                    f"repos/{repository}/issues/comments/{request_comment_id}/reactions",
+                ],
+                label="reaction",
+                observations=observations,
+                errors=errors,
+            )
+            matching_reactions: list[dict[str, Any]] = []
+            if isinstance(reactions, list):
+                for reaction in reactions:
+                    if not isinstance(reaction, dict):
+                        continue
+                    actor = _github_actor(reaction.get("user"))
+                    created = _github_datetime(reaction.get("created_at"))
+                    if (
+                        actor in _CODEX_REVIEW_ACTORS
+                        and reaction.get("content") == "+1"
+                        and created is not None
+                        and request_time is not None
+                        and created >= request_time
+                    ):
+                        matching_reactions.append(
+                            {**reaction, "_actor": actor, "_created": created}
+                        )
+            expected_completion_time = _github_datetime(completion.get("submitted_at"))
+            matching = [
+                item
+                for item in matching_reactions
+                if item["_actor"] == str(completion.get("actor", "")).lower()
+                and item["_created"] == expected_completion_time
+            ]
+            if not matching:
+                errors.append("merge_guard_codex_reaction_missing_or_drifted")
+            else:
+                completion_time = matching[-1]["_created"]
+            if completion.get("state") != "THUMBS_UP":
+                errors.append("merge_guard_codex_reaction_state_drift")
+            if completion.get("body_sha256") != hashlib.sha256(
+                b"THUMBS_UP"
+            ).hexdigest():
+                errors.append("merge_guard_codex_reaction_body_drift")
+        else:
+            errors.append("merge_guard_codex_completion_mode_invalid")
+        expected_completion_time = _github_datetime(completion.get("submitted_at"))
+        if (
+            completion_time is None
+            or expected_completion_time is None
+            or completion_time != expected_completion_time
+        ):
+            errors.append("merge_guard_codex_completion_time_drift")
+        if (
+            request_time is not None
+            and completion_time is not None
+            and completion_time < request_time
+        ):
+            errors.append("merge_guard_codex_completion_predates_request")
+
+        owner, _, name = repository.partition("/")
+        threads_payload = self._codex_api_json(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_CODEX_THREADS_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+            ],
+            label="threads",
+            observations=observations,
+            errors=errors,
+        )
+        thread_ids: list[str] = []
+        unresolved_thread_ids: list[str] = []
+        if isinstance(threads_payload, dict):
+            try:
+                connection = threads_payload["data"]["repository"]["pullRequest"][
+                    "reviewThreads"
+                ]
+            except (KeyError, TypeError):
+                connection = None
+            if not isinstance(connection, dict):
+                errors.append("merge_guard_codex_threads_shape_invalid")
+            else:
+                page_info = connection.get("pageInfo")
+                nodes = connection.get("nodes")
+                if not isinstance(page_info, dict) or page_info.get("hasNextPage") is not False:
+                    errors.append("merge_guard_codex_threads_truncated")
+                if not isinstance(nodes, list):
+                    errors.append("merge_guard_codex_threads_nodes_invalid")
+                else:
+                    for thread in nodes:
+                        if not isinstance(thread, dict):
+                            errors.append("merge_guard_codex_thread_invalid")
+                            continue
+                        thread_id = thread.get("id")
+                        comments = thread.get("comments")
+                        if not isinstance(thread_id, str) or not thread_id:
+                            errors.append("merge_guard_codex_thread_id_invalid")
+                            continue
+                        if not isinstance(comments, dict):
+                            errors.append("merge_guard_codex_thread_comments_invalid")
+                            continue
+                        page = comments.get("pageInfo")
+                        comment_nodes = comments.get("nodes")
+                        if not isinstance(page, dict) or page.get("hasNextPage") is not False:
+                            errors.append(
+                                f"merge_guard_codex_thread_comments_truncated:{thread_id}"
+                            )
+                            continue
+                        if not isinstance(comment_nodes, list):
+                            errors.append(
+                                f"merge_guard_codex_thread_comments_invalid:{thread_id}"
+                            )
+                            continue
+                        matched = False
+                        for comment in comment_nodes:
+                            if not isinstance(comment, dict):
+                                continue
+                            actor = _github_actor(comment.get("author"))
+                            commit = comment.get("commit")
+                            commit_sha = (
+                                commit.get("oid") if isinstance(commit, dict) else None
+                            )
+                            created = _github_datetime(comment.get("createdAt"))
+                            if (
+                                actor in _CODEX_REVIEW_ACTORS
+                                and commit_sha == head_sha
+                                and created is not None
+                                and request_time is not None
+                                and created >= request_time
+                            ):
+                                matched = True
+                        if matched:
+                            thread_ids.append(thread_id)
+                            if thread.get("isResolved") is not True:
+                                unresolved_thread_ids.append(thread_id)
+        thread_ids = sorted(set(thread_ids))
+        unresolved_thread_ids = sorted(set(unresolved_thread_ids))
+        expected_thread_ids = evidence.get("thread_ids")
+        if thread_ids != expected_thread_ids:
+            errors.append("merge_guard_codex_thread_set_drift")
+        if _sha256_json(thread_ids) != evidence.get("thread_ids_sha256"):
+            errors.append("merge_guard_codex_thread_digest_drift")
+        if unresolved_thread_ids:
+            errors.append("merge_guard_codex_unresolved_threads_present")
+        if evidence.get("unresolved_thread_ids") != []:
+            errors.append("merge_guard_codex_evidence_claims_unresolved_threads")
+        receipt.update(
+            {
+                "status": "blocked" if errors else "settled",
+                "request_comment_id": request_comment_id,
+                "completion_mode": mode,
+                "completion_id": completion.get("review_id"),
+                "thread_count": len(thread_ids),
+                "thread_ids_sha256": _sha256_json(thread_ids),
+                "unresolved_thread_count": len(unresolved_thread_ids),
+                "unresolved_thread_ids_sha256": _sha256_json(
+                    unresolved_thread_ids
+                ),
+                "binding_sha256": _sha256_json(
+                    {
+                        "repository": repository,
+                        "pull_request": pr_number,
+                        "head_sha": head_sha,
+                        "base_sha": base_sha,
+                        "diff_sha256": diff_sha256,
+                        "request_comment_id": request_comment_id,
+                        "completion_mode": mode,
+                        "completion_id": completion.get("review_id"),
+                        "thread_ids": thread_ids,
+                        "unresolved_thread_ids": unresolved_thread_ids,
+                    }
+                ),
+            }
+        )
+        return errors
+
     def _static_binding_errors(self) -> list[str]:
         expected_head = str(self.parameters.get("expected_head", ""))
         expected_base_sha = str(self.parameters.get("expected_base_sha", ""))
@@ -1162,6 +1657,10 @@ class CaptainMergeGuardRunner:
             "changed_paths": changed_paths,
             "changed_paths_sha256": _sha256_json(changed_paths),
         }
+        if not errors:
+            errors.extend(
+                self._revalidate_codex_review(bindings, phase="initial")
+            )
         return bindings, errors
 
     def _revalidate_dispatch_bindings(self, bindings: dict[str, Any]) -> list[str]:
@@ -1252,6 +1751,11 @@ class CaptainMergeGuardRunner:
         self.receipt["dispatch_revalidation"]["binding_sha256"] = _sha256_json(
             {field: viewed.get(field) for field in sorted(expected)}
         )
+        if not errors:
+            errors.extend(
+                self._revalidate_codex_review(bindings, phase="dispatch")
+            )
+        self.receipt["dispatch_revalidation"]["errors"] = list(errors)
         return errors
 
     def __call__(self, repo_path: Path, args: list[str]) -> dict[str, Any]:

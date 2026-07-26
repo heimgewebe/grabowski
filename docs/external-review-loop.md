@@ -4,7 +4,7 @@ Status: active
 
 ## Decision
 
-Grabowski self-review is the required review control. External LLM reviews, GitHub approvals, PR comments, and provider-specific packet reviews are optional diagnostics only. No review prose is posted to the PR as authoritative evidence.
+Grabowski self-review remains the universal required review control. For `high_critical` pull requests, and whenever `codex_review_required=true` is supplied, Captain additionally requires one current-head GitHub Codex settlement or one explicit short-lived exception. Other external LLM reviews, GitHub approvals, PR comments, and provider-specific packet reviews remain optional diagnostics. No review prose is treated as authoritative by itself.
 
 The required controls remain independent:
 
@@ -13,7 +13,8 @@ The required controls remain independent:
 3. terminal finding triage;
 4. green CI;
 5. mergeability and target identity;
-6. Captain authority and recovery controls where Captain executes the merge.
+6. current-head Codex settlement for high-critical or explicitly selected PRs;
+7. Captain authority and recovery controls where Captain executes the merge.
 
 ## Depth policy
 
@@ -98,7 +99,15 @@ For `pr-merge`, Captain `review_evidence` must be a valid `grabowski_self_review
 - no unaccepted material findings;
 - `tuning_signal: observe`.
 
-The audit may additionally carry action and target digests. Captain rejects mismatched bindings. The readiness grip also requires an independently supplied expected diff hash by default; a GitHub approval or changes-requested state is advisory and neither satisfies nor blocks the self-review contract.
+The audit may additionally carry action and target digests. Captain rejects mismatched bindings. The readiness grip also requires an independently supplied expected diff hash by default; a GitHub approval or changes-requested state neither satisfies nor blocks the self-review contract.
+
+For `high_critical` or explicitly required PRs, `codex_review_evidence` is a separate Captain gate. `tools/codex_review_settlement.py` creates an idempotent `@codex review` request whose hidden marker binds repository, PR, current head and current diff SHA-256. Settlement requires either a trusted Codex review bound to that head and submitted after the request or a trusted thumbs-up reaction on the exact request. Every bounded current-head Codex inline thread created after the request must be resolved. A new head or diff invalidates the request and all prior settlement evidence.
+
+Captain validates the evidence structurally and binds its digest into the short-lived execution intent. The atomic merge guard then reads the exact request, completion and current thread set from GitHub twice: once before acquiring merge resources and once immediately before `gh pr merge`. Any missing object, body or actor drift, stale head, changed diff, blocking review state, changed thread set, unresolved thread, truncated result window, failed GitHub read or evidence mismatch blocks fail-closed.
+
+The workflow status `Codex review settled` is a diagnostic projection. GitHub Actions supports review, review-comment and issue-comment triggers, but not the review-thread resolution webhook as a workflow trigger. Resolving a thread can therefore leave that status stale until another supported event or manual dispatch. Captain does not trust the status and always performs the authoritative live revalidation. The status must not be configured as a required repository check unless an independent supported refresh mechanism is introduced.
+
+A `grabowski_codex_review_exception` is allowed only as an explicit, repo/PR/head/diff-bound record with approver, reason and at most two hours of validity. It bypasses only the Codex settlement gate; it does not weaken self-review, CI, delivery, mergeability, authorization or live target checks.
 
 ## Audit tuning
 
@@ -122,7 +131,7 @@ Schema validation is intentionally structural. Current PR identity, `head_sha`, 
 
 ## Optional external diagnostics
 
-External review tools remain available for unusual uncertainty, incident analysis, or a deliberate second opinion. Their evidence may be supplied with `--external-review-evidence`; invalid evidence produces warnings, not a merge block. Legacy Claude packet requirements, policy waivers, and `self_review_required=false` are deprecated. External review output does not satisfy or shorten the required self-review loop.
+External review tools other than the conditional GitHub Codex settlement remain available for unusual uncertainty, incident analysis, or a deliberate second opinion. Their evidence may be supplied with `--external-review-evidence`; invalid evidence produces warnings, not a merge block. Legacy Claude packet requirements, policy waivers, and `self_review_required=false` are deprecated. No external review satisfies or shortens the required self-review loop.
 
 ## Cost policy
 
