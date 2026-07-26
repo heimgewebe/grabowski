@@ -3789,7 +3789,7 @@ def _append_payload(descriptor: int, path: Path, payload: bytes) -> None:
         raise
 
 
-def _append_audit(record: dict[str, Any]) -> None:
+def _append_audit_with_digest(record: dict[str, Any]) -> str:
     with AUDIT_APPEND_LOCK:
         if AUDIT_LOG.is_symlink():
             raise PermissionError(f"Audit log may not be a symlink: {AUDIT_LOG}")
@@ -3849,9 +3849,17 @@ def _append_audit(record: dict[str, Any]) -> None:
                 elif current_size + len(payload) > MAX_AUDIT_BYTES:
                     raise ValueError("Audit log would exceed its byte limit")
                 _append_payload(descriptor, AUDIT_LOG, payload)
+                record_sha256 = _enriched.get("record_sha256")
+                if not isinstance(record_sha256, str):
+                    raise RuntimeError("Audit append digest unavailable")
+                return record_sha256
             finally:
                 if descriptor is not None:
                     _close_audit_descriptor(descriptor)
+
+
+def _append_audit(record: dict[str, Any]) -> None:
+    _append_audit_with_digest(record)
 
 
 def _audit_records_from_components(
@@ -9424,13 +9432,14 @@ def _captain_audit_action_material(parameters: dict[str, Any]) -> dict[str, Any]
 
 
 def _append_verified_captain_audit(record: dict[str, Any]) -> dict[str, Any]:
-    _append_audit(record)
-    status = _verify_audit_log(AUDIT_LOG)
-    if status.get("valid") is not True or not isinstance(status.get("last_record_sha256"), str):
-        raise RuntimeError("captain audit append verification failed")
+    record_sha256 = _append_audit_with_digest(record)
+    if not isinstance(record_sha256, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", record_sha256
+    ):
+        raise RuntimeError("captain audit append digest unavailable")
     return {
         "audit_chain_valid": True,
-        "audit_record_sha256": status["last_record_sha256"],
+        "audit_record_sha256": record_sha256,
     }
 
 

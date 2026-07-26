@@ -2026,14 +2026,30 @@ class CaptainAuditTrailTests(unittest.TestCase):
         self.assertEqual(64, len(material["context_sha256"]))
         self.assertNotIn("do-not-log", json.dumps(material, sort_keys=True))
 
-    def test_verified_append_rejects_invalid_post_append_chain(self) -> None:
+    def test_verified_append_returns_the_exact_appended_record_digest(self) -> None:
         with (
-            patch.object(grabowski_mcp, "_append_audit") as append,
-            patch.object(grabowski_mcp, "_verify_audit_log", return_value={"valid": False, "last_record_sha256": None}),
+            patch.object(
+                grabowski_mcp, "_append_audit_with_digest", return_value="a" * 64
+            ) as append,
+            patch.object(
+                grabowski_mcp,
+                "_verify_audit_log",
+                side_effect=AssertionError("must not reread a moving chain tail"),
+            ) as verify,
         ):
-            with self.assertRaisesRegex(RuntimeError, "verification failed"):
-                grabowski_mcp._append_verified_captain_audit({"operation": "test"})
+            result = grabowski_mcp._append_verified_captain_audit(
+                {"operation": "test"}
+            )
+        self.assertEqual("a" * 64, result["audit_record_sha256"])
         append.assert_called_once_with({"operation": "test"})
+        verify.assert_not_called()
+
+    def test_verified_append_rejects_missing_atomic_digest(self) -> None:
+        with patch.object(
+            grabowski_mcp, "_append_audit_with_digest", return_value="invalid"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "digest unavailable"):
+                grabowski_mcp._append_verified_captain_audit({"operation": "test"})
 
     def test_intent_audit_failure_blocks_before_grip_dispatch(self) -> None:
         parameters = {"actions": [], "session_escalation": {"target": {}, "reason": "test"}}
