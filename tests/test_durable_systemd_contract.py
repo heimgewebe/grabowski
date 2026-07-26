@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+import subprocess
 import unittest
 
 
@@ -49,10 +51,30 @@ class DurableSystemdContractTests(unittest.TestCase):
         tunnel = (
             ROOT / "systemd" / "grabowski-tunnel-watchdog.timer.example"
         ).read_text(encoding="utf-8")
-        self.assertIn("OnUnitActiveSec=60s", operator)
-        self.assertIn("OnUnitActiveSec=30s", tunnel)
+        self.assertIn("OnCalendar=*-*-* *:*:00", operator)
+        self.assertIn("OnCalendar=*-*-* *:*:00,30", tunnel)
+        self.assertNotIn("OnUnitActiveSec=", operator)
+        self.assertNotIn("OnUnitActiveSec=", tunnel)
         self.assertIn("Persistent=true", operator)
         self.assertIn("Persistent=true", tunnel)
+
+    @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze unavailable")
+    def test_watchdog_calendar_cadences_are_accepted_by_systemd(self) -> None:
+        for expression in ("*-*-* *:*:00", "*-*-* *:*:00,30"):
+            with self.subTest(expression=expression):
+                completed = subprocess.run(
+                    ["systemd-analyze", "calendar", expression],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(
+                    0,
+                    completed.returncode,
+                    msg=(completed.stdout + completed.stderr),
+                )
 
     def test_component_watchdogs_are_productive_not_advisory(self) -> None:
         for name in (
