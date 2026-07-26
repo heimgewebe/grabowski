@@ -34,3 +34,16 @@ jobs:
 
       - name: Prove reproducible deployment staging
         run: make deploy-check
+
+      - name: Build temporary source archive
+        if: matrix.python-version == '3.12'
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/pr474-source.tar.gz" .
+
+      - name: Upload temporary source archive
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr474-source-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/pr474-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
