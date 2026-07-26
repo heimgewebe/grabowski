@@ -113,6 +113,8 @@ The workflow status `Codex review settled` is a diagnostic projection. GitHub Ac
 
 A `grabowski_codex_review_exception` is allowed only as an explicit, repo/PR/head/diff-bound record with approver, reason and at most two hours of validity. The published Captain evidence schema exposes it together with `codex_review_evidence` as the mutually exclusive `codex_review_release` alternative group and lists every runtime-required exception field. When Codex settlement is required, exactly one alternative must be present. The exception bypasses only the Codex settlement gate; it does not weaken self-review, CI, delivery, mergeability, authorization or live target checks.
 
+For `pr-merge`, the schema-version-1 Captain execution intent binds both Codex digest slots, including deterministic `null` hashes when the corresponding alternative is absent. Existing schema-version-1 intents for actions where Codex review is inapplicable, such as `runtime-deploy`, remain compatible when those two slots are omitted. If a non-merge intent supplies either slot, Captain still validates it against the expected digest; unknown evidence keys remain rejected.
+
 ## Audit tuning
 
 Audits support policy calibration. Useful aggregate signals are:

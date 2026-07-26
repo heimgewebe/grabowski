@@ -8931,6 +8931,57 @@ class CaptainExecutionIntentTests(unittest.TestCase):
 
                 self.assert_blocked_without_executor_calls(result, gh, f"execution_intent_evidence_drift:{key}")
 
+    def test_schema_v1_runtime_deploy_accepts_legacy_evidence_without_codex_keys(self) -> None:
+        action = captain_action(
+            action="runtime-deploy",
+            target={
+                "service": "grabowski-mcp",
+                "runtime_target": "heim-pc",
+                "adapter": "grabowski-self",
+            },
+            risk={
+                "risk_level": "high",
+                "irreversibility": "reversible",
+                "recovery_path": "roll back to the previous release",
+            },
+            receipt_path="receipts/captain/runtime-deploy.json",
+        )
+        parameters = self.executable_parameters([action])
+        intent = captain_execution_intent(parameters)
+        legacy_evidence = dict(intent["evidence_sha256"])
+        for key in grips.CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS:
+            legacy_evidence.pop(key)
+        intent["evidence_sha256"] = legacy_evidence
+        parameters["execution_intent"] = intent
+        actions = grips._captain_actions(
+            {"actions": parameters["actions"]},
+            gate_native_validation=True,
+        )
+
+        info, errors = grips._captain_execution_intent_review(parameters, actions)
+
+        self.assertEqual([], errors)
+        self.assertTrue(info["valid"])
+        for key in grips.CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS:
+            self.assertIsNone(info["evidence_sha256"][key])
+
+    def test_pr_merge_still_requires_codex_evidence_digest_slots(self) -> None:
+        parameters = self.executable_parameters()
+        intent = captain_execution_intent(parameters)
+        evidence = dict(intent["evidence_sha256"])
+        evidence.pop("codex_review_evidence_sha256")
+        intent["evidence_sha256"] = evidence
+        parameters["execution_intent"] = intent
+        gh = self.mergeable_gh()
+
+        result = self.run_captain_run(parameters, gh)
+
+        self.assert_blocked_without_executor_calls(
+            result,
+            gh,
+            "execution_intent_evidence_missing:codex_review_evidence_sha256",
+        )
+
     def test_captain_run_blocks_execution_intent_authorization_drift(self) -> None:
         mutations = (
             lambda parameters: parameters.__setitem__(

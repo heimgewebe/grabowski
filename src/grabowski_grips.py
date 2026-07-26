@@ -646,14 +646,17 @@ CAPTAIN_EXECUTION_INTENT_FIELDS = (
 CAPTAIN_EXECUTION_INTENT_ACTION_FIELDS = {
     "pr-merge": ("expected_base_sha",),
 }
+CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS = (
+    "codex_review_evidence_sha256",
+    "codex_review_exception_sha256",
+)
 CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
     "actions_sha256",
     "status_projection_sha256",
     "diff_sha256",
     "merge_delivery_receipt_sha256",
     "review_evidence_sha256",
-    "codex_review_evidence_sha256",
-    "codex_review_exception_sha256",
+    *CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS,
     "ci_evidence_sha256",
     "authorization_sha256",
 )
@@ -6238,9 +6241,19 @@ def _captain_execution_intent_review(
             if any(key not in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS for key in declared_evidence):
                 errors.append("execution_intent_evidence_unknown_keys_present")
             expected_evidence = _captain_execution_intent_expected_evidence(parameters, actions)
+            required_evidence_keys = (
+                CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
+                if action_name == "pr-merge"
+                else tuple(
+                    key
+                    for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
+                    if key not in CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS
+                )
+            )
             for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS:
                 if key not in declared_evidence:
-                    errors.append(f"execution_intent_evidence_missing:{key}")
+                    if key in required_evidence_keys:
+                        errors.append(f"execution_intent_evidence_missing:{key}")
                     continue
                 declared_value = declared_evidence.get(key)
                 value_status = _captain_intent_canonical_hex_status(declared_value, length=64)
