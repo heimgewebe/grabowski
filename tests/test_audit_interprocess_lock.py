@@ -50,6 +50,31 @@ class AuditInterprocessLockTests(unittest.TestCase):
                 self.assertFalse(status["exists"])
                 self.assertEqual(list(state.iterdir()), [])
 
+    def test_atomic_digest_stays_bound_after_a_later_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            audit, patches = self._state_patches(state)
+            with patches[0], patches[1], patches[2], patches[3]:
+                first_digest = grabowski_mcp._append_audit_with_digest(
+                    {"operation": "first"}
+                )
+                legacy_return = grabowski_mcp._append_audit(
+                    {"operation": "second"}
+                )
+                records = [
+                    json.loads(line)
+                    for line in audit.read_text(encoding="utf-8").splitlines()
+                ]
+                status = grabowski_mcp._verify_audit_log(audit)
+
+        self.assertIsNone(legacy_return)
+        self.assertEqual(first_digest, records[0]["record_sha256"])
+        self.assertNotEqual(first_digest, records[1]["record_sha256"])
+        self.assertEqual(
+            status["last_record_sha256"], records[1]["record_sha256"]
+        )
+
     def test_parallel_processes_append_one_valid_monotonic_chain(self) -> None:
         if "fork" not in multiprocessing.get_all_start_methods():
             self.skipTest("requires fork semantics")
