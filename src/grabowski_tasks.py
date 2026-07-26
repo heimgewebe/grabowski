@@ -28,6 +28,7 @@ import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
 import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
+import grabowski_terminal_convergence as terminal_convergence
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -3428,43 +3429,150 @@ def _reconcile_candidate_rows(task_id: str = "") -> list[dict[str, Any]]:
         record = _row(task_id)
         return (
             [record]
-            if record["state"] in {"launching", "running", "outcome_unknown"}
+            if record["state"]
+            in {"launching", "running", "outcome_unknown", "interrupted", "failed", "timed_out", "signalled"}
             else []
         )
     _recover_pending_task_terminalizations()
     with _database_connection() as connection:
         rows = connection.execute(
-            "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown') "
+            "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown', 'interrupted', 'failed', 'timed_out', 'signalled') "
             "ORDER BY created_at_unix, task_id"
         ).fetchall()
     return [dict(row) for row in rows]
 
 
+def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
+    terminalization = resources.task_terminalization_record(
+        str(record["task_id"]), include_projection=True
+    )
+    if terminalization is None:
+        return False, False
+    projection = terminalization.get("task_projection")
+    terminal_valid = bool(
+        terminalization.get("phase") == "projected"
+        and terminalization.get("lifecycle_receipt_sha256")
+        == record.get("lifecycle_receipt_sha256")
+        and terminalization.get("transition_sha256")
+        == record.get("terminalization_sha256")
+        and isinstance(projection, dict)
+        and projection.get("task_id") == record.get("task_id")
+        and projection.get("attempt") == record.get("attempt")
+        and projection.get("state") == record.get("state")
+    )
+    requested = terminalization.get("requested_resource_keys")
+    revoked = terminalization.get("revoked_resource_keys")
+    missing = terminalization.get("missing_resource_keys")
+    lease_valid = bool(
+        terminal_valid
+        and isinstance(requested, list)
+        and isinstance(revoked, list)
+        and isinstance(missing, list)
+        and not missing
+        and set(requested) == set(revoked)
+    )
+    return terminal_valid, lease_valid
+
+
+def _terminal_convergence_classification(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    observation_denied: bool = False,
+) -> dict[str, Any]:
+    terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+    current_state = str(record["state"])
+    observed_state = str(observation.get("state") or current_state)
+    if _is_terminal_state(current_state) and terminal_valid:
+        observed_state = current_state
+    return terminal_convergence.classify_terminal_failure(
+        current_state=current_state,
+        observed_state=observed_state,
+        resume_policy=str(record["resume_policy"]),
+        terminal_evidence_valid=terminal_valid,
+        lease_evidence_valid=lease_valid,
+        retry_count=max(0, int(record["attempt"]) - 1),
+        retry_limit=1,
+        observation_denied=observation_denied,
+    )
+
+
+def _terminal_retry_successor(
+    record: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    context = (
+        json.loads(record["chronik_context_json"])
+        if record.get("chronik_context_json")
+        else {}
+    )
+    started = grabowski_task_start(
+        str(record["host"]),
+        json.loads(record["argv_json"]),
+        cwd=str(record["cwd"]),
+        runtime_seconds=int(record["runtime_seconds"]),
+        resume_policy="manual",
+        cpu_weight=int(record["cpu_weight"]),
+        io_weight=int(record["io_weight"]),
+        memory_max_bytes=record.get("memory_max_bytes"),
+        resource_keys=_record_resource_keys(record),
+        chronik_outbox=bool(record.get("chronik_outbox_enabled")),
+        chronik_outbox_state_root=record.get("chronik_outbox_state_root"),
+        chronik_operation=str(context.get("operation") or "other"),
+        chronik_component=str(context.get("component") or ""),
+        chronik_bureau_task_id=str(context.get("bureau_task_id") or ""),
+        chronik_pr_number=(
+            int(context["pr_number"])
+            if isinstance(context.get("pr_number"), int)
+            else None
+        ),
+    )
+    task = dict(started["task"])
+    task["retry_of_task_id"] = record["task_id"]
+    task["retry_reason"] = _redact_reason(reason)
+    task["automatic_retry_budget_exhausted_after_start"] = True
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "task-reconcile-retry-successor",
+            "source_task_id": record["task_id"],
+            "source_lifecycle_receipt_sha256": record.get(
+                "lifecycle_receipt_sha256"
+            ),
+            "successor_task_id": task["task_id"],
+            "successor_resume_policy": task["resume_policy"],
+            "reason": _redact_reason(reason),
+        }
+    )
+    return task
+
+
 def _reconcile_blocker(record: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any] | None:
-    if observation["state"] == "running":
+    classification = _terminal_convergence_classification(record, observation)
+    if classification["reason_class"] == "running":
         return None
-    if observation["state"] == "completed":
-        return {
-            "task_id": record["task_id"],
-            "resume_policy": record["resume_policy"],
-            "reason": "completed task does not require resume",
-        }
-    if observation["state"] == "outcome_unknown":
-        return {
-            "task_id": record["task_id"],
-            "resume_policy": record["resume_policy"],
-            "reason": "outcome_unknown requires verification before retry",
-        }
-    if record["resume_policy"] != "retry-safe":
-        return {
-            "task_id": record["task_id"],
-            "resume_policy": record["resume_policy"],
-            "reason": "automatic resume requires retry-safe policy",
-        }
-    return None
+    if classification["automatic_resume_allowed"] is True:
+        return None
+    return {
+        "task_id": record["task_id"],
+        "resume_policy": record["resume_policy"],
+        "reason": classification["reason"],
+        "reason_class": classification["reason_class"],
+        "retryable": classification["retryable"],
+        "automatic_resume_allowed": classification["automatic_resume_allowed"],
+        "owner_decision_required": classification["owner_decision_required"],
+        "terminal_evidence_required": classification["terminal_evidence_required"],
+        "lease_evidence_required": classification["lease_evidence_required"],
+    }
 
 
 def _reconcile_observe_denial(record: dict[str, Any], exc: PermissionError) -> dict[str, Any]:
+    classification = _terminal_convergence_classification(
+        record,
+        {"state": record["state"]},
+        observation_denied=True,
+    )
     return {
         "task_id": record["task_id"],
         "host": record["host"],
@@ -3475,6 +3583,10 @@ def _reconcile_observe_denial(record: dict[str, Any], exc: PermissionError) -> d
         "current_state": record["state"],
         "resume_policy": record["resume_policy"],
         "reason": f"observation denied: {_redact_reason(str(exc))}",
+        "reason_class": classification["reason_class"],
+        "retryable": classification["retryable"],
+        "automatic_resume_allowed": classification["automatic_resume_allowed"],
+        "owner_decision_required": classification["owner_decision_required"],
     }
 
 
@@ -3495,6 +3607,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
         except PermissionError as exc:
             blocked.append(_reconcile_observe_denial(record, exc))
             continue
+        classification = _terminal_convergence_classification(record, observation)
         item = {
             "task_id": record["task_id"],
             "current_state": record["state"],
@@ -3503,6 +3616,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
             "execution_backend": _execution_backend(record),
             "systemd_scope": _systemd_scope(record),
             "resource_keys": _record_resource_keys(record),
+            "convergence": classification,
         }
         observations.append(item)
         if observation["state"] != record["state"]:
@@ -3619,11 +3733,23 @@ def reconcile_tasks_resume(
                     "task_id": stored["task_id"],
                     "resume_policy": stored["resume_policy"],
                     "reason": "max_resumes reached",
+                    "reason_class": "retry_exhausted",
+                    "retryable": False,
+                    "automatic_resume_allowed": False,
+                    "owner_decision_required": True,
                 }
             )
             continue
         try:
-            resumed.append(grabowski_task_resume(stored["task_id"])["task"])
+            if _is_terminal_state(str(stored["state"])):
+                resumed.append(
+                    _terminal_retry_successor(
+                        stored,
+                        reason=reason,
+                    )
+                )
+            else:
+                resumed.append(grabowski_task_resume(stored["task_id"])["task"])
         except Exception as exc:
             blocked.append(
                 {
