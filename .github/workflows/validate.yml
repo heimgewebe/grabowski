@@ -1,70 +1,36 @@
-name: PR 474 one-shot finalize
+name: validate
 
 on:
   pull_request:
-    types:
-      - synchronize
+  push:
+    branches:
+      - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  finalize:
-    if: github.event.pull_request.head.ref == 'fix/codex-review-settled-v1'
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.12"
+
     steps:
-      - name: Checkout exact PR branch
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          fetch-depth: 2
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Apply exact reviewed patch
-        env:
-          EXPECTED_PARENT: b90f11788daf887738699e6492f663c96ab80f08
-          EXPECTED_PATCH_SHA256: 891f314a391a50840535fd8a5ff5bb7a2dd112298fb67f6d8cb8b3484906b6d6
-          PATCH_GZIP_B64: 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
-          NORMAL_VALIDATE_GZIP_B64: H4sICExtZmoCA3ZhbGlkYXRlLnltbAB1Ustu2zAQvPMrFm6uciVRiiWdAuQHAgTotVhSa4uNRCp8ODGC/Huph13HbU8kZx8zO0uNAzVwxF616IkxoxsGMIa+/2npNZDzy9t10wkgLGrZkVteAAkMqDRjI9lBOaeMnkPSaE/auwYsYcvYLyNm/Ey0lNugXRIZIYigfUj6GHF+Dnk1kAk+GZQOEWwgT2fceRuTDqcz/x5Vn+wxyozX3tEKD+itej8nxQFOvjM6OZKdJP7BpwE2fJulm7+gfMNWRhqvxtWzYY8dyZeo71IV3CQSpZ8c+C7X8ANvuSxyKhFlKbBKyyovW9zdF1kqsyrLd1xgnYoMvsFxt023GbsheiYPYYSnWf9/2Bz5MCbLiA/lvkUu6hILwjrL6xp5QVVdlBWXvLrPs5JTIerdmTG9NH1Tvrt25sYzuPv4WH3dfg3B5+et7B/rnuP6R+OUN/Z06Ry33sRGL3T17b5WP1lznEutaYNUoidoaezNaYh/Ki4ED0of/tFvSUpm99lvbLrIodoCAAA=
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "$EXPECTED_PARENT"
-          test "$(git branch --show-current)" = "fix/codex-review-settled-v1"
-          printf '%s' "$PATCH_GZIP_B64" | base64 --decode | gzip --decompress > "$RUNNER_TEMP/pr474-code.patch"
-          test "$(sha256sum "$RUNNER_TEMP/pr474-code.patch" | cut -d' ' -f1)" = "$EXPECTED_PATCH_SHA256"
-          git apply --check "$RUNNER_TEMP/pr474-code.patch"
-          git apply --index "$RUNNER_TEMP/pr474-code.patch"
-          printf '%s' "$NORMAL_VALIDATE_GZIP_B64" | base64 --decode | gzip --decompress > .github/workflows/validate.yml
-          rm -f .github/workflows/pr474-source-export.yml
-          make context-refresh
-          git diff --check
+      - name: Validate repository
+        run: make validate
 
-      - name: Verify targeted behavior
-        run: |
-          set -euo pipefail
-          python3 -m unittest tests.test_codex_review_settlement -v
-          python3 -m unittest tests.test_codex_review_settlement_workflow -v
-          python3 -m unittest tests.test_grips -k reaction -v
-          python3 -m unittest tests.test_grips -k clean_comment -v
-
-      - name: Validate complete repository
-        run: |
-          set -euo pipefail
-          make validate
-          make deploy-check
-
-      - name: Commit and push exact validated tree
-        run: |
-          set -euo pipefail
-          git config user.name "grabowski-operator"
-          git config user.email "grabowski-operator@users.noreply.github.com"
-          git add -A
-          test -n "$(git status --short)"
-          git commit -m "fix(review): bind duplicate reactions and malformed outputs"
-          git push origin HEAD:fix/codex-review-settled-v1
+      - name: Prove reproducible deployment staging
+        run: make deploy-check
