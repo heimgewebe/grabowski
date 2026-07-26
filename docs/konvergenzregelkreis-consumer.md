@@ -23,7 +23,7 @@ Vor der Auswertung prüft Grabowski:
 5. regulären Evaluator;
 6. Konsistenz von Status, Schema und Exit-Code.
 
-Nur `terminally_closed` ergibt `closure_allowed=true`. Alle anderen fachlichen Zustände liefern einen gültigen, aber blockierenden Receipt. Eingabe-, Identitäts- und Ausführungsfehler scheitern geschlossen.
+Nur eine Transition-Assessment-Ausgabe mit `status=terminally_closed` ergibt `closure_allowed=true`. Für fachlich nichtterminale Zustände liefert der Grip weiterhin ein gültiges, aber blockierendes Consumer-Receipt. Eingabe-, Identitäts- und Ausführungsfehler scheitern geschlossen.
 
 ## Beispiel
 
@@ -38,10 +38,10 @@ Nur `terminally_closed` ergibt `closure_allowed=true`. Alle anderen fachlichen Z
 }
 ```
 
-Der Assessment-Receipt muss anschließend in den Abschlussbelegen referenziert werden. Er ersetzt weder Bureau-Abschluss noch Chronikpersistenz.
+Das Consumer-Receipt muss anschließend in den Abschlussbelegen referenziert werden. Es bindet die ausgewertete Transition-Assessment-Ausgabe, ersetzt aber weder Bureau-Abschluss noch Chronikpersistenz.
 
 ## Durchsetzungsgrenze
 
-Der funktionierende Consumer beweist nicht, dass jede mutierende Abschlussoberfläche ihn technisch erzwingt. Die Operator-Instruktion verlangt den Aufruf für Deployment-, Runtime-, Security-, Daten- und irreversible Arbeit; einzelne nachgelagerte Closeout-Oberflächen validieren den Receipt derzeit jedoch nicht selbst.
+Der funktionierende Consumer beweist nicht, dass jede mutierende Abschlussoberfläche ihn technisch erzwingt. Die Operator-Instruktion verlangt den Aufruf für Deployment-, Runtime-, Security-, Daten- und irreversible Arbeit; einzelne nachgelagerte Closeout-Oberflächen validieren das Consumer-Receipt und die darin gebundene Transition-Assessment-Ausgabe derzeit jedoch nicht selbst.
 
-Der revisionsgebundene Abdeckungsaudit unter [`convergence-closure-surface-coverage.md`](convergence-closure-surface-coverage.md) trennt semantische Abschlusslücken von reinen Prozess-, Effekt-, Lease- und Cleanup-Operationen. Bis zur dort beschriebenen Härtung muss der aufrufende Operator den Assessment-Receipt explizit an die konkrete Abschlussmutation binden.
+Der revisionsgebundene Abdeckungsaudit unter [`convergence-closure-surface-coverage.md`](convergence-closure-surface-coverage.md) trennt semantische Abschlusslücken von reinen Prozess-, Effekt-, Lease- und Cleanup-Operationen. Bis zur dort beschriebenen Härtung muss der aufrufende Operator das Consumer-Receipt und die darin gebundene Transition-Assessment-Ausgabe explizit an die konkrete Abschlussmutation binden.

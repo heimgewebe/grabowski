@@ -89,6 +89,21 @@ class ConvergenceCoverageContractTests(unittest.TestCase):
             self.assertIn(key.split(":", 1)[1], audit)
         self.assertTrue(self.proof["follow_up_required"])
 
+    def test_publication_and_pr_surfaces_are_explicit(self) -> None:
+        expected = {
+            "grip:branch-publish": "effect_only",
+            "grip:pr-create-or-update": "effect_only",
+            "tool:grabowski_bureau_task_publish": "effect_only",
+            "tool:grabowski_text_artifact_publish": "preflight_or_evidence",
+            "grip:pr-check-readiness": "read_only_observation",
+            "tool:grabowski_bureau_task_publish_preview": "read_only_observation",
+            "tool:grabowski_github_pr_view": "read_only_observation",
+        }
+        audit = AUDIT.read_text(encoding="utf-8")
+        for key, classification in expected.items():
+            self.assertEqual(classification, self.surfaces[key]["classification"])
+            self.assertIn(key.split(":", 1)[1], audit)
+
 
 if __name__ == "__main__":
     unittest.main()
