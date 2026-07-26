@@ -151,7 +151,7 @@ Bureau is not required for every single repo grip.
 
 Cabinet remains meaning, map and decision memory. Cabinet helps orient the operatorium. Cabinet is not a gate for every action.
 
-Steuerboard remains a read-only repo-state signal. Chronik/Plexer may provide event trace and transport. Event equals evidence; event does not equal command.
+Reposkop remains a target-bound read-only repository and checkout coherence signal. Chronik/Plexer may provide event trace and transport. Event equals evidence; event does not equal command.
 
 ## Grip registry priorities
 

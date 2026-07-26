@@ -9407,6 +9407,77 @@ def grip_list(profile: str = "operator") -> dict[str, Any]:
     return result
 
 
+def _captain_audit_action_material(parameters: dict[str, Any]) -> dict[str, Any]:
+    actions = parameters.get("actions")
+    action = actions[0] if isinstance(actions, list) and len(actions) == 1 and isinstance(actions[0], dict) else {}
+    target = action.get("target") if isinstance(action.get("target"), dict) else {}
+    context = parameters.get("execution_intent", {}).get("context") if isinstance(parameters.get("execution_intent"), dict) else None
+    return {
+        "action": action.get("action"),
+        "target_sha256": grabowski_grips.sha256_json(target),
+        "expected_head": parameters.get("expected_head") or target.get("expected_head") or target.get("head_sha"),
+        "expected_base": parameters.get("expected_base") or target.get("base"),
+        "expected_base_sha": parameters.get("expected_base_sha") or target.get("expected_base_sha"),
+        "context_sha256": grabowski_grips.sha256_json(context if isinstance(context, dict) else {}),
+        "request_sha256": grabowski_merge_guard.captain_request_sha256(parameters),
+    }
+
+
+def _append_verified_captain_audit(record: dict[str, Any]) -> dict[str, Any]:
+    _append_audit(record)
+    status = _verify_audit_log(AUDIT_LOG)
+    if status.get("valid") is not True or not isinstance(status.get("last_record_sha256"), str):
+        raise RuntimeError("captain audit append verification failed")
+    return {
+        "audit_chain_valid": True,
+        "audit_record_sha256": status["last_record_sha256"],
+    }
+
+
+def _captain_audit_intent(parameters: dict[str, Any], actor_identity: dict[str, Any]) -> dict[str, Any]:
+    actor = grabowski_merge_guard.verify_server_runtime_actor_identity(actor_identity)
+    material = _captain_audit_action_material(parameters)
+    return _append_verified_captain_audit(
+        {
+            "operation": "captain-run-audit-intent",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "intent",
+            "actor_id": actor["owner_id"],
+            **material,
+        }
+    )
+
+
+def _captain_audit_completion(
+    parameters: dict[str, Any],
+    actor_identity: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    intent_audit_sha256: str,
+) -> dict[str, Any]:
+    actor = grabowski_merge_guard.verify_server_runtime_actor_identity(actor_identity)
+    material = _captain_audit_action_material(parameters)
+    result_material = {
+        "status": result.get("status") or result.get("receipt", {}).get("status"),
+        "receipt_sha256": result.get("receipt_sha256") or result.get("receipt", {}).get("receipt_sha256"),
+        "output_sha256": result.get("receipt", {}).get("output_sha256"),
+    }
+    return _append_verified_captain_audit(
+        {
+            "operation": "captain-run-audit-completion",
+            "kind": "grabowski_captain_run_audit",
+            "schema_version": 1,
+            "phase": "completion",
+            "actor_id": actor["owner_id"],
+            **material,
+            "intent_audit_sha256": intent_audit_sha256,
+            "execution_result_sha256": grabowski_grips.sha256_json(result_material),
+            "execution_result": result_material,
+        }
+    )
+
+
 @mcp.tool(name="grip_run", annotations=CREATE_ANNOTATIONS)
 def grip_run(
     name: str,
@@ -9443,6 +9514,8 @@ def grip_run(
         )
     dispatch_parameters = dict(raw_parameters)
     dispatch_parameters.pop("session_escalation", None)
+    captain_actor_identity: dict[str, Any] | None = None
+    captain_intent_audit: dict[str, Any] | None = None
     if name == "captain-run":
         if ctx is None:
             return grabowski_grips._blocked_surface_receipt(
@@ -9462,6 +9535,7 @@ def grip_run(
                 profile=str(actor_profile),
             )
             dispatch_parameters["_server_runtime_actor_identity"] = actor_identity
+            captain_actor_identity = actor_identity
             execution_intent = dispatch_parameters.get("execution_intent")
             context = (
                 execution_intent.get("context")
@@ -9540,12 +9614,51 @@ def grip_run(
         dispatch_parameters["_server_agent_instructions_sha256"] = (
             AGENT_INSTRUCTIONS_SHA256
         )
-    return grabowski_grips.grip_run(
+    if name == "captain-run" and allow_mutation:
+        if captain_actor_identity is None:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                "captain audit actor identity is unavailable",
+            )
+        try:
+            captain_intent_audit = _captain_audit_intent(
+                dispatch_parameters,
+                captain_actor_identity,
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                f"captain audit intent unavailable: {type(exc).__name__}",
+            )
+    result = grabowski_grips.grip_run(
         name,
         dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
     )
+    if name == "captain-run" and allow_mutation and captain_actor_identity is not None and captain_intent_audit is not None:
+        try:
+            completion = _captain_audit_completion(
+                dispatch_parameters,
+                captain_actor_identity,
+                result,
+                intent_audit_sha256=captain_intent_audit["audit_record_sha256"],
+            )
+            result["captain_audit"] = {
+                "status": "complete",
+                "intent": captain_intent_audit,
+                "completion": completion,
+            }
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            result["captain_audit"] = {
+                "status": "completion_failed",
+                "intent": captain_intent_audit,
+                "error_class": type(exc).__name__,
+                "does_not_establish": ["audited_execution_completion"],
+            }
+    return result
 
 
 @mcp.tool(name="grabowski_task_archive_list", annotations=READ_ANNOTATIONS)

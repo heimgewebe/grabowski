@@ -192,7 +192,7 @@ Deliverables:
 - run deterministic checkout inventory,
 - mark retained, archived, dirty, obsolete and unknown checkouts,
 - prefer archive and recovery refs before cleanup,
-- document how Steuerboard branch-drift signal influences, but never authorizes, cleanup.
+- document how a target-bound Reposkop coherence report influences, but never authorizes, cleanup.
 
 Exit criteria:
 

@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,13 @@ import time
 from typing import Any, Iterator
 
 import grabowski_private_io as private_io
+
+try:
+    alert_outbox = importlib.import_module("grabowski_alert_outbox")
+except ModuleNotFoundError as exc:
+    if exc.name != "grabowski_alert_outbox":
+        raise
+    alert_outbox = None
 
 
 SCHEMA_VERSION = 1
@@ -404,6 +412,30 @@ def _record_path(obligation_id: str, name: str) -> Path:
     return _state_root() / obligation_id / name
 
 
+def _schedule_close_alert(close_record: dict[str, Any]) -> None:
+    if alert_outbox is None:
+        return
+    event_class = {
+        "blocked": "blocked_operation",
+        "completed": "long_run_completed",
+    }.get(close_record["outcome"])
+    if event_class is None:
+        return
+    try:
+        alert_outbox.enqueue_and_schedule(
+            event_class=event_class,
+            producer="operator_obligation",
+            correlation_key=str(close_record["obligation_id"]),
+            deduplication_key=str(close_record["record_sha256"]),
+            subject="operator_obligation",
+            fields={"outcome": str(close_record["outcome"])},
+        )
+    except Exception:
+        # The immutable close record remains authoritative when the advisory
+        # alert path cannot publish or schedule its dispatcher.
+        return
+
+
 def _read_private_json(path: Path) -> tuple[dict[str, Any], str]:
     flags = os.O_RDONLY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -531,13 +563,14 @@ def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any
         "material_sha256",
         "record_sha256",
     }
-    if set(record) != required:
+    optional = {"task_closeout_binding"}
+    if not required.issubset(record) or set(record) - required - optional:
         raise OperatorObligationIntegrityError("operator obligation close record shape is invalid")
     material = {
         key: record[key]
-        for key in required - {"closed_at", "material_sha256", "record_sha256"}
+        for key in set(record) - {"closed_at", "material_sha256", "record_sha256"}
     }
-    record_material = {key: record[key] for key in required - {"record_sha256"}}
+    record_material = {key: record[key] for key in set(record) - {"record_sha256"}}
     if (
         record["kind"] != CLOSE_KIND
         or record["schema_version"] != SCHEMA_VERSION
@@ -562,6 +595,27 @@ def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any
                 raise OperatorObligationInputError("completed close evidence must be SHA-256 bound")
             if record["blockers"] or record["delegation"] or record["next_action"]:
                 raise OperatorObligationInputError("completed close contains incompatible continuation fields")
+            task_references = [
+                item for item in open_record.get("references", [])
+                if item.get("kind") == "grabowski_task"
+            ]
+            binding = record.get("task_closeout_binding")
+            if task_references:
+                if not isinstance(binding, dict):
+                    raise OperatorObligationInputError("completed task-backed close lacks task closeout binding")
+                expected_keys = {
+                    "task_id", "attempt", "state", "lifecycle_receipt_sha256", "closeout_state"
+                }
+                if set(binding) != expected_keys:
+                    raise OperatorObligationInputError("task closeout binding shape is invalid")
+                if binding.get("task_id") != task_references[0].get("id"):
+                    raise OperatorObligationInputError("task closeout binding names another task")
+                _validate_sha256(
+                    binding.get("lifecycle_receipt_sha256"),
+                    label="task_closeout_binding.lifecycle_receipt_sha256",
+                )
+            elif binding is not None:
+                raise OperatorObligationInputError("non-task obligation may not contain task closeout binding")
         elif outcome == "blocked":
             _normalize_blockers(record["blockers"])
             if record["delegation"]:
@@ -826,6 +880,62 @@ def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]
     }
 
 
+def _validate_completed_task_closeout(
+    open_record: dict[str, Any],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    task_references = [
+        item for item in open_record.get("references", [])
+        if item.get("kind") == "grabowski_task"
+    ]
+    if not task_references:
+        return None
+    if len(task_references) != 1:
+        raise OperatorObligationInputError(
+            "completed task-backed obligation requires exactly one grabowski_task reference"
+        )
+    task_id = task_references[0]["id"]
+    import grabowski_task_attention as task_attention
+    import grabowski_tasks as tasks
+
+    try:
+        record = tasks._row(task_id)
+        closeout = task_attention.terminal_closeout_plan(record)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise OperatorObligationConflictError(
+            f"current task lifecycle truth is unavailable: {type(exc).__name__}"
+        ) from exc
+    lifecycle_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    if (
+        closeout.get("terminal") is not True
+        or closeout.get("lifecycle_evidence_valid") is not True
+        or not isinstance(lifecycle_receipt_sha256, str)
+        or closeout.get("outcome_receipt_sha256") != lifecycle_receipt_sha256
+        or closeout.get("task_binding", {}).get("task_id") != task_id
+        or closeout.get("task_binding", {}).get("attempt") != record.get("attempt")
+    ):
+        raise OperatorObligationConflictError(
+            "completed obligation task, outcome receipt and current lifecycle truth disagree"
+        )
+    matching_receipts = [
+        item for item in evidence
+        if item.get("source") == "receipt"
+        and item.get("status") == "passed"
+        and item.get("sha256") == lifecycle_receipt_sha256
+    ]
+    if not matching_receipts:
+        raise OperatorObligationInputError(
+            "completed task-backed obligation requires passed receipt evidence bound to the current lifecycle receipt"
+        )
+    return {
+        "task_id": task_id,
+        "attempt": record["attempt"],
+        "state": record["state"],
+        "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        "closeout_state": closeout["closeout_state"],
+    }
+
+
 def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
     allowed = {"obligation_id", "outcome", "evidence", "blockers", "delegation", "next_action"}
     _validate_exact_keys(
@@ -859,6 +969,10 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
                 raise OperatorObligationInputError("completed outcome evidence must be SHA-256 bound")
             if any(key in parameters for key in ("blockers", "delegation", "next_action")):
                 raise OperatorObligationInputError("completed outcome may not contain continuation fields")
+            task_closeout_binding = _validate_completed_task_closeout(
+                open_record,
+                evidence,
+            )
         elif outcome == "blocked":
             blockers = _normalize_blockers(parameters.get("blockers"))
             next_action = _validate_text(parameters.get("next_action"), label="next_action")
@@ -869,6 +983,8 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             next_action = _validate_text(parameters.get("next_action"), label="next_action")
             if "blockers" in parameters:
                 raise OperatorObligationInputError("delegated outcome may not contain blockers")
+        if outcome != "completed":
+            task_closeout_binding = None
         material = {
             "kind": CLOSE_KIND,
             "schema_version": SCHEMA_VERSION,
@@ -880,6 +996,8 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
             "delegation": delegation,
             "next_action": next_action,
         }
+        if task_closeout_binding is not None:
+            material["task_closeout_binding"] = task_closeout_binding
         material_sha256 = _sha256(material)
         payload = {**material, "closed_at": _utc_now(), "material_sha256": material_sha256}
         payload["record_sha256"] = _sha256(payload)
@@ -895,6 +1013,7 @@ def close_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
         _validate_close_record(winner, open_record=open_record, open_file_sha256=open_file_sha256)
         if winner["material_sha256"] != material_sha256:
             raise OperatorObligationConflictError("operator obligation already has a different terminal close")
+    _schedule_close_alert(winner)
     status = status_obligation(obligation_id)
     return {
         **status,

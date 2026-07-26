@@ -3,7 +3,10 @@ Description=Run Grabowski operator watchdog
 
 [Timer]
 OnBootSec=45s
-OnUnitActiveSec=60s
+# Calendar scheduling is independent of the oneshot service activation state.
+# This keeps a future elapse armed even when a prior watchdog run exits with a
+# non-success status or the user manager is reloaded after boot.
+OnCalendar=*-*-* *:*:00
 AccuracySec=5s
 # RandomizedDelaySec only decorrelates timer firings across units. Restart
 # pacing (exponential backoff with jitter and persisted

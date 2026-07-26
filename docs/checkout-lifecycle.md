@@ -31,7 +31,7 @@ Branch-Löschung.
 | `primary` | `main` | Haupt-Worktree; nie temporärer Cleanup-Kandidat. |
 | `dirty` | `dirty` | Änderungen oder untracked Dateien vorhanden; erst reviewen oder retainen. |
 | `retained` | `retained`, `completed_retained`, `completed_retained_blocked` | Aktive managed Arbeit ist wirksam retained; terminale managed Arbeit bleibt bis zur Archivierung explizit sichtbar. |
-| `archived` | `archived_grace`, `archived_blocked` | Eine konsistente `phase=archived`-Bindung besitzt ein passendes offenes Recovery-Archiv; Grace oder aktive Koordination blockieren Cleanup. |
+| `archived` | `archived_blocked` | Eine konsistente `phase=archived`-Bindung besitzt ein passendes offenes Recovery-Archiv; nur aktive Koordination blockiert die Erstellung des Cleanup-Dry-Runs. |
 | `obsolete` | `cleanup_candidate`, `prunable_or_missing` | Nur lokal gemeint: ein sauberer Checkout hat ein passendes offenes Recovery-Archiv und braucht vor Apply trotzdem einen Dry-Run; oder Git meldet den Worktree als prunable/missing. |
 | `unknown` | `unclassified_clean`, `managed_active_attention`, `managed_lifecycle_drift`, `archive_drifted`, `archive_closed`, `blocked_unarchived`, `unobservable` | Lokale Evidenz reicht nicht für eine sichere Lifecycle-Entscheidung. `unclassified_clean` bleibt unmanaged oder legacy; managed Retention-Ablauf und Identitätsdrift werden ausdrücklich blockierend. |
 
@@ -61,8 +61,10 @@ Die Phasen werden read-only wie folgt projiziert:
   nicht auf `unclassified_clean` zurück.
 - `completed_retained` bleibt als terminal-retained und
   archivierungspflichtig sichtbar.
-- `archived` gelangt nur mit passendem offenem Recovery-Archiv in
-  `archived_grace`, `archived_blocked` oder `cleanup_candidate`.
+- `archived` gelangt mit passendem offenem Recovery-Archiv unmittelbar in
+  `archived_blocked` oder `cleanup_candidate`; eine zeitbasierte Grace existiert nicht.
+- Agent-Workspace-Cleanup archiviert und entfernt nie im selben Top-Level-Aufruf:
+  Nach `archived_ready_for_cleanup` folgt ohne Wartezeit ein frischer Plan und ein zweiter Aufruf.
 - Unbekannte Phase oder widersprüchliche Path-, Repository-, Branch-, Owner-,
   Head-, Retention- oder Archivdaten werden `managed_lifecycle_drift`.
 
@@ -81,7 +83,7 @@ vergleicht solche Bindings read-only mit der kanonischen Git-Beobachtung und
 projiziert unklare oder widersprüchliche Fälle blockierend. Die Binding-Zeile
 darf nicht aus Abwesenheit allein automatisch entfernt oder terminalisiert werden.
 
-Steuerboard-, Bureau- oder GitHub-Signale können helfen, die `unknown`-Fälle zu
+Reposkop-, Bureau- oder GitHub-Signale können helfen, die `unknown`-Fälle zu
 priorisieren. Sie ersetzen aber nicht Recovery-Ref, Dirty-State-Prüfung,
 Owner-Entscheidung und Dry-Run-Plan-Hash. Der Name `obsolete` bedeutet hier
 nicht: Branch löschen. Er bedeutet: lokal cleanupfähig wirkende Arbeitskopie,

@@ -133,6 +133,14 @@ def _run_ready_recovery_status(
 
 
 class RecoveryToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.alerts = patch.object(
+            recovery.alert_outbox,
+            "enqueue_and_schedule",
+        )
+        self.alerts.start()
+        self.addCleanup(self.alerts.stop)
+
     def test_publication_failure_detail_prefers_structured_reason(self) -> None:
         self.assertEqual(
             recovery._publication_failure_detail(
@@ -526,6 +534,55 @@ class RecoveryToolTests(unittest.TestCase):
             [call.args[0] for call in require.call_args_list],
             ["secret_use", "file_write", "terminal_execute"],
         )
+
+    def test_probe_alerts_recovery_and_preserves_failure_outcome(self) -> None:
+        success = {
+            "snapshot_id": "abc12345",
+            "source_recovery": {"source_record_sha256": "a" * 64},
+        }
+        with patch.object(
+            recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": False},
+        ), patch.object(
+            recovery.base,
+            "_require_capability",
+        ), patch.object(
+            recovery,
+            "server_recovery_probe",
+            return_value=success,
+        ), patch.object(
+            recovery.alert_outbox,
+            "enqueue_and_schedule",
+            side_effect=RuntimeError("dispatcher unavailable"),
+        ) as enqueue:
+            result = recovery.grabowski_recovery_server_probe()
+
+        self.assertIs(result, success)
+        self.assertEqual("recovery", enqueue.call_args.kwargs["event_class"])
+        self.assertEqual("a" * 64, enqueue.call_args.kwargs["deduplication_key"])
+
+        with patch.object(
+            recovery.base,
+            "_kill_switch_state",
+            return_value={"engaged": False},
+        ), patch.object(
+            recovery.base,
+            "_require_capability",
+        ), patch.object(
+            recovery,
+            "server_recovery_probe",
+            side_effect=RuntimeError("primary failure"),
+        ), patch.object(
+            recovery.alert_outbox,
+            "enqueue_and_schedule",
+            side_effect=OSError("dispatcher unavailable"),
+        ) as enqueue:
+            with self.assertRaisesRegex(RuntimeError, "primary failure"):
+                recovery.grabowski_recovery_server_probe()
+
+        self.assertEqual("service_failure", enqueue.call_args.kwargs["event_class"])
+        self.assertEqual("RuntimeError", enqueue.call_args.kwargs["deduplication_key"])
 
     def test_probe_refuses_manual_or_environment_kill_switch(self) -> None:
         with patch.object(

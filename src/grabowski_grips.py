@@ -3222,7 +3222,7 @@ def _run_worktree_hygiene_reconcile(
         retention = lifecycle.get("retention") if isinstance(lifecycle.get("retention"), dict) else {}
         existing_until = retention.get("retention_until_unix")
         retention_until = max(
-            now + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS + 3600,
+            now + 3600,
             existing_until if isinstance(existing_until, int) else 0,
         )
         result = grabowski_checkouts.grabowski_checkout_archive(
@@ -3244,10 +3244,8 @@ def _run_worktree_hygiene_reconcile(
             "branch": branch,
             "merged_pr": terminal,
             "ownership_mode": owner_mode,
-            "cleanup_not_before_unix": (
-                result["archive"]["created_at_unix"]
-                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-            ),
+            "cleanup_not_before_unix": result["archive"]["created_at_unix"],
+            "cleanup_available_at_unix": result["archive"]["created_at_unix"],
         })
         actions += 1
 
@@ -3286,7 +3284,7 @@ def _run_worktree_hygiene_reconcile(
         "does_not_establish": [
             "permission_to_delete_branches",
             "terminality_without_exact_merged_pr_or_existing_archive",
-            "cleanup_before_24_hour_archive_grace",
+            "cleanup_without_matching_recovery_archive_or_fresh_dry_run",
             "authority_over_foreign_owners",
         ],
     }
