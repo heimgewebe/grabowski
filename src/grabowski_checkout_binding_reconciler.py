@@ -30,6 +30,7 @@ CHECKOUT_DATABASE_SCHEMA_VERSION = "1"
 RECONCILER_STATES = frozenset(
     {
         "bound_present",
+        "archived_cleaned",
         "orphaned_binding",
         "repository_unobservable",
         "binding_identity_drift",
@@ -133,6 +134,37 @@ def _archive_evidence(value: object) -> dict[str, Any] | None:
     }
 
 
+def _archive_cleanup_evidence(
+    binding: Mapping[str, Any],
+    phase: str | None,
+) -> tuple[bool, list[str]]:
+    """Verify the durable archive record that proves a linked checkout was cleaned."""
+    archive = binding.get("latest_archive")
+    if not isinstance(archive, Mapping):
+        return False, []
+    cleaned_at_unix = _integer(archive.get("cleaned_at_unix"))
+    cleanup_plan_id = _text(archive.get("cleanup_plan_id"))
+    if cleaned_at_unix is None and cleanup_plan_id is None:
+        return False, []
+    reasons: list[str] = []
+    if phase != "archived":
+        reasons.append("binding-cleaned-archive-phase-mismatch")
+    if _text(archive.get("archive_id")) is None:
+        reasons.append("binding-cleaned-archive-id-missing")
+    if cleaned_at_unix is None or cleaned_at_unix <= 0:
+        reasons.append("binding-archive-cleaned-at-invalid")
+    if cleanup_plan_id is None:
+        reasons.append("binding-archive-cleanup-plan-missing")
+    created_at_unix = _integer(archive.get("created_at_unix"))
+    if (
+        cleaned_at_unix is not None
+        and created_at_unix is not None
+        and cleaned_at_unix < created_at_unix
+    ):
+        reasons.append("binding-archive-cleaned-before-created")
+    return not reasons, reasons
+
+
 def _evidence(binding: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "owner_id": _text(binding.get("owner_id")),
@@ -198,6 +230,10 @@ def reconcile_binding(
     phase = _text(binding.get("phase"))
     if phase not in LIFECYCLE_PHASES:
         reasons.append("binding-phase-invalid")
+    cleaned_archive, archive_cleanup_reasons = _archive_cleanup_evidence(
+        binding, phase
+    )
+    reasons.extend(archive_cleanup_reasons)
     reasons.extend(_durable_evidence_drift_reasons(binding, phase))
     reasons.extend(
         reason for reason in ambiguity_reasons if isinstance(reason, str) and reason
@@ -210,8 +246,11 @@ def reconcile_binding(
         state = "repository_unobservable"
         reasons.append("repository-state-unobservable")
     elif worktree is None:
-        state = "orphaned_binding"
-        reasons.append("binding-has-no-current-git-worktree-record")
+        if cleaned_archive:
+            state = "archived_cleaned"
+        else:
+            state = "orphaned_binding"
+            reasons.append("binding-has-no-current-git-worktree-record")
     else:
         assert worktree_identity is not None
         reasons.extend(
@@ -227,6 +266,8 @@ def reconcile_binding(
         ):
             if binding_identity[field] != worktree_identity[field]:
                 reasons.append(f"{field.replace('_', '-')}-mismatch")
+        if cleaned_archive:
+            reasons.append("cleaned-archive-worktree-still-present")
         if phase in {"completed_retained", "archived"}:
             expected_head = _text(binding.get("expected_head"))
             current_head = _text(worktree.get("head"))
@@ -236,7 +277,7 @@ def reconcile_binding(
                 reasons.append("terminal-head-mismatch")
         state = "binding_identity_drift" if reasons else "bound_present"
 
-    blocking = state != "bound_present"
+    blocking = state not in {"bound_present", "archived_cleaned"}
     return {
         "schema_version": RECONCILER_SCHEMA_VERSION,
         "checkout_key": binding_identity["checkout_key"],
@@ -248,6 +289,7 @@ def reconcile_binding(
         "evidence": _evidence(binding),
         "recommended_next_step": {
             "bound_present": "use_existing_checkout_lifecycle_projection",
+            "archived_cleaned": "use_cleaned_archive_lifecycle_projection",
             "orphaned_binding": "inspect_git_and_binding_history_without_mutation",
             "repository_unobservable": "restore_repository_observability_before_decision",
             "binding_identity_drift": "reconcile_binding_identity_before_lifecycle_action",

@@ -82,6 +82,11 @@ zu dieser Worktree-Inventarsicht. `grabowski_checkout_binding_reconciliation`
 vergleicht solche Bindings read-only mit der kanonischen Git-Beobachtung und
 projiziert unklare oder widersprüchliche Fälle blockierend. Die Binding-Zeile
 darf nicht aus Abwesenheit allein automatisch entfernt oder terminalisiert werden.
+Nur wenn ein identitätsgleiches `archived`-Binding zusätzlich einen vollständigen
+Archive-Record mit positivem `cleaned_at_unix` und gebundener `cleanup_plan_id`
+besitzt, wird die frisch beobachtete Checkout-Abwesenheit als `archived_cleaned`
+terminal und nicht blockierend projiziert. Daraus entsteht weiterhin keine neue
+Cleanup-, Branch-Lösch- oder Binding-Löschautorität.
 
 Reposkop-, Bureau- oder GitHub-Signale können helfen, die `unknown`-Fälle zu
 priorisieren. Sie ersetzen aber nicht Recovery-Ref, Dirty-State-Prüfung,

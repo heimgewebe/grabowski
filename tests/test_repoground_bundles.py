@@ -1929,6 +1929,52 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["snippets"][0]["path"], "src/first.py")
         self.assertEqual(result["snippets"][0]["text_excerpt"], "first usable")
 
+    def test_filtered_query_fills_limit_after_empty_projected_result(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payloads = {
+            "source_citation_projection.items": {
+                "status": "available",
+                "source_citation_projection": {
+                    "items": [
+                        {"path": "src/empty.py", "text_excerpt": ""},
+                        {
+                            "path": "src/usable.py",
+                            "text_excerpt": "usable projected result",
+                        },
+                    ]
+                },
+            },
+            "query_result.results": {
+                "status": "available",
+                "query_result": {
+                    "count": 2,
+                    "results": [
+                        {"path": "src/empty.py", "text": ""},
+                        {"path": "src/usable.py", "text": "usable query result"},
+                    ],
+                },
+            },
+        }
+
+        for source_shape, payload in payloads.items():
+            with (
+                self.subTest(source_shape=source_shape),
+                patch.object(
+                    mcp, "_repoground_query_existing_index", return_value=payload
+                ),
+            ):
+                result = mcp.repoground_query(
+                    "demo-repo",
+                    "target",
+                    filters={"path": "src/*.py"},
+                    max_snippets=1,
+                )
+
+            self.assertEqual(result["query_shape"], source_shape)
+            self.assertEqual(result["hit_count"], 1)
+            self.assertEqual(result["snippets"][0]["path"], "src/usable.py")
+
     def test_filtered_query_keeps_explicit_low_level_path(self) -> None:
         _repo, head = self._git_repo("demo-repo")
         self._write_bundle("demo-repo-max-260701-1200", commit=head)
@@ -1999,6 +2045,28 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertEqual(result["strategy"], "none")
         self.assertEqual(result["retrieval"]["match_count"], 0)
         self.assertEqual(result["repoground_status"]["reason"], "index_unavailable")
+
+    def test_agent_query_preserves_unavailable_evidence_status(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payload = {
+            "status": "available",
+            "route": "text_retrieval",
+            "retrieval": {"strategy": "none", "match_count": 0},
+            "resolved_ranges": [],
+            "availability": {
+                "status": "unavailable",
+                "caveats": [{"kind": "missing_artifact"}],
+            },
+        }
+
+        with patch.object(mcp, "_repoground_agent_query", return_value=payload):
+            result = mcp.repoground_query("demo-repo", "target")
+
+        self.assertFalse(result["available"])
+        self.assertEqual(result["status"], "available")
+        self.assertEqual(result["availability"]["status"], "unavailable")
+        self.assertEqual(result["strategy"], "none")
 
     def test_context_pack_binds_route_strategy_and_budget(self) -> None:
         _repo, head = self._git_repo("demo-repo")
