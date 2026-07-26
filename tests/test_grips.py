@@ -8918,3 +8918,44 @@ class BureauPickupGripTests(unittest.TestCase):
             )
         self.assertEqual("blocked", blocked["receipt"]["status"])
         self.assertEqual("run-still-active", blocked["output"]["error"])
+
+
+class CaptainTypedEnvelopeTests(unittest.TestCase):
+    def test_typed_envelope_is_frozen_and_serializes_public_contract(self) -> None:
+        from dataclasses import FrozenInstanceError
+
+        model = grips.CaptainActionEnvelope(
+            index=0,
+            action="pr-merge",
+            target={"repository": "heimgewebe/grabowski", "pull_request": 1},
+            scope={"repositories": ["heimgewebe/grabowski"]},
+            risk={"irreversibility": "reversible", "recovery_path": "revert merge"},
+            target_change_required=False,
+            target_change=None,
+            irreversibility_record=None,
+            receipt_path="receipts/captain.json",
+            evidence_schema={"schema_version": 1},
+            created_at="2026-07-26T00:00:00Z",
+        )
+        with self.assertRaises(FrozenInstanceError):
+            model.action = "runtime-deploy"  # type: ignore[misc]
+        actions = grips._captain_serialize_actions([model])
+        self.assertEqual(1, len(actions))
+        action = actions[0]
+        self.assertEqual("captain", action["role"])
+        self.assertTrue(action["high_impact"])
+        self.assertEqual("not-performed", action["execution"])
+        self.assertEqual(action["action_sha256"], action["envelope"]["action_sha256"])
+        self.assertEqual(action["target_sha256"], action["envelope"]["target_sha256"])
+        self.assertEqual(action["actions_sha256"], action["envelope"]["actions_sha256"])
+
+    def test_typed_builder_preserves_existing_public_action_shape(self) -> None:
+        with patch.object(grips, "utc_now", return_value="2026-07-26T00:00:00Z"):
+            action = grips._captain_actions(captain_parameters())[0]
+        self.assertIsInstance(action, dict)
+        self.assertEqual(1, action["envelope"]["schema_version"])
+        self.assertEqual(action["target"], action["envelope"]["target"])
+        self.assertEqual(action["scope"], action["envelope"]["scope"])
+        self.assertEqual("2026-07-26T00:00:00Z", action["envelope"]["created_at"])
+        self.assertEqual(grips._captain_action_sha256(action), action["action_sha256"])
+
