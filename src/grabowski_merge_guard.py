@@ -1303,11 +1303,23 @@ class CaptainMergeGuardRunner:
                 if (
                     actor not in _CODEX_REVIEW_ACTORS
                     or item.get("commit_id") != head_sha
-                    or submitted is None
-                    or request_time is None
-                    or submitted < request_time
                     or isinstance(review_id, bool)
                     or not isinstance(review_id, int)
+                ):
+                    continue
+                if state == "PENDING":
+                    live_reviews.append(
+                        {
+                            "id": review_id,
+                            "state": state,
+                            "submitted": None,
+                        }
+                    )
+                    continue
+                if (
+                    submitted is None
+                    or request_time is None
+                    or submitted < request_time
                 ):
                     continue
                 live_reviews.append(
@@ -1317,16 +1329,27 @@ class CaptainMergeGuardRunner:
                         "submitted": submitted,
                     }
                 )
-        live_reviews.sort(key=lambda item: (item["submitted"], item["id"]))
+        minimum_time = datetime.min.replace(tzinfo=timezone.utc)
+        live_reviews.sort(
+            key=lambda item: (
+                item["submitted"] if isinstance(item["submitted"], datetime) else minimum_time,
+                item["id"],
+            )
+        )
+        pending_reviews = [
+            item for item in live_reviews if item["state"] == "PENDING"
+        ]
+        if pending_reviews:
+            errors.append("merge_guard_codex_outstanding_pending_review")
         blockers = [
-            item
-            for item in live_reviews
-            if item["state"] in {"CHANGES_REQUESTED", "PENDING"}
+            item for item in live_reviews if item["state"] == "CHANGES_REQUESTED"
         ]
         if blockers:
             latest_blocker = blockers[-1]
             superseding_approval = any(
                 item["state"] == "APPROVED"
+                and isinstance(item["submitted"], datetime)
+                and isinstance(latest_blocker["submitted"], datetime)
                 and (item["submitted"], item["id"])
                 > (latest_blocker["submitted"], latest_blocker["id"])
                 for item in live_reviews
@@ -1339,7 +1362,11 @@ class CaptainMergeGuardRunner:
                 {
                     "id": item["id"],
                     "state": item["state"],
-                    "submitted_at": item["submitted"].isoformat(),
+                    "submitted_at": (
+                        item["submitted"].isoformat()
+                        if isinstance(item["submitted"], datetime)
+                        else None
+                    ),
                 }
                 for item in live_reviews
             ]

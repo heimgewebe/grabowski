@@ -4509,6 +4509,8 @@ def _captain_action_evidence_item(
     required_parameters: tuple[str, ...] = (),
     parameter_bindings: dict[str, Any] | None = None,
     required_when: str | None = None,
+    alternative_group: str | None = None,
+    mutually_exclusive_with: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "name": name,
@@ -4526,6 +4528,10 @@ def _captain_action_evidence_item(
         item["parameter_bindings"] = dict(parameter_bindings)
     if required_when is not None:
         item["required_when"] = required_when
+    if alternative_group is not None:
+        item["alternative_group"] = alternative_group
+    if mutually_exclusive_with:
+        item["mutually_exclusive_with"] = list(mutually_exclusive_with)
     return item
 
 
@@ -4638,7 +4644,43 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                 },
                 binds=("expected_head", "expected_base_sha", "diff_sha256", *common_bindings),
                 purpose="current-head GitHub Codex review or trusted clean reaction with terminal inline-thread triage",
-                required_when="review_evidence.review_tier_is_high_critical_or_codex_review_required_is_true",
+                required_when=(
+                    "codex_review_release_is_required_and_"
+                    "codex_review_exception_is_absent"
+                ),
+                alternative_group="codex_review_release",
+                mutually_exclusive_with=("codex_review_exception",),
+            ),
+            _captain_action_evidence_item(
+                "codex_review_exception",
+                required_fields=(
+                    "schema_version",
+                    "kind",
+                    "repo",
+                    "pr",
+                    "head_sha",
+                    "diff_sha256",
+                    "generated_at",
+                    "expires_at",
+                    "approved_by",
+                    "reason",
+                    "exception_sha256",
+                ),
+                required_values={
+                    "schema_version": 1,
+                    "kind": "grabowski_codex_review_exception",
+                },
+                binds=("expected_head", "diff_sha256", *common_bindings),
+                purpose=(
+                    "explicit repo/PR/head/diff-bound Codex exception valid for at "
+                    "most two hours; it bypasses only the Codex settlement gate"
+                ),
+                required_when=(
+                    "codex_review_release_is_required_and_"
+                    "codex_review_evidence_is_absent"
+                ),
+                alternative_group="codex_review_release",
+                mutually_exclusive_with=("codex_review_evidence",),
             ),
             _captain_action_evidence_item(
                 "ci_evidence",
@@ -4656,6 +4698,19 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                 required_when="trusted_owner_autonomy_does_not_apply",
             ),
         ])
+        schema["evidence_alternatives"] = [
+            {
+                "name": "codex_review_release",
+                "exactly_one_of": [
+                    "codex_review_evidence",
+                    "codex_review_exception",
+                ],
+                "required_when": (
+                    "review_evidence.review_tier_is_high_critical_or_"
+                    "codex_review_required_is_true"
+                ),
+            }
+        ]
     elif action_name == "runtime-deploy":
         origin_key = "repo" if isinstance(target.get("repo"), str) and target.get("repo", "").strip() else "service"
         runtime_key = (

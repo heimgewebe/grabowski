@@ -371,11 +371,21 @@ def _review_completion(
         if (
             actor not in TRUSTED_CODEX_ACTORS
             or commit_sha != head_sha
-            or submitted is None
-            or submitted < request_time
             or isinstance(review_id, bool)
             or not isinstance(review_id, int)
         ):
+            continue
+        if state == "PENDING":
+            candidates.append(
+                {
+                    **review,
+                    "_actor": actor,
+                    "_submitted": None,
+                    "_state": state,
+                }
+            )
+            continue
+        if submitted is None or submitted < request_time:
             continue
         candidates.append(
             {
@@ -387,20 +397,32 @@ def _review_completion(
         )
 
     def order(item: dict[str, Any]) -> tuple[datetime, int]:
-        return item["_submitted"], item["databaseId"]
+        submitted = item["_submitted"]
+        if not isinstance(submitted, datetime):
+            raise SettlementError("submitted review ordering requires a timestamp")
+        return submitted, item["databaseId"]
 
     selected: dict[str, Any] | None = None
-    blockers = [item for item in candidates if item["_state"] in BLOCKING_REVIEW_STATES]
-    if blockers:
-        latest_blocker = max(blockers, key=order)
-        approvals = [
-            item
-            for item in candidates
-            if item["_state"] == "APPROVED" and order(item) > order(latest_blocker)
-        ]
-        selected = max(approvals, key=order) if approvals else latest_blocker
+    pending = [item for item in candidates if item["_state"] == "PENDING"]
+    if pending:
+        selected = max(pending, key=lambda item: item["databaseId"])
     else:
-        accepted = [item for item in candidates if item["_state"] in ACCEPTED_REVIEW_STATES]
+        blockers = [
+            item for item in candidates if item["_state"] == "CHANGES_REQUESTED"
+        ]
+        if blockers:
+            latest_blocker = max(blockers, key=order)
+            approvals = [
+                item
+                for item in candidates
+                if item["_state"] == "APPROVED"
+                and order(item) > order(latest_blocker)
+            ]
+            selected = max(approvals, key=order) if approvals else latest_blocker
+    if selected is None:
+        accepted = [
+            item for item in candidates if item["_state"] in ACCEPTED_REVIEW_STATES
+        ]
         if accepted:
             selected = max(accepted, key=order)
 

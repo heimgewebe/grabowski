@@ -6097,6 +6097,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 "status_projection",
                 "review_evidence",
                 "codex_review_evidence",
+                "codex_review_exception",
                 "ci_evidence",
                 "human_authorization",
             },
@@ -6107,6 +6108,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             item for item in schema["required_evidence"]
             if item["name"] == "codex_review_evidence"
         )
+        codex_review_exception = next(
+            item for item in schema["required_evidence"]
+            if item["name"] == "codex_review_exception"
+        )
         ci_evidence = next(item for item in schema["required_evidence"] if item["name"] == "ci_evidence")
         self.assertIn("diff_sha256", review_evidence["required_fields"])
         self.assertIn("repo", review_evidence["required_fields"])
@@ -6116,7 +6121,11 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertIn("expected_head", review_evidence["binds"])
         self.assertEqual(
             codex_review_evidence["required_when"],
-            "review_evidence.review_tier_is_high_critical_or_codex_review_required_is_true",
+            "codex_review_release_is_required_and_codex_review_exception_is_absent",
+        )
+        self.assertEqual(
+            codex_review_exception["required_when"],
+            "codex_review_release_is_required_and_codex_review_evidence_is_absent",
         )
         self.assertLessEqual(
             {
@@ -6132,6 +6141,63 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertIn("completion", codex_review_evidence["required_fields"])
         self.assertIn("expected_head", codex_review_evidence["binds"])
+        self.assertEqual(
+            codex_review_evidence["alternative_group"],
+            "codex_review_release",
+        )
+        self.assertEqual(
+            codex_review_evidence["mutually_exclusive_with"],
+            ["codex_review_exception"],
+        )
+        self.assertLessEqual(
+            {
+                "schema_version",
+                "kind",
+                "repo",
+                "pr",
+                "head_sha",
+                "diff_sha256",
+                "generated_at",
+                "expires_at",
+                "approved_by",
+                "reason",
+                "exception_sha256",
+            },
+            set(codex_review_exception["required_fields"]),
+        )
+        self.assertEqual(
+            codex_review_exception["required_values"],
+            {
+                "schema_version": 1,
+                "kind": "grabowski_codex_review_exception",
+            },
+        )
+        self.assertIn("expected_head", codex_review_exception["binds"])
+        self.assertIn("diff_sha256", codex_review_exception["binds"])
+        self.assertEqual(
+            codex_review_exception["alternative_group"],
+            "codex_review_release",
+        )
+        self.assertEqual(
+            codex_review_exception["mutually_exclusive_with"],
+            ["codex_review_evidence"],
+        )
+        self.assertEqual(
+            schema["evidence_alternatives"],
+            [
+                {
+                    "name": "codex_review_release",
+                    "exactly_one_of": [
+                        "codex_review_evidence",
+                        "codex_review_exception",
+                    ],
+                    "required_when": (
+                        "review_evidence.review_tier_is_high_critical_or_"
+                        "codex_review_required_is_true"
+                    ),
+                }
+            ],
+        )
         self.assertIn("state", ci_evidence["required_fields"])
         self.assertEqual(ci_evidence["required_values"], {"state": "passed"})
         self.assertIn("expected_head", ci_evidence["binds"])
@@ -6459,6 +6525,52 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(execution["verification_passed"])
         self.assertIn(
             "merge_guard_codex_request_not_earliest_canonical",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_blocks_pending_review_without_timestamp(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        pending = {
+            "id": 204,
+            "state": "PENDING",
+            "body": "draft review",
+            "submitted_at": None,
+            "html_url": "https://github.com/example/review/204",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        comment = deepcopy(captain_codex_live_state(view)["review"])
+        state = captain_codex_live_state(
+            view,
+            review_pages=[[comment, pending]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_codex_outstanding_pending_review",
             execution["merge_lease_guard"]["errors"],
         )
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])

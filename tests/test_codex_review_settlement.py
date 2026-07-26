@@ -76,7 +76,7 @@ def codex_review(
     head: str = HEAD,
     state: str = "COMMENTED",
     review_id: int = 2001,
-    submitted_at: str = REVIEW_TIME,
+    submitted_at: str | None = REVIEW_TIME,
 ) -> dict:
     return {
         "databaseId": review_id,
@@ -162,6 +162,32 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("block", result["status"])
         self.assertEqual(1001, result["evidence"]["request"]["comment_id"])
         self.assertEqual(1, result["unresolved_thread_count"])
+
+    def test_pending_review_without_submission_time_blocks(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="COMMENTED",
+                    review_id=2001,
+                    submitted_at="2026-07-26T08:01:00Z",
+                ),
+                codex_review(
+                    state="PENDING",
+                    review_id=2002,
+                    submitted_at=None,
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual("PENDING", result["evidence"]["completion"]["state"])
+        self.assertIsNone(result["evidence"]["completion"]["submitted_at"])
+        self.assertTrue(result["evidence"]["completion"]["blocking_state"])
 
     def test_commented_review_does_not_override_changes_requested(self) -> None:
         state = base_state()
