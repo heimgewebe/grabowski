@@ -17,7 +17,7 @@ other narrow target currently being pursued with a current goal assumption.
 
 ## Allowed registry and board use
 
-During an active work item, Steuerboard, Bureau, Cabinet, and other status
+During an active work item, Reposkop, Bureau, Cabinet, and other status
 surfaces may be used for:
 
 - context checks,
@@ -63,10 +63,11 @@ Bureau remains the registry and coordination organ. It can show work,
 claimability, status, and receipts. It does not automatically own the current
 execution priority while an active work item exists.
 
-## Relationship to Steuerboard
+## Relationship to Reposkop
 
-Steuerboard is a status view, not an autopilot. It may direct attention, but it
-must not replace the active work item without a valid switch condition.
+Reposkop is an explicitly target-bound read-only coherence view, not an autopilot.
+It may inform attention for the selected checkout, but it must not replace the
+active work item without a valid switch condition.
 
 ## Failure mode
 

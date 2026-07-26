@@ -83,7 +83,7 @@ vergleicht solche Bindings read-only mit der kanonischen Git-Beobachtung und
 projiziert unklare oder widersprüchliche Fälle blockierend. Die Binding-Zeile
 darf nicht aus Abwesenheit allein automatisch entfernt oder terminalisiert werden.
 
-Steuerboard-, Bureau- oder GitHub-Signale können helfen, die `unknown`-Fälle zu
+Reposkop-, Bureau- oder GitHub-Signale können helfen, die `unknown`-Fälle zu
 priorisieren. Sie ersetzen aber nicht Recovery-Ref, Dirty-State-Prüfung,
 Owner-Entscheidung und Dry-Run-Plan-Hash. Der Name `obsolete` bedeutet hier
 nicht: Branch löschen. Er bedeutet: lokal cleanupfähig wirkende Arbeitskopie,

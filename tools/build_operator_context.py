@@ -260,7 +260,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "- Patch file relay: local patch files use `tools/operator_patch_relay.py` for check/apply receipts before user manual execution.",
         "- Review: operator verifies directly; Claude may provide independent architecture and safety findings.",
         "- Session: direct operator context first; tmux or Antigravity may preserve a bounded advisory session when useful.",
-        "- Steuerboard: `operator report` is a lightweight read-only repo-state context signal; no separate trial/noise logging; never an approval gate.",
+        "- Reposkop: `report <absolute-target> --purpose grabowski-repo-state-context --json` is a target-bound read-only coherence signal; no global discovery, no separate trial/noise logging and never an approval gate.",
         "",
         "## Contract integrity",
         "",
