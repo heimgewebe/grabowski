@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,13 @@ try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
     import grabowski_operator as operator
+
+try:
+    alert_outbox = importlib.import_module("grabowski_alert_outbox")
+except ModuleNotFoundError as exc:
+    if exc.name != "grabowski_alert_outbox":
+        raise
+    alert_outbox = None
 
 
 mcp = operator.mcp
@@ -796,6 +804,33 @@ def _publication_failure_detail(publication: dict[str, Any]) -> str:
     return "no structured failure reason was returned"
 
 
+def _schedule_recovery_alert(
+    *,
+    event_class: str,
+    operation: str,
+    deduplication_key: str,
+    error_type: str | None = None,
+) -> None:
+    if alert_outbox is None:
+        return
+    fields = {"operation": operation}
+    if error_type is not None:
+        fields["error_type"] = error_type
+    try:
+        alert_outbox.enqueue_and_schedule(
+            event_class=event_class,
+            producer="recovery",
+            correlation_key=f"{operation}:{SERVER_RECOVERY_TARGET}",
+            deduplication_key=deduplication_key,
+            subject="recovery",
+            fields=fields,
+        )
+    except Exception:
+        # Alerting is outside the recovery evidence authority. Its failure must
+        # neither turn success into failure nor replace the primary exception.
+        return
+
+
 def server_recovery_probe() -> dict[str, Any]:
     http_password = _read_secret_text(SERVER_RECOVERY_HTTP_PASSWORD)
     if not _bounded_file(SERVER_RECOVERY_REPOSITORY_PASSWORD):
@@ -1061,8 +1096,46 @@ def grabowski_recovery_server_probe() -> dict[str, Any]:
             raise PermissionError(
                 "operator kill switch is engaged and is not an eligible Grabowski test marker"
             )
-        return _clear_test_kill_switch(
-            expected_sha256=str(test_recovery["sha256"]),
-            expected_nonce=str(test_recovery["nonce"]),
+        operation = "test_kill_switch_recovery"
+        try:
+            result = _clear_test_kill_switch(
+                expected_sha256=str(test_recovery["sha256"]),
+                expected_nonce=str(test_recovery["nonce"]),
+            )
+        except Exception as exc:
+            _schedule_recovery_alert(
+                event_class="service_failure",
+                operation=operation,
+                deduplication_key=type(exc).__name__,
+                error_type=type(exc).__name__,
+            )
+            raise
+        _schedule_recovery_alert(
+            event_class="recovery",
+            operation=operation,
+            deduplication_key=str(
+                result.get("cleared_sha256") or test_recovery["sha256"]
+            ),
         )
-    return server_recovery_probe()
+        return result
+
+    operation = "server_recovery_probe"
+    try:
+        result = server_recovery_probe()
+    except Exception as exc:
+        _schedule_recovery_alert(
+            event_class="service_failure",
+            operation=operation,
+            deduplication_key=type(exc).__name__,
+            error_type=type(exc).__name__,
+        )
+        raise
+    source = result.get("source_recovery")
+    source = source if isinstance(source, dict) else {}
+    identity = source.get("source_record_sha256") or result.get("snapshot_id")
+    _schedule_recovery_alert(
+        event_class="recovery",
+        operation=operation,
+        deduplication_key=str(identity or "completed"),
+    )
+    return result
