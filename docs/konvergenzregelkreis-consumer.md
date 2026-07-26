@@ -39,3 +39,9 @@ Nur `terminally_closed` ergibt `closure_allowed=true`. Alle anderen fachlichen Z
 ```
 
 Der Assessment-Receipt muss anschließend in den Abschlussbelegen referenziert werden. Er ersetzt weder Bureau-Abschluss noch Chronikpersistenz.
+
+## Durchsetzungsgrenze
+
+Der funktionierende Consumer beweist nicht, dass jede mutierende Abschlussoberfläche ihn technisch erzwingt. Die Operator-Instruktion verlangt den Aufruf für Deployment-, Runtime-, Security-, Daten- und irreversible Arbeit; einzelne nachgelagerte Closeout-Oberflächen validieren den Receipt derzeit jedoch nicht selbst.
+
+Der revisionsgebundene Abdeckungsaudit unter [`convergence-closure-surface-coverage.md`](convergence-closure-surface-coverage.md) trennt semantische Abschlusslücken von reinen Prozess-, Effekt-, Lease- und Cleanup-Operationen. Bis zur dort beschriebenen Härtung muss der aufrufende Operator den Assessment-Receipt explizit an die konkrete Abschlussmutation binden.

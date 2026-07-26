@@ -1,0 +1,178 @@
+{
+  "schema_version": 1,
+  "kind": "grabowski.convergence_closure_surface_coverage",
+  "observed_at": "2026-07-26",
+  "source": {
+    "grabowski_commit": "d2097c909bd60be7f947b5c50cc9fa6d56ba907c",
+    "protocol_commit": "fae4c26faa22d62d148d39e1995fe5492211cb43",
+    "capability_catalog": "contracts/capability-catalog.v1.json",
+    "grip_source": "src/grabowski_grips.py"
+  },
+  "discovery": {
+    "surface_name_pattern": "(close|archive|release|deploy|cleanup|merge)",
+    "required_explicit_surfaces": [
+      "grip:convergence-assess",
+      "grip:task-attention-decision",
+      "grip:worktree-hygiene-reconcile"
+    ]
+  },
+  "allowed_classifications": [
+    "consumer",
+    "semantic_gap",
+    "conditional_semantic_gap",
+    "upstream_binding_required",
+    "effect_only",
+    "preflight_or_evidence",
+    "mechanical_only",
+    "read_only_observation"
+  ],
+  "surfaces": [
+    {
+      "surface_kind": "grip",
+      "surface_id": "convergence-assess",
+      "classification": "consumer",
+      "convergence_requirement": "evaluates_hash_bound_request",
+      "reason": "Only terminally_closed yields allow_closure."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "operator-obligation-close",
+      "classification": "semantic_gap",
+      "convergence_requirement": "required_for_completed_high_risk",
+      "reason": "A completed obligation can be recorded without validating a convergence receipt."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "task-closeout-archive",
+      "classification": "conditional_semantic_gap",
+      "convergence_requirement": "required_when_archive_is_used_as_system_closeout",
+      "reason": "Terminal process and lifecycle evidence do not establish deployed or runtime effect."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_agent_workspace_close",
+      "classification": "conditional_semantic_gap",
+      "convergence_requirement": "required_when_workspace_result_is_used_as_system_closeout",
+      "reason": "Writer, test and review evidence establish workspace completion, not R2 or R3 system closure."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "worktree-hygiene-reconcile",
+      "classification": "upstream_binding_required",
+      "convergence_requirement": "upstream_for_high_risk_artifacts",
+      "reason": "Recovery-first hygiene must consume, not synthesize, semantic closure evidence."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_agent_workspace_cleanup",
+      "classification": "upstream_binding_required",
+      "convergence_requirement": "upstream_for_high_risk_artifacts",
+      "reason": "Cleanup follows a closed workspace and must not upgrade it to system closure."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_checkout_archive",
+      "classification": "upstream_binding_required",
+      "convergence_requirement": "upstream_for_high_risk_artifacts",
+      "reason": "Archival creates recovery evidence but does not verify the changed system."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_checkout_cleanup",
+      "classification": "upstream_binding_required",
+      "convergence_requirement": "upstream_for_high_risk_artifacts",
+      "reason": "Checkout removal is hygiene after an already bound closeout."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_runtime_deploy_schedule",
+      "classification": "effect_only",
+      "convergence_requirement": "assessment_after_live_verification",
+      "reason": "Deployment is an effect and cannot itself establish closure."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_merge_delivery_record",
+      "classification": "preflight_or_evidence",
+      "convergence_requirement": "not_a_closeout",
+      "reason": "Diff delivery is pre-merge evidence."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "runtime-deploy-check",
+      "classification": "read_only_observation",
+      "convergence_requirement": "not_a_closeout",
+      "reason": "The grip is a read-only deployment preflight."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "post-merge-sync",
+      "classification": "read_only_observation",
+      "convergence_requirement": "not_a_closeout",
+      "reason": "The grip only plans local synchronization."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_deployment_identity",
+      "classification": "read_only_observation",
+      "convergence_requirement": "evidence_input_only",
+      "reason": "Deployment identity can supply verification evidence but does not mutate closure."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_agent_workspace_cleanup_plan",
+      "classification": "read_only_observation",
+      "convergence_requirement": "not_a_closeout",
+      "reason": "The tool only inventories cleanup eligibility."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_task_archive_list",
+      "classification": "read_only_observation",
+      "convergence_requirement": "not_a_closeout",
+      "reason": "The tool reads immutable task archive metadata."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_task_archive_read",
+      "classification": "read_only_observation",
+      "convergence_requirement": "not_a_closeout",
+      "reason": "The tool reads immutable task archive contents."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "bureau-pickup-release",
+      "classification": "mechanical_only",
+      "convergence_requirement": "not_a_semantic_closeout",
+      "reason": "The grip releases exact leases after authoritative terminal Bureau evidence."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_bureau_pickup_release",
+      "classification": "mechanical_only",
+      "convergence_requirement": "not_a_semantic_closeout",
+      "reason": "The tool releases exact leases after authoritative terminal Bureau evidence."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_resource_release",
+      "classification": "mechanical_only",
+      "convergence_requirement": "not_a_semantic_closeout",
+      "reason": "Resource release changes lease state, not system completion."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "task-attention-decision",
+      "classification": "mechanical_only",
+      "convergence_requirement": "must_not_claim_system_closeout",
+      "reason": "Attention classification closes operator bookkeeping only."
+    }
+  ],
+  "follow_up_required": true,
+  "does_not_establish": [
+    "automatic mutation authority",
+    "historical closeout correctness",
+    "runtime truth beyond inspected sources",
+    "universal external client compliance"
+  ]
+}
