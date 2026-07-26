@@ -25,7 +25,7 @@ TRUSTED_CODEX_ACTORS = frozenset(
 TRUSTED_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 TRUSTED_REQUEST_ACTORS = frozenset({"github-actions[bot]"})
 ACCEPTED_REVIEW_STATES = frozenset({"APPROVED", "COMMENTED"})
-BLOCKING_REVIEW_STATES = frozenset({"CHANGES_REQUESTED", "DISMISSED", "PENDING"})
+BLOCKING_REVIEW_STATES = frozenset({"CHANGES_REQUESTED", "PENDING"})
 REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
     re.DOTALL,
@@ -367,6 +367,7 @@ def _review_completion(
         commit_sha = commit.get("oid") if isinstance(commit, dict) else None
         submitted = _parse_time(review.get("submittedAt"))
         review_id = review.get("databaseId")
+        state = str(review.get("state") or "").upper()
         if (
             actor not in TRUSTED_CODEX_ACTORS
             or commit_sha != head_sha
@@ -376,21 +377,47 @@ def _review_completion(
             or not isinstance(review_id, int)
         ):
             continue
-        candidates.append({**review, "_actor": actor, "_submitted": submitted})
-    if candidates:
-        latest = max(candidates, key=lambda item: (item["_submitted"], item["databaseId"]))
-        state = str(latest.get("state") or "").upper()
+        candidates.append(
+            {
+                **review,
+                "_actor": actor,
+                "_submitted": submitted,
+                "_state": state,
+            }
+        )
+
+    def order(item: dict[str, Any]) -> tuple[datetime, int]:
+        return item["_submitted"], item["databaseId"]
+
+    selected: dict[str, Any] | None = None
+    blockers = [item for item in candidates if item["_state"] in BLOCKING_REVIEW_STATES]
+    if blockers:
+        latest_blocker = max(blockers, key=order)
+        approvals = [
+            item
+            for item in candidates
+            if item["_state"] == "APPROVED" and order(item) > order(latest_blocker)
+        ]
+        selected = max(approvals, key=order) if approvals else latest_blocker
+    else:
+        accepted = [item for item in candidates if item["_state"] in ACCEPTED_REVIEW_STATES]
+        if accepted:
+            selected = max(accepted, key=order)
+
+    if selected is not None:
+        state = selected["_state"]
         return {
             "mode": "review",
-            "review_id": latest["databaseId"],
-            "actor": latest["_actor"],
+            "review_id": selected["databaseId"],
+            "actor": selected["_actor"],
             "state": state,
-            "submitted_at": latest["submittedAt"],
-            "body_sha256": _sha256_text(str(latest.get("body") or "")),
-            "url": latest.get("url"),
+            "submitted_at": selected["submittedAt"],
+            "body_sha256": _sha256_text(str(selected.get("body") or "")),
+            "url": selected.get("url"),
             "accepted_state": state in ACCEPTED_REVIEW_STATES,
             "blocking_state": state in BLOCKING_REVIEW_STATES,
         }
+
     reactions = request.get("reactions")
     for reaction in _list_nodes(reactions, label="request reactions"):
         actor = _actor_login(reaction.get("user"))
@@ -418,7 +445,6 @@ def _review_completion(
 def _codex_threads(
     pr: dict[str, Any],
     *,
-    request_time: datetime,
     head_sha: str,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
@@ -438,7 +464,6 @@ def _codex_threads(
                 actor in TRUSTED_CODEX_ACTORS
                 and commit_sha == head_sha
                 and created is not None
-                and created >= request_time
                 and isinstance(comment_id, int)
                 and not isinstance(comment_id, bool)
             ):
@@ -470,14 +495,14 @@ def evaluate(
     policy = _policy(pr, repository, explicitly_required=explicitly_required)
     expected_request = _request_payload(repository, pr_number, head_sha, diff_sha256)
     requests = _matching_requests(pr, expected_request)
-    request = requests[-1] if requests else None
+    request = requests[0] if requests else None
     completion = (
         _review_completion(pr, request=request, head_sha=head_sha)
         if request is not None
         else None
     )
     threads = (
-        _codex_threads(pr, request_time=request["_created"], head_sha=head_sha)
+        _codex_threads(pr, head_sha=head_sha)
         if request is not None
         else []
     )
@@ -593,7 +618,7 @@ def ensure_request(
     payload = _request_payload(repository, pr_number, head_sha, diff_sha256)
     existing = _matching_requests(pr, payload)
     if existing:
-        comment = existing[-1]
+        comment = existing[0]
         return {
             "schema_version": SCHEMA_VERSION,
             "kind": "github_codex_review_request_result",

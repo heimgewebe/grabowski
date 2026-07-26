@@ -53,31 +53,43 @@ def base_state(*, path: str = "src/grabowski_grips.py") -> dict:
     }
 
 
-def request_comment(*, actor: str = "alex", association: str = "OWNER") -> dict:
+def request_comment(
+    *,
+    actor: str = "alex",
+    association: str = "OWNER",
+    comment_id: int = 1001,
+    created_at: str = REQUEST_TIME,
+) -> dict:
     payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
     return {
-        "databaseId": 1001,
+        "databaseId": comment_id,
         "body": settlement._request_body(payload),
-        "createdAt": REQUEST_TIME,
+        "createdAt": created_at,
         "authorAssociation": association,
         "author": {"login": actor},
         "reactions": connection([], hasNextPage=False),
     }
 
 
-def codex_review(*, head: str = HEAD, state: str = "COMMENTED") -> dict:
+def codex_review(
+    *,
+    head: str = HEAD,
+    state: str = "COMMENTED",
+    review_id: int = 2001,
+    submitted_at: str = REVIEW_TIME,
+) -> dict:
     return {
-        "databaseId": 2001,
+        "databaseId": review_id,
         "state": state,
         "body": "reviewed",
-        "submittedAt": REVIEW_TIME,
+        "submittedAt": submitted_at,
         "url": "https://github.com/example/review/2001",
         "author": {"login": "chatgpt-codex-connector[bot]"},
         "commit": {"oid": head},
     }
 
 
-def codex_thread(*, resolved: bool) -> dict:
+def codex_thread(*, resolved: bool, created_at: str = REVIEW_TIME) -> dict:
     return {
         "id": "PRRT_kwDOexample",
         "isResolved": resolved,
@@ -85,7 +97,7 @@ def codex_thread(*, resolved: bool) -> dict:
             [
                 {
                     "databaseId": 3001,
-                    "createdAt": REVIEW_TIME,
+                    "createdAt": created_at,
                     "author": {"login": "chatgpt-codex-connector[bot]"},
                     "commit": {"oid": HEAD},
                     "pullRequestReview": {"databaseId": 2001},
@@ -126,6 +138,80 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertTrue(result["settled"])
         self.assertEqual(result["evidence"]["completion"]["mode"], "review")
+
+    def test_duplicate_request_uses_earliest_and_keeps_intermediate_thread(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(comment_id=1001, created_at="2026-07-26T08:00:00Z"),
+                request_comment(comment_id=1002, created_at="2026-07-26T08:02:00Z"),
+            ],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection(
+            [codex_review(review_id=2002, submitted_at="2026-07-26T08:03:00Z")],
+            hasPreviousPage=False,
+        )
+        state["reviewThreads"] = connection(
+            [codex_thread(resolved=False, created_at="2026-07-26T08:01:00Z")],
+            hasNextPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual(1001, result["evidence"]["request"]["comment_id"])
+        self.assertEqual(1, result["unresolved_thread_count"])
+
+    def test_commented_review_does_not_override_changes_requested(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    review_id=2001,
+                    submitted_at="2026-07-26T08:01:00Z",
+                ),
+                codex_review(
+                    state="COMMENTED",
+                    review_id=2002,
+                    submitted_at="2026-07-26T08:02:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual("CHANGES_REQUESTED", result["evidence"]["completion"]["state"])
+        self.assertTrue(result["evidence"]["completion"]["blocking_state"])
+
+    def test_approval_after_blocker_supersedes_changes_requested(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    review_id=2001,
+                    submitted_at="2026-07-26T08:01:00Z",
+                ),
+                codex_review(
+                    state="APPROVED",
+                    review_id=2002,
+                    submitted_at="2026-07-26T08:02:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+        self.assertEqual("APPROVED", result["evidence"]["completion"]["state"])
 
     def test_stale_review_commit_does_not_settle_current_head(self) -> None:
         state = base_state()
@@ -204,7 +290,13 @@ class CodexReviewSettlementTests(unittest.TestCase):
 
     def test_request_is_idempotent_for_current_head_and_diff(self) -> None:
         state = base_state()
-        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["comments"] = connection(
+            [
+                request_comment(comment_id=1001, created_at="2026-07-26T08:00:00Z"),
+                request_comment(comment_id=1002, created_at="2026-07-26T08:02:00Z"),
+            ],
+            hasPreviousPage=False,
+        )
         with mock.patch.object(settlement, "_live_state", return_value=state), mock.patch.object(
             settlement, "_run_json"
         ) as run_json:

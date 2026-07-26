@@ -1034,6 +1034,31 @@ class CaptainMergeGuardRunner:
             errors.append(f"merge_guard_codex_{label}_invalid_json")
             return None
 
+    def _codex_single_page(
+        self,
+        args: list[str],
+        *,
+        label: str,
+        observations: list[dict[str, Any]],
+        errors: list[str],
+    ) -> list[dict[str, Any]] | None:
+        pages = self._codex_api_json(
+            args,
+            label=label,
+            observations=observations,
+            errors=errors,
+        )
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            errors.append(f"merge_guard_codex_{label}_pages_invalid")
+            return None
+        if len(pages) != 1:
+            errors.append(f"merge_guard_codex_{label}_truncated")
+            return None
+        if any(not isinstance(item, dict) for item in pages[0]):
+            errors.append(f"merge_guard_codex_{label}_item_invalid")
+            return None
+        return [dict(item) for item in pages[0]]
+
     def _revalidate_codex_review(
         self,
         bindings: dict[str, Any],
@@ -1120,6 +1145,18 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_codex_evidence_diff_drift")
         if evidence.get("base_sha") != base_sha:
             errors.append("merge_guard_codex_evidence_base_drift")
+        request_core = {
+            "schema_version": 1,
+            "kind": "grabowski_codex_review_request",
+            "repo": repository,
+            "pr": pr_number,
+            "head_sha": head_sha,
+            "diff_sha256": diff_sha256,
+        }
+        expected_marker = {
+            **request_core,
+            "request_id": _sha256_json(request_core)[:32],
+        }
         request = evidence.get("request")
         completion = evidence.get("completion")
         if not isinstance(request, dict) or not isinstance(completion, dict):
@@ -1165,18 +1202,6 @@ class CaptainMergeGuardRunner:
                         marker_payload = json.loads(marker.group(1))
                     except json.JSONDecodeError:
                         marker_payload = None
-                request_core = {
-                    "schema_version": 1,
-                    "kind": "grabowski_codex_review_request",
-                    "repo": repository,
-                    "pr": pr_number,
-                    "head_sha": head_sha,
-                    "diff_sha256": diff_sha256,
-                }
-                expected_marker = {
-                    **request_core,
-                    "request_id": _sha256_json(request_core)[:32],
-                }
                 if marker_payload != expected_marker:
                     errors.append("merge_guard_codex_request_marker_drift")
                 if request.get("request_id") != expected_marker["request_id"]:
@@ -1198,10 +1223,134 @@ class CaptainMergeGuardRunner:
         else:
             errors.append("merge_guard_codex_request_comment_missing")
 
+        request_comments = self._codex_single_page(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/issues/{pr_number}/comments?per_page=100",
+            ],
+            label="request_comments",
+            observations=observations,
+            errors=errors,
+        )
+        canonical_requests: list[dict[str, Any]] = []
+        if request_comments is not None:
+            for item in request_comments:
+                body = item.get("body")
+                actor = _github_actor(item.get("user"))
+                association = item.get("author_association")
+                created = _github_datetime(item.get("created_at"))
+                comment_id = item.get("id")
+                if (
+                    not isinstance(body, str)
+                    or created is None
+                    or isinstance(comment_id, bool)
+                    or not isinstance(comment_id, int)
+                    or (
+                        association not in _CODEX_REQUEST_ASSOCIATIONS
+                        and actor != "github-actions[bot]"
+                    )
+                ):
+                    continue
+                marker = _CODEX_REQUEST_RE.search(body)
+                marker_payload: Any = None
+                if marker is not None:
+                    try:
+                        marker_payload = json.loads(marker.group(1))
+                    except json.JSONDecodeError:
+                        marker_payload = None
+                if marker_payload == expected_marker:
+                    canonical_requests.append(
+                        {
+                            "id": comment_id,
+                            "created": created,
+                            "actor": actor,
+                        }
+                    )
+        canonical_requests.sort(key=lambda item: (item["created"], item["id"]))
+        if not canonical_requests:
+            errors.append("merge_guard_codex_canonical_request_missing")
+        else:
+            earliest_request = canonical_requests[0]
+            if earliest_request["id"] != request_comment_id:
+                errors.append("merge_guard_codex_request_not_earliest_canonical")
+            if request_time is None or earliest_request["created"] != request_time:
+                errors.append("merge_guard_codex_canonical_request_time_drift")
+        receipt["canonical_request_count"] = len(canonical_requests)
+        receipt["canonical_request_ids_sha256"] = _sha256_json(
+            [item["id"] for item in canonical_requests]
+        )
+
+        review_items = self._codex_single_page(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/pulls/{pr_number}/reviews?per_page=100",
+            ],
+            label="reviews",
+            observations=observations,
+            errors=errors,
+        )
+        live_reviews: list[dict[str, Any]] = []
+        if review_items is not None:
+            for item in review_items:
+                actor = _github_actor(item.get("user"))
+                state = str(item.get("state") or "").upper()
+                submitted = _github_datetime(item.get("submitted_at"))
+                review_id = item.get("id")
+                if (
+                    actor not in _CODEX_REVIEW_ACTORS
+                    or item.get("commit_id") != head_sha
+                    or submitted is None
+                    or request_time is None
+                    or submitted < request_time
+                    or isinstance(review_id, bool)
+                    or not isinstance(review_id, int)
+                ):
+                    continue
+                live_reviews.append(
+                    {
+                        "id": review_id,
+                        "state": state,
+                        "submitted": submitted,
+                    }
+                )
+        live_reviews.sort(key=lambda item: (item["submitted"], item["id"]))
+        blockers = [
+            item
+            for item in live_reviews
+            if item["state"] in {"CHANGES_REQUESTED", "PENDING"}
+        ]
+        if blockers:
+            latest_blocker = blockers[-1]
+            superseding_approval = any(
+                item["state"] == "APPROVED"
+                and (item["submitted"], item["id"])
+                > (latest_blocker["submitted"], latest_blocker["id"])
+                for item in live_reviews
+            )
+            if not superseding_approval:
+                errors.append("merge_guard_codex_outstanding_blocking_review")
+        receipt["current_head_review_count"] = len(live_reviews)
+        receipt["current_head_review_set_sha256"] = _sha256_json(
+            [
+                {
+                    "id": item["id"],
+                    "state": item["state"],
+                    "submitted_at": item["submitted"].isoformat(),
+                }
+                for item in live_reviews
+            ]
+        )
+
         mode = completion.get("mode")
         completion_time: datetime | None = None
         if mode == "review":
             review_id = completion.get("review_id")
+            if review_id not in {item["id"] for item in live_reviews}:
+                errors.append("merge_guard_codex_completion_review_not_in_live_set")
             if (
                 isinstance(review_id, bool)
                 or not isinstance(review_id, int)
@@ -1242,7 +1391,7 @@ class CaptainMergeGuardRunner:
                 else:
                     errors.append("merge_guard_codex_review_missing")
         elif mode == "reaction":
-            reaction_pages = self._codex_api_json(
+            reactions = self._codex_single_page(
                 [
                     "api",
                     "--paginate",
@@ -1252,22 +1401,12 @@ class CaptainMergeGuardRunner:
                         "/reactions?per_page=100"
                     ),
                 ],
-                label="reaction",
+                label="reactions",
                 observations=observations,
                 errors=errors,
             )
-            reactions: list[dict[str, Any]] = []
-            if (
-                not isinstance(reaction_pages, list)
-                or any(not isinstance(page, list) for page in reaction_pages)
-            ):
-                errors.append("merge_guard_codex_reaction_pages_invalid")
-            elif len(reaction_pages) != 1:
-                errors.append("merge_guard_codex_reactions_truncated")
-            elif any(not isinstance(item, dict) for item in reaction_pages[0]):
-                errors.append("merge_guard_codex_reaction_item_invalid")
-            else:
-                reactions = [dict(item) for item in reaction_pages[0]]
+            if reactions is None:
+                reactions = []
             matching_reactions: list[dict[str, Any]] = []
             for reaction in reactions:
                 actor = _github_actor(reaction.get("user"))
@@ -1390,8 +1529,6 @@ class CaptainMergeGuardRunner:
                                 actor in _CODEX_REVIEW_ACTORS
                                 and commit_sha == head_sha
                                 and created is not None
-                                and request_time is not None
-                                and created >= request_time
                             ):
                                 matched = True
                         if matched:

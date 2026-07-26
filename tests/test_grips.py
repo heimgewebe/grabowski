@@ -255,8 +255,14 @@ class FakeGh:
                     reactions = state.get("reactions", []) if isinstance(state, dict) else []
                     payload = [reactions]
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+            if "/issues/" in endpoint and "/comments?per_page=100" in endpoint:
+                payload = state.get("request_pages") if isinstance(state, dict) else None
+                return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/issues/comments/" in endpoint:
                 payload = state.get("request_comment") if isinstance(state, dict) else None
+                return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
+            if "/pulls/" in endpoint and "/reviews?per_page=100" in endpoint:
+                payload = state.get("review_pages") if isinstance(state, dict) else None
                 return {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""}
             if "/pulls/" in endpoint and "/reviews/" in endpoint:
                 payload = state.get("review") if isinstance(state, dict) else None
@@ -3298,6 +3304,8 @@ def captain_codex_live_state(
     threads: list[dict[str, object]] | None = None,
     reactions: list[dict[str, object]] | None = None,
     reaction_pages: list[list[dict[str, object]]] | None = None,
+    request_pages: list[list[dict[str, object]]] | None = None,
+    review_pages: list[list[dict[str, object]]] | None = None,
 ) -> dict[str, object]:
     head = str(view.get("headRefOid") or CAPTAIN_HEAD)
     pr = int(view.get("number") or 96)
@@ -3305,23 +3313,31 @@ def captain_codex_live_state(
     _, request_body = captain_codex_request_material(
         head=head, diff_sha256=diff_sha256, pr=pr
     )
+    request_comment = {
+        "id": 101,
+        "body": request_body,
+        "created_at": "2026-07-26T08:00:00Z",
+        "author_association": "NONE",
+        "user": {"login": "github-actions[bot]"},
+    }
+    review = {
+        "id": 202,
+        "state": "COMMENTED",
+        "body": "reviewed",
+        "submitted_at": "2026-07-26T08:01:00Z",
+        "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "commit_id": head,
+    }
     return {
-        "request_comment": {
-            "id": 101,
-            "body": request_body,
-            "created_at": "2026-07-26T08:00:00Z",
-            "author_association": "NONE",
-            "user": {"login": "github-actions[bot]"},
-        },
-        "review": {
-            "id": 202,
-            "state": "COMMENTED",
-            "body": "reviewed",
-            "submitted_at": "2026-07-26T08:01:00Z",
-            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-202",
-            "user": {"login": "chatgpt-codex-connector[bot]"},
-            "commit_id": head,
-        },
+        "request_comment": request_comment,
+        "request_pages": deepcopy(
+            request_pages if request_pages is not None else [[request_comment]]
+        ),
+        "review": review,
+        "review_pages": deepcopy(
+            review_pages if review_pages is not None else [[review]]
+        ),
         "reactions": deepcopy(reactions or []),
         "reaction_pages": deepcopy(
             reaction_pages if reaction_pages is not None else [reactions or []]
@@ -6102,6 +6118,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             codex_review_evidence["required_when"],
             "review_evidence.review_tier_is_high_critical_or_codex_review_required_is_true",
         )
+        self.assertLessEqual(
+            {
+                "review_tier",
+                "finding_count",
+                "thread_ids",
+                "thread_ids_sha256",
+                "unresolved_thread_ids",
+                "unresolved_thread_ids_sha256",
+                "errors",
+            },
+            set(codex_review_evidence["required_fields"]),
+        )
         self.assertIn("completion", codex_review_evidence["required_fields"])
         self.assertIn("expected_head", codex_review_evidence["binds"])
         self.assertIn("state", ci_evidence["required_fields"])
@@ -6379,6 +6407,170 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "settled", guard["dispatch_codex_review_revalidation"]["status"]
         )
         self.assertEqual([], resources.list_resources())
+
+    def test_atomic_merge_guard_rejects_later_duplicate_request_as_canonical(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        evidence = captain_codex_review_evidence()
+        later_request = deepcopy(captain_codex_live_state({
+            "number": 96,
+            "headRefOid": CAPTAIN_HEAD,
+        })["request_comment"])
+        later_request["id"] = 102
+        later_request["created_at"] = "2026-07-26T08:00:30Z"
+        evidence["request"]["comment_id"] = 102
+        evidence["request"]["created_at"] = later_request["created_at"]
+        evidence["request"]["body_sha256"] = hashlib.sha256(
+            later_request["body"].encode("utf-8")
+        ).hexdigest()
+        core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        initial = captain_codex_live_state(view)
+        earliest_request = deepcopy(initial["request_comment"])
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[earliest_request, later_request]],
+        )
+        state["request_comment"] = later_request
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_codex_request_not_earliest_canonical",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_blocks_outstanding_changes_requested(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        blocker = {
+            "id": 201,
+            "state": "CHANGES_REQUESTED",
+            "body": "blocking",
+            "submitted_at": "2026-07-26T08:00:30Z",
+            "html_url": "https://github.com/example/review/201",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        comment = deepcopy(captain_codex_live_state(view)["review"])
+        state = captain_codex_live_state(
+            view,
+            review_pages=[[blocker, comment]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_codex_outstanding_blocking_review",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_accepts_approval_after_blocker(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        evidence = captain_codex_review_evidence()
+        evidence["completion"].update(
+            {
+                "review_id": 203,
+                "state": "APPROVED",
+                "submitted_at": "2026-07-26T08:02:00Z",
+                "body_sha256": hashlib.sha256(b"approved").hexdigest(),
+            }
+        )
+        core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        blocker = {
+            "id": 201,
+            "state": "CHANGES_REQUESTED",
+            "body": "blocking",
+            "submitted_at": "2026-07-26T08:00:30Z",
+            "html_url": "https://github.com/example/review/201",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        approval = {
+            "id": 203,
+            "state": "APPROVED",
+            "body": "approved",
+            "submitted_at": "2026-07-26T08:02:00Z",
+            "html_url": "https://github.com/example/review/203",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        state = captain_codex_live_state(
+            view,
+            review_pages=[[blocker, approval]],
+        )
+        state["review"] = approval
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
 
     def test_atomic_merge_guard_accepts_one_bounded_reaction_page(self) -> None:
         parameters = authorized_captain_run_parameters()
