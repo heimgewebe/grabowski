@@ -1,0 +1,19 @@
+name: locate-watchdog-contract
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  locate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          show-progress: false
+      - name: Locate durable systemd contract
+        run: grep -R -n -C 8 'class DurableSystemdContractTests\|test_watchdog_cadence_matches_probe_cost' tests
