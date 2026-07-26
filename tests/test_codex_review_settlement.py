@@ -71,6 +71,31 @@ def request_comment(
     }
 
 
+def codex_clean_comment(
+    *,
+    head: str = HEAD,
+    actor: str = "chatgpt-codex-connector",
+    comment_id: int = 2101,
+    created_at: str = REVIEW_TIME,
+    reviewed_prefix: str | None = None,
+) -> dict:
+    prefix = reviewed_prefix if reviewed_prefix is not None else head[:10]
+    body = (
+        "Codex Review: Didn't find any major issues. Hooray!\n\n"
+        f"**Reviewed commit:** `{prefix}`\n\n"
+        "<details><summary>About Codex</summary></details>"
+    )
+    return {
+        "databaseId": comment_id,
+        "body": body,
+        "createdAt": created_at,
+        "url": f"https://github.com/example/comment/{comment_id}",
+        "authorAssociation": "NONE",
+        "author": {"login": actor},
+        "reactions": connection([], hasNextPage=False),
+    }
+
+
 def codex_review(
     *,
     head: str = HEAD,
@@ -138,6 +163,55 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertTrue(result["settled"])
         self.assertEqual(result["evidence"]["completion"]["mode"], "review")
+
+    def test_trusted_clean_result_comment_settles_current_head(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment()
+        state["comments"] = connection(
+            [request_comment(), clean],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+        completion = result["evidence"]["completion"]
+        self.assertEqual("clean_comment", completion["mode"])
+        self.assertEqual(2101, completion["comment_id"])
+        self.assertEqual(HEAD[:10], completion["reviewed_commit_prefix"])
+        self.assertEqual("CLEAN", completion["state"])
+
+    def test_clean_result_comment_for_other_head_does_not_settle(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(),
+                codex_clean_comment(reviewed_prefix="d" * 10),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
+
+    def test_untrusted_clean_result_comment_does_not_settle(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(),
+                codex_clean_comment(actor="untrusted-bot"),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
 
     def test_duplicate_request_uses_earliest_and_keeps_intermediate_thread(self) -> None:
         state = base_state()

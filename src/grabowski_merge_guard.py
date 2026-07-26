@@ -32,6 +32,10 @@ _CODEX_REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
     re.DOTALL,
 )
+_CODEX_CLEAN_RESULT_RE = re.compile(
+    r"\ACodex Review: Didn't find any major issues\. Hooray!\s+"
+    r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]{10,40})`(?:\s|$)"
+)
 _CODEX_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -1417,6 +1421,66 @@ class CaptainMergeGuardRunner:
                         errors.append("merge_guard_codex_review_body_drift")
                 else:
                     errors.append("merge_guard_codex_review_missing")
+        elif mode == "clean_comment":
+            comment_id = completion.get("comment_id")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+            ):
+                errors.append("merge_guard_codex_clean_comment_id_invalid")
+            else:
+                matching_comments = [
+                    item
+                    for item in (request_comments or [])
+                    if item.get("id") == comment_id
+                ]
+                if len(matching_comments) != 1:
+                    errors.append("merge_guard_codex_clean_comment_missing_or_ambiguous")
+                else:
+                    live_comment = matching_comments[0]
+                    actor = _github_actor(live_comment.get("user"))
+                    body = live_comment.get("body")
+                    completion_time = _github_datetime(live_comment.get("created_at"))
+                    if actor not in _CODEX_REVIEW_ACTORS:
+                        errors.append("merge_guard_codex_clean_comment_actor_untrusted")
+                    if actor != str(completion.get("actor", "")).lower():
+                        errors.append("merge_guard_codex_clean_comment_actor_drift")
+                    if not isinstance(body, str):
+                        errors.append("merge_guard_codex_clean_comment_body_missing")
+                    else:
+                        match = _CODEX_CLEAN_RESULT_RE.match(body)
+                        if match is None:
+                            errors.append("merge_guard_codex_clean_comment_shape_invalid")
+                        else:
+                            reviewed_prefix = match.group(1)
+                            if not head_sha.startswith(reviewed_prefix):
+                                errors.append("merge_guard_codex_clean_comment_head_drift")
+                            if reviewed_prefix != completion.get(
+                                "reviewed_commit_prefix"
+                            ):
+                                errors.append(
+                                    "merge_guard_codex_clean_comment_prefix_drift"
+                                )
+                        if hashlib.sha256(body.encode("utf-8")).hexdigest() != completion.get(
+                            "body_sha256"
+                        ):
+                            errors.append("merge_guard_codex_clean_comment_body_drift")
+                    if completion.get("state") != "CLEAN":
+                        errors.append("merge_guard_codex_clean_comment_state_drift")
+                    if (
+                        request_time is not None
+                        and completion_time is not None
+                        and completion_time < request_time
+                    ):
+                        errors.append("merge_guard_codex_clean_comment_predates_request")
+                    expected_url = completion.get("url")
+                    if (
+                        isinstance(expected_url, str)
+                        and expected_url
+                        and live_comment.get("html_url") != expected_url
+                    ):
+                        errors.append("merge_guard_codex_clean_comment_url_drift")
         elif mode == "reaction":
             reactions = self._codex_single_page(
                 [

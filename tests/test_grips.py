@@ -3297,6 +3297,56 @@ def captain_codex_reaction_evidence(
     return evidence
 
 
+def captain_codex_clean_comment(
+    *,
+    head: str = CAPTAIN_HEAD,
+    comment_id: int = 205,
+    body: str | None = None,
+) -> dict[str, object]:
+    clean_body = body or (
+        "Codex Review: Didn't find any major issues. Hooray!\n\n"
+        f"**Reviewed commit:** `{head[:10]}`\n\n"
+        "<details><summary>About Codex</summary></details>"
+    )
+    return {
+        "id": comment_id,
+        "body": clean_body,
+        "created_at": "2026-07-26T08:01:00Z",
+        "html_url": f"https://github.com/example/comment/{comment_id}",
+        "author_association": "NONE",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+    }
+
+
+def captain_codex_clean_comment_evidence(
+    *,
+    head: str = CAPTAIN_HEAD,
+    review_tier: str = "high_critical",
+) -> dict[str, object]:
+    evidence = captain_codex_review_evidence(
+        head=head,
+        review_tier=review_tier,
+    )
+    comment = captain_codex_clean_comment(head=head)
+    body = str(comment["body"])
+    evidence["completion"] = {
+        "mode": "clean_comment",
+        "review_id": None,
+        "comment_id": comment["id"],
+        "actor": "chatgpt-codex-connector[bot]",
+        "state": "CLEAN",
+        "submitted_at": comment["created_at"],
+        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        "url": comment["html_url"],
+        "reviewed_commit_prefix": head[:10],
+        "accepted_state": True,
+        "blocking_state": False,
+    }
+    core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+    evidence["evidence_sha256"] = grips.sha256_json(core)
+    return evidence
+
+
 def captain_codex_live_state(
     view: dict[str, object],
     *,
@@ -6683,6 +6733,102 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         execution = result["output"]["executions"][0]
         self.assertTrue(execution["verification_passed"])
+
+    def test_atomic_merge_guard_accepts_bound_clean_comment(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence()
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        base_state = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(base_state["request_comment"])
+        clean_comment = captain_codex_clean_comment()
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, clean_comment]],
+            review_pages=[[]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+        self.assertEqual(
+            "settled",
+            execution["merge_lease_guard"]["dispatch_codex_review_revalidation"][
+                "status"
+            ],
+        )
+
+    def test_atomic_merge_guard_blocks_clean_comment_body_drift(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence()
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        template = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(template["request_comment"])
+        clean_comment = captain_codex_clean_comment()
+        initial = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, clean_comment]],
+            review_pages=[[]],
+        )
+        drifted_comment = deepcopy(clean_comment)
+        drifted_comment["body"] = str(drifted_comment["body"]) + " changed"
+        drifted = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, drifted_comment]],
+            review_pages=[[]],
+        )
+        gh = FakeGh(
+            view=view,
+            diff_text=CAPTAIN_DIFF_TEXT,
+            codex_state_sequence=[initial, drifted],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_codex_clean_comment_body_drift",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_atomic_merge_guard_accepts_one_bounded_reaction_page(self) -> None:
         parameters = authorized_captain_run_parameters()

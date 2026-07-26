@@ -1399,8 +1399,10 @@ def _codex_review_evidence_errors(
         errors.append("completion must be a structured object")
     else:
         mode = completion.get("mode")
-        if mode not in {"review", "reaction"}:
-            errors.append("completion.mode must be review or reaction")
+        if mode not in {"review", "reaction", "clean_comment"}:
+            errors.append(
+                "completion.mode must be review, reaction or clean_comment"
+            )
         actor = completion.get("actor")
         if actor not in CAPTAIN_TRUSTED_CODEX_ACTORS:
             errors.append("completion.actor is not a trusted Codex actor")
@@ -1409,6 +1411,8 @@ def _codex_review_evidence_errors(
             errors.append("completion review state is not accepted")
         if mode == "reaction" and state != "THUMBS_UP":
             errors.append("completion reaction state must be THUMBS_UP")
+        if mode == "clean_comment" and state != "CLEAN":
+            errors.append("completion clean-comment state must be CLEAN")
         if completion.get("accepted_state") is not True:
             errors.append("completion.accepted_state must be true")
         if completion.get("blocking_state") is not False:
@@ -1418,7 +1422,41 @@ def _codex_review_evidence_errors(
             if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
                 errors.append("completion.review_id must be a positive integer for review mode")
         elif review_id is not None:
-            errors.append("completion.review_id must be null for reaction mode")
+            errors.append("completion.review_id must be null outside review mode")
+        comment_id = completion.get("comment_id")
+        if mode == "clean_comment":
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+            ):
+                errors.append(
+                    "completion.comment_id must be a positive integer for clean_comment mode"
+                )
+            reviewed_prefix = completion.get("reviewed_commit_prefix")
+            if (
+                not isinstance(reviewed_prefix, str)
+                or re.fullmatch(r"[0-9a-f]{10,40}", reviewed_prefix) is None
+            ):
+                errors.append(
+                    "completion.reviewed_commit_prefix must be 10 to 40 lowercase hex characters"
+                )
+            elif (
+                isinstance(expected_head, str)
+                and not expected_head.startswith(reviewed_prefix)
+            ):
+                errors.append(
+                    "completion.reviewed_commit_prefix does not bind expected_head"
+                )
+        else:
+            if comment_id is not None:
+                errors.append(
+                    "completion.comment_id must be null outside clean_comment mode"
+                )
+            if completion.get("reviewed_commit_prefix") is not None:
+                errors.append(
+                    "completion.reviewed_commit_prefix must be null outside clean_comment mode"
+                )
         completion_time = _captain_evidence_time(
             completion.get("submitted_at"), label="completion.submitted_at", errors=errors
         )

@@ -30,6 +30,10 @@ REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
     re.DOTALL,
 )
+CLEAN_RESULT_RE = re.compile(
+    r"\ACodex Review: Didn't find any major issues\. Hooray!\s+"
+    r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]{10,40})`(?:\s|$)"
+)
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -51,6 +55,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           databaseId
           body
           createdAt
+          url
           authorAssociation
           author { login }
           reactions(first: 100) {
@@ -353,6 +358,62 @@ def _policy(pr: dict[str, Any], repository: str, *, explicitly_required: bool) -
     }
 
 
+
+def _clean_comment_completion(
+    pr: dict[str, Any],
+    *,
+    request_time: datetime,
+    head_sha: str,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for comment in _list_nodes(pr.get("comments"), label="comments"):
+        actor = _actor_login(comment.get("author"))
+        body = comment.get("body")
+        created = _parse_time(comment.get("createdAt"))
+        comment_id = comment.get("databaseId")
+        if (
+            actor not in TRUSTED_CODEX_ACTORS
+            or not isinstance(body, str)
+            or created is None
+            or created < request_time
+            or isinstance(comment_id, bool)
+            or not isinstance(comment_id, int)
+        ):
+            continue
+        match = CLEAN_RESULT_RE.match(body)
+        if match is None:
+            continue
+        reviewed_prefix = match.group(1)
+        if not head_sha.startswith(reviewed_prefix):
+            continue
+        candidates.append(
+            {
+                **comment,
+                "_actor": actor,
+                "_created": created,
+                "_reviewed_prefix": reviewed_prefix,
+            }
+        )
+    if not candidates:
+        return None
+    selected = max(
+        candidates,
+        key=lambda item: (item["_created"], item["databaseId"]),
+    )
+    return {
+        "mode": "clean_comment",
+        "review_id": None,
+        "comment_id": selected["databaseId"],
+        "actor": selected["_actor"],
+        "state": "CLEAN",
+        "submitted_at": selected["createdAt"],
+        "body_sha256": _sha256_text(str(selected.get("body") or "")),
+        "url": selected.get("url"),
+        "reviewed_commit_prefix": selected["_reviewed_prefix"],
+        "accepted_state": True,
+        "blocking_state": False,
+    }
+
 def _review_completion(
     pr: dict[str, Any],
     *,
@@ -439,6 +500,14 @@ def _review_completion(
             "accepted_state": state in ACCEPTED_REVIEW_STATES,
             "blocking_state": state in BLOCKING_REVIEW_STATES,
         }
+
+    clean_comment = _clean_comment_completion(
+        pr,
+        request_time=request_time,
+        head_sha=head_sha,
+    )
+    if clean_comment is not None:
+        return clean_comment
 
     reactions = request.get("reactions")
     for reaction in _list_nodes(reactions, label="request reactions"):
