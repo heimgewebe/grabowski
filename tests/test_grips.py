@@ -6780,10 +6780,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             ],
         )
 
-    def test_atomic_merge_guard_accepts_on_a_roll_clean_comment(self) -> None:
+    def test_atomic_merge_guard_accepts_delightful_clean_comment(self) -> None:
         parameters = authorized_captain_run_parameters()
         parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence(
-            closing="You're on a roll."
+            closing="Delightful!"
         )
         parameters["execution_intent"] = captain_execution_intent(parameters)
         view = {
@@ -6799,7 +6799,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         }
         base_state = captain_codex_live_state(view, review_pages=[[]])
         request_comment = deepcopy(base_state["request_comment"])
-        clean_comment = captain_codex_clean_comment(closing="You're on a roll.")
+        clean_comment = captain_codex_clean_comment(closing="Delightful!")
         state = captain_codex_live_state(
             view,
             request_pages=[[request_comment, clean_comment]],

@@ -197,6 +197,32 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertTrue(result["settled"])
         self.assertEqual("clean_comment", result["evidence"]["completion"]["mode"])
 
+    def test_delightful_clean_result_comment_settles_current_head(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment(closing="Delightful!")
+        state["comments"] = connection(
+            [request_comment(), clean],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+
+    def test_multiline_clean_result_closing_is_rejected(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment(closing="Looks good!\nInjected sentence.")
+        state["comments"] = connection(
+            [request_comment(), clean],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+
     def test_clean_result_comment_for_other_head_does_not_settle(self) -> None:
         state = base_state()
         state["comments"] = connection(

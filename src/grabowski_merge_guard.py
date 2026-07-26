@@ -34,7 +34,7 @@ _CODEX_REQUEST_RE = re.compile(
 )
 _CODEX_CLEAN_RESULT_RE = re.compile(
     r"\ACodex Review: Didn't find any major issues\. "
-    r"(?:Hooray!|You're on a roll\.)\s+"
+    r"[^\r\n]{0,79}[.!?]\r?\n\r?\n"
     r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]{10,40})`(?:\s|$)"
 )
 _CODEX_THREADS_QUERY = """
