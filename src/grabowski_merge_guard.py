@@ -1508,22 +1508,43 @@ class CaptainMergeGuardRunner:
                     ):
                         errors.append("merge_guard_codex_clean_comment_url_drift")
         elif mode == "reaction":
-            reactions = self._codex_single_page(
-                [
-                    "api",
-                    "--paginate",
-                    "--slurp",
-                    (
-                        f"repos/{repository}/issues/comments/{request_comment_id}"
-                        "/reactions?per_page=100"
-                    ),
-                ],
-                label="reactions",
-                observations=observations,
-                errors=errors,
-            )
-            if reactions is None:
-                reactions = []
+            reaction_comment_id = completion.get("comment_id")
+            reacted_request_time: datetime | None = None
+            if (
+                isinstance(reaction_comment_id, bool)
+                or not isinstance(reaction_comment_id, int)
+                or reaction_comment_id <= 0
+            ):
+                errors.append("merge_guard_codex_reaction_comment_id_invalid")
+                reactions: list[dict[str, Any]] = []
+            else:
+                reacted_requests = [
+                    item
+                    for item in canonical_requests
+                    if item["id"] == reaction_comment_id
+                ]
+                if len(reacted_requests) != 1:
+                    errors.append(
+                        "merge_guard_codex_reaction_request_missing_or_ambiguous"
+                    )
+                    reactions = []
+                else:
+                    reacted_request_time = reacted_requests[0]["created"]
+                    bounded_reactions = self._codex_single_page(
+                        [
+                            "api",
+                            "--paginate",
+                            "--slurp",
+                            (
+                                f"repos/{repository}/issues/comments/"
+                                f"{reaction_comment_id}/reactions?per_page=100"
+                            ),
+                        ],
+                        label="reactions",
+                        observations=observations,
+                        errors=errors,
+                    )
+                    reactions = bounded_reactions or []
             matching_reactions: list[dict[str, Any]] = []
             for reaction in reactions:
                 actor = _github_actor(reaction.get("user"))
@@ -1532,8 +1553,8 @@ class CaptainMergeGuardRunner:
                     actor in _CODEX_REVIEW_ACTORS
                     and reaction.get("content") == "+1"
                     and created is not None
-                    and request_time is not None
-                    and created >= request_time
+                    and reacted_request_time is not None
+                    and created >= reacted_request_time
                 ):
                     matching_reactions.append(
                         {**reaction, "_actor": actor, "_created": created}
@@ -1669,6 +1690,7 @@ class CaptainMergeGuardRunner:
                 "request_comment_id": request_comment_id,
                 "completion_mode": mode,
                 "completion_id": completion.get("review_id"),
+                "completion_comment_id": completion.get("comment_id"),
                 "thread_count": len(thread_ids),
                 "thread_ids_sha256": _sha256_json(thread_ids),
                 "unresolved_thread_count": len(unresolved_thread_ids),
@@ -1685,6 +1707,7 @@ class CaptainMergeGuardRunner:
                         "request_comment_id": request_comment_id,
                         "completion_mode": mode,
                         "completion_id": completion.get("review_id"),
+                        "completion_comment_id": completion.get("comment_id"),
                         "thread_ids": thread_ids,
                         "unresolved_thread_ids": unresolved_thread_ids,
                     }

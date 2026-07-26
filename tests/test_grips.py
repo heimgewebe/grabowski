@@ -3278,6 +3278,7 @@ def captain_codex_review_evidence(
 
 def captain_codex_reaction_evidence(
     *,
+    comment_id: int = 101,
     review_tier: str = "high_critical",
     closing: str = "Hooray!",
 ) -> dict[str, object]:
@@ -3285,6 +3286,7 @@ def captain_codex_reaction_evidence(
     evidence["completion"] = {
         "mode": "reaction",
         "review_id": None,
+        "comment_id": comment_id,
         "actor": "chatgpt-codex-connector[bot]",
         "state": "THUMBS_UP",
         "submitted_at": "2026-07-26T08:01:00Z",
@@ -6976,6 +6978,62 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             execution["merge_lease_guard"]["dispatch_codex_review_revalidation"][
                 "status"
             ],
+        )
+
+    def test_atomic_merge_guard_accepts_later_duplicate_reaction_marker(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        parameters["codex_review_evidence"] = captain_codex_reaction_evidence(
+            comment_id=102
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        initial = captain_codex_live_state(view)
+        earliest_request = deepcopy(initial["request_comment"])
+        later_request = deepcopy(earliest_request)
+        later_request["id"] = 102
+        later_request["created_at"] = "2026-07-26T08:00:30Z"
+        reaction = {
+            "content": "+1",
+            "created_at": "2026-07-26T08:01:00Z",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+        }
+        gh = FakeGh(
+            view=view,
+            diff_text=CAPTAIN_DIFF_TEXT,
+            codex_state=captain_codex_live_state(
+                view,
+                request_pages=[[earliest_request, later_request]],
+                review_pages=[[]],
+                reaction_pages=[[reaction]],
+            ),
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+        self.assertTrue(
+            any(
+                "issues/comments/102/reactions" in " ".join(call)
+                for call in gh.calls
+            )
         )
 
     def test_atomic_merge_guard_blocks_second_reaction_page(self) -> None:

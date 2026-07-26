@@ -449,6 +449,40 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertTrue(result["settled"])
         self.assertEqual(result["evidence"]["completion"]["mode"], "reaction")
+        self.assertEqual(result["evidence"]["completion"]["comment_id"], 1001)
+
+    def test_duplicate_request_accepts_reaction_on_later_marker(self) -> None:
+        state = base_state()
+        earliest = request_comment(
+            comment_id=1001,
+            created_at="2026-07-26T08:00:00Z",
+        )
+        later = request_comment(
+            comment_id=1002,
+            created_at="2026-07-26T08:02:00Z",
+        )
+        later["reactions"] = connection(
+            [
+                {
+                    "content": "THUMBS_UP",
+                    "createdAt": "2026-07-26T08:03:00Z",
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                }
+            ],
+            hasNextPage=False,
+        )
+        state["comments"] = connection(
+            [earliest, later],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+        self.assertEqual(1001, result["evidence"]["request"]["comment_id"])
+        self.assertEqual("reaction", result["evidence"]["completion"]["mode"])
+        self.assertEqual(1002, result["evidence"]["completion"]["comment_id"])
 
     def test_untrusted_request_marker_is_ignored(self) -> None:
         state = base_state()

@@ -68,6 +68,19 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertNotIn("github.event.pull_request.head", request_section)
         self.assertNotIn("github.event.pull_request.head", evaluate_section)
 
+    def test_malformed_evaluator_output_becomes_explicit_failure(self) -> None:
+        evaluate_section = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        self.assertIn("if ! jq -e '", evaluate_section)
+        self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
+        self.assertIn("codex-review-settlement.invalid.json", evaluate_section)
+        self.assertIn("rc=2", evaluate_section)
+        self.assertLess(
+            evaluate_section.index("trusted_evaluator_output_invalid"),
+            evaluate_section.index('echo "github_state=$github_state"'),
+        )
+
     def test_status_is_diagnostic_and_exactly_named(self) -> None:
         self.assertGreaterEqual(self.text.count('context="Codex review settled"'), 2)
         self.assertIn("-f state=pending", self.text)

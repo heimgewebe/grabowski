@@ -441,9 +441,10 @@ def _clean_comment_completion(
 def _review_completion(
     pr: dict[str, Any],
     *,
-    request: dict[str, Any],
+    requests: list[dict[str, Any]],
     head_sha: str,
 ) -> dict[str, Any] | None:
+    request = requests[0]
     request_time = request["_created"]
     candidates: list[dict[str, Any]] = []
     for review in _list_nodes(pr.get("reviews"), label="reviews"):
@@ -533,27 +534,52 @@ def _review_completion(
     if clean_comment is not None:
         return clean_comment
 
-    reactions = request.get("reactions")
-    for reaction in _list_nodes(reactions, label="request reactions"):
-        actor = _actor_login(reaction.get("user"))
-        created = _parse_time(reaction.get("createdAt"))
-        if (
-            actor in TRUSTED_CODEX_ACTORS
-            and reaction.get("content") == "THUMBS_UP"
-            and created is not None
-            and created >= request_time
+    reaction_candidates: list[dict[str, Any]] = []
+    for reacted_request in requests:
+        request_comment_id = reacted_request["databaseId"]
+        reacted_request_time = reacted_request["_created"]
+        reactions = reacted_request.get("reactions")
+        for reaction in _list_nodes(
+            reactions,
+            label=f"request {request_comment_id} reactions",
         ):
-            return {
-                "mode": "reaction",
-                "review_id": None,
-                "actor": actor,
-                "state": "THUMBS_UP",
-                "submitted_at": reaction.get("createdAt"),
-                "body_sha256": _sha256_text("THUMBS_UP"),
-                "url": None,
-                "accepted_state": True,
-                "blocking_state": False,
-            }
+            actor = _actor_login(reaction.get("user"))
+            created = _parse_time(reaction.get("createdAt"))
+            if (
+                actor in TRUSTED_CODEX_ACTORS
+                and reaction.get("content") == "THUMBS_UP"
+                and created is not None
+                and created >= reacted_request_time
+            ):
+                reaction_candidates.append(
+                    {
+                        **reaction,
+                        "_actor": actor,
+                        "_created": created,
+                        "_request_comment_id": request_comment_id,
+                    }
+                )
+    if reaction_candidates:
+        selected = min(
+            reaction_candidates,
+            key=lambda item: (
+                item["_created"],
+                item["_request_comment_id"],
+                item["_actor"],
+            ),
+        )
+        return {
+            "mode": "reaction",
+            "review_id": None,
+            "comment_id": selected["_request_comment_id"],
+            "actor": selected["_actor"],
+            "state": "THUMBS_UP",
+            "submitted_at": selected.get("createdAt"),
+            "body_sha256": _sha256_text("THUMBS_UP"),
+            "url": None,
+            "accepted_state": True,
+            "blocking_state": False,
+        }
     return None
 
 
@@ -612,7 +638,7 @@ def evaluate(
     requests = _matching_requests(pr, expected_request)
     request = requests[0] if requests else None
     completion = (
-        _review_completion(pr, request=request, head_sha=head_sha)
+        _review_completion(pr, requests=requests, head_sha=head_sha)
         if request is not None
         else None
     )
