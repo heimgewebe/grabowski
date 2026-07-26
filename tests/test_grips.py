@@ -3308,7 +3308,19 @@ def captain_codex_clean_comment(
     clean_body = body or (
         f"Codex Review: Didn't find any major issues. {closing}\n\n"
         f"**Reviewed commit:** `{head[:10]}`\n\n"
-        "<details><summary>About Codex</summary></details>"
+        "<details> <summary>ℹ️ About Codex in GitHub</summary>\n"
+        "<br/>\n\n"
+        "[Your team has set up Codex to review pull requests in this repo]"
+        "(https://chatgpt.com/codex/cloud/settings/general). "
+        "Reviews are triggered when you\n"
+        "- Open a pull request for review\n"
+        "- Mark a draft as ready\n"
+        '- Comment "@codex review".\n\n'
+        "If Codex has suggestions, it will comment; otherwise it will react with 👍."
+        "\n\n\n\n\n"
+        "Codex can also answer questions or update the PR. Try commenting "
+        '"@codex address that feedback".\n\n'
+        "</details>"
     )
     return {
         "id": comment_id,
@@ -3324,13 +3336,14 @@ def captain_codex_clean_comment_evidence(
     *,
     head: str = CAPTAIN_HEAD,
     review_tier: str = "high_critical",
+    body: str | None = None,
     closing: str = "Hooray!",
 ) -> dict[str, object]:
     evidence = captain_codex_review_evidence(
         head=head,
         review_tier=review_tier,
     )
-    comment = captain_codex_clean_comment(head=head, closing=closing)
+    comment = captain_codex_clean_comment(head=head, body=body, closing=closing)
     body = str(comment["body"])
     evidence["completion"] = {
         "mode": "clean_comment",
@@ -6818,6 +6831,53 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         execution = result["output"]["executions"][0]
         self.assertTrue(execution["verification_passed"])
+
+    def test_atomic_merge_guard_rejects_clean_comment_appended_text(self) -> None:
+        poisoned_body = str(captain_codex_clean_comment()["body"]) + (
+            "\nBlocking issue: do not merge."
+        )
+        parameters = authorized_captain_run_parameters()
+        parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence(
+            body=poisoned_body
+        )
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        template = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(template["request_comment"])
+        poisoned_comment = captain_codex_clean_comment(body=poisoned_body)
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, poisoned_comment]],
+            review_pages=[[]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_codex_clean_comment_shape_invalid",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_atomic_merge_guard_blocks_clean_comment_body_drift(self) -> None:
         parameters = authorized_captain_run_parameters()

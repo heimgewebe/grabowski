@@ -84,7 +84,19 @@ def codex_clean_comment(
     body = (
         f"Codex Review: Didn't find any major issues. {closing}\n\n"
         f"**Reviewed commit:** `{prefix}`\n\n"
-        "<details><summary>About Codex</summary></details>"
+        "<details> <summary>ℹ️ About Codex in GitHub</summary>\n"
+        "<br/>\n\n"
+        "[Your team has set up Codex to review pull requests in this repo]"
+        "(https://chatgpt.com/codex/cloud/settings/general). "
+        "Reviews are triggered when you\n"
+        "- Open a pull request for review\n"
+        "- Mark a draft as ready\n"
+        '- Comment "@codex review".\n\n'
+        "If Codex has suggestions, it will comment; otherwise it will react with 👍."
+        "\n\n\n\n\n"
+        "Codex can also answer questions or update the PR. Try commenting "
+        '"@codex address that feedback".\n\n'
+        "</details>"
     )
     return {
         "databaseId": comment_id,
@@ -213,6 +225,33 @@ class CodexReviewSettlementTests(unittest.TestCase):
     def test_multiline_clean_result_closing_is_rejected(self) -> None:
         state = base_state()
         clean = codex_clean_comment(closing="Looks good!\nInjected sentence.")
+        state["comments"] = connection(
+            [request_comment(), clean],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+
+    def test_emoji_shortcode_clean_result_comment_settles_current_head(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment(closing=":rocket:")
+        state["comments"] = connection(
+            [request_comment(), clean],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+
+    def test_clean_result_comment_with_appended_text_is_rejected(self) -> None:
+        state = base_state()
+        clean = codex_clean_comment()
+        clean["body"] = str(clean["body"]) + "\nBlocking issue: do not merge."
         state["comments"] = connection(
             [request_comment(), clean],
             hasPreviousPage=False,

@@ -30,11 +30,29 @@ REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
     re.DOTALL,
 )
+_CODEX_CLEAN_FOOTER_PATTERN = (
+    r"<details> <summary>ℹ️ About Codex in GitHub</summary>\n"
+    r"<br/>\n\n"
+    r"\[Your team has set up Codex to review pull requests in this repo\]"
+    r"\(https://chatgpt\.com/codex/cloud/settings/general\)\. "
+    r"Reviews are triggered when you\n"
+    r"- Open a pull request for review\n"
+    r"- Mark a draft as ready\n"
+    r'- Comment "@codex review"\.\n\n'
+    r"If Codex has suggestions, it will comment; otherwise it will react with 👍\."
+    r"\n{2,6}"
+    r"Codex can also answer questions or update the PR\. Try commenting "
+    r'"@codex address that feedback"\.\n\n'
+    r"</details>"
+)
 CLEAN_RESULT_RE = re.compile(
     r"\ACodex Review: Didn't find any major issues\. "
-    r"[^\r\n]{0,79}[.!?]\r?\n\r?\n"
-    r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]{10,40})`(?:\s|$)"
+    r"(?:[^\n]{0,79}[.!?]|[^\n]{0,62}:[a-z0-9_+-]{1,16}:)\n\n"
+    r"\*\*Reviewed commit:\*\* `([0-9a-f]{10,40})`\n\n"
+    + _CODEX_CLEAN_FOOTER_PATTERN
+    + r"\Z"
 )
+
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -103,6 +121,11 @@ query($owner: String!, $name: String!, $number: Int!) {
 
 class SettlementError(RuntimeError):
     pass
+
+
+def _normalize_codex_comment_body(value: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in normalized.split("\n")).rstrip("\n")
 
 
 def _canonical_json(value: Any) -> str:
@@ -381,7 +404,7 @@ def _clean_comment_completion(
             or not isinstance(comment_id, int)
         ):
             continue
-        match = CLEAN_RESULT_RE.match(body)
+        match = CLEAN_RESULT_RE.fullmatch(_normalize_codex_comment_body(body))
         if match is None:
             continue
         reviewed_prefix = match.group(1)
