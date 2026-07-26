@@ -947,7 +947,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                     ),
                     patch.object(
                         mcp,
-                        "_repoground_query_existing_index",
+                        "_repoground_agent_query",
                         return_value=query_payload,
                     ),
                 ):
@@ -1066,7 +1066,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
                 ),
                 patch.object(
                     mcp,
-                    "_repoground_query_existing_index",
+                    "_repoground_agent_query",
                     return_value=payload,
                 ),
             ):
@@ -1316,7 +1316,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(result["context_ref"]["manifest_sha256"], manifest_sha)
         self.assertEqual(result["access_wrappers"]["preflight"], "repoground_preflight")
         self.assertEqual(
-            result["access_wrappers"]["query"], "repoground_query_existing_index"
+            result["access_wrappers"]["query"], "repoground_query"
         )
         self.assertEqual(result["access_wrappers"]["range"], "repoground_range_get")
         self.assertEqual(
@@ -1632,7 +1632,7 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         }
 
         with patch.object(
-            mcp, "_repoground_query_existing_index", return_value=payload
+            mcp, "_repoground_agent_query", return_value=payload
         ):
             result = mcp.repoground_query("demo-repo", "hello", k=1)
 
@@ -1684,7 +1684,7 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         with (
             patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
             patch.object(
-                mcp, "_repoground_query_existing_index", return_value=query_payload
+                mcp, "_repoground_agent_query", return_value=query_payload
             ),
         ):
             result = mcp.repoground_context_pack("demo-repo", query="hello", k=1)
@@ -1756,6 +1756,312 @@ class RepoGroundContextBridgeToolTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["range"]["text"], "hello")
         self.assertEqual(result["mutation_boundary"]["writes"], [])
+
+
+    def test_agent_query_routes_symbol_definition_and_preserves_budget(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        manifest = self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payload = {
+            "kind": "repobrief.mcp.read_only_frontdoor",
+            "status": "available",
+            "route": "symbol_definition",
+            "intent": {"kind": "symbol_definition", "symbol": "snapshot_status"},
+            "retrieval": {
+                "strategy": "symbol_definition",
+                "match_count": 2,
+            },
+            "navigation_hits": [
+                {
+                    "id": "one",
+                    "kind": "function",
+                    "name": "snapshot_status",
+                    "qualified_name": "snapshot_status",
+                    "path": "src/first.py",
+                    "start_line": 10,
+                    "end_line": 20,
+                    "range_ref": "file:src/first.py#L10-L20",
+                    "source_range": {
+                        "path": "src/first.py",
+                        "start_line": 10,
+                        "end_line": 20,
+                    },
+                },
+                {
+                    "id": "two",
+                    "kind": "function",
+                    "name": "snapshot_status",
+                    "qualified_name": "Adapter.snapshot_status",
+                    "path": "src/second.py",
+                    "start_line": 30,
+                    "end_line": 40,
+                    "range_ref": "file:src/second.py#L30-L40",
+                },
+            ],
+            "resolved_ranges": [],
+            "budget": {
+                "max_context_tokens": 777,
+                "approx_context_chars_used": 0,
+                "truncated": False,
+            },
+            "availability": {"status": "available", "caveats": []},
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+        }
+
+        with patch.object(
+            mcp, "_repoground_agent_query", return_value=payload
+        ) as helper:
+            result = mcp.repoground_query(
+                "demo-repo",
+                "Wo ist die Funktion snapshot_status definiert?",
+                k=5,
+                max_context_tokens=777,
+            )
+
+        self.assertEqual(helper.call_args.args[0], manifest)
+        self.assertEqual(helper.call_args.kwargs["task_profile"], "basic_repo_question")
+        self.assertEqual(helper.call_args.kwargs["max_context_tokens"], 777)
+        self.assertEqual(result["schema_version"], 2)
+        self.assertTrue(result["available"])
+        self.assertEqual(result["route"], "symbol_definition")
+        self.assertEqual(result["strategy"], "symbol_definition")
+        self.assertEqual(result["query_shape"], "agent_frontdoor.navigation_hits")
+        self.assertEqual(result["hit_count"], 2)
+        self.assertEqual(result["result_count"], 2)
+        self.assertEqual(result["snippets"][0]["path"], "src/first.py")
+        self.assertEqual(
+            result["snippets"][0]["symbol"]["range_ref"],
+            "file:src/first.py#L10-L20",
+        )
+        self.assertEqual(result["ranges"][1]["file_path"], "src/second.py")
+        self.assertIsNone(result["snippets"][0]["text_excerpt"])
+
+    def test_agent_query_preserves_or_fallback_and_drops_empty_ranges(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payload = {
+            "kind": "repobrief.mcp.read_only_frontdoor",
+            "status": "available",
+            "route": "text_retrieval",
+            "intent": {"kind": "text_retrieval"},
+            "retrieval": {
+                "strategy": "or_relaxed",
+                "match_count": 3,
+            },
+            "resolved_ranges": [
+                {
+                    "source_path": "src/first.py",
+                    "source_line_range": {"start_line": 1, "end_line": 5},
+                    "text_excerpt": "a" * 1600,
+                    "range_ref": {"ref": "first"},
+                },
+                {
+                    "source_path": "src/empty.py",
+                    "source_line_range": {"start_line": 1, "end_line": 1},
+                    "text_excerpt": "",
+                    "range_ref": {"ref": "empty"},
+                },
+                {
+                    "source_path": "src/second.py",
+                    "source_line_range": {"start_line": 6, "end_line": 9},
+                    "text_excerpt": "bounded second result",
+                    "range_ref": {"ref": "second"},
+                },
+            ],
+            "budget": {
+                "max_context_tokens": 2000,
+                "approx_context_chars_used": 1621,
+                "truncated": True,
+            },
+            "availability": {"status": "available", "caveats": []},
+            "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+        }
+
+        with patch.object(mcp, "_repoground_agent_query", return_value=payload):
+            result = mcp.repoground_query(
+                "demo-repo", "How does snapshot freshness work?", k=3
+            )
+
+        self.assertEqual(result["route"], "text_retrieval")
+        self.assertEqual(result["strategy"], "or_relaxed")
+        self.assertEqual(result["query_shape"], "agent_frontdoor.resolved_ranges")
+        self.assertEqual(result["result_count"], 3)
+        self.assertEqual(result["hit_count"], 2)
+        self.assertEqual(
+            [snippet["path"] for snippet in result["snippets"]],
+            ["src/first.py", "src/second.py"],
+        )
+        self.assertTrue(all(snippet["text_excerpt"] for snippet in result["snippets"]))
+        self.assertTrue(
+            all(len(snippet["text_excerpt"]) <= 1200 for snippet in result["snippets"])
+        )
+        self.assertTrue(result["budget"]["truncated"])
+
+    def test_filtered_query_keeps_explicit_low_level_path(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        payload = {
+            "status": "available",
+            "query_result": {
+                "count": 1,
+                "results": [
+                    {
+                        "path": "src/only.py",
+                        "text": "filtered result exceeds budget",
+                    }
+                ],
+            },
+        }
+
+        with (
+            patch.object(
+                mcp,
+                "_repoground_agent_query",
+                side_effect=AssertionError("agent frontdoor must not ignore filters"),
+            ),
+            patch.object(
+                mcp, "_repoground_query_existing_index", return_value=payload
+            ) as helper,
+        ):
+            result = mcp.repoground_query(
+                "demo-repo",
+                "target",
+                filters={"path": "src/only.py"},
+                k=1,
+                max_context_tokens=2,
+            )
+
+        self.assertEqual(helper.call_args.kwargs["filters"], {"path": "src/only.py"})
+        self.assertEqual(result["route"], "filtered_text_retrieval")
+        self.assertEqual(result["strategy"], "exact_and_filtered")
+        self.assertTrue(result["local_budget_used"])
+        self.assertEqual(result["budget"]["approx_context_chars_used"], 8)
+        self.assertTrue(result["budget"]["truncated"])
+        self.assertEqual(result["snippets"][0]["path"], "src/only.py")
+        self.assertEqual(result["snippets"][0]["text_excerpt"], "filtered")
+
+    def test_context_pack_binds_route_strategy_and_budget(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        preflight = {
+            "status": "pass",
+            "available": True,
+            "answer_compliance_template": {},
+        }
+        payload = {
+            "status": "available",
+            "route": "text_retrieval",
+            "intent": {"kind": "text_retrieval"},
+            "retrieval": {"strategy": "or_relaxed", "match_count": 1},
+            "resolved_ranges": [
+                {
+                    "source_path": "src/app.py",
+                    "source_line_range": {"start_line": 1, "end_line": 2},
+                    "text_excerpt": "bounded",
+                    "range_ref": {"ref": "app"},
+                }
+            ],
+            "budget": {
+                "max_context_tokens": 900,
+                "approx_context_chars_used": 7,
+                "truncated": False,
+            },
+        }
+
+        with (
+            patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
+            patch.object(mcp, "_repoground_agent_query", return_value=payload),
+        ):
+            result = mcp.repoground_context_pack(
+                "demo-repo",
+                query="broad query",
+                max_context_tokens=900,
+            )
+
+        evidence = result["bounded_evidence"]
+        self.assertEqual(evidence["route"], "text_retrieval")
+        self.assertEqual(evidence["strategy"], "or_relaxed")
+        self.assertEqual(evidence["max_context_tokens"], 900)
+        self.assertEqual(evidence["budget"]["approx_context_chars_used"], 7)
+        self.assertIn(
+            "bounded_evidence.strategy",
+            result["determinism"]["retrieval_contract"]["semantic_fields"],
+        )
+        self.assertEqual(result["access_wrappers"]["query"], "repoground_query")
+        self.assertEqual(
+            result["access_wrappers"]["query_existing_index"],
+            "repoground_query_existing_index",
+        )
+
+    def test_agent_query_rejects_unbounded_context_budget(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_context_tokens"):
+            mcp.repoground_query(
+                "demo-repo",
+                "target",
+                max_context_tokens=8001,
+            )
+
+
+    def test_agent_query_uses_marked_legacy_fallback_and_local_budget(self) -> None:
+        _repo, head = self._git_repo("demo-repo")
+        self._write_bundle("demo-repo-max-260701-1200", commit=head)
+        core = self.home / "repos" / "repoground" / "merger" / "repoground" / "core"
+        core.mkdir(parents=True)
+        for package in (
+            core.parents[2] / "__init__.py",
+            core.parents[1] / "__init__.py",
+            core.parent / "__init__.py",
+            core / "__init__.py",
+        ):
+            package.write_text("", encoding="utf-8")
+        (core / "mcp_tools.py").write_text("", encoding="utf-8")
+        (core / "bundle_access.py").write_text(
+            """
+def query_existing_index(manifest, query, *, k, filters, resolve_evidence, project_sources):
+    return {
+        "status": "available",
+        "query_result": {
+            "count": 1,
+            "results": [
+                {
+                    "path": "src/legacy.py",
+                    "text": "legacy result " * 40,
+                    "range_ref": {"ref": "legacy"},
+                }
+            ],
+        },
+        "mutation_boundary": {"writes": [], "read_paths_do_not_refresh": True},
+    }
+""".lstrip(),
+            encoding="utf-8",
+        )
+
+        result = mcp.repoground_query(
+            "demo-repo",
+            "legacy compatibility",
+            k=1,
+            max_context_tokens=10,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertTrue(result["legacy_fallback_used"])
+        self.assertTrue(result["local_budget_used"])
+        self.assertEqual(result["route"], "legacy_text_retrieval")
+        self.assertEqual(result["strategy"], "legacy_exact_and")
+        self.assertIn(
+            "repoground_agent_frontdoor_unavailable_legacy_fallback",
+            result["availability"]["caveats"],
+        )
+        self.assertEqual(result["budget"]["max_context_tokens"], 10)
+        self.assertEqual(result["budget"]["approx_context_chars_used"], 40)
+        self.assertTrue(result["budget"]["truncated"])
+        self.assertEqual(len(result["snippets"][0]["text_excerpt"]), 40)
+
+    def test_context_pack_rejects_unbounded_budget_without_query(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_context_tokens"):
+            mcp.repoground_context_pack(
+                "demo-repo",
+                max_context_tokens=0,
+            )
 
 
 class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
@@ -1888,7 +2194,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         }
         with (
             patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
-            patch.object(mcp, "_repoground_query_existing_index", return_value=payload),
+            patch.object(mcp, "_repoground_agent_query", return_value=payload),
         ):
             result = mcp.repoground_context_pack("demo-repo", query="hello", k=1)
 
@@ -1927,7 +2233,7 @@ class RepoGroundContextPackResolvedEvidenceTests(unittest.TestCase):
         }
         with (
             patch.object(mcp, "_repoground_agent_preflight", return_value=preflight),
-            patch.object(mcp, "_repoground_query_existing_index", return_value=payload),
+            patch.object(mcp, "_repoground_agent_query", return_value=payload),
         ):
             result = mcp.repoground_context_pack("demo-repo", query="missing", k=1)
 
