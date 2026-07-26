@@ -28,6 +28,27 @@ class OperatorContextTests(unittest.TestCase):
             msg=completed.stdout + completed.stderr,
         )
 
+    def test_reposkop_context_contract_is_target_bound(self) -> None:
+        command = (
+            "reposkop report <absolute-target> --purpose "
+            "grabowski-repo-state-context --json"
+        )
+        root_contract = (ROOT / "GRABOWSKI.md").read_text(encoding="utf-8")
+        blocked_protocol = (
+            ROOT / "docs" / "blocked-action-protocol-v0.md"
+        ).read_text(encoding="utf-8")
+        relay_source = (
+            ROOT / "src" / "grabowski_operator_relay.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(command, root_contract)
+        self.assertIn(command, blocked_protocol)
+        self.assertNotIn("steuerboard operator report", root_contract.lower())
+        self.assertNotIn("steuerboard operator report", blocked_protocol.lower())
+        self.assertIn("reposkop_target_bound_report", relay_source)
+        self.assertIn("reposkop_report_action_approval", relay_source)
+        self.assertNotIn("steuerboard_operator_report", relay_source)
+        self.assertNotIn("steuerboard_report_action_approval", relay_source)
+
     def test_catalog_covers_runtime_contract_exactly(self) -> None:
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(
@@ -173,10 +194,10 @@ class OperatorContextTests(unittest.TestCase):
         )
         self.assertEqual(
             protocol["routing_roles"]["repo_state_context"],
-            "steuerboard_operator_report",
+            "reposkop_target_bound_report",
         )
         self.assertIn(
-            "steuerboard_report_action_approval",
+            "reposkop_report_action_approval",
             protocol["does_not_establish"],
         )
 

@@ -311,7 +311,52 @@ class ControlPlanePollProbeTests(unittest.TestCase):
             ("control-plane-metrics-unavailable",), result.reasons
         )
 
-    def test_stale_poll_is_indeterminate_not_restartable(self) -> None:
+    def test_missing_and_invalid_poll_evidence_remain_indeterminate(self) -> None:
+        for failure in (
+            "control-plane-poll-missing",
+            "control-plane-poll-timestamp-invalid",
+        ):
+            with self.subTest(failure=failure):
+                with (
+                    patch.object(
+                        watchdog,
+                        "service_properties",
+                        return_value={
+                            "LoadState": "loaded",
+                            "ActiveState": "active",
+                            "SubState": "running",
+                            "MainPID": "321",
+                        },
+                    ),
+                    patch.object(watchdog, "process_start_ticks", return_value=77),
+                    patch.object(
+                        watchdog, "process_age_seconds", return_value=120.0
+                    ),
+                    patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+                    patch.object(watchdog, "get_probe", return_value=True),
+                    patch.object(
+                        watchdog,
+                        "control_plane_poll_probe",
+                        return_value=failure,
+                    ),
+                ):
+                    result = watchdog.probe_component(
+                        component="tunnel",
+                        service="tunnel-client-grabowski.service",
+                        runtime_root=Path("/runtime"),
+                        module="grabowski_operator",
+                        profile="grabowski",
+                        host="127.0.0.1",
+                        port=18181,
+                        health_url=watchdog.DEFAULT_HEALTH_URL,
+                        ready_url=watchdog.DEFAULT_READY_URL,
+                        startup_grace=20,
+                        http_timeout=2,
+                    )
+                self.assertEqual("indeterminate", result.status)
+                self.assertEqual((failure,), result.reasons)
+
+    def test_stale_poll_is_unhealthy_and_enters_restart_path(self) -> None:
         with (
             patch.object(
                 watchdog,
@@ -346,8 +391,24 @@ class ControlPlanePollProbeTests(unittest.TestCase):
                 startup_grace=20,
                 http_timeout=2,
             )
-        self.assertEqual("indeterminate", result.status)
+        self.assertEqual("unhealthy", result.status)
         self.assertEqual(("control-plane-poll-stale",), result.reasons)
+
+        state = watchdog.WatchdogState()
+        actions = []
+        for now in (1_000, 1_030, 1_060):
+            action, state = watchdog.decide(
+                state,
+                now=now,
+                failure_threshold=3,
+                max_restarts=3,
+                restart_window=900,
+                jitter_source=lambda: 0.0,
+            )
+            actions.append(action)
+        self.assertEqual(["observe", "observe", "restart"], actions)
+        self.assertEqual(1, state.restart_generation)
+        self.assertEqual([1_060], state.restart_timestamps)
 
 
 class McpHttpLivenessProbeTests(unittest.TestCase):

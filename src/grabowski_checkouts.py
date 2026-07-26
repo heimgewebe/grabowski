@@ -49,7 +49,8 @@ CHECKOUT_LOCK = Path(
 DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
-CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
+# Compatibility telemetry remains in schema 2; cleanup itself is immediately eligible.
+CHECKOUT_CLEANUP_GRACE_SECONDS = 0
 CLEANUP_PLAN_SCHEMA_VERSION = 2
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
 MAX_ACTIVE_CHECKOUTS_PER_REPO = 8
@@ -1453,10 +1454,9 @@ def _checkout_lifecycle_decision(
         if archive_present and isinstance(archive.get("created_at_unix"), int)
         else None
     )
-    archive_grace_elapsed = bool(
-        archive_age_seconds is not None
-        and archive_age_seconds >= CHECKOUT_CLEANUP_GRACE_SECONDS
-    )
+    # Kept as a compatibility projection for existing consumers. The time-based
+    # gate is retired; recovery and live coordination checks remain authoritative.
+    archive_grace_elapsed = archive_age_seconds is not None
     blocking = bool(coordination.get("blocking"))
     reasons: list[str] = []
     cleanup_candidate = False
@@ -1517,12 +1517,7 @@ def _checkout_lifecycle_decision(
             next_step = "archive_completed_retained_checkout_after_external_revalidation"
             reasons.append("terminal managed checkout is retained and not yet archived")
     elif binding_phase == "archived":
-        if archive_present and not archive_grace_elapsed:
-            state = "archived_grace"
-            hygiene_mark = "archived"
-            next_step = "wait_for_checkout_cleanup_grace"
-            reasons.append("matching recovery archive is younger than the 24-hour cleanup grace")
-        elif archive_present and blocking:
+        if archive_present and blocking:
             state = "archived_blocked"
             hygiene_mark = "archived"
             next_step = "resolve_coordination_blockers_before_cleanup_dry_run"
@@ -1544,11 +1539,6 @@ def _checkout_lifecycle_decision(
         hygiene_mark = "unknown"
         next_step = "refresh_archive_or_retain_before_cleanup"
         reasons.append("latest archive does not match current checkout head or branch")
-    elif archive_present and not archive_grace_elapsed:
-        state = "archived_grace"
-        hygiene_mark = "archived"
-        next_step = "wait_for_checkout_cleanup_grace"
-        reasons.append("matching recovery archive is younger than the 24-hour cleanup grace")
     elif archive_present and blocking:
         state = "archived_blocked"
         hygiene_mark = "archived"
@@ -2120,11 +2110,6 @@ def _cleanup_plan(
     now = _now()
     archive_created_at_unix = int(archive["created_at_unix"])
     archive_age_seconds = max(0, now - archive_created_at_unix)
-    if archive_age_seconds < CHECKOUT_CLEANUP_GRACE_SECONDS:
-        raise RuntimeError(
-            "Checkout cleanup grace has not elapsed: "
-            f"age={archive_age_seconds} required={CHECKOUT_CLEANUP_GRACE_SECONDS}"
-        )
     owner = _owner(owner_id)
     retention = _retention_records([record["checkout_key"]]).get(record["checkout_key"])
     retention_active = bool(retention and retention["retention_until_unix"] > now)
