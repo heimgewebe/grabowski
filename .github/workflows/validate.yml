@@ -1,42 +1,57 @@
-name: PR 474 final diff evidence
+name: PR 474 terminal Codex evidence
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: read
+  issues: read
+  pull-requests: read
 
 jobs:
-  export:
+  verify:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout full history
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Create exact full diff
+      - name: Read exact terminal Codex state
+        id: state
         env:
-          BASE_SHA: d5573e1929ea227b9c3a1319244c2af44998cc34
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: heimgewebe/grabowski
+          PR_NUMBER: "474"
           HEAD_SHA: a36fdd294a32b1d11ca1ba83593a69aa7b0f5034
+          REQUEST_COMMENT_ID: "5085465807"
+          SINCE: 2026-07-26T21:24:00Z
         run: |
           set -euo pipefail
-          git cat-file -e "$BASE_SHA^{commit}"
-          git cat-file -e "$HEAD_SHA^{commit}"
-          git diff --binary --full-index "$BASE_SHA...$HEAD_SHA" \
-            > "$RUNNER_TEMP/grabowski-pr-474-final.diff"
-          test -s "$RUNNER_TEMP/grabowski-pr-474-final.diff"
-          sha256sum "$RUNNER_TEMP/grabowski-pr-474-final.diff" \
-            | tee "$RUNNER_TEMP/grabowski-pr-474-final.diff.sha256"
+          reviews="$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" --jq '[.[] | select(.user.login == "chatgpt-codex-connector[bot]" and ((.commit_id // "") == "'"$HEAD_SHA"'"))]')"
+          inline_comments="$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/comments" --jq '[.[] | select(.user.login == "chatgpt-codex-connector[bot]" and (.created_at >= "'"$SINCE"'"))]')"
+          issue_comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments" --jq '[.[] | select(.user.login == "chatgpt-codex-connector[bot]" and (.created_at >= "'"$SINCE"'") and ((.body // "") | contains("**Reviewed commit:** `a36fdd294a")))]')"
+          reactions="$(gh api "repos/$REPOSITORY/issues/comments/$REQUEST_COMMENT_ID/reactions" --jq '[.[] | select(.user.login == "chatgpt-codex-connector[bot]")]')"
+          jq -n \
+            --arg repository "$REPOSITORY" \
+            --argjson pr "$PR_NUMBER" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg since "$SINCE" \
+            --argjson reviews "$reviews" \
+            --argjson inline_comments "$inline_comments" \
+            --argjson issue_comments "$issue_comments" \
+            --argjson reactions "$reactions" \
+            '{repository:$repository,pr:$pr,head_sha:$head_sha,since:$since,reviews:$reviews,inline_comments:$inline_comments,issue_comments:$issue_comments,reactions:$reactions,terminal:((($reviews|length)>0) or (($issue_comments|length)>0) or ([ $reactions[] | select(.content == "+1") ]|length)>0)}' \
+            > "$RUNNER_TEMP/pr474-terminal-codex.json"
+          cat "$RUNNER_TEMP/pr474-terminal-codex.json"
+          echo "terminal=$(jq -r '.terminal' "$RUNNER_TEMP/pr474-terminal-codex.json")" >> "$GITHUB_OUTPUT"
 
-      - name: Upload exact full diff
+      - name: Upload terminal state
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: grabowski-pr-474-final-diff-a36fdd29
-          path: |
-            ${{ runner.temp }}/grabowski-pr-474-final.diff
-            ${{ runner.temp }}/grabowski-pr-474-final.diff.sha256
+          name: pr474-terminal-codex-a36fdd29
+          path: ${{ runner.temp }}/pr474-terminal-codex.json
           if-no-files-found: error
           retention-days: 7
+
+      - name: Require terminal state
+        if: steps.state.outputs.terminal != 'true'
+        run: exit 1
