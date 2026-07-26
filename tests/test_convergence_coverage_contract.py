@@ -91,6 +91,7 @@ class ConvergenceCoverageContractTests(unittest.TestCase):
 
     def test_publication_and_pr_surfaces_are_explicit(self) -> None:
         expected = {
+            "tool:grabowski_git": "effect_only",
             "grip:branch-publish": "effect_only",
             "grip:pr-create-or-update": "effect_only",
             "tool:grabowski_bureau_task_publish": "effect_only",

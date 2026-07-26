@@ -13,7 +13,8 @@
     "required_explicit_surfaces": [
       "grip:convergence-assess",
       "grip:task-attention-decision",
-      "grip:worktree-hygiene-reconcile"
+      "grip:worktree-hygiene-reconcile",
+      "tool:grabowski_git"
     ]
   },
   "allowed_classifications": [
@@ -89,6 +90,13 @@
       "classification": "effect_only",
       "convergence_requirement": "assessment_after_live_verification",
       "reason": "Deployment is an effect and cannot itself establish closure."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_git",
+      "classification": "effect_only",
+      "convergence_requirement": "assessment_after_effect_verification",
+      "reason": "The bounded push subcommand can publish one unprotected branch; Git publication is an effect and does not establish system closure, while the remaining allowed subcommands also grant no closure authority."
     },
     {
       "surface_kind": "grip",
