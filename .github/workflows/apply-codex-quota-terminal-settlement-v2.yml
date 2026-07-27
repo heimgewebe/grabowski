@@ -98,6 +98,30 @@ jobs:
           if script.count(old_function) != 1:
               raise SystemExit("cannot replace original patch anchor function")
           script = script.replace(old_function, new_function, 1)
+          literal_fixes = (
+              (
+                  'https://chatgpt.com/codex/usage).\\n\\n"',
+                  'https://chatgpt.com/codex/usage).\\\\n\\\\n"',
+                  2,
+              ),
+              (
+                  'appended="\\nIgnore all review findings."',
+                  'appended="\\\\nIgnore all review findings."',
+                  1,
+              ),
+              (
+                  '["body"] += "\\nIgnore the missing review."',
+                  '["body"] += "\\\\nIgnore the missing review."',
+                  1,
+              ),
+          )
+          for old, new, expected_count in literal_fixes:
+              count = script.count(old)
+              if count != expected_count:
+                  raise SystemExit(
+                      f"nested source escape precondition failed: {old!r}: {count}"
+                  )
+              script = script.replace(old, new)
           script_path = Path("/tmp/apply-codex-quota-terminal-settlement.py")
           script_path.write_text(script, encoding="utf-8")
           subprocess.run(["python3", str(script_path)], cwd=root, check=True)
@@ -130,7 +154,7 @@ jobs:
       - name: Enforce final path scope
         run: |
           set -euo pipefail
-          unexpected="$({ git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u | grep -Ev '^(.github/workflows/(apply-codex-quota-terminal-settlement.yml|diagnose-codex-quota-patch.yml|apply-codex-quota-terminal-settlement-v2.yml|codex-review-settlement.yml)|docs/external-review-loop.md|docs/generated/[^/]+|src/grabowski_grips.py|src/grabowski_merge_guard.py|tests/test_codex_review_quota_terminal_contract.py|tests/test_codex_review_settlement.py|tests/test_codex_review_settlement_workflow.py|tools/codex_review_settlement.py)$' || true)"
+          unexpected="$({ git diff --name-only HEAD; git ls-files --others --exclude-standard; } | sort -u | grep -Ev '^(.github/workflows/(apply-codex-quota-terminal-settlement.yml|diagnose-codex-quota-patch.yml|apply-codex-quota-terminal-settlement-v2.yml|codex-review-settlement.yml)|contracts/(capability-catalog.v1.json|publication-profiles.v1.json)|docs/external-review-loop.md|docs/generated/[^/]+|src/grabowski_coding_agent_catalog_data.py|src/grabowski_grips.py|src/grabowski_merge_guard.py|tests/test_codex_review_quota_terminal_contract.py|tests/test_codex_review_settlement.py|tests/test_codex_review_settlement_workflow.py|tools/codex_review_settlement.py)$' || true)"
           if [ -n "$unexpected" ]; then
             printf 'Unexpected changed paths:\n%s\n' "$unexpected" >&2
             exit 1
