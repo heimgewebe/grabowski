@@ -4,7 +4,7 @@ Status: active
 
 ## Decision
 
-Grabowski self-review is the required review control. External LLM reviews, GitHub approvals, PR comments, and provider-specific packet reviews are optional diagnostics only. No review prose is posted to the PR as authoritative evidence.
+Grabowski self-review remains the universal required review control. For `high_critical` pull requests, and whenever `codex_review_required=true` is supplied, Captain additionally requires one current-head GitHub Codex settlement or one explicit short-lived exception. Other external LLM reviews, GitHub approvals, PR comments, and provider-specific packet reviews remain optional diagnostics. No review prose is treated as authoritative by itself.
 
 The required controls remain independent:
 
@@ -13,7 +13,8 @@ The required controls remain independent:
 3. terminal finding triage;
 4. green CI;
 5. mergeability and target identity;
-6. Captain authority and recovery controls where Captain executes the merge.
+6. current-head Codex settlement for high-critical or explicitly selected PRs;
+7. Captain authority and recovery controls where Captain executes the merge.
 
 ## Depth policy
 
@@ -98,7 +99,21 @@ For `pr-merge`, Captain `review_evidence` must be a valid `grabowski_self_review
 - no unaccepted material findings;
 - `tuning_signal: observe`.
 
-The audit may additionally carry action and target digests. Captain rejects mismatched bindings. The readiness grip also requires an independently supplied expected diff hash by default; a GitHub approval or changes-requested state is advisory and neither satisfies nor blocks the self-review contract.
+The audit may additionally carry action and target digests. Captain rejects mismatched bindings. The readiness grip also requires an independently supplied expected diff hash by default; a GitHub approval or changes-requested state neither satisfies nor blocks the self-review contract.
+
+For `high_critical` or explicitly required PRs, `codex_review_evidence` is a separate Captain gate. `tools/codex_review_settlement.py` creates an idempotent `@codex review` request whose hidden marker binds repository, PR, current head and current diff SHA-256. If identical trusted markers are duplicated, the earliest canonical request remains authoritative and fixes the review and finding cutoff. A trusted thumbs-up may appear on any identical canonical marker; the completion evidence separately binds the exact reacted comment, and Captain revalidates that marker and reaction while retaining the earliest cutoff. Settlement requires one of three trusted completion forms after the canonical request: a Codex pull-request review bound to the full head, a deterministic clean-result issue comment whose reviewed-commit token is a 10–40 character prefix of that head, or a thumbs-up reaction on a bound identical request marker. Every bounded trusted Codex inline thread bound to the current head must be resolved, including threads created before a duplicate marker. A new head or diff invalidates the request and all prior settlement evidence.
+
+The settlement evidence records the tool's static diff classification for diagnostics, but that value is not required to equal the later self-review tier: uncertainty and discovered findings can escalate Captain's requirement after the request was created. Captain derives authority from its own current self-review and explicit parameters, not from the settlement's diagnostic tier.
+
+Captain validates the evidence structurally and binds its digest into the short-lived execution intent. A `COMMENTED` review never clears an outstanding current-head `CHANGES_REQUESTED` or `PENDING` review. GitHub represents an unsubmitted `PENDING` review with no submission timestamp; it still blocks conservatively regardless of when the canonical request was created. A later trusted `APPROVED` review may supersede `CHANGES_REQUESTED`, while a `PENDING` review must disappear from the live set through submission or deletion before settlement can pass. The atomic merge guard then reads the exact request, the bounded canonical issue-comment set, the bounded current-head review set, the selected review, clean-result comment or reaction completion, and the current thread set from GitHub twice: once before acquiring merge resources and once immediately before `gh pr merge`. Any missing object, body or actor drift, non-earliest request, stale head, changed diff, outstanding blocking review, changed thread set, unresolved thread, truncated result window, failed GitHub read or evidence mismatch blocks fail-closed. Request, issue-comment, review and reaction revalidation uses 100 items per page with pagination enabled and accepts exactly one page; any second page is an explicit boundedness failure. A clean-result comment is accepted only from a trusted Codex actor, after the request, when the entire normalized body matches the deterministic `Didn't find any major issues` prefix, one bounded single-line connector closing of at most 80 characters ending in punctuation or a bounded emoji shortcode, the reviewed-commit prefix matching the current head, and the known GitHub-Codex footer through end of body. Its exact body digest remains bound into the evidence. Multiline or unbounded success prose is rejected; the closing text itself has no authority.
+
+The workflow requests one idempotent Codex review for every current PR head, so dynamic high-critical classifications and later explicit Captain requirements cannot lack a request merely because the workflow did not have the self-review evidence yet. Captain still decides risk-based whether settlement is mandatory; lower-tier PRs are not blocked by missing Codex evidence unless explicitly required.
+
+The workflow status `Codex review settled` is a diagnostic projection. GitHub Actions supports review, review-comment and issue-comment triggers, but neither review-thread resolution nor reaction changes as direct workflow triggers. A separate default-branch dispatcher refreshes the projection every 15 minutes and on manual dispatch by invoking the trusted settlement workflow for at most 100 open pull requests. It lists 101 candidates and fails closed instead of silently truncating a larger inventory. The dispatcher has only `actions: write`, `contents: read` and `pull-requests: read`, checks out no code and never evaluates a pull-request head. During the one-time bootstrap before the evaluator itself reaches the default branch, the settlement workflow reports `trusted_evaluator_missing_on_default_branch` and blocks explicitly rather than executing the pull-request copy of the evaluator. Empty, non-object or structurally malformed evaluator output is replaced with a bounded `trusted_evaluator_output_invalid` block result so the status publication still runs and cannot leave the head silently pending. The introducing pull request therefore needs an authorized out-of-band current-head settlement; after merge, ordinary refreshes use only the trusted default-branch evaluator. Reaction and thread-resolution projections may be delayed by one refresh interval, and scheduled workflows can be delayed by the platform. Captain does not trust this projection and always performs the authoritative live revalidation. The diagnostic status must not be configured as a required repository check.
+
+A `grabowski_codex_review_exception` is allowed only as an explicit, repo/PR/head/diff-bound record with approver, reason and at most two hours of validity. The published Captain evidence schema exposes it together with `codex_review_evidence` as the mutually exclusive `codex_review_release` alternative group and lists every runtime-required exception field. When Codex settlement is required, exactly one alternative must be present. The exception bypasses only the Codex settlement gate; it does not weaken self-review, CI, delivery, mergeability, authorization or live target checks.
+
+For `pr-merge`, the schema-version-1 Captain execution intent binds both Codex digest slots, including deterministic `null` hashes when the corresponding alternative is absent. Existing schema-version-1 intents for actions where Codex review is inapplicable, such as `runtime-deploy`, remain compatible when those two slots are omitted. If a non-merge intent supplies either slot, Captain still validates it against the expected digest; unknown evidence keys remain rejected.
 
 ## Audit tuning
 
@@ -122,7 +137,7 @@ Schema validation is intentionally structural. Current PR identity, `head_sha`, 
 
 ## Optional external diagnostics
 
-External review tools remain available for unusual uncertainty, incident analysis, or a deliberate second opinion. Their evidence may be supplied with `--external-review-evidence`; invalid evidence produces warnings, not a merge block. Legacy Claude packet requirements, policy waivers, and `self_review_required=false` are deprecated. External review output does not satisfy or shorten the required self-review loop.
+External review tools other than the conditional GitHub Codex settlement remain available for unusual uncertainty, incident analysis, or a deliberate second opinion. Their evidence may be supplied with `--external-review-evidence`; invalid evidence produces warnings, not a merge block. Legacy Claude packet requirements, policy waivers, and `self_review_required=false` are deprecated. No external review satisfies or shortens the required self-review loop.
 
 ## Cost policy
 
