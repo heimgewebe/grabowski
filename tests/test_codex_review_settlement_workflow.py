@@ -37,8 +37,8 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
 
     def test_permissions_are_bounded_to_review_status_workflow(self) -> None:
         self.assertIn("  contents: read\n", self.text)
-        self.assertIn("  issues: write\n", self.text)
-        self.assertIn("  pull-requests: read\n", self.text)
+        self.assertIn("  pull-requests: write\n", self.text)
+        self.assertNotIn("  issues: write\n", self.text)
         self.assertIn("  statuses: write\n", self.text)
         self.assertNotIn("contents: write", self.text)
 
