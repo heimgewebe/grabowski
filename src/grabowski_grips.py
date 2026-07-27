@@ -582,6 +582,7 @@ CAPTAIN_GATE_IDS = (
     "evidence-digest-bound",
     "execution-authority-present",
     "review-evidence-present",
+    "codex-review-settled",
     "diff-bound",
     "diff-delivery-recorded",
     "ci-green",
@@ -619,6 +620,12 @@ CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES = frozenset({
 # Compatibility alias for older receipts/tests; new callers should use source_allowlisted.
 CAPTAIN_STATUS_PROJECTION_TRUSTED_SOURCES = CAPTAIN_STATUS_PROJECTION_ALLOWLISTED_SOURCES
 CAPTAIN_STATUS_PROJECTION_MAX_AGE_SECONDS = 3600
+CAPTAIN_CODEX_REVIEW_MAX_AGE_SECONDS = 1800
+CAPTAIN_CODEX_EXCEPTION_MAX_AGE_SECONDS = 7200
+CAPTAIN_TRUSTED_CODEX_ACTORS = frozenset({
+    "chatgpt-codex-connector",
+    "chatgpt-codex-connector[bot]",
+})
 CAPTAIN_STATUS_PROJECTION_CLOCK_SKEW_TOLERANCE_SECONDS = 300
 CAPTAIN_EXECUTION_INTENT_KIND = "grabowski_captain_execution_intent"
 CAPTAIN_EXECUTION_INTENT_SCHEMA_VERSION = 1
@@ -639,12 +646,17 @@ CAPTAIN_EXECUTION_INTENT_FIELDS = (
 CAPTAIN_EXECUTION_INTENT_ACTION_FIELDS = {
     "pr-merge": ("expected_base_sha",),
 }
+CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS = (
+    "codex_review_evidence_sha256",
+    "codex_review_exception_sha256",
+)
 CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
     "actions_sha256",
     "status_projection_sha256",
     "diff_sha256",
     "merge_delivery_receipt_sha256",
     "review_evidence_sha256",
+    *CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS,
     "ci_evidence_sha256",
     "authorization_sha256",
 )
@@ -1273,6 +1285,288 @@ def _self_review_audit_errors(
             errors.append("accepted residual risk requires a reason")
     if evidence.get("tuning_signal") != "observe":
         errors.append("tuning_signal must be observe for merge evidence")
+    return errors
+
+
+def _captain_evidence_time(value: Any, *, label: str, errors: list[str]) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{label} must be an RFC3339 timestamp with timezone")
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.tzinfo is None:
+        errors.append(f"{label} must be an RFC3339 timestamp with timezone")
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _codex_review_evidence_errors(
+    evidence: Any,
+    *,
+    expected_head: str | None,
+    expected_diff_sha256: str | None,
+    expected_base_sha: str | None,
+    expected_repo: str | None,
+    expected_pr: int | None,
+) -> list[str]:
+    if not isinstance(evidence, dict):
+        return ["codex review evidence must be a structured object"]
+    errors: list[str] = []
+    if evidence.get("schema_version") != 1 or isinstance(evidence.get("schema_version"), bool):
+        errors.append("schema_version must be integer 1")
+    if evidence.get("kind") != "github_codex_review_settlement":
+        errors.append("kind must be github_codex_review_settlement")
+    repo = evidence.get("repo")
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo.strip()) is None:
+        errors.append("repo must have owner/repo form")
+    elif expected_repo is not None and repo.strip().lower() != expected_repo.strip().lower():
+        errors.append("repo does not match PR target")
+    pr_number = evidence.get("pr")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        errors.append("pr must be a positive integer")
+    elif expected_pr is not None and pr_number != expected_pr:
+        errors.append("pr does not match PR target")
+    for field, expected, length in (
+        ("head_sha", expected_head, 40),
+        ("base_sha", expected_base_sha, 40),
+        ("diff_sha256", expected_diff_sha256, 64),
+    ):
+        value = evidence.get(field)
+        if not _is_hex_sha(value, lengths=(length,)):
+            errors.append(f"{field} must be a {length} character hex digest")
+        elif expected is not None and value != expected:
+            errors.append(f"{field} does not match expected value")
+    generated_at = _captain_evidence_time(
+        evidence.get("generated_at"), label="generated_at", errors=errors
+    )
+    if generated_at is not None:
+        age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds()
+        if age_seconds < -300:
+            errors.append("generated_at is too far in the future")
+        elif age_seconds > CAPTAIN_CODEX_REVIEW_MAX_AGE_SECONDS:
+            errors.append("codex review evidence is stale")
+    review_tier = evidence.get("review_tier")
+    if review_tier not in {
+        "documentation",
+        "very_small",
+        "standard",
+        "important_repo",
+        "high_critical",
+    }:
+        errors.append("review_tier is missing or invalid")
+    request = evidence.get("request")
+    request_time: datetime | None = None
+    if not isinstance(request, dict):
+        errors.append("request must be a structured object")
+    else:
+        comment_id = request.get("comment_id")
+        if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id <= 0:
+            errors.append("request.comment_id must be a positive integer")
+        request_id = request.get("request_id")
+        if not isinstance(request_id, str) or re.fullmatch(r"[0-9a-f]{32}", request_id) is None:
+            errors.append("request.request_id must be a 32 character lowercase hex digest")
+        elif (
+            isinstance(repo, str)
+            and isinstance(pr_number, int)
+            and not isinstance(pr_number, bool)
+            and _is_hex_sha(evidence.get("head_sha"), lengths=(40,))
+            and _is_hex_sha(evidence.get("diff_sha256"), lengths=(64,))
+        ):
+            request_core = {
+                "schema_version": 1,
+                "kind": "grabowski_codex_review_request",
+                "repo": repo.strip().lower(),
+                "pr": pr_number,
+                "head_sha": evidence["head_sha"],
+                "diff_sha256": evidence["diff_sha256"],
+            }
+            if request_id != sha256_json(request_core)[:32]:
+                errors.append("request.request_id does not bind repo, PR, head and diff")
+        request_time = _captain_evidence_time(
+            request.get("created_at"), label="request.created_at", errors=errors
+        )
+        actor = request.get("actor")
+        association = request.get("author_association")
+        if (
+            association not in {"OWNER", "MEMBER", "COLLABORATOR"}
+            and actor != "github-actions[bot]"
+        ):
+            errors.append("request actor is not trusted")
+        if not _is_hex_sha(request.get("body_sha256"), lengths=(64,)):
+            errors.append("request.body_sha256 must be a 64 character hex digest")
+    completion = evidence.get("completion")
+    completion_time: datetime | None = None
+    if not isinstance(completion, dict):
+        errors.append("completion must be a structured object")
+    else:
+        mode = completion.get("mode")
+        if mode not in {"review", "reaction", "clean_comment"}:
+            errors.append(
+                "completion.mode must be review, reaction or clean_comment"
+            )
+        actor = completion.get("actor")
+        if actor not in CAPTAIN_TRUSTED_CODEX_ACTORS:
+            errors.append("completion.actor is not a trusted Codex actor")
+        state = completion.get("state")
+        if mode == "review" and state not in {"APPROVED", "COMMENTED"}:
+            errors.append("completion review state is not accepted")
+        if mode == "reaction" and state != "THUMBS_UP":
+            errors.append("completion reaction state must be THUMBS_UP")
+        if mode == "clean_comment" and state != "CLEAN":
+            errors.append("completion clean-comment state must be CLEAN")
+        if completion.get("accepted_state") is not True:
+            errors.append("completion.accepted_state must be true")
+        if completion.get("blocking_state") is not False:
+            errors.append("completion.blocking_state must be false")
+        review_id = completion.get("review_id")
+        if mode == "review":
+            if isinstance(review_id, bool) or not isinstance(review_id, int) or review_id <= 0:
+                errors.append("completion.review_id must be a positive integer for review mode")
+        elif review_id is not None:
+            errors.append("completion.review_id must be null outside review mode")
+        comment_id = completion.get("comment_id")
+        if mode in {"clean_comment", "reaction"}:
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+            ):
+                errors.append(
+                    "completion.comment_id must be a positive integer for "
+                    f"{mode} mode"
+                )
+        elif comment_id is not None:
+            errors.append(
+                "completion.comment_id must be null outside clean_comment or reaction mode"
+            )
+        reviewed_prefix = completion.get("reviewed_commit_prefix")
+        if mode == "clean_comment":
+            if (
+                not isinstance(reviewed_prefix, str)
+                or re.fullmatch(r"[0-9a-f]{10,40}", reviewed_prefix) is None
+            ):
+                errors.append(
+                    "completion.reviewed_commit_prefix must be 10 to 40 lowercase hex characters"
+                )
+            elif (
+                isinstance(expected_head, str)
+                and not expected_head.startswith(reviewed_prefix)
+            ):
+                errors.append(
+                    "completion.reviewed_commit_prefix does not bind expected_head"
+                )
+        elif reviewed_prefix is not None:
+            errors.append(
+                "completion.reviewed_commit_prefix must be null outside clean_comment mode"
+            )
+        completion_time = _captain_evidence_time(
+            completion.get("submitted_at"), label="completion.submitted_at", errors=errors
+        )
+        if (
+            request_time is not None
+            and completion_time is not None
+            and completion_time < request_time
+        ):
+            errors.append("completion predates the current-head request")
+        if not _is_hex_sha(completion.get("body_sha256"), lengths=(64,)):
+            errors.append("completion.body_sha256 must be a 64 character hex digest")
+    finding_count = evidence.get("finding_count")
+    if isinstance(finding_count, bool) or not isinstance(finding_count, int) or finding_count < 0:
+        errors.append("finding_count must be an integer >= 0")
+    thread_ids = evidence.get("thread_ids")
+    if (
+        not isinstance(thread_ids, list)
+        or any(not isinstance(item, str) or not item for item in thread_ids)
+        or thread_ids != sorted(set(thread_ids))
+    ):
+        errors.append("thread_ids must be a sorted unique list of non-empty strings")
+    elif evidence.get("thread_ids_sha256") != sha256_json(thread_ids):
+        errors.append("thread_ids_sha256 mismatch")
+    unresolved = evidence.get("unresolved_thread_ids")
+    if unresolved != []:
+        errors.append("unresolved_thread_ids must be empty")
+    elif evidence.get("unresolved_thread_ids_sha256") != sha256_json([]):
+        errors.append("unresolved_thread_ids_sha256 mismatch")
+    if evidence.get("all_findings_triaged") is not True:
+        errors.append("all_findings_triaged must be true")
+    if evidence.get("settled") is not True:
+        errors.append("settled must be true")
+    if evidence.get("status") != "pass":
+        errors.append("status must be pass")
+    if evidence.get("errors") != []:
+        errors.append("errors must be an empty list")
+    evidence_sha256 = evidence.get("evidence_sha256")
+    core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+    if not _is_hex_sha(evidence_sha256, lengths=(64,)):
+        errors.append("evidence_sha256 must be a 64 character hex digest")
+    elif evidence_sha256 != sha256_json(core):
+        errors.append("evidence_sha256 mismatch")
+    return errors
+
+
+def _codex_review_exception_errors(
+    evidence: Any,
+    *,
+    expected_head: str | None,
+    expected_diff_sha256: str | None,
+    expected_repo: str | None,
+    expected_pr: int | None,
+) -> list[str]:
+    if not isinstance(evidence, dict):
+        return ["codex review exception must be a structured object"]
+    errors: list[str] = []
+    if evidence.get("schema_version") != 1 or isinstance(evidence.get("schema_version"), bool):
+        errors.append("schema_version must be integer 1")
+    if evidence.get("kind") != "grabowski_codex_review_exception":
+        errors.append("kind must be grabowski_codex_review_exception")
+    repo = evidence.get("repo")
+    if not isinstance(repo, str) or re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo.strip()) is None:
+        errors.append("repo must have owner/repo form")
+    elif expected_repo is not None and repo.strip().lower() != expected_repo.strip().lower():
+        errors.append("repo does not match PR target")
+    pr_number = evidence.get("pr")
+    if isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0:
+        errors.append("pr must be a positive integer")
+    elif expected_pr is not None and pr_number != expected_pr:
+        errors.append("pr does not match PR target")
+    for field, expected, length in (
+        ("head_sha", expected_head, 40),
+        ("diff_sha256", expected_diff_sha256, 64),
+    ):
+        value = evidence.get(field)
+        if not _is_hex_sha(value, lengths=(length,)):
+            errors.append(f"{field} must be a {length} character hex digest")
+        elif expected is not None and value != expected:
+            errors.append(f"{field} does not match expected value")
+    generated_at = _captain_evidence_time(
+        evidence.get("generated_at"), label="generated_at", errors=errors
+    )
+    expires_at = _captain_evidence_time(
+        evidence.get("expires_at"), label="expires_at", errors=errors
+    )
+    now = datetime.now(timezone.utc)
+    if generated_at is not None and expires_at is not None:
+        lifetime = (expires_at - generated_at).total_seconds()
+        if lifetime <= 0 or lifetime > CAPTAIN_CODEX_EXCEPTION_MAX_AGE_SECONDS:
+            errors.append("codex review exception lifetime must be between 1 second and 2 hours")
+        if generated_at > now:
+            errors.append("codex review exception is from the future")
+        if expires_at <= now:
+            errors.append("codex review exception is expired")
+    approved_by = evidence.get("approved_by")
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        errors.append("approved_by must be a non-empty string")
+    reason = evidence.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        errors.append("reason must be a non-empty string")
+    exception_sha256 = evidence.get("exception_sha256")
+    core = {key: value for key, value in evidence.items() if key != "exception_sha256"}
+    if not _is_hex_sha(exception_sha256, lengths=(64,)):
+        errors.append("exception_sha256 must be a 64 character hex digest")
+    elif exception_sha256 != sha256_json(core):
+        errors.append("exception_sha256 mismatch")
     return errors
 
 
@@ -4255,6 +4549,8 @@ def _captain_action_evidence_item(
     required_parameters: tuple[str, ...] = (),
     parameter_bindings: dict[str, Any] | None = None,
     required_when: str | None = None,
+    alternative_group: str | None = None,
+    mutually_exclusive_with: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     item: dict[str, Any] = {
         "name": name,
@@ -4272,6 +4568,10 @@ def _captain_action_evidence_item(
         item["parameter_bindings"] = dict(parameter_bindings)
     if required_when is not None:
         item["required_when"] = required_when
+    if alternative_group is not None:
+        item["alternative_group"] = alternative_group
+    if mutually_exclusive_with:
+        item["mutually_exclusive_with"] = list(mutually_exclusive_with)
     return item
 
 
@@ -4351,6 +4651,78 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                 purpose="diff-bound self-review audit for the exact PR head and base commit, including risk-scaled review depth",
             ),
             _captain_action_evidence_item(
+                "codex_review_evidence",
+                required_fields=(
+                    "schema_version",
+                    "kind",
+                    "repo",
+                    "pr",
+                    "generated_at",
+                    "head_sha",
+                    "base_sha",
+                    "diff_sha256",
+                    "review_tier",
+                    "request",
+                    "completion",
+                    "finding_count",
+                    "thread_ids",
+                    "thread_ids_sha256",
+                    "unresolved_thread_ids",
+                    "unresolved_thread_ids_sha256",
+                    "all_findings_triaged",
+                    "settled",
+                    "status",
+                    "errors",
+                    "evidence_sha256",
+                ),
+                required_values={
+                    "schema_version": 1,
+                    "kind": "github_codex_review_settlement",
+                    "all_findings_triaged": True,
+                    "settled": True,
+                    "status": "pass",
+                },
+                binds=("expected_head", "expected_base_sha", "diff_sha256", *common_bindings),
+                purpose="current-head GitHub Codex review or trusted clean reaction with terminal inline-thread triage",
+                required_when=(
+                    "codex_review_release_is_required_and_"
+                    "codex_review_exception_is_absent"
+                ),
+                alternative_group="codex_review_release",
+                mutually_exclusive_with=("codex_review_exception",),
+            ),
+            _captain_action_evidence_item(
+                "codex_review_exception",
+                required_fields=(
+                    "schema_version",
+                    "kind",
+                    "repo",
+                    "pr",
+                    "head_sha",
+                    "diff_sha256",
+                    "generated_at",
+                    "expires_at",
+                    "approved_by",
+                    "reason",
+                    "exception_sha256",
+                ),
+                required_values={
+                    "schema_version": 1,
+                    "kind": "grabowski_codex_review_exception",
+                },
+                binds=("expected_head", "diff_sha256", *common_bindings),
+                purpose=(
+                    "explicit repo/PR/head/diff-bound Codex exception valid for at "
+                    "most two hours; it bypasses only the Codex settlement gate"
+                ),
+                required_when=(
+                    "codex_review_release_is_required_and_"
+                    "codex_review_evidence_is_absent"
+                ),
+                alternative_group="codex_review_release",
+                mutually_exclusive_with=("codex_review_evidence",),
+            ),
+            _captain_action_evidence_item(
                 "ci_evidence",
                 required_fields=("state", "head_sha", "source"),
                 required_values={"state": "passed"},
@@ -4366,6 +4738,19 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                 required_when="trusted_owner_autonomy_does_not_apply",
             ),
         ])
+        schema["evidence_alternatives"] = [
+            {
+                "name": "codex_review_release",
+                "exactly_one_of": [
+                    "codex_review_evidence",
+                    "codex_review_exception",
+                ],
+                "required_when": (
+                    "review_evidence.review_tier_is_high_critical_or_"
+                    "codex_review_required_is_true"
+                ),
+            }
+        ]
     elif action_name == "runtime-deploy":
         origin_key = "repo" if isinstance(target.get("repo"), str) and target.get("repo", "").strip() else "service"
         runtime_key = (
@@ -4938,7 +5323,14 @@ def _captain_evidence_digest_gate(parameters: dict[str, Any], actions: list[dict
     projection = parameters.get("status_projection")
     if isinstance(projection, dict):
         problems.extend(_captain_evidence_digest_binding_errors(projection, evidence_name="status_projection", actions=actions))
-    for name in ("execution_authority", "review_evidence", "ci_evidence", "human_authorization"):
+    for name in (
+        "execution_authority",
+        "review_evidence",
+        "codex_review_evidence",
+        "codex_review_exception",
+        "ci_evidence",
+        "human_authorization",
+    ):
         evidence = parameters.get(name)
         if isinstance(evidence, dict):
             problems.extend(_captain_evidence_digest_binding_errors(evidence, evidence_name=name, actions=actions))
@@ -4950,7 +5342,15 @@ def _captain_evidence_digest_gate(parameters: dict[str, Any], actions: list[dict
             problems,
         )
     bound_sources = []
-    for name in ("status_projection", "execution_authority", "review_evidence", "ci_evidence", "human_authorization"):
+    for name in (
+        "status_projection",
+        "execution_authority",
+        "review_evidence",
+        "codex_review_evidence",
+        "codex_review_exception",
+        "ci_evidence",
+        "human_authorization",
+    ):
         evidence = parameters.get(name)
         if isinstance(evidence, dict) and any(key in evidence for key in ("actions_sha256", "action_sha256", "target_sha256")):
             bound_sources.append(name)
@@ -5064,6 +5464,150 @@ def _captain_review_evidence_gate(parameters: dict[str, Any], actions: list[dict
         "review-evidence-present",
         "pass",
         "diff-bound self-review audit records sufficient review depth and terminal triage; it is not posted to the PR",
+    )
+
+
+def _captain_codex_review_gate(
+    parameters: dict[str, Any], actions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    review_evidence = parameters.get("review_evidence")
+    review_tier = (
+        review_evidence.get("review_tier")
+        if isinstance(review_evidence, dict)
+        else None
+    )
+    explicit_required = parameters.get("codex_review_required")
+    if explicit_required is not None and not isinstance(explicit_required, bool):
+        return _captain_gate(
+            "codex-review-settled",
+            "blocked",
+            "codex_review_required must be a bool when provided",
+            ["codex_review_required_invalid"],
+        )
+    required = review_tier == "high_critical" or explicit_required is True
+    targets = [
+        action.get("target")
+        for action in actions
+        if action.get("action") == "pr-merge"
+        and isinstance(action.get("target"), dict)
+    ]
+    if not targets:
+        return _captain_gate(
+            "codex-review-settled",
+            "pass",
+            "Codex review settlement is not applicable because no pr-merge action is requested",
+        )
+    if len(targets) != 1:
+        return _captain_gate(
+            "codex-review-settled",
+            "blocked",
+            "one Codex review settlement can bind exactly one pr-merge action",
+            ["pr_merge_codex_review_target_count_invalid"],
+        )
+    evidence = parameters.get("codex_review_evidence")
+    exception = parameters.get("codex_review_exception")
+    if evidence is not None and exception is not None:
+        return _captain_gate(
+            "codex-review-settled",
+            "blocked",
+            "Codex review evidence and exception are mutually exclusive",
+            ["codex_review_evidence_exception_ambiguous"],
+        )
+    if not required and evidence is None and exception is None:
+        return _captain_gate(
+            "codex-review-settled",
+            "pass",
+            "Codex review settlement is not required for this review tier",
+            {"review_tier": review_tier, "required": False},
+        )
+    target = targets[0]
+    expected_repo = target.get("repo")
+    expected_pr = target.get("pr")
+    expected_head = parameters.get("expected_head")
+    expected_base_sha = parameters.get("expected_base_sha")
+    expected_diff = parameters.get("diff_sha256")
+    if exception is not None:
+        errors = _codex_review_exception_errors(
+            exception,
+            expected_head=expected_head if isinstance(expected_head, str) else None,
+            expected_diff_sha256=expected_diff if isinstance(expected_diff, str) else None,
+            expected_repo=expected_repo if isinstance(expected_repo, str) else None,
+            expected_pr=(
+                expected_pr
+                if isinstance(expected_pr, int) and not isinstance(expected_pr, bool)
+                else None
+            ),
+        )
+        errors.extend(
+            _captain_evidence_digest_binding_errors(
+                exception,
+                evidence_name="codex_review_exception",
+                actions=actions,
+            )
+        )
+        if errors:
+            return _captain_gate(
+                "codex-review-settled",
+                "blocked",
+                "Codex review exception is invalid or bound to another action",
+                errors,
+            )
+        return _captain_gate(
+            "codex-review-settled",
+            "pass",
+            "explicit short-lived Codex review exception recorded",
+            {
+                "required": required,
+                "review_tier": review_tier,
+                "approved_by": exception.get("approved_by"),
+                "expires_at": exception.get("expires_at"),
+            },
+        )
+    if evidence is None:
+        return _captain_gate(
+            "codex-review-settled",
+            "blocked",
+            "current-head Codex review settlement evidence is required but missing",
+            ["codex_review_evidence_missing"],
+        )
+    errors = _codex_review_evidence_errors(
+        evidence,
+        expected_head=expected_head if isinstance(expected_head, str) else None,
+        expected_diff_sha256=expected_diff if isinstance(expected_diff, str) else None,
+        expected_base_sha=(
+            expected_base_sha if isinstance(expected_base_sha, str) else None
+        ),
+        expected_repo=expected_repo if isinstance(expected_repo, str) else None,
+        expected_pr=(
+            expected_pr
+            if isinstance(expected_pr, int) and not isinstance(expected_pr, bool)
+            else None
+        ),
+    )
+    errors.extend(
+        _captain_evidence_digest_binding_errors(
+            evidence,
+            evidence_name="codex_review_evidence",
+            actions=actions,
+        )
+    )
+    if errors:
+        return _captain_gate(
+            "codex-review-settled",
+            "blocked",
+            "current-head Codex review settlement evidence is invalid or stale",
+            errors,
+        )
+    return _captain_gate(
+        "codex-review-settled",
+        "pass",
+        "current-head Codex completion and terminal inline-thread triage are diff-bound",
+        {
+            "required": required,
+            "review_tier": review_tier,
+            "completion_mode": evidence.get("completion", {}).get("mode"),
+            "finding_count": evidence.get("finding_count"),
+        },
     )
 
 
@@ -5381,6 +5925,7 @@ def _captain_authority_gates(
         _captain_evidence_digest_gate(parameters, actions),
         _captain_execution_authority_gate(parameters, actions),
         _captain_review_evidence_gate(parameters, actions),
+        _captain_codex_review_gate(parameters, actions),
         _captain_diff_bound_gate(parameters),
         _captain_merge_delivery_gate(parameters, actions),
         _captain_ci_gate(parameters, actions),
@@ -5501,6 +6046,8 @@ def _captain_execution_intent_expected_evidence(
 ) -> dict[str, str | None]:
     projection = parameters.get("status_projection")
     review = parameters.get("review_evidence")
+    codex_review = parameters.get("codex_review_evidence")
+    codex_exception = parameters.get("codex_review_exception")
     ci = parameters.get("ci_evidence")
     diff = parameters.get("diff_sha256")
     merge_delivery_receipt_sha256 = parameters.get("merge_delivery_receipt_sha256")
@@ -5514,6 +6061,16 @@ def _captain_execution_intent_expected_evidence(
             else None
         ),
         "review_evidence_sha256": sha256_json(review) if isinstance(review, dict) and review else None,
+        "codex_review_evidence_sha256": (
+            sha256_json(codex_review)
+            if isinstance(codex_review, dict) and codex_review
+            else sha256_json(None)
+        ),
+        "codex_review_exception_sha256": (
+            sha256_json(codex_exception)
+            if isinstance(codex_exception, dict) and codex_exception
+            else sha256_json(None)
+        ),
         "ci_evidence_sha256": sha256_json(ci) if isinstance(ci, dict) and ci else None,
         "authorization_sha256": _captain_execution_intent_authorization_sha256(parameters),
     }
@@ -5684,9 +6241,19 @@ def _captain_execution_intent_review(
             if any(key not in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS for key in declared_evidence):
                 errors.append("execution_intent_evidence_unknown_keys_present")
             expected_evidence = _captain_execution_intent_expected_evidence(parameters, actions)
+            required_evidence_keys = (
+                CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
+                if action_name == "pr-merge"
+                else tuple(
+                    key
+                    for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
+                    if key not in CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS
+                )
+            )
             for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS:
                 if key not in declared_evidence:
-                    errors.append(f"execution_intent_evidence_missing:{key}")
+                    if key in required_evidence_keys:
+                        errors.append(f"execution_intent_evidence_missing:{key}")
                     continue
                 declared_value = declared_evidence.get(key)
                 value_status = _captain_intent_canonical_hex_status(declared_value, length=64)

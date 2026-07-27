@@ -631,7 +631,7 @@ class RepoGroundConsumerBindingTests(CatalogFixture):
                 mcp, "_repoground_agent_preflight", return_value=preflight_payload
             ),
             patch.object(
-                mcp, "_repoground_query_existing_index", return_value=available
+                mcp, "_repoground_agent_query", return_value=available
             ),
             patch.object(mcp, "_repoground_find_symbol", return_value=available),
             patch.object(mcp, "_repoground_get_callers", return_value=available),

@@ -1,0 +1,48 @@
+---
+name: Codex review settlement refresh
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: codex-review-settlement-refresh
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Refresh open pull requests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch bounded settlement refresh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          mapfile -t pull_requests < <(
+            gh pr list \
+              --repo "$GITHUB_REPOSITORY" \
+              --state open \
+              --limit 101 \
+              --json number \
+              --jq '.[].number'
+          )
+          if [ "${#pull_requests[@]}" -gt 100 ]; then
+            echo "More than 100 open pull requests; refusing a truncated refresh" >&2
+            exit 1
+          fi
+          for pr in "${pull_requests[@]}"; do
+            gh workflow run codex-review-settlement.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$DEFAULT_BRANCH" \
+              -f "pr=$pr"
+          done
+          printf 'Dispatched settlement refresh for %s open pull request(s).\n' \
+            "${#pull_requests[@]}" >> "$GITHUB_STEP_SUMMARY"
