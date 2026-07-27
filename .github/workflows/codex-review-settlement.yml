@@ -23,7 +23,18 @@ permissions:
   statuses: write
 
 concurrency:
-  group: codex-review-settlement-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr || github.run_id }}
+  # Self-authored request comments must not enter the pull request cancellation
+  # group before the job-level recursion guard can skip them.
+  group: >-
+    codex-review-settlement-${{
+      github.event_name == 'issue_comment'
+      && github.event.comment.user.login == 'github-actions[bot]'
+      && github.run_id
+      || github.event.pull_request.number
+      || github.event.issue.number
+      || inputs.pr
+      || github.run_id
+    }}
   cancel-in-progress: true
 
 jobs:

@@ -65,6 +65,17 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
             self.text,
         )
 
+    def test_github_actions_issue_comments_do_not_cancel_originating_run(self) -> None:
+        concurrency = self.text.split("concurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
+        self.assertIn("github.event_name == 'issue_comment'", concurrency)
+        self.assertIn(
+            "github.event.comment.user.login == 'github-actions[bot]'",
+            concurrency,
+        )
+        self.assertIn("&& github.run_id", concurrency)
+        self.assertIn("|| github.event.issue.number", concurrency)
+        self.assertIn("cancel-in-progress: true", concurrency)
+
     def test_bootstrap_without_default_branch_evaluator_fails_explicitly(self) -> None:
         request_section = self.text.split(
             "      - name: Request current-head Codex review\n", 1
