@@ -2217,18 +2217,50 @@ class TaskTests(unittest.TestCase):
 
     def test_mcp_reconcile_refresh_rechecks_authority_inside_lock(self) -> None:
         with (
+            patch.object(tasks.operator, "_require_operator_capability") as capability,
             patch.object(
                 tasks.operator,
                 "_require_operator_mutation",
-                side_effect=[None, PermissionError("blocked after wait")],
-            ) as require,
+                side_effect=PermissionError("blocked after wait"),
+            ) as mutation,
             patch.object(tasks, "reconcile_tasks_refresh") as refresh,
         ):
             with self.assertRaisesRegex(PermissionError, "blocked after wait"):
                 asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
 
-        self.assertEqual(require.call_count, 2)
+        capability.assert_called_once_with("durable_job")
+        mutation.assert_called_once_with("durable_job")
         refresh.assert_not_called()
+
+    def test_mcp_reconcile_refresh_runs_full_mutation_guard_off_event_loop(self) -> None:
+        caller_thread = threading.get_ident()
+        mutation_threads: list[int] = []
+        payload = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+        }
+
+        def mutation(capability: str) -> None:
+            self.assertEqual(capability, "durable_job")
+            mutation_threads.append(threading.get_ident())
+
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=mutation),
+            patch.object(tasks, "reconcile_tasks_refresh", return_value=payload),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+
+        self.assertEqual(result, payload)
+        self.assertEqual(len(mutation_threads), 1)
+        self.assertNotEqual(mutation_threads[0], caller_thread)
 
     def test_reconcile_refresh_isolates_retired_host_and_continues(self) -> None:
         retired = self._start()["task"]

@@ -3937,7 +3937,7 @@ def grabowski_task_reconcile_refresh(task_id: str = "") -> dict[str, Any]:
 @mcp.tool(name="grabowski_task_reconcile_refresh", annotations=MUTATING)
 async def _grabowski_task_reconcile_refresh_tool(task_id: str = "") -> dict[str, Any]:
     """Refresh persistent task states without resuming processes."""
-    operator._require_operator_mutation("durable_job")
+    operator._require_operator_capability("durable_job")
     return await asyncio.to_thread(_task_reconcile_refresh_after_guard, task_id)
 
 
@@ -3985,7 +3985,7 @@ async def _grabowski_task_reconcile_resume_tool(
     reason: str = "",
 ) -> dict[str, Any]:
     """Resume retry-safe tasks after reconcile verification."""
-    operator._require_operator_mutation("durable_job")
+    operator._require_operator_capability("durable_job")
     return await asyncio.to_thread(
         _task_reconcile_resume_after_guard,
         task_id,
@@ -4022,7 +4022,7 @@ async def _grabowski_task_reconcile_tool(
     auto_resume: bool = False,
 ) -> dict[str, Any]:
     """Reconcile persistent tasks after process loss or host restart."""
-    operator._require_operator_mutation("durable_job")
+    operator._require_operator_capability("durable_job")
     return await asyncio.to_thread(_task_reconcile_after_guard, auto_resume)
 
 
