@@ -1,0 +1,101 @@
+---
+name: Diagnose Codex quota patch
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  diagnose:
+    if: github.head_ref == 'fix/codex-quota-terminal-settlement-v1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/codex-quota-terminal-settlement-v1
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reproduce patch in disposable copy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+          import textwrap
+
+          root = Path.cwd()
+          workflow = root / ".github/workflows/apply-codex-quota-terminal-settlement.yml"
+          text = workflow.read_text(encoding="utf-8")
+          start_marker = "          python3 - <<'PY'\n"
+          end_marker = "\n          PY\n\n          rm .github/workflows/apply-codex-quota-terminal-settlement.yml"
+          start = text.index(start_marker) + len(start_marker)
+          end = text.index(end_marker, start)
+          script = textwrap.dedent(text[start:end])
+
+          with tempfile.TemporaryDirectory(prefix="grabowski-patch-diagnostic-") as tmp:
+              checkout = Path(tmp) / "repo"
+              shutil.copytree(
+                  root,
+                  checkout,
+                  ignore=shutil.ignore_patterns(".git", "build", "__pycache__"),
+              )
+              script_path = Path(tmp) / "patch.py"
+              script_path.write_text(script, encoding="utf-8")
+              completed = subprocess.run(
+                  ["python3", str(script_path)],
+                  cwd=checkout,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              changed = sorted(
+                  str(path.relative_to(checkout))
+                  for path in checkout.rglob("*")
+                  if path.is_file()
+                  and not str(path.relative_to(checkout)).startswith(".git/")
+                  and (
+                      not (root / path.relative_to(checkout)).exists()
+                      or path.read_bytes()
+                      != (root / path.relative_to(checkout)).read_bytes()
+                  )
+              )
+              report = [
+                  "### One-shot patch diagnostic",
+                  "",
+                  f"Return code: `{completed.returncode}`",
+                  "",
+                  "Changed before failure:",
+                  "```text",
+                  *(changed or ["<none>"]),
+                  "```",
+                  "",
+                  "stderr:",
+                  "```text",
+                  (completed.stderr or "<empty>")[-6000:],
+                  "```",
+                  "",
+                  "stdout:",
+                  "```text",
+                  (completed.stdout or "<empty>")[-2000:],
+                  "```",
+              ]
+              Path("/tmp/patch-diagnostic.md").write_text(
+                  "\n".join(report) + "\n",
+                  encoding="utf-8",
+              )
+          PY
+          gh pr comment "$PR_NUMBER" --body-file /tmp/patch-diagnostic.md
