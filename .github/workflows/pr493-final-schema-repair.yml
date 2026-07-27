@@ -5,6 +5,10 @@ on:
     branches:
       - fix/bureau-pickup-typed-schema-v1
 
+concurrency:
+  group: pr493-final-schema-repair
+  cancel-in-progress: true
+
 permissions:
   contents: write
   pull-requests: write
@@ -12,6 +16,7 @@ permissions:
 
 jobs:
   repair:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -61,10 +66,9 @@ jobs:
                   self.skipTest("real FastMCP unavailable in dependency-free validation")
               tool = next(
           '''
-          if new not in text:
-              if text.count(old) != 1:
-                  raise SystemExit(f"Expected one schema marker, found {text.count(old)}")
-              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          if text.count(old) != 1:
+              raise SystemExit(f"Expected one schema marker, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
       - name: Prove dependency-free contract
         run: PYTHONPATH=src python -m unittest tests.test_bureau_pickup
