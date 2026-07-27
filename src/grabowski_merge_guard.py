@@ -1793,10 +1793,9 @@ class CaptainMergeGuardRunner:
                 "completion_mode": mode,
                 "completion_id": completion.get("review_id"),
                 "completion_comment_id": completion.get("comment_id"),
-            "review_performed": mode != "unavailable_comment",
-            "settlement_reason": completion.get("reason"),
-            "thread_count": len(thread_ids),
-
+                "review_performed": mode != "unavailable_comment",
+                "settlement_reason": completion.get("reason"),
+                "thread_count": len(thread_ids),
                 "thread_ids_sha256": _sha256_json(thread_ids),
                 "unresolved_thread_count": len(unresolved_thread_ids),
                 "unresolved_thread_ids_sha256": _sha256_json(
@@ -1813,10 +1812,9 @@ class CaptainMergeGuardRunner:
                         "completion_mode": mode,
                         "completion_id": completion.get("review_id"),
                         "completion_comment_id": completion.get("comment_id"),
-                    "review_performed": mode != "unavailable_comment",
-                    "settlement_reason": completion.get("reason"),
-                    "thread_ids": thread_ids,
-
+                        "review_performed": mode != "unavailable_comment",
+                        "settlement_reason": completion.get("reason"),
+                        "thread_ids": thread_ids,
                         "unresolved_thread_ids": unresolved_thread_ids,
                     }
                 ),

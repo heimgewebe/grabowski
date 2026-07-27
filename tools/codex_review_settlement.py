@@ -457,6 +457,7 @@ def _clean_comment_completion(
         "blocking_state": False,
     }
 
+
 def _unavailable_comment_completion(
     pr: dict[str, Any],
     *,
