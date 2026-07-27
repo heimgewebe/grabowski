@@ -196,6 +196,57 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
         self.assertFalse(receipt["review_performed"])
         self.assertEqual("usage_limit", receipt["settlement_reason"])
 
+    def test_merge_guard_keeps_pre_request_blocking_review(self) -> None:
+        evidence, live = evidence_and_live_state()
+        live["reviews"] = [
+            {
+                "id": 301,
+                "state": "CHANGES_REQUESTED",
+                "body": "blocking",
+                "submitted_at": "2026-07-27T07:59:00Z",
+                "commit_id": HEAD,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+            }
+        ]
+        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+        runner.parameters = {
+            "review_evidence": {"review_tier": "high_critical"},
+            "codex_review_evidence": evidence,
+        }
+        runner.receipt = {}
+
+        def api_json(self, args, *, label, observations, errors):
+            if label == "request_comment":
+                return deepcopy(live["request"])
+            if label == "threads":
+                return deepcopy(live["threads"])
+            return None
+
+        def single_page(self, args, *, label, observations, errors):
+            if label == "request_comments":
+                return deepcopy(live["comments"])
+            if label == "reviews":
+                return deepcopy(live["reviews"])
+            return None
+
+        runner._codex_api_json = MethodType(api_json, runner)
+        runner._codex_single_page = MethodType(single_page, runner)
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner,
+            {
+                "repository": REPOSITORY,
+                "pull_request": PR,
+                "head_sha": HEAD,
+                "base_sha": BASE,
+                "diff_sha256": DIFF,
+            },
+            phase="test",
+        )
+
+        self.assertIn(
+            "merge_guard_codex_outstanding_blocking_review", errors
+        )
+
     def test_merge_guard_rejects_quota_with_older_request_identity(self) -> None:
         evidence, live = evidence_and_live_state()
         old_payload = settlement._request_payload(

@@ -614,7 +614,9 @@ def _review_completion(
                 }
             )
             continue
-        if submitted is None or submitted < request_time:
+        if submitted is None:
+            continue
+        if submitted < request_time and state != "CHANGES_REQUESTED":
             continue
         candidates.append(
             {

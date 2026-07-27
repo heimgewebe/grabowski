@@ -428,6 +428,30 @@ class CodexReviewSettlementTests(unittest.TestCase):
             result["evidence"]["completion"]["state"],
         )
 
+    def test_usage_limit_comment_keeps_pre_request_blocking_review(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [request_comment(), codex_unavailable_comment()],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    submitted_at="2026-07-26T07:59:00Z",
+                )
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual(
+            "CHANGES_REQUESTED",
+            result["evidence"]["completion"]["state"],
+        )
+
     def test_usage_limit_comment_keeps_unresolved_findings_blocking(self) -> None:
         state = base_state()
         state["comments"] = connection(
