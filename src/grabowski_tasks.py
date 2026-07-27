@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import functools
 import hashlib
 import json
@@ -67,15 +68,162 @@ JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 DEFAULT_TASK_LIST_LIMIT = 20
-# One re-entrant process lock serializes reconciliation with every
-# persistent-task mutation. Reconcile may call resume/start recursively.
+# One re-entrant in-process lock plus one shared file lock serializes every
+# persistent-task mutation across the MCP runtime and the timer-driven
+# reconciler process. Nested task operations reuse the outer file lock.
 TASK_RECONCILE_LOCK = threading.RLock()
+_TASK_MUTATION_LOCK_STATE = threading.local()
+
+
+def _task_mutation_lock_parent_identity(descriptor: int, parent: Path) -> None:
+    opened = os.fstat(descriptor)
+    linked = os.stat(parent, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_gid != os.getegid()
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise PermissionError(
+            "Task mutation lock parent violates its directory contract"
+        )
+
+
+def _task_mutation_lock_identity(
+    descriptor: int,
+    parent_descriptor: int,
+    filename: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    linked = os.stat(
+        filename,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_gid != os.getegid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise PermissionError("Task mutation lock violates its file contract")
+
+
+def _open_task_mutation_lock(lock_path: Path) -> tuple[int, int]:
+    parent = lock_path.parent
+    if parent.is_symlink():
+        raise PermissionError("Task mutation lock parent may not be a symlink")
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        parent_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        parent_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        parent_flags |= os.O_NOFOLLOW
+    try:
+        parent_descriptor = os.open(parent, parent_flags)
+    except OSError as exc:
+        raise PermissionError(
+            "Task mutation lock parent cannot be opened safely"
+        ) from exc
+    try:
+        _task_mutation_lock_parent_identity(parent_descriptor, parent)
+        flags = os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            try:
+                descriptor = os.open(
+                    lock_path.name,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                try:
+                    descriptor = os.open(
+                        lock_path.name,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileExistsError:
+                    descriptor = os.open(
+                        lock_path.name,
+                        flags,
+                        dir_fd=parent_descriptor,
+                    )
+        except OSError as exc:
+            raise PermissionError(
+                "Task mutation lock cannot be opened safely"
+            ) from exc
+        try:
+            _task_mutation_lock_identity(
+                descriptor,
+                parent_descriptor,
+                lock_path.name,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor, parent_descriptor
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+
+
+@contextmanager
+def _task_mutation_lock() -> Iterator[None]:
+    with TASK_RECONCILE_LOCK:
+        depth = int(getattr(_TASK_MUTATION_LOCK_STATE, "depth", 0))
+        if depth:
+            _TASK_MUTATION_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _TASK_MUTATION_LOCK_STATE.depth = depth
+            return
+
+        lock_path = TASK_DB.with_suffix(".mutation.lock")
+        descriptor, parent_descriptor = _open_task_mutation_lock(lock_path)
+        locked = False
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            _task_mutation_lock_parent_identity(
+                parent_descriptor,
+                lock_path.parent,
+            )
+            _task_mutation_lock_identity(
+                descriptor,
+                parent_descriptor,
+                lock_path.name,
+            )
+            _TASK_MUTATION_LOCK_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _TASK_MUTATION_LOCK_STATE.depth = 0
+        finally:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            os.close(parent_descriptor)
 
 
 def _serialize_task_mutation(function):
     @functools.wraps(function)
     def serialized(*args: Any, **kwargs: Any) -> Any:
-        with TASK_RECONCILE_LOCK:
+        with _task_mutation_lock():
             return function(*args, **kwargs)
 
     return serialized

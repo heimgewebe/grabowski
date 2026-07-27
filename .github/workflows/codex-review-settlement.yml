@@ -29,7 +29,12 @@ concurrency:
 jobs:
   settle:
     name: Codex review settled
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request
+    if: >-
+      github.event_name != 'issue_comment'
+      || (
+        github.event.issue.pull_request
+        && github.event.comment.user.login != 'github-actions[bot]'
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Resolve pull request
@@ -76,6 +81,12 @@ jobs:
           persist-credentials: false
 
       - name: Request current-head Codex review
+        if: >-
+          github.event_name != 'workflow_dispatch'
+          && (
+            github.event_name != 'issue_comment'
+            || github.event.comment.user.login != 'chatgpt-codex-connector[bot]'
+          )
         id: request
         env:
           GH_TOKEN: ${{ github.token }}

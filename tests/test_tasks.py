@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2236,6 +2237,136 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result, {"task_id": task_id})
         self.assertEqual(len(worker_threads), 1)
         self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_task_mutation_waits_for_external_process_lock(self) -> None:
+        task = self._start()["task"]
+        lock_path = self.database.with_suffix(".mutation.lock")
+        child = (
+            "import fcntl, os, sys; "
+            "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); "
+            "print('locked', flush=True); "
+            "sys.stdin.readline(); "
+            "fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(lock_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        completed = threading.Event()
+        errors: list[BaseException] = []
+
+        def read_task() -> None:
+            try:
+                tasks._row(str(task["task_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=read_task)
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline().strip(), "locked")
+            thread.start()
+            self.assertFalse(completed.wait(timeout=0.15))
+            assert process.stdin is not None
+            process.stdin.write("\n")
+            process.stdin.flush()
+            self.assertEqual(process.wait(timeout=2), 0)
+            self.assertTrue(completed.wait(timeout=2))
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            if process.poll() is None:
+                if process.stdin is not None:
+                    process.stdin.write("\n")
+                    process.stdin.flush()
+                process.kill()
+                process.wait(timeout=2)
+            if thread.is_alive():
+                thread.join(timeout=2)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+
+    def test_task_mutation_creates_private_lock_parent(self) -> None:
+        database = self.root / "fresh-state" / "tasks.sqlite3"
+        with patch.object(tasks, "TASK_DB", database):
+            with tasks._task_mutation_lock():
+                pass
+
+        self.assertEqual(
+            tasks.stat.S_IMODE(database.parent.stat().st_mode),
+            0o700,
+        )
+        self.assertEqual(
+            tasks.stat.S_IMODE(database.with_suffix(".mutation.lock").stat().st_mode),
+            0o600,
+        )
+
+    def test_task_mutation_rejects_public_lock_parent(self) -> None:
+        parent = self.root / "public-state"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o755)
+        database = parent / "tasks.sqlite3"
+
+        with (
+            patch.object(tasks, "TASK_DB", database),
+            self.assertRaisesRegex(
+                PermissionError,
+                "Task mutation lock parent violates its directory contract",
+            ),
+        ):
+            with tasks._task_mutation_lock():
+                pass
+
+    def test_task_mutation_rejects_symlink_lock_parent(self) -> None:
+        target = self.root / "real-state"
+        target.mkdir(mode=0o700)
+        parent = self.root / "linked-state"
+        parent.symlink_to(target, target_is_directory=True)
+        database = parent / "tasks.sqlite3"
+
+        with (
+            patch.object(tasks, "TASK_DB", database),
+            self.assertRaisesRegex(
+                PermissionError,
+                "Task mutation lock parent may not be a symlink",
+            ),
+        ):
+            with tasks._task_mutation_lock():
+                pass
+
+    def test_task_mutation_rejects_symlink_lock(self) -> None:
+        task = self._start()["task"]
+        lock_path = self.database.with_suffix(".mutation.lock")
+        lock_path.unlink()
+        target = self.root / "foreign.lock"
+        target.write_text("foreign", encoding="utf-8")
+        target.chmod(0o600)
+        lock_path.symlink_to(target)
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "Task mutation lock cannot be opened safely",
+        ):
+            tasks._row(str(task["task_id"]))
+
+    def test_task_mutation_rejects_permissive_lock_mode(self) -> None:
+        task = self._start()["task"]
+        lock_path = self.database.with_suffix(".mutation.lock")
+        lock_path.chmod(0o640)
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "Task mutation lock violates its file contract",
+        ):
+            tasks._row(str(task["task_id"]))
 
     def test_mcp_reconcile_refresh_runs_store_work_off_event_loop(self) -> None:
         caller_thread = threading.get_ident()
