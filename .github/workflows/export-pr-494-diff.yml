@@ -71,7 +71,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch --orphan "$evidence_branch"
-          git rm -rf .
+          git rm -rf --ignore-unmatch .
           mkdir -p evidence
           cp "$diff_file" evidence/grabowski-pr-494-head-6c72265a.diff
           cp "$manifest_file" evidence/manifest.txt
