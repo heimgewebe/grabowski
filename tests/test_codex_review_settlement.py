@@ -566,6 +566,61 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertTrue(result["settled"])
         self.assertEqual("APPROVED", result["evidence"]["completion"]["state"])
 
+    def test_pre_request_approval_clears_blocker_but_not_request(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    review_id=2001,
+                    submitted_at="2026-07-26T07:58:00Z",
+                ),
+                codex_review(
+                    state="APPROVED",
+                    review_id=2002,
+                    submitted_at="2026-07-26T07:59:00Z",
+                ),
+                codex_review(
+                    state="COMMENTED",
+                    review_id=2003,
+                    submitted_at="2026-07-26T08:01:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual(2003, result["evidence"]["completion"]["review_id"])
+        self.assertEqual("COMMENTED", result["evidence"]["completion"]["state"])
+
+    def test_pre_request_approval_alone_does_not_complete_request(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    review_id=2001,
+                    submitted_at="2026-07-26T07:58:00Z",
+                ),
+                codex_review(
+                    state="APPROVED",
+                    review_id=2002,
+                    submitted_at="2026-07-26T07:59:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
+
     def test_stale_review_commit_does_not_settle_current_head(self) -> None:
         state = base_state()
         state["comments"] = connection([request_comment()], hasPreviousPage=False)

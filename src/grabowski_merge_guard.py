@@ -1346,8 +1346,6 @@ class CaptainMergeGuardRunner:
                     continue
                 if submitted is None or request_time is None:
                     continue
-                if submitted < request_time and state != "CHANGES_REQUESTED":
-                    continue
                 live_reviews.append(
                     {
                         "id": review_id,

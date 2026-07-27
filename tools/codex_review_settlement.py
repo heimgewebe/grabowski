@@ -541,8 +541,6 @@ def _review_completion(
             continue
         if submitted is None:
             continue
-        if submitted < request_time and state != "CHANGES_REQUESTED":
-            continue
         candidates.append(
             {
                 **review,
@@ -574,10 +572,15 @@ def _review_completion(
                 if item["_state"] == "APPROVED"
                 and order(item) > order(latest_blocker)
             ]
-            selected = max(approvals, key=order) if approvals else latest_blocker
+            if not approvals:
+                selected = latest_blocker
     if selected is None:
         accepted = [
-            item for item in candidates if item["_state"] in ACCEPTED_REVIEW_STATES
+            item
+            for item in candidates
+            if item["_state"] in ACCEPTED_REVIEW_STATES
+            and isinstance(item["_submitted"], datetime)
+            and item["_submitted"] >= request_time
         ]
         if accepted:
             selected = max(accepted, key=order)

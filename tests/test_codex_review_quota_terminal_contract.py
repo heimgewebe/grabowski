@@ -287,6 +287,33 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
         )
         self.assertEqual([], errors)
 
+    def test_merge_guard_honors_pre_request_approval_ordering(self) -> None:
+        evidence, live = valid_review_evidence_and_live()
+        live["reviews"][0:0] = [
+            {
+                "id": 299,
+                "state": "CHANGES_REQUESTED",
+                "body": "blocking",
+                "submitted_at": "2026-07-27T07:58:00Z",
+                "commit_id": HEAD,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+            },
+            {
+                "id": 300,
+                "state": "APPROVED",
+                "body": "cleared",
+                "submitted_at": "2026-07-27T07:59:00Z",
+                "commit_id": HEAD,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+            },
+        ]
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner_for(evidence, live),
+            bindings(),
+            phase="test",
+        )
+        self.assertEqual([], errors)
+
     def test_merge_guard_keeps_pre_request_blocking_review(self) -> None:
         evidence, live = valid_review_evidence_and_live()
         live["reviews"].insert(
