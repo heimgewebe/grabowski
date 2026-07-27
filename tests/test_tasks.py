@@ -2522,6 +2522,142 @@ class TaskTests(unittest.TestCase):
         mutation.assert_called_once_with("durable_job")
         refresh.assert_not_called()
 
+    def test_mcp_reconcile_mutations_recheck_authority_inside_process_lock(self) -> None:
+        cases = (
+            (
+                "refresh",
+                lambda: tasks._task_reconcile_refresh_after_guard(""),
+                "reconcile_tasks_refresh",
+            ),
+            (
+                "resume",
+                lambda: tasks._task_reconcile_resume_after_guard("", 1, "test"),
+                "reconcile_tasks_resume",
+            ),
+            (
+                "reconcile",
+                lambda: tasks._task_reconcile_after_guard(False),
+                "reconcile_tasks",
+            ),
+        )
+
+        for label, invoke, target_name in cases:
+            with self.subTest(label=label):
+                order: list[str] = []
+
+                @contextmanager
+                def process_guard():
+                    order.append("lock-enter")
+                    try:
+                        yield
+                    finally:
+                        order.append("lock-exit")
+
+                def deny_inside_lock(capability: str) -> None:
+                    self.assertEqual(capability, "durable_job")
+                    self.assertEqual(order, ["lock-enter"])
+                    raise PermissionError("blocked inside process lock")
+
+                with (
+                    patch.object(
+                        tasks,
+                        "_task_mutation_lock",
+                        side_effect=process_guard,
+                    ),
+                    patch.object(
+                        tasks.operator,
+                        "_require_operator_mutation",
+                        side_effect=deny_inside_lock,
+                    ),
+                    patch.object(tasks, target_name) as mutation_target,
+                    self.assertRaisesRegex(
+                        PermissionError,
+                        "blocked inside process lock",
+                    ),
+                ):
+                    invoke()
+
+                mutation_target.assert_not_called()
+                self.assertEqual(order, ["lock-enter", "lock-exit"])
+
+    def test_mcp_reconcile_refresh_rechecks_authority_after_external_lock_wait(self) -> None:
+        lock_path = self.database.with_suffix(".mutation.lock")
+        with tasks._task_mutation_lock():
+            pass
+        child = (
+            "import fcntl, os, sys; "
+            "fd=os.open(sys.argv[1], os.O_RDWR); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); "
+            "print('locked', flush=True); "
+            "sys.stdin.readline(); "
+            "fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(lock_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        mutation_checked = threading.Event()
+        completed = threading.Event()
+        errors: list[BaseException] = []
+
+        def deny_after_wait(capability: str) -> None:
+            self.assertEqual(capability, "durable_job")
+            mutation_checked.set()
+            raise PermissionError("blocked after process wait")
+
+        def run_tool() -> None:
+            try:
+                asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=run_tool)
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline().strip(), "locked")
+            with (
+                patch.object(tasks.operator, "_require_operator_capability"),
+                patch.object(
+                    tasks.operator,
+                    "_require_operator_mutation",
+                    side_effect=deny_after_wait,
+                ),
+                patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+            ):
+                thread.start()
+                self.assertFalse(mutation_checked.wait(timeout=0.15))
+                self.assertFalse(completed.is_set())
+                assert process.stdin is not None
+                process.stdin.write("\n")
+                process.stdin.flush()
+                self.assertEqual(process.wait(timeout=2), 0)
+                self.assertTrue(completed.wait(timeout=2))
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+                refresh.assert_not_called()
+
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], PermissionError)
+            self.assertEqual(str(errors[0]), "blocked after process wait")
+            self.assertTrue(mutation_checked.is_set())
+        finally:
+            if process.poll() is None:
+                if process.stdin is not None:
+                    process.stdin.write("\n")
+                    process.stdin.flush()
+                process.kill()
+                process.wait(timeout=2)
+            if thread.is_alive():
+                thread.join(timeout=2)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+
     def test_mcp_reconcile_refresh_runs_full_mutation_guard_off_event_loop(self) -> None:
         caller_thread = threading.get_ident()
         mutation_threads: list[int] = []

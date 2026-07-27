@@ -4078,7 +4078,7 @@ async def _grabowski_task_reconcile_check_tool(task_id: str = "") -> dict[str, A
 
 
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
-    with TASK_RECONCILE_LOCK:
+    with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
         result = reconcile_tasks_refresh(task_id=task_id)
         base._append_audit(
@@ -4111,7 +4111,7 @@ def _task_reconcile_resume_after_guard(
     max_resumes: int,
     reason: str,
 ) -> dict[str, Any]:
-    with TASK_RECONCILE_LOCK:
+    with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
         result = reconcile_tasks_resume(
             task_id=task_id,
@@ -4160,7 +4160,7 @@ async def _grabowski_task_reconcile_resume_tool(
 
 
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
-    with TASK_RECONCILE_LOCK:
+    with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
         result = reconcile_tasks(auto_resume=auto_resume)
         base._append_audit(
