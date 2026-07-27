@@ -14,7 +14,7 @@ jobs:
   diagnose:
     if: github.head_ref == 'fix/codex-quota-terminal-settlement-v1'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout feature branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,7 +23,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Reproduce patch in disposable copy
+      - name: Reproduce focused validation in disposable copy
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -37,68 +37,81 @@ jobs:
           import textwrap
 
           root = Path.cwd()
-          workflow = root / ".github/workflows/apply-codex-quota-terminal-settlement.yml"
-          text = workflow.read_text(encoding="utf-8")
+          v2_workflow = root / ".github/workflows/apply-codex-quota-terminal-settlement-v2.yml"
+          text = v2_workflow.read_text(encoding="utf-8")
           start_marker = "          python3 - <<'PY'\n"
-          end_marker = "\n          PY\n\n          rm .github/workflows/apply-codex-quota-terminal-settlement.yml"
+          end_marker = "\n          PY\n\n          rm -f \\\n"
           start = text.index(start_marker) + len(start_marker)
           end = text.index(end_marker, start)
-          script = textwrap.dedent(text[start:end])
-          write_line = '    path.write_text(text.replace(old, new, 1), encoding="utf-8")'
-          instrumented = (
-              '    print(f"PATCHED {relative}: {old.splitlines()[0][:100]!r}")\n'
-              + write_line
-          )
-          if script.count(write_line) != 1:
-              raise SystemExit("cannot instrument replace_once")
-          script = script.replace(write_line, instrumented, 1)
+          executor = textwrap.dedent(text[start:end])
 
-          with tempfile.TemporaryDirectory(prefix="grabowski-patch-diagnostic-") as tmp:
+          with tempfile.TemporaryDirectory(prefix="grabowski-quota-test-diagnostic-") as tmp:
               checkout = Path(tmp) / "repo"
               shutil.copytree(
                   root,
                   checkout,
                   ignore=shutil.ignore_patterns(".git", "build", "__pycache__"),
               )
-              script_path = Path(tmp) / "patch.py"
-              script_path.write_text(script, encoding="utf-8")
-              completed = subprocess.run(
-                  ["python3", str(script_path)],
+              executor_path = Path(tmp) / "execute-v2.py"
+              executor_path.write_text(executor, encoding="utf-8")
+              patch = subprocess.run(
+                  ["python3", str(executor_path)],
                   cwd=checkout,
                   text=True,
                   stdout=subprocess.PIPE,
                   stderr=subprocess.PIPE,
                   check=False,
               )
-              changed = sorted(
-                  str(path.relative_to(checkout))
-                  for path in checkout.rglob("*")
-                  if path.is_file()
-                  and not str(path.relative_to(checkout)).startswith(".git/")
-                  and (
-                      not (root / path.relative_to(checkout)).exists()
-                      or path.read_bytes()
-                      != (root / path.relative_to(checkout)).read_bytes()
-                  )
+              for relative in (
+                  ".github/workflows/apply-codex-quota-terminal-settlement.yml",
+                  ".github/workflows/diagnose-codex-quota-patch.yml",
+                  ".github/workflows/apply-codex-quota-terminal-settlement-v2.yml",
+              ):
+                  (checkout / relative).unlink(missing_ok=True)
+              refresh = subprocess.run(
+                  ["make", "context-refresh"],
+                  cwd=checkout,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  check=False,
+              )
+              tests = subprocess.run(
+                  [
+                      "python3",
+                      "-m",
+                      "unittest",
+                      "tests.test_codex_review_settlement",
+                      "tests.test_codex_review_settlement_workflow",
+                      "tests.test_codex_review_quota_terminal_contract",
+                      "-v",
+                  ],
+                  cwd=checkout,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  check=False,
               )
               report = [
-                  "### One-shot patch diagnostic with anchor sequence",
+                  "### Focused Codex quota contract diagnostic",
                   "",
-                  f"Return code: `{completed.returncode}`",
+                  f"Patch return code: `{patch.returncode}`",
+                  f"Context refresh return code: `{refresh.returncode}`",
+                  f"Focused tests return code: `{tests.returncode}`",
                   "",
-                  "Changed before failure:",
+                  "Patch stderr:",
                   "```text",
-                  *(changed or ["<none>"]),
+                  (patch.stderr or "<empty>")[-4000:],
                   "```",
                   "",
-                  "stderr:",
+                  "Context refresh output:",
                   "```text",
-                  (completed.stderr or "<empty>")[-6000:],
+                  (refresh.stdout or "<empty>")[-3000:],
                   "```",
                   "",
-                  "stdout:",
+                  "Focused test output:",
                   "```text",
-                  (completed.stdout or "<empty>")[-6000:],
+                  (tests.stdout or "<empty>")[-12000:],
                   "```",
               ]
               Path("/tmp/patch-diagnostic.md").write_text(
