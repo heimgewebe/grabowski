@@ -1,0 +1,819 @@
+diff --git a/.github/workflows/codex-review-settlement.yml b/.github/workflows/codex-review-settlement.yml
+index 83779593df7447c9f6b1b23f7c459c12f340f185..8662dd2ff41d491af7f1f598929139627e685458 100644
+--- a/.github/workflows/codex-review-settlement.yml
++++ b/.github/workflows/codex-review-settlement.yml
+@@ -147,7 +147,12 @@ jobs:
+           case "$status" in
+             pass)
+               github_state="success"
+-              description="Current-head Codex review requirement satisfied"
++              completion_mode="$(jq -r '.evidence.completion.mode // empty' codex-review-settlement.json)"
++              if [ "$completion_mode" = "unavailable_comment" ]; then
++                description="Codex request settled: code-review usage limit reached"
++              else
++                description="Current-head Codex review requirement satisfied"
++              fi
+               ;;
+             pending)
+               github_state="pending"
+diff --git a/docs/external-review-loop.md b/docs/external-review-loop.md
+index 496788d8b6e0c631c2afb02b6d6448f70fdfd9b6..2200f8f24d8bddcbbafe72d14345253f9e7693d3 100644
+--- a/docs/external-review-loop.md
++++ b/docs/external-review-loop.md
+@@ -142,3 +142,18 @@ External review tools other than the conditional GitHub Codex settlement remain
+ ## Cost policy
+ 
+ External providers default to a `0 USD` request and a `0 USD` runtime policy cap, so they are blocked before process launch. A positive request remains blocked unless an administrator explicitly raises `GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD`; the requested amount must not exceed that cap. Agent competition additionally requires a provider-enforced hard USD limit by default. Providers without a hard limit remain blocked unless the caller explicitly weakens that gate. Prior budget authorizations do not carry forward.
++
++## Terminale Codex-Nichtverfügbarkeit
++
++Eine vertrauenswürdige Codex-Antwort auf die exakt an Head und Diff gebundene
++Review-Anfrage darf den Wartezustand terminal beenden, wenn sie eindeutig
++meldet, dass das Code-Review-Kontingent ausgeschöpft ist. Dieser Zustand ist
++`unavailable_comment` mit `reason=usage_limit` und
++`review_performed=false`.
++
++Diese Terminalisierung ist keine Code-Review-Evidenz. Sie darf weder einen
++vorhandenen blockierenden Codex-Reviewzustand noch offene Codex-Threads
++überstimmen. Self-Review, allgemeine Review-Evidenz, CI, Diff-Auslieferung und
++sämtliche übrigen Captain-Gates bleiben unabhängig erforderlich. Unbekannte,
++veränderte, angehängte oder nicht vertrauenswürdig erzeugte Fehlermeldungen
++bleiben `pending` beziehungsweise blockieren fail-closed.
+diff --git a/docs/generated/operator-context.v1.json b/docs/generated/operator-context.v1.json
+index d086074d745ed6d745e3567fc64eb396a5395227..08db288de78e71955a68c8222b08986e9a74c58b 100644
+--- a/docs/generated/operator-context.v1.json
++++ b/docs/generated/operator-context.v1.json
+@@ -2944,7 +2944,7 @@
+       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
+       "src/grabowski_friction.py": "236ce1e84a01166bfcc0775a126f207202e179668921569c0c6b843884b6fbe1",
+       "src/grabowski_grip_orchestration.py": "0f69fc3eeadc69609e49b3f3654c0a882380c9412d21592f24448a812fa4657e",
+-      "src/grabowski_grips.py": "a057931e0b84bc87dae29809c2ff606e4da673a2539b64df646c26fe4f3f0fb1",
++      "src/grabowski_grips.py": "058de637672a6d051238d13472a5430f6d52faaff506c4310fb1077dab82be09",
+       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
+       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
+       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
+@@ -2959,7 +2959,7 @@
+       "src/grabowski_mcp.py": "157c2eadcd8b2037d666446afc2fed119d556ccca419efcadf7b55a3118ab924",
+       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
+       "src/grabowski_merge_delivery_surface.py": "02678c8d02fb82abd918e7e65e113e4f0bf0252f2a79ee26be180f0dcbde5fe7",
+-      "src/grabowski_merge_guard.py": "99446915b8859f262b02e9a769c277d3474ce5abeb21b96fa777a6f3e9ba0b91",
++      "src/grabowski_merge_guard.py": "3b06c5d1d622bfd141e77c38137509e9d2b913b2a8025fcefe1d81f5d53231ad",
+       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
+       "src/grabowski_ntfy_dispatch.py": "982bc06d4e4be7823fcc7613df01d39294ebb2b76d2ed378f412e762191dfbc5",
+       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
+diff --git a/src/grabowski_grips.py b/src/grabowski_grips.py
+index d189b2a76d53caf4e42067d333cb46ba194cc331..d8871fc19db55661e5d410fba3f9cdde3ef0356d 100644
+--- a/src/grabowski_grips.py
++++ b/src/grabowski_grips.py
+@@ -1402,9 +1402,15 @@ def _codex_review_evidence_errors(
+         errors.append("completion must be a structured object")
+     else:
+         mode = completion.get("mode")
+-        if mode not in {"review", "reaction", "clean_comment"}:
++        if mode not in {
++            "review",
++            "reaction",
++            "clean_comment",
++            "unavailable_comment",
++        }:
+             errors.append(
+-                "completion.mode must be review, reaction or clean_comment"
++                "completion.mode must be review, reaction, clean_comment or "
++                "unavailable_comment"
+             )
+         actor = completion.get("actor")
+         if actor not in CAPTAIN_TRUSTED_CODEX_ACTORS:
+@@ -1416,6 +1422,32 @@ def _codex_review_evidence_errors(
+             errors.append("completion reaction state must be THUMBS_UP")
+         if mode == "clean_comment" and state != "CLEAN":
+             errors.append("completion clean-comment state must be CLEAN")
++        if mode == "unavailable_comment":
++            if state != "UNAVAILABLE":
++                errors.append(
++                    "completion unavailable-comment state must be UNAVAILABLE"
++                )
++            if completion.get("reason") != "usage_limit":
++                errors.append(
++                    "completion unavailable-comment reason must be usage_limit"
++                )
++            if completion.get("review_performed") is not False:
++                errors.append(
++                    "completion unavailable-comment must state review_performed=false"
++                )
++            if evidence.get("review_performed") is not False:
++                errors.append(
++                    "unavailable settlement evidence must state review_performed=false"
++                )
++        else:
++            if completion.get("review_performed") is False:
++                errors.append(
++                    "performed Codex completion cannot state review_performed=false"
++                )
++            if evidence.get("review_performed") is False:
++                errors.append(
++                    "performed Codex evidence cannot state review_performed=false"
++                )
+         if completion.get("accepted_state") is not True:
+             errors.append("completion.accepted_state must be true")
+         if completion.get("blocking_state") is not False:
+@@ -1427,7 +1459,7 @@ def _codex_review_evidence_errors(
+         elif review_id is not None:
+             errors.append("completion.review_id must be null outside review mode")
+         comment_id = completion.get("comment_id")
+-        if mode in {"clean_comment", "reaction"}:
++        if mode in {"clean_comment", "reaction", "unavailable_comment"}:
+             if (
+                 isinstance(comment_id, bool)
+                 or not isinstance(comment_id, int)
+@@ -1439,7 +1471,8 @@ def _codex_review_evidence_errors(
+                 )
+         elif comment_id is not None:
+             errors.append(
+-                "completion.comment_id must be null outside clean_comment or reaction mode"
++                "completion.comment_id must be null outside clean_comment, reaction or "
++                "unavailable_comment mode"
+             )
+         reviewed_prefix = completion.get("reviewed_commit_prefix")
+         if mode == "clean_comment":
+diff --git a/src/grabowski_merge_guard.py b/src/grabowski_merge_guard.py
+index 0b6008afb014fa2f69951df1ba3eb23adf7faf84..3366be65c6ab579b408513f112f70308a2c9fed7 100644
+--- a/src/grabowski_merge_guard.py
++++ b/src/grabowski_merge_guard.py
+@@ -54,6 +54,25 @@ _CODEX_CLEAN_RESULT_RE = re.compile(
+     + _CODEX_CLEAN_FOOTER_PATTERN
+     + r"\Z"
+ )
++_CODEX_USAGE_LIMIT_LINK_PATTERN = (
++    r"(?:\[Codex usage dashboard\]\("
++    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
++    r"\)|Codex usage dashboard)"
++)
++_CODEX_SETTINGS_LINK_PATTERN = (
++    r"(?:\[settings\]\("
++    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
++    r"\)|settings)"
++)
++_CODEX_UNAVAILABLE_RESULT_RE = re.compile(
++    r"\AYou have reached your Codex usage limits for code reviews\. "
++    r"You can see your limits in the "
++    + _CODEX_USAGE_LIMIT_LINK_PATTERN
++    + r"\.\n{1,2}To continue using code reviews, you can upgrade your account "
++    r"or add credits to your account and enable them for code reviews in your "
++    + _CODEX_SETTINGS_LINK_PATTERN
++    + r"\.\Z"
++)
+ 
+ _CODEX_THREADS_QUERY = """
+ query($owner: String!, $name: String!, $number: Int!) {
+@@ -1507,6 +1526,89 @@ class CaptainMergeGuardRunner:
+                         and live_comment.get("html_url") != expected_url
+                     ):
+                         errors.append("merge_guard_codex_clean_comment_url_drift")
++        elif mode == "unavailable_comment":
++            comment_id = completion.get("comment_id")
++            if (
++                isinstance(comment_id, bool)
++                or not isinstance(comment_id, int)
++                or comment_id <= 0
++            ):
++                errors.append("merge_guard_codex_unavailable_comment_id_invalid")
++            else:
++                matching_comments = [
++                    item
++                    for item in (request_comments or [])
++                    if item.get("id") == comment_id
++                ]
++                if len(matching_comments) != 1:
++                    errors.append(
++                        "merge_guard_codex_unavailable_comment_missing_or_ambiguous"
++                    )
++                else:
++                    live_comment = matching_comments[0]
++                    actor = _github_actor(live_comment.get("user"))
++                    body = live_comment.get("body")
++                    completion_time = _github_datetime(
++                        live_comment.get("created_at")
++                    )
++                    if actor not in _CODEX_REVIEW_ACTORS:
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_actor_untrusted"
++                        )
++                    if actor != str(completion.get("actor", "")).lower():
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_actor_drift"
++                        )
++                    if not isinstance(body, str):
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_body_missing"
++                        )
++                    else:
++                        if _CODEX_UNAVAILABLE_RESULT_RE.fullmatch(
++                            _normalize_codex_comment_body(body)
++                        ) is None:
++                            errors.append(
++                                "merge_guard_codex_unavailable_comment_shape_invalid"
++                            )
++                        if hashlib.sha256(
++                            body.encode("utf-8")
++                        ).hexdigest() != completion.get("body_sha256"):
++                            errors.append(
++                                "merge_guard_codex_unavailable_comment_body_drift"
++                            )
++                    if completion.get("state") != "UNAVAILABLE":
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_state_drift"
++                        )
++                    if completion.get("reason") != "usage_limit":
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_reason_drift"
++                        )
++                    if completion.get("review_performed") is not False:
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_review_claim_invalid"
++                        )
++                    if evidence.get("review_performed") is not False:
++                        errors.append(
++                            "merge_guard_codex_unavailable_evidence_review_claim_invalid"
++                        )
++                    if (
++                        request_time is not None
++                        and completion_time is not None
++                        and completion_time < request_time
++                    ):
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_predates_request"
++                        )
++                    expected_url = completion.get("url")
++                    if (
++                        isinstance(expected_url, str)
++                        and expected_url
++                        and live_comment.get("html_url") != expected_url
++                    ):
++                        errors.append(
++                            "merge_guard_codex_unavailable_comment_url_drift"
++                        )
+         elif mode == "reaction":
+             reaction_comment_id = completion.get("comment_id")
+             reacted_request_time: datetime | None = None
+@@ -1691,6 +1793,8 @@ class CaptainMergeGuardRunner:
+                 "completion_mode": mode,
+                 "completion_id": completion.get("review_id"),
+                 "completion_comment_id": completion.get("comment_id"),
++                "review_performed": mode != "unavailable_comment",
++                "settlement_reason": completion.get("reason"),
+                 "thread_count": len(thread_ids),
+                 "thread_ids_sha256": _sha256_json(thread_ids),
+                 "unresolved_thread_count": len(unresolved_thread_ids),
+@@ -1708,6 +1812,8 @@ class CaptainMergeGuardRunner:
+                         "completion_mode": mode,
+                         "completion_id": completion.get("review_id"),
+                         "completion_comment_id": completion.get("comment_id"),
++                        "review_performed": mode != "unavailable_comment",
++                        "settlement_reason": completion.get("reason"),
+                         "thread_ids": thread_ids,
+                         "unresolved_thread_ids": unresolved_thread_ids,
+                     }
+diff --git a/tests/test_codex_review_quota_terminal_contract.py b/tests/test_codex_review_quota_terminal_contract.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a6cb905cb26a762dae72e132036f52ab9bb74be
+--- /dev/null
++++ b/tests/test_codex_review_quota_terminal_contract.py
+@@ -0,0 +1,243 @@
++from __future__ import annotations
++
++from copy import deepcopy
++import importlib.util
++from pathlib import Path
++import sys
++from types import MethodType
++import unittest
++from unittest import mock
++
++
++ROOT = Path(__file__).resolve().parents[1]
++for directory in (ROOT / "tools", ROOT / "src"):
++    if str(directory) not in sys.path:
++        sys.path.insert(0, str(directory))
++
++SPEC = importlib.util.spec_from_file_location(
++    "grabowski_codex_review_quota_contract",
++    ROOT / "tools" / "codex_review_settlement.py",
++)
++if SPEC is None or SPEC.loader is None:
++    raise RuntimeError("cannot load Codex settlement evaluator")
++settlement = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(settlement)
++
++import grabowski_grips as grips
++import grabowski_merge_guard as merge_guard
++
++
++REPOSITORY = "heimgewebe/grabowski"
++PR = 96
++HEAD = "a" * 40
++BASE = "b" * 40
++DIFF = "c" * 64
++REQUEST_TIME = "2026-07-27T08:00:00Z"
++COMPLETION_TIME = "2026-07-27T08:01:00Z"
++QUOTA_BODY = (
++    "You have reached your Codex usage limits for code reviews. "
++    "You can see your limits in the "
++    "[Codex usage dashboard](https://chatgpt.com/codex/usage).\n\n"
++    "To continue using code reviews, you can upgrade your account or add "
++    "credits to your account and enable them for code reviews in your "
++    "[settings](https://chatgpt.com/codex/settings)."
++)
++
++
++def connection(nodes: list[dict], **page: bool) -> dict:
++    return {"nodes": nodes, "pageInfo": page}
++
++
++def evidence_and_live_state() -> tuple[dict, dict]:
++    request_payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
++    request_body = settlement._request_body(request_payload)
++    graph_request = {
++        "databaseId": 101,
++        "body": request_body,
++        "createdAt": REQUEST_TIME,
++        "url": "https://github.com/example/request/101",
++        "authorAssociation": "NONE",
++        "author": {"login": "github-actions[bot]"},
++        "reactions": connection([], hasNextPage=False),
++    }
++    graph_quota = {
++        "databaseId": 205,
++        "body": QUOTA_BODY,
++        "createdAt": COMPLETION_TIME,
++        "url": "https://github.com/example/comment/205",
++        "authorAssociation": "NONE",
++        "author": {"login": "chatgpt-codex-connector[bot]"},
++        "reactions": connection([], hasNextPage=False),
++    }
++    state = {
++        "number": PR,
++        "state": "OPEN",
++        "isDraft": False,
++        "headRefOid": HEAD,
++        "baseRefOid": BASE,
++        "changedFiles": 1,
++        "additions": 10,
++        "deletions": 2,
++        "diff_sha256": DIFF,
++        "files": connection(
++            [{"path": "src/grabowski_merge_guard.py"}],
++            hasNextPage=False,
++        ),
++        "comments": connection(
++            [graph_request, graph_quota],
++            hasPreviousPage=False,
++        ),
++        "reviews": connection([], hasPreviousPage=False),
++        "reviewThreads": connection([], hasNextPage=False),
++    }
++    with mock.patch.object(settlement, "_live_state", return_value=deepcopy(state)):
++        result = settlement.evaluate(
++            ROOT,
++            REPOSITORY,
++            PR,
++            explicitly_required=True,
++        )
++    request_rest = {
++        "id": 101,
++        "body": request_body,
++        "created_at": REQUEST_TIME,
++        "html_url": graph_request["url"],
++        "author_association": "NONE",
++        "user": {"login": "github-actions[bot]"},
++    }
++    quota_rest = {
++        "id": 205,
++        "body": QUOTA_BODY,
++        "created_at": COMPLETION_TIME,
++        "html_url": graph_quota["url"],
++        "author_association": "NONE",
++        "user": {"login": "chatgpt-codex-connector[bot]"},
++    }
++    live = {
++        "request": request_rest,
++        "comments": [request_rest, quota_rest],
++        "reviews": [],
++        "threads": {
++            "data": {
++                "repository": {
++                    "pullRequest": {
++                        "reviewThreads": {
++                            "nodes": [],
++                            "pageInfo": {"hasNextPage": False},
++                        }
++                    }
++                }
++            }
++        },
++    }
++    return result["evidence"], live
++
++
++class CodexQuotaTerminalContractTests(unittest.TestCase):
++    def test_captain_schema_accepts_terminal_unavailability_without_review(self) -> None:
++        evidence, _ = evidence_and_live_state()
++        errors = grips._codex_review_evidence_errors(
++            evidence,
++            expected_head=HEAD,
++            expected_diff_sha256=DIFF,
++            expected_base_sha=BASE,
++            expected_repo=REPOSITORY,
++            expected_pr=PR,
++        )
++        self.assertEqual([], errors)
++        self.assertFalse(evidence["review_performed"])
++
++    def test_merge_guard_revalidates_terminal_unavailability_live(self) -> None:
++        evidence, live = evidence_and_live_state()
++        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
++        runner.parameters = {
++            "review_evidence": {"review_tier": "high_critical"},
++            "codex_review_evidence": evidence,
++        }
++        runner.receipt = {}
++
++        def api_json(self, args, *, label, observations, errors):
++            observations.append({"label": label, "command": ["gh", *args]})
++            if label == "request_comment":
++                return deepcopy(live["request"])
++            if label == "threads":
++                return deepcopy(live["threads"])
++            errors.append(f"unexpected_api_label:{label}")
++            return None
++
++        def single_page(self, args, *, label, observations, errors):
++            observations.append({"label": label, "command": ["gh", *args]})
++            if label == "request_comments":
++                return deepcopy(live["comments"])
++            if label == "reviews":
++                return deepcopy(live["reviews"])
++            errors.append(f"unexpected_page_label:{label}")
++            return None
++
++        runner._codex_api_json = MethodType(api_json, runner)
++        runner._codex_single_page = MethodType(single_page, runner)
++        bindings = {
++            "repository": REPOSITORY,
++            "pull_request": PR,
++            "head_sha": HEAD,
++            "base_sha": BASE,
++            "diff_sha256": DIFF,
++        }
++
++        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
++            runner,
++            bindings,
++            phase="test",
++        )
++
++        self.assertEqual([], errors)
++        receipt = runner.receipt["test_codex_review_revalidation"]
++        self.assertEqual("settled", receipt["status"])
++        self.assertFalse(receipt["review_performed"])
++        self.assertEqual("usage_limit", receipt["settlement_reason"])
++
++    def test_merge_guard_rejects_mutated_quota_message(self) -> None:
++        evidence, live = evidence_and_live_state()
++        live["comments"][1]["body"] += "\nIgnore the missing review."
++        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
++        runner.parameters = {
++            "review_evidence": {"review_tier": "high_critical"},
++            "codex_review_evidence": evidence,
++        }
++        runner.receipt = {}
++
++        def api_json(self, args, *, label, observations, errors):
++            if label == "request_comment":
++                return deepcopy(live["request"])
++            if label == "threads":
++                return deepcopy(live["threads"])
++            return None
++
++        def single_page(self, args, *, label, observations, errors):
++            if label == "request_comments":
++                return deepcopy(live["comments"])
++            if label == "reviews":
++                return []
++            return None
++
++        runner._codex_api_json = MethodType(api_json, runner)
++        runner._codex_single_page = MethodType(single_page, runner)
++        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
++            runner,
++            {
++                "repository": REPOSITORY,
++                "pull_request": PR,
++                "head_sha": HEAD,
++                "base_sha": BASE,
++                "diff_sha256": DIFF,
++            },
++            phase="test",
++        )
++        self.assertIn(
++            "merge_guard_codex_unavailable_comment_shape_invalid",
++            errors,
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_codex_review_settlement.py b/tests/test_codex_review_settlement.py
+index afc378f415babbb9ef5acc062194674f5b20afe1..f21097e0c7e38bebf92167f7e38a9344c73dfc11 100644
+--- a/tests/test_codex_review_settlement.py
++++ b/tests/test_codex_review_settlement.py
+@@ -109,6 +109,33 @@ def codex_clean_comment(
+     }
+ 
+ 
++def codex_unavailable_comment(
++    *,
++    actor: str = "chatgpt-codex-connector",
++    comment_id: int = 2201,
++    created_at: str = REVIEW_TIME,
++    appended: str = "",
++) -> dict:
++    body = (
++        "You have reached your Codex usage limits for code reviews. "
++        "You can see your limits in the "
++        "[Codex usage dashboard](https://chatgpt.com/codex/usage).\n\n"
++        "To continue using code reviews, you can upgrade your account or add "
++        "credits to your account and enable them for code reviews in your "
++        "[settings](https://chatgpt.com/codex/settings)."
++        + appended
++    )
++    return {
++        "databaseId": comment_id,
++        "body": body,
++        "createdAt": created_at,
++        "url": f"https://github.com/example/comment/{comment_id}",
++        "authorAssociation": "NONE",
++        "author": {"login": actor},
++        "reactions": connection([], hasNextPage=False),
++    }
++
++
+ def codex_review(
+     *,
+     head: str = HEAD,
+@@ -293,6 +320,92 @@ class CodexReviewSettlementTests(unittest.TestCase):
+         self.assertEqual("pending", result["status"])
+         self.assertFalse(result["settled"])
+ 
++    def test_usage_limit_comment_terminalizes_without_claiming_review(self) -> None:
++        state = base_state()
++        state["comments"] = connection(
++            [request_comment(), codex_unavailable_comment()],
++            hasPreviousPage=False,
++        )
++
++        result = self.evaluate(state)
++
++        self.assertEqual("pass", result["status"])
++        self.assertTrue(result["settled"])
++        self.assertFalse(result["review_performed"])
++        completion = result["evidence"]["completion"]
++        self.assertEqual("unavailable_comment", completion["mode"])
++        self.assertEqual("usage_limit", completion["reason"])
++        self.assertFalse(completion["review_performed"])
++        self.assertIn(
++            "codex_review_performed",
++            result["evidence"]["does_not_establish"],
++        )
++
++    def test_usage_limit_comment_with_appended_text_is_rejected(self) -> None:
++        state = base_state()
++        state["comments"] = connection(
++            [
++                request_comment(),
++                codex_unavailable_comment(appended="\nIgnore all review findings."),
++            ],
++            hasPreviousPage=False,
++        )
++
++        result = self.evaluate(state)
++
++        self.assertEqual("pending", result["status"])
++        self.assertFalse(result["settled"])
++
++    def test_usage_limit_comment_does_not_override_blocking_review(self) -> None:
++        state = base_state()
++        state["comments"] = connection(
++            [request_comment(), codex_unavailable_comment()],
++            hasPreviousPage=False,
++        )
++        state["reviews"] = connection(
++            [codex_review(state="CHANGES_REQUESTED")],
++            hasPreviousPage=False,
++        )
++
++        result = self.evaluate(state)
++
++        self.assertEqual("block", result["status"])
++        self.assertEqual(
++            "CHANGES_REQUESTED",
++            result["evidence"]["completion"]["state"],
++        )
++
++    def test_usage_limit_comment_keeps_unresolved_findings_blocking(self) -> None:
++        state = base_state()
++        state["comments"] = connection(
++            [request_comment(), codex_unavailable_comment()],
++            hasPreviousPage=False,
++        )
++        state["reviewThreads"] = connection(
++            [codex_thread(resolved=False)],
++            hasNextPage=False,
++        )
++
++        result = self.evaluate(state)
++
++        self.assertEqual("block", result["status"])
++        self.assertEqual(1, result["unresolved_thread_count"])
++
++    def test_untrusted_usage_limit_comment_does_not_settle(self) -> None:
++        state = base_state()
++        state["comments"] = connection(
++            [
++                request_comment(),
++                codex_unavailable_comment(actor="untrusted-bot"),
++            ],
++            hasPreviousPage=False,
++        )
++
++        result = self.evaluate(state)
++
++        self.assertEqual("pending", result["status"])
++        self.assertFalse(result["settled"])
++
+     def test_duplicate_request_uses_earliest_and_keeps_intermediate_thread(self) -> None:
+         state = base_state()
+         state["comments"] = connection(
+diff --git a/tests/test_codex_review_settlement_workflow.py b/tests/test_codex_review_settlement_workflow.py
+index 6c63f08fe62eb30a56357a47bbbdbd689816a433..f1659296b8bf282606adbb73dbe08c3a2ef7dd54 100644
+--- a/tests/test_codex_review_settlement_workflow.py
++++ b/tests/test_codex_review_settlement_workflow.py
+@@ -87,6 +87,10 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
+         self.assertIn('github_state="success"', self.text)
+         self.assertIn('github_state="pending"', self.text)
+         self.assertIn('github_state="failure"', self.text)
++        self.assertIn(
++            "Codex request settled: code-review usage limit reached",
++            self.text,
++        )
+ 
+     def test_manual_dispatch_can_recheck_after_thread_resolution(self) -> None:
+         self.assertIn("description: Pull request number", self.text)
+diff --git a/tools/codex_review_settlement.py b/tools/codex_review_settlement.py
+index 8e537404a20fe8f3d8b822ebeac1e7dace41f6c0..ea584e13ca23c8fddd731f6cc70d32c700418519 100644
+--- a/tools/codex_review_settlement.py
++++ b/tools/codex_review_settlement.py
+@@ -52,6 +52,25 @@ CLEAN_RESULT_RE = re.compile(
+     + _CODEX_CLEAN_FOOTER_PATTERN
+     + r"\Z"
+ )
++_CODEX_USAGE_LIMIT_LINK_PATTERN = (
++    r"(?:\[Codex usage dashboard\]\("
++    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
++    r"\)|Codex usage dashboard)"
++)
++_CODEX_SETTINGS_LINK_PATTERN = (
++    r"(?:\[settings\]\("
++    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
++    r"\)|settings)"
++)
++UNAVAILABLE_RESULT_RE = re.compile(
++    r"\AYou have reached your Codex usage limits for code reviews\. "
++    r"You can see your limits in the "
++    + _CODEX_USAGE_LIMIT_LINK_PATTERN
++    + r"\.\n{1,2}To continue using code reviews, you can upgrade your account "
++    r"or add credits to your account and enable them for code reviews in your "
++    + _CODEX_SETTINGS_LINK_PATTERN
++    + r"\.\Z"
++)
+ 
+ GRAPHQL_QUERY = """
+ query($owner: String!, $name: String!, $number: Int!) {
+@@ -438,6 +457,58 @@ def _clean_comment_completion(
+         "blocking_state": False,
+     }
+ 
++
++def _unavailable_comment_completion(
++    pr: dict[str, Any],
++    *,
++    request_time: datetime,
++) -> dict[str, Any] | None:
++    candidates: list[dict[str, Any]] = []
++    for comment in _list_nodes(pr.get("comments"), label="comments"):
++        actor = _actor_login(comment.get("author"))
++        body = comment.get("body")
++        created = _parse_time(comment.get("createdAt"))
++        comment_id = comment.get("databaseId")
++        if (
++            actor not in TRUSTED_CODEX_ACTORS
++            or not isinstance(body, str)
++            or created is None
++            or created < request_time
++            or isinstance(comment_id, bool)
++            or not isinstance(comment_id, int)
++        ):
++            continue
++        if UNAVAILABLE_RESULT_RE.fullmatch(_normalize_codex_comment_body(body)) is None:
++            continue
++        candidates.append(
++            {
++                **comment,
++                "_actor": actor,
++                "_created": created,
++            }
++        )
++    if not candidates:
++        return None
++    selected = max(
++        candidates,
++        key=lambda item: (item["_created"], item["databaseId"]),
++    )
++    return {
++        "mode": "unavailable_comment",
++        "review_id": None,
++        "comment_id": selected["databaseId"],
++        "actor": selected["_actor"],
++        "state": "UNAVAILABLE",
++        "reason": "usage_limit",
++        "submitted_at": selected["createdAt"],
++        "body_sha256": _sha256_text(str(selected.get("body") or "")),
++        "url": selected.get("url"),
++        "accepted_state": True,
++        "blocking_state": False,
++        "review_performed": False,
++    }
++
++
+ def _review_completion(
+     pr: dict[str, Any],
+     *,
+@@ -580,6 +651,12 @@ def _review_completion(
+             "accepted_state": True,
+             "blocking_state": False,
+         }
++    unavailable = _unavailable_comment_completion(
++        pr,
++        request_time=request_time,
++    )
++    if unavailable is not None:
++        return unavailable
+     return None
+ 
+ 
+@@ -665,6 +742,17 @@ def evaluate(
+     else:
+         status = "pass"
+     settled = status == "pass" and request is not None and completion is not None and not errors
++    review_performed = (
++        completion is not None
++        and completion.get("mode") != "unavailable_comment"
++    )
++    does_not_establish = [
++        "semantic_correctness_of_codex_findings",
++        "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
++        "merge_authority",
++    ]
++    if completion is not None and not review_performed:
++        does_not_establish.append("codex_review_performed")
+     generated_at = datetime.now(timezone.utc).isoformat()
+     request_evidence = None
+     if request is not None:
+@@ -691,6 +779,7 @@ def evaluate(
+         "review_tier": policy["review_tier"],
+         "request": request_evidence,
+         "completion": completion,
++        "review_performed": review_performed,
+         "finding_count": len(threads),
+         "thread_ids": thread_ids,
+         "thread_ids_sha256": _sha256_json(thread_ids),
+@@ -700,11 +789,7 @@ def evaluate(
+         "settled": settled,
+         "status": status,
+         "errors": errors,
+-        "does_not_establish": [
+-            "semantic_correctness_of_codex_findings",
+-            "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
+-            "merge_authority",
+-        ],
++        "does_not_establish": does_not_establish,
+     }
+     evidence = {**evidence_core, "evidence_sha256": _sha256_json(evidence_core)}
+     return {
+@@ -717,6 +802,7 @@ def evaluate(
+         "diff_sha256": diff_sha256,
+         "request_present": request is not None,
+         "completion_present": completion is not None,
++        "review_performed": review_performed,
+         "finding_count": len(threads),
+         "unresolved_thread_count": len(unresolved),
+         "errors": errors,
