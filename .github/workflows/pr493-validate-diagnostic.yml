@@ -34,10 +34,10 @@ jobs:
           status=$?
           set -e
           {
-            printf '### PR 493 validation diagnostic 2\n\n'
+            printf '### PR 493 validation diagnostic 3\n\n'
             printf 'Head: `%s`\n\n' "$GITHUB_SHA"
             printf 'Exit status: `%s`\n\n```text\n' "$status"
-            tail -n 140 /tmp/pr493-validate.log
+            tail -n 30 /tmp/pr493-validate.log
             printf '\n```\n'
           } > /tmp/pr493-comment.md
           gh pr comment 493 --repo heimgewebe/grabowski --body-file /tmp/pr493-comment.md
