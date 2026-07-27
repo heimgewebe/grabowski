@@ -93,11 +93,8 @@ jobs:
 
       - name: Request current-head Codex review
         if: >-
-          github.event_name != 'workflow_dispatch'
-          && (
-            github.event_name != 'issue_comment'
-            || github.event.comment.user.login != 'chatgpt-codex-connector[bot]'
-          )
+          github.event_name != 'issue_comment'
+          || github.event.comment.user.login != 'chatgpt-codex-connector[bot]'
         id: request
         env:
           GH_TOKEN: ${{ github.token }}
