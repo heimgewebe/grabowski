@@ -28,8 +28,8 @@ jobs:
         run: |
           set -euo pipefail
           product_head="6c72265a988d69059cecc2718cab169c3371a13d"
-          test "$(git rev-parse HEAD^)" = "$product_head"
-          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/export-pr-494-diff.yml"
+          git merge-base --is-ancestor "$product_head" HEAD
+          test "$(git diff --name-only "$product_head" HEAD)" = ".github/workflows/export-pr-494-diff.yml"
           expected_paths="$(cat <<'EOF'
           .github/workflows/codex-review-settlement.yml
           docs/external-review-loop.md
