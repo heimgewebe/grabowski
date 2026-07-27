@@ -1416,6 +1416,14 @@ def _codex_review_evidence_errors(
             errors.append("completion reaction state must be THUMBS_UP")
         if mode == "clean_comment" and state != "CLEAN":
             errors.append("completion clean-comment state must be CLEAN")
+        if completion.get("review_performed") is False:
+            errors.append(
+                "performed Codex completion cannot state review_performed=false"
+            )
+        if evidence.get("review_performed") is False:
+            errors.append(
+                "performed Codex evidence cannot state review_performed=false"
+            )
         if completion.get("accepted_state") is not True:
             errors.append("completion.accepted_state must be true")
         if completion.get("blocking_state") is not False:

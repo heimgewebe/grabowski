@@ -52,7 +52,6 @@ CLEAN_RESULT_RE = re.compile(
     + _CODEX_CLEAN_FOOTER_PATTERN
     + r"\Z"
 )
-
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -327,18 +326,86 @@ def _request_actor_allowed(comment: dict[str, Any]) -> bool:
     return association in TRUSTED_REQUEST_ASSOCIATIONS or actor in TRUSTED_REQUEST_ACTORS
 
 
-def _matching_requests(pr: dict[str, Any], expected: dict[str, Any]) -> list[dict[str, Any]]:
+def _canonical_request_payload(
+    value: Any,
+    *,
+    repository: str,
+    pr_number: int,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "repo",
+        "pr",
+        "head_sha",
+        "diff_sha256",
+        "request_id",
+    }:
+        return None
+    head_sha = value.get("head_sha")
+    diff_sha256 = value.get("diff_sha256")
+    if (
+        value.get("schema_version") != SCHEMA_VERSION
+        or value.get("kind") != REQUEST_KIND
+        or value.get("repo") != repository
+        or value.get("pr") != pr_number
+        or not isinstance(head_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or not isinstance(diff_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", diff_sha256) is None
+    ):
+        return None
+    core = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": REQUEST_KIND,
+        "repo": repository,
+        "pr": pr_number,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
+    }
+    if value.get("request_id") != _sha256_json(core)[:32]:
+        return None
+    return dict(value)
+
+
+def _canonical_requests(
+    pr: dict[str, Any],
+    *,
+    repository: str,
+    pr_number: int,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for comment in _list_nodes(pr.get("comments"), label="comments"):
-        parsed = _parse_request(comment)
-        if parsed != expected or not _request_actor_allowed(comment):
+        if not _request_actor_allowed(comment):
             continue
+        parsed = _canonical_request_payload(
+            _parse_request(comment),
+            repository=repository,
+            pr_number=pr_number,
+        )
         created = _parse_time(comment.get("createdAt"))
         comment_id = comment.get("databaseId")
-        if created is None or isinstance(comment_id, bool) or not isinstance(comment_id, int):
+        if (
+            parsed is None
+            or created is None
+            or isinstance(comment_id, bool)
+            or not isinstance(comment_id, int)
+        ):
             continue
         result.append({**comment, "_created": created, "_request": parsed})
     return sorted(result, key=lambda item: (item["_created"], item["databaseId"]))
+
+
+def _matching_requests(pr: dict[str, Any], expected: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _canonical_requests(
+            pr,
+            repository=expected["repo"],
+            pr_number=expected["pr"],
+        )
+        if item["_request"] == expected
+    ]
 
 
 def _current_head(pr: dict[str, Any]) -> str:
@@ -438,6 +505,7 @@ def _clean_comment_completion(
         "blocking_state": False,
     }
 
+
 def _review_completion(
     pr: dict[str, Any],
     *,
@@ -471,7 +539,7 @@ def _review_completion(
                 }
             )
             continue
-        if submitted is None or submitted < request_time:
+        if submitted is None:
             continue
         candidates.append(
             {
@@ -504,10 +572,15 @@ def _review_completion(
                 if item["_state"] == "APPROVED"
                 and order(item) > order(latest_blocker)
             ]
-            selected = max(approvals, key=order) if approvals else latest_blocker
+            if not approvals:
+                selected = latest_blocker
     if selected is None:
         accepted = [
-            item for item in candidates if item["_state"] in ACCEPTED_REVIEW_STATES
+            item
+            for item in candidates
+            if item["_state"] in ACCEPTED_REVIEW_STATES
+            and isinstance(item["_submitted"], datetime)
+            and item["_submitted"] >= request_time
         ]
         if accepted:
             selected = max(accepted, key=order)
@@ -635,10 +708,19 @@ def evaluate(
     diff_sha256 = _current_diff(pr)
     policy = _policy(pr, repository, explicitly_required=explicitly_required)
     expected_request = _request_payload(repository, pr_number, head_sha, diff_sha256)
-    requests = _matching_requests(pr, expected_request)
+    canonical_requests = _canonical_requests(
+        pr, repository=repository, pr_number=pr_number
+    )
+    requests = [
+        item for item in canonical_requests if item["_request"] == expected_request
+    ]
     request = requests[0] if requests else None
     completion = (
-        _review_completion(pr, requests=requests, head_sha=head_sha)
+        _review_completion(
+            pr,
+            requests=requests,
+            head_sha=head_sha,
+        )
         if request is not None
         else None
     )
@@ -665,6 +747,12 @@ def evaluate(
     else:
         status = "pass"
     settled = status == "pass" and request is not None and completion is not None and not errors
+    review_performed = completion is not None
+    does_not_establish = [
+        "semantic_correctness_of_codex_findings",
+        "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
+        "merge_authority",
+    ]
     generated_at = datetime.now(timezone.utc).isoformat()
     request_evidence = None
     if request is not None:
@@ -691,6 +779,7 @@ def evaluate(
         "review_tier": policy["review_tier"],
         "request": request_evidence,
         "completion": completion,
+        "review_performed": review_performed,
         "finding_count": len(threads),
         "thread_ids": thread_ids,
         "thread_ids_sha256": _sha256_json(thread_ids),
@@ -700,11 +789,7 @@ def evaluate(
         "settled": settled,
         "status": status,
         "errors": errors,
-        "does_not_establish": [
-            "semantic_correctness_of_codex_findings",
-            "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
-            "merge_authority",
-        ],
+        "does_not_establish": does_not_establish,
     }
     evidence = {**evidence_core, "evidence_sha256": _sha256_json(evidence_core)}
     return {
@@ -717,6 +802,7 @@ def evaluate(
         "diff_sha256": diff_sha256,
         "request_present": request is not None,
         "completion_present": completion is not None,
+        "review_performed": review_performed,
         "finding_count": len(threads),
         "unresolved_thread_count": len(unresolved),
         "errors": errors,

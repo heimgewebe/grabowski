@@ -54,7 +54,6 @@ _CODEX_CLEAN_RESULT_RE = re.compile(
     + _CODEX_CLEAN_FOOTER_PATTERN
     + r"\Z"
 )
-
 _CODEX_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -1310,6 +1309,7 @@ class CaptainMergeGuardRunner:
             [item["id"] for item in canonical_requests]
         )
 
+
         review_items = self._codex_single_page(
             [
                 "api",
@@ -1344,11 +1344,7 @@ class CaptainMergeGuardRunner:
                         }
                     )
                     continue
-                if (
-                    submitted is None
-                    or request_time is None
-                    or submitted < request_time
-                ):
+                if submitted is None or request_time is None:
                     continue
                 live_reviews.append(
                     {
@@ -1507,6 +1503,8 @@ class CaptainMergeGuardRunner:
                         and live_comment.get("html_url") != expected_url
                     ):
                         errors.append("merge_guard_codex_clean_comment_url_drift")
+        elif mode == "unavailable_comment":
+            errors.append("merge_guard_codex_unavailable_comment_unbound")
         elif mode == "reaction":
             reaction_comment_id = completion.get("comment_id")
             reacted_request_time: datetime | None = None
@@ -1691,6 +1689,8 @@ class CaptainMergeGuardRunner:
                 "completion_mode": mode,
                 "completion_id": completion.get("review_id"),
                 "completion_comment_id": completion.get("comment_id"),
+                "review_performed": True,
+                "settlement_reason": completion.get("reason"),
                 "thread_count": len(thread_ids),
                 "thread_ids_sha256": _sha256_json(thread_ids),
                 "unresolved_thread_count": len(unresolved_thread_ids),
@@ -1708,6 +1708,8 @@ class CaptainMergeGuardRunner:
                         "completion_mode": mode,
                         "completion_id": completion.get("review_id"),
                         "completion_comment_id": completion.get("comment_id"),
+                        "review_performed": True,
+                        "settlement_reason": completion.get("reason"),
                         "thread_ids": thread_ids,
                         "unresolved_thread_ids": unresolved_thread_ids,
                     }
