@@ -41,74 +41,79 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          def replace_once(path: str, old: str, new: str) -> None:
-              target = Path(path)
-              text = target.read_text(encoding="utf-8")
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected one cleanup anchor, found {count}")
-              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+          merge_guard = Path("src/grabowski_merge_guard.py")
+          lines = merge_guard.read_text(encoding="utf-8").splitlines()
+          anchor = '"completion_comment_id": completion.get("comment_id"),'
+          indices = [index for index, line in enumerate(lines) if line.strip() == anchor]
+          if len(indices) != 2:
+              raise SystemExit(
+                  f"merge guard: expected two completion-comment anchors, found {len(indices)}"
+              )
 
-          replace_once(
-              "src/grabowski_merge_guard.py",
-              '''                "completion_comment_id": completion.get("comment_id"),
-              "review_performed": mode != "unavailable_comment",
-              "settlement_reason": completion.get("reason"),
-              "thread_count": len(thread_ids),
+          def replace_receipt_block(index: int, *, binding: bool) -> None:
+              prefix = lines[index][: len(lines[index]) - len(lines[index].lstrip())]
+              if binding:
+                  expected = [
+                      anchor,
+                      '"review_performed": mode != "unavailable_comment",',
+                      '"settlement_reason": completion.get("reason"),',
+                      '"thread_ids": thread_ids,',
+                      "",
+                      '"unresolved_thread_ids": unresolved_thread_ids,',
+                  ]
+                  replacement = [
+                      prefix + anchor,
+                      prefix + '"review_performed": mode != "unavailable_comment",',
+                      prefix + '"settlement_reason": completion.get("reason"),',
+                      prefix + '"thread_ids": thread_ids,',
+                      prefix + '"unresolved_thread_ids": unresolved_thread_ids,',
+                  ]
+              else:
+                  expected = [
+                      anchor,
+                      '"review_performed": mode != "unavailable_comment",',
+                      '"settlement_reason": completion.get("reason"),',
+                      '"thread_count": len(thread_ids),',
+                      "",
+                      '"thread_ids_sha256": _sha256_json(thread_ids),',
+                  ]
+                  replacement = [
+                      prefix + anchor,
+                      prefix + '"review_performed": mode != "unavailable_comment",',
+                      prefix + '"settlement_reason": completion.get("reason"),',
+                      prefix + '"thread_count": len(thread_ids),',
+                      prefix + '"thread_ids_sha256": _sha256_json(thread_ids),',
+                  ]
+              actual = [line.strip() for line in lines[index : index + len(expected)]]
+              if actual != expected:
+                  raise SystemExit(
+                      f"merge guard: cleanup precondition mismatch at line {index + 1}: {actual!r}"
+                  )
+              lines[index : index + len(expected)] = replacement
 
-                  "thread_ids_sha256": _sha256_json(thread_ids),
-          ''',
-              '''                "completion_comment_id": completion.get("comment_id"),
-                  "review_performed": mode != "unavailable_comment",
-                  "settlement_reason": completion.get("reason"),
-                  "thread_count": len(thread_ids),
-                  "thread_ids_sha256": _sha256_json(thread_ids),
-          ''',
-          )
-          replace_once(
-              "src/grabowski_merge_guard.py",
-              '''                        "completion_comment_id": completion.get("comment_id"),
-                      "review_performed": mode != "unavailable_comment",
-                      "settlement_reason": completion.get("reason"),
-                      "thread_ids": thread_ids,
+          replace_receipt_block(indices[1], binding=True)
+          replace_receipt_block(indices[0], binding=False)
+          merge_guard.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-                          "unresolved_thread_ids": unresolved_thread_ids,
-          ''',
-              '''                        "completion_comment_id": completion.get("comment_id"),
-                          "review_performed": mode != "unavailable_comment",
-                          "settlement_reason": completion.get("reason"),
-                          "thread_ids": thread_ids,
-                          "unresolved_thread_ids": unresolved_thread_ids,
-          ''',
-          )
-          replace_once(
-              "tools/codex_review_settlement.py",
-              '''        "blocking_state": False,
-              }
+          evaluator = Path("tools/codex_review_settlement.py")
+          text = evaluator.read_text(encoding="utf-8")
+          old = '        "blocking_state": False,\n    }\n\ndef _unavailable_comment_completion(\n'
+          new = '        "blocking_state": False,\n    }\n\n\ndef _unavailable_comment_completion(\n'
+          if text.count(old) != 1:
+              raise SystemExit("evaluator: expected one top-level spacing anchor")
+          evaluator.write_text(text.replace(old, new, 1), encoding="utf-8")
 
-          def _unavailable_comment_completion(
-          ''',
-              '''        "blocking_state": False,
-              }
-
-
-          def _unavailable_comment_completion(
-          ''',
-          )
-          replace_once(
-              "tests/test_codex_review_quota_terminal_contract.py",
-              '''from copy import deepcopy
-          from datetime import datetime, timezone
-          import hashlib
-          import importlib.util
-          import json
-          from pathlib import Path
-          ''',
-              '''from copy import deepcopy
-          import importlib.util
-          from pathlib import Path
-          ''',
-          )
+          contract_test = Path("tests/test_codex_review_quota_terminal_contract.py")
+          text = contract_test.read_text(encoding="utf-8")
+          for unused in (
+              "from datetime import datetime, timezone\n",
+              "import hashlib\n",
+              "import json\n",
+          ):
+              if text.count(unused) != 1:
+                  raise SystemExit(f"contract test: expected one unused import {unused!r}")
+              text = text.replace(unused, "", 1)
+          contract_test.write_text(text, encoding="utf-8")
           PY
           git diff --check
 
