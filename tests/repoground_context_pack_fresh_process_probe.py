@@ -78,18 +78,17 @@ def main(argv: list[str]) -> int:
             _manifest,
             query,
             *,
+            task_profile,
+            max_context_tokens,
             k,
-            filters,
-            resolve_evidence,
-            project_sources,
         ):
             if query != expected_query or k != expected_k:
                 raise RuntimeError("fresh-process query binding mismatch")
-            if filters != {} or not resolve_evidence or not project_sources:
+            if task_profile != config["task_profile"] or max_context_tokens != 2000:
                 raise RuntimeError("fresh-process query mode mismatch")
             return json.loads(json.dumps(query_payload))
 
-        mcp._repoground_query_existing_index = _fixed_query
+        mcp._repoground_agent_query = _fixed_query
 
     payload = mcp.repoground_context_pack(
         config["repo"],

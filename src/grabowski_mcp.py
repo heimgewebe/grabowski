@@ -7209,6 +7209,16 @@ def _repoground_validate_task_profile(task_profile: str) -> str:
     return task_profile
 
 
+def _repoground_validate_context_tokens(max_context_tokens: int) -> int:
+    if (
+        not isinstance(max_context_tokens, int)
+        or isinstance(max_context_tokens, bool)
+        or not 1 <= max_context_tokens <= 8000
+    ):
+        raise ValueError("max_context_tokens must be an integer between 1 and 8000")
+    return max_context_tokens
+
+
 def _repoground_file_sha256(path: Path) -> str:
     return hashlib.sha256(_ensure_regular_text_file(path, 2_000_000)).hexdigest()
 
@@ -7313,7 +7323,51 @@ operation = sys.argv[1]
 manifest = sys.argv[2]
 payload = json.loads(sys.stdin.read() or "{}")
 
-if operation == "query_existing_index":
+if operation == "agent_query":
+    if hasattr(mcp_tools, "query_existing_index"):
+        result = mcp_tools.query_existing_index(
+            bundle_manifest=manifest,
+            query=payload.get("query", ""),
+            task_profile=payload.get("task_profile", "basic_repo_question"),
+            max_context_tokens=payload.get("max_context_tokens", 2000),
+            k=payload.get("k", 5),
+        )
+    else:
+        result = bundle_access.query_existing_index(
+            manifest,
+            payload.get("query", ""),
+            k=payload.get("k", 5),
+            filters={},
+            resolve_evidence=True,
+            project_sources=True,
+        )
+        query_result = result.get("query_result") if isinstance(result, dict) else None
+        match_count = None
+        if isinstance(query_result, dict):
+            if isinstance(query_result.get("count"), int):
+                match_count = query_result["count"]
+            elif isinstance(query_result.get("results"), list):
+                match_count = len(query_result["results"])
+        if isinstance(result, dict):
+            result["route"] = "legacy_text_retrieval"
+            result["intent"] = {"kind": "legacy_text_retrieval"}
+            result["retrieval"] = {
+                "raw_query": payload.get("query", ""),
+                "fts_query": None,
+                "strategy": "legacy_exact_and",
+                "match_count": match_count,
+            }
+            result["budget"] = {
+                "max_context_tokens": payload.get("max_context_tokens", 2000),
+                "approx_context_chars_used": None,
+                "truncated": None,
+            }
+            result["availability"] = {
+                "status": result.get("status", "unknown"),
+                "caveats": ["repoground_agent_frontdoor_unavailable_legacy_fallback"],
+            }
+            result["legacy_fallback_used"] = True
+elif operation == "query_existing_index":
     result = bundle_access.query_existing_index(
         manifest,
         payload.get("query", ""),
@@ -7414,6 +7468,26 @@ print(json.dumps(result, sort_keys=True))
     value.setdefault("available", value.get("status") == "available")
     value["returncode"] = completed.returncode
     return value
+
+
+def _repoground_agent_query(
+    manifest_path: Path,
+    query: str,
+    *,
+    task_profile: str,
+    max_context_tokens: int,
+    k: int,
+) -> dict[str, Any]:
+    return _repoground_core_json(
+        "agent_query",
+        manifest_path,
+        {
+            "query": query,
+            "task_profile": task_profile,
+            "max_context_tokens": max_context_tokens,
+            "k": k,
+        },
+    )
 
 
 def _repoground_query_existing_index(
@@ -7548,11 +7622,131 @@ def _repoground_range_identity_from_hit(hit: dict[str, Any]) -> dict[str, Any] |
 def _repoground_query_snippets(
     payload: Any, *, max_snippets: int = 5
 ) -> dict[str, Any]:
-    projection_items = _repoground_source_projection_items(payload)
     snippets: list[dict[str, Any]] = []
     ranges: list[dict[str, Any]] = []
+    if isinstance(payload, dict):
+        navigation_hits = _repoground_list_of_dicts(payload.get("navigation_hits"))
+        if navigation_hits:
+            for ordinal, hit in enumerate(navigation_hits[:max_snippets]):
+                path = hit.get("path")
+                source_range = (
+                    dict(hit["source_range"])
+                    if isinstance(hit.get("source_range"), dict)
+                    else None
+                )
+                if source_range is None and isinstance(path, str) and path:
+                    source_range = {
+                        "file_path": path,
+                        "start_line": hit.get("start_line"),
+                        "end_line": hit.get("end_line"),
+                    }
+                elif source_range is not None and "file_path" not in source_range:
+                    source_range["file_path"] = path
+                snippets.append(
+                    {
+                        "ordinal": ordinal,
+                        "path": path,
+                        "chunk_id": hit.get("id"),
+                        "score": None,
+                        "text_excerpt": None,
+                        "range_ref": None,
+                        "source_range": source_range,
+                        "line_range": {
+                            "start_line": hit.get("start_line"),
+                            "end_line": hit.get("end_line"),
+                        },
+                        "citation_id": None,
+                        "citation_status": None,
+                        "citation_verified": None,
+                        "canonical_authority": {
+                            "authority": "python_symbol_index_json",
+                            "risk_class": "navigation",
+                        },
+                        "live_repo_address": None,
+                        "live_repo_address_status": None,
+                        "symbol": {
+                            "kind": hit.get("kind"),
+                            "name": hit.get("name"),
+                            "qualified_name": hit.get("qualified_name"),
+                            "range_ref": hit.get("range_ref"),
+                        },
+                    }
+                )
+                if source_range is not None:
+                    ranges.append(source_range)
+            return {
+                "source_shape": "agent_frontdoor.navigation_hits",
+                "hit_count": len(navigation_hits),
+                "snippets": snippets,
+                "ranges": ranges,
+            }
+
+        resolved_ranges = _repoground_list_of_dicts(payload.get("resolved_ranges"))
+        if resolved_ranges:
+            for ordinal, hit in enumerate(resolved_ranges):
+                if len(snippets) >= max_snippets:
+                    break
+                text = _repoground_text_excerpt(hit.get("text_excerpt"))
+                if not text:
+                    continue
+                path = hit.get("source_path") or hit.get("path")
+                source_line_range = (
+                    hit.get("source_line_range")
+                    if isinstance(hit.get("source_line_range"), dict)
+                    else None
+                )
+                source_range = dict(source_line_range) if source_line_range else None
+                if source_range is not None and isinstance(path, str) and path:
+                    source_range.setdefault("file_path", path)
+                range_ref = (
+                    hit.get("range_ref")
+                    if isinstance(hit.get("range_ref"), dict)
+                    else None
+                )
+                snippets.append(
+                    {
+                        "ordinal": ordinal,
+                        "path": path,
+                        "chunk_id": range_ref.get("ref")
+                        if isinstance(range_ref, dict)
+                        else None,
+                        "score": None,
+                        "text_excerpt": text,
+                        "range_ref": range_ref,
+                        "source_range": source_range,
+                        "line_range": source_line_range,
+                        "citation_id": hit.get("citation_id"),
+                        "citation_status": "resolved"
+                        if hit.get("citation_id")
+                        else None,
+                        "citation_verified": None,
+                        "canonical_authority": {
+                            "authority": "canonical_md",
+                            "risk_class": "evidence",
+                        },
+                        "live_repo_address": None,
+                        "live_repo_address_status": None,
+                    }
+                )
+                if source_range is not None:
+                    ranges.append(source_range)
+                elif range_ref is not None:
+                    ranges.append(range_ref)
+            return {
+                "source_shape": "agent_frontdoor.resolved_ranges",
+                "hit_count": len(snippets),
+                "snippets": snippets,
+                "ranges": ranges,
+            }
+
+    projection_items = _repoground_source_projection_items(payload)
     if projection_items:
-        for item in projection_items[:max_snippets]:
+        for item in projection_items:
+            if len(snippets) >= max_snippets:
+                break
+            text = _repoground_text_excerpt(item.get("text_excerpt"))
+            if text == "":
+                continue
             source_range = (
                 item.get("source_range")
                 if isinstance(item.get("source_range"), dict)
@@ -7562,7 +7756,7 @@ def _repoground_query_snippets(
                 "ordinal": item.get("ordinal", len(snippets)),
                 "path": item.get("path"),
                 "chunk_id": item.get("chunk_id"),
-                "text_excerpt": _repoground_text_excerpt(item.get("text_excerpt")),
+                "text_excerpt": text,
                 "range_status": item.get("range_status"),
                 "citation_status": item.get("citation_status"),
                 "citation_id": item.get("citation_id"),
@@ -7589,7 +7783,9 @@ def _repoground_query_snippets(
         }
 
     hits, shape = _repoground_extract_query_hits(payload)
-    for ordinal, hit in enumerate(hits[:max_snippets]):
+    for ordinal, hit in enumerate(hits):
+        if len(snippets) >= max_snippets:
+            break
         range_ref = _repoground_range_identity_from_hit(hit)
         source_range = (
             hit.get("source_range")
@@ -7615,6 +7811,8 @@ def _repoground_query_snippets(
             if isinstance(hit.get("content"), str)
             else hit.get("snippet")
         )
+        if text == "":
+            continue
         snippet = {
             "ordinal": ordinal,
             "path": hit.get("source_path") or hit.get("path"),
@@ -7643,6 +7841,54 @@ def _repoground_query_snippets(
         "hit_count": len(hits),
         "snippets": snippets,
         "ranges": ranges,
+    }
+
+
+def _repoground_apply_local_context_budget(
+    snippet_view: dict[str, Any], *, max_context_tokens: int
+) -> dict[str, Any]:
+    char_budget = max_context_tokens * 4
+    bounded_snippets: list[dict[str, Any]] = []
+    bounded_ranges: list[dict[str, Any]] = []
+    used = 0
+    truncated = False
+    source_snippets = _repoground_list_of_dicts(snippet_view.get("snippets"))
+    for snippet in source_snippets:
+        bounded = dict(snippet)
+        text = bounded.get("text_excerpt")
+        if isinstance(text, str):
+            if not text:
+                truncated = True
+                continue
+            remaining = char_budget - used
+            if remaining <= 0:
+                truncated = True
+                break
+            clipped = text[:remaining]
+            if len(clipped) < len(text):
+                bounded["text_truncated"] = True
+                truncated = True
+            bounded["text_excerpt"] = clipped
+            used += len(clipped)
+        bounded_snippets.append(bounded)
+        range_value = (
+            bounded.get("source_range")
+            if isinstance(bounded.get("source_range"), dict)
+            else bounded.get("range_ref")
+            if isinstance(bounded.get("range_ref"), dict)
+            else None
+        )
+        if isinstance(range_value, dict):
+            bounded_ranges.append(range_value)
+    if len(bounded_snippets) < len(source_snippets):
+        truncated = True
+    return {
+        **snippet_view,
+        "hit_count": len(bounded_snippets),
+        "snippets": bounded_snippets,
+        "ranges": bounded_ranges,
+        "approx_context_chars_used": used,
+        "truncated": truncated,
     }
 
 
@@ -7854,8 +8100,9 @@ def repoground_query(
     k: int = 5,
     filters: dict[str, Any] | None = None,
     max_snippets: int = 5,
+    max_context_tokens: int = 2000,
 ) -> dict[str, Any]:
-    """Run a bounded read-only RepoGround query and normalize result shapes."""
+    """Run the bounded RepoGround agent frontdoor without refreshing bundles."""
     _require_capability("bundle_registry")
     repo = _repoground_validate_repo(repo) or ""
     task_profile = _repoground_validate_task_profile(task_profile)
@@ -7871,6 +8118,7 @@ def repoground_query(
         or not 1 <= max_snippets <= 20
     ):
         raise ValueError("max_snippets must be an integer between 1 and 20")
+    max_context_tokens = _repoground_validate_context_tokens(max_context_tokens)
 
     freshness, selected_stem, manifest_path, selection_error = (
         _repoground_selected_manifest_for_repo(repo, stem)
@@ -7878,19 +8126,31 @@ def repoground_query(
     if selection_error is not None:
         return {
             "kind": "grabowski.repoground_query",
-            "schema_version": 1,
+            "schema_version": 2,
             "repo": repo,
             "task_profile": task_profile,
             "stem": selected_stem,
             "query": query,
             "k": k,
+            "max_context_tokens": max_context_tokens,
             "available": False,
+            "status": "unavailable",
             "freshness": freshness,
             "reason": selection_error.get("reason"),
             "bundle_repo": selection_error.get("bundle_repo"),
+            "route": "unavailable",
+            "strategy": "none",
+            "intent": None,
+            "retrieval": None,
+            "budget": {
+                "max_context_tokens": max_context_tokens,
+                "approx_context_chars_used": 0,
+                "truncated": False,
+            },
             "query_shape": "unavailable",
             "normalized_query_shape": "unavailable",
             "hit_count": 0,
+            "result_count": 0,
             "snippets": [],
             "ranges": [],
             "raw_results_included": False,
@@ -7904,39 +8164,138 @@ def repoground_query(
         }
     assert isinstance(manifest_path, Path)
     assert isinstance(selected_stem, str)
-    repoground_result = _repoground_query_existing_index(
-        manifest_path,
-        query,
-        k=k,
-        filters=filters or {},
-        resolve_evidence=True,
-        project_sources=True,
+
+    if filters:
+        repoground_result = _repoground_query_existing_index(
+            manifest_path,
+            query,
+            k=k,
+            filters=filters,
+            resolve_evidence=True,
+            project_sources=True,
+        )
+        filtered_available = repoground_result.get("status") == "available"
+        route = str(repoground_result.get("route") or "filtered_text_retrieval")
+        intent = (
+            repoground_result.get("intent")
+            if isinstance(repoground_result.get("intent"), dict)
+            else {"kind": route}
+        )
+        observed_retrieval = repoground_result.get("retrieval")
+        if isinstance(observed_retrieval, dict):
+            retrieval = dict(observed_retrieval)
+            retrieval.setdefault("raw_query", query)
+            retrieval.setdefault("fts_query", None)
+            retrieval.setdefault("match_count", None)
+            retrieval.setdefault(
+                "strategy", "exact_and_filtered" if filtered_available else "none"
+            )
+        else:
+            retrieval = {
+                "raw_query": query,
+                "fts_query": None,
+                "strategy": "exact_and_filtered" if filtered_available else "none",
+                "match_count": None,
+            }
+        budget = (
+            repoground_result.get("budget")
+            if isinstance(repoground_result.get("budget"), dict)
+            else {
+                "max_context_tokens": max_context_tokens,
+                "approx_context_chars_used": 0,
+                "truncated": False,
+            }
+        )
+    else:
+        repoground_result = _repoground_agent_query(
+            manifest_path,
+            query,
+            task_profile=task_profile,
+            max_context_tokens=max_context_tokens,
+            k=k,
+        )
+        route = str(repoground_result.get("route") or "text_retrieval")
+        intent = (
+            repoground_result.get("intent")
+            if isinstance(repoground_result.get("intent"), dict)
+            else {"kind": route}
+        )
+        retrieval = (
+            repoground_result.get("retrieval")
+            if isinstance(repoground_result.get("retrieval"), dict)
+            else {
+                "raw_query": query,
+                "fts_query": None,
+                "strategy": "none",
+                "match_count": 0,
+            }
+        )
+        budget = (
+            repoground_result.get("budget")
+            if isinstance(repoground_result.get("budget"), dict)
+            else {
+                "max_context_tokens": max_context_tokens,
+                "approx_context_chars_used": None,
+                "truncated": None,
+            }
+        )
+
+    snippets = _repoground_query_snippets(
+        repoground_result, max_snippets=max_snippets
     )
-    snippets = _repoground_query_snippets(repoground_result, max_snippets=max_snippets)
+    legacy_fallback_used = repoground_result.get("legacy_fallback_used") is True
+    local_budget_used = bool(filters) or legacy_fallback_used
+    if local_budget_used:
+        snippets = _repoground_apply_local_context_budget(
+            snippets, max_context_tokens=max_context_tokens
+        )
+        budget = {
+            "max_context_tokens": max_context_tokens,
+            "approx_context_chars_used": snippets["approx_context_chars_used"],
+            "truncated": snippets["truncated"],
+        }
     query_result = (
         repoground_result.get("query_result")
         if isinstance(repoground_result, dict)
         else None
     )
-    result_count = None
-    if isinstance(query_result, dict):
-        if isinstance(query_result.get("count"), int):
-            result_count = query_result.get("count")
-        elif isinstance(query_result.get("results"), list):
-            result_count = len(query_result["results"])
-    available = repoground_result.get("status") == "available"
+    result_count = retrieval.get("match_count")
+    if not isinstance(result_count, int):
+        result_count = None
+        if isinstance(query_result, dict):
+            if isinstance(query_result.get("count"), int):
+                result_count = query_result.get("count")
+            elif isinstance(query_result.get("results"), list):
+                result_count = len(query_result["results"])
+    if result_count is None:
+        result_count = snippets["hit_count"]
+    availability = repoground_result.get("availability")
+    available = repoground_result.get("status") == "available" and (
+        not isinstance(availability, dict)
+        or availability.get("status") == "available"
+    )
+    strategy = str(retrieval.get("strategy") or "none")
     return {
         "kind": "grabowski.repoground_query",
-        "schema_version": 1,
+        "schema_version": 2,
         "repo": repo,
         "task_profile": task_profile,
         "stem": selected_stem,
         "query": query,
         "k": k,
+        "max_context_tokens": max_context_tokens,
         "filters": filters or {},
         "available": available,
         "status": repoground_result.get("status", "unknown"),
         "freshness": freshness,
+        "route": route,
+        "strategy": strategy,
+        "intent": intent,
+        "retrieval": retrieval,
+        "budget": budget,
+        "availability": availability,
+        "legacy_fallback_used": legacy_fallback_used,
+        "local_budget_used": local_budget_used,
         "query_shape": snippets["source_shape"],
         "normalized_query_shape": snippets["source_shape"],
         "hit_count": snippets["hit_count"],
@@ -7952,7 +8311,9 @@ def repoground_query(
         },
         "mutation_boundary": repoground_result.get("mutation_boundary")
         or {"writes": [], "read_paths_do_not_refresh": True},
-        "evidence_resolution_used": repoground_result.get("evidence_resolution_used"),
+        "evidence_resolution_used": repoground_result.get(
+            "evidence_resolution_used"
+        ),
         "raw_results_included": False,
         "does_not_establish": [
             "actual_agent_reading",
@@ -8171,11 +8532,13 @@ def repoground_context_pack(
     query: str | None = None,
     k: int = 5,
     max_snippets: int = 5,
+    max_context_tokens: int = 2000,
 ) -> dict[str, Any]:
     """Build a bounded RepoGround context pack for agent handoff and Bureau receipts."""
     _require_capability("bundle_registry")
     repo = _repoground_validate_repo(repo) or ""
     task_profile = _repoground_validate_task_profile(task_profile)
+    max_context_tokens = _repoground_validate_context_tokens(max_context_tokens)
     if query is not None and not isinstance(query, str):
         raise ValueError("query must be a string when supplied")
     if not isinstance(k, int) or isinstance(k, bool) or not 1 <= k <= 100:
@@ -8243,6 +8606,7 @@ def repoground_context_pack(
             stem=selected_stem,
             k=k,
             max_snippets=max_snippets,
+            max_context_tokens=max_context_tokens,
         )
     else:
         query_context = {
@@ -8255,6 +8619,14 @@ def repoground_context_pack(
             "result_count": None,
             "snippets": [],
             "ranges": [],
+            "route": "skipped",
+            "strategy": "none",
+            "intent": None,
+            "budget": {
+                "max_context_tokens": max_context_tokens,
+                "approx_context_chars_used": 0,
+                "truncated": False,
+            },
             "raw_results_included": False,
         }
     snippets = _repoground_list_of_dicts(query_context.get("snippets"))
@@ -8267,6 +8639,11 @@ def repoground_context_pack(
         "query": query,
         "k": k if query else None,
         "max_snippets": max_snippets if query else None,
+        "max_context_tokens": max_context_tokens if query else None,
+        "route": query_context.get("route"),
+        "strategy": query_context.get("strategy"),
+        "intent": query_context.get("intent"),
+        "budget": query_context.get("budget"),
         "normalized_query_shape": query_context.get("normalized_query_shape")
         or query_context.get("query_shape"),
         "resolved_evidence_status": evidence_status,
@@ -8340,6 +8717,10 @@ def repoground_context_pack(
             "status": query_context.get("status"),
             "reason": query_context.get("reason"),
             "query": query,
+            "route": query_context.get("route"),
+            "strategy": query_context.get("strategy"),
+            "intent": query_context.get("intent"),
+            "budget": query_context.get("budget"),
             "query_shape": query_context.get("query_shape"),
             "hit_count": query_context.get("hit_count", 0),
             "result_count": query_context.get("result_count"),
@@ -8351,7 +8732,8 @@ def repoground_context_pack(
         "ranges": ranges,
         "access_wrappers": {
             "preflight": "repoground_preflight",
-            "query": "repoground_query_existing_index",
+            "query": "repoground_query",
+            "query_existing_index": "repoground_query_existing_index",
             "range": "repoground_range_get",
             "context_pack": "repoground_context_pack",
             "raw_canonical_dump_included": False,
@@ -8396,8 +8778,13 @@ def repoground_context_pack(
                 "bounded_evidence.query",
                 "bounded_evidence.k",
                 "bounded_evidence.max_snippets",
+                "bounded_evidence.max_context_tokens",
             ],
             "semantic_fields": [
+                "bounded_evidence.route",
+                "bounded_evidence.strategy",
+                "bounded_evidence.intent",
+                "bounded_evidence.budget",
                 "bounded_evidence.normalized_query_shape",
                 "bounded_evidence.hit_count",
                 "bounded_evidence.result_count",
