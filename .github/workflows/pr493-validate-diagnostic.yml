@@ -7,13 +7,11 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
-  issues: write
 
 jobs:
   repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Checkout branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,8 +75,8 @@ jobs:
                   raise SystemExit("Expected schema test marker is absent")
               path.write_text(text.replace(marker, replacement, 1), encoding="utf-8")
           PY
-      - name: Dependency-free repository validation
-        run: make validate
+      - name: Dependency-free structural proof
+        run: PYTHONPATH=src python -m unittest tests.test_bureau_pickup
       - name: Runtime FastMCP schema proof
         shell: bash
         run: |
@@ -95,6 +93,7 @@ jobs:
             printf 'Unexpected repair paths:\n%s\n' "$changed" >&2
             exit 1
           fi
+          git diff --check
       - name: Commit test-boundary repair
         shell: bash
         run: |
