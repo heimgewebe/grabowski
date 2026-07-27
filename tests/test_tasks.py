@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import asyncio
 from contextlib import closing, contextmanager
 import hashlib
 import io
@@ -7,9 +9,11 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -2138,6 +2142,415 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["released"], [])
         self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:refresh.service"))
+
+    def test_serialized_task_mcp_entrypoints_offload_to_worker_threads(self) -> None:
+        expected = {
+            "grabowski_task_start",
+            "grabowski_task_status",
+            "grabowski_task_routing_shadow_seal",
+            "grabowski_task_logs",
+            "grabowski_task_cancel",
+            "grabowski_task_resume",
+            "grabowski_task_list",
+        }
+        module = ast.parse((SRC / "grabowski_tasks.py").read_text(encoding="utf-8"))
+        observed: set[str] = set()
+        for node in module.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            tool_name = None
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "tool"
+                ):
+                    continue
+                for keyword in decorator.keywords:
+                    if (
+                        keyword.arg == "name"
+                        and isinstance(keyword.value, ast.Constant)
+                        and isinstance(keyword.value.value, str)
+                    ):
+                        tool_name = keyword.value.value
+            if tool_name not in expected:
+                continue
+            observed.add(tool_name)
+            self.assertIsInstance(node, ast.AsyncFunctionDef, tool_name)
+            self.assertTrue(
+                any(
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == "asyncio"
+                    and child.func.attr == "to_thread"
+                    for child in ast.walk(node)
+                ),
+                tool_name,
+            )
+        self.assertEqual(observed, expected)
+
+    def test_mcp_task_status_lock_wait_does_not_block_event_loop(self) -> None:
+        task_id = "a" * 24
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+        worker_threads: list[int] = []
+        caller_thread = threading.get_ident()
+
+        def hold_lock() -> None:
+            with tasks.TASK_RECONCILE_LOCK:
+                lock_held.set()
+                release_lock.wait(timeout=2)
+
+        def status(identifier: str) -> dict[str, object]:
+            with tasks.TASK_RECONCILE_LOCK:
+                worker_threads.append(threading.get_ident())
+                return {"task_id": identifier}
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=2))
+        fallback_release = threading.Timer(0.5, release_lock.set)
+
+        async def exercise() -> dict[str, object]:
+            started = time.monotonic()
+            pending = asyncio.create_task(tasks._grabowski_task_status_tool(task_id))
+            await asyncio.sleep(0.05)
+            self.assertLess(time.monotonic() - started, 0.25)
+            self.assertFalse(pending.done())
+            release_lock.set()
+            return await asyncio.wait_for(pending, timeout=2)
+
+        fallback_release.start()
+        try:
+            with (
+                patch.object(tasks.operator, "_require_operator_capability"),
+                patch.object(tasks, "grabowski_task_status", side_effect=status),
+            ):
+                result = asyncio.run(exercise())
+        finally:
+            release_lock.set()
+            fallback_release.cancel()
+            holder.join(timeout=2)
+
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(result, {"task_id": task_id})
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_task_mutation_waits_for_external_process_lock(self) -> None:
+        task = self._start()["task"]
+        lock_path = self.database.with_suffix(".mutation.lock")
+        child = (
+            "import fcntl, os, sys; "
+            "fd=os.open(sys.argv[1], os.O_RDWR|os.O_CREAT, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); "
+            "print('locked', flush=True); "
+            "sys.stdin.readline(); "
+            "fcntl.flock(fd, fcntl.LOCK_UN); os.close(fd)"
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", child, str(lock_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        completed = threading.Event()
+        errors: list[BaseException] = []
+
+        def read_task() -> None:
+            try:
+                tasks._row(str(task["task_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=read_task)
+        try:
+            assert process.stdout is not None
+            self.assertEqual(process.stdout.readline().strip(), "locked")
+            thread.start()
+            self.assertFalse(completed.wait(timeout=0.15))
+            assert process.stdin is not None
+            process.stdin.write("\n")
+            process.stdin.flush()
+            self.assertEqual(process.wait(timeout=2), 0)
+            self.assertTrue(completed.wait(timeout=2))
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            if process.poll() is None:
+                if process.stdin is not None:
+                    process.stdin.write("\n")
+                    process.stdin.flush()
+                process.kill()
+                process.wait(timeout=2)
+            if thread.is_alive():
+                thread.join(timeout=2)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+
+    def test_task_mutation_creates_private_lock_parent(self) -> None:
+        database = self.root / "fresh-state" / "tasks.sqlite3"
+        with patch.object(tasks, "TASK_DB", database):
+            with tasks._task_mutation_lock():
+                pass
+
+        self.assertEqual(
+            tasks.stat.S_IMODE(database.parent.stat().st_mode),
+            0o700,
+        )
+        self.assertEqual(
+            tasks.stat.S_IMODE(database.with_suffix(".mutation.lock").stat().st_mode),
+            0o600,
+        )
+
+    def test_task_mutation_rejects_public_lock_parent(self) -> None:
+        parent = self.root / "public-state"
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o755)
+        database = parent / "tasks.sqlite3"
+
+        with (
+            patch.object(tasks, "TASK_DB", database),
+            self.assertRaisesRegex(
+                PermissionError,
+                "Task mutation lock parent violates its directory contract",
+            ),
+        ):
+            with tasks._task_mutation_lock():
+                pass
+
+    def test_task_mutation_rejects_symlink_lock_parent(self) -> None:
+        target = self.root / "real-state"
+        target.mkdir(mode=0o700)
+        parent = self.root / "linked-state"
+        parent.symlink_to(target, target_is_directory=True)
+        database = parent / "tasks.sqlite3"
+
+        with (
+            patch.object(tasks, "TASK_DB", database),
+            self.assertRaisesRegex(
+                PermissionError,
+                "Task mutation lock parent may not be a symlink",
+            ),
+        ):
+            with tasks._task_mutation_lock():
+                pass
+
+    def test_task_mutation_rejects_symlink_lock(self) -> None:
+        task = self._start()["task"]
+        lock_path = self.database.with_suffix(".mutation.lock")
+        lock_path.unlink()
+        target = self.root / "foreign.lock"
+        target.write_text("foreign", encoding="utf-8")
+        target.chmod(0o600)
+        lock_path.symlink_to(target)
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "Task mutation lock cannot be opened safely",
+        ):
+            tasks._row(str(task["task_id"]))
+
+    def test_task_mutation_rejects_permissive_lock_mode(self) -> None:
+        task = self._start()["task"]
+        lock_path = self.database.with_suffix(".mutation.lock")
+        lock_path.chmod(0o640)
+
+        with self.assertRaisesRegex(
+            PermissionError,
+            "Task mutation lock violates its file contract",
+        ):
+            tasks._row(str(task["task_id"]))
+
+    def test_mcp_reconcile_refresh_runs_store_work_off_event_loop(self) -> None:
+        caller_thread = threading.get_ident()
+        worker_threads: list[int] = []
+        payload = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+        }
+
+        def refresh(task_id: str) -> dict[str, object]:
+            self.assertEqual(task_id, "")
+            worker_threads.append(threading.get_ident())
+            return payload
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(
+                tasks,
+                "_task_reconcile_refresh_after_guard",
+                side_effect=refresh,
+            ),
+        ):
+            result = asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+
+        self.assertEqual(result, payload)
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_mcp_reconcile_refresh_serializes_store_mutations(self) -> None:
+        active = 0
+        maximum_active = 0
+        counter_lock = threading.Lock()
+
+        def refresh(*, task_id: str = "") -> dict[str, object]:
+            nonlocal active, maximum_active
+            with counter_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                time.sleep(0.03)
+                return {
+                    "mode": "refresh",
+                    "task_id": task_id,
+                    "scanned": 0,
+                    "refreshed": [],
+                    "released": [],
+                    "resumed": [],
+                    "blocked": [],
+                    "checked_at_unix": 123,
+                }
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        async def run_both() -> None:
+            await asyncio.gather(
+                tasks._grabowski_task_reconcile_refresh_tool("a" * 24),
+                tasks._grabowski_task_reconcile_refresh_tool("b" * 24),
+            )
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "reconcile_tasks_refresh", side_effect=refresh),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            asyncio.run(run_both())
+
+        self.assertEqual(maximum_active, 1)
+
+    def test_reconcile_refresh_serializes_with_cancel(self) -> None:
+        resource_key = "service:reconcile-cancel-race.service"
+        task = self._start(resource_keys=[resource_key])["task"]
+        reconcile_entered = threading.Event()
+        allow_reconcile = threading.Event()
+        cancel_started = threading.Event()
+        cancel_dispatched = threading.Event()
+        errors: list[BaseException] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            self.assertEqual(record["task_id"], task["task_id"])
+            reconcile_entered.set()
+            if not allow_reconcile.wait(timeout=2):
+                raise RuntimeError("test did not release reconcile observation")
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        def dispatch(*args, **kwargs) -> dict[str, object]:
+            cancel_dispatched.set()
+            return _launcher()
+
+        def run_refresh() -> None:
+            try:
+                tasks.grabowski_task_reconcile_refresh(str(task["task_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def run_cancel() -> None:
+            cancel_started.set()
+            try:
+                tasks.grabowski_task_cancel(str(task["task_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_observation", side_effect=observe),
+            patch.object(tasks, "_dispatch", side_effect=dispatch),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            refresh_thread = threading.Thread(target=run_refresh)
+            cancel_thread = threading.Thread(target=run_cancel)
+            refresh_thread.start()
+            self.assertTrue(reconcile_entered.wait(timeout=2))
+            cancel_thread.start()
+            self.assertTrue(cancel_started.wait(timeout=2))
+            self.assertFalse(cancel_dispatched.wait(timeout=0.1))
+            allow_reconcile.set()
+            refresh_thread.join(timeout=2)
+            cancel_thread.join(timeout=2)
+
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(cancel_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(cancel_dispatched.is_set())
+        self.assertEqual(tasks._row(str(task["task_id"]))["state"], "cancelled")
+        self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+
+    def test_mcp_reconcile_refresh_rechecks_authority_inside_lock(self) -> None:
+        with (
+            patch.object(tasks.operator, "_require_operator_capability") as capability,
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=PermissionError("blocked after wait"),
+            ) as mutation,
+            patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+        ):
+            with self.assertRaisesRegex(PermissionError, "blocked after wait"):
+                asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+
+        capability.assert_called_once_with("durable_job")
+        mutation.assert_called_once_with("durable_job")
+        refresh.assert_not_called()
+
+    def test_mcp_reconcile_refresh_runs_full_mutation_guard_off_event_loop(self) -> None:
+        caller_thread = threading.get_ident()
+        mutation_threads: list[int] = []
+        payload = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+        }
+
+        def mutation(capability: str) -> None:
+            self.assertEqual(capability, "durable_job")
+            mutation_threads.append(threading.get_ident())
+
+        with (
+            patch.object(tasks.operator, "_require_operator_capability"),
+            patch.object(tasks.operator, "_require_operator_mutation", side_effect=mutation),
+            patch.object(tasks, "reconcile_tasks_refresh", return_value=payload),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            result = asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+
+        self.assertEqual(result, payload)
+        self.assertEqual(len(mutation_threads), 1)
+        self.assertNotEqual(mutation_threads[0], caller_thread)
 
     def test_reconcile_refresh_isolates_retired_host_and_continues(self) -> None:
         retired = self._start()["task"]

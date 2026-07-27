@@ -42,14 +42,43 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("  statuses: write\n", self.text)
         self.assertNotIn("contents: write", self.text)
 
-    def test_every_supported_event_can_create_idempotent_request(self) -> None:
+    def test_supported_events_create_requests_without_bot_recursion(self) -> None:
         request_section = self.text.split(
             "      - name: Request current-head Codex review\n", 1
         )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
-        self.assertNotIn("        if:", request_section)
+        self.assertIn("        if: >-", request_section)
+        self.assertNotIn(
+            "github.event_name != 'workflow_dispatch'",
+            request_section,
+        )
+        self.assertIn(
+            "github.event_name != 'issue_comment'",
+            request_section,
+        )
+        self.assertIn(
+            "github.event.comment.user.login != 'chatgpt-codex-connector[bot]'",
+            request_section,
+        )
         self.assertIn("tools/codex_review_settlement.py", request_section)
         self.assertIn("--require", request_section)
         self.assertIn("request > codex-review-request.json", request_section)
+
+    def test_github_actions_issue_comments_do_not_retrigger_settlement(self) -> None:
+        self.assertIn(
+            "github.event.comment.user.login != 'github-actions[bot]'",
+            self.text,
+        )
+
+    def test_github_actions_issue_comments_do_not_cancel_originating_run(self) -> None:
+        concurrency = self.text.split("concurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
+        self.assertIn("github.event_name == 'issue_comment'", concurrency)
+        self.assertIn(
+            "github.event.comment.user.login == 'github-actions[bot]'",
+            concurrency,
+        )
+        self.assertIn("&& github.run_id", concurrency)
+        self.assertIn("|| github.event.issue.number", concurrency)
+        self.assertIn("cancel-in-progress: true", concurrency)
 
     def test_bootstrap_without_default_branch_evaluator_fails_explicitly(self) -> None:
         request_section = self.text.split(

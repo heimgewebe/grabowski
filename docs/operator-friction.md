@@ -110,6 +110,28 @@ The tool reads recent friction events, `grabowski_status`, fixed user-service st
 | Possible mutation outcome unknown | Target may have changed despite transport failure | Read the exact target state only | Retry blocked until readback |
 | Failure persists | Second failure or insufficient evidence | Keep unresolved and stop | Blocked |
 
+### Local-upstream 502 during an operator restart
+
+When the tunnel journal binds an HTTP 502 to `connection refused` on the exact
+loopback operator endpoint `127.0.0.1:18181`, the tunnel was reachable but its
+local upstream was not listening. Treat this as an operator-unavailable window,
+not as evidence that the tunnel itself is defective.
+
+Required response:
+
+1. Read operator and tunnel service status and the operator listener state.
+2. Read the bounded operator-watchdog journal and the fresh stackdump receipt,
+   when one exists, before triggering another restart.
+3. If the operator becomes healthy again, keep both services running and retry
+   one small typed read-only call once. Do not restart either component merely
+   because the earlier request returned 502.
+4. If a watchdog restart loop is proven while the operator repeatedly recovers,
+   stop only `grabowski-operator-watchdog.timer` as temporary containment. Keep
+   the operator and tunnel running. Re-enable the timer only after the causing
+   runtime fix is deployed and live health has been re-read.
+5. For any request that may have mutated state, read the exact target before any
+   retry.
+
 A successful read-only retry proves restored access only; it does not prove root cause, harmlessness or future transport reliability. The parser is case-insensitive and recognizes explicit syntax such as `HTTP404`, `HTTP/2 404`, `Http status: 502`, `status_code=200`, `statusCode=503` and `httpStatus: 404`. Structured snake_case and common camelCase status keys are accepted. Embedded tokens such as `SOMEHTTP 404`, suffixed values such as `status=404ms`, and bare numbers such as `404 ms`, `error 404 in comment` or `version 4040` are not statuses.
 
 Minimal shape:

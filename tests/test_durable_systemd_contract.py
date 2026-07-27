@@ -93,7 +93,7 @@ class DurableSystemdContractTests(unittest.TestCase):
             ROOT / "systemd" / "grabowski-operator-watchdog.service.example"
         ).read_text(encoding="utf-8")
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", operator)
-        self.assertIn("--failure-threshold 2", operator)
+        self.assertIn("--failure-threshold 5", operator)
         self.assertNotIn("--mcp-url", operator)
         tunnel = (
             ROOT / "systemd" / "grabowski-tunnel-watchdog.service.example"

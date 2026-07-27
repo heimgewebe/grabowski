@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -12,6 +15,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any
@@ -64,6 +68,165 @@ JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 DEFAULT_TASK_LIST_LIMIT = 20
+# One re-entrant in-process lock plus one shared file lock serializes every
+# persistent-task mutation across the MCP runtime and the timer-driven
+# reconciler process. Nested task operations reuse the outer file lock.
+TASK_RECONCILE_LOCK = threading.RLock()
+_TASK_MUTATION_LOCK_STATE = threading.local()
+
+
+def _task_mutation_lock_parent_identity(descriptor: int, parent: Path) -> None:
+    opened = os.fstat(descriptor)
+    linked = os.stat(parent, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_gid != os.getegid()
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        raise PermissionError(
+            "Task mutation lock parent violates its directory contract"
+        )
+
+
+def _task_mutation_lock_identity(
+    descriptor: int,
+    parent_descriptor: int,
+    filename: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    linked = os.stat(
+        filename,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(linked.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_uid != os.geteuid()
+        or opened.st_gid != os.getegid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+    ):
+        raise PermissionError("Task mutation lock violates its file contract")
+
+
+def _open_task_mutation_lock(lock_path: Path) -> tuple[int, int]:
+    parent = lock_path.parent
+    if parent.is_symlink():
+        raise PermissionError("Task mutation lock parent may not be a symlink")
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        parent_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        parent_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        parent_flags |= os.O_NOFOLLOW
+    try:
+        parent_descriptor = os.open(parent, parent_flags)
+    except OSError as exc:
+        raise PermissionError(
+            "Task mutation lock parent cannot be opened safely"
+        ) from exc
+    try:
+        _task_mutation_lock_parent_identity(parent_descriptor, parent)
+        flags = os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            try:
+                descriptor = os.open(
+                    lock_path.name,
+                    flags,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                try:
+                    descriptor = os.open(
+                        lock_path.name,
+                        flags | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileExistsError:
+                    descriptor = os.open(
+                        lock_path.name,
+                        flags,
+                        dir_fd=parent_descriptor,
+                    )
+        except OSError as exc:
+            raise PermissionError(
+                "Task mutation lock cannot be opened safely"
+            ) from exc
+        try:
+            _task_mutation_lock_identity(
+                descriptor,
+                parent_descriptor,
+                lock_path.name,
+            )
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor, parent_descriptor
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+
+
+@contextmanager
+def _task_mutation_lock() -> Iterator[None]:
+    with TASK_RECONCILE_LOCK:
+        depth = int(getattr(_TASK_MUTATION_LOCK_STATE, "depth", 0))
+        if depth:
+            _TASK_MUTATION_LOCK_STATE.depth = depth + 1
+            try:
+                yield
+            finally:
+                _TASK_MUTATION_LOCK_STATE.depth = depth
+            return
+
+        lock_path = TASK_DB.with_suffix(".mutation.lock")
+        descriptor, parent_descriptor = _open_task_mutation_lock(lock_path)
+        locked = False
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            _task_mutation_lock_parent_identity(
+                parent_descriptor,
+                lock_path.parent,
+            )
+            _task_mutation_lock_identity(
+                descriptor,
+                parent_descriptor,
+                lock_path.name,
+            )
+            _TASK_MUTATION_LOCK_STATE.depth = 1
+            try:
+                yield
+            finally:
+                _TASK_MUTATION_LOCK_STATE.depth = 0
+        finally:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            os.close(parent_descriptor)
+
+
+def _serialize_task_mutation(function):
+    @functools.wraps(function)
+    def serialized(*args: Any, **kwargs: Any) -> Any:
+        with _task_mutation_lock():
+            return function(*args, **kwargs)
+
+    return serialized
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -1801,6 +1964,7 @@ def _effective_observed_state(record: dict[str, Any], observed_state: str) -> st
     return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
+@_serialize_task_mutation
 def _maintain_record_resources(
     record: dict[str, Any],
     state: str,
@@ -2166,6 +2330,7 @@ def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
     return _apply_terminalization_projection(transition, recovered=True)
 
 
+@_serialize_task_mutation
 def _recover_pending_task_terminalizations() -> list[str]:
     recovered: list[str] = []
     for terminalization in resources.pending_task_terminalizations():
@@ -2174,6 +2339,7 @@ def _recover_pending_task_terminalizations() -> list[str]:
     return recovered
 
 
+@_serialize_task_mutation
 def _row(task_id: str) -> dict[str, Any]:
     identifier = _validate_task_id(task_id)
     recovered = _recover_task_terminalization(identifier)
@@ -2660,6 +2826,7 @@ def _public_for_view(record: dict[str, Any], view: str) -> dict[str, Any]:
     return minimal
 
 
+@_serialize_task_mutation
 def _set_state(
     task_id: str,
     state: str,
@@ -2878,7 +3045,7 @@ def server_task_lease_delegation_evidence(lease_owner_id: str) -> dict[str, Any]
     }
 
 
-@mcp.tool(name="grabowski_task_start", annotations=MUTATING)
+@_serialize_task_mutation
 def grabowski_task_start(
     host: str,
     argv: list[str],
@@ -3142,7 +3309,7 @@ def grabowski_task_start(
     }
 
 
-@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+@_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
     """Observe one persistent task and refresh its recorded state."""
     operator._require_operator_capability("durable_job")
@@ -3165,7 +3332,6 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
     return result
 
 
-@mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)
 def grabowski_task_routing_shadow_seal(
     task_id: str,
     outcome: dict[str, Any],
@@ -3242,7 +3408,6 @@ def grabowski_task_routing_shadow_seal(
         "audit": audit,
     }
 
-@mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
 def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     """Read redacted journal output for one local or fleet task."""
     operator._require_operator_capability("durable_job")
@@ -3281,7 +3446,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="grabowski_task_cancel", annotations=MUTATING)
+@_serialize_task_mutation
 def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     """Stop one task process group and retain its persistent task record."""
     record = _row(task_id)
@@ -3331,7 +3496,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     return {"task": _public(stored), "result": result, "audit": audit}
 
 
-@mcp.tool(name="grabowski_task_resume", annotations=MUTATING)
+@_serialize_task_mutation
 def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     """Recreate a missing or stopped task unit from its persistent record."""
     record = _row(task_id)
@@ -3712,6 +3877,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     }
 
 
+@_serialize_task_mutation
 def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
@@ -3758,6 +3924,7 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
     }
 
 
+@_serialize_task_mutation
 def reconcile_tasks_resume(
     *,
     task_id: str = "",
@@ -3856,6 +4023,7 @@ def reconcile_tasks_resume(
     }
 
 
+@_serialize_task_mutation
 def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
     if not isinstance(auto_resume, bool):
         raise ValueError("auto_resume must be boolean")
@@ -3890,31 +4058,81 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+def _task_reconcile_check_after_guard(task_id: str) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        operator._require_operator_capability("durable_job")
+        return reconcile_tasks_check(task_id=task_id)
+
+
 def grabowski_task_reconcile_check(task_id: str = "") -> dict[str, Any]:
     """Read-only reconcile preview for persistent tasks."""
     operator._require_operator_capability("durable_job")
-    return reconcile_tasks_check(task_id=task_id)
+    return _task_reconcile_check_after_guard(task_id)
 
 
-@mcp.tool(name="grabowski_task_reconcile_refresh", annotations=MUTATING)
+@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+async def _grabowski_task_reconcile_check_tool(task_id: str = "") -> dict[str, Any]:
+    """Read-only reconcile preview for persistent tasks."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(_task_reconcile_check_after_guard, task_id)
+
+
+def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        operator._require_operator_mutation("durable_job")
+        result = reconcile_tasks_refresh(task_id=task_id)
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-reconcile-refresh",
+                "task_id": task_id,
+                "scanned": result["scanned"],
+                "released_count": len(result["released"]),
+            }
+        )
+        return result
+
+
 def grabowski_task_reconcile_refresh(task_id: str = "") -> dict[str, Any]:
     """Refresh persistent task states without resuming processes."""
     operator._require_operator_mutation("durable_job")
-    result = reconcile_tasks_refresh(task_id=task_id)
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "task-reconcile-refresh",
-            "task_id": task_id,
-            "scanned": result["scanned"],
-            "released_count": len(result["released"]),
-        }
-    )
-    return result
+    return _task_reconcile_refresh_after_guard(task_id)
 
 
-@mcp.tool(name="grabowski_task_reconcile_resume", annotations=MUTATING)
+@mcp.tool(name="grabowski_task_reconcile_refresh", annotations=MUTATING)
+async def _grabowski_task_reconcile_refresh_tool(task_id: str = "") -> dict[str, Any]:
+    """Refresh persistent task states without resuming processes."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(_task_reconcile_refresh_after_guard, task_id)
+
+
+def _task_reconcile_resume_after_guard(
+    task_id: str,
+    max_resumes: int,
+    reason: str,
+) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        operator._require_operator_mutation("durable_job")
+        result = reconcile_tasks_resume(
+            task_id=task_id,
+            max_resumes=max_resumes,
+            reason=reason,
+        )
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-reconcile-resume",
+                "task_id": task_id,
+                "max_resumes": max_resumes,
+                "reason": result["reason"],
+                "scanned": result["scanned"],
+                "resumed_count": len(result["resumed"]),
+                "blocked_count": len(result["blocked"]),
+            }
+        )
+        return result
+
+
 def grabowski_task_reconcile_resume(
     task_id: str = "",
     max_resumes: int = 1,
@@ -3922,45 +4140,57 @@ def grabowski_task_reconcile_resume(
 ) -> dict[str, Any]:
     """Resume retry-safe tasks after reconcile verification."""
     operator._require_operator_mutation("durable_job")
-    result = reconcile_tasks_resume(
-        task_id=task_id,
-        max_resumes=max_resumes,
-        reason=reason,
-    )
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "task-reconcile-resume",
-            "task_id": task_id,
-            "max_resumes": max_resumes,
-            "reason": result["reason"],
-            "scanned": result["scanned"],
-            "resumed_count": len(result["resumed"]),
-            "blocked_count": len(result["blocked"]),
-        }
-    )
-    return result
+    return _task_reconcile_resume_after_guard(task_id, max_resumes, reason)
 
 
-@mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
+@mcp.tool(name="grabowski_task_reconcile_resume", annotations=MUTATING)
+async def _grabowski_task_reconcile_resume_tool(
+    task_id: str = "",
+    max_resumes: int = 1,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Resume retry-safe tasks after reconcile verification."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        _task_reconcile_resume_after_guard,
+        task_id,
+        max_resumes,
+        reason,
+    )
+
+
+def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        operator._require_operator_mutation("durable_job")
+        result = reconcile_tasks(auto_resume=auto_resume)
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-reconcile",
+                "auto_resume": auto_resume,
+                "scanned": result["scanned"],
+                "resumed_count": len(result["resumed"]),
+                "blocked_count": len(result["blocked"]),
+            }
+        )
+        return result
+
+
 def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
     """Reconcile persistent tasks after process loss or host restart."""
     operator._require_operator_mutation("durable_job")
-    result = reconcile_tasks(auto_resume=auto_resume)
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "task-reconcile",
-            "auto_resume": auto_resume,
-            "scanned": result["scanned"],
-            "resumed_count": len(result["resumed"]),
-            "blocked_count": len(result["blocked"]),
-        }
-    )
-    return result
+    return _task_reconcile_after_guard(auto_resume)
 
 
-@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+@mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
+async def _grabowski_task_reconcile_tool(
+    auto_resume: bool = False,
+) -> dict[str, Any]:
+    """Reconcile persistent tasks after process loss or host restart."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(_task_reconcile_after_guard, auto_resume)
+
+
 def grabowski_task_list(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,
@@ -4226,6 +4456,128 @@ def grabowski_task_list(
             "recommended_next_action",
             "does_not_establish",
         ),
+    )
+
+
+@mcp.tool(name="grabowski_task_start", annotations=MUTATING)
+async def _grabowski_task_start_tool(
+    host: str,
+    argv: list[str],
+    cwd: str | None = None,
+    runtime_seconds: int = operator.DEFAULT_JOB_RUNTIME,
+    resume_policy: str = "verify-then-retry",
+    cpu_weight: int = 100,
+    io_weight: int = 100,
+    memory_max_bytes: int | None = None,
+    resource_keys: list[str] | None = None,
+    chronik_outbox: bool = False,
+    chronik_outbox_state_root: str | None = None,
+    chronik_operation: str = "other",
+    chronik_component: str = "",
+    chronik_bureau_task_id: str = "",
+    chronik_pr_number: int | None = None,
+    runtime_python: bool = False,
+    route_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start one persistent local or fleet task in its own systemd unit.
+
+    Direct local write-capable agent CLIs receive an implicit repository lease
+    unless the caller supplies an explicit path or repository scope. Every
+    task-owned broad repository lease carries a complete whole-repository scope manifest.
+    """
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        grabowski_task_start,
+        host,
+        argv,
+        cwd,
+        runtime_seconds,
+        resume_policy,
+        cpu_weight,
+        io_weight,
+        memory_max_bytes,
+        resource_keys,
+        chronik_outbox,
+        chronik_outbox_state_root,
+        chronik_operation,
+        chronik_component,
+        chronik_bureau_task_id,
+        chronik_pr_number,
+        runtime_python,
+        route_evidence,
+    )
+
+
+@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
+    """Observe one persistent task and refresh its recorded state."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_status, task_id)
+
+
+@mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)
+async def _grabowski_task_routing_shadow_seal_tool(
+    task_id: str,
+    outcome: dict[str, Any],
+    primary_evidence_refs: list[str],
+    execution_provenance: dict[str, Any],
+    semantic_assessments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Seal one independently reviewed direct-task shadow outcome without routing effect."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        grabowski_task_routing_shadow_seal,
+        task_id,
+        outcome,
+        primary_evidence_refs,
+        execution_provenance,
+        semantic_assessments,
+    )
+
+
+@mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
+async def _grabowski_task_logs_tool(
+    task_id: str,
+    max_lines: int = 200,
+) -> dict[str, Any]:
+    """Read redacted journal output for one local or fleet task."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_logs, task_id, max_lines)
+
+
+@mcp.tool(name="grabowski_task_cancel", annotations=MUTATING)
+async def _grabowski_task_cancel_tool(task_id: str) -> dict[str, Any]:
+    """Stop one task process group and retain its persistent task record."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_cancel, task_id)
+
+
+@mcp.tool(name="grabowski_task_resume", annotations=MUTATING)
+async def _grabowski_task_resume_tool(task_id: str) -> dict[str, Any]:
+    """Recreate a missing or stopped task unit from its persistent record."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_resume, task_id)
+
+
+@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+async def _grabowski_task_list_tool(
+    limit: int = DEFAULT_TASK_LIST_LIMIT,
+    state: str | None = None,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+    schema_only: bool = False,
+) -> dict[str, Any]:
+    """List persistent tasks or inspect store-schema compatibility read-only."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        grabowski_task_list,
+        limit,
+        state,
+        view,
+        cursor,
+        fields,
+        schema_only,
     )
 
 
