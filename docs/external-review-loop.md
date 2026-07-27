@@ -147,8 +147,13 @@ External providers default to a `0 USD` request and a `0 USD` runtime policy cap
 
 Eine vertrauenswürdige Codex-Antwort auf die exakt an Head und Diff gebundene
 Review-Anfrage darf den Wartezustand terminal beenden, wenn sie eindeutig
-meldet, dass das Code-Review-Kontingent ausgeschöpft ist. Dieser Zustand ist
-`unavailable_comment` mit `reason=usage_limit` und
+meldet, dass das Code-Review-Kontingent ausgeschöpft ist. Da diese Antwort
+selbst keinen Head, Diff oder Request-Identifier trägt, gilt sie nur dann als
+kausal gebunden, wenn sämtliche gültigen vertrauenswürdigen Request-Marker im
+PR dieselbe aktuelle Request-Identität besitzen. Ein Marker eines älteren Heads
+hält die Antwort fail-closed auf `pending`; zeitliche Reihenfolge allein genügt
+nicht. Der gebundene Zustand ist `unavailable_comment` mit
+`reason=usage_limit`, `request_binding=sole_canonical_request_identity` und
 `review_performed=false`.
 
 Diese Terminalisierung ist keine Code-Review-Evidenz. Sie darf weder einen

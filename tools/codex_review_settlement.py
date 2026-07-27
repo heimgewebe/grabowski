@@ -346,18 +346,86 @@ def _request_actor_allowed(comment: dict[str, Any]) -> bool:
     return association in TRUSTED_REQUEST_ASSOCIATIONS or actor in TRUSTED_REQUEST_ACTORS
 
 
-def _matching_requests(pr: dict[str, Any], expected: dict[str, Any]) -> list[dict[str, Any]]:
+def _canonical_request_payload(
+    value: Any,
+    *,
+    repository: str,
+    pr_number: int,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "repo",
+        "pr",
+        "head_sha",
+        "diff_sha256",
+        "request_id",
+    }:
+        return None
+    head_sha = value.get("head_sha")
+    diff_sha256 = value.get("diff_sha256")
+    if (
+        value.get("schema_version") != SCHEMA_VERSION
+        or value.get("kind") != REQUEST_KIND
+        or value.get("repo") != repository
+        or value.get("pr") != pr_number
+        or not isinstance(head_sha, str)
+        or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None
+        or not isinstance(diff_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", diff_sha256) is None
+    ):
+        return None
+    core = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": REQUEST_KIND,
+        "repo": repository,
+        "pr": pr_number,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
+    }
+    if value.get("request_id") != _sha256_json(core)[:32]:
+        return None
+    return dict(value)
+
+
+def _canonical_requests(
+    pr: dict[str, Any],
+    *,
+    repository: str,
+    pr_number: int,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for comment in _list_nodes(pr.get("comments"), label="comments"):
-        parsed = _parse_request(comment)
-        if parsed != expected or not _request_actor_allowed(comment):
+        if not _request_actor_allowed(comment):
             continue
+        parsed = _canonical_request_payload(
+            _parse_request(comment),
+            repository=repository,
+            pr_number=pr_number,
+        )
         created = _parse_time(comment.get("createdAt"))
         comment_id = comment.get("databaseId")
-        if created is None or isinstance(comment_id, bool) or not isinstance(comment_id, int):
+        if (
+            parsed is None
+            or created is None
+            or isinstance(comment_id, bool)
+            or not isinstance(comment_id, int)
+        ):
             continue
         result.append({**comment, "_created": created, "_request": parsed})
     return sorted(result, key=lambda item: (item["_created"], item["databaseId"]))
+
+
+def _matching_requests(pr: dict[str, Any], expected: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _canonical_requests(
+            pr,
+            repository=expected["repo"],
+            pr_number=expected["pr"],
+        )
+        if item["_request"] == expected
+    ]
 
 
 def _current_head(pr: dict[str, Any]) -> str:
@@ -462,6 +530,7 @@ def _unavailable_comment_completion(
     pr: dict[str, Any],
     *,
     request_time: datetime,
+    request_id: str,
 ) -> dict[str, Any] | None:
     candidates: list[dict[str, Any]] = []
     for comment in _list_nodes(pr.get("comments"), label="comments"):
@@ -506,6 +575,8 @@ def _unavailable_comment_completion(
         "accepted_state": True,
         "blocking_state": False,
         "review_performed": False,
+        "request_id": request_id,
+        "request_binding": "sole_canonical_request_identity",
     }
 
 
@@ -513,6 +584,7 @@ def _review_completion(
     pr: dict[str, Any],
     *,
     requests: list[dict[str, Any]],
+    canonical_requests: list[dict[str, Any]],
     head_sha: str,
 ) -> dict[str, Any] | None:
     request = requests[0]
@@ -651,9 +723,16 @@ def _review_completion(
             "accepted_state": True,
             "blocking_state": False,
         }
+    current_request_id = request["_request"]["request_id"]
+    canonical_request_ids = {
+        item["_request"]["request_id"] for item in canonical_requests
+    }
+    if canonical_request_ids != {current_request_id}:
+        return None
     unavailable = _unavailable_comment_completion(
         pr,
         request_time=request_time,
+        request_id=current_request_id,
     )
     if unavailable is not None:
         return unavailable
@@ -712,10 +791,20 @@ def evaluate(
     diff_sha256 = _current_diff(pr)
     policy = _policy(pr, repository, explicitly_required=explicitly_required)
     expected_request = _request_payload(repository, pr_number, head_sha, diff_sha256)
-    requests = _matching_requests(pr, expected_request)
+    canonical_requests = _canonical_requests(
+        pr, repository=repository, pr_number=pr_number
+    )
+    requests = [
+        item for item in canonical_requests if item["_request"] == expected_request
+    ]
     request = requests[0] if requests else None
     completion = (
-        _review_completion(pr, requests=requests, head_sha=head_sha)
+        _review_completion(
+            pr,
+            requests=requests,
+            canonical_requests=canonical_requests,
+            head_sha=head_sha,
+        )
         if request is not None
         else None
     )

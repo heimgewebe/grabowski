@@ -1439,6 +1439,17 @@ def _codex_review_evidence_errors(
                 errors.append(
                     "unavailable settlement evidence must state review_performed=false"
                 )
+            if completion.get("request_id") != request_id:
+                errors.append(
+                    "completion unavailable-comment request_id must bind the current request"
+                )
+            if (
+                completion.get("request_binding")
+                != "sole_canonical_request_identity"
+            ):
+                errors.append(
+                    "completion unavailable-comment must state sole canonical request identity"
+                )
         else:
             if completion.get("review_performed") is False:
                 errors.append(

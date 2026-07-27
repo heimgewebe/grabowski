@@ -59,8 +59,12 @@ def request_comment(
     association: str = "OWNER",
     comment_id: int = 1001,
     created_at: str = REQUEST_TIME,
+    head: str = HEAD,
+    diff_sha256: str = DIFF,
 ) -> dict:
-    payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
+    payload = settlement._request_payload(
+        REPOSITORY, PR, head, diff_sha256
+    )
     return {
         "databaseId": comment_id,
         "body": settlement._request_body(payload),
@@ -336,9 +340,58 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("unavailable_comment", completion["mode"])
         self.assertEqual("usage_limit", completion["reason"])
         self.assertFalse(completion["review_performed"])
+        self.assertEqual(
+            settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)["request_id"],
+            completion["request_id"],
+        )
+        self.assertEqual(
+            "sole_canonical_request_identity", completion["request_binding"]
+        )
         self.assertIn(
             "codex_review_performed",
             result["evidence"]["does_not_establish"],
+        )
+
+    def test_usage_limit_comment_after_older_head_request_remains_pending(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(
+                    comment_id=901,
+                    created_at="2026-07-26T07:55:00Z",
+                    head="d" * 40,
+                    diff_sha256="e" * 64,
+                ),
+                request_comment(),
+                codex_unavailable_comment(),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
+
+    def test_duplicate_current_request_identity_allows_usage_limit_terminalization(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(comment_id=1001),
+                request_comment(comment_id=1002, created_at="2026-07-26T08:00:30Z"),
+                codex_unavailable_comment(),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pass", result["status"])
+        self.assertTrue(result["settled"])
+        self.assertEqual(
+            "sole_canonical_request_identity",
+            result["evidence"]["completion"]["request_binding"],
         )
 
     def test_usage_limit_comment_with_appended_text_is_rejected(self) -> None:

@@ -191,6 +191,48 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _canonical_codex_request_payload(
+    value: Any,
+    *,
+    repository: str,
+    pr_number: int,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "kind",
+        "repo",
+        "pr",
+        "head_sha",
+        "diff_sha256",
+        "request_id",
+    }:
+        return None
+    head_sha = value.get("head_sha")
+    diff_sha256 = value.get("diff_sha256")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "grabowski_codex_review_request"
+        or value.get("repo") != repository
+        or value.get("pr") != pr_number
+        or not isinstance(head_sha, str)
+        or _SHA40_RE.fullmatch(head_sha) is None
+        or not isinstance(diff_sha256, str)
+        or _SHA256_RE.fullmatch(diff_sha256) is None
+    ):
+        return None
+    core = {
+        "schema_version": 1,
+        "kind": "grabowski_codex_review_request",
+        "repo": repository,
+        "pr": pr_number,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
+    }
+    if value.get("request_id") != _sha256_json(core)[:32]:
+        return None
+    return dict(value)
+
+
 def issue_server_runtime_actor_identity(
     session: Any,
     *,
@@ -1282,6 +1324,7 @@ class CaptainMergeGuardRunner:
             errors=errors,
         )
         canonical_requests: list[dict[str, Any]] = []
+        canonical_request_identity_ids: set[str] = set()
         if request_comments is not None:
             for item in request_comments:
                 body = item.get("body")
@@ -1307,7 +1350,16 @@ class CaptainMergeGuardRunner:
                         marker_payload = json.loads(marker.group(1))
                     except json.JSONDecodeError:
                         marker_payload = None
-                if marker_payload == expected_marker:
+                canonical_marker = _canonical_codex_request_payload(
+                    marker_payload,
+                    repository=repository,
+                    pr_number=pr_number,
+                )
+                if canonical_marker is not None:
+                    canonical_request_identity_ids.add(
+                        canonical_marker["request_id"]
+                    )
+                if canonical_marker == expected_marker:
                     canonical_requests.append(
                         {
                             "id": comment_id,
@@ -1327,6 +1379,12 @@ class CaptainMergeGuardRunner:
         receipt["canonical_request_count"] = len(canonical_requests)
         receipt["canonical_request_ids_sha256"] = _sha256_json(
             [item["id"] for item in canonical_requests]
+        )
+        receipt["canonical_request_identity_count"] = len(
+            canonical_request_identity_ids
+        )
+        receipt["canonical_request_identity_ids_sha256"] = _sha256_json(
+            sorted(canonical_request_identity_ids)
         )
 
         review_items = self._codex_single_page(
@@ -1583,6 +1641,23 @@ class CaptainMergeGuardRunner:
                     if completion.get("reason") != "usage_limit":
                         errors.append(
                             "merge_guard_codex_unavailable_comment_reason_drift"
+                        )
+                    if completion.get("request_id") != expected_marker["request_id"]:
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_request_id_drift"
+                        )
+                    if (
+                        completion.get("request_binding")
+                        != "sole_canonical_request_identity"
+                    ):
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_request_binding_drift"
+                        )
+                    if canonical_request_identity_ids != {
+                        expected_marker["request_id"]
+                    }:
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_request_identity_ambiguous"
                         )
                     if completion.get("review_performed") is not False:
                         errors.append(
