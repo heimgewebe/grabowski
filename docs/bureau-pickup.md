@@ -10,6 +10,10 @@ Every request is bound to one existing absolute Bureau registry root. The defaul
 
 The module declares three canonical MCP tools: `grabowski_bureau_pickup_execute`, `grabowski_bureau_pickup_status` and `grabowski_bureau_pickup_release`. The production runtime imports the module for registration, the deployment manifest includes the module and tools, and the capability catalogue classifies execute and release as operator-gated effects while status remains read-only. These source declarations do not establish that a particular runtime release has already been deployed; deployment identity and live tool readback remain separate evidence.
 
+## Machine-readable execute request
+
+The MCP input remains one top-level `request` object, preserving existing Python and Grip callers. Its generated schema requires `worker_id`, `task_id` and the non-empty `capabilities` list enforced by runtime normalization. It exposes `resource`, `kind`, `base_dir`, `approval_source`, `lease_ttl_seconds`, `create_workspace`, `repository_scope_manifests`, `nonconflict_proofs` and `registry_root` as optional properties. Unknown request properties are forbidden by the MCP schema and remain rejected by the authoritative `_normalize_request` path for direct callers. Value bounds, path checks, defaults and normalization remain runtime checks and are not weakened by the published structural schema.
+
 ## Execute path
 
 `grabowski_bureau_pickup_execute`:

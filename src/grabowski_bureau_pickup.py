@@ -9,6 +9,11 @@ import stat
 import time
 from typing import Any
 
+try:
+    from typing_extensions import TypedDict
+except ModuleNotFoundError:
+    from typing import TypedDict
+
 import grabowski_bureau_intake as bureau
 import grabowski_bureau_leases as bureau_leases
 import grabowski_resources as resources
@@ -34,6 +39,26 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_REQUEST_BYTES = 1024 * 1024
 MIN_LEASE_TTL_SECONDS = 120
 MAX_LEASE_TTL_SECONDS = 3600
+
+
+class _RequiredBureauPickupRequest(TypedDict):
+    worker_id: str
+    capabilities: list[str]
+    task_id: str
+
+
+class BureauPickupRequest(_RequiredBureauPickupRequest, total=False):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    resource: str | None
+    kind: str
+    base_dir: str | None
+    approval_source: str
+    lease_ttl_seconds: int
+    create_workspace: bool
+    repository_scope_manifests: dict[str, dict[str, Any]] | None
+    nonconflict_proofs: dict[str, dict[str, Any]] | None
+    registry_root: str
 
 
 class BureauPickupError(RuntimeError):
@@ -969,7 +994,9 @@ def _recover_after_commit(
 
 
 @mcp.tool(name="grabowski_bureau_pickup_execute", annotations=MUTATING)
-def grabowski_bureau_pickup_execute(request: dict[str, Any]) -> dict[str, Any]:
+def grabowski_bureau_pickup_execute(
+    request: BureauPickupRequest,
+) -> dict[str, Any]:
     """Coordinate one Bureau claim with owner-bound Grabowski leases and recovery."""
     normalized = _normalize_request(request)
     operator._require_operator_mutation(

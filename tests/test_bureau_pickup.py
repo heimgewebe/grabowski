@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -62,6 +63,90 @@ class BureauPickupTests(unittest.TestCase):
                 ):
                     observed[name.value] = annotations.id
         self.assertEqual(expected, observed)
+
+    def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
+        required = {"worker_id", "capabilities", "task_id"}
+        optional = {
+            "resource",
+            "kind",
+            "base_dir",
+            "approval_source",
+            "lease_ttl_seconds",
+            "create_workspace",
+            "repository_scope_manifests",
+            "nonconflict_proofs",
+            "registry_root",
+        }
+        self.assertEqual(required, set(pickup.BureauPickupRequest.__required_keys__))
+        self.assertEqual(optional, set(pickup.BureauPickupRequest.__optional_keys__))
+        self.assertEqual(
+            {"extra": "forbid", "strict": True},
+            pickup.BureauPickupRequest.__pydantic_config__,
+        )
+
+    def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
+        if not hasattr(pickup.mcp, "list_tools"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(pickup.mcp.list_tools())
+            if item.name == "grabowski_bureau_pickup_execute"
+        )
+        schema = tool.inputSchema
+        self.assertEqual({"request"}, set(schema["properties"]))
+        self.assertEqual(["request"], schema["required"])
+
+        request_schema = schema
+        for component in (
+            schema["properties"]["request"]["$ref"].removeprefix("#/").split("/")
+        ):
+            request_schema = request_schema[component]
+
+        required = {"worker_id", "capabilities", "task_id"}
+        optional = {
+            "resource",
+            "kind",
+            "base_dir",
+            "approval_source",
+            "lease_ttl_seconds",
+            "create_workspace",
+            "repository_scope_manifests",
+            "nonconflict_proofs",
+            "registry_root",
+        }
+        self.assertEqual("object", request_schema["type"])
+        self.assertEqual(required | optional, set(request_schema["properties"]))
+        self.assertEqual(required, set(request_schema["required"]))
+        self.assertTrue(optional.isdisjoint(request_schema["required"]))
+        self.assertFalse(request_schema["additionalProperties"])
+
+    def test_minimal_valid_request_normalizes_without_changing_runtime_defaults(
+        self,
+    ) -> None:
+        normalized = pickup._normalize_request(
+            {
+                "worker_id": "operator-test",
+                "capabilities": ["shell", "repository"],
+                "task_id": "TEST-T001",
+            }
+        )
+        self.assertEqual("operator-test", normalized["worker_id"])
+        self.assertEqual(["repository", "shell"], normalized["capabilities"])
+        self.assertEqual("TEST-T001", normalized["task_id"])
+        self.assertEqual("interactive-agent", normalized["kind"])
+        self.assertEqual(900, normalized["lease_ttl_seconds"])
+        self.assertTrue(normalized["create_workspace"])
+
+    def test_normalizer_still_rejects_unknown_request_fields(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported request fields"):
+            pickup._normalize_request(
+                {
+                    "worker_id": "operator-test",
+                    "capabilities": ["repository"],
+                    "task_id": "TEST-T001",
+                    "goal": "guessing must fail closed",
+                }
+            )
 
     def test_private_root_rejects_symlink(self) -> None:
         target = self.root / "redirected-root"
