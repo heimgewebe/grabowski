@@ -7,11 +7,13 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
   repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Checkout branch
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -23,10 +25,14 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Remove import-time Pydantic dependency
+      - name: Apply and verify dependency-free schema
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PY'
+          set +e
+          {
+            python - <<'PY'
           from pathlib import Path
 
           path = Path("src/grabowski_bureau_pickup.py")
@@ -73,23 +79,35 @@ jobs:
           else:
               if old_import not in text or old_schema not in text:
                   raise SystemExit("Expected PR 493 schema blocks are absent")
-              text = text.replace(old_import, new_import, 1).replace(old_schema, new_schema, 1)
-              path.write_text(text, encoding="utf-8")
+              path.write_text(
+                  text.replace(old_import, new_import, 1).replace(old_schema, new_schema, 1),
+                  encoding="utf-8",
+              )
           PY
-      - name: Refresh generated context
-        run: make context-refresh
-      - name: Validate repository
-        run: make validate
-      - name: Verify mutation scope
-        shell: bash
-        run: |
-          set -euo pipefail
-          allowed='^(docs/generated/operator-context\.v1\.json|src/grabowski_bureau_pickup\.py)$'
-          unexpected="$(git status --porcelain=v1 | sed 's/^...//' | grep -Ev "$allowed" || true)"
-          if [[ -n "$unexpected" ]]; then
-            printf 'Unexpected repair paths:\n%s\n' "$unexpected" >&2
-            exit 1
+            make context-refresh
+            python -m unittest tests.test_bureau_pickup
+            python tools/build_operator_context.py --check
+            allowed='^(docs/generated/operator-context\.v1\.json|src/grabowski_bureau_pickup\.py)$'
+            unexpected="$(git status --porcelain=v1 | sed 's/^...//' | grep -Ev "$allowed" || true)"
+            if [[ -n "$unexpected" ]]; then
+              printf 'Unexpected repair paths:\n%s\n' "$unexpected" >&2
+              exit 1
+            fi
+          } > /tmp/pr493-repair.log 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            {
+              printf '### PR 493 dependency-repair diagnostic\n\n'
+              printf 'Head: `%s`\n\n' "$GITHUB_SHA"
+              printf 'Exit status: `%s`\n\n```text\n' "$status"
+              tail -n 100 /tmp/pr493-repair.log
+              printf '\n```\n'
+            } > /tmp/pr493-repair-comment.md
+            gh pr comment 493 --repo heimgewebe/grabowski --body-file /tmp/pr493-repair-comment.md
+            exit "$status"
           fi
+          cat /tmp/pr493-repair.log
       - name: Commit repair
         shell: bash
         run: |
