@@ -324,7 +324,7 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("pending", result["status"])
         self.assertFalse(result["settled"])
 
-    def test_usage_limit_comment_terminalizes_without_claiming_review(self) -> None:
+    def test_usage_limit_comment_remains_pending_without_immutable_binding(self) -> None:
         state = base_state()
         state["comments"] = connection(
             [request_comment(), codex_unavailable_comment()],
@@ -333,24 +333,10 @@ class CodexReviewSettlementTests(unittest.TestCase):
 
         result = self.evaluate(state)
 
-        self.assertEqual("pass", result["status"])
-        self.assertTrue(result["settled"])
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
         self.assertFalse(result["review_performed"])
-        completion = result["evidence"]["completion"]
-        self.assertEqual("unavailable_comment", completion["mode"])
-        self.assertEqual("usage_limit", completion["reason"])
-        self.assertFalse(completion["review_performed"])
-        self.assertEqual(
-            settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)["request_id"],
-            completion["request_id"],
-        )
-        self.assertEqual(
-            "sole_canonical_request_identity", completion["request_binding"]
-        )
-        self.assertIn(
-            "codex_review_performed",
-            result["evidence"]["does_not_establish"],
-        )
 
     def test_usage_limit_comment_after_older_head_request_remains_pending(self) -> None:
         state = base_state()
@@ -374,7 +360,7 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertFalse(result["settled"])
         self.assertFalse(result["completion_present"])
 
-    def test_duplicate_current_request_identity_allows_usage_limit_terminalization(self) -> None:
+    def test_duplicate_current_request_identity_does_not_bind_usage_limit(self) -> None:
         state = base_state()
         state["comments"] = connection(
             [
@@ -387,12 +373,9 @@ class CodexReviewSettlementTests(unittest.TestCase):
 
         result = self.evaluate(state)
 
-        self.assertEqual("pass", result["status"])
-        self.assertTrue(result["settled"])
-        self.assertEqual(
-            "sole_canonical_request_identity",
-            result["evidence"]["completion"]["request_binding"],
-        )
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
 
     def test_usage_limit_comment_with_appended_text_is_rejected(self) -> None:
         state = base_state()

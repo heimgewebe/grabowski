@@ -143,22 +143,18 @@ External review tools other than the conditional GitHub Codex settlement remain 
 
 External providers default to a `0 USD` request and a `0 USD` runtime policy cap, so they are blocked before process launch. A positive request remains blocked unless an administrator explicitly raises `GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD`; the requested amount must not exceed that cap. Agent competition additionally requires a provider-enforced hard USD limit by default. Providers without a hard limit remain blocked unless the caller explicitly weakens that gate. Prior budget authorizations do not carry forward.
 
-## Terminale Codex-Nichtverfügbarkeit
+## Codex-Nichtverfügbarkeit
 
-Eine vertrauenswürdige Codex-Antwort auf die exakt an Head und Diff gebundene
-Review-Anfrage darf den Wartezustand terminal beenden, wenn sie eindeutig
-meldet, dass das Code-Review-Kontingent ausgeschöpft ist. Da diese Antwort
-selbst keinen Head, Diff oder Request-Identifier trägt, gilt sie nur dann als
-kausal gebunden, wenn sämtliche gültigen vertrauenswürdigen Request-Marker im
-PR dieselbe aktuelle Request-Identität besitzen. Ein Marker eines älteren Heads
-hält die Antwort fail-closed auf `pending`; zeitliche Reihenfolge allein genügt
-nicht. Der gebundene Zustand ist `unavailable_comment` mit
-`reason=usage_limit`, `request_binding=sole_canonical_request_identity` und
-`review_performed=false`.
+Eine vertrauenswürdige Codex-Meldung über ausgeschöpftes Code-Review-Kontingent
+ist diagnostisch, aber keine terminale Review-Evidenz. GitHub liefert für einen
+freien Issue-Kommentar keine unveränderliche Beziehung zum auslösenden
+Head-/Diff-Request. Weder Zeitnähe noch die aktuell sichtbare Marker-Menge
+belegen diese Kausalität, weil ältere Requests noch laufen und Marker später
+gelöscht werden können.
 
-Diese Terminalisierung ist keine Code-Review-Evidenz. Sie darf weder einen
-vorhandenen blockierenden Codex-Reviewzustand noch offene Codex-Threads
-überstimmen. Self-Review, allgemeine Review-Evidenz, CI, Diff-Auslieferung und
-sämtliche übrigen Captain-Gates bleiben unabhängig erforderlich. Unbekannte,
-veränderte, angehängte oder nicht vertrauenswürdig erzeugte Fehlermeldungen
-bleiben `pending` beziehungsweise blockieren fail-closed.
+Daher bleibt ein ungebundener Quota-Kommentar stets `pending`. Er darf weder
+einen aktuellen Review ersetzen noch einen blockierenden Reviewzustand oder
+offene Threads überstimmen. Erst eine künftige Antwortoberfläche mit einer
+unveränderlichen, live revalidierbaren Bindung an Repository, PR, Head, Diff und
+Request-ID dürfte einen separaten Terminalvertrag begründen. Self-Review, CI,
+Diff-Auslieferung und sämtliche Captain-Gates bleiben unabhängig erforderlich.

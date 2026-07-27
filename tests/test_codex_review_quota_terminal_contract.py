@@ -48,19 +48,31 @@ def connection(nodes: list[dict], **page: bool) -> dict:
     return {"nodes": nodes, "pageInfo": page}
 
 
-def evidence_and_live_state() -> tuple[dict, dict]:
-    request_payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
-    request_body = settlement._request_body(request_payload)
-    graph_request = {
+def request_payloads() -> tuple[dict, dict, dict]:
+    payload = settlement._request_payload(REPOSITORY, PR, HEAD, DIFF)
+    body = settlement._request_body(payload)
+    graph = {
         "databaseId": 101,
-        "body": request_body,
+        "body": body,
         "createdAt": REQUEST_TIME,
         "url": "https://github.com/example/request/101",
         "authorAssociation": "NONE",
         "author": {"login": "github-actions[bot]"},
         "reactions": connection([], hasNextPage=False),
     }
-    graph_quota = {
+    rest = {
+        "id": 101,
+        "body": body,
+        "created_at": REQUEST_TIME,
+        "html_url": graph["url"],
+        "author_association": "NONE",
+        "user": {"login": "github-actions[bot]"},
+    }
+    return payload, graph, rest
+
+
+def quota_payloads() -> tuple[dict, dict]:
+    graph = {
         "databaseId": 205,
         "body": QUOTA_BODY,
         "createdAt": COMPLETION_TIME,
@@ -69,7 +81,21 @@ def evidence_and_live_state() -> tuple[dict, dict]:
         "author": {"login": "chatgpt-codex-connector[bot]"},
         "reactions": connection([], hasNextPage=False),
     }
-    state = {
+    rest = {
+        "id": 205,
+        "body": QUOTA_BODY,
+        "created_at": COMPLETION_TIME,
+        "html_url": graph["url"],
+        "author_association": "NONE",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+    }
+    return graph, rest
+
+
+def state(*, reviews: list[dict] | None = None) -> dict:
+    _, graph_request, _ = request_payloads()
+    graph_quota, _ = quota_payloads()
+    return {
         "number": PR,
         "state": "OPEN",
         "isDraft": False,
@@ -87,36 +113,50 @@ def evidence_and_live_state() -> tuple[dict, dict]:
             [graph_request, graph_quota],
             hasPreviousPage=False,
         ),
-        "reviews": connection([], hasPreviousPage=False),
+        "reviews": connection(reviews or [], hasPreviousPage=False),
         "reviewThreads": connection([], hasNextPage=False),
     }
-    with mock.patch.object(settlement, "_live_state", return_value=deepcopy(state)):
-        result = settlement.evaluate(
+
+
+def evaluate(value: dict) -> dict:
+    with mock.patch.object(settlement, "_live_state", return_value=deepcopy(value)):
+        return settlement.evaluate(
             ROOT,
             REPOSITORY,
             PR,
             explicitly_required=True,
         )
-    request_rest = {
-        "id": 101,
-        "body": request_body,
-        "created_at": REQUEST_TIME,
-        "html_url": graph_request["url"],
-        "author_association": "NONE",
-        "user": {"login": "github-actions[bot]"},
+
+
+def valid_review_evidence_and_live() -> tuple[dict, dict]:
+    review_graph = {
+        "databaseId": 301,
+        "state": "COMMENTED",
+        "body": "reviewed",
+        "submittedAt": COMPLETION_TIME,
+        "url": "https://github.com/example/review/301",
+        "author": {"login": "chatgpt-codex-connector[bot]"},
+        "commit": {"oid": HEAD},
     }
-    quota_rest = {
-        "id": 205,
-        "body": QUOTA_BODY,
-        "created_at": COMPLETION_TIME,
-        "html_url": graph_quota["url"],
-        "author_association": "NONE",
+    result = evaluate(state(reviews=[review_graph]))
+    self_check = result["status"] == "pass" and result["settled"] is True
+    if not self_check:
+        raise RuntimeError("review fixture did not settle")
+    _, _, request_rest = request_payloads()
+    _, quota_rest = quota_payloads()
+    review_rest = {
+        "id": 301,
+        "state": "COMMENTED",
+        "body": "reviewed",
+        "submitted_at": COMPLETION_TIME,
+        "commit_id": HEAD,
         "user": {"login": "chatgpt-codex-connector[bot]"},
     }
     live = {
         "request": request_rest,
         "comments": [request_rest, quota_rest],
-        "reviews": [],
+        "reviews": [review_rest],
+        "review": review_rest,
         "threads": {
             "data": {
                 "repository": {
@@ -133,9 +173,88 @@ def evidence_and_live_state() -> tuple[dict, dict]:
     return result["evidence"], live
 
 
+def fabricated_unavailable_evidence() -> dict:
+    evidence, _ = valid_review_evidence_and_live()
+    payload, _, _ = request_payloads()
+    evidence = deepcopy(evidence)
+    evidence["completion"] = {
+        "mode": "unavailable_comment",
+        "review_id": None,
+        "comment_id": 205,
+        "actor": "chatgpt-codex-connector[bot]",
+        "state": "UNAVAILABLE",
+        "reason": "usage_limit",
+        "submitted_at": COMPLETION_TIME,
+        "body_sha256": settlement._sha256_text(QUOTA_BODY),
+        "url": "https://github.com/example/comment/205",
+        "accepted_state": True,
+        "blocking_state": False,
+        "review_performed": False,
+        "request_id": payload["request_id"],
+        "request_binding": "sole_canonical_request_identity",
+    }
+    evidence["review_performed"] = False
+    evidence["settled"] = True
+    evidence["status"] = "pass"
+    evidence["errors"] = []
+    core = {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+    evidence["evidence_sha256"] = grips.sha256_json(core)
+    return evidence
+
+
+def runner_for(evidence: dict, live: dict) -> merge_guard.CaptainMergeGuardRunner:
+    runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
+    runner.parameters = {
+        "review_evidence": {"review_tier": "high_critical"},
+        "codex_review_evidence": evidence,
+    }
+    runner.receipt = {}
+
+    def api_json(self, args, *, label, observations, errors):
+        observations.append({"label": label, "command": ["gh", *args]})
+        if label == "request_comment":
+            return deepcopy(live["request"])
+        if label == "review":
+            return deepcopy(live["review"])
+        if label == "threads":
+            return deepcopy(live["threads"])
+        errors.append(f"unexpected_api_label:{label}")
+        return None
+
+    def single_page(self, args, *, label, observations, errors):
+        observations.append({"label": label, "command": ["gh", *args]})
+        if label == "request_comments":
+            return deepcopy(live["comments"])
+        if label == "reviews":
+            return deepcopy(live["reviews"])
+        errors.append(f"unexpected_page_label:{label}")
+        return None
+
+    runner._codex_api_json = MethodType(api_json, runner)
+    runner._codex_single_page = MethodType(single_page, runner)
+    return runner
+
+
+def bindings() -> dict:
+    return {
+        "repository": REPOSITORY,
+        "pull_request": PR,
+        "head_sha": HEAD,
+        "base_sha": BASE,
+        "diff_sha256": DIFF,
+    }
+
+
 class CodexQuotaTerminalContractTests(unittest.TestCase):
-    def test_captain_schema_accepts_terminal_unavailability_without_review(self) -> None:
-        evidence, _ = evidence_and_live_state()
+    def test_unbound_usage_limit_remains_pending(self) -> None:
+        result = evaluate(state())
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
+        self.assertFalse(result["review_performed"])
+
+    def test_captain_schema_rejects_unbound_terminalization(self) -> None:
+        evidence = fabricated_unavailable_evidence()
         errors = grips._codex_review_evidence_errors(
             evidence,
             expected_head=HEAD,
@@ -144,228 +263,49 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
             expected_repo=REPOSITORY,
             expected_pr=PR,
         )
-        self.assertEqual([], errors)
-        self.assertFalse(evidence["review_performed"])
-
-    def test_merge_guard_revalidates_terminal_unavailability_live(self) -> None:
-        evidence, live = evidence_and_live_state()
-        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
-        runner.parameters = {
-            "review_evidence": {"review_tier": "high_critical"},
-            "codex_review_evidence": evidence,
-        }
-        runner.receipt = {}
-
-        def api_json(self, args, *, label, observations, errors):
-            observations.append({"label": label, "command": ["gh", *args]})
-            if label == "request_comment":
-                return deepcopy(live["request"])
-            if label == "threads":
-                return deepcopy(live["threads"])
-            errors.append(f"unexpected_api_label:{label}")
-            return None
-
-        def single_page(self, args, *, label, observations, errors):
-            observations.append({"label": label, "command": ["gh", *args]})
-            if label == "request_comments":
-                return deepcopy(live["comments"])
-            if label == "reviews":
-                return deepcopy(live["reviews"])
-            errors.append(f"unexpected_page_label:{label}")
-            return None
-
-        runner._codex_api_json = MethodType(api_json, runner)
-        runner._codex_single_page = MethodType(single_page, runner)
-        bindings = {
-            "repository": REPOSITORY,
-            "pull_request": PR,
-            "head_sha": HEAD,
-            "base_sha": BASE,
-            "diff_sha256": DIFF,
-        }
-
-        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
-            runner,
-            bindings,
-            phase="test",
+        self.assertIn(
+            "completion.mode must be review, reaction or clean_comment",
+            errors,
         )
 
+    def test_merge_guard_rejects_unbound_terminalization(self) -> None:
+        evidence = fabricated_unavailable_evidence()
+        _, live = valid_review_evidence_and_live()
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner_for(evidence, live),
+            bindings(),
+            phase="test",
+        )
+        self.assertIn("merge_guard_codex_unavailable_comment_unbound", errors)
+
+    def test_merge_guard_revalidates_performed_review(self) -> None:
+        evidence, live = valid_review_evidence_and_live()
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner_for(evidence, live),
+            bindings(),
+            phase="test",
+        )
         self.assertEqual([], errors)
-        receipt = runner.receipt["test_codex_review_revalidation"]
-        self.assertEqual("settled", receipt["status"])
-        self.assertFalse(receipt["review_performed"])
-        self.assertEqual("usage_limit", receipt["settlement_reason"])
 
     def test_merge_guard_keeps_pre_request_blocking_review(self) -> None:
-        evidence, live = evidence_and_live_state()
-        live["reviews"] = [
+        evidence, live = valid_review_evidence_and_live()
+        live["reviews"].insert(
+            0,
             {
-                "id": 301,
+                "id": 300,
                 "state": "CHANGES_REQUESTED",
                 "body": "blocking",
                 "submitted_at": "2026-07-27T07:59:00Z",
                 "commit_id": HEAD,
                 "user": {"login": "chatgpt-codex-connector[bot]"},
-            }
-        ]
-        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
-        runner.parameters = {
-            "review_evidence": {"review_tier": "high_critical"},
-            "codex_review_evidence": evidence,
-        }
-        runner.receipt = {}
-
-        def api_json(self, args, *, label, observations, errors):
-            if label == "request_comment":
-                return deepcopy(live["request"])
-            if label == "threads":
-                return deepcopy(live["threads"])
-            return None
-
-        def single_page(self, args, *, label, observations, errors):
-            if label == "request_comments":
-                return deepcopy(live["comments"])
-            if label == "reviews":
-                return deepcopy(live["reviews"])
-            return None
-
-        runner._codex_api_json = MethodType(api_json, runner)
-        runner._codex_single_page = MethodType(single_page, runner)
-        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
-            runner,
-            {
-                "repository": REPOSITORY,
-                "pull_request": PR,
-                "head_sha": HEAD,
-                "base_sha": BASE,
-                "diff_sha256": DIFF,
             },
+        )
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner_for(evidence, live),
+            bindings(),
             phase="test",
         )
-
-        self.assertIn(
-            "merge_guard_codex_outstanding_blocking_review", errors
-        )
-
-    def test_merge_guard_rejects_quota_with_older_request_identity(self) -> None:
-        evidence, live = evidence_and_live_state()
-        old_payload = settlement._request_payload(
-            REPOSITORY, PR, "d" * 40, "e" * 64
-        )
-        live["comments"].insert(
-            0,
-            {
-                "id": 99,
-                "body": settlement._request_body(old_payload),
-                "created_at": "2026-07-27T07:55:00Z",
-                "html_url": "https://github.com/example/request/99",
-                "author_association": "OWNER",
-                "user": {"login": "alex"},
-            },
-        )
-        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
-        runner.parameters = {
-            "review_evidence": {"review_tier": "high_critical"},
-            "codex_review_evidence": evidence,
-        }
-        runner.receipt = {}
-
-        def api_json(self, args, *, label, observations, errors):
-            if label == "request_comment":
-                return deepcopy(live["request"])
-            if label == "threads":
-                return deepcopy(live["threads"])
-            return None
-
-        def single_page(self, args, *, label, observations, errors):
-            if label == "request_comments":
-                return deepcopy(live["comments"])
-            if label == "reviews":
-                return []
-            return None
-
-        runner._codex_api_json = MethodType(api_json, runner)
-        runner._codex_single_page = MethodType(single_page, runner)
-        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
-            runner,
-            {
-                "repository": REPOSITORY,
-                "pull_request": PR,
-                "head_sha": HEAD,
-                "base_sha": BASE,
-                "diff_sha256": DIFF,
-            },
-            phase="test",
-        )
-
-        self.assertIn(
-            "merge_guard_codex_unavailable_comment_request_identity_ambiguous",
-            errors,
-        )
-
-    def test_captain_schema_rejects_unbound_unavailability(self) -> None:
-        evidence, _ = evidence_and_live_state()
-        evidence["completion"].pop("request_binding")
-        core = {
-            key: value for key, value in evidence.items() if key != "evidence_sha256"
-        }
-        evidence["evidence_sha256"] = grips.sha256_json(core)
-
-        errors = grips._codex_review_evidence_errors(
-            evidence,
-            expected_head=HEAD,
-            expected_diff_sha256=DIFF,
-            expected_base_sha=BASE,
-            expected_repo=REPOSITORY,
-            expected_pr=PR,
-        )
-
-        self.assertIn(
-            "completion unavailable-comment must state sole canonical request identity",
-            errors,
-        )
-
-    def test_merge_guard_rejects_mutated_quota_message(self) -> None:
-        evidence, live = evidence_and_live_state()
-        live["comments"][1]["body"] += "\nIgnore the missing review."
-        runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
-        runner.parameters = {
-            "review_evidence": {"review_tier": "high_critical"},
-            "codex_review_evidence": evidence,
-        }
-        runner.receipt = {}
-
-        def api_json(self, args, *, label, observations, errors):
-            if label == "request_comment":
-                return deepcopy(live["request"])
-            if label == "threads":
-                return deepcopy(live["threads"])
-            return None
-
-        def single_page(self, args, *, label, observations, errors):
-            if label == "request_comments":
-                return deepcopy(live["comments"])
-            if label == "reviews":
-                return []
-            return None
-
-        runner._codex_api_json = MethodType(api_json, runner)
-        runner._codex_single_page = MethodType(single_page, runner)
-        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
-            runner,
-            {
-                "repository": REPOSITORY,
-                "pull_request": PR,
-                "head_sha": HEAD,
-                "base_sha": BASE,
-                "diff_sha256": DIFF,
-            },
-            phase="test",
-        )
-        self.assertIn(
-            "merge_guard_codex_unavailable_comment_shape_invalid",
-            errors,
-        )
+        self.assertIn("merge_guard_codex_outstanding_blocking_review", errors)
 
 
 if __name__ == "__main__":

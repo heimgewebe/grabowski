@@ -146,12 +146,7 @@ jobs:
           case "$status" in
             pass)
               github_state="success"
-              completion_mode="$(jq -r '.evidence.completion.mode // empty' codex-review-settlement.json)"
-              if [ "$completion_mode" = "unavailable_comment" ]; then
-                description="Codex request settled: code-review usage limit reached"
-              else
-                description="Current-head Codex review requirement satisfied"
-              fi
+              description="Current-head Codex review requirement satisfied"
               ;;
             pending)
               github_state="pending"
