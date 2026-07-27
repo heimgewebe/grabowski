@@ -1,0 +1,97 @@
+name: PR 493 final schema repair
+
+on:
+  push:
+    branches:
+      - fix/bureau-pickup-typed-schema-v1
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: fix/bureau-pickup-typed-schema-v1
+          show-progress: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Patch test boundary
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/test_bureau_pickup.py")
+          text = path.read_text(encoding="utf-8")
+          old = '''    def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
+              tool = next(
+          '''
+          new = '''    def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
+              required = {"worker_id", "capabilities", "task_id"}
+              optional = {
+                  "resource",
+                  "kind",
+                  "base_dir",
+                  "approval_source",
+                  "lease_ttl_seconds",
+                  "create_workspace",
+                  "repository_scope_manifests",
+                  "nonconflict_proofs",
+                  "registry_root",
+              }
+              self.assertEqual(required, set(pickup.BureauPickupRequest.__required_keys__))
+              self.assertEqual(optional, set(pickup.BureauPickupRequest.__optional_keys__))
+              self.assertEqual(
+                  {"extra": "forbid", "strict": True},
+                  pickup.BureauPickupRequest.__pydantic_config__,
+              )
+
+          def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
+              if not hasattr(pickup.mcp, "list_tools"):
+                  self.skipTest("real FastMCP unavailable in dependency-free validation")
+              tool = next(
+          '''
+          if new not in text:
+              if text.count(old) != 1:
+                  raise SystemExit(f"Expected one schema marker, found {text.count(old)}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+      - name: Prove dependency-free contract
+        run: PYTHONPATH=src python -m unittest tests.test_bureau_pickup
+      - name: Prove real FastMCP schema
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check --quiet \
+            'mcp==1.27.2' 'pydantic==2.13.4' 'typing-extensions==4.15.0'
+          PYTHONPATH=src python -m unittest \
+            tests.test_bureau_pickup.BureauPickupTests.test_execute_registered_request_schema_is_complete_and_strict
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed="$(git status --porcelain=v1 | sed 's/^...//')"
+          test "$changed" = 'tests/test_bureau_pickup.py'
+          git diff --check
+          git add tests/test_bureau_pickup.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'test(mcp): separate structural and runtime schema proofs'
+          git push origin HEAD:fix/bureau-pickup-typed-schema-v1
+      - name: Report failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment 493 --repo heimgewebe/grabowski --body \
+            "PR 493 final schema-repair workflow failed on head \`$GITHUB_SHA\`. Inspect the workflow step before merging."
