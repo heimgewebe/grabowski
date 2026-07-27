@@ -37,8 +37,8 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
 
     def test_permissions_are_bounded_to_review_status_workflow(self) -> None:
         self.assertIn("  contents: read\n", self.text)
-        self.assertIn("  issues: write\n", self.text)
-        self.assertIn("  pull-requests: read\n", self.text)
+        self.assertIn("  pull-requests: write\n", self.text)
+        self.assertNotIn("  issues: write\n", self.text)
         self.assertIn("  statuses: write\n", self.text)
         self.assertNotIn("contents: write", self.text)
 
@@ -87,6 +87,11 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn('github_state="success"', self.text)
         self.assertIn('github_state="pending"', self.text)
         self.assertIn('github_state="failure"', self.text)
+        self.assertIn(
+            "Current-head Codex review requirement satisfied",
+            self.text,
+        )
+        self.assertNotIn("usage limit reached", self.text)
 
     def test_manual_dispatch_can_recheck_after_thread_resolution(self) -> None:
         self.assertIn("description: Pull request number", self.text)
