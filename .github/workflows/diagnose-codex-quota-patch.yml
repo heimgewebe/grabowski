@@ -44,6 +44,14 @@ jobs:
           start = text.index(start_marker) + len(start_marker)
           end = text.index(end_marker, start)
           script = textwrap.dedent(text[start:end])
+          write_line = '    path.write_text(text.replace(old, new, 1), encoding="utf-8")'
+          instrumented = (
+              '    print(f"PATCHED {relative}: {old.splitlines()[0][:100]!r}")\n'
+              + write_line
+          )
+          if script.count(write_line) != 1:
+              raise SystemExit("cannot instrument replace_once")
+          script = script.replace(write_line, instrumented, 1)
 
           with tempfile.TemporaryDirectory(prefix="grabowski-patch-diagnostic-") as tmp:
               checkout = Path(tmp) / "repo"
@@ -74,7 +82,7 @@ jobs:
                   )
               )
               report = [
-                  "### One-shot patch diagnostic",
+                  "### One-shot patch diagnostic with anchor sequence",
                   "",
                   f"Return code: `{completed.returncode}`",
                   "",
@@ -90,7 +98,7 @@ jobs:
                   "",
                   "stdout:",
                   "```text",
-                  (completed.stdout or "<empty>")[-2000:],
+                  (completed.stdout or "<empty>")[-6000:],
                   "```",
               ]
               Path("/tmp/patch-diagnostic.md").write_text(
