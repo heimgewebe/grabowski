@@ -9,8 +9,10 @@ import stat
 import time
 from typing import Any
 
-from pydantic import ConfigDict
-from typing_extensions import NotRequired, Required, TypedDict
+try:
+    from typing_extensions import TypedDict
+except ModuleNotFoundError:
+    from typing import TypedDict
 
 import grabowski_bureau_intake as bureau
 import grabowski_bureau_leases as bureau_leases
@@ -39,21 +41,24 @@ MIN_LEASE_TTL_SECONDS = 120
 MAX_LEASE_TTL_SECONDS = 3600
 
 
-class BureauPickupRequest(TypedDict, total=False):
-    __pydantic_config__ = ConfigDict(extra="forbid", strict=True)
+class _RequiredBureauPickupRequest(TypedDict):
+    worker_id: str
+    capabilities: list[str]
+    task_id: str
 
-    worker_id: Required[str]
-    capabilities: Required[list[str]]
-    task_id: Required[str]
-    resource: NotRequired[str | None]
-    kind: NotRequired[str]
-    base_dir: NotRequired[str | None]
-    approval_source: NotRequired[str]
-    lease_ttl_seconds: NotRequired[int]
-    create_workspace: NotRequired[bool]
-    repository_scope_manifests: NotRequired[dict[str, dict[str, Any]] | None]
-    nonconflict_proofs: NotRequired[dict[str, dict[str, Any]] | None]
-    registry_root: NotRequired[str]
+
+class BureauPickupRequest(_RequiredBureauPickupRequest, total=False):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    resource: str | None
+    kind: str
+    base_dir: str | None
+    approval_source: str
+    lease_ttl_seconds: int
+    create_workspace: bool
+    repository_scope_manifests: dict[str, dict[str, Any]] | None
+    nonconflict_proofs: dict[str, dict[str, Any]] | None
+    registry_root: str
 
 
 class BureauPickupError(RuntimeError):
