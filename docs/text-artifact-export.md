@@ -13,7 +13,7 @@ UTF-8-Textdatei mit der Endung `.txt` und ein SHA-256-gebundenes Receipt nach
 3. Hochkonfidente Zugangsdaten und Private-Key-Marker blockieren die Ausgabe.
 4. Diff und Receipt werden privat und atomar unter
    `~/.local/state/grabowski/text-artifacts/<artifact_id>/` veröffentlicht.
-   Ein hartes Budget von 128 Artefakten und insgesamt 512 MiB verhindert
+   Ein hartes Budget von 4.096 Artefakten und insgesamt 512 MiB verhindert
    unbegrenztes Wachstum; bei ausgeschöpfter Kapazität schlägt die Publikation
    fehl, statt vorhandene Evidenz still zu löschen.
    Ein nicht blockierender Store-Lock serialisiert Inventarprüfung und atomare

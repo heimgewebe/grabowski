@@ -708,6 +708,8 @@ class ArtifactTests(unittest.TestCase):
 
     def test_text_artifact_default_count_capacity_exceeds_legacy_limit(self) -> None:
         self.assertGreater(artifacts.MAX_RETAINED_TEXT_ARTIFACTS, 128)
+        documentation = (ROOT / "docs/text-artifact-export.md").read_text(encoding="utf-8")
+        self.assertIn("Budget von 4.096 Artefakten", documentation)
 
     def test_text_artifact_retention_count_is_fail_closed(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()
