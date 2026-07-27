@@ -1,0 +1,139 @@
+---
+name: Clean Codex quota settlement patch
+
+on:
+  pull_request:
+    types: [synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clean-codex-quota-settlement-patch
+  cancel-in-progress: false
+
+jobs:
+  clean:
+    if: github.head_ref == 'fix/codex-quota-terminal-settlement-v1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact feature branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/codex-quota-terminal-settlement-v1
+          fetch-depth: 0
+
+      - name: Verify isolated product preimage
+        run: |
+          set -euo pipefail
+          base="08640a73ad4b8aecd9cf974082bb8efd2c67dbfc"
+          test "$(git merge-base HEAD origin/main)" = "$base"
+          unexpected="$(git diff --name-only "$base" HEAD | grep -Ev '^(.github/workflows/(cleanup-codex-quota-patch.yml|codex-review-settlement.yml)|docs/external-review-loop.md|docs/generated/operator-context.v1.json|src/grabowski_grips.py|src/grabowski_merge_guard.py|tests/test_codex_review_quota_terminal_contract.py|tests/test_codex_review_settlement.py|tests/test_codex_review_settlement_workflow.py|tools/codex_review_settlement.py)$' || true)"
+          if [ -n "$unexpected" ]; then
+            printf 'Unexpected preimage paths:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+
+      - name: Apply exact quality cleanup
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one cleanup anchor, found {count}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+          replace_once(
+              "src/grabowski_merge_guard.py",
+              '''                "completion_comment_id": completion.get("comment_id"),
+              "review_performed": mode != "unavailable_comment",
+              "settlement_reason": completion.get("reason"),
+              "thread_count": len(thread_ids),
+
+                  "thread_ids_sha256": _sha256_json(thread_ids),
+          ''',
+              '''                "completion_comment_id": completion.get("comment_id"),
+                  "review_performed": mode != "unavailable_comment",
+                  "settlement_reason": completion.get("reason"),
+                  "thread_count": len(thread_ids),
+                  "thread_ids_sha256": _sha256_json(thread_ids),
+          ''',
+          )
+          replace_once(
+              "src/grabowski_merge_guard.py",
+              '''                        "completion_comment_id": completion.get("comment_id"),
+                      "review_performed": mode != "unavailable_comment",
+                      "settlement_reason": completion.get("reason"),
+                      "thread_ids": thread_ids,
+
+                          "unresolved_thread_ids": unresolved_thread_ids,
+          ''',
+              '''                        "completion_comment_id": completion.get("comment_id"),
+                          "review_performed": mode != "unavailable_comment",
+                          "settlement_reason": completion.get("reason"),
+                          "thread_ids": thread_ids,
+                          "unresolved_thread_ids": unresolved_thread_ids,
+          ''',
+          )
+          replace_once(
+              "tools/codex_review_settlement.py",
+              '''        "blocking_state": False,
+              }
+
+          def _unavailable_comment_completion(
+          ''',
+              '''        "blocking_state": False,
+              }
+
+
+          def _unavailable_comment_completion(
+          ''',
+          )
+          replace_once(
+              "tests/test_codex_review_quota_terminal_contract.py",
+              '''from copy import deepcopy
+          from datetime import datetime, timezone
+          import hashlib
+          import importlib.util
+          import json
+          from pathlib import Path
+          ''',
+              '''from copy import deepcopy
+          import importlib.util
+          from pathlib import Path
+          ''',
+          )
+          PY
+          git diff --check
+
+      - name: Verify focused contracts
+        run: |
+          set -euo pipefail
+          python3 -m unittest \
+            tests.test_codex_review_settlement \
+            tests.test_codex_review_settlement_workflow \
+            tests.test_codex_review_quota_terminal_contract -v
+
+      - name: Verify full repository
+        run: |
+          set -euo pipefail
+          make validate
+
+      - name: Commit cleanup
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            src/grabowski_merge_guard.py \
+            tools/codex_review_settlement.py \
+            tests/test_codex_review_quota_terminal_contract.py
+          git diff --cached --check
+          git commit -m "style(review): clean quota settlement contracts"
+          git push origin HEAD:fix/codex-quota-terminal-settlement-v1
