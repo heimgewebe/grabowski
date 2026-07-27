@@ -52,6 +52,25 @@ CLEAN_RESULT_RE = re.compile(
     + _CODEX_CLEAN_FOOTER_PATTERN
     + r"\Z"
 )
+_CODEX_USAGE_LIMIT_LINK_PATTERN = (
+    r"(?:\[Codex usage dashboard\]\("
+    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
+    r"\)|Codex usage dashboard)"
+)
+_CODEX_SETTINGS_LINK_PATTERN = (
+    r"(?:\[settings\]\("
+    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
+    r"\)|settings)"
+)
+UNAVAILABLE_RESULT_RE = re.compile(
+    r"\AYou have reached your Codex usage limits for code reviews\. "
+    r"You can see your limits in the "
+    + _CODEX_USAGE_LIMIT_LINK_PATTERN
+    + r"\.\n{1,2}To continue using code reviews, you can upgrade your account "
+    r"or add credits to your account and enable them for code reviews in your "
+    + _CODEX_SETTINGS_LINK_PATTERN
+    + r"\.\Z"
+)
 
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
@@ -438,6 +457,57 @@ def _clean_comment_completion(
         "blocking_state": False,
     }
 
+def _unavailable_comment_completion(
+    pr: dict[str, Any],
+    *,
+    request_time: datetime,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for comment in _list_nodes(pr.get("comments"), label="comments"):
+        actor = _actor_login(comment.get("author"))
+        body = comment.get("body")
+        created = _parse_time(comment.get("createdAt"))
+        comment_id = comment.get("databaseId")
+        if (
+            actor not in TRUSTED_CODEX_ACTORS
+            or not isinstance(body, str)
+            or created is None
+            or created < request_time
+            or isinstance(comment_id, bool)
+            or not isinstance(comment_id, int)
+        ):
+            continue
+        if UNAVAILABLE_RESULT_RE.fullmatch(_normalize_codex_comment_body(body)) is None:
+            continue
+        candidates.append(
+            {
+                **comment,
+                "_actor": actor,
+                "_created": created,
+            }
+        )
+    if not candidates:
+        return None
+    selected = max(
+        candidates,
+        key=lambda item: (item["_created"], item["databaseId"]),
+    )
+    return {
+        "mode": "unavailable_comment",
+        "review_id": None,
+        "comment_id": selected["databaseId"],
+        "actor": selected["_actor"],
+        "state": "UNAVAILABLE",
+        "reason": "usage_limit",
+        "submitted_at": selected["createdAt"],
+        "body_sha256": _sha256_text(str(selected.get("body") or "")),
+        "url": selected.get("url"),
+        "accepted_state": True,
+        "blocking_state": False,
+        "review_performed": False,
+    }
+
+
 def _review_completion(
     pr: dict[str, Any],
     *,
@@ -580,6 +650,12 @@ def _review_completion(
             "accepted_state": True,
             "blocking_state": False,
         }
+    unavailable = _unavailable_comment_completion(
+        pr,
+        request_time=request_time,
+    )
+    if unavailable is not None:
+        return unavailable
     return None
 
 
@@ -665,6 +741,17 @@ def evaluate(
     else:
         status = "pass"
     settled = status == "pass" and request is not None and completion is not None and not errors
+    review_performed = (
+        completion is not None
+        and completion.get("mode") != "unavailable_comment"
+    )
+    does_not_establish = [
+        "semantic_correctness_of_codex_findings",
+        "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
+        "merge_authority",
+    ]
+    if completion is not None and not review_performed:
+        does_not_establish.append("codex_review_performed")
     generated_at = datetime.now(timezone.utc).isoformat()
     request_evidence = None
     if request is not None:
@@ -691,6 +778,7 @@ def evaluate(
         "review_tier": policy["review_tier"],
         "request": request_evidence,
         "completion": completion,
+        "review_performed": review_performed,
         "finding_count": len(threads),
         "thread_ids": thread_ids,
         "thread_ids_sha256": _sha256_json(thread_ids),
@@ -700,11 +788,7 @@ def evaluate(
         "settled": settled,
         "status": status,
         "errors": errors,
-        "does_not_establish": [
-            "semantic_correctness_of_codex_findings",
-            "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
-            "merge_authority",
-        ],
+        "does_not_establish": does_not_establish,
     }
     evidence = {**evidence_core, "evidence_sha256": _sha256_json(evidence_core)}
     return {
@@ -717,6 +801,7 @@ def evaluate(
         "diff_sha256": diff_sha256,
         "request_present": request is not None,
         "completion_present": completion is not None,
+        "review_performed": review_performed,
         "finding_count": len(threads),
         "unresolved_thread_count": len(unresolved),
         "errors": errors,

@@ -87,6 +87,10 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn('github_state="success"', self.text)
         self.assertIn('github_state="pending"', self.text)
         self.assertIn('github_state="failure"', self.text)
+        self.assertIn(
+            "Codex request settled: code-review usage limit reached",
+            self.text,
+        )
 
     def test_manual_dispatch_can_recheck_after_thread_resolution(self) -> None:
         self.assertIn("description: Pull request number", self.text)

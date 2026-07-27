@@ -1402,9 +1402,15 @@ def _codex_review_evidence_errors(
         errors.append("completion must be a structured object")
     else:
         mode = completion.get("mode")
-        if mode not in {"review", "reaction", "clean_comment"}:
+        if mode not in {
+            "review",
+            "reaction",
+            "clean_comment",
+            "unavailable_comment",
+        }:
             errors.append(
-                "completion.mode must be review, reaction or clean_comment"
+                "completion.mode must be review, reaction, clean_comment or "
+                "unavailable_comment"
             )
         actor = completion.get("actor")
         if actor not in CAPTAIN_TRUSTED_CODEX_ACTORS:
@@ -1416,6 +1422,32 @@ def _codex_review_evidence_errors(
             errors.append("completion reaction state must be THUMBS_UP")
         if mode == "clean_comment" and state != "CLEAN":
             errors.append("completion clean-comment state must be CLEAN")
+        if mode == "unavailable_comment":
+            if state != "UNAVAILABLE":
+                errors.append(
+                    "completion unavailable-comment state must be UNAVAILABLE"
+                )
+            if completion.get("reason") != "usage_limit":
+                errors.append(
+                    "completion unavailable-comment reason must be usage_limit"
+                )
+            if completion.get("review_performed") is not False:
+                errors.append(
+                    "completion unavailable-comment must state review_performed=false"
+                )
+            if evidence.get("review_performed") is not False:
+                errors.append(
+                    "unavailable settlement evidence must state review_performed=false"
+                )
+        else:
+            if completion.get("review_performed") is False:
+                errors.append(
+                    "performed Codex completion cannot state review_performed=false"
+                )
+            if evidence.get("review_performed") is False:
+                errors.append(
+                    "performed Codex evidence cannot state review_performed=false"
+                )
         if completion.get("accepted_state") is not True:
             errors.append("completion.accepted_state must be true")
         if completion.get("blocking_state") is not False:
@@ -1427,7 +1459,7 @@ def _codex_review_evidence_errors(
         elif review_id is not None:
             errors.append("completion.review_id must be null outside review mode")
         comment_id = completion.get("comment_id")
-        if mode in {"clean_comment", "reaction"}:
+        if mode in {"clean_comment", "reaction", "unavailable_comment"}:
             if (
                 isinstance(comment_id, bool)
                 or not isinstance(comment_id, int)
@@ -1439,7 +1471,8 @@ def _codex_review_evidence_errors(
                 )
         elif comment_id is not None:
             errors.append(
-                "completion.comment_id must be null outside clean_comment or reaction mode"
+                "completion.comment_id must be null outside clean_comment, reaction or "
+                "unavailable_comment mode"
             )
         reviewed_prefix = completion.get("reviewed_commit_prefix")
         if mode == "clean_comment":

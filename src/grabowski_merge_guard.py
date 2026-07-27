@@ -54,6 +54,25 @@ _CODEX_CLEAN_RESULT_RE = re.compile(
     + _CODEX_CLEAN_FOOTER_PATTERN
     + r"\Z"
 )
+_CODEX_USAGE_LIMIT_LINK_PATTERN = (
+    r"(?:\[Codex usage dashboard\]\("
+    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
+    r"\)|Codex usage dashboard)"
+)
+_CODEX_SETTINGS_LINK_PATTERN = (
+    r"(?:\[settings\]\("
+    r"https://chatgpt\.com/codex/[A-Za-z0-9_./?=&%#-]+"
+    r"\)|settings)"
+)
+_CODEX_UNAVAILABLE_RESULT_RE = re.compile(
+    r"\AYou have reached your Codex usage limits for code reviews\. "
+    r"You can see your limits in the "
+    + _CODEX_USAGE_LIMIT_LINK_PATTERN
+    + r"\.\n{1,2}To continue using code reviews, you can upgrade your account "
+    r"or add credits to your account and enable them for code reviews in your "
+    + _CODEX_SETTINGS_LINK_PATTERN
+    + r"\.\Z"
+)
 
 _CODEX_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
@@ -1507,6 +1526,89 @@ class CaptainMergeGuardRunner:
                         and live_comment.get("html_url") != expected_url
                     ):
                         errors.append("merge_guard_codex_clean_comment_url_drift")
+        elif mode == "unavailable_comment":
+            comment_id = completion.get("comment_id")
+            if (
+                isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or comment_id <= 0
+            ):
+                errors.append("merge_guard_codex_unavailable_comment_id_invalid")
+            else:
+                matching_comments = [
+                    item
+                    for item in (request_comments or [])
+                    if item.get("id") == comment_id
+                ]
+                if len(matching_comments) != 1:
+                    errors.append(
+                        "merge_guard_codex_unavailable_comment_missing_or_ambiguous"
+                    )
+                else:
+                    live_comment = matching_comments[0]
+                    actor = _github_actor(live_comment.get("user"))
+                    body = live_comment.get("body")
+                    completion_time = _github_datetime(
+                        live_comment.get("created_at")
+                    )
+                    if actor not in _CODEX_REVIEW_ACTORS:
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_actor_untrusted"
+                        )
+                    if actor != str(completion.get("actor", "")).lower():
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_actor_drift"
+                        )
+                    if not isinstance(body, str):
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_body_missing"
+                        )
+                    else:
+                        if _CODEX_UNAVAILABLE_RESULT_RE.fullmatch(
+                            _normalize_codex_comment_body(body)
+                        ) is None:
+                            errors.append(
+                                "merge_guard_codex_unavailable_comment_shape_invalid"
+                            )
+                        if hashlib.sha256(
+                            body.encode("utf-8")
+                        ).hexdigest() != completion.get("body_sha256"):
+                            errors.append(
+                                "merge_guard_codex_unavailable_comment_body_drift"
+                            )
+                    if completion.get("state") != "UNAVAILABLE":
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_state_drift"
+                        )
+                    if completion.get("reason") != "usage_limit":
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_reason_drift"
+                        )
+                    if completion.get("review_performed") is not False:
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_review_claim_invalid"
+                        )
+                    if evidence.get("review_performed") is not False:
+                        errors.append(
+                            "merge_guard_codex_unavailable_evidence_review_claim_invalid"
+                        )
+                    if (
+                        request_time is not None
+                        and completion_time is not None
+                        and completion_time < request_time
+                    ):
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_predates_request"
+                        )
+                    expected_url = completion.get("url")
+                    if (
+                        isinstance(expected_url, str)
+                        and expected_url
+                        and live_comment.get("html_url") != expected_url
+                    ):
+                        errors.append(
+                            "merge_guard_codex_unavailable_comment_url_drift"
+                        )
         elif mode == "reaction":
             reaction_comment_id = completion.get("comment_id")
             reacted_request_time: datetime | None = None
@@ -1691,7 +1793,10 @@ class CaptainMergeGuardRunner:
                 "completion_mode": mode,
                 "completion_id": completion.get("review_id"),
                 "completion_comment_id": completion.get("comment_id"),
-                "thread_count": len(thread_ids),
+            "review_performed": mode != "unavailable_comment",
+            "settlement_reason": completion.get("reason"),
+            "thread_count": len(thread_ids),
+
                 "thread_ids_sha256": _sha256_json(thread_ids),
                 "unresolved_thread_count": len(unresolved_thread_ids),
                 "unresolved_thread_ids_sha256": _sha256_json(
@@ -1708,7 +1813,10 @@ class CaptainMergeGuardRunner:
                         "completion_mode": mode,
                         "completion_id": completion.get("review_id"),
                         "completion_comment_id": completion.get("comment_id"),
-                        "thread_ids": thread_ids,
+                    "review_performed": mode != "unavailable_comment",
+                    "settlement_reason": completion.get("reason"),
+                    "thread_ids": thread_ids,
+
                         "unresolved_thread_ids": unresolved_thread_ids,
                     }
                 ),

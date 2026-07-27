@@ -142,3 +142,18 @@ External review tools other than the conditional GitHub Codex settlement remain 
 ## Cost policy
 
 External providers default to a `0 USD` request and a `0 USD` runtime policy cap, so they are blocked before process launch. A positive request remains blocked unless an administrator explicitly raises `GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD`; the requested amount must not exceed that cap. Agent competition additionally requires a provider-enforced hard USD limit by default. Providers without a hard limit remain blocked unless the caller explicitly weakens that gate. Prior budget authorizations do not carry forward.
+
+## Terminale Codex-Nichtverfügbarkeit
+
+Eine vertrauenswürdige Codex-Antwort auf die exakt an Head und Diff gebundene
+Review-Anfrage darf den Wartezustand terminal beenden, wenn sie eindeutig
+meldet, dass das Code-Review-Kontingent ausgeschöpft ist. Dieser Zustand ist
+`unavailable_comment` mit `reason=usage_limit` und
+`review_performed=false`.
+
+Diese Terminalisierung ist keine Code-Review-Evidenz. Sie darf weder einen
+vorhandenen blockierenden Codex-Reviewzustand noch offene Codex-Threads
+überstimmen. Self-Review, allgemeine Review-Evidenz, CI, Diff-Auslieferung und
+sämtliche übrigen Captain-Gates bleiben unabhängig erforderlich. Unbekannte,
+veränderte, angehängte oder nicht vertrauenswürdig erzeugte Fehlermeldungen
+bleiben `pending` beziehungsweise blockieren fail-closed.
