@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import functools
 import hashlib
 import json
 import os
@@ -66,7 +67,18 @@ JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 DEFAULT_TASK_LIST_LIMIT = 20
-TASK_RECONCILE_LOCK = threading.Lock()
+# One re-entrant process lock serializes reconciliation with every
+# persistent-task mutation. Reconcile may call resume/start recursively.
+TASK_RECONCILE_LOCK = threading.RLock()
+
+
+def _serialize_task_mutation(function):
+    @functools.wraps(function)
+    def serialized(*args: Any, **kwargs: Any) -> Any:
+        with TASK_RECONCILE_LOCK:
+            return function(*args, **kwargs)
+
+    return serialized
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -1804,6 +1816,7 @@ def _effective_observed_state(record: dict[str, Any], observed_state: str) -> st
     return stored_state if _is_terminal_state(stored_state) else observed_state
 
 
+@_serialize_task_mutation
 def _maintain_record_resources(
     record: dict[str, Any],
     state: str,
@@ -2169,6 +2182,7 @@ def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
     return _apply_terminalization_projection(transition, recovered=True)
 
 
+@_serialize_task_mutation
 def _recover_pending_task_terminalizations() -> list[str]:
     recovered: list[str] = []
     for terminalization in resources.pending_task_terminalizations():
@@ -2177,6 +2191,7 @@ def _recover_pending_task_terminalizations() -> list[str]:
     return recovered
 
 
+@_serialize_task_mutation
 def _row(task_id: str) -> dict[str, Any]:
     identifier = _validate_task_id(task_id)
     recovered = _recover_task_terminalization(identifier)
@@ -2663,6 +2678,7 @@ def _public_for_view(record: dict[str, Any], view: str) -> dict[str, Any]:
     return minimal
 
 
+@_serialize_task_mutation
 def _set_state(
     task_id: str,
     state: str,
@@ -2882,6 +2898,7 @@ def server_task_lease_delegation_evidence(lease_owner_id: str) -> dict[str, Any]
 
 
 @mcp.tool(name="grabowski_task_start", annotations=MUTATING)
+@_serialize_task_mutation
 def grabowski_task_start(
     host: str,
     argv: list[str],
@@ -3146,6 +3163,7 @@ def grabowski_task_start(
 
 
 @mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+@_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
     """Observe one persistent task and refresh its recorded state."""
     operator._require_operator_capability("durable_job")
@@ -3285,6 +3303,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_task_cancel", annotations=MUTATING)
+@_serialize_task_mutation
 def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     """Stop one task process group and retain its persistent task record."""
     record = _row(task_id)
@@ -3335,6 +3354,7 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(name="grabowski_task_resume", annotations=MUTATING)
+@_serialize_task_mutation
 def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     """Recreate a missing or stopped task unit from its persistent record."""
     record = _row(task_id)
@@ -3715,6 +3735,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     }
 
 
+@_serialize_task_mutation
 def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
@@ -3761,6 +3782,7 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
     }
 
 
+@_serialize_task_mutation
 def reconcile_tasks_resume(
     *,
     task_id: str = "",
@@ -3859,6 +3881,7 @@ def reconcile_tasks_resume(
     }
 
 
+@_serialize_task_mutation
 def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
     if not isinstance(auto_resume, bool):
         raise ValueError("auto_resume must be boolean")

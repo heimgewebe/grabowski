@@ -2215,6 +2215,69 @@ class TaskTests(unittest.TestCase):
 
         self.assertEqual(maximum_active, 1)
 
+    def test_reconcile_refresh_serializes_with_cancel(self) -> None:
+        resource_key = "service:reconcile-cancel-race.service"
+        task = self._start(resource_keys=[resource_key])["task"]
+        reconcile_entered = threading.Event()
+        allow_reconcile = threading.Event()
+        cancel_started = threading.Event()
+        cancel_dispatched = threading.Event()
+        errors: list[BaseException] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            self.assertEqual(record["task_id"], task["task_id"])
+            reconcile_entered.set()
+            if not allow_reconcile.wait(timeout=2):
+                raise RuntimeError("test did not release reconcile observation")
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        def dispatch(*args, **kwargs) -> dict[str, object]:
+            cancel_dispatched.set()
+            return _launcher()
+
+        def run_refresh() -> None:
+            try:
+                tasks.grabowski_task_reconcile_refresh(str(task["task_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+
+        def run_cancel() -> None:
+            cancel_started.set()
+            try:
+                tasks.grabowski_task_cancel(str(task["task_id"]))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "_reconcile_observation", side_effect=observe),
+            patch.object(tasks, "_dispatch", side_effect=dispatch),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            refresh_thread = threading.Thread(target=run_refresh)
+            cancel_thread = threading.Thread(target=run_cancel)
+            refresh_thread.start()
+            self.assertTrue(reconcile_entered.wait(timeout=2))
+            cancel_thread.start()
+            self.assertTrue(cancel_started.wait(timeout=2))
+            self.assertFalse(cancel_dispatched.wait(timeout=0.1))
+            allow_reconcile.set()
+            refresh_thread.join(timeout=2)
+            cancel_thread.join(timeout=2)
+
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertFalse(cancel_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(cancel_dispatched.is_set())
+        self.assertEqual(tasks._row(str(task["task_id"]))["state"], "cancelled")
+        self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+
     def test_mcp_reconcile_refresh_rechecks_authority_inside_lock(self) -> None:
         with (
             patch.object(tasks.operator, "_require_operator_capability") as capability,
