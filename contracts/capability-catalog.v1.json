@@ -342,7 +342,7 @@
     },
     {
       "category": "knowledge",
-      "description": "Run a bounded read-only RepoGround query and normalize result shapes.",
+      "description": "Run the bounded RepoGround agent frontdoor without refreshing bundles.",
       "effects": [],
       "id": "repoground_query",
       "purpose": "Run a bounded read-only RepoGround query and normalize snippets and ranges.",

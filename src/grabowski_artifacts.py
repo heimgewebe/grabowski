@@ -41,7 +41,8 @@ TEXT_ARTIFACT_ROOT = Path.home() / ".local/state/grabowski/text-artifacts"
 MAX_TEXT_ARTIFACT_BYTES = 32 * 1024 * 1024
 MAX_TEXT_ARTIFACT_CHUNK_BYTES = 256 * 1024
 MAX_TEXT_ARTIFACT_RECEIPT_BYTES = 64 * 1024
-MAX_RETAINED_TEXT_ARTIFACTS = 128
+# Keep a bounded inode count while allowing normal immutable merge-delivery history.
+MAX_RETAINED_TEXT_ARTIFACTS = 4096
 MAX_RETAINED_TEXT_ARTIFACT_BYTES = 512 * 1024 * 1024
 ARTIFACT_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
