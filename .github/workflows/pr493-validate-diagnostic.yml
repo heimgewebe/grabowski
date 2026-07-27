@@ -1,0 +1,44 @@
+name: PR 493 validate diagnostic
+
+on:
+  push:
+    branches:
+      - fix/bureau-pickup-typed-schema-v1
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/bureau-pickup-typed-schema-v1
+          show-progress: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Capture validation result
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          make validate > /tmp/pr493-validate.log 2>&1
+          status=$?
+          set -e
+          {
+            printf '### PR 493 validation diagnostic 2\n\n'
+            printf 'Head: `%s`\n\n' "$GITHUB_SHA"
+            printf 'Exit status: `%s`\n\n```text\n' "$status"
+            tail -n 140 /tmp/pr493-validate.log
+            printf '\n```\n'
+          } > /tmp/pr493-comment.md
+          gh pr comment 493 --repo heimgewebe/grabowski --body-file /tmp/pr493-comment.md
+          exit "$status"
