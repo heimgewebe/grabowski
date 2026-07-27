@@ -161,13 +161,12 @@ jobs:
           fi
           git status --short
 
-      - name: Commit validated product patch
+      - name: Commit validated non-workflow product patch
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -- \
-            .github/workflows/codex-review-settlement.yml \
             contracts/capability-catalog.v1.json \
             contracts/publication-profiles.v1.json \
             docs/external-review-loop.md \
@@ -181,7 +180,7 @@ jobs:
             tests/test_codex_review_settlement_workflow.py \
             tools/codex_review_settlement.py
           if git diff --cached --quiet; then
-            echo "No product changes staged" >&2
+            echo "No non-workflow product changes staged" >&2
             exit 1
           fi
           git commit -m "fix(review): settle Codex quota exhaustion"
