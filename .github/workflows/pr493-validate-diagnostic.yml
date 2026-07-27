@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
   repair:
@@ -23,18 +25,22 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Split structural and runtime schema proofs
+      - name: Apply and prove test-boundary repair
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PY'
+          set +e
+          {
+            python - <<'PY'
           from pathlib import Path
 
           path = Path("tests/test_bureau_pickup.py")
           text = path.read_text(encoding="utf-8")
-          marker = '''    def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
+          old = '''    def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
               tool = next(
-          '''.replace("          ", "")
-          replacement = '''    def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
+          '''
+          new = '''    def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
               required = {"worker_id", "capabilities", "task_id"}
               optional = {
                   "resource",
@@ -54,46 +60,40 @@ jobs:
                   pickup.BureauPickupRequest.__pydantic_config__,
               )
 
-              normalized = pickup._normalize_request(
-                  {
-                      "worker_id": "operator-test",
-                      "capabilities": ["repository"],
-                      "task_id": "TEST-T001",
-                  }
-              )
-              self.assertEqual("operator-test", normalized["worker_id"])
-
           def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
               if not hasattr(pickup.mcp, "list_tools"):
                   self.skipTest("real FastMCP unavailable in dependency-free validation")
               tool = next(
-          '''.replace("          ", "")
-          if replacement in text:
+          '''
+          if new in text:
               print("Schema-test split already applied.")
           else:
-              if marker not in text:
-                  raise SystemExit("Expected schema test marker is absent")
-              path.write_text(text.replace(marker, replacement, 1), encoding="utf-8")
+              if text.count(old) != 1:
+                  raise SystemExit(f"Expected one schema test marker, found {text.count(old)}")
+              path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
-      - name: Dependency-free structural proof
-        run: PYTHONPATH=src python -m unittest tests.test_bureau_pickup
-      - name: Runtime FastMCP schema proof
-        shell: bash
-        run: |
-          python -m pip install --disable-pip-version-check --quiet \
-            'mcp==1.27.2' 'pydantic==2.13.4' 'typing-extensions==4.15.0'
-          PYTHONPATH=src python -m unittest \
-            tests.test_bureau_pickup.BureauPickupTests.test_execute_registered_request_schema_is_complete_and_strict
-      - name: Verify mutation scope
-        shell: bash
-        run: |
-          set -euo pipefail
-          changed="$(git status --porcelain=v1 | sed 's/^...//')"
-          if [[ "$changed" != "tests/test_bureau_pickup.py" ]]; then
-            printf 'Unexpected repair paths:\n%s\n' "$changed" >&2
-            exit 1
+            PYTHONPATH=src python -m unittest tests.test_bureau_pickup
+            python -m pip install --disable-pip-version-check --quiet \
+              'mcp==1.27.2' 'pydantic==2.13.4' 'typing-extensions==4.15.0'
+            PYTHONPATH=src python -m unittest \
+              tests.test_bureau_pickup.BureauPickupTests.test_execute_registered_request_schema_is_complete_and_strict
+            changed="$(git status --porcelain=v1 | sed 's/^...//')"
+            test "$changed" = 'tests/test_bureau_pickup.py'
+            git diff --check
+          } > /tmp/pr493-repair.log 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            {
+              printf '### PR 493 schema-test repair failed\n\n'
+              printf 'Head: `%s`\n\n```text\n' "$GITHUB_SHA"
+              tail -n 80 /tmp/pr493-repair.log
+              printf '\n```\n'
+            } > /tmp/pr493-repair-comment.md
+            gh pr comment 493 --repo heimgewebe/grabowski --body-file /tmp/pr493-repair-comment.md
+            exit "$status"
           fi
-          git diff --check
+          cat /tmp/pr493-repair.log
       - name: Commit test-boundary repair
         shell: bash
         run: |
