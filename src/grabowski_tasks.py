@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any
@@ -64,6 +66,7 @@ JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 DEFAULT_TASK_LIST_LIMIT = 20
+TASK_RECONCILE_LOCK = threading.Lock()
 
 TASK_ID = re.compile(r"[0-9a-f]{24}\Z")
 EXTERNAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -3890,31 +3893,78 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+def _task_reconcile_check_after_guard(task_id: str) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        return reconcile_tasks_check(task_id=task_id)
+
+
 def grabowski_task_reconcile_check(task_id: str = "") -> dict[str, Any]:
     """Read-only reconcile preview for persistent tasks."""
     operator._require_operator_capability("durable_job")
-    return reconcile_tasks_check(task_id=task_id)
+    return _task_reconcile_check_after_guard(task_id)
 
 
-@mcp.tool(name="grabowski_task_reconcile_refresh", annotations=MUTATING)
+@mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
+async def _grabowski_task_reconcile_check_tool(task_id: str = "") -> dict[str, Any]:
+    """Read-only reconcile preview for persistent tasks."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(_task_reconcile_check_after_guard, task_id)
+
+
+def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        result = reconcile_tasks_refresh(task_id=task_id)
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-reconcile-refresh",
+                "task_id": task_id,
+                "scanned": result["scanned"],
+                "released_count": len(result["released"]),
+            }
+        )
+        return result
+
+
 def grabowski_task_reconcile_refresh(task_id: str = "") -> dict[str, Any]:
     """Refresh persistent task states without resuming processes."""
     operator._require_operator_mutation("durable_job")
-    result = reconcile_tasks_refresh(task_id=task_id)
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "task-reconcile-refresh",
-            "task_id": task_id,
-            "scanned": result["scanned"],
-            "released_count": len(result["released"]),
-        }
-    )
-    return result
+    return _task_reconcile_refresh_after_guard(task_id)
 
 
-@mcp.tool(name="grabowski_task_reconcile_resume", annotations=MUTATING)
+@mcp.tool(name="grabowski_task_reconcile_refresh", annotations=MUTATING)
+async def _grabowski_task_reconcile_refresh_tool(task_id: str = "") -> dict[str, Any]:
+    """Refresh persistent task states without resuming processes."""
+    operator._require_operator_mutation("durable_job")
+    return await asyncio.to_thread(_task_reconcile_refresh_after_guard, task_id)
+
+
+def _task_reconcile_resume_after_guard(
+    task_id: str,
+    max_resumes: int,
+    reason: str,
+) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        result = reconcile_tasks_resume(
+            task_id=task_id,
+            max_resumes=max_resumes,
+            reason=reason,
+        )
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-reconcile-resume",
+                "task_id": task_id,
+                "max_resumes": max_resumes,
+                "reason": result["reason"],
+                "scanned": result["scanned"],
+                "resumed_count": len(result["resumed"]),
+                "blocked_count": len(result["blocked"]),
+            }
+        )
+        return result
+
+
 def grabowski_task_reconcile_resume(
     task_id: str = "",
     max_resumes: int = 1,
@@ -3922,42 +3972,54 @@ def grabowski_task_reconcile_resume(
 ) -> dict[str, Any]:
     """Resume retry-safe tasks after reconcile verification."""
     operator._require_operator_mutation("durable_job")
-    result = reconcile_tasks_resume(
-        task_id=task_id,
-        max_resumes=max_resumes,
-        reason=reason,
-    )
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "task-reconcile-resume",
-            "task_id": task_id,
-            "max_resumes": max_resumes,
-            "reason": result["reason"],
-            "scanned": result["scanned"],
-            "resumed_count": len(result["resumed"]),
-            "blocked_count": len(result["blocked"]),
-        }
-    )
-    return result
+    return _task_reconcile_resume_after_guard(task_id, max_resumes, reason)
 
 
-@mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
+@mcp.tool(name="grabowski_task_reconcile_resume", annotations=MUTATING)
+async def _grabowski_task_reconcile_resume_tool(
+    task_id: str = "",
+    max_resumes: int = 1,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Resume retry-safe tasks after reconcile verification."""
+    operator._require_operator_mutation("durable_job")
+    return await asyncio.to_thread(
+        _task_reconcile_resume_after_guard,
+        task_id,
+        max_resumes,
+        reason,
+    )
+
+
+def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
+    with TASK_RECONCILE_LOCK:
+        result = reconcile_tasks(auto_resume=auto_resume)
+        base._append_audit(
+            {
+                "timestamp_unix": _now(),
+                "operation": "task-reconcile",
+                "auto_resume": auto_resume,
+                "scanned": result["scanned"],
+                "resumed_count": len(result["resumed"]),
+                "blocked_count": len(result["blocked"]),
+            }
+        )
+        return result
+
+
 def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:
     """Reconcile persistent tasks after process loss or host restart."""
     operator._require_operator_mutation("durable_job")
-    result = reconcile_tasks(auto_resume=auto_resume)
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "task-reconcile",
-            "auto_resume": auto_resume,
-            "scanned": result["scanned"],
-            "resumed_count": len(result["resumed"]),
-            "blocked_count": len(result["blocked"]),
-        }
-    )
-    return result
+    return _task_reconcile_after_guard(auto_resume)
+
+
+@mcp.tool(name="grabowski_task_reconcile", annotations=MUTATING)
+async def _grabowski_task_reconcile_tool(
+    auto_resume: bool = False,
+) -> dict[str, Any]:
+    """Reconcile persistent tasks after process loss or host restart."""
+    operator._require_operator_mutation("durable_job")
+    return await asyncio.to_thread(_task_reconcile_after_guard, auto_resume)
 
 
 @mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)

@@ -120,10 +120,14 @@ den auth-freien Loopback-Betrieb statt einer nicht parsebaren 404-Antwort.
 
 ### Backoff mit Jitter und persistenter Sperrzeit
 
-Failure-Threshold (2 aufeinanderfolgende Fehlmessungen) und Restart-Budget
-(3 Neustarts pro 15 Minuten) bleiben unverändert fail-closed und werden vor
-dem Backoff geprüft. Zusätzlich trägt der State einen begrenzten
-exponentiellen Restart-Backoff:
+Der Operator-Watchdog benötigt fünf aufeinanderfolgende Fehlmessungen, bevor
+er den Operator neu startet. Der Tunnel-Watchdog behält seine Schwelle von drei
+Fehlmessungen. Das Restart-Budget von drei Neustarts pro 15 Minuten bleibt für
+beide Komponenten fail-closed und wird vor dem Backoff geprüft. Die höhere
+Operator-Schwelle verhindert, dass begrenzte synchrone Store-Wartung eine
+Neustartschleife auslöst; der Trade-off ist eine langsamere automatische
+Erholung bei einem echten dauerhaften Operator-Hänger. Zusätzlich trägt der
+State einen begrenzten exponentiellen Restart-Backoff:
 
 - Nach jedem Watchdog-Neustart steigt `backoff_level`; die nominale
   Verzögerung ist `backoff_base * 2^(level-1)` (Standard 60 s Basis), darauf

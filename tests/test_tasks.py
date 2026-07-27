@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import closing, contextmanager
 import hashlib
 import io
@@ -10,6 +11,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -2138,6 +2140,80 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["released"], [])
         self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:refresh.service"))
+
+    def test_mcp_reconcile_refresh_runs_store_work_off_event_loop(self) -> None:
+        caller_thread = threading.get_ident()
+        worker_threads: list[int] = []
+        payload = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+        }
+
+        def refresh(task_id: str) -> dict[str, object]:
+            self.assertEqual(task_id, "")
+            worker_threads.append(threading.get_ident())
+            return payload
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(
+                tasks,
+                "_task_reconcile_refresh_after_guard",
+                side_effect=refresh,
+            ),
+        ):
+            result = asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+
+        self.assertEqual(result, payload)
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_mcp_reconcile_refresh_serializes_store_mutations(self) -> None:
+        active = 0
+        maximum_active = 0
+        counter_lock = threading.Lock()
+
+        def refresh(*, task_id: str = "") -> dict[str, object]:
+            nonlocal active, maximum_active
+            with counter_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            try:
+                time.sleep(0.03)
+                return {
+                    "mode": "refresh",
+                    "task_id": task_id,
+                    "scanned": 0,
+                    "refreshed": [],
+                    "released": [],
+                    "resumed": [],
+                    "blocked": [],
+                    "checked_at_unix": 123,
+                }
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        async def run_both() -> None:
+            await asyncio.gather(
+                tasks._grabowski_task_reconcile_refresh_tool("a" * 24),
+                tasks._grabowski_task_reconcile_refresh_tool("b" * 24),
+            )
+
+        with (
+            patch.object(tasks.operator, "_require_operator_mutation"),
+            patch.object(tasks, "reconcile_tasks_refresh", side_effect=refresh),
+            patch.object(tasks.base, "_append_audit"),
+        ):
+            asyncio.run(run_both())
+
+        self.assertEqual(maximum_active, 1)
 
     def test_reconcile_refresh_isolates_retired_host_and_continues(self) -> None:
         retired = self._start()["task"]

@@ -100,7 +100,7 @@ def _static_tool_guard_requirements() -> tuple[dict[str, tuple[str, ...]], set[s
     for path in sorted((ROOT / "src").glob("grabowski_*.py")):
         module = ast.parse(path.read_text(encoding="utf-8"))
         for node in module.body:
-            if not isinstance(node, ast.FunctionDef):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             tool_name = None
             for decorator in node.decorator_list:
