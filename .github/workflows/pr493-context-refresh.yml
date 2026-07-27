@@ -1,0 +1,53 @@
+name: PR 493 context refresh
+
+on:
+  push:
+    branches:
+      - fix/bureau-pickup-typed-schema-v1
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: fix/bureau-pickup-typed-schema-v1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Regenerate canonical context
+        run: make context-refresh
+      - name: Verify generated scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          allowed='^(contracts/capability-catalog\.v1\.json|contracts/publication-profiles\.v1\.json|docs/generated/operator-context\.md|docs/generated/operator-context\.v1\.json|src/grabowski_coding_agent_catalog_data\.py)$'
+          unexpected="$(git status --porcelain=v1 | sed 's/^...//' | grep -Ev "$allowed" || true)"
+          if [[ -n "$unexpected" ]]; then
+            printf 'Unexpected generated paths:\n%s\n' "$unexpected" >&2
+            exit 1
+          fi
+      - name: Commit generated outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add contracts/capability-catalog.v1.json \
+            contracts/publication-profiles.v1.json \
+            docs/generated/operator-context.md \
+            docs/generated/operator-context.v1.json \
+            src/grabowski_coding_agent_catalog_data.py
+          if git diff --cached --quiet; then
+            echo 'Generated context already current.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: refresh generated operator context'
+          git push origin HEAD:fix/bureau-pickup-typed-schema-v1
