@@ -2897,7 +2897,6 @@ def server_task_lease_delegation_evidence(lease_owner_id: str) -> dict[str, Any]
     }
 
 
-@mcp.tool(name="grabowski_task_start", annotations=MUTATING)
 @_serialize_task_mutation
 def grabowski_task_start(
     host: str,
@@ -3162,7 +3161,6 @@ def grabowski_task_start(
     }
 
 
-@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
 @_serialize_task_mutation
 def grabowski_task_status(task_id: str) -> dict[str, Any]:
     """Observe one persistent task and refresh its recorded state."""
@@ -3186,7 +3184,6 @@ def grabowski_task_status(task_id: str) -> dict[str, Any]:
     return result
 
 
-@mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)
 def grabowski_task_routing_shadow_seal(
     task_id: str,
     outcome: dict[str, Any],
@@ -3263,7 +3260,6 @@ def grabowski_task_routing_shadow_seal(
         "audit": audit,
     }
 
-@mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
 def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     """Read redacted journal output for one local or fleet task."""
     operator._require_operator_capability("durable_job")
@@ -3302,7 +3298,6 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
     }
 
 
-@mcp.tool(name="grabowski_task_cancel", annotations=MUTATING)
 @_serialize_task_mutation
 def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     """Stop one task process group and retain its persistent task record."""
@@ -3353,7 +3348,6 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
     return {"task": _public(stored), "result": result, "audit": audit}
 
 
-@mcp.tool(name="grabowski_task_resume", annotations=MUTATING)
 @_serialize_task_mutation
 def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     """Recreate a missing or stopped task unit from its persistent record."""
@@ -4049,7 +4043,6 @@ async def _grabowski_task_reconcile_tool(
     return await asyncio.to_thread(_task_reconcile_after_guard, auto_resume)
 
 
-@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
 def grabowski_task_list(
     limit: int = DEFAULT_TASK_LIST_LIMIT,
     state: str | None = None,
@@ -4315,6 +4308,128 @@ def grabowski_task_list(
             "recommended_next_action",
             "does_not_establish",
         ),
+    )
+
+
+@mcp.tool(name="grabowski_task_start", annotations=MUTATING)
+async def _grabowski_task_start_tool(
+    host: str,
+    argv: list[str],
+    cwd: str | None = None,
+    runtime_seconds: int = operator.DEFAULT_JOB_RUNTIME,
+    resume_policy: str = "verify-then-retry",
+    cpu_weight: int = 100,
+    io_weight: int = 100,
+    memory_max_bytes: int | None = None,
+    resource_keys: list[str] | None = None,
+    chronik_outbox: bool = False,
+    chronik_outbox_state_root: str | None = None,
+    chronik_operation: str = "other",
+    chronik_component: str = "",
+    chronik_bureau_task_id: str = "",
+    chronik_pr_number: int | None = None,
+    runtime_python: bool = False,
+    route_evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Start one persistent local or fleet task in its own systemd unit.
+
+    Direct local write-capable agent CLIs receive an implicit repository lease
+    unless the caller supplies an explicit path or repository scope. Every
+    task-owned broad repository lease carries a complete whole-repository scope manifest.
+    """
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        grabowski_task_start,
+        host,
+        argv,
+        cwd,
+        runtime_seconds,
+        resume_policy,
+        cpu_weight,
+        io_weight,
+        memory_max_bytes,
+        resource_keys,
+        chronik_outbox,
+        chronik_outbox_state_root,
+        chronik_operation,
+        chronik_component,
+        chronik_bureau_task_id,
+        chronik_pr_number,
+        runtime_python,
+        route_evidence,
+    )
+
+
+@mcp.tool(name="grabowski_task_status", annotations=READ_ONLY)
+async def _grabowski_task_status_tool(task_id: str) -> dict[str, Any]:
+    """Observe one persistent task and refresh its recorded state."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_status, task_id)
+
+
+@mcp.tool(name="grabowski_task_routing_shadow_seal", annotations=MUTATING)
+async def _grabowski_task_routing_shadow_seal_tool(
+    task_id: str,
+    outcome: dict[str, Any],
+    primary_evidence_refs: list[str],
+    execution_provenance: dict[str, Any],
+    semantic_assessments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Seal one independently reviewed direct-task shadow outcome without routing effect."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        grabowski_task_routing_shadow_seal,
+        task_id,
+        outcome,
+        primary_evidence_refs,
+        execution_provenance,
+        semantic_assessments,
+    )
+
+
+@mcp.tool(name="grabowski_task_logs", annotations=READ_ONLY)
+async def _grabowski_task_logs_tool(
+    task_id: str,
+    max_lines: int = 200,
+) -> dict[str, Any]:
+    """Read redacted journal output for one local or fleet task."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_logs, task_id, max_lines)
+
+
+@mcp.tool(name="grabowski_task_cancel", annotations=MUTATING)
+async def _grabowski_task_cancel_tool(task_id: str) -> dict[str, Any]:
+    """Stop one task process group and retain its persistent task record."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_cancel, task_id)
+
+
+@mcp.tool(name="grabowski_task_resume", annotations=MUTATING)
+async def _grabowski_task_resume_tool(task_id: str) -> dict[str, Any]:
+    """Recreate a missing or stopped task unit from its persistent record."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(grabowski_task_resume, task_id)
+
+
+@mcp.tool(name="grabowski_task_list", annotations=READ_ONLY)
+async def _grabowski_task_list_tool(
+    limit: int = DEFAULT_TASK_LIST_LIMIT,
+    state: str | None = None,
+    view: str = "minimal",
+    cursor: str | None = None,
+    fields: list[str] | None = None,
+    schema_only: bool = False,
+) -> dict[str, Any]:
+    """List persistent tasks or inspect store-schema compatibility read-only."""
+    operator._require_operator_capability("durable_job")
+    return await asyncio.to_thread(
+        grabowski_task_list,
+        limit,
+        state,
+        view,
+        cursor,
+        fields,
+        schema_only,
     )
 
 

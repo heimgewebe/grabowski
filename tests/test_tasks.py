@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 from contextlib import closing, contextmanager
 import hashlib
@@ -2140,6 +2141,101 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["released"], [])
         self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:refresh.service"))
+
+    def test_serialized_task_mcp_entrypoints_offload_to_worker_threads(self) -> None:
+        expected = {
+            "grabowski_task_start",
+            "grabowski_task_status",
+            "grabowski_task_routing_shadow_seal",
+            "grabowski_task_logs",
+            "grabowski_task_cancel",
+            "grabowski_task_resume",
+            "grabowski_task_list",
+        }
+        module = ast.parse((SRC / "grabowski_tasks.py").read_text(encoding="utf-8"))
+        observed: set[str] = set()
+        for node in module.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            tool_name = None
+            for decorator in node.decorator_list:
+                if not (
+                    isinstance(decorator, ast.Call)
+                    and isinstance(decorator.func, ast.Attribute)
+                    and decorator.func.attr == "tool"
+                ):
+                    continue
+                for keyword in decorator.keywords:
+                    if (
+                        keyword.arg == "name"
+                        and isinstance(keyword.value, ast.Constant)
+                        and isinstance(keyword.value.value, str)
+                    ):
+                        tool_name = keyword.value.value
+            if tool_name not in expected:
+                continue
+            observed.add(tool_name)
+            self.assertIsInstance(node, ast.AsyncFunctionDef, tool_name)
+            self.assertTrue(
+                any(
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and isinstance(child.func.value, ast.Name)
+                    and child.func.value.id == "asyncio"
+                    and child.func.attr == "to_thread"
+                    for child in ast.walk(node)
+                ),
+                tool_name,
+            )
+        self.assertEqual(observed, expected)
+
+    def test_mcp_task_status_lock_wait_does_not_block_event_loop(self) -> None:
+        task_id = "a" * 24
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+        worker_threads: list[int] = []
+        caller_thread = threading.get_ident()
+
+        def hold_lock() -> None:
+            with tasks.TASK_RECONCILE_LOCK:
+                lock_held.set()
+                release_lock.wait(timeout=2)
+
+        def status(identifier: str) -> dict[str, object]:
+            with tasks.TASK_RECONCILE_LOCK:
+                worker_threads.append(threading.get_ident())
+                return {"task_id": identifier}
+
+        holder = threading.Thread(target=hold_lock)
+        holder.start()
+        self.assertTrue(lock_held.wait(timeout=2))
+        fallback_release = threading.Timer(0.5, release_lock.set)
+
+        async def exercise() -> dict[str, object]:
+            started = time.monotonic()
+            pending = asyncio.create_task(tasks._grabowski_task_status_tool(task_id))
+            await asyncio.sleep(0.05)
+            self.assertLess(time.monotonic() - started, 0.25)
+            self.assertFalse(pending.done())
+            release_lock.set()
+            return await asyncio.wait_for(pending, timeout=2)
+
+        fallback_release.start()
+        try:
+            with (
+                patch.object(tasks.operator, "_require_operator_capability"),
+                patch.object(tasks, "grabowski_task_status", side_effect=status),
+            ):
+                result = asyncio.run(exercise())
+        finally:
+            release_lock.set()
+            fallback_release.cancel()
+            holder.join(timeout=2)
+
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(result, {"task_id": task_id})
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], caller_thread)
 
     def test_mcp_reconcile_refresh_runs_store_work_off_event_loop(self) -> None:
         caller_thread = threading.get_ident()
