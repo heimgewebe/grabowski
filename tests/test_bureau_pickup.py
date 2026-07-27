@@ -64,7 +64,29 @@ class BureauPickupTests(unittest.TestCase):
                     observed[name.value] = annotations.id
         self.assertEqual(expected, observed)
 
+    def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
+        required = {"worker_id", "capabilities", "task_id"}
+        optional = {
+            "resource",
+            "kind",
+            "base_dir",
+            "approval_source",
+            "lease_ttl_seconds",
+            "create_workspace",
+            "repository_scope_manifests",
+            "nonconflict_proofs",
+            "registry_root",
+        }
+        self.assertEqual(required, set(pickup.BureauPickupRequest.__required_keys__))
+        self.assertEqual(optional, set(pickup.BureauPickupRequest.__optional_keys__))
+        self.assertEqual(
+            {"extra": "forbid", "strict": True},
+            pickup.BureauPickupRequest.__pydantic_config__,
+        )
+
     def test_execute_registered_request_schema_is_complete_and_strict(self) -> None:
+        if not hasattr(pickup.mcp, "list_tools"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
         tool = next(
             item
             for item in asyncio.run(pickup.mcp.list_tools())
