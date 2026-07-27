@@ -2215,6 +2215,21 @@ class TaskTests(unittest.TestCase):
 
         self.assertEqual(maximum_active, 1)
 
+    def test_mcp_reconcile_refresh_rechecks_authority_inside_lock(self) -> None:
+        with (
+            patch.object(
+                tasks.operator,
+                "_require_operator_mutation",
+                side_effect=[None, PermissionError("blocked after wait")],
+            ) as require,
+            patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+        ):
+            with self.assertRaisesRegex(PermissionError, "blocked after wait"):
+                asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
+
+        self.assertEqual(require.call_count, 2)
+        refresh.assert_not_called()
+
     def test_reconcile_refresh_isolates_retired_host_and_continues(self) -> None:
         retired = self._start()["task"]
         healthy = self._start()["task"]
