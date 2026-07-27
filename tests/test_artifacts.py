@@ -706,6 +706,9 @@ class ArtifactTests(unittest.TestCase):
                     "git-diff.v1", str(repository), base_commit, head_commit
                 )
 
+    def test_text_artifact_default_count_capacity_exceeds_legacy_limit(self) -> None:
+        self.assertGreater(artifacts.MAX_RETAINED_TEXT_ARTIFACTS, 128)
+
     def test_text_artifact_retention_count_is_fail_closed(self) -> None:
         repository, base_commit, head_commit = self._repository_with_two_commits()
         artifact_root = self.root / "text-artifacts"
