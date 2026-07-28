@@ -234,6 +234,80 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
 
+    def _prepare_pending_terminalization(
+        self,
+        *,
+        terminal_state: str = "failed",
+        prepared_at_unix: int | None = None,
+    ) -> dict[str, object]:
+        started = self._start()["task"]
+        task_id = str(started["task_id"])
+        record = tasks._row_raw(task_id)
+        observation = {
+            "state": terminal_state,
+            "source": "pending-reconcile-fixture",
+        }
+        projection = tasks._terminal_projection(
+            record,
+            terminal_state,
+            observation=observation,
+        )
+        transition = resources.begin_task_terminalization(
+            task_id,
+            int(record["attempt"]),
+            str(record["lease_owner_id"]),
+            terminal_state,
+            tasks._record_resource_keys(record),
+            task_projection=projection,
+            observation_sha256=tasks._sha256_json(observation),
+        )
+        if prepared_at_unix is not None:
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute(
+                    "UPDATE task_terminalizations SET prepared_at_unix=? "
+                    "WHERE task_id=?",
+                    (prepared_at_unix, task_id),
+                )
+                connection.commit()
+            transition = resources.task_terminalization_record(
+                task_id,
+                include_projection=True,
+            )
+        if transition is None:
+            raise AssertionError("pending terminalization fixture disappeared")
+        return transition
+
+    def _store_terminalization_recovery_cycle(
+        self,
+        *,
+        high_water: tuple[int, str],
+        cursor: tuple[int, str],
+    ) -> str:
+        payload = tasks._canonical_json(
+            {
+                "version": tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION,
+                "high_water": {
+                    "prepared_at_unix": high_water[0],
+                    "task_id": high_water[1],
+                },
+                "cursor": {
+                    "prepared_at_unix": cursor[0],
+                    "task_id": cursor[1],
+                },
+            }
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,
+                    payload,
+                ),
+            )
+            connection.commit()
+        return payload
+
     def test_task_start_captures_verified_direct_route_before_launch(self) -> None:
         from tests.test_task_routing_shadow_capture import direct_route_evidence
 
@@ -2721,6 +2795,974 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual([item["task_id"] for item in result["refreshed"]], [healthy["task_id"]])
 
+    def test_bounded_reconcile_cursor_visits_large_store_incrementally(self) -> None:
+        started = [self._start()["task"] for _ in range(5)]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET created_at_unix=100")
+            connection.commit()
+        expected = sorted((100, str(item["task_id"])) for item in started)
+        observed: list[tuple[int, str]] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(
+                (int(record["created_at_unix"]), str(record["task_id"]))
+            )
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        results: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for _ in range(3):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=2))
+
+        self.assertEqual(expected, observed)
+        self.assertEqual(
+            [result["batch"]["examined"] for result in results],
+            [2, 2, 1],
+        )
+        self.assertFalse(results[0]["batch"]["cycle_completed"])
+        self.assertFalse(results[1]["batch"]["cycle_completed"])
+        self.assertTrue(results[2]["batch"]["cycle_completed"])
+        self.assertEqual(
+            [result["batch"]["cycle_phase"] for result in results],
+            [tasks.TASK_RECONCILE_CYCLE_PHASE] * 3,
+        )
+        self.assertEqual(
+            len(
+                {
+                    result["batch"]["cycle_high_water_sequence"]
+                    for result in results
+                }
+            ),
+            1,
+        )
+        self.assertIsNone(results[2]["batch"]["cursor_after"])
+        with sqlite3.connect(self.database) as connection:
+            stored_cursor = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_CURSOR_METADATA_KEY,),
+            ).fetchone()
+        self.assertIsNone(stored_cursor)
+
+    def test_terminalization_recovery_large_backlog_is_strictly_bounded(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(7)
+        ]
+        results: list[dict[str, object]] = []
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            for _ in range(7):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=2))
+
+        recovery = [
+            result["batch"]["terminalization_recovery"]
+            for result in results
+        ]
+        self.assertEqual([1] * 7, [item["examined"] for item in recovery])
+        self.assertTrue(all(item["limit"] == 1 for item in recovery))
+        self.assertTrue(all(result["batch"]["examined"] <= 1 for result in results))
+        self.assertTrue(
+            all(result["batch"]["total_examined"] <= 2 for result in results)
+        )
+        self.assertTrue(
+            all(result["batch"]["total_examined_limit"] == 2 for result in results)
+        )
+        self.assertEqual(
+            {str(item["task_id"]) for item in pending},
+            {
+                task_id
+                for item in recovery
+                for task_id in item["recovered"]
+            },
+        )
+        self.assertEqual([], [item for item in recovery if item["failed"]])
+        self.assertTrue(recovery[-1]["cycle_completed"])
+
+    def test_reconcile_shared_budget_bounds_simultaneous_full_backlogs(self) -> None:
+        for index in range(4):
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+        for _ in range(4):
+            self._start()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=4)
+        batch = result["batch"]
+        self.assertEqual(2, batch["terminalization_recovery"]["examined"])
+        self.assertEqual(2, batch["task_examined"])
+        self.assertEqual(batch["examined"], batch["task_examined"])
+        self.assertEqual(4, batch["total_examined"])
+        self.assertEqual(4, batch["total_examined_limit"])
+
+    def test_reconcile_shared_budget_uses_full_terminalization_only_capacity(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(6)
+        ]
+        with sqlite3.connect(self.database) as connection:
+            connection.executemany(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                [(item["task_id"],) for item in pending],
+            )
+            connection.commit()
+        with patch.object(tasks, "_reconcile_observation") as observe:
+            result = tasks.reconcile_tasks_refresh(batch_size=4)
+        observe.assert_not_called()
+        batch = result["batch"]
+        self.assertEqual(4, batch["terminalization_recovery"]["examined"])
+        self.assertEqual(0, batch["task_examined"])
+        self.assertEqual(4, batch["total_examined"])
+
+    def test_reconcile_shared_budget_uses_full_task_only_capacity(self) -> None:
+        for _ in range(6):
+            self._start()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=4)
+        batch = result["batch"]
+        self.assertEqual(0, batch["terminalization_recovery"]["examined"])
+        self.assertEqual(4, batch["task_examined"])
+        self.assertEqual(4, batch["total_examined"])
+
+    def test_reconcile_shared_budget_assigns_partial_remaining_capacity(self) -> None:
+        pending = self._prepare_pending_terminalization(prepared_at_unix=100)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='completed' WHERE task_id=?",
+                (pending["task_id"],),
+            )
+            connection.commit()
+        for _ in range(6):
+            self._start()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=4)
+        batch = result["batch"]
+        self.assertEqual(1, batch["terminalization_recovery"]["examined"])
+        self.assertEqual(3, batch["task_examined"])
+        self.assertEqual(3, batch["task_limit"])
+        self.assertEqual(4, batch["total_examined"])
+
+    def test_reconcile_shared_budget_isolates_poison_first_terminalization(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(3)
+        ]
+        poison_id = str(pending[0]["task_id"])
+        original_apply = tasks._apply_terminalization_projection
+
+        def apply(terminalization: dict[str, object], *, recovered: bool = False):
+            if terminalization["task_id"] == poison_id:
+                raise RuntimeError("poison terminalization")
+            return original_apply(terminalization, recovered=recovered)
+
+        for _ in range(4):
+            self._start()
+        with (
+            patch.object(
+                tasks,
+                "_apply_terminalization_projection",
+                side_effect=apply,
+            ),
+            patch.object(
+                tasks,
+                "_reconcile_observation",
+                return_value={
+                    "state": "running",
+                    "properties": {"ActiveState": "active"},
+                    "probe": _launcher(),
+                    "observer": {"kind": "test"},
+                    "observed_at_unix": 123,
+                },
+            ),
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=4)
+        batch = result["batch"]
+        recovery = batch["terminalization_recovery"]
+        self.assertEqual(poison_id, recovery["failed"][0]["task_id"])
+        self.assertEqual(1, len(recovery["recovered"]))
+        self.assertEqual(4, batch["total_examined"])
+        self.assertEqual(4, batch["total_examined_limit"])
+
+    def test_reconcile_batch_one_rotates_fairly_between_full_phases(self) -> None:
+        for index in range(2):
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+        for _ in range(2):
+            self._start()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            first = tasks.reconcile_tasks_refresh(batch_size=1)
+            second = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(
+            [
+                tasks.TASK_RECONCILE_PHASE_TERMINALIZATION,
+                tasks.TASK_RECONCILE_PHASE_TASKS,
+            ],
+            [first["batch"]["phase_first"], second["batch"]["phase_first"]],
+        )
+        self.assertEqual(
+            [1, 0],
+            [
+                first["batch"]["terminalization_recovery"]["examined"],
+                second["batch"]["terminalization_recovery"]["examined"],
+            ],
+        )
+        self.assertEqual(
+            [0, 1],
+            [first["batch"]["task_examined"], second["batch"]["task_examined"]],
+        )
+        self.assertEqual(
+            [1, 1],
+            [
+                first["batch"]["total_examined"],
+                second["batch"]["total_examined"],
+            ],
+        )
+
+    def test_default_systemd_batch_size_is_exact_shared_maximum(self) -> None:
+        for index in range(51):
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+        for _ in range(51):
+            self._start()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            result = tasks.reconcile_tasks_refresh(
+                batch_size=tasks.DEFAULT_TASK_RECONCILE_BATCH_SIZE
+            )
+        batch = result["batch"]
+        self.assertEqual(50, batch["terminalization_recovery"]["examined"])
+        self.assertEqual(50, batch["task_examined"])
+        self.assertEqual(100, batch["total_examined"])
+        self.assertEqual(100, batch["total_examined_limit"])
+
+    def test_poison_terminalization_does_not_starve_later_rows_or_task_scan(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(3)
+        ]
+        poison_id = str(pending[0]["task_id"])
+        later_ids = {str(item["task_id"]) for item in pending[1:]}
+        original_apply = tasks._apply_terminalization_projection
+
+        def apply(terminalization: dict[str, object], *, recovered: bool = False):
+            if terminalization["task_id"] == poison_id:
+                raise RuntimeError("poison terminalization")
+            return original_apply(terminalization, recovered=recovered)
+
+        task_observations: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            task_observations.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        results: list[dict[str, object]] = []
+        with (
+            patch.object(
+                tasks,
+                "_apply_terminalization_projection",
+                side_effect=apply,
+            ),
+            patch.object(tasks, "_reconcile_observation", side_effect=observe),
+        ):
+            for _ in range(6):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=1))
+
+        recovery = [
+            result["batch"]["terminalization_recovery"]
+            for result in results
+        ]
+        self.assertEqual(poison_id, recovery[0]["failed"][0]["task_id"])
+        self.assertEqual(
+            later_ids,
+            {
+                task_id
+                for item in recovery
+                for task_id in item["recovered"]
+            },
+        )
+        self.assertTrue(
+            all(result["batch"]["total_examined"] == 1 for result in results)
+        )
+        self.assertTrue(
+            any(result["batch"]["task_examined"] == 1 for result in results)
+        )
+        self.assertTrue(
+            any(result["batch"]["cursor_after"] is not None for result in results)
+        )
+        self.assertEqual(
+            "leases_revoked",
+            resources.task_terminalization_record(poison_id)["phase"],
+        )
+        for task_id in later_ids:
+            self.assertEqual(
+                "projected",
+                resources.task_terminalization_record(task_id)["phase"],
+            )
+
+    def test_terminalization_recovery_defers_insertions_and_survives_deletion(self) -> None:
+        observation_patcher = patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        )
+        observation_patcher.start()
+        self.addCleanup(observation_patcher.stop)
+        initial = [
+            self._prepare_pending_terminalization(prepared_at_unix=100)
+            for _ in range(3)
+        ]
+        first = tasks.reconcile_tasks_refresh(batch_size=1)
+        first_recovery = first["batch"]["terminalization_recovery"]
+        recovered_first = set(first_recovery["recovered"])
+        remaining = [
+            str(item["task_id"])
+            for item in initial
+            if str(item["task_id"]) not in recovered_first
+        ]
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (remaining[0],),
+            )
+            connection.commit()
+        behind = self._prepare_pending_terminalization(prepared_at_unix=99)
+        ahead = self._prepare_pending_terminalization(prepared_at_unix=101)
+
+        cycle = [first]
+        while not cycle[-1]["batch"]["terminalization_recovery"][
+            "cycle_completed"
+        ]:
+            cycle.append(tasks.reconcile_tasks_refresh(batch_size=1))
+        cycle_recovered = {
+            task_id
+            for result in cycle
+            for task_id in result["batch"]["terminalization_recovery"][
+                "recovered"
+            ]
+        }
+        self.assertNotIn(str(behind["task_id"]), cycle_recovered)
+        self.assertNotIn(str(ahead["task_id"]), cycle_recovered)
+        self.assertEqual(
+            {tuple(first_recovery["cycle_high_water"])},
+            {
+                tuple(
+                    result["batch"]["terminalization_recovery"][
+                        "cycle_high_water"
+                    ]
+                )
+                for result in cycle
+            },
+        )
+
+        next_cycle: list[dict[str, object]] = []
+        for _ in range(4):
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+            next_cycle.append(result)
+            if result["batch"]["terminalization_recovery"]["cycle_completed"]:
+                break
+        self.assertEqual(
+            {str(behind["task_id"]), str(ahead["task_id"])},
+            {
+                task_id
+                for result in next_cycle
+                for task_id in result["batch"]["terminalization_recovery"][
+                    "recovered"
+                ]
+            },
+        )
+        self.assertTrue(
+            next_cycle[-1]["batch"]["terminalization_recovery"][
+                "cycle_completed"
+            ]
+        )
+
+    def test_terminalization_recovery_cycle_completes_under_sustained_arrivals(self) -> None:
+        initial = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(3)
+        ]
+        results: list[dict[str, object]] = []
+        arrivals: list[dict[str, object]] = []
+        for index in range(6):
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+            results.append(result)
+            arrivals.append(
+                self._prepare_pending_terminalization(
+                    prepared_at_unix=1_000 + index
+                )
+            )
+            if result["batch"]["terminalization_recovery"]["cycle_completed"]:
+                break
+        recovery = [
+            result["batch"]["terminalization_recovery"]
+            for result in results
+        ]
+        self.assertTrue(recovery[-1]["cycle_completed"])
+        self.assertEqual(
+            {tuple(recovery[0]["cycle_high_water"])},
+            {tuple(item["cycle_high_water"]) for item in recovery},
+        )
+        self.assertEqual(
+            {str(item["task_id"]) for item in initial},
+            {
+                task_id
+                for item in recovery
+                for task_id in item["recovered"]
+            },
+        )
+        self.assertTrue(
+            all(
+                resources.task_terminalization_record(str(item["task_id"]))[
+                    "phase"
+                ]
+                == "leases_revoked"
+                for item in arrivals
+            )
+        )
+
+    def test_terminalization_recovery_crash_before_cursor_save_replays_from_truth(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(2)
+        ]
+        with (
+            patch.object(
+                tasks,
+                "_save_terminalization_recovery_cycle",
+                side_effect=RuntimeError("simulated terminal cursor crash"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "terminal cursor crash"),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        phases = {
+            str(item["task_id"]): resources.task_terminalization_record(
+                str(item["task_id"])
+            )["phase"]
+            for item in pending
+        }
+        self.assertEqual(1, list(phases.values()).count("projected"))
+        self.assertEqual(1, list(phases.values()).count("leases_revoked"))
+
+        replay = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(
+            1,
+            len(
+                replay["batch"]["terminalization_recovery"]["recovered"]
+            ),
+        )
+        self.assertTrue(
+            replay["batch"]["terminalization_recovery"]["cycle_completed"]
+        )
+        self.assertTrue(
+            all(
+                resources.task_terminalization_record(str(item["task_id"]))[
+                    "phase"
+                ]
+                == "projected"
+                for item in pending
+            )
+        )
+
+    def test_terminalization_recovery_output_contract_is_deterministic(self) -> None:
+        self._prepare_pending_terminalization(prepared_at_unix=100)
+        result = tasks.reconcile_tasks_refresh(batch_size=1)
+        recovery = result["batch"]["terminalization_recovery"]
+        self.assertEqual(
+            [
+                "cursor_after",
+                "cursor_before",
+                "cycle_completed",
+                "cycle_high_water",
+                "examined",
+                "failed",
+                "limit",
+                "recovered",
+            ],
+            sorted(recovery),
+        )
+        self.assertEqual(1, recovery["limit"])
+        self.assertEqual(1, recovery["examined"])
+        self.assertEqual([], recovery["failed"])
+
+    def test_bounded_reconcile_defers_insertions_behind_and_ahead_of_cursor(self) -> None:
+        initial = [self._start()["task"] for _ in range(4)]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET created_at_unix=100")
+            connection.commit()
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            first = tasks.reconcile_tasks_refresh(batch_size=2)
+            behind = self._start()["task"]
+            ahead = self._start()["task"]
+            with sqlite3.connect(self.database) as connection:
+                connection.execute(
+                    "UPDATE tasks SET created_at_unix=99 WHERE task_id=?",
+                    (behind["task_id"],),
+                )
+                connection.execute(
+                    "UPDATE tasks SET created_at_unix=101 WHERE task_id=?",
+                    (ahead["task_id"],),
+                )
+                connection.commit()
+            second = tasks.reconcile_tasks_refresh(batch_size=2)
+
+        initial_ids = {str(item["task_id"]) for item in initial}
+        self.assertEqual(set(observed), initial_ids)
+        self.assertFalse(first["batch"]["cycle_completed"])
+        self.assertTrue(second["batch"]["cycle_completed"])
+        self.assertEqual(
+            first["batch"]["cycle_high_water_sequence"],
+            second["batch"]["cycle_high_water_sequence"],
+        )
+        self.assertNotIn(str(behind["task_id"]), observed)
+        self.assertNotIn(str(ahead["task_id"]), observed)
+
+        observed.clear()
+        results: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for _ in range(3):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=2))
+        self.assertTrue(results[-1]["batch"]["cycle_completed"])
+        self.assertIn(str(behind["task_id"]), observed)
+        self.assertIn(str(ahead["task_id"]), observed)
+
+    def test_bounded_reconcile_replays_before_cursor_save_and_advances_after(self) -> None:
+        started = [self._start()["task"] for _ in range(3)]
+        expected = [
+            str(item["task_id"])
+            for item in sorted(
+                started,
+                key=lambda item: (
+                    int(item["created_at_unix"]),
+                    str(item["task_id"]),
+                ),
+            )
+        ]
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with (
+            patch.object(tasks, "_reconcile_observation", side_effect=observe),
+            patch.object(
+                tasks,
+                "_save_reconcile_cycle",
+                side_effect=RuntimeError("simulated crash before cursor save"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash"),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual([expected[0]], observed)
+
+        observed.clear()
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            first_saved = tasks.reconcile_tasks_refresh(batch_size=1)
+            second_saved = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(expected[:2], observed)
+        self.assertEqual(first_saved["batch"]["cursor_before"], None)
+        self.assertEqual(
+            second_saved["batch"]["cursor_before"],
+            first_saved["batch"]["cursor_after"],
+        )
+
+    def test_bounded_reconcile_completion_is_truthful_after_deletion(self) -> None:
+        started = [self._start()["task"] for _ in range(3)]
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            first = tasks.reconcile_tasks_refresh(batch_size=1)
+        remaining = {
+            str(item["task_id"]) for item in started
+        } - set(observed)
+        with sqlite3.connect(self.database) as connection:
+            connection.executemany(
+                "DELETE FROM tasks WHERE task_id=?",
+                [(task_id,) for task_id in remaining],
+            )
+            connection.commit()
+        replacement = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=0 WHERE task_id=?",
+                (replacement["task_id"],),
+            )
+            connection.commit()
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            completed = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertFalse(first["batch"]["cycle_completed"])
+        self.assertTrue(completed["batch"]["cycle_completed"])
+        self.assertEqual(0, completed["batch"]["examined"])
+        self.assertIsNone(completed["batch"]["cursor_after"])
+        self.assertNotIn(str(replacement["task_id"]), observed)
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(str(replacement["task_id"]), observed[-1])
+
+    def test_bounded_reconcile_cycle_completes_under_sustained_tail_arrivals(self) -> None:
+        initial = [self._start()["task"] for _ in range(3)]
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        arrivals: list[dict[str, object]] = []
+        first_cycle: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for index in range(3):
+                first_cycle.append(
+                    tasks.reconcile_tasks_refresh(batch_size=1)
+                )
+                arrival = self._start()["task"]
+                arrivals.append(arrival)
+                with sqlite3.connect(self.database) as connection:
+                    connection.execute(
+                        "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                        (1_000 + index, arrival["task_id"]),
+                    )
+                    connection.commit()
+
+        self.assertTrue(first_cycle[-1]["batch"]["cycle_completed"])
+        self.assertEqual(
+            {
+                result["batch"]["cycle_high_water_sequence"]
+                for result in first_cycle
+            },
+            {first_cycle[0]["batch"]["cycle_high_water_sequence"]},
+        )
+        self.assertEqual(
+            set(observed), {str(item["task_id"]) for item in initial}
+        )
+
+        observed.clear()
+        second_cycle: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for index in range(6):
+                second_cycle.append(
+                    tasks.reconcile_tasks_refresh(batch_size=1)
+                )
+                arrival = self._start()["task"]
+                with sqlite3.connect(self.database) as connection:
+                    connection.execute(
+                        "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                        (2_000 + index, arrival["task_id"]),
+                    )
+                    connection.commit()
+
+        self.assertTrue(second_cycle[-1]["batch"]["cycle_completed"])
+        self.assertEqual(
+            {
+                result["batch"]["cycle_high_water_sequence"]
+                for result in second_cycle
+            },
+            {second_cycle[0]["batch"]["cycle_high_water_sequence"]},
+        )
+        self.assertTrue(
+            {str(item["task_id"]) for item in arrivals}.issubset(observed)
+        )
+
+    def test_bounded_reconcile_migrates_legacy_cursor_by_replaying_safely(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (
+                    tasks.TASK_RECONCILE_CURSOR_METADATA_KEY,
+                    tasks._canonical_json(
+                        {
+                            "created_at_unix": int(started["created_at_unix"]),
+                            "task_id": str(started["task_id"]),
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ) as observe:
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+        observe.assert_called_once()
+        self.assertIsNone(result["batch"]["cursor_before"])
+        self.assertTrue(result["batch"]["cycle_completed"])
+
+    def test_bounded_reconcile_rejects_malformed_cursor_without_observation(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (tasks.TASK_RECONCILE_CURSOR_METADATA_KEY, '{"task_id":"bad"}'),
+            )
+            connection.commit()
+        with (
+            patch.object(tasks, "_reconcile_observation") as observe,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Task reconcile cursor metadata is invalid",
+            ),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=2)
+        observe.assert_not_called()
+        self.assertEqual(
+            "running",
+            tasks._row_raw(str(started["task_id"]))["state"],
+        )
+
+    def test_reconcile_rejects_terminalization_cursor_after_high_water_without_deletion(self) -> None:
+        started = self._start()["task"]
+        stored = self._store_terminalization_recovery_cycle(
+            high_water=(100, "a" * 24),
+            cursor=(100, "b" * 24),
+        )
+        with (
+            patch.object(
+                resources,
+                "pending_task_terminalizations",
+            ) as pending,
+            patch.object(tasks, "_reconcile_observation") as observe,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "terminalization recovery cursor metadata is inconsistent",
+            ),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        pending.assert_not_called()
+        observe.assert_not_called()
+        with sqlite3.connect(self.database) as connection:
+            current = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            ).fetchone()
+        self.assertEqual((stored,), current)
+        self.assertEqual(
+            "running",
+            tasks._row_raw(str(started["task_id"]))["state"],
+        )
+
+    def test_reconcile_rejects_contradictory_terminalization_page_without_deletion(self) -> None:
+        stored = self._store_terminalization_recovery_cycle(
+            high_water=(100, "b" * 24),
+            cursor=(100, "a" * 24),
+        )
+        contradictory_page = {
+            "terminalizations": [],
+            "limit": 1,
+            "examined": 0,
+            "cursor_before": (100, "a" * 24),
+            "cursor_after": (100, "c" * 24),
+            "high_water": (100, "b" * 24),
+            "cycle_completed": False,
+        }
+        with (
+            patch.object(
+                resources,
+                "pending_task_terminalizations_exist",
+                return_value=True,
+            ),
+            patch.object(
+                resources,
+                "pending_task_terminalizations",
+                return_value=contradictory_page,
+            ),
+            patch.object(tasks, "_apply_terminalization_projection") as apply,
+            patch.object(tasks, "_reconcile_observation") as observe,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "terminalization recovery page is inconsistent",
+            ),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        apply.assert_not_called()
+        observe.assert_not_called()
+        with sqlite3.connect(self.database) as connection:
+            current = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            ).fetchone()
+        self.assertEqual((stored,), current)
+
+    def test_reconcile_accepts_terminalization_cursor_equal_to_high_water(self) -> None:
+        boundary = (100, "a" * 24)
+        self._store_terminalization_recovery_cycle(
+            high_water=boundary,
+            cursor=boundary,
+        )
+        result = tasks.reconcile_tasks_refresh(batch_size=1)
+        recovery = result["batch"]["terminalization_recovery"]
+        self.assertEqual(0, recovery["examined"])
+        self.assertTrue(recovery["cycle_completed"])
+        with sqlite3.connect(self.database) as connection:
+            stored = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            ).fetchone()
+        self.assertIsNone(stored)
+
+    def test_terminalization_recovery_deleted_high_water_completes_cycle(self) -> None:
+        self._prepare_pending_terminalization(prepared_at_unix=100)
+        high_water = self._prepare_pending_terminalization(prepared_at_unix=101)
+        first = tasks._recover_pending_task_terminalizations(limit=1)
+        self.assertFalse(first["cycle_completed"])
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (high_water["task_id"],),
+            )
+            connection.commit()
+        completed = tasks._recover_pending_task_terminalizations(limit=1)
+        self.assertEqual(0, completed["examined"])
+        self.assertTrue(completed["cycle_completed"])
+        with sqlite3.connect(self.database) as connection:
+            stored = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            ).fetchone()
+        self.assertIsNone(stored)
+
+    def test_reconcile_rejects_malformed_terminalization_cursor_before_reads(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (
+                    tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,
+                    '{"version":1,"high_water":{},"cursor":{}}',
+                ),
+            )
+            connection.commit()
+        with (
+            patch.object(
+                resources,
+                "pending_task_terminalizations",
+            ) as pending,
+            patch.object(tasks, "_reconcile_observation") as observe,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "terminalization recovery cursor metadata is invalid",
+            ),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        pending.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual(
+            "running",
+            tasks._row_raw(str(started["task_id"]))["state"],
+        )
+
     def test_reconcile_resume_keeps_converged_retry_safe_failure_eligible(self) -> None:
         started = self._start()["task"]
         with sqlite3.connect(self.database) as connection:
@@ -2838,6 +3880,29 @@ class TaskTests(unittest.TestCase):
         refresh.assert_called_once_with(task_id=task_id)
         resume.assert_not_called()
         audit.assert_not_called()
+
+    def test_reconcile_cli_refresh_defaults_to_bounded_cursor_mode(self) -> None:
+        refreshed = {"mode": "refresh", "scanned": 0}
+        with (
+            patch.object(
+                task_reconcile_cli.grabowski_tasks,
+                "reconcile_tasks_refresh",
+                return_value=refreshed,
+            ) as refresh,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                task_reconcile_cli.main(["--mode", "refresh"]),
+                0,
+            )
+        refresh.assert_called_once_with(
+            batch_size=task_reconcile_cli.DEFAULT_REFRESH_BATCH_SIZE
+        )
+        self.assertEqual(100, task_reconcile_cli.DEFAULT_REFRESH_BATCH_SIZE)
+        self.assertIn(
+            "in total across terminalization recovery and task scanning",
+            " ".join(task_reconcile_cli.parser().format_help().split()),
+        )
 
     def test_reconcile_cli_resume_requires_reason(self) -> None:
         with patch("sys.stderr", new_callable=io.StringIO):
@@ -3700,7 +4765,15 @@ class RuntimeContractTests(unittest.TestCase):
         legacy = "--auto-" + "resume"
         self.assertNotIn(legacy, source)
         self.assertIn("--mode refresh", source)
+        self.assertIn("--batch-size 100", source)
         self.assertNotIn("--mode resume", source)
+
+    def test_reconcile_timer_waits_from_prior_run_completion(self) -> None:
+        source = (
+            ROOT / "systemd" / "grabowski-reconcile-tasks.timer.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OnUnitInactiveSec=1min", source)
+        self.assertNotIn("OnUnitActiveSec=", source)
 
     def test_shared_command_identity_is_in_runtime_contract(self) -> None:
         contract = json.loads(
