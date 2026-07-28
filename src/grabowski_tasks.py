@@ -50,6 +50,21 @@ TASK_DB = Path(
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
 TASK_LIST_SCAN_BATCH = 100
+TASK_RECONCILE_BATCH_LIMIT = 500
+DEFAULT_TASK_RECONCILE_BATCH_SIZE = 100
+TASK_RECONCILE_CURSOR_METADATA_KEY = "task_reconcile_refresh_cursor_v1"
+TASK_RECONCILE_CYCLE_VERSION = 2
+TASK_RECONCILE_CYCLE_PHASE = "scan_to_high_water"
+TASK_RECONCILE_SEQUENCE_COUNTER_KEY = "task_reconcile_sequence_counter_v1"
+TASK_RECONCILE_SEQUENCE_KEY_PREFIX = "task_reconcile_sequence_v1:"
+TASK_RECONCILE_SEQUENCE_MAX = (1 << 63) - 1
+TASK_RECONCILE_PHASE_TURN_METADATA_KEY = "task_reconcile_phase_turn_v1"
+TASK_RECONCILE_PHASE_TERMINALIZATION = "terminalization"
+TASK_RECONCILE_PHASE_TASKS = "tasks"
+TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY = (
+    "task_terminalization_recovery_cursor_v1"
+)
+TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION = 1
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
@@ -2330,13 +2345,210 @@ def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
     return _apply_terminalization_projection(transition, recovered=True)
 
 
+def _terminalization_recovery_position(
+    value: Any,
+) -> tuple[int, str]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"prepared_at_unix", "task_id"}
+        or isinstance(value["prepared_at_unix"], bool)
+        or not isinstance(value["prepared_at_unix"], int)
+        or value["prepared_at_unix"] < 0
+        or not isinstance(value["task_id"], str)
+        or TASK_ID.fullmatch(value["task_id"]) is None
+    ):
+        raise RuntimeError("Task terminalization recovery cursor metadata is invalid")
+    return int(value["prepared_at_unix"]), str(value["task_id"])
+
+
+def _load_terminalization_recovery_cycle() -> dict[str, Any] | None:
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "Task terminalization recovery cursor metadata is invalid"
+        ) from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"version", "high_water", "cursor"}
+        or payload["version"] != TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION
+    ):
+        raise RuntimeError("Task terminalization recovery cursor metadata is invalid")
+    high_water = _terminalization_recovery_position(payload["high_water"])
+    cursor = _terminalization_recovery_position(payload["cursor"])
+    if cursor > high_water:
+        raise RuntimeError(
+            "Task terminalization recovery cursor metadata is inconsistent"
+        )
+    return {
+        "version": TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION,
+        "high_water": high_water,
+        "cursor": cursor,
+    }
+
+
+def _save_terminalization_recovery_cycle(
+    cycle: dict[str, Any] | None,
+) -> None:
+    with _database_connection() as connection:
+        if cycle is None:
+            connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,),
+            )
+            return
+        high_water = cycle["high_water"]
+        cursor = cycle["cursor"]
+        payload = _canonical_json(
+            {
+                "version": TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION,
+                "high_water": {
+                    "prepared_at_unix": high_water[0],
+                    "task_id": high_water[1],
+                },
+                "cursor": {
+                    "prepared_at_unix": cursor[0],
+                    "task_id": cursor[1],
+                },
+            }
+        )
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY, payload),
+        )
+
+
+def _validate_terminalization_recovery_page(
+    page: dict[str, Any],
+    *,
+    cursor_before: tuple[int, str] | None,
+    high_water: tuple[int, str] | None,
+) -> None:
+    page_high_water = page.get("high_water")
+    cursor_after = page.get("cursor_after")
+    cycle_completed = page.get("cycle_completed")
+    if (
+        page.get("cursor_before") != cursor_before
+        or (
+            high_water is not None
+            and page_high_water != high_water
+        )
+        or not isinstance(cycle_completed, bool)
+    ):
+        raise RuntimeError("Task terminalization recovery page is inconsistent")
+    for field, value in (
+        ("high_water", page_high_water),
+        ("cursor_after", cursor_after),
+    ):
+        if value is None:
+            continue
+        try:
+            resources._task_terminalization_cursor(value, field=field)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Task terminalization recovery page is inconsistent"
+            ) from exc
+    if (
+        cursor_before is not None
+        and page_high_water is not None
+        and cursor_before > page_high_water
+    ):
+        raise RuntimeError("Task terminalization recovery page is inconsistent")
+    if cursor_after is not None and (
+        page_high_water is None
+        or cursor_after > page_high_water
+        or (
+            cursor_before is not None
+            and cursor_after <= cursor_before
+        )
+    ):
+        raise RuntimeError("Task terminalization recovery page is inconsistent")
+    if cycle_completed:
+        if cursor_after is not None:
+            raise RuntimeError(
+                "Task terminalization recovery page is inconsistent"
+            )
+    elif page_high_water is None or cursor_after is None:
+        raise RuntimeError("Task terminalization recovery page is inconsistent")
+
+
 @_serialize_task_mutation
-def _recover_pending_task_terminalizations() -> list[str]:
+def _recover_pending_task_terminalizations(
+    *,
+    limit: int = DEFAULT_TASK_RECONCILE_BATCH_SIZE,
+) -> dict[str, Any]:
+    bounded_limit = _validate_reconcile_phase_limit(limit)
+    cycle = _load_terminalization_recovery_cycle()
+    cursor_before = None if cycle is None else cycle["cursor"]
+    high_water = None if cycle is None else cycle["high_water"]
+    if bounded_limit == 0:
+        return {
+            "limit": 0,
+            "examined": 0,
+            "recovered": [],
+            "failed": [],
+            "cursor_before": cursor_before,
+            "cursor_after": cursor_before,
+            "cycle_high_water": high_water,
+            "cycle_completed": False,
+        }
+    page = resources.pending_task_terminalizations(
+        limit=bounded_limit,
+        cursor=cursor_before,
+        high_water=high_water,
+    )
+    _validate_terminalization_recovery_page(
+        page,
+        cursor_before=cursor_before,
+        high_water=high_water,
+    )
     recovered: list[str] = []
-    for terminalization in resources.pending_task_terminalizations():
-        updated = _apply_terminalization_projection(terminalization, recovered=True)
+    failed: list[dict[str, str]] = []
+    for terminalization in page["terminalizations"]:
+        task_id = str(terminalization["task_id"])
+        try:
+            updated = _apply_terminalization_projection(
+                terminalization,
+                recovered=True,
+            )
+        except Exception as exc:
+            failed.append(
+                {
+                    "task_id": task_id,
+                    "error_type": type(exc).__name__,
+                    "reason": _redact_reason(str(exc)),
+                }
+            )
+            continue
         recovered.append(str(updated["task_id"]))
-    return recovered
+    cycle_after = None
+    if not page["cycle_completed"]:
+        if page["high_water"] is None or page["cursor_after"] is None:
+            raise RuntimeError("Task terminalization recovery page is inconsistent")
+        cycle_after = {
+            "version": TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION,
+            "high_water": page["high_water"],
+            "cursor": page["cursor_after"],
+        }
+    _save_terminalization_recovery_cycle(cycle_after)
+    return {
+        "limit": bounded_limit,
+        "examined": int(page["examined"]),
+        "recovered": recovered,
+        "failed": failed,
+        "cursor_before": cursor_before,
+        "cursor_after": page["cursor_after"],
+        "cycle_high_water": page["high_water"],
+        "cycle_completed": bool(page["cycle_completed"]),
+    }
 
 
 @_serialize_task_mutation
@@ -3261,6 +3473,7 @@ def grabowski_task_start(
             """,
                 record,
             )
+            _register_task_reconcile_sequence(connection, task_id)
             connection.commit()
     except Exception:
         if task_resources:
@@ -3607,7 +3820,6 @@ def _reconcile_candidate_rows(
         record = _row(task_id)
         rows = [record] if record["state"] in candidate_states else []
     else:
-        _recover_pending_task_terminalizations()
         with _database_connection() as connection:
             selected = connection.execute(
                 "SELECT * FROM tasks WHERE state IN ('launching', 'running', 'outcome_unknown', 'interrupted', 'failed', 'timed_out', 'signalled') "
@@ -3626,6 +3838,415 @@ def _reconcile_candidate_rows(
                 continue
         candidates.append(record)
     return candidates
+
+
+def _validate_reconcile_batch_size(batch_size: int) -> int:
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or not 1 <= batch_size <= TASK_RECONCILE_BATCH_LIMIT
+    ):
+        raise ValueError(
+            f"batch_size must be between 1 and {TASK_RECONCILE_BATCH_LIMIT}"
+        )
+    return batch_size
+
+
+def _validate_reconcile_phase_limit(limit: int) -> int:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 0 <= limit <= TASK_RECONCILE_BATCH_LIMIT
+    ):
+        raise ValueError(
+            f"phase limit must be between 0 and {TASK_RECONCILE_BATCH_LIMIT}"
+        )
+    return limit
+
+
+def _load_reconcile_sequence_counter(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_SEQUENCE_COUNTER_KEY,),
+    ).fetchone()
+    if row is None:
+        return 0
+    raw = str(row[0])
+    if not raw.isdecimal():
+        raise RuntimeError("Task reconcile sequence metadata is invalid")
+    value = int(raw)
+    if value < 0 or value > TASK_RECONCILE_SEQUENCE_MAX:
+        raise RuntimeError("Task reconcile sequence metadata is invalid")
+    return value
+
+
+def _register_task_reconcile_sequence(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> int:
+    identifier = _validate_task_id(task_id)
+    current = _load_reconcile_sequence_counter(connection)
+    if current >= TASK_RECONCILE_SEQUENCE_MAX:
+        raise RuntimeError("Task reconcile sequence is exhausted")
+    sequence = current + 1
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_SEQUENCE_COUNTER_KEY, str(sequence)),
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (f"{TASK_RECONCILE_SEQUENCE_KEY_PREFIX}{identifier}", str(sequence)),
+    )
+    return sequence
+
+
+def _load_reconcile_cycle(
+    connection: sqlite3.Connection,
+) -> dict[str, Any] | None:
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_CURSOR_METADATA_KEY,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError("Task reconcile cursor metadata is ambiguous")
+    try:
+        payload = json.loads(str(rows[0][0]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Task reconcile cursor metadata is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Task reconcile cursor metadata is invalid")
+    if set(payload) == {"created_at_unix", "task_id"}:
+        created_at_unix = payload["created_at_unix"]
+        task_id = payload["task_id"]
+        if (
+            isinstance(created_at_unix, bool)
+            or not isinstance(created_at_unix, int)
+            or created_at_unix < 0
+            or not isinstance(task_id, str)
+            or TASK_ID.fullmatch(task_id) is None
+        ):
+            raise RuntimeError("Task reconcile cursor metadata is invalid")
+        # A v1 cursor has no insertion high-water mark. Restarting the bounded
+        # scan may replay rows, but cannot falsely claim a completed cycle.
+        return None
+    if set(payload) != {
+        "version",
+        "phase",
+        "high_water_sequence",
+        "cursor",
+    }:
+        raise RuntimeError("Task reconcile cursor metadata is invalid")
+    version = payload["version"]
+    phase = payload["phase"]
+    high_water_sequence = payload["high_water_sequence"]
+    cursor_payload = payload["cursor"]
+    if (
+        type(version) is not int
+        or version != TASK_RECONCILE_CYCLE_VERSION
+        or phase != TASK_RECONCILE_CYCLE_PHASE
+        or type(high_water_sequence) is not int
+        or high_water_sequence < 0
+        or high_water_sequence > TASK_RECONCILE_SEQUENCE_MAX
+    ):
+        raise RuntimeError("Task reconcile cursor metadata is invalid")
+    cursor: tuple[int, str] | None = None
+    if cursor_payload is not None:
+        if not isinstance(cursor_payload, dict) or set(cursor_payload) != {
+            "created_at_unix",
+            "task_id",
+        }:
+            raise RuntimeError("Task reconcile cursor metadata is invalid")
+        created_at_unix = cursor_payload["created_at_unix"]
+        task_id = cursor_payload["task_id"]
+        if (
+            isinstance(created_at_unix, bool)
+            or not isinstance(created_at_unix, int)
+            or created_at_unix < 0
+            or not isinstance(task_id, str)
+            or TASK_ID.fullmatch(task_id) is None
+        ):
+            raise RuntimeError("Task reconcile cursor metadata is invalid")
+        cursor = (created_at_unix, task_id)
+    return {
+        "version": version,
+        "phase": phase,
+        "high_water_sequence": high_water_sequence,
+        "cursor": cursor,
+    }
+
+
+def _write_reconcile_cycle(
+    connection: sqlite3.Connection,
+    cycle: dict[str, Any] | None,
+) -> None:
+    if cycle is None:
+        connection.execute(
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_CURSOR_METADATA_KEY,),
+        )
+        return
+    cursor = cycle["cursor"]
+    cursor_payload = (
+        None
+        if cursor is None
+        else {"created_at_unix": cursor[0], "task_id": cursor[1]}
+    )
+    payload = _canonical_json(
+        {
+            "version": cycle["version"],
+            "phase": cycle["phase"],
+            "high_water_sequence": cycle["high_water_sequence"],
+            "cursor": cursor_payload,
+        }
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_CURSOR_METADATA_KEY, payload),
+    )
+
+
+def _load_reconcile_phase_turn(
+    connection: sqlite3.Connection,
+) -> str:
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_PHASE_TURN_METADATA_KEY,),
+    ).fetchall()
+    if not rows:
+        return TASK_RECONCILE_PHASE_TERMINALIZATION
+    if len(rows) != 1 or str(rows[0][0]) not in {
+        TASK_RECONCILE_PHASE_TERMINALIZATION,
+        TASK_RECONCILE_PHASE_TASKS,
+    }:
+        raise RuntimeError("Task reconcile phase turn metadata is invalid")
+    return str(rows[0][0])
+
+
+def _write_reconcile_phase_turn(
+    connection: sqlite3.Connection,
+    phase_turn: str,
+) -> None:
+    if phase_turn not in {
+        TASK_RECONCILE_PHASE_TERMINALIZATION,
+        TASK_RECONCILE_PHASE_TASKS,
+    }:
+        raise RuntimeError("Task reconcile phase turn is invalid")
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_PHASE_TURN_METADATA_KEY, phase_turn),
+    )
+
+
+def _save_reconcile_cycle(
+    cycle: dict[str, Any] | None,
+    *,
+    phase_turn: str,
+) -> None:
+    with _database_connection() as connection:
+        _write_reconcile_cycle(connection, cycle)
+        _write_reconcile_phase_turn(connection, phase_turn)
+
+
+def _ensure_reconcile_cycle(
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    cycle = _load_reconcile_cycle(connection)
+    if cycle is not None:
+        return cycle
+    cycle = {
+        "version": TASK_RECONCILE_CYCLE_VERSION,
+        "phase": TASK_RECONCILE_CYCLE_PHASE,
+        "high_water_sequence": _load_reconcile_sequence_counter(connection),
+        "cursor": None,
+    }
+    # Persist the cycle boundary before any external observation. A crash
+    # from this point replays the same bounded cycle.
+    _write_reconcile_cycle(connection, cycle)
+    return cycle
+
+
+def _select_reconcile_task_rows(
+    connection: sqlite3.Connection,
+    cycle: dict[str, Any],
+    *,
+    limit: int,
+) -> list[sqlite3.Row]:
+    candidate_clause = (
+        "state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
+        "'failed', 'timed_out', 'signalled')"
+    )
+    parameters: list[Any] = [
+        TASK_RECONCILE_SEQUENCE_KEY_PREFIX,
+        cycle["high_water_sequence"],
+    ]
+    cursor = cycle["cursor"]
+    cursor_clause = ""
+    if cursor is not None:
+        cursor_clause = (
+            " AND (created_at_unix > ? OR "
+            "(created_at_unix = ? AND task_id > ?))"
+        )
+        parameters.extend((cursor[0], cursor[0], cursor[1]))
+    parameters.append(limit)
+    return connection.execute(
+        "SELECT tasks.* FROM tasks LEFT JOIN metadata AS reconcile_order "
+        "ON reconcile_order.key = ? || tasks.task_id "
+        f"WHERE {candidate_clause} "
+        "AND (reconcile_order.value IS NULL "
+        f"OR CAST(reconcile_order.value AS INTEGER) <= ?){cursor_clause} "
+        "ORDER BY created_at_unix, task_id LIMIT ?",
+        parameters,
+    ).fetchall()
+
+
+def _reconcile_task_phase_has_work() -> bool:
+    with _database_connection() as connection:
+        cycle = _ensure_reconcile_cycle(connection)
+        return bool(
+            _select_reconcile_task_rows(
+                connection,
+                cycle,
+                limit=1,
+            )
+        )
+
+
+def _reconcile_task_candidate_page(limit: int) -> dict[str, Any]:
+    bounded_limit = _validate_reconcile_phase_limit(limit)
+    with _database_connection() as connection:
+        cycle = _ensure_reconcile_cycle(connection)
+        cursor_before = cycle["cursor"]
+        selected = _select_reconcile_task_rows(
+            connection,
+            cycle,
+            limit=bounded_limit + 1,
+        )
+    has_more = len(selected) > bounded_limit
+    examined_rows = selected[:bounded_limit]
+    examined = [dict(row) for row in examined_rows]
+    cursor_after = (
+        (
+            int(examined[-1]["created_at_unix"]),
+            str(examined[-1]["task_id"]),
+        )
+        if examined and has_more
+        else None
+    )
+    cycle_after = (
+        {
+            **cycle,
+            "cursor": cursor_after,
+        }
+        if has_more
+        else None
+    )
+    candidates: list[dict[str, Any]] = []
+    for record in examined:
+        terminalization = resources.task_terminalization_record(
+            str(record["task_id"])
+        )
+        if (
+            terminalization is not None
+            and terminalization["phase"] != "projected"
+        ):
+            # Pending transitions are owned exclusively by the separately
+            # bounded fair recovery cursor above. Advancing the task cursor
+            # past them preserves task-cycle fairness without exceeding the
+            # terminalization recovery budget through _set_state().
+            continue
+        if _is_terminal_state(str(record["state"])):
+            terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+            if terminal_valid and lease_valid:
+                continue
+        candidates.append(record)
+    return {
+        "rows": candidates,
+        "examined": len(examined),
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "cycle_wrapped": False,
+        "cycle_phase": cycle["phase"],
+        "cycle_high_water_sequence": cycle["high_water_sequence"],
+        "cycle_completed": not has_more,
+        "cycle_after": cycle_after,
+        "limit": bounded_limit,
+    }
+
+
+def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
+    limit = _validate_reconcile_batch_size(batch_size)
+    # Validate persisted terminal recovery truth before either phase can
+    # observe or mutate task state, even when the task phase has first turn.
+    terminalization_cycle = _load_terminalization_recovery_cycle()
+    with _database_connection() as connection:
+        stored_phase_turn = _load_reconcile_phase_turn(connection)
+    terminalization_has_work = resources.pending_task_terminalizations_exist(
+        cursor=(
+            None
+            if terminalization_cycle is None
+            else terminalization_cycle["cursor"]
+        ),
+        high_water=(
+            None
+            if terminalization_cycle is None
+            else terminalization_cycle["high_water"]
+        ),
+    )
+    task_has_work = _reconcile_task_phase_has_work()
+    both_phases_have_work = terminalization_has_work and task_has_work
+    if not both_phases_have_work:
+        phase_first = TASK_RECONCILE_PHASE_TERMINALIZATION
+        terminalization_recovery = _recover_pending_task_terminalizations(
+            limit=limit
+        )
+        task_page = _reconcile_task_candidate_page(
+            limit - int(terminalization_recovery["examined"])
+        )
+    else:
+        phase_first = stored_phase_turn
+        first_phase_limit = (limit + 1) // 2
+        if phase_first == TASK_RECONCILE_PHASE_TERMINALIZATION:
+            terminalization_recovery = _recover_pending_task_terminalizations(
+                limit=first_phase_limit
+            )
+            task_page = _reconcile_task_candidate_page(
+                limit - int(terminalization_recovery["examined"])
+            )
+        else:
+            task_page = _reconcile_task_candidate_page(first_phase_limit)
+            terminalization_recovery = _recover_pending_task_terminalizations(
+                limit=limit - int(task_page["examined"])
+            )
+    total_examined = int(task_page["examined"]) + int(
+        terminalization_recovery["examined"]
+    )
+    if total_examined > limit:
+        raise RuntimeError("Task reconcile shared batch budget was exceeded")
+    task_examined = int(task_page["examined"])
+    if both_phases_have_work:
+        phase_next = (
+            TASK_RECONCILE_PHASE_TASKS
+            if phase_first == TASK_RECONCILE_PHASE_TERMINALIZATION
+            else TASK_RECONCILE_PHASE_TERMINALIZATION
+        )
+    else:
+        phase_next = stored_phase_turn
+    return {
+        **task_page,
+        "limit": limit,
+        "task_limit": int(task_page["limit"]),
+        "task_examined": task_examined,
+        "terminalization_recovery": terminalization_recovery,
+        "phase_first": phase_first,
+        "phase_next": phase_next,
+        "total_examined": total_examined,
+        "total_examined_limit": limit,
+    }
 
 
 def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
@@ -3878,12 +4499,31 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
 
 
 @_serialize_task_mutation
-def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
+def reconcile_tasks_refresh(
+    *,
+    task_id: str = "",
+    batch_size: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
     if task_id:
         _validate_task_id(task_id)
-    rows = _reconcile_candidate_rows(task_id)
+    if batch_size is not None and task_id:
+        raise ValueError("batch_size cannot be combined with task_id")
+    batch = (
+        None
+        if task_id
+        else _reconcile_candidate_batch(
+            DEFAULT_TASK_RECONCILE_BATCH_SIZE
+            if batch_size is None
+            else batch_size
+        )
+    )
+    rows = (
+        list(batch["rows"])
+        if batch is not None
+        else _reconcile_candidate_rows(task_id)
+    )
     refreshed: list[dict[str, Any]] = []
     released: list[str] = []
     denied: list[dict[str, Any]] = []
@@ -3912,7 +4552,12 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
         public = _public(stored)
         public["lease_maintenance"] = lease_maintenance
         refreshed.append(public)
-    return {
+    if batch is not None:
+        _save_reconcile_cycle(
+            batch["cycle_after"],
+            phase_turn=batch["phase_next"],
+        )
+    result = {
         "mode": "refresh",
         "task_id": task_id,
         "scanned": len(rows),
@@ -3922,6 +4567,30 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
         "blocked": denied,
         "checked_at_unix": _now(),
     }
+    if batch is not None:
+        result["batch"] = {
+            key: batch[key]
+            for key in (
+                "limit",
+                "task_limit",
+                "examined",
+                "task_examined",
+                "cursor_before",
+                "cursor_after",
+                "cycle_wrapped",
+                "cycle_phase",
+                "cycle_high_water_sequence",
+                "cycle_completed",
+                "phase_first",
+                "phase_next",
+                "total_examined",
+                "total_examined_limit",
+            )
+        }
+        result["batch"]["terminalization_recovery"] = batch[
+            "terminalization_recovery"
+        ]
+    return result
 
 
 @_serialize_task_mutation

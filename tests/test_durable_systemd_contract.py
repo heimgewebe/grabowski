@@ -52,7 +52,7 @@ class DurableSystemdContractTests(unittest.TestCase):
             ROOT / "systemd" / "grabowski-tunnel-watchdog.timer.example"
         ).read_text(encoding="utf-8")
         self.assertIn("OnCalendar=*-*-* *:*:00", operator)
-        self.assertIn("OnCalendar=*-*-* *:*:00,30", tunnel)
+        self.assertIn("OnCalendar=*-*-* *:0/2:00", tunnel)
         self.assertNotIn("OnUnitActiveSec=", operator)
         self.assertNotIn("OnUnitActiveSec=", tunnel)
         self.assertIn("Persistent=true", operator)
@@ -60,7 +60,7 @@ class DurableSystemdContractTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze unavailable")
     def test_watchdog_calendar_cadences_are_accepted_by_systemd(self) -> None:
-        for expression in ("*-*-* *:*:00", "*-*-* *:*:00,30"):
+        for expression in ("*-*-* *:*:00", "*-*-* *:0/2:00"):
             with self.subTest(expression=expression):
                 completed = subprocess.run(
                     ["systemd-analyze", "calendar", expression],
@@ -99,6 +99,7 @@ class DurableSystemdContractTests(unittest.TestCase):
             ROOT / "systemd" / "grabowski-tunnel-watchdog.service.example"
         ).read_text(encoding="utf-8")
         self.assertIn("--failure-threshold 3", tunnel)
+        self.assertIn("SuccessExitStatus=1 5", tunnel)
 
     def test_timers_keep_decorrelation_while_watchdog_owns_backoff(self) -> None:
         for name in (

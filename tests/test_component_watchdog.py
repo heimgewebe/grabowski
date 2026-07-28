@@ -19,6 +19,7 @@ sys.modules["component_watchdog_test"] = watchdog
 spec.loader.exec_module(watchdog)
 
 HEALTH_PAYLOAD = {"healthy": True, "audit_valid": True}
+BOOT_ID = "11111111-2222-3333-8444-555555555555"
 
 
 def fake_stdio_server_code(**config: object) -> str:
@@ -222,6 +223,70 @@ class McpLifecycleProbeTests(unittest.TestCase):
 
 
 class ControlPlanePollProbeTests(unittest.TestCase):
+    def readiness_probe(
+        self,
+        *,
+        boot_id: str = BOOT_ID,
+        pid: int = 321,
+        start_ticks: int = 77,
+        age_seconds: float = 120.0,
+    ) -> object:
+        return watchdog.ProbeResult(
+            "indeterminate",
+            ("readiness-failed",),
+            pid=pid,
+            age_seconds=age_seconds,
+            start_ticks=start_ticks,
+            boot_id=boot_id,
+        )
+
+    def tunnel_identity(
+        self,
+        *,
+        boot_id: str = BOOT_ID,
+        pid: int = 321,
+        start_ticks: int = 77,
+        age_seconds: float = 120.0,
+    ) -> object:
+        return watchdog.TunnelProcessIdentity(
+            boot_id,
+            pid,
+            start_ticks,
+            age_seconds,
+        )
+
+    def classify(
+        self,
+        probe: object,
+        state: object,
+        *,
+        dependency_failure: str | None,
+        identity: object | None = None,
+        identity_failure: str | None = None,
+    ) -> tuple[object, object]:
+        stable_identity = self.tunnel_identity() if identity is None else identity
+        with (
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                return_value=dependency_failure,
+            ),
+            patch.object(
+                watchdog,
+                "tunnel_service_process_identity",
+                return_value=(stable_identity, identity_failure),
+            ),
+        ):
+            return watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                state,
+                service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                profile=watchdog.DEFAULT_PROFILE,
+                startup_grace=20,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+            )
+
     def test_recent_control_plane_poll_is_healthy(self) -> None:
         metrics = (
             "# TYPE commands_poll_last_successful_timestamp_seconds gauge\n"
@@ -257,6 +322,61 @@ class ControlPlanePollProbeTests(unittest.TestCase):
                     watchdog.DEFAULT_METRICS_URL, 2, 90, now=1091
                 ),
             )
+
+    def test_tunnel_identity_reprobe_requires_stable_systemd_process(self) -> None:
+        running = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "MainPID": "321",
+        }
+        replaced = {**running, "MainPID": "322"}
+        with (
+            patch.object(
+                watchdog,
+                "service_properties",
+                side_effect=[running, replaced],
+            ),
+            patch.object(watchdog, "read_boot_id", return_value=BOOT_ID),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=120.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+        ):
+            identity, failure = watchdog.tunnel_service_process_identity(
+                watchdog.DEFAULT_TUNNEL_SERVICE,
+                watchdog.DEFAULT_PROFILE,
+                20,
+            )
+        self.assertIsNone(identity)
+        self.assertEqual(
+            "tunnel-service-changed-after-dependency-probe",
+            failure,
+        )
+
+    def test_tunnel_identity_reprobe_rejects_startup_grace(self) -> None:
+        running = {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "MainPID": "321",
+        }
+        with (
+            patch.object(watchdog, "service_properties", return_value=running),
+            patch.object(watchdog, "read_boot_id", return_value=BOOT_ID),
+            patch.object(watchdog, "process_start_ticks", return_value=77),
+            patch.object(watchdog, "process_age_seconds", return_value=1.0),
+            patch.object(watchdog, "tunnel_identity_ok", return_value=True),
+        ):
+            identity, failure = watchdog.tunnel_service_process_identity(
+                watchdog.DEFAULT_TUNNEL_SERVICE,
+                watchdog.DEFAULT_PROFILE,
+                20,
+            )
+        self.assertIsNone(identity)
+        self.assertEqual(
+            "tunnel-service-startup-grace-after-dependency-probe",
+            failure,
+        )
 
     def test_metric_parser_ignores_nonfinite_and_other_series(self) -> None:
         metrics = (
@@ -389,6 +509,188 @@ class ControlPlanePollProbeTests(unittest.TestCase):
             )
         self.assertEqual("indeterminate", result.status)
         self.assertEqual(("readiness-failed",), result.reasons)
+
+    def test_missing_readiness_dependency_is_distinct_and_non_restartable(self) -> None:
+        result, state = self.classify(
+            self.readiness_probe(),
+            watchdog.WatchdogState(),
+            dependency_failure="mcp-http-request-failed",
+        )
+        self.assertEqual("dependency-unavailable", result.status)
+        self.assertEqual(("readiness-dependency-unavailable",), result.reasons)
+        self.assertEqual(321, result.pid)
+        self.assertEqual(BOOT_ID, state.readiness_dependency_unavailable_boot_id)
+        self.assertEqual(321, state.readiness_dependency_unavailable_pid)
+        self.assertEqual(
+            77, state.readiness_dependency_unavailable_start_ticks
+        )
+        self.assertFalse(
+            state._readiness_dependency_evidence_loaded_from_disk
+        )
+
+    def test_normal_readiness_backpressure_is_not_restartable(self) -> None:
+        result, state = self.classify(
+            self.readiness_probe(),
+            watchdog.WatchdogState(),
+            dependency_failure=None,
+        )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(("readiness-failed",), result.reasons)
+        self.assertIsNone(state.readiness_dependency_unavailable_pid)
+
+    def test_dependency_recovery_requires_persisted_then_loaded_evidence(self) -> None:
+        probe = self.readiness_probe()
+        outage, fresh_state = self.classify(
+            probe,
+            watchdog.WatchdogState(),
+            dependency_failure="mcp-http-request-failed",
+        )
+        self.assertEqual("dependency-unavailable", outage.status)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            watchdog.save_state(path, fresh_state)
+            loaded_state = watchdog.load_state(path)
+        result, recovered_state = self.classify(
+            probe,
+            loaded_state,
+            dependency_failure=None,
+        )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(
+            ("readiness-stale-after-dependency-recovered",),
+            result.reasons,
+        )
+        self.assertTrue(
+            recovered_state._readiness_dependency_evidence_loaded_from_disk
+        )
+
+    def test_fresh_in_memory_evidence_never_authorizes_recovery(self) -> None:
+        with self.assertRaises(TypeError):
+            watchdog.WatchdogState(
+                _readiness_dependency_evidence_loaded_from_disk=True,
+            )
+        probe = self.readiness_probe()
+        _, state = self.classify(
+            probe,
+            watchdog.WatchdogState(),
+            dependency_failure="mcp-http-request-failed",
+        )
+        recovered, state = self.classify(
+            probe,
+            state,
+            dependency_failure=None,
+        )
+        self.assertEqual("indeterminate", recovered.status)
+        self.assertEqual(("readiness-failed",), recovered.reasons)
+        self.assertFalse(
+            state._readiness_dependency_evidence_loaded_from_disk
+        )
+
+    def test_reentrant_dependency_probe_does_not_manufacture_disk_evidence(self) -> None:
+        probe = self.readiness_probe()
+        with (
+            patch.object(
+                watchdog,
+                "mcp_http_probe",
+                side_effect=[
+                    "mcp-http-request-failed",
+                    "mcp-http-request-failed",
+                    None,
+                ],
+            ),
+            patch.object(
+                watchdog,
+                "tunnel_service_process_identity",
+                return_value=(self.tunnel_identity(), None),
+            ),
+        ):
+            state = watchdog.WatchdogState()
+            results = []
+            for _ in range(3):
+                result, state = watchdog.classify_tunnel_readiness_dependency(
+                    probe,
+                    state,
+                    service=watchdog.DEFAULT_TUNNEL_SERVICE,
+                    profile=watchdog.DEFAULT_PROFILE,
+                    startup_grace=20,
+                    mcp_url=watchdog.DEFAULT_MCP_URL,
+                    timeout=2,
+                )
+                results.append(result.status)
+        self.assertEqual(
+            ["dependency-unavailable", "dependency-unavailable", "indeterminate"],
+            results,
+        )
+        self.assertFalse(
+            state._readiness_dependency_evidence_loaded_from_disk
+        )
+
+    def test_reboot_pid_reuse_invalidates_loaded_dependency_evidence(self) -> None:
+        state = watchdog.WatchdogState(
+            readiness_dependency_unavailable_boot_id=BOOT_ID,
+            readiness_dependency_unavailable_pid=321,
+            readiness_dependency_unavailable_start_ticks=77,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            watchdog.save_state(path, state)
+            loaded_state = watchdog.load_state(path)
+        new_boot = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        result, state = self.classify(
+            self.readiness_probe(boot_id=new_boot),
+            loaded_state,
+            dependency_failure=None,
+            identity=self.tunnel_identity(boot_id=new_boot),
+        )
+        self.assertEqual("indeterminate", result.status)
+        self.assertIsNone(state.readiness_dependency_unavailable_boot_id)
+        self.assertIsNone(state.readiness_dependency_unavailable_pid)
+
+    def test_process_replacement_during_dependency_probe_fails_safe(self) -> None:
+        result, state = self.classify(
+            self.readiness_probe(),
+            watchdog.WatchdogState(),
+            dependency_failure="mcp-http-request-failed",
+            identity=self.tunnel_identity(pid=322, start_ticks=91),
+        )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(
+            ("tunnel-service-changed-after-dependency-probe",),
+            result.reasons,
+        )
+        self.assertIsNone(state.readiness_dependency_unavailable_pid)
+
+    def test_post_dependency_startup_grace_fails_safe(self) -> None:
+        result, state = self.classify(
+            self.readiness_probe(),
+            watchdog.WatchdogState(),
+            dependency_failure=None,
+            identity_failure=(
+                "tunnel-service-startup-grace-after-dependency-probe"
+            ),
+        )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(
+            ("tunnel-service-startup-grace-after-dependency-probe",),
+            result.reasons,
+        )
+        self.assertIsNone(state.readiness_dependency_unavailable_pid)
+
+    def test_unprovable_post_dependency_identity_fails_safe(self) -> None:
+        result, state = self.classify(
+            self.readiness_probe(),
+            watchdog.WatchdogState(),
+            dependency_failure=None,
+            identity_failure=(
+                "tunnel-service-identity-unavailable-after-dependency-probe"
+            ),
+        )
+        self.assertEqual("indeterminate", result.status)
+        self.assertEqual(
+            ("tunnel-service-identity-unavailable-after-dependency-probe",),
+            result.reasons,
+        )
+        self.assertIsNone(state.readiness_dependency_unavailable_pid)
 
     def test_readiness_failure_with_stale_poll_remains_restartable(self) -> None:
         with (
@@ -1072,9 +1374,86 @@ class StateFileTests(unittest.TestCase):
     def test_state_roundtrip_preserves_backoff_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
-            original = watchdog.WatchdogState(1, [10, 20], 4, 5000, 9)
+            original = watchdog.WatchdogState(
+                1,
+                [10, 20],
+                4,
+                5000,
+                9,
+                readiness_dependency_unavailable_boot_id=BOOT_ID,
+                readiness_dependency_unavailable_pid=321,
+                readiness_dependency_unavailable_start_ticks=77,
+            )
             watchdog.save_state(path, original)
-            self.assertEqual(original, watchdog.load_state(path))
+            loaded = watchdog.load_state(path)
+            self.assertEqual(original, loaded)
+            self.assertTrue(
+                loaded._readiness_dependency_evidence_loaded_from_disk
+            )
+
+    def test_legacy_dependency_identity_is_loaded_but_not_trusted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(
+                '{"consecutive_failures":0,"restart_timestamps":[],'
+                '"readiness_dependency_unavailable_pid":321,'
+                '"readiness_dependency_unavailable_start_ticks":77}',
+                encoding="utf-8",
+            )
+            loaded = watchdog.load_state(path)
+        self.assertIsNone(loaded.readiness_dependency_unavailable_boot_id)
+        self.assertIsNone(loaded.readiness_dependency_unavailable_pid)
+        self.assertFalse(
+            loaded._readiness_dependency_evidence_loaded_from_disk
+        )
+
+    def test_malformed_dependency_boot_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(
+                '{"consecutive_failures":0,"restart_timestamps":[],'
+                '"readiness_dependency_unavailable_boot_id":"not-a-boot-id",'
+                '"readiness_dependency_unavailable_pid":321,'
+                '"readiness_dependency_unavailable_start_ticks":77}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                watchdog.WatchdogError, "invalid-state-shape"
+            ):
+                watchdog.load_state(path)
+
+    def test_partial_dependency_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text(
+                '{"consecutive_failures":0,"restart_timestamps":[],'
+                '"readiness_dependency_unavailable_pid":321}',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                watchdog.WatchdogError, "invalid-state-shape"
+            ):
+                watchdog.load_state(path)
+
+    def test_crash_before_atomic_replace_leaves_no_authorizing_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            state = watchdog.WatchdogState(
+                readiness_dependency_unavailable_boot_id=BOOT_ID,
+                readiness_dependency_unavailable_pid=321,
+                readiness_dependency_unavailable_start_ticks=77,
+            )
+            with (
+                patch.object(
+                    watchdog.os,
+                    "replace",
+                    side_effect=RuntimeError("simulated crash before replace"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "simulated crash"),
+            ):
+                watchdog.save_state(path, state)
+            self.assertFalse(path.exists())
+            self.assertEqual(watchdog.WatchdogState(), watchdog.load_state(path))
 
 
 class ConnectorSnapshotRefreshTests(unittest.TestCase):
@@ -1171,6 +1550,50 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.assertEqual(watchdog.DEFAULT_BACKOFF_BASE, args.backoff_base)
         self.assertEqual(watchdog.DEFAULT_BACKOFF_MAX, args.backoff_max)
         self.assertGreaterEqual(args.backoff_max, args.backoff_base)
+
+    def test_dependency_outage_has_structured_nonfailure_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp]
+                )
+            )
+            probe = watchdog.ProbeResult(
+                "indeterminate",
+                ("readiness-failed",),
+                pid=321,
+                age_seconds=120.0,
+                start_ticks=77,
+                boot_id=BOOT_ID,
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "mcp_http_probe",
+                    return_value="mcp-http-request-failed",
+                ),
+                patch.object(
+                    watchdog,
+                    "tunnel_service_process_identity",
+                    return_value=(
+                        watchdog.TunnelProcessIdentity(
+                            BOOT_ID, 321, 77, 120.0
+                        ),
+                        None,
+                    ),
+                ),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(watchdog, "emit") as emit,
+            ):
+                result = watchdog.run_watchdog(args)
+
+        self.assertEqual(watchdog.DEPENDENCY_UNAVAILABLE_EXIT, result)
+        restart.assert_not_called()
+        self.assertEqual(
+            "grabowski.component_watchdog.dependency_unavailable",
+            emit.call_args.args[0],
+        )
 
     def test_restart_service_queues_nonblocking_restart(self) -> None:
         with patch.object(watchdog.subprocess, "run") as run:

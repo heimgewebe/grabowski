@@ -11,6 +11,7 @@ MODE_CHECK = "check"
 MODE_REFRESH = "refresh"
 MODE_RESUME = "resume"
 MAX_RESUMES_LIMIT = 50
+DEFAULT_REFRESH_BATCH_SIZE = grabowski_tasks.DEFAULT_TASK_RECONCILE_BATCH_SIZE
 
 
 def _bounded_max_resumes(value: str) -> int:
@@ -23,6 +24,20 @@ def _bounded_max_resumes(value: str) -> int:
     if not 1 <= parsed <= MAX_RESUMES_LIMIT:
         raise argparse.ArgumentTypeError(
             "--max-resumes must be an integer between 1 and 50"
+        )
+    return parsed
+
+
+def _bounded_batch_size(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--batch-size must be an integer between 1 and 500"
+        ) from exc
+    if not 1 <= parsed <= grabowski_tasks.TASK_RECONCILE_BATCH_LIMIT:
+        raise argparse.ArgumentTypeError(
+            "--batch-size must be an integer between 1 and 500"
         )
     return parsed
 
@@ -44,6 +59,16 @@ def parser() -> argparse.ArgumentParser:
         "--task-id",
         default="",
         help="Optional 24-hex task id. Defaults to all eligible task records.",
+    )
+    result.add_argument(
+        "--batch-size",
+        type=_bounded_batch_size,
+        default=DEFAULT_REFRESH_BATCH_SIZE,
+        help=(
+            "Maximum records examined in total across terminalization recovery "
+            "and task scanning per cursor-bound refresh run. "
+            "Ignored for a targeted --task-id refresh."
+        ),
     )
     result.add_argument(
         "--max-resumes",
@@ -103,7 +128,11 @@ def run(arguments: argparse.Namespace) -> dict[str, object]:
     if arguments.mode == MODE_CHECK:
         return grabowski_tasks.reconcile_tasks_check(task_id=arguments.task_id)
     if arguments.mode == MODE_REFRESH:
-        return grabowski_tasks.reconcile_tasks_refresh(task_id=arguments.task_id)
+        if arguments.task_id:
+            return grabowski_tasks.reconcile_tasks_refresh(task_id=arguments.task_id)
+        return grabowski_tasks.reconcile_tasks_refresh(
+            batch_size=arguments.batch_size
+        )
     if arguments.mode == MODE_RESUME:
         if not arguments.reason.strip():
             raise ValueError("--reason is required for --mode resume")
