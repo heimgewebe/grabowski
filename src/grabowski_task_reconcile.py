@@ -11,7 +11,7 @@ MODE_CHECK = "check"
 MODE_REFRESH = "refresh"
 MODE_RESUME = "resume"
 MAX_RESUMES_LIMIT = 50
-DEFAULT_REFRESH_BATCH_SIZE = 100
+DEFAULT_REFRESH_BATCH_SIZE = grabowski_tasks.DEFAULT_TASK_RECONCILE_BATCH_SIZE
 
 
 def _bounded_max_resumes(value: str) -> int:

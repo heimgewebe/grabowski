@@ -234,6 +234,49 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
         return result
 
+    def _prepare_pending_terminalization(
+        self,
+        *,
+        terminal_state: str = "failed",
+        prepared_at_unix: int | None = None,
+    ) -> dict[str, object]:
+        started = self._start()["task"]
+        task_id = str(started["task_id"])
+        record = tasks._row_raw(task_id)
+        observation = {
+            "state": terminal_state,
+            "source": "pending-reconcile-fixture",
+        }
+        projection = tasks._terminal_projection(
+            record,
+            terminal_state,
+            observation=observation,
+        )
+        transition = resources.begin_task_terminalization(
+            task_id,
+            int(record["attempt"]),
+            str(record["lease_owner_id"]),
+            terminal_state,
+            tasks._record_resource_keys(record),
+            task_projection=projection,
+            observation_sha256=tasks._sha256_json(observation),
+        )
+        if prepared_at_unix is not None:
+            with sqlite3.connect(self.resource_database) as connection:
+                connection.execute(
+                    "UPDATE task_terminalizations SET prepared_at_unix=? "
+                    "WHERE task_id=?",
+                    (prepared_at_unix, task_id),
+                )
+                connection.commit()
+            transition = resources.task_terminalization_record(
+                task_id,
+                include_projection=True,
+            )
+        if transition is None:
+            raise AssertionError("pending terminalization fixture disappeared")
+        return transition
+
     def test_task_start_captures_verified_direct_route_before_launch(self) -> None:
         from tests.test_task_routing_shadow_capture import direct_route_evidence
 
@@ -2779,6 +2822,301 @@ class TaskTests(unittest.TestCase):
             ).fetchone()
         self.assertIsNone(stored_cursor)
 
+    def test_terminalization_recovery_large_backlog_is_strictly_bounded(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(7)
+        ]
+        results: list[dict[str, object]] = []
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ):
+            for _ in range(4):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=2))
+
+        recovery = [
+            result["batch"]["terminalization_recovery"]
+            for result in results
+        ]
+        self.assertEqual([2, 2, 2, 1], [item["examined"] for item in recovery])
+        self.assertTrue(all(item["limit"] == 2 for item in recovery))
+        self.assertTrue(all(result["batch"]["examined"] <= 2 for result in results))
+        self.assertTrue(
+            all(result["batch"]["total_examined"] <= 4 for result in results)
+        )
+        self.assertTrue(
+            all(result["batch"]["total_examined_limit"] == 4 for result in results)
+        )
+        self.assertEqual(
+            {str(item["task_id"]) for item in pending},
+            {
+                task_id
+                for item in recovery
+                for task_id in item["recovered"]
+            },
+        )
+        self.assertEqual([], [item for item in recovery if item["failed"]])
+        self.assertTrue(recovery[-1]["cycle_completed"])
+
+    def test_poison_terminalization_does_not_starve_later_rows_or_task_scan(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(3)
+        ]
+        poison_id = str(pending[0]["task_id"])
+        later_ids = {str(item["task_id"]) for item in pending[1:]}
+        original_apply = tasks._apply_terminalization_projection
+
+        def apply(terminalization: dict[str, object], *, recovered: bool = False):
+            if terminalization["task_id"] == poison_id:
+                raise RuntimeError("poison terminalization")
+            return original_apply(terminalization, recovered=recovered)
+
+        task_observations: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            task_observations.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        results: list[dict[str, object]] = []
+        with (
+            patch.object(
+                tasks,
+                "_apply_terminalization_projection",
+                side_effect=apply,
+            ),
+            patch.object(tasks, "_reconcile_observation", side_effect=observe),
+        ):
+            for _ in range(4):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=1))
+
+        recovery = [
+            result["batch"]["terminalization_recovery"]
+            for result in results
+        ]
+        self.assertEqual(poison_id, recovery[0]["failed"][0]["task_id"])
+        self.assertEqual(
+            later_ids,
+            {
+                task_id
+                for item in recovery
+                for task_id in item["recovered"]
+            },
+        )
+        self.assertTrue(all(result["batch"]["examined"] == 1 for result in results))
+        self.assertTrue(
+            any(result["batch"]["cursor_after"] is not None for result in results)
+        )
+        self.assertEqual(
+            "leases_revoked",
+            resources.task_terminalization_record(poison_id)["phase"],
+        )
+        for task_id in later_ids:
+            self.assertEqual(
+                "projected",
+                resources.task_terminalization_record(task_id)["phase"],
+            )
+
+    def test_terminalization_recovery_defers_insertions_and_survives_deletion(self) -> None:
+        observation_patcher = patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        )
+        observation_patcher.start()
+        self.addCleanup(observation_patcher.stop)
+        initial = [
+            self._prepare_pending_terminalization(prepared_at_unix=100)
+            for _ in range(3)
+        ]
+        first = tasks.reconcile_tasks_refresh(batch_size=1)
+        first_recovery = first["batch"]["terminalization_recovery"]
+        recovered_first = set(first_recovery["recovered"])
+        remaining = [
+            str(item["task_id"])
+            for item in initial
+            if str(item["task_id"]) not in recovered_first
+        ]
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (remaining[0],),
+            )
+            connection.commit()
+        behind = self._prepare_pending_terminalization(prepared_at_unix=99)
+        ahead = self._prepare_pending_terminalization(prepared_at_unix=101)
+
+        cycle = [first]
+        while not cycle[-1]["batch"]["terminalization_recovery"][
+            "cycle_completed"
+        ]:
+            cycle.append(tasks.reconcile_tasks_refresh(batch_size=1))
+        cycle_recovered = {
+            task_id
+            for result in cycle
+            for task_id in result["batch"]["terminalization_recovery"][
+                "recovered"
+            ]
+        }
+        self.assertNotIn(str(behind["task_id"]), cycle_recovered)
+        self.assertNotIn(str(ahead["task_id"]), cycle_recovered)
+        self.assertEqual(
+            {tuple(first_recovery["cycle_high_water"])},
+            {
+                tuple(
+                    result["batch"]["terminalization_recovery"][
+                        "cycle_high_water"
+                    ]
+                )
+                for result in cycle
+            },
+        )
+
+        next_cycle = [
+            tasks.reconcile_tasks_refresh(batch_size=1),
+            tasks.reconcile_tasks_refresh(batch_size=1),
+        ]
+        self.assertEqual(
+            {str(behind["task_id"]), str(ahead["task_id"])},
+            {
+                task_id
+                for result in next_cycle
+                for task_id in result["batch"]["terminalization_recovery"][
+                    "recovered"
+                ]
+            },
+        )
+        self.assertTrue(
+            next_cycle[-1]["batch"]["terminalization_recovery"][
+                "cycle_completed"
+            ]
+        )
+
+    def test_terminalization_recovery_cycle_completes_under_sustained_arrivals(self) -> None:
+        initial = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(3)
+        ]
+        results: list[dict[str, object]] = []
+        arrivals: list[dict[str, object]] = []
+        for index in range(3):
+            results.append(tasks.reconcile_tasks_refresh(batch_size=1))
+            arrivals.append(
+                self._prepare_pending_terminalization(
+                    prepared_at_unix=1_000 + index
+                )
+            )
+        recovery = [
+            result["batch"]["terminalization_recovery"]
+            for result in results
+        ]
+        self.assertTrue(recovery[-1]["cycle_completed"])
+        self.assertEqual(
+            {tuple(recovery[0]["cycle_high_water"])},
+            {tuple(item["cycle_high_water"]) for item in recovery},
+        )
+        self.assertEqual(
+            {str(item["task_id"]) for item in initial},
+            {
+                task_id
+                for item in recovery
+                for task_id in item["recovered"]
+            },
+        )
+        self.assertTrue(
+            all(
+                resources.task_terminalization_record(str(item["task_id"]))[
+                    "phase"
+                ]
+                == "leases_revoked"
+                for item in arrivals
+            )
+        )
+
+    def test_terminalization_recovery_crash_before_cursor_save_replays_from_truth(self) -> None:
+        pending = [
+            self._prepare_pending_terminalization(prepared_at_unix=100 + index)
+            for index in range(2)
+        ]
+        with (
+            patch.object(
+                tasks,
+                "_save_terminalization_recovery_cycle",
+                side_effect=RuntimeError("simulated terminal cursor crash"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "terminal cursor crash"),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        phases = {
+            str(item["task_id"]): resources.task_terminalization_record(
+                str(item["task_id"])
+            )["phase"]
+            for item in pending
+        }
+        self.assertEqual(1, list(phases.values()).count("projected"))
+        self.assertEqual(1, list(phases.values()).count("leases_revoked"))
+
+        replay = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(
+            1,
+            len(
+                replay["batch"]["terminalization_recovery"]["recovered"]
+            ),
+        )
+        self.assertTrue(
+            replay["batch"]["terminalization_recovery"]["cycle_completed"]
+        )
+        self.assertTrue(
+            all(
+                resources.task_terminalization_record(str(item["task_id"]))[
+                    "phase"
+                ]
+                == "projected"
+                for item in pending
+            )
+        )
+
+    def test_terminalization_recovery_output_contract_is_deterministic(self) -> None:
+        self._prepare_pending_terminalization(prepared_at_unix=100)
+        result = tasks.reconcile_tasks_refresh(batch_size=1)
+        recovery = result["batch"]["terminalization_recovery"]
+        self.assertEqual(
+            [
+                "cursor_after",
+                "cursor_before",
+                "cycle_completed",
+                "cycle_high_water",
+                "examined",
+                "failed",
+                "limit",
+                "recovered",
+            ],
+            sorted(recovery),
+        )
+        self.assertEqual(1, recovery["limit"])
+        self.assertEqual(1, recovery["examined"])
+        self.assertEqual([], recovery["failed"])
+
     def test_bounded_reconcile_defers_insertions_behind_and_ahead_of_cursor(self) -> None:
         initial = [self._start()["task"] for _ in range(4)]
         with sqlite3.connect(self.database) as connection:
@@ -3040,6 +3378,36 @@ class TaskTests(unittest.TestCase):
             ),
         ):
             tasks.reconcile_tasks_refresh(batch_size=2)
+        observe.assert_not_called()
+        self.assertEqual(
+            "running",
+            tasks._row_raw(str(started["task_id"]))["state"],
+        )
+
+    def test_reconcile_rejects_malformed_terminalization_cursor_before_reads(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (
+                    tasks.TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY,
+                    '{"version":1,"high_water":{},"cursor":{}}',
+                ),
+            )
+            connection.commit()
+        with (
+            patch.object(
+                resources,
+                "pending_task_terminalizations",
+            ) as pending,
+            patch.object(tasks, "_reconcile_observation") as observe,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "terminalization recovery cursor metadata is invalid",
+            ),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        pending.assert_not_called()
         observe.assert_not_called()
         self.assertEqual(
             "running",

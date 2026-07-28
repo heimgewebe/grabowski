@@ -80,6 +80,42 @@ class ResourceTests(unittest.TestCase):
             "shared_gates": [],
         }
 
+    def _pending_terminalization(
+        self,
+        task_id: str,
+        *,
+        prepared_at_unix: int,
+    ) -> dict[str, object]:
+        owner = f"task:{task_id}"
+        key = f"component:pending-{task_id}"
+        resources.acquire_resources(
+            owner,
+            [key],
+            purpose="pending terminalization fixture",
+            ttl_seconds=120,
+            metadata={"task_id": task_id, "attempt": 1},
+        )
+        projection = {
+            "task_id": task_id,
+            "state": "failed",
+            "updated_at_unix": prepared_at_unix,
+            "launcher_json": "{}",
+            "last_observation_json": "{}",
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+            "attempt": 1,
+        }
+        with patch.object(resources, "_now", return_value=prepared_at_unix):
+            return resources.begin_task_terminalization(
+                task_id,
+                1,
+                owner,
+                "failed",
+                [key],
+                task_projection=projection,
+                observation_sha256="d" * 64,
+            )
+
     def _promote_to_additive_schema_v2(self, *, incomplete: bool = False) -> None:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.database) as connection:
@@ -153,7 +189,7 @@ class ResourceTests(unittest.TestCase):
             )
             connection.commit()
 
-    def test_additive_schema_v2_preserves_task_lifetime_state(self) -> None:
+    def test_additive_schema_v2_migrates_and_preserves_task_lifetime_state(self) -> None:
         self._promote_to_additive_schema_v2()
 
         resources.acquire_resources(
@@ -162,7 +198,7 @@ class ResourceTests(unittest.TestCase):
 
         with sqlite3.connect(self.database) as connection:
             self.assertEqual(
-                "2",
+                "3",
                 connection.execute(
                     "SELECT value FROM metadata WHERE key='schema_version'"
                 ).fetchone()[0],
@@ -183,6 +219,13 @@ class ResourceTests(unittest.TestCase):
                     "SELECT COUNT(*) FROM leases WHERE owner_id='owner-v2'"
                 ).fetchone()[0],
             )
+            indexes = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA index_list(task_terminalizations)"
+                )
+            }
+            self.assertIn("task_terminalizations_pending_idx", indexes)
 
     def test_incomplete_additive_schema_v2_fails_closed(self) -> None:
         self._promote_to_additive_schema_v2(incomplete=True)
@@ -194,7 +237,7 @@ class ResourceTests(unittest.TestCase):
         with resources._database():
             pass
         self.database.unlink()
-        with patch.object(resources, "_preflight_resource_store", return_value="2"):
+        with patch.object(resources, "_preflight_resource_store", return_value="3"):
             with self.assertRaises(sqlite3.OperationalError):
                 resources._database()
         self.assertFalse(self.database.exists())
@@ -239,7 +282,7 @@ class ResourceTests(unittest.TestCase):
         resources.count_resources()
         with sqlite3.connect(self.database) as connection:
             connection.execute(
-                "UPDATE metadata SET value='3' WHERE key='schema_version'"
+                "UPDATE metadata SET value='4' WHERE key='schema_version'"
             )
             connection.commit()
         before = self.database.read_bytes()
@@ -532,6 +575,76 @@ class ResourceTests(unittest.TestCase):
                 },
                 delegated_task=delegated,
             )
+
+    def test_pending_terminalization_keyset_page_is_indexed_and_high_water_bound(self) -> None:
+        initial = [
+            self._pending_terminalization(
+                format(index + 1, "024x"),
+                prepared_at_unix=100 + index,
+            )
+            for index in range(6)
+        ]
+        first = resources.pending_task_terminalizations(limit=2)
+        self.assertEqual(2, first["examined"])
+        self.assertFalse(first["cycle_completed"])
+        self.assertEqual(
+            [item["task_id"] for item in initial[:2]],
+            [item["task_id"] for item in first["terminalizations"]],
+        )
+
+        self._pending_terminalization("a" * 24, prepared_at_unix=99)
+        self._pending_terminalization("b" * 24, prepared_at_unix=200)
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (initial[2]["task_id"],),
+            )
+            connection.commit()
+
+        pages = [first]
+        while not pages[-1]["cycle_completed"]:
+            pages.append(
+                resources.pending_task_terminalizations(
+                    limit=2,
+                    cursor=pages[-1]["cursor_after"],
+                    high_water=pages[-1]["high_water"],
+                )
+            )
+        scanned = {
+            item["task_id"]
+            for page in pages
+            for item in page["terminalizations"]
+        }
+        self.assertNotIn("a" * 24, scanned)
+        self.assertNotIn("b" * 24, scanned)
+        self.assertNotIn(initial[2]["task_id"], scanned)
+        self.assertEqual(
+            {initial[0]["task_id"], initial[1]["task_id"]}
+            | {item["task_id"] for item in initial[3:]},
+            scanned,
+        )
+        self.assertTrue(all(page["examined"] <= 2 for page in pages))
+        self.assertEqual(
+            {tuple(first["high_water"])},
+            {tuple(page["high_water"]) for page in pages},
+        )
+
+        with sqlite3.connect(self.database) as connection:
+            plan = list(
+                connection.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT * FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' "
+                    "AND (prepared_at_unix > ? OR "
+                    "(prepared_at_unix = ? AND task_id > ?)) "
+                    "ORDER BY prepared_at_unix, task_id LIMIT ?",
+                    (0, 0, "0" * 24, 3),
+                )
+            )
+        self.assertIn(
+            "task_terminalizations_pending_idx",
+            " ".join(str(row) for row in plan),
+        )
 
     def test_merge_guard_preserves_owner_repo_lease_and_blocks_only_changed_paths(self) -> None:
         repository = self.root / "repo"
@@ -1302,7 +1415,7 @@ class ResourceTests(unittest.TestCase):
             connection.commit()
         return resource_key, original
 
-    def test_schema_v1_database_migrates_to_v2_without_losing_leases(self) -> None:
+    def test_schema_v1_database_migrates_to_v3_without_losing_leases(self) -> None:
         self.database.parent.mkdir(parents=True)
         metadata_json, metadata_sha256 = resources._metadata({"task_id": "a" * 24})
         now = int(time.time())
@@ -1355,7 +1468,7 @@ class ResourceTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 )
             }
-        self.assertEqual("2", version)
+        self.assertEqual("3", version)
         self.assertTrue(
             {"leases", "task_terminalizations", "task_authority_adoptions"}.issubset(
                 tables
@@ -1419,8 +1532,8 @@ class ResourceTests(unittest.TestCase):
         inventory = resources.grabowski_resource_list(schema_only=True)
         self.assertEqual("resources", inventory["store"])
         self.assertEqual("1", inventory["observed_version"])
-        self.assertEqual("2", inventory["current_version"])
-        self.assertEqual(["1", "2"], inventory["supported_versions"])
+        self.assertEqual("3", inventory["current_version"])
+        self.assertEqual(["1", "2", "3"], inventory["supported_versions"])
         self.assertEqual("migration_required", inventory["status"])
         self.assertTrue(inventory["migration_required"])
         self.assertFalse(inventory["write_compatible"])
@@ -1440,7 +1553,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(
             [{
                 "from": "1",
-                "to": "2",
+                "to": "3",
                 "lock": "exclusive_store_directory",
                 "transaction": "immediate",
                 "verified_backup_required": True,
@@ -1472,7 +1585,7 @@ class ResourceTests(unittest.TestCase):
             connection.close()
         self.assertEqual(1, integrity.call_count)
         inventory = resources.grabowski_resource_list(schema_only=True)
-        self.assertEqual("2", inventory["observed_version"])
+        self.assertEqual("3", inventory["observed_version"])
         self.assertEqual("current", inventory["status"])
         self.assertTrue(inventory["write_compatible"])
         self.assertFalse(inventory["migration_required"])
@@ -1518,7 +1631,7 @@ class ResourceTests(unittest.TestCase):
                 0, keeper.execute("PRAGMA wal_autocheckpoint=0").fetchone()[0]
             )
             keeper.execute(
-                "UPDATE metadata SET value='3' WHERE key='schema_version'"
+                "UPDATE metadata SET value='4' WHERE key='schema_version'"
             )
             keeper.commit()
             wal = Path(str(self.database) + "-wal")
@@ -1550,7 +1663,7 @@ class ResourceTests(unittest.TestCase):
                 side_effect=reject_source_sqlite_open,
             ):
                 inventory = resources.grabowski_resource_list(schema_only=True)
-            self.assertEqual("3", inventory["observed_version"])
+            self.assertEqual("4", inventory["observed_version"])
             self.assertEqual("unsupported_future", inventory["status"])
             self.assertFalse(inventory["write_compatible"])
             self.assertFalse(inventory["mutation_performed"])
@@ -1675,7 +1788,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(backups, self._resource_migration_backups())
         with sqlite3.connect(self.database) as connection:
             self.assertEqual(
-                "2",
+                "3",
                 connection.execute(
                     "SELECT value FROM metadata WHERE key='schema_version'"
                 ).fetchone()[0],
@@ -1727,7 +1840,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(1, len(self._resource_migration_backups()))
         with sqlite3.connect(self.database) as connection:
             self.assertEqual(
-                "2",
+                "3",
                 connection.execute(
                     "SELECT value FROM metadata WHERE key='schema_version'"
                 ).fetchone()[0],
@@ -1755,6 +1868,18 @@ class ResourceTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
             resources.list_resources()
+
+    def test_schema_v3_missing_pending_index_fails_closed_without_repair(self) -> None:
+        with resources._database():
+            pass
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("DROP INDEX task_terminalizations_pending_idx")
+            connection.commit()
+        before = self.database.read_bytes()
+        with self.assertRaisesRegex(RuntimeError, "indexes are incomplete"):
+            resources.list_resources()
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual([], self._resource_migration_backups())
 
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"
