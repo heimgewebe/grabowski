@@ -22,4 +22,10 @@ The direct `grabowski_chronik_history` tool remains a lower-level provider and d
 
 Chronik-backed recall reports `source_trust=grabowski_validated_chronik_history`, `evidence_binding=hash_bound_chronik_event` and `historical_only=true`. Its learned-rule field is explicitly `historical_observation_not_rule`: it summarizes an observed historical outcome and does not create policy or operator instruction authority.
 
+Every successful result carries a `result_reference` with the validated Chronik `result_sha256`, the ledger snapshot SHA-256 and a digest of the bound event-id set. An unavailable but valid Chronik receipt still exposes its `result_sha256`; it does not invent a ledger snapshot.
+
+The published tool checks its runtime capability helper before querying Chronik. If that helper is absent from the deployed runtime, the tool fails closed with `failure.code=operator_runtime_dependency_missing` and machine-readable bindings for the tool name, runtime head, capability and missing dependency. Capability denials remain normal authorization errors and are not converted into dependency failures.
+
+Deployment-facing tests execute the published tool function through its real call path. Post-deploy verification invokes the public MCP tool by name. Static source-set tests additionally detect missing imported runtime modules and unqualified capability-helper calls.
+
 Historical recall never establishes current Git state, CI state, runtime state, safe retry, merge readiness, task completion, routing authority or policy authority. Any effect still requires fresh live preflight evidence and the normal current authorization gates.

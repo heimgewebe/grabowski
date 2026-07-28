@@ -383,6 +383,16 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _validated_sha256(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
 def _chronik_event_id(event: dict[str, Any]) -> str:
     payload = dict(event)
     payload.pop("event_id", None)
@@ -512,6 +522,10 @@ def export_chronik_history_recall(
     raw_events = history_result.get("events")
     if not isinstance(raw_events, list):
         raise ValueError("Chronik history events must be a list")
+    base_result_reference = {
+        "kind": "chronik_history_receipt",
+        "result_sha256": claimed_digest,
+    }
     if not available:
         if raw_events:
             raise ValueError("Unavailable Chronik history may not carry events")
@@ -527,6 +541,7 @@ def export_chronik_history_recall(
             "historical_only": True,
             "query": dict(query),
             "history_result_sha256": claimed_digest,
+            "result_reference": base_result_reference,
             "returned": 0,
             "items": [],
             "failure_code": _optional_bounded_text(failure_code, max_chars=160),
@@ -538,6 +553,17 @@ def export_chronik_history_recall(
     event_ids = history_metadata.get("event_ids")
     if not isinstance(event_ids, list) or event_ids != [event.get("event_id") for event in raw_events if isinstance(event, dict)]:
         raise ValueError("Chronik history event_ids are unbound")
+    ledger_snapshot = history_metadata.get("ledger_snapshot")
+    if not isinstance(ledger_snapshot, dict):
+        raise ValueError("Chronik history ledger snapshot is invalid")
+    ledger_snapshot_sha256 = _validated_sha256(
+        ledger_snapshot.get("sha256"), label="Chronik history ledger snapshot digest"
+    )
+    result_reference = {
+        **base_result_reference,
+        "ledger_snapshot_sha256": ledger_snapshot_sha256,
+        "event_ids_sha256": _sha256_json(event_ids),
+    }
     items = [_validated_chronik_event_recall(event) for event in raw_events[:limit]]
     return {
         "schema_version": 1,
@@ -549,6 +575,7 @@ def export_chronik_history_recall(
         "historical_only": True,
         "query": dict(query),
         "history_result_sha256": claimed_digest,
+        "result_reference": result_reference,
         "returned": len(items),
         "items": items,
         "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),

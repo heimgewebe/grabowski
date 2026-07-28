@@ -347,7 +347,26 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(item["source"], "chronik_event")
         self.assertEqual(module.SOURCE_TO_EVIDENCE_TYPE["chronik_event"], "chronik_event")
         self.assertEqual(item["learned_rule_trust"], "historical_observation_not_rule")
-        self.assertEqual(item["evidence_refs"][0]["id"], self._chronik_history_result(module)["events"][0]["event_id"])
+        self.assertEqual(
+            item["evidence_refs"][0]["id"],
+            self._chronik_history_result(module)["events"][0]["event_id"],
+        )
+        self.assertEqual(
+            result["result_reference"]["kind"],
+            "chronik_history_receipt",
+        )
+        self.assertEqual(
+            result["result_reference"]["result_sha256"],
+            result["history_result_sha256"],
+        )
+        self.assertEqual(
+            result["result_reference"]["ledger_snapshot_sha256"],
+            "b" * 64,
+        )
+        self.assertEqual(
+            len(result["result_reference"]["event_ids_sha256"]),
+            64,
+        )
         self.assertIn("current_git_state", result["does_not_establish"])
         self.assertIn("safe_retry", result["does_not_establish"])
         self.assertIn("policy_change", item["does_not_establish"])
@@ -389,14 +408,45 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(result["returned"], 0)
         self.assertEqual(result["items"], [])
         self.assertEqual(result["failure_code"], "chronik_repository_unavailable")
+        self.assertEqual(
+            result["result_reference"]["result_sha256"],
+            result["history_result_sha256"],
+        )
+        self.assertNotIn(
+            "ledger_snapshot_sha256",
+            result["result_reference"],
+        )
         self.assertIn("current_runtime_state", result["does_not_establish"])
+
+    def test_chronik_history_recall_rejects_invalid_ledger_snapshot(self) -> None:
+        module = self._load_module()
+        for snapshot in (None, {}, {"sha256": "not-a-digest"}):
+            with self.subTest(snapshot=snapshot):
+                history = self._chronik_history_result(module)
+                if snapshot is None:
+                    history["history"].pop("ledger_snapshot")
+                else:
+                    history["history"]["ledger_snapshot"] = snapshot
+                unsigned = dict(history)
+                unsigned.pop("result_sha256", None)
+                history["result_sha256"] = module._sha256_json(unsigned)
+
+                with self.assertRaisesRegex(ValueError, "ledger snapshot"):
+                    module.export_chronik_history_recall(history)
 
     def test_runtime_publishes_canonical_chronik_backed_operator_recall_tool(self) -> None:
         tasks = (ROOT / "src/grabowski_tasks.py").read_text(encoding="utf-8")
         capabilities = (ROOT / "src/grabowski_capabilities.py").read_text(encoding="utf-8")
         mcp = (ROOT / "src/grabowski_mcp.py").read_text(encoding="utf-8")
 
-        self.assertIn('name="grabowski_operator_historical_recall"', tasks)
+        self.assertIn(
+            'OPERATOR_HISTORICAL_RECALL_TOOL = "grabowski_operator_historical_recall"',
+            tasks,
+        )
+        self.assertIn(
+            '@mcp.tool(name="grabowski_operator_historical_recall"',
+            tasks,
+        )
         self.assertIn("recall.export_chronik_history_recall", tasks)
         self.assertIn('"grabowski_operator_historical_recall": {', capabilities)
         self.assertIn('"grabowski_operator_historical_recall": ("durable_job",)', mcp)

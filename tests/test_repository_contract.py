@@ -364,6 +364,67 @@ class RepositoryContractTests(unittest.TestCase):
                 missing[module] = absent
         self.assertEqual({}, missing)
 
+    def test_runtime_capability_helper_calls_are_module_qualified(self) -> None:
+        runtime_sources = [
+            ROOT / "src" / "grabowski_tasks.py",
+            ROOT / "src" / "grabowski_runtime.py",
+        ]
+        offenders: list[str] = []
+        helper_names = {
+            "_require_operator_capability",
+            "_require_operator_mutation",
+        }
+        for source in runtime_sources:
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id in helper_names
+                ):
+                    offenders.append(
+                        f"{source.name}:{node.lineno}:{node.func.id}"
+                    )
+        self.assertEqual([], offenders)
+
+    def test_runtime_source_set_check_detects_missing_recall_dependencies(
+        self,
+    ) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        deployed_modules = {
+            contract["module"],
+            *(item["module"] for item in contract["supporting_sources"]),
+        }
+        tree = ast.parse(
+            (ROOT / "src" / "grabowski_tasks.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        imports: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                candidates = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                candidates = [node.module or ""]
+            else:
+                continue
+            imports.update(
+                candidate.split(".", 1)[0]
+                for candidate in candidates
+                if candidate.startswith("grabowski_")
+            )
+        for missing_module in (
+            "grabowski_operator_core",
+            "grabowski_recall",
+        ):
+            with self.subTest(missing_module=missing_module):
+                incomplete = deployed_modules - {missing_module}
+                self.assertIn(missing_module, imports - incomplete)
+
     def test_runtime_python_module_spawns_are_explicitly_declared(self) -> None:
         contract = json.loads(
             (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
