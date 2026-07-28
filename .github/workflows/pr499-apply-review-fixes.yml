@@ -1,0 +1,585 @@
+name: pr499-apply-review-fixes
+
+on:
+  push:
+    branches:
+      - fix/runtime-deploy-admission-drain-v1
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.event.head_commit.message == 'chore: stage PR 499 review fix applicator'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout exact branch head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Verify applicator ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "7803616b187cd3c8c9a65bca74884cb53eea5a1a"
+          test "$(git diff --name-only HEAD^ HEAD)" = ".github/workflows/pr499-apply-review-fixes.yml"
+
+      - name: Apply exact review fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          from pathlib import Path
+
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one replacement target, got {count}")
+              target.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+          replace_once(
+              "tools/deploy_runtime_dual.py",
+              '''OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 600
+          OPERATOR_ADMISSION_TIMEOUT_WINDOWS = 8
+          OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS = 120
+          ''',
+              '''OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 1800
+          OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
+          OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS = 6
+          OPERATOR_ADMISSION_STOP_OPERATIONS = 6
+          OPERATOR_ADMISSION_START_OPERATIONS = 4
+          OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS = 12
+          OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS = 120
+          ''',
+          )
+
+          replace_once(
+              "tools/deploy_runtime_dual.py",
+              '''def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
+              if (
+                  not isinstance(timeout_seconds, int)
+                  or isinstance(timeout_seconds, bool)
+                  or timeout_seconds <= 0
+              ):
+                  core.fail(
+                      "Deployment-Admission-Timeout muss positiv und ganzzahlig sein",
+                      phase="operator-admission-marker",
+                  )
+              required = (
+                  timeout_seconds * OPERATOR_ADMISSION_TIMEOUT_WINDOWS
+                  + OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS
+              )
+              if required > OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS:
+                  core.fail(
+                      "Deployment-Admission-Marker kann den vollständigen Deployment- und Recovery-Ablauf nicht abdecken",
+                      phase="operator-admission-marker",
+                      details={
+                          "timeout_seconds": timeout_seconds,
+                          "timeout_windows": OPERATOR_ADMISSION_TIMEOUT_WINDOWS,
+                          "recovery_margin_seconds": OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS,
+                          "required_lifetime_seconds": required,
+                          "maximum_lifetime_seconds": OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+                      },
+                  )
+              return required
+          ''',
+              '''def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
+              if (
+                  not isinstance(timeout_seconds, int)
+                  or isinstance(timeout_seconds, bool)
+                  or timeout_seconds <= 0
+              ):
+                  core.fail(
+                      "Deployment-Admission-Timeout muss positiv und ganzzahlig sein",
+                      phase="operator-admission-marker",
+                  )
+              if timeout_seconds > OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS:
+                  core.fail(
+                      "Deployment-Admission-Timeout überschreitet das unterstützte Maximum",
+                      phase="operator-admission-marker",
+                      details={
+                          "timeout_seconds": timeout_seconds,
+                          "maximum_timeout_seconds": OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
+                      },
+                  )
+              required = (
+                  timeout_seconds * OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS
+                  + OPERATOR_ADMISSION_STOP_OPERATIONS
+                  * 2
+                  * core.TIMEOUTS["service_stop"]
+                  + OPERATOR_ADMISSION_START_OPERATIONS
+                  * 2
+                  * core.TIMEOUTS["service_start"]
+                  + OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS
+                  * core.TIMEOUTS["systemd_query"]
+                  + OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS
+              )
+              if required > OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS:
+                  core.fail(
+                      "Deployment-Admission-Marker kann den vollständigen Deployment- und Recovery-Ablauf nicht abdecken",
+                      phase="operator-admission-marker",
+                      details={
+                          "timeout_seconds": timeout_seconds,
+                          "dynamic_timeout_windows": OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS,
+                          "stop_operations": OPERATOR_ADMISSION_STOP_OPERATIONS,
+                          "start_operations": OPERATOR_ADMISSION_START_OPERATIONS,
+                          "systemd_query_windows": OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS,
+                          "recovery_margin_seconds": OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS,
+                          "required_lifetime_seconds": required,
+                          "maximum_lifetime_seconds": OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+                      },
+                  )
+              return required
+          ''',
+          )
+
+          replace_once(
+              "tools/deploy_runtime_dual.py",
+              '''        except FileNotFoundError:
+                      return
+                  opened = os.fstat(descriptor)
+          ''',
+              '''        except FileNotFoundError:
+                      core.fail(
+                          "Deployment-Admission-Marker fehlt vor Freigabe",
+                          phase="operator-admission-marker-release",
+                          details={"reason": "marker-missing"},
+                      )
+                  opened = os.fstat(descriptor)
+          ''',
+          )
+
+          replace_once(
+              "tools/deploy_runtime_dual.py",
+              '''    operator_start_ok, started_operator = step("start-operator", lambda: start_service(OPERATOR_SERVICE))
+              identity_ok = False
+              identity = None
+              if operator_start_ok and started_operator is not None:
+                  identity_ok, identity = step("verify-operator", lambda: verify_operator_process(activation.runtime, contract))
+              listener_ok = False
+              listener = None
+              if identity_ok and identity is not None:
+                  listener_ok, listener = step("operator-listener", lambda: require_operator_listener(timeout_seconds=timeout_seconds))
+              tunnel_start_ok = False
+              started_tunnel = None
+              if listener_ok and listener is not None:
+                  tunnel_start_ok, started_tunnel = step("start-tunnel", lambda: start_service(TUNNEL_SERVICE))
+              ready_ok = False
+              ready = None
+              if tunnel_start_ok and started_tunnel is not None:
+                  ready_ok, ready = step("readiness", lambda: wait_until_ready(timeout_seconds))
+                  if ready_ok and isinstance(ready, DualReadiness) and not ready.ok:
+                      errors.append({"phase": "readiness", "message": "Wiederhergestellte Runtime wurde nicht ready", "result": ready.to_dict()})
+                      ready_ok = False
+          ''',
+              '''    operator_start_ok, started_operator = step("start-operator", lambda: start_service(OPERATOR_SERVICE))
+              identity_ok = False
+              identity = None
+              if operator_start_ok and started_operator is not None:
+                  identity_ok, identity = step("verify-operator", lambda: verify_operator_process(activation.runtime, contract))
+              listener_ok = False
+              listener = None
+              if identity_ok and identity is not None:
+                  listener_ok, listener = step("operator-listener", lambda: require_operator_listener(timeout_seconds=timeout_seconds))
+              admission_ok = admission_marker is None
+              admission = None
+              if listener_ok and listener is not None and admission_marker is not None:
+                  admission_ok, admission = step(
+                      "operator-admission-replacement-guard",
+                      lambda: verify_operator_deployment_admission(admission_marker),
+                  )
+                  if not admission_ok:
+                      step(
+                          "stop-operator-after-admission-failure",
+                          lambda: stop_service(OPERATOR_SERVICE),
+                      )
+              tunnel_start_ok = False
+              started_tunnel = None
+              if listener_ok and listener is not None and admission_ok:
+                  tunnel_start_ok, started_tunnel = step("start-tunnel", lambda: start_service(TUNNEL_SERVICE))
+                  if tunnel_start_ok and started_tunnel is not None and admission_marker is not None:
+                      admission_ok, admission = step(
+                          "operator-admission-post-tunnel-guard",
+                          lambda: verify_operator_deployment_admission(admission_marker),
+                      )
+                      if not admission_ok:
+                          step(
+                              "stop-tunnel-after-admission-drift",
+                              lambda: stop_service(TUNNEL_SERVICE),
+                          )
+                          step(
+                              "stop-operator-after-admission-drift",
+                              lambda: stop_service(OPERATOR_SERVICE),
+                          )
+                          tunnel_start_ok = False
+                          started_tunnel = None
+              ready_ok = False
+              ready = None
+              if tunnel_start_ok and started_tunnel is not None:
+                  ready_ok, ready = step("readiness", lambda: wait_until_ready(timeout_seconds))
+                  if ready_ok and isinstance(ready, DualReadiness) and not ready.ok:
+                      errors.append({"phase": "readiness", "message": "Wiederhergestellte Runtime wurde nicht ready", "result": ready.to_dict()})
+                      ready_ok = False
+          ''',
+          )
+
+          replace_once(
+              "tools/deploy_runtime_dual.py",
+              '''        "operator_identity": "verified" if identity_ok and identity is not None else "failed",
+                  "readiness": "verified" if ready_ok and isinstance(ready, DualReadiness) and ready.ok else "failed",
+          ''',
+              '''        "operator_identity": "verified" if identity_ok and identity is not None else "failed",
+                  "operator_admission": "verified" if admission_ok else "failed",
+                  "readiness": "verified" if ready_ok and isinstance(ready, DualReadiness) and ready.ok else "failed",
+          ''',
+          )
+
+          replace_once(
+              "tools/deploy_runtime_dual.py",
+              '''        phase = "operator-listener"
+                  require_operator_listener(timeout_seconds=timeout_seconds)
+
+                  phase = "start-tunnel"
+                  start_service(TUNNEL_SERVICE)
+                  verify_tunnel_process()
+
+                  phase = "readiness"
+          ''',
+              '''        phase = "operator-listener"
+                  require_operator_listener(timeout_seconds=timeout_seconds)
+                  phase = "operator-admission-replacement-guard"
+                  verify_operator_deployment_admission(admission_marker)
+
+                  phase = "start-tunnel"
+                  start_service(TUNNEL_SERVICE)
+                  verify_tunnel_process()
+                  phase = "operator-admission-post-tunnel-guard"
+                  verify_operator_deployment_admission(admission_marker)
+
+                  phase = "readiness"
+          ''',
+          )
+
+          replace_once(
+              "src/grabowski_operator.py",
+              "DEPLOYMENT_ADMISSION_MAX_LIFETIME_SECONDS = 600\n",
+              "DEPLOYMENT_ADMISSION_MAX_LIFETIME_SECONDS = 1800\n",
+          )
+
+          operator_sha = hashlib.sha256(Path("src/grabowski_operator.py").read_bytes()).hexdigest()
+          if operator_sha != "90d90837977a7180b6a5dfc9f7e30849de2bea3384206ac53b3ce53b8d24e5cb":
+              raise SystemExit(f"unexpected operator source hash: {operator_sha}")
+          replace_once(
+              "docs/generated/operator-context.v1.json",
+              '"src/grabowski_operator.py": "cc02c3019ce92b6150b55000e017994227f7b506fe95a7867149e96fe970eddb"',
+              f'"src/grabowski_operator.py": "{operator_sha}"',
+          )
+
+          replace_once(
+              "docs/runtime-deployment-admission-drain-v1.md",
+              "The deployer creates `~/.local/state/grabowski/deployment-admission-drain.json` with create-only semantics, mode `0600`, no symlink following, one link, owner UID binding, a maximum ten-minute lifetime and exact fields for token, expected repository head, source-identity digest and timestamps. Its lifetime covers eight bounded deployment/recovery timeout windows plus a 120-second recovery margin. A requested timeout that cannot fit inside the ten-minute marker contract is rejected before publication. Existing active, malformed or foreign markers fail closed. Expired valid markers may be removed only through the same token-, identity- and inode-bound release path.",
+              "The deployer creates `~/.local/state/grabowski/deployment-admission-drain.json` with create-only semantics, mode `0600`, no symlink following, one link, owner UID binding, a maximum thirty-minute lifetime and exact fields for token, expected repository head, source-identity digest and timestamps. Its lifetime is derived from all six dynamic deployment/recovery waits, six stop operations, four start operations, twelve bounded systemd-query windows and a 120-second recovery margin. Deploy timeouts above 120 seconds or a derived lifetime above thirty minutes are rejected before publication. Existing active, malformed or foreign markers fail closed. Expired valid markers may be removed only through the same token-, identity- and inode-bound release path.",
+          )
+          replace_once(
+              "docs/runtime-deployment-admission-drain-v1.md",
+              '''7. Stop tunnel, then operator; activate and verify the new runtime.
+          8. Release the marker only after the new runtime is healthy and identity-bound.
+          ''',
+              '''7. Stop tunnel, then operator; activate and start the replacement operator.
+          8. Require the replacement operator to attest the exact active marker before the tunnel starts and again immediately after tunnel startup.
+          9. Release the marker only after the new runtime is healthy and identity-bound; marker absence is drift, never success.
+          ''',
+          )
+          replace_once(
+              "docs/runtime-deployment-admission-drain-v1.md",
+              "Before service stop, failure releases the exact marker and leaves the healthy runtime untouched. After service stop, rollback restores the previous pointer and services, verifies identity and readiness, then releases the marker. If rollback cannot restore a healthy operator, the marker remains until its bounded expiry so new effects stay blocked rather than running in an unclear state.",
+              "Before service stop, failure releases the exact marker and leaves the healthy runtime untouched. After service stop, rollback restores the previous pointer and operator, then requires that restored operator to attest the exact active marker before the tunnel may restart. A predecessor runtime without the admission contract therefore remains fail-closed with both the tunnel and restored loopback operator stopped instead of admitting work during an incomplete rollback. Only a marker-aware, identity- and readiness-verified rollback may release the marker. Missing or drifted markers are failures, not successful cleanup.",
+          )
+
+          replace_once(
+              "tests/test_dual_service_deploy.py",
+              '''    def test_marker_lifetime_covers_forward_and_recovery_windows(self) -> None:
+                  self.assertEqual(
+                      440,
+                      dual._operator_admission_marker_lifetime_seconds(40),
+                  )
+                  self.assertEqual(
+                      dual.OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+                      dual._operator_admission_marker_lifetime_seconds(60),
+                  )
+                  with self.assertRaises(core.DeployError) as raised:
+                      dual._operator_admission_marker_lifetime_seconds(61)
+                  self.assertEqual("operator-admission-marker", raised.exception.phase)
+                  self.assertEqual(
+                      608,
+                      raised.exception.details["required_lifetime_seconds"],
+                  )
+          ''',
+              '''    def test_marker_lifetime_covers_forward_and_recovery_windows(self) -> None:
+                  self.assertEqual(
+                      1080,
+                      dual._operator_admission_marker_lifetime_seconds(40),
+                  )
+                  self.assertEqual(
+                      1200,
+                      dual._operator_admission_marker_lifetime_seconds(60),
+                  )
+                  self.assertEqual(
+                      1560,
+                      dual._operator_admission_marker_lifetime_seconds(120),
+                  )
+                  with self.assertRaises(core.DeployError) as raised:
+                      dual._operator_admission_marker_lifetime_seconds(121)
+                  self.assertEqual("operator-admission-marker", raised.exception.phase)
+                  self.assertEqual(
+                      120,
+                      raised.exception.details["maximum_timeout_seconds"],
+                  )
+          ''',
+          )
+          replace_once(
+              "tests/test_dual_service_deploy.py",
+              '''                self.assertEqual("f" * 64, marker["token"])
+                          self.assertEqual(540, marker["expires_at_unix"])
+                          self.assertEqual(marker, json.loads(marker_path.read_text()))
+                          dual.release_operator_deployment_admission(marker)
+                          self.assertFalse(marker_path.exists())
+
+              def test_marker_creation_is_create_only_and_rejects_symlink(self) -> None:
+          ''',
+              '''                self.assertEqual("f" * 64, marker["token"])
+                          self.assertEqual(1180, marker["expires_at_unix"])
+                          self.assertEqual(marker, json.loads(marker_path.read_text()))
+                          dual.release_operator_deployment_admission(marker)
+                          self.assertFalse(marker_path.exists())
+
+              def test_marker_release_rejects_absence_after_publication(self) -> None:
+                  marker = self.marker()
+                  with tempfile.TemporaryDirectory() as directory:
+                      marker_path = Path(directory) / "deployment-admission-drain.json"
+                      with mock.patch.object(
+                          dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path
+                      ):
+                          with self.assertRaises(core.DeployError) as raised:
+                              dual.release_operator_deployment_admission(marker)
+                  self.assertEqual(
+                      "operator-admission-marker-release", raised.exception.phase
+                  )
+                  self.assertEqual("marker-missing", raised.exception.details["reason"])
+
+              def test_marker_creation_is_create_only_and_rejects_symlink(self) -> None:
+          ''',
+          )
+          replace_once(
+              "tests/test_dual_service_deploy.py",
+              '''        for patcher in self._admission_patchers:
+                      patcher.start()
+                      self.addCleanup(patcher.stop)
+
+
+              def snapshot(self):
+          ''',
+              '''        for patcher in self._admission_patchers:
+                      patcher.start()
+                      self.addCleanup(patcher.stop)
+                  self._verify_admission_patcher = mock.patch.object(
+                      dual,
+                      "verify_operator_deployment_admission",
+                      return_value={"active_tool_calls": 0},
+                  )
+                  self.verify_admission = self._verify_admission_patcher.start()
+                  self.addCleanup(self._verify_admission_patcher.stop)
+
+
+              def snapshot(self):
+          ''',
+          )
+          replace_once(
+              "tests/test_dual_service_deploy.py",
+              '''        install.assert_called_once_with(ROOT, snapshot)
+                  install_watchdogs.assert_called_once_with(ROOT, snapshot)
+          ''',
+              '''        self.assertEqual(2, self.verify_admission.call_count)
+                  install.assert_called_once_with(ROOT, snapshot)
+                  install_watchdogs.assert_called_once_with(ROOT, snapshot)
+          ''',
+          )
+
+          rollback_tests = '''    def test_rollback_requires_replacement_admission_before_tunnel(self) -> None:
+              events: list[str] = []
+              active = observation(True)
+              inactive = observation(False)
+              ready = dual.DualReadiness(True, active, active, "live", "ready")
+              activation = SimpleNamespace(runtime=RUNTIME, previous=SimpleNamespace())
+              marker = {
+                  "token": "d" * 64,
+                  "expected_head": "a" * 40,
+                  "source_identity_sha256": "e" * 64,
+              }
+              with (
+                  mock.patch.object(
+                      dual,
+                      "stop_service",
+                      side_effect=lambda unit: events.append(f"stop:{unit}") or inactive,
+                  ),
+                  mock.patch.object(
+                      core,
+                      "restore_pointer",
+                      side_effect=lambda value: events.append("restore") or value,
+                  ),
+                  mock.patch.object(
+                      core,
+                      "verify_pointer_state",
+                      side_effect=lambda *args: events.append("verify:pointer")
+                      or SimpleNamespace(),
+                  ),
+                  mock.patch.object(
+                      dual,
+                      "start_service",
+                      side_effect=lambda unit: events.append(f"start:{unit}") or active,
+                  ),
+                  mock.patch.object(
+                      dual,
+                      "verify_operator_process",
+                      side_effect=lambda *args, **kwargs: events.append("verify:operator")
+                      or {"pid": 1},
+                  ),
+                  mock.patch.object(
+                      dual,
+                      "require_operator_listener",
+                      side_effect=lambda **kwargs: events.append("listener")
+                      or {"successful_samples": 2},
+                  ),
+                  mock.patch.object(
+                      dual,
+                      "verify_operator_deployment_admission",
+                      side_effect=lambda value: events.append("verify:admission")
+                      or {"active_tool_calls": 0},
+                  ),
+                  mock.patch.object(dual, "wait_until_ready", return_value=ready),
+                  mock.patch.object(
+                      dual,
+                      "release_operator_deployment_admission",
+                      side_effect=lambda value: events.append("release:admission"),
+                  ),
+              ):
+                  with self.assertRaises(core.DeployError):
+                      dual.rollback_url(
+                          core.DeployError("primary"),
+                          activation=activation,
+                          contract=CONTRACT,
+                          timeout_seconds=1,
+                          admission_marker=marker,
+                      )
+              self.assertEqual(
+                  [
+                      f"stop:{dual.TUNNEL_SERVICE}",
+                      f"stop:{dual.OPERATOR_SERVICE}",
+                      "restore",
+                      "verify:pointer",
+                      f"start:{dual.OPERATOR_SERVICE}",
+                      "verify:operator",
+                      "listener",
+                      "verify:admission",
+                      f"start:{dual.TUNNEL_SERVICE}",
+                      "verify:admission",
+                      "release:admission",
+                  ],
+                  events,
+              )
+
+              def test_rollback_keeps_tunnel_stopped_when_previous_runtime_lacks_admission(self) -> None:
+              events: list[str] = []
+              active = observation(True)
+              inactive = observation(False)
+              activation = SimpleNamespace(runtime=RUNTIME, previous=SimpleNamespace())
+              marker = {
+                  "token": "d" * 64,
+                  "expected_head": "a" * 40,
+                  "source_identity_sha256": "e" * 64,
+              }
+              with (
+                  mock.patch.object(
+                      dual,
+                      "stop_service",
+                      side_effect=lambda unit: events.append(f"stop:{unit}") or inactive,
+                  ),
+                  mock.patch.object(core, "restore_pointer"),
+                  mock.patch.object(core, "verify_pointer_state"),
+                  mock.patch.object(
+                      dual,
+                      "start_service",
+                      side_effect=lambda unit: events.append(f"start:{unit}") or active,
+                  ),
+                  mock.patch.object(
+                      dual, "verify_operator_process", return_value={"pid": 1}
+                  ),
+                  mock.patch.object(
+                      dual,
+                      "require_operator_listener",
+                      return_value={"successful_samples": 2},
+                  ),
+                  mock.patch.object(
+                      dual,
+                      "verify_operator_deployment_admission",
+                      side_effect=core.DeployError("admission route unavailable"),
+                  ),
+                  mock.patch.object(
+                      dual, "release_operator_deployment_admission"
+                  ) as release,
+              ):
+                  with self.assertRaises(core.DeployError) as raised:
+                      dual.rollback_url(
+                          core.DeployError("primary"),
+                          activation=activation,
+                          contract=CONTRACT,
+                          timeout_seconds=1,
+                          admission_marker=marker,
+                      )
+              self.assertNotIn(f"start:{dual.TUNNEL_SERVICE}", events)
+              self.assertEqual(2, events.count(f"stop:{dual.OPERATOR_SERVICE}"))
+              release.assert_not_called()
+              self.assertIn('"operator_admission": "failed"', str(raised.exception))
+
+          '''
+          replace_once(
+              "tests/test_dual_service_deploy.py",
+              "    def test_rollback_stops_both_restores_then_starts_operator_before_tunnel(self) -> None:\n",
+              rollback_tests
+              + "    def test_rollback_stops_both_restores_then_starts_operator_before_tunnel(self) -> None:\n",
+          )
+          PY
+
+      - name: Validate exact modified tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python -m pytest -q tests/test_dual_service_deploy.py tests/test_operator_contract.py tests/test_self_deploy.py
+          make validate
+
+      - name: Commit fixes and remove applicator
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/workflows/pr499-apply-review-fixes.yml
+          git add docs/generated/operator-context.v1.json docs/runtime-deployment-admission-drain-v1.md src/grabowski_operator.py tests/test_dual_service_deploy.py tools/deploy_runtime_dual.py
+          git diff --cached --check
+          git commit -m 'fix: close deployment admission rollback gaps'
+          git push origin HEAD:refs/heads/fix/runtime-deploy-admission-drain-v1
