@@ -5890,6 +5890,53 @@ def grabowski_chronik_history(
     return _chronik_receipt(payload, field="result_sha256")
 
 
+OPERATOR_HISTORICAL_RECALL_TOOL = "grabowski_operator_historical_recall"
+OPERATOR_HISTORICAL_RECALL_CAPABILITY = "durable_job"
+OPERATOR_HISTORICAL_RECALL_HELPER = "_require_operator_capability"
+
+
+def _operator_runtime_head() -> str | None:
+    manifest_path = getattr(base, "DEPLOYMENT_MANIFEST", None)
+    if not isinstance(manifest_path, Path):
+        return None
+    try:
+        raw = manifest_path.read_bytes()
+        if len(raw) > getattr(base, "MAX_MANIFEST_BYTES", 1024 * 1024):
+            return None
+        manifest = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    source_commit = manifest.get("source_commit") if isinstance(manifest, dict) else None
+    if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-f]{40,64}", source_commit) is None:
+        return None
+    return source_commit
+
+
+def _operator_historical_recall_dependency_failure(*, missing_dependency: str) -> dict[str, Any]:
+    runtime_head = _operator_runtime_head()
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_operator_historical_recall",
+        "authority": "runtime_dependency_failure",
+        "source_trust": recall.HISTORICAL_SOURCE_TRUST,
+        "evidence_binding": recall.HISTORICAL_EVIDENCE_BINDING,
+        "available": False,
+        "historical_only": True,
+        "returned": 0,
+        "items": [],
+        "failure_code": "operator_runtime_dependency_missing",
+        "failure": {
+            "code": "operator_runtime_dependency_missing",
+            "tool": OPERATOR_HISTORICAL_RECALL_TOOL,
+            "runtime_head": runtime_head,
+            "runtime_head_available": runtime_head is not None,
+            "capability": OPERATOR_HISTORICAL_RECALL_CAPABILITY,
+            "missing_dependency": missing_dependency,
+        },
+        "does_not_establish": list(recall.HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
+    }
+
+
 @mcp.tool(name="grabowski_operator_historical_recall", annotations=READ_ONLY)
 def grabowski_operator_historical_recall(
     repo: str = "",
@@ -5903,7 +5950,13 @@ def grabowski_operator_historical_recall(
     limit: int = 20,
 ) -> dict[str, Any]:
     """Read evidence-bound operator recall derived from validated Chronik history."""
-    _require_operator_capability("durable_job")
+    capability_gate = getattr(operator, OPERATOR_HISTORICAL_RECALL_HELPER, None)
+    if not callable(capability_gate):
+        operator_module = getattr(operator, "__name__", "grabowski_operator_core")
+        return _operator_historical_recall_dependency_failure(
+            missing_dependency=f"{operator_module}.{OPERATOR_HISTORICAL_RECALL_HELPER}"
+        )
+    operator._require_operator_capability("durable_job")
     history = grabowski_chronik_history(
         repo=repo,
         host=host,

@@ -5372,5 +5372,131 @@ else:
         self.assertEqual([], history["events"])
 
 
+    def test_deployed_runtime_tool_executes_historical_recall(self) -> None:
+        event = {
+            "schema_version": "agent-run-event.v0",
+            "kind": "agent.run.completed",
+            "ts": "2026-07-28T18:37:00Z",
+            "source": {
+                "repo": "heimgewebe/grabowski",
+                "component": "grabowski",
+                "run_id": "task-0123456789abcdef01234567-a1",
+            },
+            "subject": {
+                "scope": "host",
+                "host": "heim-pc",
+                "component": "operator-convergence",
+            },
+            "trust_tier": "observed",
+            "status": "active",
+            "caused_by": [],
+            "evidence_refs": ["grabowski-task:0123456789abcdef01234567"],
+            "data": {
+                "result": "completed",
+                "operation": "operator-convergence-check",
+                "task_class": "runtime_verify",
+            },
+        }
+        event["event_id"] = tasks.recall._chronik_event_id(event)
+        query = {
+            "host": "heim-pc",
+            "operation": "operator-convergence-check",
+            "limit": 1,
+        }
+        history = {
+            "schema_version": 1,
+            "kind": "grabowski_chronik_history",
+            "query": query,
+            "cli_present": True,
+            "available": True,
+            "historical_only": True,
+            "events": [event],
+            "history": {
+                "schema_version": "chronik-coding-history.v1",
+                "query": query,
+                "target": {"scope": "host", "host": "heim-pc"},
+                "event_ids": [event["event_id"]],
+                "historical_only": True,
+                "does_not_establish": list(
+                    tasks.recall.CHRONIK_HISTORY_DOES_NOT_ESTABLISH
+                ),
+                "ledger_snapshot": {"sha256": "b" * 64},
+            },
+            "does_not_establish": list(
+                tasks.recall.CHRONIK_HISTORY_DOES_NOT_ESTABLISH
+            ),
+        }
+        history["result_sha256"] = tasks.recall._sha256_json(history)
+
+        with (
+            patch.object(tasks.operator, "_require_operator_capability") as capability,
+            patch.object(
+                tasks, "grabowski_chronik_history", return_value=history
+            ) as provider,
+        ):
+            result = tasks.grabowski_operator_historical_recall(
+                host="heim-pc",
+                operation="operator-convergence-check",
+                limit=1,
+            )
+
+        capability.assert_called_once_with("durable_job")
+        provider.assert_called_once_with(
+            repo="",
+            host="heim-pc",
+            component="",
+            subject_component="",
+            operation="operator-convergence-check",
+            task_class="",
+            outcome="",
+            since="",
+            limit=1,
+        )
+        self.assertTrue(result["available"])
+        self.assertEqual(result["returned"], 1)
+        self.assertEqual(
+            result["result_reference"]["result_sha256"],
+            history["result_sha256"],
+        )
+        self.assertEqual(
+            result["result_reference"]["ledger_snapshot_sha256"],
+            "b" * 64,
+        )
+
+    def test_deployed_runtime_tool_reports_missing_recall_helper(self) -> None:
+        manifest = self.root / "deployment-manifest.json"
+        manifest.write_text(
+            json.dumps({"source_commit": "a" * 40}),
+            encoding="utf-8",
+        )
+        with (
+            patch.object(tasks.operator, "_require_operator_capability", None),
+            patch.object(tasks.base, "DEPLOYMENT_MANIFEST", manifest),
+            patch.object(tasks, "grabowski_chronik_history") as provider,
+        ):
+            result = tasks.grabowski_operator_historical_recall(
+                operation="operator-convergence-check",
+                limit=1,
+            )
+
+        provider.assert_not_called()
+        self.assertFalse(result["available"])
+        self.assertEqual(
+            result["failure_code"],
+            "operator_runtime_dependency_missing",
+        )
+        self.assertEqual(
+            result["failure"]["tool"],
+            "grabowski_operator_historical_recall",
+        )
+        self.assertEqual(result["failure"]["runtime_head"], "a" * 40)
+        self.assertEqual(result["failure"]["capability"], "durable_job")
+        self.assertTrue(
+            result["failure"]["missing_dependency"].endswith(
+                "._require_operator_capability"
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
