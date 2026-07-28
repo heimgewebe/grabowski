@@ -245,8 +245,12 @@ OPERATOR_ADMISSION_MARKER_KEYS = frozenset(
         "expires_at_unix",
     }
 )
-OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 600
-OPERATOR_ADMISSION_TIMEOUT_WINDOWS = 8
+OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 1800
+OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
+OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS = 6
+OPERATOR_ADMISSION_STOP_OPERATIONS = 6
+OPERATOR_ADMISSION_START_OPERATIONS = 4
+OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS = 12
 OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS = 120
 OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES = 2
 OPERATOR_ADMISSION_PROBE_SECONDS = 3
@@ -2580,8 +2584,25 @@ def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
             "Deployment-Admission-Timeout muss positiv und ganzzahlig sein",
             phase="operator-admission-marker",
         )
+    if timeout_seconds > OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS:
+        core.fail(
+            "Deployment-Admission-Timeout überschreitet das unterstützte Maximum",
+            phase="operator-admission-marker",
+            details={
+                "timeout_seconds": timeout_seconds,
+                "maximum_timeout_seconds": OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
+            },
+        )
     required = (
-        timeout_seconds * OPERATOR_ADMISSION_TIMEOUT_WINDOWS
+        timeout_seconds * OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS
+        + OPERATOR_ADMISSION_STOP_OPERATIONS
+        * 2
+        * core.TIMEOUTS["service_stop"]
+        + OPERATOR_ADMISSION_START_OPERATIONS
+        * 2
+        * core.TIMEOUTS["service_start"]
+        + OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS
+        * core.TIMEOUTS["systemd_query"]
         + OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS
     )
     if required > OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS:
@@ -2590,7 +2611,10 @@ def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
             phase="operator-admission-marker",
             details={
                 "timeout_seconds": timeout_seconds,
-                "timeout_windows": OPERATOR_ADMISSION_TIMEOUT_WINDOWS,
+                "dynamic_timeout_windows": OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS,
+                "stop_operations": OPERATOR_ADMISSION_STOP_OPERATIONS,
+                "start_operations": OPERATOR_ADMISSION_START_OPERATIONS,
+                "systemd_query_windows": OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS,
                 "recovery_margin_seconds": OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS,
                 "required_lifetime_seconds": required,
                 "maximum_lifetime_seconds": OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
@@ -2648,7 +2672,11 @@ def release_operator_deployment_admission(marker: dict[str, Any]) -> None:
         try:
             descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
         except FileNotFoundError:
-            return
+            core.fail(
+                "Deployment-Admission-Marker fehlt vor Freigabe",
+                phase="operator-admission-marker-release",
+                details={"reason": "marker-missing"},
+            )
         opened = os.fstat(descriptor)
         linked = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
         if (
@@ -3169,10 +3197,38 @@ def rollback_url(
     listener = None
     if identity_ok and identity is not None:
         listener_ok, listener = step("operator-listener", lambda: require_operator_listener(timeout_seconds=timeout_seconds))
+    admission_ok = admission_marker is None
+    admission = None
+    if listener_ok and listener is not None and admission_marker is not None:
+        admission_ok, admission = step(
+            "operator-admission-replacement-guard",
+            lambda: verify_operator_deployment_admission(admission_marker),
+        )
+        if not admission_ok:
+            step(
+                "stop-operator-after-admission-failure",
+                lambda: stop_service(OPERATOR_SERVICE),
+            )
     tunnel_start_ok = False
     started_tunnel = None
-    if listener_ok and listener is not None:
+    if listener_ok and listener is not None and admission_ok:
         tunnel_start_ok, started_tunnel = step("start-tunnel", lambda: start_service(TUNNEL_SERVICE))
+        if tunnel_start_ok and started_tunnel is not None and admission_marker is not None:
+            admission_ok, admission = step(
+                "operator-admission-post-tunnel-guard",
+                lambda: verify_operator_deployment_admission(admission_marker),
+            )
+            if not admission_ok:
+                step(
+                    "stop-tunnel-after-admission-drift",
+                    lambda: stop_service(TUNNEL_SERVICE),
+                )
+                step(
+                    "stop-operator-after-admission-drift",
+                    lambda: stop_service(OPERATOR_SERVICE),
+                )
+                tunnel_start_ok = False
+                started_tunnel = None
     ready_ok = False
     ready = None
     if tunnel_start_ok and started_tunnel is not None:
@@ -3202,6 +3258,7 @@ def rollback_url(
         "errors": errors,
         "pointer_restore": "restored",
         "operator_identity": "verified" if identity_ok and identity is not None else "failed",
+        "operator_admission": "verified" if admission_ok else "failed",
         "readiness": "verified" if ready_ok and isinstance(ready, DualReadiness) and ready.ok else "failed",
         "admission_release": admission_release,
     }
@@ -3337,10 +3394,14 @@ def deploy_url(
         )
         phase = "operator-listener"
         require_operator_listener(timeout_seconds=timeout_seconds)
+        phase = "operator-admission-replacement-guard"
+        verify_operator_deployment_admission(admission_marker)
 
         phase = "start-tunnel"
         start_service(TUNNEL_SERVICE)
         verify_tunnel_process()
+        phase = "operator-admission-post-tunnel-guard"
+        verify_operator_deployment_admission(admission_marker)
 
         phase = "readiness"
         readiness = wait_until_ready(timeout_seconds)

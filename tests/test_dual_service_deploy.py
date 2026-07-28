@@ -2041,19 +2041,23 @@ class DeploymentAdmissionTests(unittest.TestCase):
 
     def test_marker_lifetime_covers_forward_and_recovery_windows(self) -> None:
         self.assertEqual(
-            440,
+            1080,
             dual._operator_admission_marker_lifetime_seconds(40),
         )
         self.assertEqual(
-            dual.OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+            1200,
             dual._operator_admission_marker_lifetime_seconds(60),
         )
+        self.assertEqual(
+            1560,
+            dual._operator_admission_marker_lifetime_seconds(120),
+        )
         with self.assertRaises(core.DeployError) as raised:
-            dual._operator_admission_marker_lifetime_seconds(61)
+            dual._operator_admission_marker_lifetime_seconds(121)
         self.assertEqual("operator-admission-marker", raised.exception.phase)
         self.assertEqual(
-            608,
-            raised.exception.details["required_lifetime_seconds"],
+            120,
+            raised.exception.details["maximum_timeout_seconds"],
         )
 
     def test_marker_is_private_exact_and_released_by_token(self) -> None:
@@ -2078,10 +2082,24 @@ class DeploymentAdmissionTests(unittest.TestCase):
                 metadata = marker_path.stat()
                 self.assertEqual(0o600, metadata.st_mode & 0o777)
                 self.assertEqual("f" * 64, marker["token"])
-                self.assertEqual(540, marker["expires_at_unix"])
+                self.assertEqual(1180, marker["expires_at_unix"])
                 self.assertEqual(marker, json.loads(marker_path.read_text()))
                 dual.release_operator_deployment_admission(marker)
                 self.assertFalse(marker_path.exists())
+
+    def test_marker_release_rejects_absence_after_publication(self) -> None:
+        marker = self.marker()
+        with tempfile.TemporaryDirectory() as directory:
+            marker_path = Path(directory) / "deployment-admission-drain.json"
+            with mock.patch.object(
+                dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path
+            ):
+                with self.assertRaises(core.DeployError) as raised:
+                    dual.release_operator_deployment_admission(marker)
+        self.assertEqual(
+            "operator-admission-marker-release", raised.exception.phase
+        )
+        self.assertEqual("marker-missing", raised.exception.details["reason"])
 
     def test_marker_creation_is_create_only_and_rejects_symlink(self) -> None:
         snapshot = SimpleNamespace(
@@ -2213,6 +2231,13 @@ class DeploymentSequenceTests(unittest.TestCase):
         for patcher in self._admission_patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
+        self._verify_admission_patcher = mock.patch.object(
+            dual,
+            "verify_operator_deployment_admission",
+            return_value={"active_tool_calls": 0},
+        )
+        self.verify_admission = self._verify_admission_patcher.start()
+        self.addCleanup(self._verify_admission_patcher.stop)
 
 
     def snapshot(self):
@@ -2619,6 +2644,7 @@ class DeploymentSequenceTests(unittest.TestCase):
                 "verify:tunnel",
             ],
         )
+        self.assertEqual(2, self.verify_admission.call_count)
         install.assert_called_once_with(ROOT, snapshot)
         install_watchdogs.assert_called_once_with(ROOT, snapshot)
         restore_watchdogs.assert_not_called()
@@ -2984,6 +3010,142 @@ class DeploymentSequenceTests(unittest.TestCase):
 
         self.assertEqual(payload["phase"], "command-timeout")
         self.assertEqual(payload["deploy_phase"], "stop-operator")
+
+    def test_rollback_requires_replacement_admission_before_tunnel(self) -> None:
+        events: list[str] = []
+        active = observation(True)
+        inactive = observation(False)
+        ready = dual.DualReadiness(True, active, active, "live", "ready")
+        activation = SimpleNamespace(runtime=RUNTIME, previous=SimpleNamespace())
+        marker = {
+            "token": "d" * 64,
+            "expected_head": "a" * 40,
+            "source_identity_sha256": "e" * 64,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "stop_service",
+                side_effect=lambda unit: events.append(f"stop:{unit}") or inactive,
+            ),
+            mock.patch.object(
+                core,
+                "restore_pointer",
+                side_effect=lambda value: events.append("restore") or value,
+            ),
+            mock.patch.object(
+                core,
+                "verify_pointer_state",
+                side_effect=lambda *args: events.append("verify:pointer")
+                or SimpleNamespace(),
+            ),
+            mock.patch.object(
+                dual,
+                "start_service",
+                side_effect=lambda unit: events.append(f"start:{unit}") or active,
+            ),
+            mock.patch.object(
+                dual,
+                "verify_operator_process",
+                side_effect=lambda *args, **kwargs: events.append("verify:operator")
+                or {"pid": 1},
+            ),
+            mock.patch.object(
+                dual,
+                "require_operator_listener",
+                side_effect=lambda **kwargs: events.append("listener")
+                or {"successful_samples": 2},
+            ),
+            mock.patch.object(
+                dual,
+                "verify_operator_deployment_admission",
+                side_effect=lambda value: events.append("verify:admission")
+                or {"active_tool_calls": 0},
+            ),
+            mock.patch.object(dual, "wait_until_ready", return_value=ready),
+            mock.patch.object(
+                dual,
+                "release_operator_deployment_admission",
+                side_effect=lambda value: events.append("release:admission"),
+            ),
+        ):
+            with self.assertRaises(core.DeployError):
+                dual.rollback_url(
+                    core.DeployError("primary"),
+                    activation=activation,
+                    contract=CONTRACT,
+                    timeout_seconds=1,
+                    admission_marker=marker,
+                )
+        self.assertEqual(
+            [
+                f"stop:{dual.TUNNEL_SERVICE}",
+                f"stop:{dual.OPERATOR_SERVICE}",
+                "restore",
+                "verify:pointer",
+                f"start:{dual.OPERATOR_SERVICE}",
+                "verify:operator",
+                "listener",
+                "verify:admission",
+                f"start:{dual.TUNNEL_SERVICE}",
+                "verify:admission",
+                "release:admission",
+            ],
+            events,
+        )
+
+    def test_rollback_keeps_tunnel_stopped_when_previous_runtime_lacks_admission(self) -> None:
+        events: list[str] = []
+        active = observation(True)
+        inactive = observation(False)
+        activation = SimpleNamespace(runtime=RUNTIME, previous=SimpleNamespace())
+        marker = {
+            "token": "d" * 64,
+            "expected_head": "a" * 40,
+            "source_identity_sha256": "e" * 64,
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "stop_service",
+                side_effect=lambda unit: events.append(f"stop:{unit}") or inactive,
+            ),
+            mock.patch.object(core, "restore_pointer"),
+            mock.patch.object(core, "verify_pointer_state"),
+            mock.patch.object(
+                dual,
+                "start_service",
+                side_effect=lambda unit: events.append(f"start:{unit}") or active,
+            ),
+            mock.patch.object(
+                dual, "verify_operator_process", return_value={"pid": 1}
+            ),
+            mock.patch.object(
+                dual,
+                "require_operator_listener",
+                return_value={"successful_samples": 2},
+            ),
+            mock.patch.object(
+                dual,
+                "verify_operator_deployment_admission",
+                side_effect=core.DeployError("admission route unavailable"),
+            ),
+            mock.patch.object(
+                dual, "release_operator_deployment_admission"
+            ) as release,
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.rollback_url(
+                    core.DeployError("primary"),
+                    activation=activation,
+                    contract=CONTRACT,
+                    timeout_seconds=1,
+                    admission_marker=marker,
+                )
+        self.assertNotIn(f"start:{dual.TUNNEL_SERVICE}", events)
+        self.assertEqual(2, events.count(f"stop:{dual.OPERATOR_SERVICE}"))
+        release.assert_not_called()
+        self.assertIn('"operator_admission": "failed"', str(raised.exception))
 
     def test_rollback_stops_both_restores_then_starts_operator_before_tunnel(self) -> None:
         events: list[str] = []
