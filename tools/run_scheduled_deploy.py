@@ -483,10 +483,12 @@ def observe_tunnel_dispatcher_contention() -> dict[str, Any]:
     busy_samples: list[dict[str, Any]] = []
     for sample in samples:
         metrics = sample["metrics"]
+        # ants.Pool.Running() counts live worker goroutines, including workers
+        # parked idle in the pool. It is therefore diagnostic capacity state,
+        # not authoritative in-flight command evidence. Command admission and
+        # completion are proven by the queue plus conserved poll/enqueue/final
+        # response counters, and by their stability across bounded samples.
         mismatch = deploy_dual._tunnel_drain_idle_mismatch(metrics)
-        workers = metrics[deploy_dual.TUNNEL_DRAIN_WORKER_GAUGE_NAME]
-        if workers != 0:
-            mismatch[deploy_dual.TUNNEL_DRAIN_WORKER_GAUGE_NAME] = workers
         if mismatch:
             busy_samples.append(
                 {
@@ -526,6 +528,8 @@ def observe_tunnel_dispatcher_contention() -> dict[str, Any]:
     }
 
 
+
+
 def deployment_contention_preflight(
     *,
     expected_head: str,
@@ -535,13 +539,26 @@ def deployment_contention_preflight(
         deploy_core.DEFAULT_LOCK_FILE,
         state_root=deploy_core.DEFAULT_STATE_ROOT,
     )
-    dispatcher = observe_tunnel_dispatcher_contention()
-    decision = (
-        "proceed"
-        if lock.get("state") == "available"
-        and dispatcher.get("state") == "idle"
-        else "defer"
-    )
+    try:
+        dispatcher = observe_tunnel_dispatcher_contention()
+    except Exception as exc:
+        dispatcher = {
+            "schema_version": 1,
+            "kind": "grabowski_tunnel_dispatcher_contention_observation",
+            "state": "unknown",
+            "reason": "advisory-probe-failed",
+            "error_type": type(exc).__name__,
+            "does_not_establish": [
+                "dispatcher_idle",
+                "root_cause",
+                "permission_to_skip_final_admission_and_drain",
+            ],
+        }
+    # Dispatcher activity is advisory here. The apply path now engages a
+    # source-bound operator admission marker before the authoritative drain,
+    # so normal connector traffic must not starve validation indefinitely.
+    # The deployment lock remains an early hard serialization gate.
+    decision = "proceed" if lock.get("state") == "available" else "defer"
     material = {
         "schema_version": 1,
         "kind": "grabowski_runtime_deploy_contention_preflight",
@@ -553,6 +570,7 @@ def deployment_contention_preflight(
         "decision": decision,
         "validation_started": False,
         "final_lock_and_drain_gates_required": True,
+        "dispatcher_activity_advisory_before_final_admission": True,
         "does_not_establish": [
             "that_contention_will_not_appear_later",
             "deployment_authority",
@@ -561,6 +579,8 @@ def deployment_contention_preflight(
         ],
     }
     return {**material, "evidence_sha256": canonical_json_sha256(material)}
+
+
 
 
 def wait_for_deployment_window(

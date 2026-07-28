@@ -33,6 +33,13 @@ class _FakeFastMCP:
             _session_creation_lock=_FakeAsyncLock(),
         )
 
+        async def call_tool(*args, **kwargs):
+            return {"called": True, "args": args, "kwargs": kwargs}
+
+        self._tool_manager = types.SimpleNamespace(call_tool=call_tool)
+
+
+
     def tool(self, *args, **kwargs):
         return lambda function: function
 
@@ -161,6 +168,27 @@ class OperatorContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "loopback HTTP"):
             operator._protected_resource_metadata("https://example.com/")
 
+    def test_deployment_admission_status_route_is_registered(self) -> None:
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"), filename=str(SOURCE))
+        function = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "deployment_admission_status"
+        )
+        decorators = [
+            decorator
+            for decorator in function.decorator_list
+            if isinstance(decorator, ast.Call)
+            and isinstance(decorator.func, ast.Name)
+            and decorator.func.id == "_mcp_custom_route"
+        ]
+        self.assertEqual(1, len(decorators))
+        self.assertIsInstance(decorators[0].args[0], ast.Name)
+        self.assertEqual(
+            "DEPLOYMENT_ADMISSION_STATUS_PATH", decorators[0].args[0].id
+        )
+
     def test_http_sessions_and_liveness_lock_are_bounded(self) -> None:
         operator = _load_operator_module()
         operator._configure_http_runtime()
@@ -177,6 +205,71 @@ class OperatorContractTests(unittest.TestCase):
             )
         )
         self.assertEqual("/_grabowski/mcp-liveness", operator.MCP_LIVENESS_PATH)
+
+    def test_deployment_admission_marker_is_private_bounded_and_expiring(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "deployment-admission-drain.json"
+            payload = {
+                "schema_version": 1,
+                "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                "token": "a" * 64,
+                "expected_head": "b" * 40,
+                "source_identity_sha256": "c" * 64,
+                "created_at_unix": 100,
+                "expires_at_unix": 200,
+            }
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            marker.chmod(0o600)
+            with patch.object(operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker):
+                active = operator._read_deployment_admission_marker(now_unix=150)
+                expired = operator._read_deployment_admission_marker(now_unix=201)
+                marker.chmod(0o644)
+                invalid = operator._read_deployment_admission_marker(now_unix=150)
+                marker.unlink()
+                target = Path(directory) / "target"
+                target.write_text(json.dumps(payload), encoding="utf-8")
+                marker.symlink_to(target)
+                symlink = operator._read_deployment_admission_marker(now_unix=150)
+        self.assertEqual("active", active["state"])
+        self.assertTrue(active["active"])
+        self.assertEqual("expired", expired["state"])
+        self.assertFalse(expired["active"])
+        self.assertEqual("invalid", invalid["state"])
+        self.assertTrue(invalid["active"])
+        self.assertEqual("invalid", symlink["state"])
+        self.assertTrue(symlink["active"])
+
+
+    def test_deployment_admission_gate_rejects_new_tools_before_effect(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "deployment-admission-drain.json"
+            payload = {
+                "schema_version": 1,
+                "kind": operator.DEPLOYMENT_ADMISSION_MARKER_KIND,
+                "token": "a" * 64,
+                "expected_head": "b" * 40,
+                "source_identity_sha256": "c" * 64,
+                "created_at_unix": int(time.time()) - 1,
+                "expires_at_unix": int(time.time()) + 60,
+            }
+            marker.write_text(json.dumps(payload), encoding="utf-8")
+            marker.chmod(0o600)
+            with patch.object(operator, "DEPLOYMENT_ADMISSION_MARKER_PATH", marker):
+                operator._configure_http_runtime()
+                with self.assertRaisesRegex(RuntimeError, "rejects new tool calls"):
+                    operator.asyncio.run(
+                        operator.mcp._tool_manager.call_tool("write", {})
+                    )
+                self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+                marker.unlink()
+                result = operator.asyncio.run(
+                    operator.mcp._tool_manager.call_tool("read", {})
+                )
+        self.assertTrue(result["called"])
+        self.assertTrue(operator._DEPLOYMENT_ADMISSION_GATE_INSTALLED)
+
 
     def test_liveness_probe_times_out_on_held_session_creation_lock(self) -> None:
         operator = _load_operator_module()

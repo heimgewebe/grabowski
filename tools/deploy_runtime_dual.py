@@ -20,7 +20,9 @@ import subprocess
 import sys
 import time
 from typing import Any, NoReturn
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 import deploy_runtime as core
 
@@ -224,6 +226,28 @@ TUNNEL_DRAIN_COUNTER_NAMES = (
 )
 TUNNEL_DRAIN_IDENTITY_NAMES = ("process_start_time_seconds",)
 TUNNEL_DRAIN_STABILITY_NAMES = TUNNEL_DRAIN_COUNTER_NAMES + TUNNEL_DRAIN_IDENTITY_NAMES
+OPERATOR_ADMISSION_MARKER_PATH = (
+    core.DEFAULT_STATE_ROOT / "deployment-admission-drain.json"
+)
+OPERATOR_ADMISSION_STATUS_URL = (
+    f"http://{OPERATOR_LISTENER_HOST}:{OPERATOR_LISTENER_PORT}"
+    "/_grabowski/deployment-admission"
+)
+OPERATOR_ADMISSION_MARKER_KIND = "grabowski_deployment_admission_drain"
+OPERATOR_ADMISSION_MARKER_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "token",
+        "expected_head",
+        "source_identity_sha256",
+        "created_at_unix",
+        "expires_at_unix",
+    }
+)
+OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 600
+OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES = 2
+OPERATOR_ADMISSION_PROBE_SECONDS = 3
 TUNNEL_DRAIN_DIRECT_METRIC_NAMES = (
     TUNNEL_DRAIN_QUEUE_GAUGE_NAME,
     TUNNEL_DRAIN_WORKER_GAUGE_NAME,
@@ -2365,6 +2389,452 @@ def _tunnel_drain_idle_mismatch(observed: dict[str, float]) -> dict[str, float]:
     return mismatch
 
 
+def _deployment_source_identity_sha256(snapshot: core.Snapshot) -> str:
+    payload = {
+        "repo_head": snapshot.repo_head,
+        "contract_sha256": snapshot.contract_sha256,
+        "runtime_input_sha256": snapshot.runtime_input_sha256,
+        "runtime_lock_sha256": snapshot.runtime_lock_sha256,
+        "source_sha256s": snapshot.source_sha256s,
+        "runtime_asset_sha256s": snapshot.runtime_asset_sha256s,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _secure_admission_marker_payload(path: Path) -> dict[str, Any] | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        core.fail(
+            "Deployment-Admission-Marker konnte nicht sicher geöffnet werden",
+            phase="operator-admission-marker",
+            details={"error_type": type(exc).__name__},
+        )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or statmod.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > 4096
+        ):
+            core.fail(
+                "Deployment-Admission-Marker ist nicht sicher lesbar",
+                phase="operator-admission-marker",
+            )
+        chunks: list[bytes] = []
+        remaining = 4097
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > 4096:
+            core.fail(
+                "Deployment-Admission-Marker überschreitet das Größenlimit",
+                phase="operator-admission-marker",
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        core.fail(
+            "Deployment-Admission-Marker ist ungültig",
+            phase="operator-admission-marker",
+            details={"error_type": type(exc).__name__},
+        )
+    if not isinstance(value, dict) or set(value) != OPERATOR_ADMISSION_MARKER_KEYS:
+        core.fail(
+            "Deployment-Admission-Marker hat ein ungültiges Schema",
+            phase="operator-admission-marker",
+        )
+    created = value.get("created_at_unix")
+    expires = value.get("expires_at_unix")
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != OPERATOR_ADMISSION_MARKER_KIND
+        or not isinstance(value.get("token"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["token"]) is None
+        or not isinstance(value.get("expected_head"), str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", value["expected_head"])
+        is None
+        or not isinstance(value.get("source_identity_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["source_identity_sha256"]) is None
+        or not isinstance(created, int)
+        or isinstance(created, bool)
+        or not isinstance(expires, int)
+        or isinstance(expires, bool)
+        or expires <= created
+        or expires - created > OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS
+    ):
+        core.fail(
+            "Deployment-Admission-Marker enthält ungültige Werte",
+            phase="operator-admission-marker",
+        )
+    return value
+
+
+def _fsync_parent(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _create_private_admission_marker(path: Path, value: dict[str, Any]) -> None:
+    payload = (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_descriptor = os.open(path.parent, flags)
+    descriptor = -1
+    try:
+        parent_linked = path.parent.lstat()
+        parent_opened = os.fstat(parent_descriptor)
+        if (
+            not statmod.S_ISDIR(parent_opened.st_mode)
+            or statmod.S_ISLNK(parent_linked.st_mode)
+            or parent_opened.st_uid != os.getuid()
+            or (parent_linked.st_dev, parent_linked.st_ino)
+            != (parent_opened.st_dev, parent_opened.st_ino)
+        ):
+            core.fail(
+                "Deployment-Admission-Marker-Elternverzeichnis ist unsicher",
+                phase="operator-admission-marker",
+            )
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            create_flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                path.name, create_flags, 0o600, dir_fd=parent_descriptor
+            )
+        except FileExistsError:
+            core.fail(
+                "Deployment-Admission-Marker existiert bereits",
+                phase="operator-admission-marker",
+            )
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                core.fail(
+                    "Deployment-Admission-Marker konnte nicht vollständig geschrieben werden",
+                    phase="operator-admission-marker",
+                )
+            offset += written
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        linked = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(linked.st_mode)
+            or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+        ):
+            core.fail(
+                "Deployment-Admission-Marker-Bindung driftete",
+                phase="operator-admission-marker",
+            )
+        os.fsync(parent_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def engage_operator_deployment_admission(
+    snapshot: core.Snapshot, *, timeout_seconds: int
+) -> dict[str, Any]:
+    now = int(time.time())
+    existing = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
+    if existing is not None:
+        expires = existing.get("expires_at_unix")
+        if not isinstance(expires, int) or isinstance(expires, bool) or expires > now:
+            core.fail(
+                "Ein aktiver oder unklarer Deployment-Admission-Marker existiert bereits",
+                phase="operator-admission-marker",
+            )
+        release_operator_deployment_admission(existing)
+    lifetime = min(
+        OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+        max(120, timeout_seconds + 120),
+    )
+    marker = {
+        "schema_version": 1,
+        "kind": OPERATOR_ADMISSION_MARKER_KIND,
+        "token": secrets.token_hex(32),
+        "expected_head": snapshot.repo_head,
+        "source_identity_sha256": _deployment_source_identity_sha256(snapshot),
+        "created_at_unix": now,
+        "expires_at_unix": now + lifetime,
+    }
+    _create_private_admission_marker(OPERATOR_ADMISSION_MARKER_PATH, marker)
+    observed = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
+    if observed != marker:
+        core.fail(
+            "Deployment-Admission-Marker-Readback driftete",
+            phase="operator-admission-marker",
+        )
+    return marker
+
+
+def release_operator_deployment_admission(marker: dict[str, Any]) -> None:
+    path = OPERATOR_ADMISSION_MARKER_PATH
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_descriptor = os.open(path.parent, flags)
+    descriptor = -1
+    try:
+        file_flags = os.O_RDONLY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path.name, file_flags, dir_fd=parent_descriptor)
+        except FileNotFoundError:
+            return
+        opened = os.fstat(descriptor)
+        linked = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(linked.st_mode)
+            or (linked.st_dev, linked.st_ino) != (opened.st_dev, opened.st_ino)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+        ):
+            core.fail(
+                "Deployment-Admission-Marker-Bindung ist vor Freigabe unsicher",
+                phase="operator-admission-marker-release",
+            )
+        chunks: list[bytes] = []
+        remaining = 4097
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > 4096:
+            core.fail(
+                "Deployment-Admission-Marker ist vor Freigabe zu groß",
+                phase="operator-admission-marker-release",
+            )
+        try:
+            observed = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            core.fail(
+                "Deployment-Admission-Marker ist vor Freigabe ungültig",
+                phase="operator-admission-marker-release",
+            )
+        if (
+            not isinstance(observed, dict)
+            or observed.get("token") != marker.get("token")
+            or observed.get("expected_head") != marker.get("expected_head")
+            or observed.get("source_identity_sha256")
+            != marker.get("source_identity_sha256")
+        ):
+            core.fail(
+                "Deployment-Admission-Marker gehört einem anderen Lauf",
+                phase="operator-admission-marker-release",
+            )
+        linked_again = os.stat(
+            path.name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+        if (linked_again.st_dev, linked_again.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            core.fail(
+                "Deployment-Admission-Marker driftete vor Freigabe",
+                phase="operator-admission-marker-release",
+            )
+        os.unlink(path.name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_descriptor)
+    if path.exists() or path.is_symlink():
+        core.fail(
+            "Deployment-Admission-Marker blieb nach Freigabe vorhanden",
+            phase="operator-admission-marker-release",
+        )
+
+
+def _operator_admission_observation() -> dict[str, Any] | None:
+    request = Request(
+        OPERATOR_ADMISSION_STATUS_URL,
+        headers={"Cache-Control": "no-store", "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=2) as response:
+            status = int(response.status)
+            raw = response.read(8193)
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        core.fail(
+            "Operator-Admission-Readback lieferte einen unerwarteten HTTP-Status",
+            phase="operator-admission-drain",
+            details={"http_status": exc.code},
+        )
+    except (URLError, TimeoutError, OSError) as exc:
+        core.fail(
+            "Operator-Admission-Readback war transportseitig nicht erreichbar",
+            phase="operator-admission-drain",
+            details={"error_type": type(exc).__name__},
+        )
+    if status != 200:
+        core.fail(
+            "Operator-Admission-Readback lieferte einen unerwarteten HTTP-Status",
+            phase="operator-admission-drain",
+            details={"http_status": status},
+        )
+    if len(raw) > 8192:
+        core.fail(
+            "Operator-Admission-Readback überschreitet das Größenlimit",
+            phase="operator-admission-drain",
+        )
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        core.fail(
+            "Operator-Admission-Readback ist kein gültiges JSON",
+            phase="operator-admission-drain",
+            details={"error_type": type(exc).__name__},
+        )
+    if not isinstance(value, dict):
+        core.fail(
+            "Operator-Admission-Readback muss ein Objekt sein",
+            phase="operator-admission-drain",
+        )
+    return value
+
+
+def wait_for_operator_deployment_admission(
+    marker: dict[str, Any], *, timeout_seconds: int
+) -> dict[str, Any]:
+    probe_deadline = time.monotonic() + min(
+        timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS
+    )
+    first: dict[str, Any] | None = None
+    while time.monotonic() < probe_deadline:
+        first = _operator_admission_observation()
+        if first is not None:
+            break
+        time.sleep(0.2)
+    if first is None:
+        return {
+            "supported": False,
+            "reason": "operator-runtime-precedes-admission-contract",
+            "does_not_establish": [
+                "safe_continuous_admission",
+                "absence_of_inflight_commands",
+            ],
+        }
+    deadline = time.monotonic() + timeout_seconds
+    consecutive_idle = 0
+    attempts = 0
+    last = first
+    while True:
+        attempts += 1
+        observed = first if attempts == 1 else _operator_admission_observation()
+        if observed is None:
+            consecutive_idle = 0
+        else:
+            last = observed
+            active_calls = observed.get("active_tool_calls")
+            valid = (
+                observed.get("valid") is True
+                and observed.get("active") is True
+                and observed.get("state") == "active"
+                and observed.get("admission_gate_installed") is True
+                and observed.get("token") == marker.get("token")
+                and observed.get("expected_head") == marker.get("expected_head")
+                and observed.get("source_identity_sha256")
+                == marker.get("source_identity_sha256")
+                and isinstance(active_calls, int)
+                and not isinstance(active_calls, bool)
+                and active_calls >= 0
+            )
+            if not valid:
+                core.fail(
+                    "Operator bestätigte den Deployment-Admission-Marker nicht",
+                    phase="operator-admission-drain",
+                    details={"observation": observed},
+                )
+            consecutive_idle = consecutive_idle + 1 if active_calls == 0 else 0
+            if consecutive_idle >= OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES:
+                return {
+                    "supported": True,
+                    "attempts": attempts,
+                    "consecutive_idle_samples": consecutive_idle,
+                    "observation": observed,
+                }
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.2, remaining))
+    core.fail(
+        "Operator-Admission wurde nicht rechtzeitig leer",
+        phase="operator-admission-drain",
+        details={"attempts": attempts, "last_observation": last},
+    )
+
+
+def verify_operator_deployment_admission(
+    marker: dict[str, Any],
+) -> dict[str, Any]:
+    observed = _operator_admission_observation()
+    if (
+        observed is None
+        or observed.get("valid") is not True
+        or observed.get("active") is not True
+        or observed.get("admission_gate_installed") is not True
+        or observed.get("token") != marker.get("token")
+        or observed.get("expected_head") != marker.get("expected_head")
+        or observed.get("source_identity_sha256")
+        != marker.get("source_identity_sha256")
+        or observed.get("active_tool_calls") != 0
+    ):
+        core.fail(
+            "Operator-Admission-Finalprüfung scheiterte",
+            phase="operator-admission-final-guard",
+            details={"observation": observed},
+        )
+    return observed
+
+
 def _tunnel_drain_counter_snapshot(observed: dict[str, float]) -> dict[str, float]:
     return {name: observed[name] for name in TUNNEL_DRAIN_COUNTER_NAMES}
 
@@ -2390,7 +2860,9 @@ def _require_tunnel_drain_counters_not_regressed(
         )
 
 
-def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
+def wait_for_tunnel_dispatcher_idle(
+    *, timeout_seconds: int, admission_active: bool = False
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
     consecutive_idle = 0
     attempts = 0
@@ -2436,12 +2908,20 @@ def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
                         },
                     )
                 idle = not _tunnel_drain_idle_mismatch(observed)
+                comparable_stability = (
+                    {"process_start_time_seconds": process_start_time}
+                    if admission_active
+                    else stability
+                )
                 if not idle:
                     consecutive_idle = 0
                     last_idle_stability = None
-                elif last_idle_stability is None or stability != last_idle_stability:
+                elif (
+                    last_idle_stability is None
+                    or comparable_stability != last_idle_stability
+                ):
                     consecutive_idle = 1
-                    last_idle_stability = stability
+                    last_idle_stability = comparable_stability
                 else:
                     consecutive_idle += 1
                 last_error = None
@@ -2451,6 +2931,7 @@ def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
                         "consecutive_idle_samples": consecutive_idle,
                         "metrics": observed,
                         "stability": stability,
+                        "admission_active": admission_active,
                     }
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2467,12 +2948,19 @@ def wait_for_tunnel_dispatcher_idle(*, timeout_seconds: int) -> dict[str, Any]:
             "last_valid_counters": last_valid_counters or {},
             "expected_process_start_time_seconds": expected_process_start_time,
             "last_error": last_error,
+            "admission_active": admission_active,
         },
     )
 
 
+
+
+
+
 def verify_tunnel_drain_final_guard(
     expected_stability: dict[str, float],
+    *,
+    admission_active: bool = False,
 ) -> dict[str, float]:
     metrics_text = core.http_text(TUNNEL_METRICS_URL)
     if metrics_text is None:
@@ -2491,11 +2979,28 @@ def verify_tunnel_drain_final_guard(
         )
     busy = _tunnel_drain_idle_mismatch(observed)
     stability = _tunnel_drain_stability_snapshot(observed)
-    changed_stability = {
-        name: {"expected": expected_stability.get(name), "observed": stability[name]}
-        for name in TUNNEL_DRAIN_STABILITY_NAMES
-        if expected_stability.get(name) != stability[name]
-    }
+    if admission_active:
+        changed_stability = {}
+        if expected_stability.get("process_start_time_seconds") != stability[
+            "process_start_time_seconds"
+        ]:
+            changed_stability["process_start_time_seconds"] = {
+                "expected": expected_stability.get("process_start_time_seconds"),
+                "observed": stability["process_start_time_seconds"],
+            }
+        for name in TUNNEL_DRAIN_COUNTER_NAMES:
+            expected = expected_stability.get(name)
+            if not isinstance(expected, (int, float)) or stability[name] < expected:
+                changed_stability[name] = {
+                    "expected_minimum": expected,
+                    "observed": stability[name],
+                }
+    else:
+        changed_stability = {
+            name: {"expected": expected_stability.get(name), "observed": stability[name]}
+            for name in TUNNEL_DRAIN_STABILITY_NAMES
+            if expected_stability.get(name) != stability[name]
+        }
     if busy or changed_stability:
         core.fail(
             "Tunnel wurde zwischen Drain-Beweis und geplantem Stop wieder aktiv",
@@ -2506,6 +3011,10 @@ def verify_tunnel_drain_final_guard(
             },
         )
     return observed
+
+
+
+
 
 
 def stop_service(unit: str) -> core.ServiceObservation:
@@ -2595,6 +3104,7 @@ def rollback_url(
     activation: core.ActivationState,
     contract: core.RuntimeContract,
     timeout_seconds: int,
+    admission_marker: dict[str, Any] | None = None,
 ) -> NoReturn:
     phases: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
@@ -2643,6 +3153,21 @@ def rollback_url(
             errors.append({"phase": "readiness", "message": "Wiederhergestellte Runtime wurde nicht ready", "result": ready.to_dict()})
             ready_ok = False
 
+    admission_release = "not-requested"
+    if (
+        admission_marker is not None
+        and identity_ok
+        and identity is not None
+        and ready_ok
+        and isinstance(ready, DualReadiness)
+        and ready.ok
+    ):
+        released_ok, _ = step(
+            "release-admission",
+            lambda: release_operator_deployment_admission(admission_marker),
+        )
+        admission_release = "released" if released_ok else "failed"
+
     payload = {
         "original": _error_summary(original),
         "phases": phases,
@@ -2650,8 +3175,13 @@ def rollback_url(
         "pointer_restore": "restored",
         "operator_identity": "verified" if identity_ok and identity is not None else "failed",
         "readiness": "verified" if ready_ok and isinstance(ready, DualReadiness) and ready.ok else "failed",
+        "admission_release": admission_release,
     }
     raise core.DeployError("Deployment fehlgeschlagen; Zwei-Dienste-Rollbackzustand: " + json.dumps(payload, sort_keys=True)) from original
+
+
+
+
 
 
 def preflight_url(
@@ -2724,12 +3254,33 @@ def deploy_url(
             )
         raise
     phase = "post-host-assets-snapshot-revalidation"
+    admission_marker: dict[str, Any] | None = None
+    admission_proof: dict[str, Any] = {"supported": False}
     try:
         core.verify_apply_snapshot_unchanged(repo, snapshot, build.release_path)
+        phase = "operator-admission-engage"
+        admission_marker = engage_operator_deployment_admission(
+            snapshot, timeout_seconds=timeout_seconds
+        )
+        phase = "operator-admission-drain"
+        admission_proof = wait_for_operator_deployment_admission(
+            admission_marker, timeout_seconds=timeout_seconds
+        )
+        admission_active = admission_proof.get("supported") is True
         phase = "tunnel-drain-pre-stop"
-        drain_proof = wait_for_tunnel_dispatcher_idle(timeout_seconds=timeout_seconds)
+        drain_proof = wait_for_tunnel_dispatcher_idle(
+            timeout_seconds=timeout_seconds, admission_active=admission_active
+        )
+        if admission_active:
+            phase = "operator-admission-final-guard"
+            verify_operator_deployment_admission(admission_marker)
         phase = "tunnel-drain-final-guard"
-        final_drain_metrics = verify_tunnel_drain_final_guard(drain_proof["stability"])
+        final_drain_metrics = verify_tunnel_drain_final_guard(
+            drain_proof["stability"], admission_active=admission_active
+        )
+        if admission_active:
+            phase = "operator-admission-final-guard"
+            verify_operator_deployment_admission(admission_marker)
         phase = "stop-tunnel"
         stop_service(TUNNEL_SERVICE)
         phase = "stop-operator"
@@ -2780,6 +3331,9 @@ def deploy_url(
             snapshot=snapshot,
             agent_instructions=build.agent_instructions,
         )
+        phase = "operator-admission-release"
+        release_operator_deployment_admission(admission_marker)
+        admission_marker = None
 
         print("PASS: Zwei-Dienste-Deployment erfolgreich")
         print(f"Repo-HEAD:       {snapshot.repo_head}")
@@ -2796,6 +3350,7 @@ def deploy_url(
             "Tunnel-Drain:    "
             f"attempts={drain_proof['attempts']} "
             f"stable={drain_proof['consecutive_idle_samples']} "
+            f"admission={admission_proof.get('supported')} "
             f"final_queue={final_drain_metrics['commands_queue_length']:g} "
             f"final_responses={final_drain_metrics[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]:g} "
             f"workers_observed={final_drain_metrics['dispatcher_worker_pool_occupancy']:g}"
@@ -2848,7 +3403,17 @@ def deploy_url(
                 "Deployment und Watchdog-Host-Asset-Rücksicherung fehlgeschlagen: "
                 f"{original}; watchdog rollback: {watchdog_rollback_error}"
             )
-        if phase in {"tunnel-drain-pre-stop", "tunnel-drain-final-guard"}:
+        pre_stop_phases = {
+            "operator-admission-engage",
+            "operator-admission-drain",
+            "operator-admission-final-guard",
+            "tunnel-drain-pre-stop",
+            "tunnel-drain-final-guard",
+        }
+        if phase in pre_stop_phases:
+            if admission_marker is not None:
+                release_operator_deployment_admission(admission_marker)
+                admission_marker = None
             if watchdog_rollback_error is not None:
                 raise rollback_original from original
             raise original
@@ -2857,7 +3422,12 @@ def deploy_url(
             activation=activation,
             contract=snapshot.contract,
             timeout_seconds=timeout_seconds,
+            admission_marker=admission_marker,
         )
+
+
+
+
 
 
 def parse_args() -> argparse.Namespace:

@@ -2027,7 +2027,176 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                     dual.verify_watchdog_systemd_fragments((asset,))
 
 
+class DeploymentAdmissionTests(unittest.TestCase):
+    def marker(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": dual.OPERATOR_ADMISSION_MARKER_KIND,
+            "token": "d" * 64,
+            "expected_head": "a" * 40,
+            "source_identity_sha256": "e" * 64,
+            "created_at_unix": 100,
+            "expires_at_unix": 200,
+        }
+
+    def test_marker_is_private_exact_and_released_by_token(self) -> None:
+        snapshot = SimpleNamespace(
+            repo_head="a" * 40,
+            contract_sha256="b" * 64,
+            runtime_input_sha256="c" * 64,
+            runtime_lock_sha256="d" * 64,
+            source_sha256s={"grabowski_operator": "e" * 64},
+            runtime_asset_sha256s={},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            marker_path = Path(directory) / "deployment-admission-drain.json"
+            with (
+                mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path),
+                mock.patch.object(dual.time, "time", return_value=100),
+                mock.patch.object(dual.secrets, "token_hex", return_value="f" * 64),
+            ):
+                marker = dual.engage_operator_deployment_admission(
+                    snapshot, timeout_seconds=40
+                )
+                metadata = marker_path.stat()
+                self.assertEqual(0o600, metadata.st_mode & 0o777)
+                self.assertEqual("f" * 64, marker["token"])
+                self.assertEqual(marker, json.loads(marker_path.read_text()))
+                dual.release_operator_deployment_admission(marker)
+                self.assertFalse(marker_path.exists())
+
+    def test_marker_creation_is_create_only_and_rejects_symlink(self) -> None:
+        snapshot = SimpleNamespace(
+            repo_head="a" * 40,
+            contract_sha256="b" * 64,
+            runtime_input_sha256="c" * 64,
+            runtime_lock_sha256="d" * 64,
+            source_sha256s={"grabowski_operator": "e" * 64},
+            runtime_asset_sha256s={},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            marker_path = Path(directory) / "deployment-admission-drain.json"
+            marker_path.write_text("occupied", encoding="utf-8")
+            marker_path.chmod(0o600)
+            with (
+                mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path),
+                mock.patch.object(dual.time, "time", return_value=100),
+            ):
+                with self.assertRaises(core.DeployError):
+                    dual.engage_operator_deployment_admission(
+                        snapshot, timeout_seconds=40
+                    )
+            marker_path.unlink()
+            target = Path(directory) / "target"
+            target.write_text("{}", encoding="utf-8")
+            marker_path.symlink_to(target)
+            with mock.patch.object(dual, "OPERATOR_ADMISSION_MARKER_PATH", marker_path):
+                with self.assertRaises(core.DeployError):
+                    dual._secure_admission_marker_payload(marker_path)
+
+    def test_operator_admission_probe_distinguishes_404_from_transport_failure(
+        self,
+    ) -> None:
+        missing = dual.HTTPError(
+            dual.OPERATOR_ADMISSION_STATUS_URL, 404, "missing", None, None
+        )
+        with mock.patch.object(dual, "urlopen", side_effect=missing):
+            self.assertIsNone(dual._operator_admission_observation())
+        with mock.patch.object(dual, "urlopen", side_effect=dual.URLError("offline")):
+            with self.assertRaises(core.DeployError) as raised:
+                dual._operator_admission_observation()
+        self.assertEqual("operator-admission-drain", raised.exception.phase)
+
+    def test_operator_admission_waits_for_existing_calls_then_seals(self) -> None:
+        marker = self.marker()
+        observations = [
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                "token": marker["token"],
+                "expected_head": marker["expected_head"],
+                "source_identity_sha256": marker["source_identity_sha256"],
+                "active_tool_calls": count,
+            }
+            for count in (1, 0, 0)
+        ]
+        with (
+            mock.patch.object(
+                dual, "_operator_admission_observation", side_effect=observations
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker, timeout_seconds=5
+            )
+        self.assertTrue(proof["supported"])
+        self.assertEqual(3, proof["attempts"])
+        self.assertEqual(0, proof["observation"]["active_tool_calls"])
+
+    def test_admission_drain_accepts_balanced_progress_but_not_unfinished_work(
+        self,
+    ) -> None:
+        def metrics(counter: int, responses: int | None = None) -> str:
+            final = counter if responses is None else responses
+            return (
+                "commands_queue_length 0\n"
+                "dispatcher_worker_pool_occupancy 9\n"
+                f"commands_polled_total {counter}\n"
+                f"commands_enqueued_total {counter}\n"
+                f'command_end_to_end_latency_milliseconds_count{{latency_type="enqueue_to_response"}} {final}\n'
+                "process_start_time_seconds 1000\n"
+            )
+
+        with (
+            mock.patch.object(
+                core, "http_text", side_effect=[metrics(10), metrics(11), metrics(12)]
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_tunnel_dispatcher_idle(
+                timeout_seconds=5, admission_active=True
+            )
+        self.assertEqual(3, proof["consecutive_idle_samples"])
+        self.assertEqual(12.0, proof["stability"]["commands_final_responses_total"])
+
+        with mock.patch.object(core, "http_text", return_value=metrics(13)):
+            final = dual.verify_tunnel_drain_final_guard(
+                proof["stability"], admission_active=True
+            )
+        self.assertEqual(13.0, final["commands_final_responses_total"])
+
+        with mock.patch.object(core, "http_text", return_value=metrics(14, 13)):
+            with self.assertRaises(core.DeployError):
+                dual.verify_tunnel_drain_final_guard(
+                    proof["stability"], admission_active=True
+                )
+
+
 class DeploymentSequenceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        marker = {
+            "token": "d" * 64,
+            "expected_head": "a" * 40,
+            "source_identity_sha256": "e" * 64,
+        }
+        self._admission_patchers = [
+            mock.patch.object(
+                dual, "engage_operator_deployment_admission", return_value=marker
+            ),
+            mock.patch.object(
+                dual,
+                "wait_for_operator_deployment_admission",
+                return_value={"supported": False, "reason": "legacy-test-runtime"},
+            ),
+            mock.patch.object(dual, "release_operator_deployment_admission"),
+        ]
+        for patcher in self._admission_patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
     def snapshot(self):
         return SimpleNamespace(
             contract=CONTRACT,
@@ -2360,7 +2529,7 @@ class DeploymentSequenceTests(unittest.TestCase):
             mock.patch.object(
                 dual,
                 "verify_tunnel_drain_final_guard",
-                side_effect=lambda stability: events.append("drain:final-guard")
+                side_effect=lambda stability, **kwargs: events.append("drain:final-guard")
                 or {
                     "commands_queue_length": 0.0,
                     "dispatcher_worker_pool_occupancy": 10.0,
