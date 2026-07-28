@@ -3,7 +3,9 @@ Description=Periodically reconcile persistent Grabowski tasks
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=1min
+# Schedule from the prior run's terminal transition. A slow or timed-out
+# oneshot therefore cannot make the next timer elapse immediately overdue.
+OnUnitInactiveSec=1min
 AccuracySec=30s
 Persistent=true
 Unit=grabowski-reconcile-tasks.service
