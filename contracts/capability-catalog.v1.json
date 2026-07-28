@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "fec4bb0449fbd372663a7001db12103326d27cf43b252b8c0a182c6bcf7a504b",
+  "capability_source_sha256": "ab0930fa8249123bbffd415fbce24e2fdca720c0df58ad975746d18ed850d399",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "5fab0c129560bace4d71392cc405a2f5485f7af62a539aeff13c3adabd56c42b",
+  "contract_sha256": "b0d032e607e5c537de0e203bd19fb5210ab654d24509a34355cda2a3fe5d9d54",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -504,6 +504,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_current_work"
+    },
+    {
+      "category": "operations-observability",
+      "description": "Audit bounded operator friction and optimization potential on manual request.",
+      "effects": [],
+      "id": "grabowski_operator_optimization_report",
+      "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_operator_optimization_report"
     },
     {
       "category": "version-control",

@@ -1001,6 +1001,13 @@ TOOL_PROFILES.update(
             "effects": [],
             "reversibility": "not-applicable",
         },
+        "grabowski_operator_optimization_report": {
+            "category": "operations-observability",
+            "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        },
         "grabowski_git_status": {
             "category": "version-control",
             "purpose": "Read fixed short Git status for one allowed repository.",

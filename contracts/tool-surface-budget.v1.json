@@ -544,6 +544,29 @@
         "tool": "grabowski_current_work"
       }
     },
+    "grabowski_operator_optimization_report": {
+      "evidence_refs": [
+        "source:src/grabowski_operator_optimization.py",
+        "tests:tests/test_operator_optimization.py",
+        "contract:config/runtime-entrypoint.json"
+      ],
+      "exception_detail": {
+        "claim": "The tool composes only bounded read-only evidence from existing audit, friction, execution-outcome and current-work sources and explicitly excludes personal activity telemetry.",
+        "evidence": "Source-bound hashes, partial-source warnings, bounded time-window comparison, no raw event or work-item payloads in the minimal view, explicit nonclaims and focused deterministic tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Client-side composition of audit, friction, execution-governor and current-work calls was rejected because it would duplicate window normalization, source binding, partial-evidence handling, finding ranking and no-productivity-claim semantics across operators.",
+      "rationale": "A manual ecosystem optimization audit needs one bounded cross-source read shape. The tool adds no mutable truth, task creation, policy mutation, routing promotion or personal telemetry.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "operations-observability",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_operator_optimization_report"
+      }
+    },
     "grabowski_juno_pair": {
       "evidence_refs": [
         "docs:juno-ipad-agent.md",

@@ -50,9 +50,9 @@ class ToolSurfaceBudgetTests(unittest.TestCase):
         self.assertTrue(report["valid"], report)
         self.assertTrue(report["schema_valid"])
         self.assertEqual(report["baseline_tool_count"], 125)
-        self.assertEqual(report["current_tool_count"], 175)
-        self.assertEqual(report["growth"], 58)
-        self.assertEqual(report["accepted_addition_count"], 58)
+        self.assertEqual(report["current_tool_count"], 176)
+        self.assertEqual(report["growth"], 59)
+        self.assertEqual(report["accepted_addition_count"], 59)
         self.assertEqual(report["operation_count"], 3)
         self.assertEqual(report["retired_tool_count"], 8)
 

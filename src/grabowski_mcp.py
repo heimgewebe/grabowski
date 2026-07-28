@@ -267,6 +267,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),
     "grabowski_current_work": (),
+    "grabowski_operator_optimization_report": (),
     "grabowski_git_status": (),
     "grabowski_git_diff": (),
     "grabowski_git_log": (),
