@@ -1132,24 +1132,54 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             RUNNER.EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS
         )
 
-    def test_dispatcher_contention_observation_reports_worker_activity(self) -> None:
-        metrics = _dispatcher_metrics(workers=1.0)
-        with patch.object(
-            RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
-        ), patch.object(
-            RUNNER.deploy_dual,
-            "_parse_tunnel_drain_metrics",
-            side_effect=[metrics.copy(), metrics.copy()],
-        ), patch.object(RUNNER.time, "sleep"):
+    def test_dispatcher_contention_observation_accepts_idle_warm_workers(self) -> None:
+        metrics = _dispatcher_metrics(workers=9.0)
+        with (
+            patch.object(
+                RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+            ),
+            patch.object(
+                RUNNER.deploy_dual,
+                "_parse_tunnel_drain_metrics",
+                side_effect=[metrics.copy(), metrics.copy()],
+            ),
+            patch.object(RUNNER.time, "sleep"),
+        ):
+            observed = RUNNER.observe_tunnel_dispatcher_contention()
+        self.assertEqual(observed["state"], "idle")
+        self.assertEqual(observed["reason"], "two-stable-idle-samples")
+        self.assertEqual(
+            observed["samples"][0]["metrics"]["dispatcher_worker_pool_occupancy"],
+            9.0,
+        )
+
+
+    def test_dispatcher_contention_observation_detects_unfinished_command_with_zero_workers(
+        self,
+    ) -> None:
+        metrics = _dispatcher_metrics(
+            workers=0.0, polled=8.0, enqueued=8.0, responses=7.0
+        )
+        with (
+            patch.object(
+                RUNNER.deploy_dual.core, "http_text", side_effect=["one", "two"]
+            ),
+            patch.object(
+                RUNNER.deploy_dual,
+                "_parse_tunnel_drain_metrics",
+                side_effect=[metrics.copy(), metrics.copy()],
+            ),
+            patch.object(RUNNER.time, "sleep"),
+        ):
             observed = RUNNER.observe_tunnel_dispatcher_contention()
         self.assertEqual(observed["state"], "busy")
         self.assertEqual(observed["reason"], "dispatcher-work-observed")
         self.assertEqual(
-            observed["busy_samples"][0]["mismatch"][
-                "dispatcher_worker_pool_occupancy"
-            ],
-            1.0,
+            observed["busy_samples"][0]["mismatch"]["commands_final_responses_total"],
+            7.0,
         )
+
+
 
     def test_dispatcher_contention_observation_fails_closed_on_generation_drift(self) -> None:
         with patch.object(
@@ -1226,6 +1256,53 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         self.assertEqual(result["decision"], "proceed")
         self.assertFalse(result["validation_started"])
         self.assertTrue(result["final_lock_and_drain_gates_required"])
+
+    def test_contention_preflight_keeps_failed_dispatcher_probe_advisory(self) -> None:
+        with (
+            patch.object(
+                RUNNER.deploy_core,
+                "observe_deployment_lock_availability",
+                return_value={"state": "available"},
+            ),
+            patch.object(
+                RUNNER,
+                "observe_tunnel_dispatcher_contention",
+                side_effect=RuntimeError("probe failed"),
+            ),
+        ):
+            result = RUNNER.deployment_contention_preflight(
+                expected_head="a" * 40,
+                source_identity_sha256="b" * 64,
+            )
+        self.assertEqual("proceed", result["decision"])
+        self.assertEqual("unknown", result["dispatcher"]["state"])
+        self.assertEqual("advisory-probe-failed", result["dispatcher"]["reason"])
+
+
+    def test_contention_preflight_does_not_let_dispatcher_traffic_starve_admission_drain(
+        self,
+    ) -> None:
+        lock = {"state": "available", "observed_at_unix_ns": 1}
+        dispatcher = {"state": "busy", "observed_at_unix_ns": 2}
+        with (
+            patch.object(
+                RUNNER.deploy_core,
+                "observe_deployment_lock_availability",
+                return_value=lock,
+            ),
+            patch.object(
+                RUNNER, "observe_tunnel_dispatcher_contention", return_value=dispatcher
+            ),
+            patch.object(RUNNER.time, "time_ns", return_value=3),
+        ):
+            result = RUNNER.deployment_contention_preflight(
+                expected_head="a" * 40,
+                source_identity_sha256="b" * 64,
+            )
+        self.assertEqual("proceed", result["decision"])
+        self.assertTrue(result["dispatcher_activity_advisory_before_final_admission"])
+        self.assertTrue(result["final_lock_and_drain_gates_required"])
+
 
     def _runner_argv(self, repo: Path, expected: str) -> list[str]:
         return [

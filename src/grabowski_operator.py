@@ -20,6 +20,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 import uuid
@@ -39,6 +40,29 @@ HOME = Path.home().resolve()
 EVIDENCE_ROOT = (HOME / "repos" / "merges").resolve()
 STATE_DIR = (HOME / ".local" / "state" / "grabowski").resolve()
 JOBS_DIR = STATE_DIR / "jobs"
+DEPLOYMENT_ADMISSION_MARKER_PATH = STATE_DIR / "deployment-admission-drain.json"
+DEPLOYMENT_ADMISSION_STATUS_PATH = "/_grabowski/deployment-admission"
+DEPLOYMENT_ADMISSION_MARKER_KIND = "grabowski_deployment_admission_drain"
+DEPLOYMENT_ADMISSION_MARKER_SCHEMA_VERSION = 1
+DEPLOYMENT_ADMISSION_MARKER_MAX_BYTES = 4096
+DEPLOYMENT_ADMISSION_MAX_LIFETIME_SECONDS = 1800
+DEPLOYMENT_ADMISSION_CLOCK_SKEW_SECONDS = 30
+DEPLOYMENT_ADMISSION_MARKER_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "token",
+        "expected_head",
+        "source_identity_sha256",
+        "created_at_unix",
+        "expires_at_unix",
+    }
+)
+DEPLOYMENT_ADMISSION_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
+DEPLOYMENT_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+_DEPLOYMENT_ADMISSION_LOCK = threading.Lock()
+_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+_DEPLOYMENT_ADMISSION_GATE_INSTALLED = False
 JOB_PREFIX = "grabowski-job-"
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
@@ -250,6 +274,167 @@ def _find_server() -> FastMCP:
 mcp = _find_server()
 
 
+def _deployment_admission_invalid(reason: str) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_deployment_admission_observation",
+        "state": "invalid",
+        "active": True,
+        "valid": False,
+        "reason": reason,
+        "path": str(DEPLOYMENT_ADMISSION_MARKER_PATH),
+        "does_not_establish": [
+            "deployment_authority",
+            "safe_marker_repair",
+            "absence_of_running_tool_calls",
+        ],
+    }
+
+
+def _read_deployment_admission_marker(*, now_unix: int | None = None) -> dict[str, Any]:
+    now = int(time.time()) if now_unix is None else now_unix
+    path = DEPLOYMENT_ADMISSION_MARKER_PATH
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_deployment_admission_observation",
+            "state": "absent",
+            "active": False,
+            "valid": True,
+            "path": str(path),
+            "does_not_establish": [
+                "future_admission_state",
+                "absence_of_running_tool_calls",
+            ],
+        }
+    except OSError as exc:
+        return _deployment_admission_invalid(f"marker-open-failed:{type(exc).__name__}")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > DEPLOYMENT_ADMISSION_MARKER_MAX_BYTES
+        ):
+            return _deployment_admission_invalid("marker-metadata-invalid")
+        chunks: list[bytes] = []
+        remaining = DEPLOYMENT_ADMISSION_MARKER_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > DEPLOYMENT_ADMISSION_MARKER_MAX_BYTES:
+            return _deployment_admission_invalid("marker-size-invalid")
+    finally:
+        os.close(descriptor)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        return _deployment_admission_invalid(f"marker-read-failed:{type(exc).__name__}")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != DEPLOYMENT_ADMISSION_MARKER_KEYS
+    ):
+        return _deployment_admission_invalid("marker-schema-invalid")
+    created = payload.get("created_at_unix")
+    expires = payload.get("expires_at_unix")
+    if (
+        payload.get("schema_version") != DEPLOYMENT_ADMISSION_MARKER_SCHEMA_VERSION
+        or payload.get("kind") != DEPLOYMENT_ADMISSION_MARKER_KIND
+        or not isinstance(payload.get("token"), str)
+        or DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(payload["token"]) is None
+        or not isinstance(payload.get("expected_head"), str)
+        or DEPLOYMENT_ADMISSION_HEAD_RE.fullmatch(payload["expected_head"]) is None
+        or not isinstance(payload.get("source_identity_sha256"), str)
+        or DEPLOYMENT_ADMISSION_TOKEN_RE.fullmatch(payload["source_identity_sha256"])
+        is None
+        or not isinstance(created, int)
+        or isinstance(created, bool)
+        or not isinstance(expires, int)
+        or isinstance(expires, bool)
+        or created > now + DEPLOYMENT_ADMISSION_CLOCK_SKEW_SECONDS
+        or expires <= created
+        or expires - created > DEPLOYMENT_ADMISSION_MAX_LIFETIME_SECONDS
+    ):
+        return _deployment_admission_invalid("marker-values-invalid")
+    active = expires > now
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_deployment_admission_observation",
+        "state": "active" if active else "expired",
+        "active": active,
+        "valid": True,
+        "path": str(path),
+        "token": payload["token"],
+        "expected_head": payload["expected_head"],
+        "source_identity_sha256": payload["source_identity_sha256"],
+        "created_at_unix": created,
+        "expires_at_unix": expires,
+        "does_not_establish": [
+            "deployment_authority",
+            "that_the_marker_will_remain_unchanged",
+            "absence_of_running_tool_calls",
+        ],
+    }
+
+
+def _deployment_admission_active_tool_calls() -> int:
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        return _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+
+
+def _deployment_admission_snapshot() -> dict[str, Any]:
+    return {
+        **_read_deployment_admission_marker(),
+        "active_tool_calls": _deployment_admission_active_tool_calls(),
+        "admission_gate_installed": _DEPLOYMENT_ADMISSION_GATE_INSTALLED,
+    }
+
+
+def _install_deployment_admission_gate() -> None:
+    global _DEPLOYMENT_ADMISSION_GATE_INSTALLED
+    manager = getattr(mcp, "_tool_manager", None)
+    original = getattr(manager, "call_tool", None)
+    if not callable(original):
+        raise RuntimeError("FastMCP tool manager call boundary is unavailable")
+    if getattr(original, "_grabowski_deployment_admission_gate", False):
+        _DEPLOYMENT_ADMISSION_GATE_INSTALLED = True
+        return
+
+    async def gated_call_tool(*args: Any, **kwargs: Any) -> Any:
+        global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+        with _DEPLOYMENT_ADMISSION_LOCK:
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS += 1
+        try:
+            marker = _read_deployment_admission_marker()
+            if marker.get("active") or marker.get("state") == "invalid":
+                raise RuntimeError(
+                    "Grabowski deployment admission drain rejects new tool calls "
+                    f"while marker state is {marker.get('state')}"
+                )
+            return await original(*args, **kwargs)
+        finally:
+            with _DEPLOYMENT_ADMISSION_LOCK:
+                _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS -= 1
+                if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS < 0:
+                    _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+
+    gated_call_tool._grabowski_deployment_admission_gate = True
+    manager.call_tool = gated_call_tool
+    _DEPLOYMENT_ADMISSION_GATE_INSTALLED = True
+
+
 def _mcp_custom_route(path: str, **kwargs: Any) -> Any:
     custom_route = getattr(mcp, "custom_route", None)
     if callable(custom_route):
@@ -342,6 +527,22 @@ async def mcp_session_manager_liveness(_request: Any) -> Any:
     )
 
 
+@_mcp_custom_route(
+    DEPLOYMENT_ADMISSION_STATUS_PATH,
+    methods=["GET"],
+    include_in_schema=False,
+)
+async def deployment_admission_status(_request: Any) -> Any:
+    from starlette.responses import JSONResponse
+
+    snapshot = _deployment_admission_snapshot()
+    return JSONResponse(
+        snapshot,
+        status_code=200,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 def _configure_http_runtime() -> None:
     if not callable(getattr(mcp, "custom_route", None)):
         raise RuntimeError("FastMCP custom_route support is required")
@@ -349,7 +550,10 @@ def _configure_http_runtime() -> None:
     manager = mcp.session_manager
     if getattr(manager, "_session_creation_lock", None) is None:
         raise RuntimeError("FastMCP session creation lock is unavailable")
+    _install_deployment_admission_gate()
     manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+
+
 
 
 def _open_stack_dump_memfd(max_bytes: int = STACK_DUMP_MAX_BYTES) -> Any:
