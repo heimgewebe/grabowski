@@ -253,7 +253,7 @@ OPERATOR_ADMISSION_START_OPERATIONS = 4
 OPERATOR_ADMISSION_SYSTEMD_QUERY_WINDOWS = 12
 OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS = 120
 OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES = 2
-OPERATOR_ADMISSION_PROBE_SECONDS = 3
+OPERATOR_ADMISSION_PROBE_SECONDS = 30
 TUNNEL_DRAIN_DIRECT_METRIC_NAMES = (
     TUNNEL_DRAIN_QUEUE_GAUGE_NAME,
     TUNNEL_DRAIN_WORKER_GAUGE_NAME,
@@ -2768,7 +2768,10 @@ def _operator_admission_observation() -> dict[str, Any] | None:
         core.fail(
             "Operator-Admission-Readback war transportseitig nicht erreichbar",
             phase="operator-admission-drain",
-            details={"error_type": type(exc).__name__},
+            details={
+                "failure_class": "transport",
+                "error_type": type(exc).__name__,
+            },
         )
     if status != 200:
         core.fail(
@@ -2800,24 +2803,51 @@ def _operator_admission_observation() -> dict[str, Any] | None:
 def wait_for_operator_deployment_admission(
     marker: dict[str, Any], *, timeout_seconds: int
 ) -> dict[str, Any]:
-    probe_deadline = time.monotonic() + min(
-        timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS
-    )
+    probe_seconds = min(timeout_seconds, OPERATOR_ADMISSION_PROBE_SECONDS)
+    probe_deadline = time.monotonic() + probe_seconds
+    probe_attempts = 0
+    transport_retries = 0
+    last_transport_error: dict[str, Any] | None = None
     first: dict[str, Any] | None = None
-    while time.monotonic() < probe_deadline:
-        first = _operator_admission_observation()
-        if first is not None:
-            break
-        time.sleep(0.2)
-    if first is None:
-        return {
-            "supported": False,
-            "reason": "operator-runtime-precedes-admission-contract",
-            "does_not_establish": [
-                "safe_continuous_admission",
-                "absence_of_inflight_commands",
-            ],
-        }
+    while True:
+        probe_attempts += 1
+        try:
+            first = _operator_admission_observation()
+        except core.DeployError as exc:
+            if not (
+                exc.phase == "operator-admission-drain"
+                and exc.details.get("failure_class") == "transport"
+            ):
+                raise
+            transport_retries += 1
+            last_transport_error = _error_summary(exc)
+            remaining = probe_deadline - time.monotonic()
+            if remaining <= 0:
+                core.fail(
+                    "Operator-Admission-Readback blieb transportseitig nicht erreichbar",
+                    phase="operator-admission-drain",
+                    details={
+                        "failure_class": "transport",
+                        "probe_attempts": probe_attempts,
+                        "transport_retries": transport_retries,
+                        "probe_seconds": probe_seconds,
+                        "last_error": last_transport_error,
+                    },
+                )
+            time.sleep(min(0.2, remaining))
+            continue
+        if first is None:
+            return {
+                "supported": False,
+                "reason": "operator-runtime-precedes-admission-contract",
+                "probe_attempts": probe_attempts,
+                "transport_retries": transport_retries,
+                "does_not_establish": [
+                    "safe_continuous_admission",
+                    "absence_of_inflight_commands",
+                ],
+            }
+        break
     deadline = time.monotonic() + timeout_seconds
     consecutive_idle = 0
     attempts = 0
@@ -2853,6 +2883,8 @@ def wait_for_operator_deployment_admission(
             if consecutive_idle >= OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES:
                 return {
                     "supported": True,
+                    "probe_attempts": probe_attempts,
+                    "transport_retries": transport_retries,
                     "attempts": attempts,
                     "consecutive_idle_samples": consecutive_idle,
                     "observation": observed,
