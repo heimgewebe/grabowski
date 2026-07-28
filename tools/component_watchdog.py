@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
 import http.client
@@ -80,6 +80,8 @@ class WatchdogState:
     backoff_level: int = 0
     next_restart_not_before: int = 0
     restart_generation: int = 0
+    readiness_dependency_unavailable_pid: int | None = None
+    readiness_dependency_unavailable_start_ticks: int | None = None
 
 
 def emit(event: str, **fields: object) -> None:
@@ -815,12 +817,36 @@ def load_state(path: Path) -> WatchdogState:
         raise WatchdogError("invalid-state-file") from exc
     if not isinstance(raw, dict):
         raise WatchdogError("invalid-state-shape")
+    allowed_fields = {
+        "consecutive_failures",
+        "restart_timestamps",
+        "backoff_level",
+        "next_restart_not_before",
+        "restart_generation",
+        "readiness_dependency_unavailable_pid",
+        "readiness_dependency_unavailable_start_ticks",
+    }
+    if not set(raw).issubset(allowed_fields):
+        raise WatchdogError("invalid-state-shape")
     failures = raw.get("consecutive_failures")
     timestamps = raw.get("restart_timestamps")
     # Legacy state files predate the backoff fields; default them to zero.
     backoff_level = raw.get("backoff_level", 0)
     next_restart_not_before = raw.get("next_restart_not_before", 0)
     restart_generation = raw.get("restart_generation", 0)
+    dependency_pid = raw.get("readiness_dependency_unavailable_pid")
+    dependency_start_ticks = raw.get(
+        "readiness_dependency_unavailable_start_ticks"
+    )
+    dependency_identity_valid = (
+        dependency_pid is None
+        and dependency_start_ticks is None
+    ) or (
+        type(dependency_pid) is int
+        and dependency_pid > 0
+        and type(dependency_start_ticks) is int
+        and dependency_start_ticks >= 0
+    )
     if (
         type(failures) is not int
         or failures < 0
@@ -832,14 +858,17 @@ def load_state(path: Path) -> WatchdogState:
         or next_restart_not_before < 0
         or type(restart_generation) is not int
         or restart_generation < 0
+        or not dependency_identity_valid
     ):
         raise WatchdogError("invalid-state-shape")
     return WatchdogState(
-        failures,
-        list(timestamps),
-        backoff_level,
-        next_restart_not_before,
-        restart_generation,
+        consecutive_failures=failures,
+        restart_timestamps=list(timestamps),
+        backoff_level=backoff_level,
+        next_restart_not_before=next_restart_not_before,
+        restart_generation=restart_generation,
+        readiness_dependency_unavailable_pid=dependency_pid,
+        readiness_dependency_unavailable_start_ticks=dependency_start_ticks,
     )
 
 
@@ -852,6 +881,12 @@ def save_state(path: Path, state: WatchdogState) -> None:
                 "backoff_level": state.backoff_level,
                 "next_restart_not_before": state.next_restart_not_before,
                 "restart_generation": state.restart_generation,
+                "readiness_dependency_unavailable_pid": (
+                    state.readiness_dependency_unavailable_pid
+                ),
+                "readiness_dependency_unavailable_start_ticks": (
+                    state.readiness_dependency_unavailable_start_ticks
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -899,11 +934,14 @@ def reset_after_healthy(
     state: WatchdogState, *, now: int, restart_window: int
 ) -> WatchdogState:
     return WatchdogState(
-        0,
-        [item for item in state.restart_timestamps if item > now - restart_window],
-        0,
-        0,
-        state.restart_generation,
+        consecutive_failures=0,
+        restart_timestamps=[
+            item for item in state.restart_timestamps
+            if item > now - restart_window
+        ],
+        backoff_level=0,
+        next_restart_not_before=0,
+        restart_generation=state.restart_generation,
     )
 
 
@@ -921,11 +959,17 @@ def decide(
     recent = [item for item in state.restart_timestamps if item > now - restart_window]
     failures = state.consecutive_failures + 1
     carried = WatchdogState(
-        failures,
-        recent,
-        state.backoff_level,
-        state.next_restart_not_before,
-        state.restart_generation,
+        consecutive_failures=failures,
+        restart_timestamps=recent,
+        backoff_level=state.backoff_level,
+        next_restart_not_before=state.next_restart_not_before,
+        restart_generation=state.restart_generation,
+        readiness_dependency_unavailable_pid=(
+            state.readiness_dependency_unavailable_pid
+        ),
+        readiness_dependency_unavailable_start_ticks=(
+            state.readiness_dependency_unavailable_start_ticks
+        ),
     )
     if failures < failure_threshold:
         return "observe", carried
@@ -938,11 +982,17 @@ def decide(
         level, base=backoff_base, maximum=backoff_max, jitter=jitter_source()
     )
     return "restart", WatchdogState(
-        0,
-        recent + [now],
-        level,
-        now + delay,
-        state.restart_generation + 1,
+        consecutive_failures=0,
+        restart_timestamps=recent + [now],
+        backoff_level=level,
+        next_restart_not_before=now + delay,
+        restart_generation=state.restart_generation + 1,
+        readiness_dependency_unavailable_pid=(
+            state.readiness_dependency_unavailable_pid
+        ),
+        readiness_dependency_unavailable_start_ticks=(
+            state.readiness_dependency_unavailable_start_ticks
+        ),
     )
 
 
@@ -1472,36 +1522,71 @@ def _is_new_process_instance(previous: ProbeResult, current: ProbeResult) -> boo
 
 def classify_tunnel_readiness_dependency(
     probe: ProbeResult,
+    state: WatchdogState,
     *,
     mcp_url: str,
     timeout: float,
-) -> ProbeResult:
+) -> tuple[ProbeResult, WatchdogState]:
     """Separate a missing readiness dependency from stale tunnel state."""
+    evidence_matches_process = (
+        state.readiness_dependency_unavailable_pid is not None
+        and state.readiness_dependency_unavailable_start_ticks is not None
+        and probe.pid == state.readiness_dependency_unavailable_pid
+        and probe.start_ticks
+        == state.readiness_dependency_unavailable_start_ticks
+    )
+    if (
+        state.readiness_dependency_unavailable_pid is not None
+        and not evidence_matches_process
+    ):
+        state = replace(
+            state,
+            readiness_dependency_unavailable_pid=None,
+            readiness_dependency_unavailable_start_ticks=None,
+        )
+        evidence_matches_process = False
     if probe.status != "indeterminate" or probe.reasons != ("readiness-failed",):
-        return probe
+        return probe, state
     dependency_failure = mcp_http_probe(mcp_url, timeout)
     if dependency_failure == "mcp-http-request-failed":
-        return ProbeResult(
-            "dependency-unavailable",
-            ("readiness-dependency-unavailable",),
-            probe.pid,
-            probe.age_seconds,
-            probe.start_ticks,
+        if probe.pid is not None and probe.pid > 0 and probe.start_ticks is not None:
+            state = replace(
+                state,
+                readiness_dependency_unavailable_pid=probe.pid,
+                readiness_dependency_unavailable_start_ticks=probe.start_ticks,
+            )
+        return (
+            ProbeResult(
+                "dependency-unavailable",
+                ("readiness-dependency-unavailable",),
+                probe.pid,
+                probe.age_seconds,
+                probe.start_ticks,
+            ),
+            state,
+        )
+    if dependency_failure is None and evidence_matches_process:
+        return (
+            ProbeResult(
+                "unhealthy",
+                ("readiness-stale-after-dependency-recovered",),
+                probe.pid,
+                probe.age_seconds,
+                probe.start_ticks,
+            ),
+            state,
         )
     if dependency_failure is None:
-        return ProbeResult(
-            "unhealthy",
-            ("readiness-stale-after-dependency-recovered",),
+        return probe, state
+    return (
+        ProbeResult(
+            "indeterminate",
+            ("readiness-failed", f"readiness-dependency-{dependency_failure}"),
             probe.pid,
             probe.age_seconds,
             probe.start_ticks,
-        )
-    return ProbeResult(
-        "indeterminate",
-        ("readiness-failed", f"readiness-dependency-{dependency_failure}"),
-        probe.pid,
-        probe.age_seconds,
-        probe.start_ticks,
+        ),
+        state,
     )
 
 
@@ -1546,13 +1631,15 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 metrics_url=args.metrics_url,
                 control_plane_poll_max_age=args.control_plane_poll_max_age,
             )
+            state = load_state(state_path)
             if args.component == "tunnel":
-                probe = classify_tunnel_readiness_dependency(
+                probe, state = classify_tunnel_readiness_dependency(
                     probe,
+                    state,
                     mcp_url=args.mcp_url,
                     timeout=args.http_timeout,
                 )
-            state = load_state(state_path)
+                save_state(state_path, state)
             common = {
                 "component": args.component,
                 "service": args.service,

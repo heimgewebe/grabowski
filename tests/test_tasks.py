@@ -2723,10 +2723,14 @@ class TaskTests(unittest.TestCase):
 
     def test_bounded_reconcile_cursor_visits_large_store_incrementally(self) -> None:
         started = [self._start()["task"] for _ in range(5)]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET created_at_unix=100")
+            connection.commit()
         expected = sorted(
             (int(item["created_at_unix"]), str(item["task_id"]))
             for item in started
         )
+        expected = [(100, task_id) for _, task_id in expected]
         observed: list[tuple[int, str]] = []
 
         def observe(record: dict[str, object]) -> dict[str, object]:
@@ -2754,6 +2758,19 @@ class TaskTests(unittest.TestCase):
         self.assertFalse(results[0]["batch"]["cycle_completed"])
         self.assertFalse(results[1]["batch"]["cycle_completed"])
         self.assertTrue(results[2]["batch"]["cycle_completed"])
+        self.assertEqual(
+            [result["batch"]["cycle_phase"] for result in results],
+            [tasks.TASK_RECONCILE_CYCLE_PHASE] * 3,
+        )
+        self.assertEqual(
+            len(
+                {
+                    result["batch"]["cycle_high_water_sequence"]
+                    for result in results
+                }
+            ),
+            1,
+        )
         self.assertIsNone(results[2]["batch"]["cursor_after"])
         with sqlite3.connect(self.database) as connection:
             stored_cursor = connection.execute(
@@ -2761,6 +2778,251 @@ class TaskTests(unittest.TestCase):
                 (tasks.TASK_RECONCILE_CURSOR_METADATA_KEY,),
             ).fetchone()
         self.assertIsNone(stored_cursor)
+
+    def test_bounded_reconcile_defers_insertions_behind_and_ahead_of_cursor(self) -> None:
+        initial = [self._start()["task"] for _ in range(4)]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute("UPDATE tasks SET created_at_unix=100")
+            connection.commit()
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            first = tasks.reconcile_tasks_refresh(batch_size=2)
+            behind = self._start()["task"]
+            ahead = self._start()["task"]
+            with sqlite3.connect(self.database) as connection:
+                connection.execute(
+                    "UPDATE tasks SET created_at_unix=99 WHERE task_id=?",
+                    (behind["task_id"],),
+                )
+                connection.execute(
+                    "UPDATE tasks SET created_at_unix=101 WHERE task_id=?",
+                    (ahead["task_id"],),
+                )
+                connection.commit()
+            second = tasks.reconcile_tasks_refresh(batch_size=2)
+
+        initial_ids = {str(item["task_id"]) for item in initial}
+        self.assertEqual(set(observed), initial_ids)
+        self.assertFalse(first["batch"]["cycle_completed"])
+        self.assertTrue(second["batch"]["cycle_completed"])
+        self.assertEqual(
+            first["batch"]["cycle_high_water_sequence"],
+            second["batch"]["cycle_high_water_sequence"],
+        )
+        self.assertNotIn(str(behind["task_id"]), observed)
+        self.assertNotIn(str(ahead["task_id"]), observed)
+
+        observed.clear()
+        results: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for _ in range(3):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=2))
+        self.assertTrue(results[-1]["batch"]["cycle_completed"])
+        self.assertIn(str(behind["task_id"]), observed)
+        self.assertIn(str(ahead["task_id"]), observed)
+
+    def test_bounded_reconcile_replays_before_cursor_save_and_advances_after(self) -> None:
+        started = [self._start()["task"] for _ in range(3)]
+        expected = [
+            str(item["task_id"])
+            for item in sorted(
+                started,
+                key=lambda item: (
+                    int(item["created_at_unix"]),
+                    str(item["task_id"]),
+                ),
+            )
+        ]
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with (
+            patch.object(tasks, "_reconcile_observation", side_effect=observe),
+            patch.object(
+                tasks,
+                "_save_reconcile_cycle",
+                side_effect=RuntimeError("simulated crash before cursor save"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash"),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual([expected[0]], observed)
+
+        observed.clear()
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            first_saved = tasks.reconcile_tasks_refresh(batch_size=1)
+            second_saved = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(expected[:2], observed)
+        self.assertEqual(first_saved["batch"]["cursor_before"], None)
+        self.assertEqual(
+            second_saved["batch"]["cursor_before"],
+            first_saved["batch"]["cursor_after"],
+        )
+
+    def test_bounded_reconcile_completion_is_truthful_after_deletion(self) -> None:
+        started = [self._start()["task"] for _ in range(3)]
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            first = tasks.reconcile_tasks_refresh(batch_size=1)
+        remaining = {
+            str(item["task_id"]) for item in started
+        } - set(observed)
+        with sqlite3.connect(self.database) as connection:
+            connection.executemany(
+                "DELETE FROM tasks WHERE task_id=?",
+                [(task_id,) for task_id in remaining],
+            )
+            connection.commit()
+        replacement = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=0 WHERE task_id=?",
+                (replacement["task_id"],),
+            )
+            connection.commit()
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            completed = tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertFalse(first["batch"]["cycle_completed"])
+        self.assertTrue(completed["batch"]["cycle_completed"])
+        self.assertEqual(0, completed["batch"]["examined"])
+        self.assertIsNone(completed["batch"]["cursor_after"])
+        self.assertNotIn(str(replacement["task_id"]), observed)
+
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            tasks.reconcile_tasks_refresh(batch_size=1)
+        self.assertEqual(str(replacement["task_id"]), observed[-1])
+
+    def test_bounded_reconcile_cycle_completes_under_sustained_tail_arrivals(self) -> None:
+        initial = [self._start()["task"] for _ in range(3)]
+        observed: list[str] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        arrivals: list[dict[str, object]] = []
+        first_cycle: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for index in range(3):
+                first_cycle.append(
+                    tasks.reconcile_tasks_refresh(batch_size=1)
+                )
+                arrival = self._start()["task"]
+                arrivals.append(arrival)
+                with sqlite3.connect(self.database) as connection:
+                    connection.execute(
+                        "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                        (1_000 + index, arrival["task_id"]),
+                    )
+                    connection.commit()
+
+        self.assertTrue(first_cycle[-1]["batch"]["cycle_completed"])
+        self.assertEqual(
+            {
+                result["batch"]["cycle_high_water_sequence"]
+                for result in first_cycle
+            },
+            {first_cycle[0]["batch"]["cycle_high_water_sequence"]},
+        )
+        self.assertEqual(
+            set(observed), {str(item["task_id"]) for item in initial}
+        )
+
+        observed.clear()
+        second_cycle: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for index in range(6):
+                second_cycle.append(
+                    tasks.reconcile_tasks_refresh(batch_size=1)
+                )
+                arrival = self._start()["task"]
+                with sqlite3.connect(self.database) as connection:
+                    connection.execute(
+                        "UPDATE tasks SET created_at_unix=? WHERE task_id=?",
+                        (2_000 + index, arrival["task_id"]),
+                    )
+                    connection.commit()
+
+        self.assertTrue(second_cycle[-1]["batch"]["cycle_completed"])
+        self.assertEqual(
+            {
+                result["batch"]["cycle_high_water_sequence"]
+                for result in second_cycle
+            },
+            {second_cycle[0]["batch"]["cycle_high_water_sequence"]},
+        )
+        self.assertTrue(
+            {str(item["task_id"]) for item in arrivals}.issubset(observed)
+        )
+
+    def test_bounded_reconcile_migrates_legacy_cursor_by_replaying_safely(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (
+                    tasks.TASK_RECONCILE_CURSOR_METADATA_KEY,
+                    tasks._canonical_json(
+                        {
+                            "created_at_unix": int(started["created_at_unix"]),
+                            "task_id": str(started["task_id"]),
+                        }
+                    ),
+                ),
+            )
+            connection.commit()
+        with patch.object(
+            tasks,
+            "_reconcile_observation",
+            return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            },
+        ) as observe:
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+        observe.assert_called_once()
+        self.assertIsNone(result["batch"]["cursor_before"])
+        self.assertTrue(result["batch"]["cycle_completed"])
 
     def test_bounded_reconcile_rejects_malformed_cursor_without_observation(self) -> None:
         started = self._start()["task"]

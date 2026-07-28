@@ -52,6 +52,11 @@ TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
 TASK_LIST_SCAN_BATCH = 100
 TASK_RECONCILE_BATCH_LIMIT = 500
 TASK_RECONCILE_CURSOR_METADATA_KEY = "task_reconcile_refresh_cursor_v1"
+TASK_RECONCILE_CYCLE_VERSION = 2
+TASK_RECONCILE_CYCLE_PHASE = "scan_to_high_water"
+TASK_RECONCILE_SEQUENCE_COUNTER_KEY = "task_reconcile_sequence_counter_v1"
+TASK_RECONCILE_SEQUENCE_KEY_PREFIX = "task_reconcile_sequence_v1:"
+TASK_RECONCILE_SEQUENCE_MAX = (1 << 63) - 1
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
@@ -3263,6 +3268,7 @@ def grabowski_task_start(
             """,
                 record,
             )
+            _register_task_reconcile_sequence(connection, task_id)
             connection.commit()
     except Exception:
         if task_resources:
@@ -3642,7 +3648,46 @@ def _validate_reconcile_batch_size(batch_size: int) -> int:
     return batch_size
 
 
-def _load_reconcile_cursor(connection: sqlite3.Connection) -> tuple[int, str] | None:
+def _load_reconcile_sequence_counter(connection: sqlite3.Connection) -> int:
+    row = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_SEQUENCE_COUNTER_KEY,),
+    ).fetchone()
+    if row is None:
+        return 0
+    raw = str(row[0])
+    if not raw.isdecimal():
+        raise RuntimeError("Task reconcile sequence metadata is invalid")
+    value = int(raw)
+    if value < 0 or value > TASK_RECONCILE_SEQUENCE_MAX:
+        raise RuntimeError("Task reconcile sequence metadata is invalid")
+    return value
+
+
+def _register_task_reconcile_sequence(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> int:
+    identifier = _validate_task_id(task_id)
+    current = _load_reconcile_sequence_counter(connection)
+    if current >= TASK_RECONCILE_SEQUENCE_MAX:
+        raise RuntimeError("Task reconcile sequence is exhausted")
+    sequence = current + 1
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_SEQUENCE_COUNTER_KEY, str(sequence)),
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?)",
+        (f"{TASK_RECONCILE_SEQUENCE_KEY_PREFIX}{identifier}", str(sequence)),
+    )
+    return sequence
+
+
+def _load_reconcile_cycle(
+    connection: sqlite3.Connection,
+) -> dict[str, Any] | None:
     rows = connection.execute(
         "SELECT value FROM metadata WHERE key=?",
         (TASK_RECONCILE_CURSOR_METADATA_KEY,),
@@ -3655,41 +3700,102 @@ def _load_reconcile_cursor(connection: sqlite3.Connection) -> tuple[int, str] | 
         payload = json.loads(str(rows[0][0]))
     except json.JSONDecodeError as exc:
         raise RuntimeError("Task reconcile cursor metadata is invalid") from exc
-    if not isinstance(payload, dict) or set(payload) != {
-        "created_at_unix",
-        "task_id",
+    if not isinstance(payload, dict):
+        raise RuntimeError("Task reconcile cursor metadata is invalid")
+    if set(payload) == {"created_at_unix", "task_id"}:
+        created_at_unix = payload["created_at_unix"]
+        task_id = payload["task_id"]
+        if (
+            isinstance(created_at_unix, bool)
+            or not isinstance(created_at_unix, int)
+            or created_at_unix < 0
+            or not isinstance(task_id, str)
+            or TASK_ID.fullmatch(task_id) is None
+        ):
+            raise RuntimeError("Task reconcile cursor metadata is invalid")
+        # A v1 cursor has no insertion high-water mark. Restarting the bounded
+        # scan may replay rows, but cannot falsely claim a completed cycle.
+        return None
+    if set(payload) != {
+        "version",
+        "phase",
+        "high_water_sequence",
+        "cursor",
     }:
         raise RuntimeError("Task reconcile cursor metadata is invalid")
-    created_at_unix = payload["created_at_unix"]
-    task_id = payload["task_id"]
+    version = payload["version"]
+    phase = payload["phase"]
+    high_water_sequence = payload["high_water_sequence"]
+    cursor_payload = payload["cursor"]
     if (
-        isinstance(created_at_unix, bool)
-        or not isinstance(created_at_unix, int)
-        or created_at_unix < 0
-        or not isinstance(task_id, str)
-        or TASK_ID.fullmatch(task_id) is None
+        type(version) is not int
+        or version != TASK_RECONCILE_CYCLE_VERSION
+        or phase != TASK_RECONCILE_CYCLE_PHASE
+        or type(high_water_sequence) is not int
+        or high_water_sequence < 0
+        or high_water_sequence > TASK_RECONCILE_SEQUENCE_MAX
     ):
         raise RuntimeError("Task reconcile cursor metadata is invalid")
-    return created_at_unix, task_id
+    cursor: tuple[int, str] | None = None
+    if cursor_payload is not None:
+        if not isinstance(cursor_payload, dict) or set(cursor_payload) != {
+            "created_at_unix",
+            "task_id",
+        }:
+            raise RuntimeError("Task reconcile cursor metadata is invalid")
+        created_at_unix = cursor_payload["created_at_unix"]
+        task_id = cursor_payload["task_id"]
+        if (
+            isinstance(created_at_unix, bool)
+            or not isinstance(created_at_unix, int)
+            or created_at_unix < 0
+            or not isinstance(task_id, str)
+            or TASK_ID.fullmatch(task_id) is None
+        ):
+            raise RuntimeError("Task reconcile cursor metadata is invalid")
+        cursor = (created_at_unix, task_id)
+    return {
+        "version": version,
+        "phase": phase,
+        "high_water_sequence": high_water_sequence,
+        "cursor": cursor,
+    }
 
 
-def _save_reconcile_cursor(cursor: tuple[int, str] | None) -> None:
-    with _database_connection() as connection:
-        if cursor is None:
-            connection.execute(
-                "DELETE FROM metadata WHERE key=?",
-                (TASK_RECONCILE_CURSOR_METADATA_KEY,),
-            )
-            return
-        created_at_unix, task_id = cursor
-        payload = _canonical_json(
-            {"created_at_unix": created_at_unix, "task_id": task_id}
-        )
+def _write_reconcile_cycle(
+    connection: sqlite3.Connection,
+    cycle: dict[str, Any] | None,
+) -> None:
+    if cycle is None:
         connection.execute(
-            "INSERT INTO metadata(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (TASK_RECONCILE_CURSOR_METADATA_KEY, payload),
+            "DELETE FROM metadata WHERE key=?",
+            (TASK_RECONCILE_CURSOR_METADATA_KEY,),
         )
+        return
+    cursor = cycle["cursor"]
+    cursor_payload = (
+        None
+        if cursor is None
+        else {"created_at_unix": cursor[0], "task_id": cursor[1]}
+    )
+    payload = _canonical_json(
+        {
+            "version": cycle["version"],
+            "phase": cycle["phase"],
+            "high_water_sequence": cycle["high_water_sequence"],
+            "cursor": cursor_payload,
+        }
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES(?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (TASK_RECONCILE_CURSOR_METADATA_KEY, payload),
+    )
+
+
+def _save_reconcile_cycle(cycle: dict[str, Any] | None) -> None:
+    with _database_connection() as connection:
+        _write_reconcile_cycle(connection, cycle)
 
 
 def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
@@ -3700,12 +3806,27 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
         "'failed', 'timed_out', 'signalled')"
     )
     with _database_connection() as connection:
-        cursor_before = _load_reconcile_cursor(connection)
+        cycle = _load_reconcile_cycle(connection)
+        if cycle is None:
+            high_water_sequence = _load_reconcile_sequence_counter(connection)
+            cycle = {
+                "version": TASK_RECONCILE_CYCLE_VERSION,
+                "phase": TASK_RECONCILE_CYCLE_PHASE,
+                "high_water_sequence": high_water_sequence,
+                "cursor": None,
+            }
+            # Persist the cycle boundary before any external observation. A
+            # crash from this point replays the same bounded cycle.
+            _write_reconcile_cycle(connection, cycle)
+        cursor_before = cycle["cursor"]
 
         def select_after(
             cursor: tuple[int, str] | None,
         ) -> list[sqlite3.Row]:
-            parameters: list[Any] = []
+            parameters: list[Any] = [
+                TASK_RECONCILE_SEQUENCE_KEY_PREFIX,
+                cycle["high_water_sequence"],
+            ]
             cursor_clause = ""
             if cursor is not None:
                 cursor_clause = (
@@ -3715,15 +3836,16 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
                 parameters.extend((cursor[0], cursor[0], cursor[1]))
             parameters.append(limit + 1)
             return connection.execute(
-                f"SELECT * FROM tasks WHERE {candidate_clause}{cursor_clause} "
+                "SELECT tasks.* FROM tasks LEFT JOIN metadata AS reconcile_order "
+                "ON reconcile_order.key = ? || tasks.task_id "
+                f"WHERE {candidate_clause} "
+                "AND (reconcile_order.value IS NULL "
+                f"OR CAST(reconcile_order.value AS INTEGER) <= ?){cursor_clause} "
                 "ORDER BY created_at_unix, task_id LIMIT ?",
                 parameters,
             ).fetchall()
 
         selected = select_after(cursor_before)
-        wrapped = bool(cursor_before is not None and not selected)
-        if wrapped:
-            selected = select_after(None)
 
     has_more = len(selected) > limit
     examined_rows = selected[:limit]
@@ -3734,6 +3856,14 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
             str(examined[-1]["task_id"]),
         )
         if examined and has_more
+        else None
+    )
+    cycle_after = (
+        {
+            **cycle,
+            "cursor": cursor_after,
+        }
+        if has_more
         else None
     )
     candidates: list[dict[str, Any]] = []
@@ -3748,8 +3878,11 @@ def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
         "examined": len(examined),
         "cursor_before": cursor_before,
         "cursor_after": cursor_after,
-        "cycle_wrapped": wrapped,
+        "cycle_wrapped": False,
+        "cycle_phase": cycle["phase"],
+        "cycle_high_water_sequence": cycle["high_water_sequence"],
         "cycle_completed": not has_more,
+        "cycle_after": cycle_after,
         "limit": limit,
     }
 
@@ -4054,7 +4187,7 @@ def reconcile_tasks_refresh(
         public["lease_maintenance"] = lease_maintenance
         refreshed.append(public)
     if batch is not None:
-        _save_reconcile_cursor(batch["cursor_after"])
+        _save_reconcile_cycle(batch["cycle_after"])
     result = {
         "mode": "refresh",
         "task_id": task_id,
@@ -4074,6 +4207,8 @@ def reconcile_tasks_refresh(
                 "cursor_before",
                 "cursor_after",
                 "cycle_wrapped",
+                "cycle_phase",
+                "cycle_high_water_sequence",
                 "cycle_completed",
             )
         }
