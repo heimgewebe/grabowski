@@ -246,6 +246,8 @@ OPERATOR_ADMISSION_MARKER_KEYS = frozenset(
     }
 )
 OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 600
+OPERATOR_ADMISSION_TIMEOUT_WINDOWS = 8
+OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS = 120
 OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES = 2
 OPERATOR_ADMISSION_PROBE_SECONDS = 3
 TUNNEL_DRAIN_DIRECT_METRIC_NAMES = (
@@ -2568,6 +2570,35 @@ def _create_private_admission_marker(path: Path, value: dict[str, Any]) -> None:
         os.close(parent_descriptor)
 
 
+def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        core.fail(
+            "Deployment-Admission-Timeout muss positiv und ganzzahlig sein",
+            phase="operator-admission-marker",
+        )
+    required = (
+        timeout_seconds * OPERATOR_ADMISSION_TIMEOUT_WINDOWS
+        + OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS
+    )
+    if required > OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS:
+        core.fail(
+            "Deployment-Admission-Marker kann den vollständigen Deployment- und Recovery-Ablauf nicht abdecken",
+            phase="operator-admission-marker",
+            details={
+                "timeout_seconds": timeout_seconds,
+                "timeout_windows": OPERATOR_ADMISSION_TIMEOUT_WINDOWS,
+                "recovery_margin_seconds": OPERATOR_ADMISSION_RECOVERY_MARGIN_SECONDS,
+                "required_lifetime_seconds": required,
+                "maximum_lifetime_seconds": OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+            },
+        )
+    return required
+
+
 def engage_operator_deployment_admission(
     snapshot: core.Snapshot, *, timeout_seconds: int
 ) -> dict[str, Any]:
@@ -2581,10 +2612,7 @@ def engage_operator_deployment_admission(
                 phase="operator-admission-marker",
             )
         release_operator_deployment_admission(existing)
-    lifetime = min(
-        OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
-        max(120, timeout_seconds + 120),
-    )
+    lifetime = _operator_admission_marker_lifetime_seconds(timeout_seconds)
     marker = {
         "schema_version": 1,
         "kind": OPERATOR_ADMISSION_MARKER_KIND,

@@ -12,7 +12,7 @@ A Grabowski self-deployment must not depend on the operator manually keeping eve
 
 ## Marker contract
 
-The deployer creates `~/.local/state/grabowski/deployment-admission-drain.json` with create-only semantics, mode `0600`, no symlink following, one link, owner UID binding, a maximum ten-minute lifetime and exact fields for token, expected repository head, source-identity digest and timestamps. Existing active, malformed or foreign markers fail closed. Expired valid markers may be removed only through the same token-, identity- and inode-bound release path.
+The deployer creates `~/.local/state/grabowski/deployment-admission-drain.json` with create-only semantics, mode `0600`, no symlink following, one link, owner UID binding, a maximum ten-minute lifetime and exact fields for token, expected repository head, source-identity digest and timestamps. Its lifetime covers eight bounded deployment/recovery timeout windows plus a 120-second recovery margin. A requested timeout that cannot fit inside the ten-minute marker contract is rejected before publication. Existing active, malformed or foreign markers fail closed. Expired valid markers may be removed only through the same token-, identity- and inode-bound release path.
 
 The operator reads the marker at the FastMCP tool-call boundary. It increments an active-call counter before reading the marker, so a call cannot slip between the drain decision and accounting. Active or invalid markers reject new tool calls before the registered tool function runs. Calls already admitted continue and decrement the counter on completion.
 

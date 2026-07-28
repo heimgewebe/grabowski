@@ -2039,6 +2039,23 @@ class DeploymentAdmissionTests(unittest.TestCase):
             "expires_at_unix": 200,
         }
 
+    def test_marker_lifetime_covers_forward_and_recovery_windows(self) -> None:
+        self.assertEqual(
+            440,
+            dual._operator_admission_marker_lifetime_seconds(40),
+        )
+        self.assertEqual(
+            dual.OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS,
+            dual._operator_admission_marker_lifetime_seconds(60),
+        )
+        with self.assertRaises(core.DeployError) as raised:
+            dual._operator_admission_marker_lifetime_seconds(61)
+        self.assertEqual("operator-admission-marker", raised.exception.phase)
+        self.assertEqual(
+            608,
+            raised.exception.details["required_lifetime_seconds"],
+        )
+
     def test_marker_is_private_exact_and_released_by_token(self) -> None:
         snapshot = SimpleNamespace(
             repo_head="a" * 40,
@@ -2061,6 +2078,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
                 metadata = marker_path.stat()
                 self.assertEqual(0o600, metadata.st_mode & 0o777)
                 self.assertEqual("f" * 64, marker["token"])
+                self.assertEqual(540, marker["expires_at_unix"])
                 self.assertEqual(marker, json.loads(marker_path.read_text()))
                 dual.release_operator_deployment_admission(marker)
                 self.assertFalse(marker_path.exists())
