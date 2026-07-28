@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
 import http.client
@@ -21,6 +21,7 @@ import tempfile
 import time
 from typing import Callable, Iterator
 from urllib.parse import urlsplit
+import uuid
 
 
 DEFAULT_STATE_DIR = Path.home() / ".local/state/grabowski"
@@ -53,6 +54,7 @@ DEFAULT_BACKOFF_BASE = 60
 DEFAULT_BACKOFF_MAX = 900
 BACKOFF_MAX_LEVEL = 32
 BACKOFF_JITTER_RATIO = 0.2
+DEPENDENCY_UNAVAILABLE_EXIT = 5
 
 
 class WatchdogError(RuntimeError):
@@ -70,6 +72,15 @@ class ProbeResult:
     pid: int | None = None
     age_seconds: float | None = None
     start_ticks: int | None = None
+    boot_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TunnelProcessIdentity:
+    boot_id: str
+    pid: int
+    start_ticks: int
+    age_seconds: float
 
 
 @dataclass
@@ -79,6 +90,15 @@ class WatchdogState:
     backoff_level: int = 0
     next_restart_not_before: int = 0
     restart_generation: int = 0
+    readiness_dependency_unavailable_boot_id: str | None = None
+    readiness_dependency_unavailable_pid: int | None = None
+    readiness_dependency_unavailable_start_ticks: int | None = None
+    _readiness_dependency_evidence_loaded_from_disk: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 def emit(event: str, **fields: object) -> None:
@@ -170,16 +190,80 @@ def process_age_seconds(
     return max(0.0, uptime - (start_ticks / ticks))
 
 
+def read_boot_id(proc_root: Path) -> str:
+    try:
+        raw = (
+            proc_root / "sys/kernel/random/boot_id"
+        ).read_text(encoding="ascii").strip()
+        parsed = str(uuid.UUID(raw))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise WatchdogError("boot-id-unavailable") from exc
+    if raw.lower() != parsed:
+        raise WatchdogError("boot-id-invalid")
+    return parsed
+
+
 def tunnel_identity_ok(proc_root: Path, pid: int, profile: str) -> bool:
     try:
         argv = read_cmdline(proc_root, pid)
-    except (FileNotFoundError, PermissionError, ProcessLookupError):
+    except OSError:
         return False
     return (
         len(argv) == 4
         and Path(argv[0]).name == "tunnel-client"
         and argv[1:] == ["run", "--profile", profile]
     )
+
+
+def tunnel_service_process_identity(
+    service: str,
+    profile: str,
+    startup_grace: float,
+    *,
+    proc_root: Path = Path("/proc"),
+) -> tuple[TunnelProcessIdentity | None, str | None]:
+    """Re-probe one stable, active tunnel process identity fail-closed."""
+    try:
+        before = service_properties(service)
+    except WatchdogError:
+        return None, "tunnel-service-identity-unavailable-after-dependency-probe"
+    try:
+        pid = int(before["MainPID"])
+    except (KeyError, ValueError):
+        return None, "tunnel-service-identity-unavailable-after-dependency-probe"
+    if (
+        before.get("LoadState") != "loaded"
+        or before.get("ActiveState") != "active"
+        or before.get("SubState") != "running"
+        or pid <= 0
+    ):
+        return None, "tunnel-service-disappeared-after-dependency-probe"
+    try:
+        boot_id = read_boot_id(proc_root)
+        start_ticks = process_start_ticks(proc_root, pid)
+        age = process_age_seconds(proc_root, pid, start_ticks=start_ticks)
+    except (OSError, ValueError, WatchdogError):
+        return None, "tunnel-service-identity-unavailable-after-dependency-probe"
+    if not tunnel_identity_ok(proc_root, pid, profile):
+        return None, "tunnel-service-identity-unavailable-after-dependency-probe"
+    try:
+        after = service_properties(service)
+        final_start_ticks = process_start_ticks(proc_root, pid)
+        final_boot_id = read_boot_id(proc_root)
+    except (OSError, ValueError, WatchdogError):
+        return None, "tunnel-service-identity-unavailable-after-dependency-probe"
+    if (
+        after.get("LoadState") != "loaded"
+        or after.get("ActiveState") != "active"
+        or after.get("SubState") != "running"
+        or after.get("MainPID") != str(pid)
+        or final_start_ticks != start_ticks
+        or final_boot_id != boot_id
+    ):
+        return None, "tunnel-service-changed-after-dependency-probe"
+    if age < startup_grace:
+        return None, "tunnel-service-startup-grace-after-dependency-probe"
+    return TunnelProcessIdentity(boot_id, pid, start_ticks, age), None
 
 
 def operator_identity_ok(
@@ -639,6 +723,7 @@ def probe_component(
     control_plane_poll_max_age: float = DEFAULT_CONTROL_PLANE_POLL_MAX_AGE,
     proc_root: Path = Path("/proc"),
 ) -> ProbeResult:
+    boot_id: str | None = None
     try:
         properties = service_properties(service)
     except WatchdogError as exc:
@@ -655,6 +740,11 @@ def probe_component(
     ):
         return ProbeResult("unhealthy", ("service-inactive",), pid or None)
 
+    if component == "tunnel":
+        try:
+            boot_id = read_boot_id(proc_root)
+        except WatchdogError as exc:
+            return ProbeResult("indeterminate", (str(exc),), pid)
     try:
         start_ticks = process_start_ticks(proc_root, pid)
         age = process_age_seconds(proc_root, pid, start_ticks=start_ticks)
@@ -691,6 +781,20 @@ def probe_component(
                 )
             reasons.append("mcp-runtime-unhealthy")
     elif component == "tunnel":
+        try:
+            final_boot_id = read_boot_id(proc_root)
+        except WatchdogError as exc:
+            return ProbeResult(
+                "indeterminate", (str(exc),), pid, age, start_ticks
+            )
+        if final_boot_id != boot_id:
+            return ProbeResult(
+                "indeterminate",
+                ("boot-id-changed-during-probe",),
+                pid,
+                age,
+                start_ticks,
+            )
         if not tunnel_identity_ok(proc_root, pid, profile):
             reasons.append("tunnel-identity-mismatch")
         try:
@@ -716,6 +820,7 @@ def probe_component(
                     pid,
                     age,
                     start_ticks,
+                    boot_id,
                 )
             if poll_failure is not None:
                 reasons.append(poll_failure)
@@ -731,6 +836,7 @@ def probe_component(
                         pid,
                         age,
                         start_ticks,
+                        boot_id,
                     )
                 reasons.append("readiness-failed")
         except WatchdogError as exc:
@@ -740,13 +846,19 @@ def probe_component(
 
     if not reasons:
         return ProbeResult(
-            "healthy", pid=pid, age_seconds=age, start_ticks=start_ticks
+            "healthy",
+            pid=pid,
+            age_seconds=age,
+            start_ticks=start_ticks,
+            boot_id=boot_id,
         )
     if age < startup_grace:
         return ProbeResult(
-            "startup-grace", tuple(reasons), pid, age, start_ticks
+            "startup-grace", tuple(reasons), pid, age, start_ticks, boot_id
         )
-    return ProbeResult("unhealthy", tuple(reasons), pid, age, start_ticks)
+    return ProbeResult(
+        "unhealthy", tuple(reasons), pid, age, start_ticks, boot_id
+    )
 
 
 def ensure_state_dir(path: Path) -> Path:
@@ -814,12 +926,55 @@ def load_state(path: Path) -> WatchdogState:
         raise WatchdogError("invalid-state-file") from exc
     if not isinstance(raw, dict):
         raise WatchdogError("invalid-state-shape")
+    allowed_fields = {
+        "consecutive_failures",
+        "restart_timestamps",
+        "backoff_level",
+        "next_restart_not_before",
+        "restart_generation",
+        "readiness_dependency_unavailable_boot_id",
+        "readiness_dependency_unavailable_pid",
+        "readiness_dependency_unavailable_start_ticks",
+    }
+    if not set(raw).issubset(allowed_fields):
+        raise WatchdogError("invalid-state-shape")
     failures = raw.get("consecutive_failures")
     timestamps = raw.get("restart_timestamps")
     # Legacy state files predate the backoff fields; default them to zero.
     backoff_level = raw.get("backoff_level", 0)
     next_restart_not_before = raw.get("next_restart_not_before", 0)
     restart_generation = raw.get("restart_generation", 0)
+    dependency_boot_id = raw.get("readiness_dependency_unavailable_boot_id")
+    dependency_pid = raw.get("readiness_dependency_unavailable_pid")
+    dependency_start_ticks = raw.get(
+        "readiness_dependency_unavailable_start_ticks"
+    )
+    dependency_boot_id_valid = False
+    if isinstance(dependency_boot_id, str):
+        try:
+            dependency_boot_id_valid = (
+                str(uuid.UUID(dependency_boot_id)) == dependency_boot_id
+            )
+        except ValueError:
+            pass
+    legacy_dependency_identity = (
+        dependency_boot_id is None
+        and type(dependency_pid) is int
+        and dependency_pid > 0
+        and type(dependency_start_ticks) is int
+        and dependency_start_ticks >= 0
+    )
+    dependency_identity_valid = (
+        dependency_boot_id is None
+        and dependency_pid is None
+        and dependency_start_ticks is None
+    ) or (
+        dependency_boot_id_valid
+        and type(dependency_pid) is int
+        and dependency_pid > 0
+        and type(dependency_start_ticks) is int
+        and dependency_start_ticks >= 0
+    ) or legacy_dependency_identity
     if (
         type(failures) is not int
         or failures < 0
@@ -831,15 +986,26 @@ def load_state(path: Path) -> WatchdogState:
         or next_restart_not_before < 0
         or type(restart_generation) is not int
         or restart_generation < 0
+        or not dependency_identity_valid
     ):
         raise WatchdogError("invalid-state-shape")
-    return WatchdogState(
-        failures,
-        list(timestamps),
-        backoff_level,
-        next_restart_not_before,
-        restart_generation,
+    if legacy_dependency_identity:
+        dependency_pid = None
+        dependency_start_ticks = None
+    state = WatchdogState(
+        consecutive_failures=failures,
+        restart_timestamps=list(timestamps),
+        backoff_level=backoff_level,
+        next_restart_not_before=next_restart_not_before,
+        restart_generation=restart_generation,
+        readiness_dependency_unavailable_boot_id=dependency_boot_id,
+        readiness_dependency_unavailable_pid=dependency_pid,
+        readiness_dependency_unavailable_start_ticks=dependency_start_ticks,
     )
+    state._readiness_dependency_evidence_loaded_from_disk = (
+        dependency_boot_id is not None
+    )
+    return state
 
 
 def save_state(path: Path, state: WatchdogState) -> None:
@@ -851,6 +1017,15 @@ def save_state(path: Path, state: WatchdogState) -> None:
                 "backoff_level": state.backoff_level,
                 "next_restart_not_before": state.next_restart_not_before,
                 "restart_generation": state.restart_generation,
+                "readiness_dependency_unavailable_boot_id": (
+                    state.readiness_dependency_unavailable_boot_id
+                ),
+                "readiness_dependency_unavailable_pid": (
+                    state.readiness_dependency_unavailable_pid
+                ),
+                "readiness_dependency_unavailable_start_ticks": (
+                    state.readiness_dependency_unavailable_start_ticks
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -864,6 +1039,11 @@ def save_state(path: Path, state: WatchdogState) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except Exception:
         try:
             os.unlink(temporary)
@@ -898,11 +1078,14 @@ def reset_after_healthy(
     state: WatchdogState, *, now: int, restart_window: int
 ) -> WatchdogState:
     return WatchdogState(
-        0,
-        [item for item in state.restart_timestamps if item > now - restart_window],
-        0,
-        0,
-        state.restart_generation,
+        consecutive_failures=0,
+        restart_timestamps=[
+            item for item in state.restart_timestamps
+            if item > now - restart_window
+        ],
+        backoff_level=0,
+        next_restart_not_before=0,
+        restart_generation=state.restart_generation,
     )
 
 
@@ -920,11 +1103,20 @@ def decide(
     recent = [item for item in state.restart_timestamps if item > now - restart_window]
     failures = state.consecutive_failures + 1
     carried = WatchdogState(
-        failures,
-        recent,
-        state.backoff_level,
-        state.next_restart_not_before,
-        state.restart_generation,
+        consecutive_failures=failures,
+        restart_timestamps=recent,
+        backoff_level=state.backoff_level,
+        next_restart_not_before=state.next_restart_not_before,
+        restart_generation=state.restart_generation,
+        readiness_dependency_unavailable_boot_id=(
+            state.readiness_dependency_unavailable_boot_id
+        ),
+        readiness_dependency_unavailable_pid=(
+            state.readiness_dependency_unavailable_pid
+        ),
+        readiness_dependency_unavailable_start_ticks=(
+            state.readiness_dependency_unavailable_start_ticks
+        ),
     )
     if failures < failure_threshold:
         return "observe", carried
@@ -937,11 +1129,20 @@ def decide(
         level, base=backoff_base, maximum=backoff_max, jitter=jitter_source()
     )
     return "restart", WatchdogState(
-        0,
-        recent + [now],
-        level,
-        now + delay,
-        state.restart_generation + 1,
+        consecutive_failures=0,
+        restart_timestamps=recent + [now],
+        backoff_level=level,
+        next_restart_not_before=now + delay,
+        restart_generation=state.restart_generation + 1,
+        readiness_dependency_unavailable_boot_id=(
+            state.readiness_dependency_unavailable_boot_id
+        ),
+        readiness_dependency_unavailable_pid=(
+            state.readiness_dependency_unavailable_pid
+        ),
+        readiness_dependency_unavailable_start_ticks=(
+            state.readiness_dependency_unavailable_start_ticks
+        ),
     )
 
 
@@ -1469,6 +1670,120 @@ def _is_new_process_instance(previous: ProbeResult, current: ProbeResult) -> boo
     return current.start_ticks != previous.start_ticks
 
 
+def classify_tunnel_readiness_dependency(
+    probe: ProbeResult,
+    state: WatchdogState,
+    *,
+    service: str,
+    profile: str,
+    startup_grace: float,
+    mcp_url: str,
+    timeout: float,
+    proc_root: Path = Path("/proc"),
+) -> tuple[ProbeResult, WatchdogState]:
+    """Separate a missing readiness dependency from stale tunnel state."""
+    evidence_matches_process = (
+        state._readiness_dependency_evidence_loaded_from_disk
+        and state.readiness_dependency_unavailable_boot_id is not None
+        and state.readiness_dependency_unavailable_pid is not None
+        and state.readiness_dependency_unavailable_start_ticks is not None
+        and probe.boot_id == state.readiness_dependency_unavailable_boot_id
+        and probe.pid == state.readiness_dependency_unavailable_pid
+        and probe.start_ticks
+        == state.readiness_dependency_unavailable_start_ticks
+    )
+    if (
+        state.readiness_dependency_unavailable_boot_id is not None
+        and not evidence_matches_process
+    ):
+        state = replace(
+            state,
+            readiness_dependency_unavailable_boot_id=None,
+            readiness_dependency_unavailable_pid=None,
+            readiness_dependency_unavailable_start_ticks=None,
+        )
+        evidence_matches_process = False
+    if probe.status != "indeterminate" or probe.reasons != ("readiness-failed",):
+        return probe, state
+    dependency_failure = mcp_http_probe(mcp_url, timeout)
+    identity, identity_failure = tunnel_service_process_identity(
+        service,
+        profile,
+        startup_grace,
+        proc_root=proc_root,
+    )
+    if (
+        identity_failure is not None
+        or identity is None
+        or probe.boot_id != identity.boot_id
+        or probe.pid != identity.pid
+        or probe.start_ticks != identity.start_ticks
+    ):
+        state = replace(
+            state,
+            readiness_dependency_unavailable_boot_id=None,
+            readiness_dependency_unavailable_pid=None,
+            readiness_dependency_unavailable_start_ticks=None,
+        )
+        return (
+            ProbeResult(
+                "indeterminate",
+                (
+                    identity_failure
+                    or "tunnel-service-changed-after-dependency-probe",
+                ),
+                probe.pid,
+                probe.age_seconds,
+                probe.start_ticks,
+                probe.boot_id,
+            ),
+            state,
+        )
+    if dependency_failure == "mcp-http-request-failed":
+        state = replace(
+            state,
+            readiness_dependency_unavailable_boot_id=identity.boot_id,
+            readiness_dependency_unavailable_pid=identity.pid,
+            readiness_dependency_unavailable_start_ticks=identity.start_ticks,
+        )
+        return (
+            ProbeResult(
+                "dependency-unavailable",
+                ("readiness-dependency-unavailable",),
+                probe.pid,
+                probe.age_seconds,
+                probe.start_ticks,
+                probe.boot_id,
+            ),
+            state,
+        )
+    if dependency_failure is None and evidence_matches_process:
+        return (
+            ProbeResult(
+                "unhealthy",
+                ("readiness-stale-after-dependency-recovered",),
+                probe.pid,
+                probe.age_seconds,
+                probe.start_ticks,
+                probe.boot_id,
+            ),
+            state,
+        )
+    if dependency_failure is None:
+        return probe, state
+    return (
+        ProbeResult(
+            "indeterminate",
+            ("readiness-failed", f"readiness-dependency-{dependency_failure}"),
+            probe.pid,
+            probe.age_seconds,
+            probe.start_ticks,
+            probe.boot_id,
+        ),
+        state,
+    )
+
+
 def run_watchdog(args: argparse.Namespace) -> int:
     if args.component not in {"operator", "tunnel"}:
         raise WatchdogError("invalid-component")
@@ -1511,6 +1826,17 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 control_plane_poll_max_age=args.control_plane_poll_max_age,
             )
             state = load_state(state_path)
+            if args.component == "tunnel":
+                probe, state = classify_tunnel_readiness_dependency(
+                    probe,
+                    state,
+                    service=args.service,
+                    profile=args.profile,
+                    startup_grace=args.startup_grace,
+                    mcp_url=args.mcp_url,
+                    timeout=args.http_timeout,
+                )
+                save_state(state_path, state)
             common = {
                 "component": args.component,
                 "service": args.service,
@@ -1536,6 +1862,12 @@ def run_watchdog(args: argparse.Namespace) -> int:
             if probe.status == "startup-grace":
                 emit("grabowski.component_watchdog.skipped", **common)
                 return 0
+            if probe.status == "dependency-unavailable":
+                emit(
+                    "grabowski.component_watchdog.dependency_unavailable",
+                    **common,
+                )
+                return DEPENDENCY_UNAVAILABLE_EXIT
             if probe.status == "indeterminate":
                 emit("grabowski.component_watchdog.indeterminate", **common)
                 return 2

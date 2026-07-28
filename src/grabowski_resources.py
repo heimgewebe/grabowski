@@ -52,6 +52,7 @@ DIRECT_OPERATOR_OWNER_RE = re.compile(r"operator:[A-Za-z0-9._:@-]{1,119}\Z")
 SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_TERMINAL_RECEIPT_BYTES = 64 * 1024
@@ -163,9 +164,23 @@ RESOURCE_LEASE_SHAPE = (
 RESOURCE_SCHEMA_V2_TABLES = frozenset({
     "metadata", "leases", "task_terminalizations", "task_authority_adoptions",
 })
-RESOURCE_CURRENT_SCHEMA_VERSION = "2"
-RESOURCE_SUPPORTED_SCHEMA_VERSIONS = ("1", "2")
-RESOURCE_SCHEMA_MIGRATION_PATHS = {"1": ("1", RESOURCE_CURRENT_SCHEMA_VERSION)}
+RESOURCE_SCHEMA_V3_TABLES = RESOURCE_SCHEMA_V2_TABLES
+RESOURCE_SCHEMA_V3_REQUIRED_INDEXES = {
+    "task_authority_adoptions_expiry_idx": (
+        "task_authority_adoptions",
+        ("expires_at_unix",),
+    ),
+    "task_terminalizations_pending_idx": (
+        "task_terminalizations",
+        ("phase", "prepared_at_unix", "task_id"),
+    ),
+}
+RESOURCE_CURRENT_SCHEMA_VERSION = "3"
+RESOURCE_SUPPORTED_SCHEMA_VERSIONS = ("1", "2", "3")
+RESOURCE_SCHEMA_MIGRATION_PATHS = {
+    "1": ("1", RESOURCE_CURRENT_SCHEMA_VERSION),
+    "2": ("2", RESOURCE_CURRENT_SCHEMA_VERSION),
+}
 RESOURCE_SCHEMA_RECOVERY_INSTRUCTION = (
     "Keep the resource store unchanged; use a runtime that explicitly supports "
     "the observed schema or restore a verified backup before retrying."
@@ -251,7 +266,27 @@ def _validate_additive_schema_v2(connection: sqlite3.Connection) -> None:
             raise RuntimeError("Unsupported resource database schema")
 
 
-def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
+def _resource_indexes(
+    connection: sqlite3.Connection,
+    table_name: str,
+) -> set[str]:
+    return {
+        str(row[1])
+        for row in connection.execute(f'PRAGMA index_list("{table_name}")')
+    }
+
+
+def _resource_index_columns(
+    connection: sqlite3.Connection,
+    index_name: str,
+) -> tuple[str, ...]:
+    return tuple(
+        str(row[2])
+        for row in connection.execute(f'PRAGMA index_info("{index_name}")')
+    )
+
+
+def _validate_resource_schema_v2(connection: sqlite3.Connection) -> None:
     if _resource_database_tables(connection) != RESOURCE_SCHEMA_V2_TABLES:
         raise RuntimeError("Unsupported resource database schema")
     if _resource_table_shape(connection, "metadata") != RESOURCE_METADATA_SHAPE:
@@ -259,6 +294,25 @@ def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
     if _resource_table_shape(connection, "leases") != RESOURCE_LEASE_SHAPE:
         raise RuntimeError("Unsupported resource database schema")
     _validate_additive_schema_v2(connection)
+
+
+def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
+    if _resource_database_tables(connection) != RESOURCE_SCHEMA_V3_TABLES:
+        raise RuntimeError("Unsupported resource database schema")
+    _validate_resource_schema_v2(connection)
+    missing = {
+        index_name
+        for index_name, (table_name, columns) in (
+            RESOURCE_SCHEMA_V3_REQUIRED_INDEXES.items()
+        )
+        if index_name not in _resource_indexes(connection, table_name)
+        or _resource_index_columns(connection, index_name) != columns
+    }
+    if missing:
+        raise RuntimeError(
+            "Resource database schema 3 indexes are incomplete: "
+            + ", ".join(sorted(missing))
+        )
 
 
 def _resource_schema_inventory() -> dict[str, Any]:
@@ -370,7 +424,12 @@ def _validate_resource_backup(
         _resource_sqlite_integrity(backup, "Resource migration backup")
         if _resource_schema_version(backup) != version:
             raise RuntimeError("Resource migration backup schema version does not match")
-        _validate_resource_schema_legacy(backup)
+        if version == "1":
+            _validate_resource_schema_legacy(backup)
+        elif version == "2":
+            _validate_resource_schema_v2(backup)
+        else:
+            raise RuntimeError("Resource migration backup schema version is unsupported")
         if _resource_sqlite_fingerprint(backup) != fingerprint:
             raise RuntimeError("Resource migration backup fingerprint does not match")
 
@@ -440,12 +499,14 @@ def _preflight_resource_store() -> str | None:
     with _resource_readonly_sqlite(RESOURCE_DB) as connection:
         _resource_sqlite_integrity(connection, "Resource database", quick=True)
         version = _resource_schema_version(connection)
-        if version not in {"1", "2"}:
+        if version not in {"1", "2", "3"}:
             raise RuntimeError(
                 "Unsupported resource database schema; use a compatible runtime"
             )
         if version == "1":
             _validate_resource_schema_legacy(connection)
+        elif version == "2":
+            _validate_resource_schema_v2(connection)
         else:
             _validate_resource_schema_current(connection)
         return version
@@ -494,9 +555,13 @@ def _create_resource_additive_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX task_authority_adoptions_expiry_idx "
         "ON task_authority_adoptions(expires_at_unix)"
     )
+    connection.execute(
+        "CREATE INDEX task_terminalizations_pending_idx "
+        "ON task_terminalizations(phase, prepared_at_unix, task_id)"
+    )
 
 
-def _create_resource_schema_v2(connection: sqlite3.Connection) -> None:
+def _create_resource_schema_v3(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
@@ -517,14 +582,28 @@ def _create_resource_schema_v2(connection: sqlite3.Connection) -> None:
     )
     _create_resource_additive_tables(connection)
     connection.execute(
-        "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
+        "INSERT INTO metadata(key, value) VALUES('schema_version', '3')"
     )
 
 
 def _migrate_resource_schema_v1(connection: sqlite3.Connection) -> None:
     _create_resource_additive_tables(connection)
     connection.execute(
-        "UPDATE metadata SET value='2' WHERE key='schema_version'"
+        "UPDATE metadata SET value='3' WHERE key='schema_version'"
+    )
+
+
+def _migrate_resource_schema_v2(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS task_authority_adoptions_expiry_idx "
+        "ON task_authority_adoptions(expires_at_unix)"
+    )
+    connection.execute(
+        "CREATE INDEX task_terminalizations_pending_idx "
+        "ON task_terminalizations(phase, prepared_at_unix, task_id)"
+    )
+    connection.execute(
+        "UPDATE metadata SET value='3' WHERE key='schema_version'"
     )
 
 
@@ -547,7 +626,7 @@ def _open_current_resource_database() -> sqlite3.Connection:
     connection = _connect_existing_resource_database()
     connection.row_factory = sqlite3.Row
     try:
-        if _resource_schema_version(connection) != "2":
+        if _resource_schema_version(connection) != "3":
             raise RuntimeError(
                 "Resource database schema changed while opening; retry with a compatible runtime"
             )
@@ -572,12 +651,12 @@ def _database() -> sqlite3.Connection:
         raise PermissionError(f"Resource database may not be a symlink: {RESOURCE_DB}")
 
     observed = _preflight_resource_store()
-    if observed == "2":
+    if observed == "3":
         return _open_current_resource_database()
 
     with _resource_schema_directory_lock(parent):
         observed = _preflight_resource_store()
-        if observed == "2":
+        if observed == "3":
             return _open_current_resource_database()
         connection = (
             sqlite3.connect(RESOURCE_DB, timeout=10, isolation_level=None)
@@ -588,7 +667,7 @@ def _database() -> sqlite3.Connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
             version = _resource_schema_version(connection)
-            if version not in {None, "1", "2"}:
+            if version not in {None, "1", "2", "3"}:
                 raise RuntimeError(
                     "Unsupported resource database schema; use a compatible runtime"
                 )
@@ -597,17 +676,23 @@ def _database() -> sqlite3.Connection:
                     raise RuntimeError(
                         "Resource database schema metadata is missing from an existing database"
                     )
-                _create_resource_schema_v2(connection)
+                _create_resource_schema_v3(connection)
             elif version == "1":
                 _validate_resource_schema_legacy(connection)
                 _resource_sqlite_integrity(connection, "Resource database")
                 fingerprint = _resource_sqlite_fingerprint(connection)
                 _verified_resource_migration_backup(version, fingerprint)
                 _migrate_resource_schema_v1(connection)
+            elif version == "2":
+                _validate_resource_schema_v2(connection)
+                _resource_sqlite_integrity(connection, "Resource database")
+                fingerprint = _resource_sqlite_fingerprint(connection)
+                _verified_resource_migration_backup(version, fingerprint)
+                _migrate_resource_schema_v2(connection)
             else:
                 _validate_resource_schema_current(connection)
-            if _resource_schema_version(connection) != "2":
-                raise RuntimeError("Resource database migration did not reach schema 2")
+            if _resource_schema_version(connection) != "3":
+                raise RuntimeError("Resource database migration did not reach schema 3")
             _validate_resource_schema_current(connection)
             _resource_sqlite_integrity(connection, "Migrated resource database")
             connection.commit()
@@ -2006,15 +2091,145 @@ def task_terminalization_record(
     )
 
 
-def pending_task_terminalizations() -> list[dict[str, Any]]:
+def _task_terminalization_cursor(
+    value: tuple[int, str] | None,
+    *,
+    field: str,
+) -> tuple[int, str] | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, tuple)
+        or len(value) != 2
+        or isinstance(value[0], bool)
+        or not isinstance(value[0], int)
+        or value[0] < 0
+        or not isinstance(value[1], str)
+        or TASK_ID_RE.fullmatch(value[1]) is None
+    ):
+        raise ValueError(f"{field} is invalid")
+    return value
+
+
+def pending_task_terminalizations(
+    *,
+    limit: int,
+    cursor: tuple[int, str] | None = None,
+    high_water: tuple[int, str] | None = None,
+) -> dict[str, Any]:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= 500
+    ):
+        raise ValueError("limit must be between 1 and 500")
+    after = _task_terminalization_cursor(cursor, field="cursor")
+    boundary = _task_terminalization_cursor(high_water, field="high_water")
+    if after is not None and boundary is None:
+        raise ValueError("cursor requires high_water")
+    if after is not None and after > boundary:
+        raise ValueError("cursor cannot be greater than high_water")
     with _database() as connection:
-        rows = connection.execute(
-            "SELECT * FROM task_terminalizations WHERE phase!='projected' "
-            "ORDER BY prepared_at_unix, task_id"
-        ).fetchall()
-    return [
-        _task_terminalization_public(row, include_projection=True) for row in rows
-    ]
+        if boundary is None:
+            boundary_row = connection.execute(
+                "SELECT prepared_at_unix, task_id FROM task_terminalizations "
+                "WHERE phase='leases_revoked' "
+                "ORDER BY prepared_at_unix DESC, task_id DESC LIMIT 1"
+            ).fetchone()
+            if boundary_row is None:
+                return {
+                    "terminalizations": [],
+                    "limit": limit,
+                    "examined": 0,
+                    "cursor_before": after,
+                    "cursor_after": None,
+                    "high_water": None,
+                    "cycle_completed": True,
+                }
+            boundary = (int(boundary_row[0]), str(boundary_row[1]))
+        parameters: list[Any] = [boundary[0], boundary[0], boundary[1]]
+        after_clause = ""
+        if after is not None:
+            after_clause = (
+                "AND (prepared_at_unix > ? OR "
+                "(prepared_at_unix = ? AND task_id > ?)) "
+            )
+            parameters.extend((after[0], after[0], after[1]))
+        parameters.append(limit + 1)
+        selected = list(
+            connection.execute(
+                "SELECT * FROM task_terminalizations "
+                "WHERE phase='leases_revoked' "
+                "AND (prepared_at_unix < ? OR "
+                "(prepared_at_unix = ? AND task_id <= ?)) "
+                f"{after_clause}"
+                "ORDER BY prepared_at_unix, task_id LIMIT ?",
+                parameters,
+            ).fetchmany(limit + 1)
+        )
+    has_more = len(selected) > limit
+    examined_rows = selected[:limit]
+    cursor_after = (
+        (
+            int(examined_rows[-1]["prepared_at_unix"]),
+            str(examined_rows[-1]["task_id"]),
+        )
+        if examined_rows and has_more
+        else None
+    )
+    return {
+        "terminalizations": [
+            _task_terminalization_public(row, include_projection=True)
+            for row in examined_rows
+        ],
+        "limit": limit,
+        "examined": len(examined_rows),
+        "cursor_before": after,
+        "cursor_after": cursor_after,
+        "high_water": boundary,
+        "cycle_completed": not has_more,
+    }
+
+
+def pending_task_terminalizations_exist(
+    *,
+    cursor: tuple[int, str] | None = None,
+    high_water: tuple[int, str] | None = None,
+) -> bool:
+    after = _task_terminalization_cursor(cursor, field="cursor")
+    boundary = _task_terminalization_cursor(high_water, field="high_water")
+    if after is not None and boundary is None:
+        raise ValueError("cursor requires high_water")
+    if after is not None and after > boundary:
+        raise ValueError("cursor cannot be greater than high_water")
+    with _database() as connection:
+        if boundary is None:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+        parameters: list[Any] = [boundary[0], boundary[0], boundary[1]]
+        after_clause = ""
+        if after is not None:
+            after_clause = (
+                "AND (prepared_at_unix > ? OR "
+                "(prepared_at_unix = ? AND task_id > ?)) "
+            )
+            parameters.extend((after[0], after[0], after[1]))
+        return (
+            connection.execute(
+                "SELECT 1 FROM task_terminalizations "
+                "WHERE phase='leases_revoked' "
+                "AND (prepared_at_unix < ? OR "
+                "(prepared_at_unix = ? AND task_id <= ?)) "
+                f"{after_clause}LIMIT 1",
+                parameters,
+            ).fetchone()
+            is not None
+        )
 
 
 def begin_task_terminalization(
