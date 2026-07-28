@@ -390,6 +390,49 @@ class ControlPlanePollProbeTests(unittest.TestCase):
         self.assertEqual("indeterminate", result.status)
         self.assertEqual(("readiness-failed",), result.reasons)
 
+    def test_missing_readiness_dependency_is_distinct_and_non_restartable(self) -> None:
+        probe = watchdog.ProbeResult(
+            "indeterminate",
+            ("readiness-failed",),
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+        )
+        with patch.object(
+            watchdog,
+            "mcp_http_probe",
+            return_value="mcp-http-request-failed",
+        ) as dependency_probe:
+            result = watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+            )
+        self.assertEqual("dependency-unavailable", result.status)
+        self.assertEqual(("readiness-dependency-unavailable",), result.reasons)
+        self.assertEqual(321, result.pid)
+        dependency_probe.assert_called_once_with(watchdog.DEFAULT_MCP_URL, 2)
+
+    def test_recovered_dependency_makes_stale_readiness_restartable(self) -> None:
+        probe = watchdog.ProbeResult(
+            "indeterminate",
+            ("readiness-failed",),
+            pid=321,
+            age_seconds=120.0,
+            start_ticks=77,
+        )
+        with patch.object(watchdog, "mcp_http_probe", return_value=None):
+            result = watchdog.classify_tunnel_readiness_dependency(
+                probe,
+                mcp_url=watchdog.DEFAULT_MCP_URL,
+                timeout=2,
+            )
+        self.assertEqual("unhealthy", result.status)
+        self.assertEqual(
+            ("readiness-stale-after-dependency-recovered",),
+            result.reasons,
+        )
+
     def test_readiness_failure_with_stale_poll_remains_restartable(self) -> None:
         with (
             patch.object(
@@ -1171,6 +1214,39 @@ class WatchdogPolicyTests(unittest.TestCase):
         self.assertEqual(watchdog.DEFAULT_BACKOFF_BASE, args.backoff_base)
         self.assertEqual(watchdog.DEFAULT_BACKOFF_MAX, args.backoff_max)
         self.assertGreaterEqual(args.backoff_max, args.backoff_base)
+
+    def test_dependency_outage_has_structured_nonfailure_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", tmp]
+                )
+            )
+            probe = watchdog.ProbeResult(
+                "indeterminate",
+                ("readiness-failed",),
+                pid=321,
+                age_seconds=120.0,
+                start_ticks=77,
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "mcp_http_probe",
+                    return_value="mcp-http-request-failed",
+                ),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(watchdog, "emit") as emit,
+            ):
+                result = watchdog.run_watchdog(args)
+
+        self.assertEqual(watchdog.DEPENDENCY_UNAVAILABLE_EXIT, result)
+        restart.assert_not_called()
+        self.assertEqual(
+            "grabowski.component_watchdog.dependency_unavailable",
+            emit.call_args.args[0],
+        )
 
     def test_restart_service_queues_nonblocking_restart(self) -> None:
         with patch.object(watchdog.subprocess, "run") as run:

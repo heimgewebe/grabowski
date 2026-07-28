@@ -50,6 +50,8 @@ TASK_DB = Path(
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
 TASK_LIST_SCAN_BATCH = 100
+TASK_RECONCILE_BATCH_LIMIT = 500
+TASK_RECONCILE_CURSOR_METADATA_KEY = "task_reconcile_refresh_cursor_v1"
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
@@ -3628,6 +3630,130 @@ def _reconcile_candidate_rows(
     return candidates
 
 
+def _validate_reconcile_batch_size(batch_size: int) -> int:
+    if (
+        isinstance(batch_size, bool)
+        or not isinstance(batch_size, int)
+        or not 1 <= batch_size <= TASK_RECONCILE_BATCH_LIMIT
+    ):
+        raise ValueError(
+            f"batch_size must be between 1 and {TASK_RECONCILE_BATCH_LIMIT}"
+        )
+    return batch_size
+
+
+def _load_reconcile_cursor(connection: sqlite3.Connection) -> tuple[int, str] | None:
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (TASK_RECONCILE_CURSOR_METADATA_KEY,),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1:
+        raise RuntimeError("Task reconcile cursor metadata is ambiguous")
+    try:
+        payload = json.loads(str(rows[0][0]))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Task reconcile cursor metadata is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "created_at_unix",
+        "task_id",
+    }:
+        raise RuntimeError("Task reconcile cursor metadata is invalid")
+    created_at_unix = payload["created_at_unix"]
+    task_id = payload["task_id"]
+    if (
+        isinstance(created_at_unix, bool)
+        or not isinstance(created_at_unix, int)
+        or created_at_unix < 0
+        or not isinstance(task_id, str)
+        or TASK_ID.fullmatch(task_id) is None
+    ):
+        raise RuntimeError("Task reconcile cursor metadata is invalid")
+    return created_at_unix, task_id
+
+
+def _save_reconcile_cursor(cursor: tuple[int, str] | None) -> None:
+    with _database_connection() as connection:
+        if cursor is None:
+            connection.execute(
+                "DELETE FROM metadata WHERE key=?",
+                (TASK_RECONCILE_CURSOR_METADATA_KEY,),
+            )
+            return
+        created_at_unix, task_id = cursor
+        payload = _canonical_json(
+            {"created_at_unix": created_at_unix, "task_id": task_id}
+        )
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (TASK_RECONCILE_CURSOR_METADATA_KEY, payload),
+        )
+
+
+def _reconcile_candidate_batch(batch_size: int) -> dict[str, Any]:
+    limit = _validate_reconcile_batch_size(batch_size)
+    _recover_pending_task_terminalizations()
+    candidate_clause = (
+        "state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
+        "'failed', 'timed_out', 'signalled')"
+    )
+    with _database_connection() as connection:
+        cursor_before = _load_reconcile_cursor(connection)
+
+        def select_after(
+            cursor: tuple[int, str] | None,
+        ) -> list[sqlite3.Row]:
+            parameters: list[Any] = []
+            cursor_clause = ""
+            if cursor is not None:
+                cursor_clause = (
+                    " AND (created_at_unix > ? OR "
+                    "(created_at_unix = ? AND task_id > ?))"
+                )
+                parameters.extend((cursor[0], cursor[0], cursor[1]))
+            parameters.append(limit + 1)
+            return connection.execute(
+                f"SELECT * FROM tasks WHERE {candidate_clause}{cursor_clause} "
+                "ORDER BY created_at_unix, task_id LIMIT ?",
+                parameters,
+            ).fetchall()
+
+        selected = select_after(cursor_before)
+        wrapped = bool(cursor_before is not None and not selected)
+        if wrapped:
+            selected = select_after(None)
+
+    has_more = len(selected) > limit
+    examined_rows = selected[:limit]
+    examined = [dict(row) for row in examined_rows]
+    cursor_after = (
+        (
+            int(examined[-1]["created_at_unix"]),
+            str(examined[-1]["task_id"]),
+        )
+        if examined and has_more
+        else None
+    )
+    candidates: list[dict[str, Any]] = []
+    for record in examined:
+        if _is_terminal_state(str(record["state"])):
+            terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+            if terminal_valid and lease_valid:
+                continue
+        candidates.append(record)
+    return {
+        "rows": candidates,
+        "examined": len(examined),
+        "cursor_before": cursor_before,
+        "cursor_after": cursor_after,
+        "cycle_wrapped": wrapped,
+        "cycle_completed": not has_more,
+        "limit": limit,
+    }
+
+
 def _terminal_convergence_evidence(record: dict[str, Any]) -> tuple[bool, bool]:
     terminalization = resources.task_terminalization_record(
         str(record["task_id"]), include_projection=True
@@ -3878,12 +4004,27 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
 
 
 @_serialize_task_mutation
-def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
+def reconcile_tasks_refresh(
+    *,
+    task_id: str = "",
+    batch_size: int | None = None,
+) -> dict[str, Any]:
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
     if task_id:
         _validate_task_id(task_id)
-    rows = _reconcile_candidate_rows(task_id)
+    if batch_size is not None and task_id:
+        raise ValueError("batch_size cannot be combined with task_id")
+    batch = (
+        _reconcile_candidate_batch(batch_size)
+        if batch_size is not None
+        else None
+    )
+    rows = (
+        list(batch["rows"])
+        if batch is not None
+        else _reconcile_candidate_rows(task_id)
+    )
     refreshed: list[dict[str, Any]] = []
     released: list[str] = []
     denied: list[dict[str, Any]] = []
@@ -3912,7 +4053,9 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
         public = _public(stored)
         public["lease_maintenance"] = lease_maintenance
         refreshed.append(public)
-    return {
+    if batch is not None:
+        _save_reconcile_cursor(batch["cursor_after"])
+    result = {
         "mode": "refresh",
         "task_id": task_id,
         "scanned": len(rows),
@@ -3922,6 +4065,19 @@ def reconcile_tasks_refresh(*, task_id: str = "") -> dict[str, Any]:
         "blocked": denied,
         "checked_at_unix": _now(),
     }
+    if batch is not None:
+        result["batch"] = {
+            key: batch[key]
+            for key in (
+                "limit",
+                "examined",
+                "cursor_before",
+                "cursor_after",
+                "cycle_wrapped",
+                "cycle_completed",
+            )
+        }
+    return result
 
 
 @_serialize_task_mutation

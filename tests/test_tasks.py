@@ -2721,6 +2721,69 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual([item["task_id"] for item in result["refreshed"]], [healthy["task_id"]])
 
+    def test_bounded_reconcile_cursor_visits_large_store_incrementally(self) -> None:
+        started = [self._start()["task"] for _ in range(5)]
+        expected = sorted(
+            (int(item["created_at_unix"]), str(item["task_id"]))
+            for item in started
+        )
+        observed: list[tuple[int, str]] = []
+
+        def observe(record: dict[str, object]) -> dict[str, object]:
+            observed.append(
+                (int(record["created_at_unix"]), str(record["task_id"]))
+            )
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+                "probe": _launcher(),
+                "observer": {"kind": "test"},
+                "observed_at_unix": 123,
+            }
+
+        results: list[dict[str, object]] = []
+        with patch.object(tasks, "_reconcile_observation", side_effect=observe):
+            for _ in range(3):
+                results.append(tasks.reconcile_tasks_refresh(batch_size=2))
+
+        self.assertEqual(expected, observed)
+        self.assertEqual(
+            [result["batch"]["examined"] for result in results],
+            [2, 2, 1],
+        )
+        self.assertFalse(results[0]["batch"]["cycle_completed"])
+        self.assertFalse(results[1]["batch"]["cycle_completed"])
+        self.assertTrue(results[2]["batch"]["cycle_completed"])
+        self.assertIsNone(results[2]["batch"]["cursor_after"])
+        with sqlite3.connect(self.database) as connection:
+            stored_cursor = connection.execute(
+                "SELECT value FROM metadata WHERE key=?",
+                (tasks.TASK_RECONCILE_CURSOR_METADATA_KEY,),
+            ).fetchone()
+        self.assertIsNone(stored_cursor)
+
+    def test_bounded_reconcile_rejects_malformed_cursor_without_observation(self) -> None:
+        started = self._start()["task"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (tasks.TASK_RECONCILE_CURSOR_METADATA_KEY, '{"task_id":"bad"}'),
+            )
+            connection.commit()
+        with (
+            patch.object(tasks, "_reconcile_observation") as observe,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Task reconcile cursor metadata is invalid",
+            ),
+        ):
+            tasks.reconcile_tasks_refresh(batch_size=2)
+        observe.assert_not_called()
+        self.assertEqual(
+            "running",
+            tasks._row_raw(str(started["task_id"]))["state"],
+        )
+
     def test_reconcile_resume_keeps_converged_retry_safe_failure_eligible(self) -> None:
         started = self._start()["task"]
         with sqlite3.connect(self.database) as connection:
@@ -2838,6 +2901,24 @@ class TaskTests(unittest.TestCase):
         refresh.assert_called_once_with(task_id=task_id)
         resume.assert_not_called()
         audit.assert_not_called()
+
+    def test_reconcile_cli_refresh_defaults_to_bounded_cursor_mode(self) -> None:
+        refreshed = {"mode": "refresh", "scanned": 0}
+        with (
+            patch.object(
+                task_reconcile_cli.grabowski_tasks,
+                "reconcile_tasks_refresh",
+                return_value=refreshed,
+            ) as refresh,
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                task_reconcile_cli.main(["--mode", "refresh"]),
+                0,
+            )
+        refresh.assert_called_once_with(
+            batch_size=task_reconcile_cli.DEFAULT_REFRESH_BATCH_SIZE
+        )
 
     def test_reconcile_cli_resume_requires_reason(self) -> None:
         with patch("sys.stderr", new_callable=io.StringIO):
@@ -3700,7 +3781,15 @@ class RuntimeContractTests(unittest.TestCase):
         legacy = "--auto-" + "resume"
         self.assertNotIn(legacy, source)
         self.assertIn("--mode refresh", source)
+        self.assertIn("--batch-size 100", source)
         self.assertNotIn("--mode resume", source)
+
+    def test_reconcile_timer_waits_from_prior_run_completion(self) -> None:
+        source = (
+            ROOT / "systemd" / "grabowski-reconcile-tasks.timer.example"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OnUnitInactiveSec=1min", source)
+        self.assertNotIn("OnUnitActiveSec=", source)
 
     def test_shared_command_identity_is_in_runtime_contract(self) -> None:
         contract = json.loads(

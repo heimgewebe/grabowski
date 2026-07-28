@@ -53,6 +53,7 @@ DEFAULT_BACKOFF_BASE = 60
 DEFAULT_BACKOFF_MAX = 900
 BACKOFF_MAX_LEVEL = 32
 BACKOFF_JITTER_RATIO = 0.2
+DEPENDENCY_UNAVAILABLE_EXIT = 5
 
 
 class WatchdogError(RuntimeError):
@@ -1469,6 +1470,41 @@ def _is_new_process_instance(previous: ProbeResult, current: ProbeResult) -> boo
     return current.start_ticks != previous.start_ticks
 
 
+def classify_tunnel_readiness_dependency(
+    probe: ProbeResult,
+    *,
+    mcp_url: str,
+    timeout: float,
+) -> ProbeResult:
+    """Separate a missing readiness dependency from stale tunnel state."""
+    if probe.status != "indeterminate" or probe.reasons != ("readiness-failed",):
+        return probe
+    dependency_failure = mcp_http_probe(mcp_url, timeout)
+    if dependency_failure == "mcp-http-request-failed":
+        return ProbeResult(
+            "dependency-unavailable",
+            ("readiness-dependency-unavailable",),
+            probe.pid,
+            probe.age_seconds,
+            probe.start_ticks,
+        )
+    if dependency_failure is None:
+        return ProbeResult(
+            "unhealthy",
+            ("readiness-stale-after-dependency-recovered",),
+            probe.pid,
+            probe.age_seconds,
+            probe.start_ticks,
+        )
+    return ProbeResult(
+        "indeterminate",
+        ("readiness-failed", f"readiness-dependency-{dependency_failure}"),
+        probe.pid,
+        probe.age_seconds,
+        probe.start_ticks,
+    )
+
+
 def run_watchdog(args: argparse.Namespace) -> int:
     if args.component not in {"operator", "tunnel"}:
         raise WatchdogError("invalid-component")
@@ -1510,6 +1546,12 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 metrics_url=args.metrics_url,
                 control_plane_poll_max_age=args.control_plane_poll_max_age,
             )
+            if args.component == "tunnel":
+                probe = classify_tunnel_readiness_dependency(
+                    probe,
+                    mcp_url=args.mcp_url,
+                    timeout=args.http_timeout,
+                )
             state = load_state(state_path)
             common = {
                 "component": args.component,
@@ -1536,6 +1578,12 @@ def run_watchdog(args: argparse.Namespace) -> int:
             if probe.status == "startup-grace":
                 emit("grabowski.component_watchdog.skipped", **common)
                 return 0
+            if probe.status == "dependency-unavailable":
+                emit(
+                    "grabowski.component_watchdog.dependency_unavailable",
+                    **common,
+                )
+                return DEPENDENCY_UNAVAILABLE_EXIT
             if probe.status == "indeterminate":
                 emit("grabowski.component_watchdog.indeterminate", **common)
                 return 2
