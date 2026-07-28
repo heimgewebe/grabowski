@@ -2127,6 +2127,8 @@ def pending_task_terminalizations(
     boundary = _task_terminalization_cursor(high_water, field="high_water")
     if after is not None and boundary is None:
         raise ValueError("cursor requires high_water")
+    if after is not None and after > boundary:
+        raise ValueError("cursor cannot be greater than high_water")
     with _database() as connection:
         if boundary is None:
             boundary_row = connection.execute(
@@ -2187,6 +2189,47 @@ def pending_task_terminalizations(
         "high_water": boundary,
         "cycle_completed": not has_more,
     }
+
+
+def pending_task_terminalizations_exist(
+    *,
+    cursor: tuple[int, str] | None = None,
+    high_water: tuple[int, str] | None = None,
+) -> bool:
+    after = _task_terminalization_cursor(cursor, field="cursor")
+    boundary = _task_terminalization_cursor(high_water, field="high_water")
+    if after is not None and boundary is None:
+        raise ValueError("cursor requires high_water")
+    if after is not None and after > boundary:
+        raise ValueError("cursor cannot be greater than high_water")
+    with _database() as connection:
+        if boundary is None:
+            return (
+                connection.execute(
+                    "SELECT 1 FROM task_terminalizations "
+                    "WHERE phase='leases_revoked' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+        parameters: list[Any] = [boundary[0], boundary[0], boundary[1]]
+        after_clause = ""
+        if after is not None:
+            after_clause = (
+                "AND (prepared_at_unix > ? OR "
+                "(prepared_at_unix = ? AND task_id > ?)) "
+            )
+            parameters.extend((after[0], after[0], after[1]))
+        return (
+            connection.execute(
+                "SELECT 1 FROM task_terminalizations "
+                "WHERE phase='leases_revoked' "
+                "AND (prepared_at_unix < ? OR "
+                "(prepared_at_unix = ? AND task_id <= ?)) "
+                f"{after_clause}LIMIT 1",
+                parameters,
+            ).fetchone()
+            is not None
+        )
 
 
 def begin_task_terminalization(

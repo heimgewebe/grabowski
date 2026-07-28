@@ -646,6 +646,67 @@ class ResourceTests(unittest.TestCase):
             " ".join(str(row) for row in plan),
         )
 
+    def test_pending_terminalization_rejects_cursor_after_high_water(self) -> None:
+        with self.subTest("later timestamp"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "cursor cannot be greater than high_water",
+            ):
+                resources.pending_task_terminalizations(
+                    limit=1,
+                    cursor=(101, "0" * 24),
+                    high_water=(100, "f" * 24),
+                )
+        with self.subTest("same timestamp later task id"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "cursor cannot be greater than high_water",
+            ):
+                resources.pending_task_terminalizations(
+                    limit=1,
+                    cursor=(100, "b" * 24),
+                    high_water=(100, "a" * 24),
+                )
+
+    def test_pending_terminalization_cursor_equal_to_high_water_completes(self) -> None:
+        boundary = (100, "a" * 24)
+        page = resources.pending_task_terminalizations(
+            limit=1,
+            cursor=boundary,
+            high_water=boundary,
+        )
+        self.assertEqual(0, page["examined"])
+        self.assertTrue(page["cycle_completed"])
+        self.assertEqual(boundary, page["high_water"])
+        self.assertIsNone(page["cursor_after"])
+
+    def test_pending_terminalization_deleted_high_water_completes_truthfully(self) -> None:
+        first = self._pending_terminalization(
+            "1" * 24,
+            prepared_at_unix=100,
+        )
+        high_water = self._pending_terminalization(
+            "2" * 24,
+            prepared_at_unix=101,
+        )
+        page = resources.pending_task_terminalizations(limit=1)
+        self.assertFalse(page["cycle_completed"])
+        self.assertEqual(first["task_id"], page["terminalizations"][0]["task_id"])
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "DELETE FROM task_terminalizations WHERE task_id=?",
+                (high_water["task_id"],),
+            )
+            connection.commit()
+        completed = resources.pending_task_terminalizations(
+            limit=1,
+            cursor=page["cursor_after"],
+            high_water=page["high_water"],
+        )
+        self.assertEqual(0, completed["examined"])
+        self.assertTrue(completed["cycle_completed"])
+        self.assertEqual(page["high_water"], completed["high_water"])
+
     def test_merge_guard_preserves_owner_repo_lease_and_blocks_only_changed_paths(self) -> None:
         repository = self.root / "repo"
         repository.mkdir()

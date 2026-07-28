@@ -65,7 +65,8 @@ def parser() -> argparse.ArgumentParser:
         type=_bounded_batch_size,
         default=DEFAULT_REFRESH_BATCH_SIZE,
         help=(
-            "Maximum records examined per cursor-bound refresh run. "
+            "Maximum records examined in total across terminalization recovery "
+            "and task scanning per cursor-bound refresh run. "
             "Ignored for a targeted --task-id refresh."
         ),
     )
