@@ -2142,6 +2142,70 @@ class DeploymentAdmissionTests(unittest.TestCase):
             with self.assertRaises(core.DeployError) as raised:
                 dual._operator_admission_observation()
         self.assertEqual("operator-admission-drain", raised.exception.phase)
+        self.assertEqual("transport", raised.exception.details["failure_class"])
+
+    def test_operator_admission_bootstrap_retries_transport_until_explicit_404(
+        self,
+    ) -> None:
+        marker = self.marker()
+        transport = core.DeployError(
+            "temporarily unavailable",
+            phase="operator-admission-drain",
+            details={
+                "failure_class": "transport",
+                "error_type": "TimeoutError",
+            },
+        )
+        with (
+            mock.patch.object(
+                dual,
+                "_operator_admission_observation",
+                side_effect=[transport, None],
+            ),
+            mock.patch.object(dual.time, "monotonic", side_effect=[0.0, 0.1]),
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker, timeout_seconds=5
+            )
+        self.assertFalse(proof["supported"])
+        self.assertEqual(
+            "operator-runtime-precedes-admission-contract", proof["reason"]
+        )
+        self.assertEqual(2, proof["probe_attempts"])
+        self.assertEqual(1, proof["transport_retries"])
+        sleep.assert_called_once_with(0.2)
+
+    def test_operator_admission_bootstrap_transport_exhaustion_fails_closed(
+        self,
+    ) -> None:
+        marker = self.marker()
+        transport = core.DeployError(
+            "still unavailable",
+            phase="operator-admission-drain",
+            details={
+                "failure_class": "transport",
+                "error_type": "TimeoutError",
+            },
+        )
+        with (
+            mock.patch.object(
+                dual,
+                "_operator_admission_observation",
+                side_effect=transport,
+            ),
+            mock.patch.object(dual.time, "monotonic", side_effect=[0.0, 1.1]),
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_operator_deployment_admission(
+                    marker, timeout_seconds=1
+                )
+        self.assertEqual("operator-admission-drain", raised.exception.phase)
+        self.assertEqual("transport", raised.exception.details["failure_class"])
+        self.assertEqual(1, raised.exception.details["probe_attempts"])
+        self.assertEqual(1, raised.exception.details["transport_retries"])
+        sleep.assert_not_called()
 
     def test_operator_admission_waits_for_existing_calls_then_seals(self) -> None:
         marker = self.marker()

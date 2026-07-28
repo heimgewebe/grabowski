@@ -30,7 +30,7 @@ The loopback-only `/_grabowski/deployment-admission` route exposes bounded marke
 8. Require the replacement operator to attest the exact active marker before the tunnel starts and again immediately after tunnel startup.
 9. Release the marker only after the new runtime is healthy and identity-bound; marker absence is drift, never success.
 
-The first deployment from a predecessor runtime uses the legacy stable-counter drain because the status route returns 404. It still fails closed rather than stopping services with unfinished work. Every later deployment uses the admission-aware path.
+The first deployment from a predecessor runtime uses the legacy stable-counter drain only after the status route explicitly returns 404. Transient transport failures are retried for up to the smaller of the deployment timeout and thirty seconds; they never establish legacy compatibility. If no explicit 404 or valid admission response becomes observable inside that bound, deployment fails closed before service stop. Every later deployment uses the admission-aware path.
 
 ## Failure and rollback
 
