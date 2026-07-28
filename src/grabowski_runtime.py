@@ -4,6 +4,7 @@ import grabowski_operator_core
 import grabowski_checkouts
 import grabowski_checkout_binding_reconciler
 import grabowski_current_work_surface
+import grabowski_operator_optimization
 import grabowski_runtime_extensions
 import grabowski_audit_query
 import grabowski_read_surface
@@ -51,6 +52,28 @@ def grabowski_current_work(
     )
 
 
+@mcp.tool(name="grabowski_operator_optimization_report", annotations=READ_ONLY)
+def grabowski_operator_optimization_report(
+    repositories: list[str],
+    window: str = "7d",
+    view: str = "minimal",
+    top_limit: int = 10,
+    friction_limit: int = 100,
+    outcome_limit: int = 200,
+    current_work_limit: int = 50,
+) -> dict[str, object]:
+    """Audit bounded operator friction and optimization potential on manual request."""
+    return grabowski_operator_optimization.build_operator_optimization_report(
+        repositories,
+        window=window,
+        view=view,
+        top_limit=top_limit,
+        friction_limit=friction_limit,
+        outcome_limit=outcome_limit,
+        current_work_limit=current_work_limit,
+    )
+
+
 @mcp.tool(name="grabowski_checkout_binding_reconciliation", annotations=READ_ONLY)
 def grabowski_checkout_binding_reconciliation(
     repository_filters: list[str] | None = None,
@@ -63,7 +86,6 @@ def grabowski_checkout_binding_reconciliation(
         limit=limit,
         cursor=cursor,
     )
-
 
 
 @mcp.tool(name="grabowski_merge_delivery_record", annotations=grabowski_operator_core.MUTATING)
@@ -97,6 +119,7 @@ def grabowski_merge_delivery_record(
         delivery_channel,
         delivery_reference,
     )
+
 
 def main() -> None:
     grabowski_operator_core.main()

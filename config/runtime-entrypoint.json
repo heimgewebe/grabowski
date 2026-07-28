@@ -42,6 +42,7 @@
     "grabowski_contract_drift",
     "grabowski_checkout_summary",
     "grabowski_current_work",
+    "grabowski_operator_optimization_report",
     "grabowski_git_status",
     "grabowski_git_diff",
     "grabowski_git_log",
@@ -296,6 +297,10 @@
     {
       "module": "grabowski_current_work_surface",
       "source": "src/grabowski_current_work_surface.py"
+    },
+    {
+      "module": "grabowski_operator_optimization",
+      "source": "src/grabowski_operator_optimization.py"
     },
     {
       "module": "grabowski_fleet",
