@@ -26,6 +26,7 @@ except ModuleNotFoundError as exc:
 SCHEMA_VERSION = 1
 OPEN_KIND = "grabowski.operator_obligation"
 CLOSE_KIND = "grabowski.operator_obligation_close"
+RESOLUTION_KIND = "grabowski.operator_obligation_resolution"
 OBLIGATION_ID_RE = re.compile(r"^goo-[a-z0-9][a-z0-9-]{7,79}$")
 ACCEPTANCE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 CODE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
@@ -37,10 +38,13 @@ MAX_EVIDENCE = 128
 MAX_BLOCKERS = 32
 MAX_LIST_LIMIT = 100
 MAX_LIST_SCAN = 1_000
+MAX_RESOLUTION_REVISIONS = 128
 MAX_TEXT = 4_096
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
 TERMINAL_OUTCOMES = frozenset({"completed", "blocked", "delegated"})
+RESOLUTION_DISPOSITIONS = frozenset({"resolved", "superseded", "deferred"})
+RESOLUTION_SUCCESSOR_RE = re.compile(r"^resolution-(?P<sequence>[0-9]{6})\.json$")
 STATUS_STATES = TERMINAL_OUTCOMES | {"open"}
 EVIDENCE_STATUSES = frozenset({"passed", "failed", "partial", "not_run", "unknown"})
 EVIDENCE_SOURCES = frozenset(
@@ -65,6 +69,15 @@ DELEGATION_TOOLS = {
     "systemd_job": "grabowski_job_status",
 }
 DELEGATION_STATUSES = frozenset({"launch_submitted", "launching", "running"})
+DELEGATION_TERMINAL_STATUSES = {
+    "systemd_job": frozenset(
+        {"completed", "succeeded", "failed", "timed_out", "signalled", "terminated_unclear"}
+    ),
+    "grabowski_task": frozenset(
+        {"completed", "failed", "cancelled", "timed_out", "signalled"}
+    ),
+    "agent_workspace": frozenset({"closed"}),
+}
 
 
 class OperatorObligationError(RuntimeError):
@@ -172,7 +185,31 @@ def _status_projection_requires_attention(status: dict[str, Any]) -> bool:
         raise OperatorObligationIntegrityError(
             "operator obligation status projection has inconsistent completion state"
         )
-    expected_continuation = not expected_complete
+    attention_class = status.get("attention_class")
+    resolution_disposition = status.get("resolution_disposition")
+    if attention_class is None:
+        expected_continuation = not expected_complete
+    else:
+        if attention_class not in {"completed", "current", "historical"}:
+            raise OperatorObligationIntegrityError(
+                "operator obligation status projection has invalid attention_class"
+            )
+        if expected_complete and attention_class != "completed":
+            raise OperatorObligationIntegrityError(
+                "completed obligation must use completed attention_class"
+            )
+        if not expected_complete and attention_class == "completed":
+            raise OperatorObligationIntegrityError(
+                "unfinished obligation may not use completed attention_class"
+            )
+        if (
+            resolution_disposition is not None
+            and resolution_disposition not in RESOLUTION_DISPOSITIONS
+        ):
+            raise OperatorObligationIntegrityError(
+                "operator obligation status projection has invalid resolution disposition"
+            )
+        expected_continuation = attention_class == "current"
     if boolean_fields["continuation_required"] is not expected_continuation:
         raise OperatorObligationIntegrityError(
             "operator obligation status projection has inconsistent continuation state"
@@ -221,6 +258,42 @@ def _normalize_acceptance(value: Any) -> list[dict[str, str]]:
             }
         )
     return normalized
+
+
+def _normalize_resolution_evidence(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value or len(value) > MAX_EVIDENCE:
+        raise OperatorObligationInputError(
+            "resolution evidence must be a non-empty bounded list"
+        )
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise OperatorObligationInputError(
+                f"resolution evidence[{index}] must be an object"
+            )
+        _validate_exact_keys(
+            item,
+            allowed={"source", "reference", "sha256"},
+            required={"source", "reference", "sha256"},
+            label=f"resolution evidence[{index}]",
+        )
+        normalized.append(
+            {
+                "source": _validate_text(
+                    item["source"],
+                    label=f"resolution evidence[{index}].source",
+                    maximum=64,
+                ),
+                "reference": _validate_text(
+                    item["reference"], label=f"resolution evidence[{index}].reference"
+                ),
+                "sha256": _validate_sha256(
+                    item["sha256"], label=f"resolution evidence[{index}].sha256"
+                ),
+            }
+        )
+    return normalized
+
 
 
 def _normalize_origin(value: Any) -> dict[str, str]:
@@ -389,6 +462,78 @@ def _normalize_delegation(value: Any) -> dict[str, str]:
     )
     if receipt_sha256 != _sha256(material):
         raise OperatorObligationInputError("delegation observation receipt binding is invalid")
+    return {**material, "observation_receipt_sha256": receipt_sha256}
+
+
+def _normalize_resolution_delegation_observation(
+    value: Any,
+    *,
+    expected_delegation: dict[str, str],
+) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise OperatorObligationInputError(
+            "delegated resolution requires a terminal delegation observation"
+        )
+    fields = {
+        "kind",
+        "id",
+        "observation_tool",
+        "status",
+        "observed_at",
+        "identity_sha256",
+        "observation_receipt_sha256",
+    }
+    _validate_exact_keys(
+        value,
+        allowed=fields,
+        required=fields,
+        label="delegation_observation",
+    )
+    kind = value["kind"]
+    identifier = _validate_text(
+        value["id"], label="delegation_observation.id", maximum=1_024
+    )
+    if kind != expected_delegation.get("kind") or identifier != expected_delegation.get("id"):
+        raise OperatorObligationInputError(
+            "terminal delegation observation does not match the delegated obligation"
+        )
+    observation_tool = _validate_text(
+        value["observation_tool"],
+        label="delegation_observation.observation_tool",
+        maximum=256,
+    )
+    if observation_tool != DELEGATION_TOOLS.get(str(kind)):
+        raise OperatorObligationInputError(
+            "terminal delegation observation tool does not match kind"
+        )
+    status_value = value["status"]
+    allowed_statuses = DELEGATION_TERMINAL_STATUSES.get(str(kind), frozenset())
+    if not isinstance(status_value, str) or status_value not in allowed_statuses:
+        raise OperatorObligationInputError(
+            "delegation observation does not establish a terminal state"
+        )
+    observed_at = _validate_timestamp(
+        value["observed_at"], label="delegation_observation.observed_at"
+    )
+    identity_sha256 = _validate_sha256(
+        value["identity_sha256"], label="delegation_observation.identity_sha256"
+    )
+    material = {
+        "kind": str(kind),
+        "id": identifier,
+        "observation_tool": observation_tool,
+        "status": status_value,
+        "observed_at": observed_at,
+        "identity_sha256": identity_sha256,
+    }
+    receipt_sha256 = _validate_sha256(
+        value["observation_receipt_sha256"],
+        label="delegation_observation.observation_receipt_sha256",
+    )
+    if receipt_sha256 != _sha256(material):
+        raise OperatorObligationInputError(
+            "terminal delegation observation receipt binding is invalid"
+        )
     return {**material, "observation_receipt_sha256": receipt_sha256}
 
 
@@ -630,6 +775,188 @@ def _validate_close_record(record: dict[str, Any], *, open_record: dict[str, Any
         raise OperatorObligationIntegrityError("operator obligation close record semantics are invalid") from exc
 
 
+def _resolution_path(directory: Path, sequence: int) -> Path:
+    if isinstance(sequence, bool) or not isinstance(sequence, int):
+        raise OperatorObligationIntegrityError("resolution sequence is invalid")
+    if sequence == 1:
+        return directory / "resolution.json"
+    if not 2 <= sequence <= MAX_RESOLUTION_REVISIONS:
+        raise OperatorObligationIntegrityError("resolution sequence is out of bounds")
+    return directory / f"resolution-{sequence:06d}.json"
+
+
+def _resolution_entries(directory: Path) -> list[tuple[int, Path]]:
+    entries: list[tuple[int, Path]] = []
+    for child in directory.iterdir():
+        if child.name == "resolution.json":
+            entries.append((1, child))
+            continue
+        match = RESOLUTION_SUCCESSOR_RE.fullmatch(child.name)
+        if match is not None:
+            sequence = int(match.group("sequence"))
+            if sequence < 2:
+                raise OperatorObligationIntegrityError(
+                    "resolution successor sequence is invalid"
+                )
+            entries.append((sequence, child))
+            continue
+        if child.name.startswith("resolution") and not child.name.startswith("."):
+            raise OperatorObligationIntegrityError(
+                "unexpected operator obligation resolution entry"
+            )
+    entries.sort(key=lambda item: item[0])
+    if len(entries) > MAX_RESOLUTION_REVISIONS:
+        raise OperatorObligationIntegrityError("resolution chain exceeds bounded limit")
+    actual = [sequence for sequence, _ in entries]
+    expected = list(range(1, len(entries) + 1))
+    if actual != expected:
+        raise OperatorObligationIntegrityError("resolution chain has a gap or duplicate")
+    return entries
+
+
+def _resolution_request_projection(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "disposition": record["disposition"],
+        "evidence": record["evidence"],
+        "delegation_observation": record["delegation_observation"],
+        "next_action": record["next_action"],
+    }
+
+
+def _validate_resolution_record(
+    record: dict[str, Any],
+    *,
+    open_record: dict[str, Any],
+    open_file_sha256: str,
+    close_record: dict[str, Any],
+    close_file_sha256: str,
+    expected_sequence: int,
+    expected_predecessor_file_sha256: str | None,
+) -> None:
+    required = {
+        "kind",
+        "schema_version",
+        "obligation_id",
+        "open_file_sha256",
+        "close_file_sha256",
+        "sequence",
+        "predecessor_file_sha256",
+        "disposition",
+        "evidence",
+        "delegation_observation",
+        "next_action",
+        "resolved_at",
+        "material_sha256",
+        "record_sha256",
+    }
+    if set(record) != required:
+        raise OperatorObligationIntegrityError(
+            "operator obligation resolution record shape is invalid"
+        )
+    material = {
+        key: record[key]
+        for key in required - {"resolved_at", "material_sha256", "record_sha256"}
+    }
+    record_material = {key: record[key] for key in required - {"record_sha256"}}
+    sequence = record["sequence"]
+    predecessor = record["predecessor_file_sha256"]
+    if (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, int)
+        or sequence != expected_sequence
+        or not 1 <= sequence <= MAX_RESOLUTION_REVISIONS
+    ):
+        raise OperatorObligationIntegrityError(
+            "operator obligation resolution sequence is invalid"
+        )
+    if predecessor != expected_predecessor_file_sha256:
+        raise OperatorObligationIntegrityError(
+            "operator obligation resolution predecessor binding is invalid"
+        )
+    if predecessor is not None:
+        try:
+            _validate_sha256(predecessor, label="resolution.predecessor_file_sha256")
+        except OperatorObligationInputError as exc:
+            raise OperatorObligationIntegrityError(
+                "operator obligation resolution predecessor digest is invalid"
+            ) from exc
+    if (
+        record["kind"] != RESOLUTION_KIND
+        or record["schema_version"] != SCHEMA_VERSION
+        or record["obligation_id"] != open_record["obligation_id"]
+        or record["open_file_sha256"] != open_file_sha256
+        or record["close_file_sha256"] != close_file_sha256
+        or record["disposition"] not in RESOLUTION_DISPOSITIONS
+        or record["material_sha256"] != _sha256(material)
+        or record["record_sha256"] != _sha256(record_material)
+    ):
+        raise OperatorObligationIntegrityError(
+            "operator obligation resolution binding is invalid"
+        )
+    try:
+        _validate_timestamp(record["resolved_at"], label="resolution.resolved_at")
+        _normalize_resolution_evidence(record["evidence"])
+        terminal_disposition = record["disposition"] in {"resolved", "superseded"}
+        if close_record["outcome"] == "delegated" and terminal_disposition:
+            observation = _normalize_resolution_delegation_observation(
+                record["delegation_observation"],
+                expected_delegation=close_record["delegation"],
+            )
+            receipt_matches = [
+                item
+                for item in record["evidence"]
+                if item.get("source") == "receipt"
+                and item.get("reference")
+                == f"delegation:{observation['kind']}:{observation['id']}"
+                and item.get("sha256") == observation["observation_receipt_sha256"]
+            ]
+            if not receipt_matches:
+                raise OperatorObligationInputError(
+                    "delegated resolution evidence is not bound to the terminal observation"
+                )
+        elif record["delegation_observation"]:
+            raise OperatorObligationInputError(
+                "resolution contains an inapplicable delegation observation"
+            )
+        if record["disposition"] == "deferred":
+            _validate_text(record["next_action"], label="resolution.next_action")
+        elif record["next_action"]:
+            raise OperatorObligationInputError(
+                "terminal resolution contains next_action"
+            )
+    except OperatorObligationInputError as exc:
+        raise OperatorObligationIntegrityError(
+            "operator obligation resolution semantics are invalid"
+        ) from exc
+
+
+def _read_resolution_chain(
+    directory: Path,
+    *,
+    open_record: dict[str, Any],
+    open_file_sha256: str,
+    close_record: dict[str, Any],
+    close_file_sha256: str,
+) -> list[tuple[dict[str, Any], str, Path]]:
+    chain: list[tuple[dict[str, Any], str, Path]] = []
+    predecessor: str | None = None
+    for sequence, path in _resolution_entries(directory):
+        record, file_sha256 = _read_private_json(path)
+        _validate_resolution_record(
+            record,
+            open_record=open_record,
+            open_file_sha256=open_file_sha256,
+            close_record=close_record,
+            close_file_sha256=close_file_sha256,
+            expected_sequence=sequence,
+            expected_predecessor_file_sha256=predecessor,
+        )
+        chain.append((record, file_sha256, path))
+        predecessor = file_sha256
+    return chain
+
+
+
 def open_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
     allowed = {"obligation_id", "objective", "acceptance", "origin", "references"}
     _validate_exact_keys(parameters, allowed=allowed, required={"obligation_id", "objective", "acceptance"}, label="open parameters")
@@ -706,13 +1033,64 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
             "close_file_sha256": None,
             "recommended_next_action": "continue work; the chat response must not imply completion",
         }
-    _validate_close_record(close_record, open_record=open_record, open_file_sha256=open_file_sha256)
+    _validate_close_record(
+        close_record, open_record=open_record, open_file_sha256=open_file_sha256
+    )
     evidence_by_id = {item["acceptance_id"]: item for item in close_record["evidence"]}
-    missing = [item["id"] for item in open_record["acceptance"] if item["id"] not in evidence_by_id]
+    missing = [
+        item["id"]
+        for item in open_record["acceptance"]
+        if item["id"] not in evidence_by_id
+    ]
     outcome = close_record["outcome"]
+    resolution_chain = _read_resolution_chain(
+        directory,
+        open_record=open_record,
+        open_file_sha256=open_file_sha256,
+        close_record=close_record,
+        close_file_sha256=close_file_sha256,
+    )
+    if resolution_chain:
+        resolution_record, resolution_file_sha256, _ = resolution_chain[-1]
+    else:
+        resolution_record = None
+        resolution_file_sha256 = None
+    disposition = resolution_record["disposition"] if resolution_record else None
+    continuation_required = outcome != "completed" and disposition not in {
+        "resolved",
+        "superseded",
+    }
+    recommended_next_action = (
+        "report acceptance-bound completion"
+        if outcome == "completed"
+        else (
+            resolution_record["next_action"]
+            if disposition == "deferred"
+            else "no current continuation required"
+        )
+        if resolution_record is not None
+        else close_record["next_action"]
+    )
     return {
         "obligation_id": obligation_id,
         "state": outcome,
+        "attention_class": (
+            "completed"
+            if outcome == "completed"
+            else "current"
+            if continuation_required
+            else "historical"
+        ),
+        "resolution_disposition": disposition,
+        "resolution_evidence": resolution_record["evidence"]
+        if resolution_record
+        else [],
+        "resolution_delegation_observation": resolution_record[
+            "delegation_observation"
+        ]
+        if resolution_record
+        else {},
+        "resolved_at": resolution_record["resolved_at"] if resolution_record else None,
         "objective": open_record["objective"],
         "origin": open_record["origin"],
         "references": open_record["references"],
@@ -724,23 +1102,27 @@ def status_obligation(obligation_id: str) -> dict[str, Any]:
         "blockers": close_record["blockers"],
         "delegation": close_record["delegation"],
         "next_action": close_record["next_action"],
-        "continuation_required": outcome != "completed",
+        "continuation_required": continuation_required,
         "response_may_end": True,
         "work_complete": outcome == "completed",
-        "follow_up_required": outcome != "completed",
+        "follow_up_required": continuation_required,
         "open_file_sha256": open_file_sha256,
         "close_file_sha256": close_file_sha256,
-        "recommended_next_action": (
-            "report acceptance-bound completion"
-            if outcome == "completed"
-            else close_record["next_action"]
-        ),
+        "resolution_file_sha256": resolution_file_sha256,
+        "resolution_sequence": resolution_record["sequence"]
+        if resolution_record
+        else None,
+        "resolution_revision_count": len(resolution_chain),
+        "recommended_next_action": recommended_next_action,
         "non_claims": (
             []
             if outcome == "completed"
-            else ["terminal chat closeout does not establish that the underlying work is complete"]
+            else [
+                "terminal chat closeout does not establish acceptance-bound completion; historical resolution does not rewrite the original close outcome"
+            ]
         ),
     }
+
 
 
 def list_obligations(parameters: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -933,6 +1315,165 @@ def _validate_completed_task_closeout(
         "state": record["state"],
         "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
         "closeout_state": closeout["closeout_state"],
+    }
+
+
+def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
+    allowed = {
+        "obligation_id",
+        "disposition",
+        "evidence",
+        "delegation_observation",
+        "next_action",
+    }
+    _validate_exact_keys(
+        parameters,
+        allowed=allowed,
+        required={"obligation_id", "disposition", "evidence"},
+        label="resolution parameters",
+    )
+    obligation_id = _validate_obligation_id(parameters["obligation_id"])
+    disposition = parameters["disposition"]
+    if not isinstance(disposition, str) or disposition not in RESOLUTION_DISPOSITIONS:
+        raise OperatorObligationInputError(
+            "disposition must be resolved, superseded, or deferred"
+        )
+    evidence = _normalize_resolution_evidence(parameters["evidence"])
+    next_action = parameters.get("next_action", "")
+    if disposition == "deferred":
+        next_action = _validate_text(next_action, label="next_action")
+    elif next_action:
+        raise OperatorObligationInputError(
+            "terminal resolution may not contain next_action"
+        )
+    directory = _state_root() / obligation_id
+    with _state_lock():
+        _ensure_private_directory(directory, create=False)
+        open_record, open_file_sha256 = _read_private_json(directory / "open.json")
+        _validate_open_record(open_record, expected_id=obligation_id)
+        try:
+            close_record, close_file_sha256 = _read_private_json(
+                directory / "close.json"
+            )
+        except FileNotFoundError as exc:
+            raise OperatorObligationInputError(
+                "open obligation cannot be resolved"
+            ) from exc
+        _validate_close_record(
+            close_record, open_record=open_record, open_file_sha256=open_file_sha256
+        )
+        if close_record["outcome"] == "completed":
+            raise OperatorObligationInputError(
+                "completed obligation does not require resolution"
+            )
+        terminal_disposition = disposition in {"resolved", "superseded"}
+        if close_record["outcome"] == "delegated" and terminal_disposition:
+            delegation_observation = _normalize_resolution_delegation_observation(
+                parameters.get("delegation_observation"),
+                expected_delegation=close_record["delegation"],
+            )
+            receipt_reference = (
+                f"delegation:{delegation_observation['kind']}:"
+                f"{delegation_observation['id']}"
+            )
+            if not any(
+                item["source"] == "receipt"
+                and item["reference"] == receipt_reference
+                and item["sha256"]
+                == delegation_observation["observation_receipt_sha256"]
+                for item in evidence
+            ):
+                raise OperatorObligationInputError(
+                    "delegated resolution requires evidence bound to the terminal observation receipt"
+                )
+        else:
+            raw_observation = parameters.get("delegation_observation", {})
+            if raw_observation:
+                raise OperatorObligationInputError(
+                    "resolution may not contain an inapplicable delegation observation"
+                )
+            delegation_observation = {}
+        request_projection = {
+            "disposition": disposition,
+            "evidence": evidence,
+            "delegation_observation": delegation_observation,
+            "next_action": next_action,
+        }
+        chain = _read_resolution_chain(
+            directory,
+            open_record=open_record,
+            open_file_sha256=open_file_sha256,
+            close_record=close_record,
+            close_file_sha256=close_file_sha256,
+        )
+        if chain:
+            latest, latest_file_sha256, _ = chain[-1]
+            if _resolution_request_projection(latest) == request_projection:
+                created = False
+                file_sha256 = latest_file_sha256
+            else:
+                if latest["disposition"] != "deferred":
+                    raise OperatorObligationConflictError(
+                        "operator obligation already has a terminal resolution"
+                    )
+                sequence = latest["sequence"] + 1
+                predecessor_file_sha256 = latest_file_sha256
+                created = True
+        else:
+            sequence = 1
+            predecessor_file_sha256 = None
+            created = True
+        if created:
+            material = {
+                "kind": RESOLUTION_KIND,
+                "schema_version": SCHEMA_VERSION,
+                "obligation_id": obligation_id,
+                "open_file_sha256": open_file_sha256,
+                "close_file_sha256": close_file_sha256,
+                "sequence": sequence,
+                "predecessor_file_sha256": predecessor_file_sha256,
+                **request_projection,
+            }
+            material_sha256 = _sha256(material)
+            payload = {
+                **material,
+                "resolved_at": _utc_now(),
+                "material_sha256": material_sha256,
+            }
+            payload["record_sha256"] = _sha256(payload)
+            target = _resolution_path(directory, sequence)
+            published = private_io.publish_private_create_only_json(
+                directory,
+                target,
+                payload,
+                max_bytes=MAX_RECORD_BYTES,
+                label="operator obligation resolution record",
+            )
+            winner, file_sha256 = _read_private_json(target)
+            _validate_resolution_record(
+                winner,
+                open_record=open_record,
+                open_file_sha256=open_file_sha256,
+                close_record=close_record,
+                close_file_sha256=close_file_sha256,
+                expected_sequence=sequence,
+                expected_predecessor_file_sha256=predecessor_file_sha256,
+            )
+            if not published or winner["material_sha256"] != material_sha256:
+                if _resolution_request_projection(winner) != request_projection:
+                    raise OperatorObligationConflictError(
+                        "operator obligation resolution revision conflicts with another writer"
+                    )
+                created = False
+        # Keep the status projection under the same writer lock so every
+        # returned field is bound to the exact revision represented by
+        # file_sha256, even when another resolver is waiting.
+        status = status_obligation(obligation_id)
+    return {
+        **status,
+        "created": created,
+        "replayed": not created,
+        "resolution_file_sha256": file_sha256,
     }
 
 
