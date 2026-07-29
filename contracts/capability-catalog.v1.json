@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "ab0930fa8249123bbffd415fbce24e2fdca720c0df58ad975746d18ed850d399",
+  "capability_source_sha256": "bfe3317e21fed21d2d6e647fd10a620cb0b5a6bc6aee4feea2ea2eedbbfb8ffc",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "b0d032e607e5c537de0e203bd19fb5210ab654d24509a34355cda2a3fe5d9d54",
+  "contract_sha256": "cfc439b302d70c151b03ceb8db7f8eaf68ede81b6d452af42ceb6989dbb688f5",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -504,6 +504,20 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_current_work"
+    },
+    {
+      "category": "repository-observation",
+      "description": "Run one target-bound Reposkop report and persist a deduplicated usage receipt.",
+      "effects": [
+        "repository-read",
+        "state-create"
+      ],
+      "id": "grabowski_reposkop_context",
+      "purpose": "Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt.",
+      "read_only": false,
+      "reversibility": "idempotent-create-only",
+      "risk_class": "low",
+      "tool": "grabowski_reposkop_context"
     },
     {
       "category": "operations-observability",
