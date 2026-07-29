@@ -75,6 +75,8 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else "antigravity-gemini-flash-medium"
                 if provider == "antigravity"
+                else "grok-4.5-review-high"
+                if provider == "grok"
                 else "codex-sol-high"
             )
             model = (
@@ -82,6 +84,8 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else "gemini-3.5-flash"
                 if provider == "antigravity"
+                else "grok-4.5"
+                if provider == "grok"
                 else "gpt-5.6-sol"
             )
             argv_prefix = (
@@ -98,6 +102,8 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else ["agy", "--model", "gemini-3.5-flash-medium"]
                 if provider == "antigravity"
+                else ["grok", "--model", "grok-4.5"]
+                if provider == "grok"
                 else ["codexr", "architecture"]
             )
             quota_pools = (
@@ -105,6 +111,8 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                 if provider == "claude"
                 else ["antigravity-gemini", "antigravity-account"]
                 if provider == "antigravity"
+                else ["grok-com"]
+                if provider == "grok"
                 else ["openai-agentic"]
             )
             route = {
@@ -237,6 +245,90 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         self.assertIn("--mode", command)
         self.assertEqual(command[command.index("--mode") + 1], "plan")
         self.assertIn("--sandbox", command)
+        self.assertIsNone(stdin_path)
+        self.assertEqual(cwd, prompt.parent)
+        self.assertFalse(prompt_in_argv)
+
+    def test_grok_executable_resolution_uses_private_native_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            bin_directory = home / ".grok" / "bin"
+            bin_directory.mkdir(parents=True, mode=0o755)
+            native = bin_directory / "grok-0.2.114"
+            native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            native.chmod(0o755)
+            (bin_directory / "grok").symlink_to(native.name)
+            wrapper_directory = home / "wrapper-bin"
+            wrapper_directory.mkdir(mode=0o755)
+            wrapper = wrapper_directory / "grok"
+            wrapper.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            executable = candidate_tool.resolve_provider_executable(
+                ["grok", "--model", "grok-4.5"],
+                packet={"schema_version": 3, "provider": "grok"},
+                environment={"HOME": str(home), "PATH": str(wrapper_directory)},
+            )
+        self.assertEqual(executable, str(native))
+
+    def test_grok_executable_resolution_rejects_escaping_or_writable_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            bin_directory = home / ".grok" / "bin"
+            bin_directory.mkdir(parents=True, mode=0o755)
+            external = home / "grok-escape"
+            external.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            external.chmod(0o755)
+            canonical = bin_directory / "grok"
+            canonical.symlink_to(external)
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "identity is invalid"):
+                candidate_tool.resolve_provider_executable(
+                    ["grok"],
+                    packet={"schema_version": 3, "provider": "grok"},
+                    environment={"HOME": str(home), "PATH": ""},
+                )
+            canonical.unlink()
+            native = bin_directory / "grok-0.2.114"
+            native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            native.chmod(0o775)
+            canonical.symlink_to(native.name)
+            with self.assertRaisesRegex(candidate_tool.CandidateError, "identity is invalid"):
+                candidate_tool.resolve_provider_executable(
+                    ["grok"],
+                    packet={"schema_version": 3, "provider": "grok"},
+                    environment={"HOME": str(home), "PATH": ""},
+                )
+
+    def test_route_bound_grok_command_is_single_turn_read_only_and_offline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet = candidate_tool.validate_packet(
+                candidate_tool.load_private_json(
+                    self._packet(root, repo, provider="grok", schema_version=3, max_budget_usd=0),
+                    label="packet",
+                )
+            )
+            prompt = root / "prompt.txt"
+            prompt.write_text("prompt", encoding="utf-8")
+            command, stdin_path, cwd, prompt_in_argv = candidate_tool.provider_command(
+                packet,
+                timeout_seconds=120,
+                max_budget_usd=0,
+                prompt_path=prompt,
+            )
+        self.assertEqual(command[:3], ["grok", "--model", "grok-4.5"])
+        self.assertNotIn("--single", command)
+        self.assertEqual(command[command.index("--prompt-file") + 1], str(prompt))
+        self.assertEqual(command[command.index("--max-turns") + 1], "1")
+        self.assertIn("--disable-web-search", command)
+        self.assertIn("--no-subagents", command)
+        self.assertIn("--no-memory", command)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "plan")
+        self.assertIn("--tools=", command)
+        schema = json.loads(command[command.index("--json-schema") + 1])
+        self.assertEqual(schema, candidate_tool.CANDIDATE_SCHEMA)
         self.assertIsNone(stdin_path)
         self.assertEqual(cwd, prompt.parent)
         self.assertFalse(prompt_in_argv)
@@ -858,6 +950,29 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             self.assertEqual(result, 2)
             bounded.assert_not_called()
 
+
+    def test_parse_grok_json_requires_one_matching_structured_turn(self) -> None:
+        candidate = self._candidate()
+        envelope = {
+            "text": json.dumps(candidate, separators=(",", ":"), sort_keys=True),
+            "stopReason": "EndTurn",
+            "num_turns": 1,
+            "total_cost_usd": 0.01,
+            "structuredOutput": candidate,
+        }
+        observed_envelope, observed_candidate = candidate_tool.parse_grok_json(
+            json.dumps(envelope)
+        )
+        self.assertEqual(observed_envelope, envelope)
+        self.assertEqual(observed_candidate, candidate)
+        mismatched = dict(envelope)
+        mismatched["structuredOutput"] = {**candidate, "confidence": "high"}
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "disagrees"):
+            candidate_tool.parse_grok_json(json.dumps(mismatched))
+        incomplete = dict(envelope)
+        incomplete["num_turns"] = 2
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "one completed turn"):
+            candidate_tool.parse_grok_json(json.dumps(incomplete))
 
     def test_parse_agent_jsonl_extracts_final_text_object(self) -> None:
         candidate = {key: [] for key in (

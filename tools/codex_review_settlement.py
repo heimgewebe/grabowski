@@ -23,7 +23,7 @@ TRUSTED_CODEX_ACTORS = frozenset(
     {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 )
 TRUSTED_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-TRUSTED_REQUEST_ACTORS = frozenset({"github-actions[bot]"})
+TRUSTED_REQUEST_ACTORS = frozenset({"github-actions", "github-actions[bot]"})
 ACCEPTED_REVIEW_STATES = frozenset({"APPROVED", "COMMENTED"})
 BLOCKING_REVIEW_STATES = frozenset({"CHANGES_REQUESTED", "PENDING"})
 REQUEST_RE = re.compile(
