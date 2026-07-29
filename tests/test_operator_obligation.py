@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -651,6 +652,67 @@ class OperatorObligationTests(unittest.TestCase):
         self.assertTrue((directory / "resolution-000002.json").is_file())
         self.assertTrue((directory / "resolution-000003.json").is_file())
 
+
+
+    def test_resolution_status_readback_remains_under_writer_lock(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "external",
+                        "detail": "External blocker.",
+                        "reference": "probe:external",
+                        "sha256": "e" * 64,
+                    }
+                ],
+                "next_action": "Recheck later.",
+            }
+        )
+        original_lock = obligation._state_lock
+        original_status = obligation.status_obligation
+        lock_held = False
+
+        @contextmanager
+        def tracked_lock():
+            nonlocal lock_held
+            with original_lock():
+                lock_held = True
+                try:
+                    yield
+                finally:
+                    lock_held = False
+
+        def checked_status(obligation_id: str) -> dict[str, object]:
+            self.assertTrue(lock_held)
+            return original_status(obligation_id)
+
+        with patch.object(obligation, "_state_lock", tracked_lock), patch.object(
+            obligation, "status_obligation", side_effect=checked_status
+        ):
+            result = obligation.resolve_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "disposition": "deferred",
+                    "evidence": [
+                        {
+                            "source": "runtime",
+                            "reference": "probe:locked-readback",
+                            "sha256": "f" * 64,
+                        }
+                    ],
+                    "next_action": "Retry after the external checkpoint.",
+                }
+            )
+
+        self.assertEqual(1, result["resolution_sequence"])
+        self.assertEqual(1, result["resolution_revision_count"])
+        self.assertEqual(result["resolution_file_sha256"], (
+            obligation.status_obligation("goo-example-work-0001")["resolution_file_sha256"]
+        ))
 
 
     def test_resolution_is_create_only_and_conflict_bound(self) -> None:

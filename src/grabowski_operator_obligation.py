@@ -1465,8 +1465,12 @@ def resolve_obligation(parameters: dict[str, Any]) -> dict[str, Any]:
                         "operator obligation resolution revision conflicts with another writer"
                     )
                 created = False
+        # Keep the status projection under the same writer lock so every
+        # returned field is bound to the exact revision represented by
+        # file_sha256, even when another resolver is waiting.
+        status = status_obligation(obligation_id)
     return {
-        **status_obligation(obligation_id),
+        **status,
         "created": created,
         "replayed": not created,
         "resolution_file_sha256": file_sha256,
