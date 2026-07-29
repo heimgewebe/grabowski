@@ -2294,6 +2294,25 @@ def _record_matches_unprepared_managed_cargo_command(
         raise RuntimeError("stored task argv is invalid")
     if stored == command:
         return True
+
+    # An explicitly managed CARGO_TARGET_DIR is lifecycle-fenced by prefixing
+    # only the flock wrapper. Match that persisted form before the lock root is
+    # prepared again, so an unchanged terminal retry remains effect-free.
+    if len(stored) == len(command) + 3 and stored[3:] == command:
+        target_dir = _explicit_managed_cargo_target_dir(command)
+        if (
+            stored[0] != FLOCK_EXECUTABLE
+            or stored[1] != "--shared"
+            or target_dir is None
+        ):
+            raise RuntimeError("stored managed Cargo task wrapper is invalid")
+        expected_lock = _managed_cargo_lifecycle_lock_path(target_dir)
+        if stored[2] != str(expected_lock):
+            raise RuntimeError("stored managed Cargo task lock binding is invalid")
+        return True
+
+    # An unprepared Cargo request gains both the lifecycle flock and an env
+    # assignment produced by the managed-build resolver.
     if len(stored) != len(command) + 5 or stored[5:] != command:
         return False
     if (
@@ -2379,15 +2398,19 @@ def _guard_unprepared_managed_cargo_retry(
     identity: dict[str, Any],
     retry_context: dict[str, Any] | None,
 ) -> None:
-    if (
-        _managed_cargo_request_root(
-            command,
-            target=target,
-            cwd=cwd,
-            execution_backend=execution_backend,
-        )
-        is None
-    ):
+    local_systemd = (
+        target["transport"] == "local" and execution_backend == "systemd-user"
+    )
+    request_root = _managed_cargo_request_root(
+        command,
+        target=target,
+        cwd=cwd,
+        execution_backend=execution_backend,
+    )
+    explicit_managed_target = (
+        _explicit_managed_cargo_target_dir(command) if local_systemd else None
+    )
+    if request_root is None and explicit_managed_target is None:
         return
     if retry_context is None:
         latest = _latest_matching_unprepared_managed_cargo_record(identity, command)

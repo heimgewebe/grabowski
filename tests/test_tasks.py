@@ -5100,6 +5100,64 @@ class TaskTests(unittest.TestCase):
             tasks.grabowski_task_start(**common)
         prepare.assert_not_called()
 
+    def test_explicit_managed_cargo_retry_is_blocked_before_lock_preparation(self) -> None:
+        cache_key = "d" * 64
+        target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        command = [
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target_dir}",
+            "/usr/bin/cargo",
+            "test",
+        ]
+        common = {
+            "host": "local",
+            "argv": command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks,
+                "_managed_cargo_lifecycle_lock",
+                return_value=lifecycle_lock,
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+        tasks._set_state(
+            str(first["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_lifecycle_lock") as prepare_lock,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        prepare_lock.assert_not_called()
+
     def test_invalid_named_managed_cargo_retry_is_rejected_before_preparation(self) -> None:
         raw_command = ["/usr/bin/cargo", "check"]
         identity = tasks._task_execution_identity(
