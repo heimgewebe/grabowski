@@ -418,6 +418,36 @@ class ReposkopContextTests(unittest.TestCase):
             1,
         )
 
+    def test_publication_uses_bound_root_descriptor_after_path_replacement(self) -> None:
+        patches = self.patches(self.report())
+        moved_root = self.root / "receipts-moved"
+        attacker_root = self.root / "attacker-receipts"
+        real_publish_receipt = context._publish_receipt
+
+        def replace_root_then_publish(binding, *, root_descriptor):
+            self.receipts.rename(moved_root)
+            attacker_root.mkdir(mode=0o700)
+            self.receipts.symlink_to(attacker_root, target_is_directory=True)
+            return real_publish_receipt(binding, root_descriptor=root_descriptor)
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context,
+                "_publish_receipt",
+                side_effect=replace_root_then_publish,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "receipt root path identity changed after descriptor binding",
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertEqual(list(attacker_root.iterdir()), [])
+        self.assertEqual(len(list(moved_root.glob("*.json"))), 1)
+        self.assertEqual(list(moved_root.glob("*.pending")), [])
+
     def test_recovers_linked_pending_after_interruption(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):
@@ -436,7 +466,11 @@ class ReposkopContextTests(unittest.TestCase):
                 "recorded_at": "2026-07-29T10:00:00+00:00",
                 "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
             }
-            context._create_pending(binding)
+            with context._receipt_root_descriptor() as root_descriptor:
+                context._create_pending(
+                    binding,
+                    root_descriptor=root_descriptor,
+                )
             os.link(binding["pending_path"], binding["receipt_path"])
             self.assertEqual(binding["receipt_path"].stat().st_nlink, 2)
             result = context.grabowski_reposkop_context(str(self.repo))

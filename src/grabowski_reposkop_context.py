@@ -460,12 +460,69 @@ def _ensure_receipt_root() -> None:
         )
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ReposkopContextError(
+            "Reposkop receipt root descriptor has unsafe ownership, type or mode"
+        )
     try:
-        os.fsync(descriptor)
+        linked = RECEIPT_ROOT.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt root disappeared after descriptor binding"
+        ) from exc
+    if stat.S_ISLNK(linked.st_mode) or (linked.st_dev, linked.st_ino) != (
+        metadata.st_dev,
+        metadata.st_ino,
+    ):
+        raise ReposkopContextError(
+            "Reposkop receipt root path identity changed after descriptor binding"
+        )
+    return metadata
+
+
+@contextmanager
+def _receipt_root_descriptor() -> Iterator[int]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(RECEIPT_ROOT, flags)
+    except OSError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt root could not be opened as a stable directory"
+        ) from exc
+    try:
+        _validate_receipt_root_descriptor(descriptor)
+        yield descriptor
     finally:
         os.close(descriptor)
+
+
+def _entry_exists(root_descriptor: int, path: Path) -> bool:
+    if path.parent != RECEIPT_ROOT:
+        raise ReposkopContextError("Reposkop receipt entry escaped its bound root")
+    try:
+        os.stat(path.name, dir_fd=root_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt entry could not be inspected relative to its root"
+        ) from exc
+    return True
+
+
+def _fsync_directory(root_descriptor: int) -> None:
+    os.fsync(root_descriptor)
 
 
 def _receipt_identity(
@@ -549,12 +606,15 @@ def _read_exact_regular(
     expected_data: bytes,
     *,
     label: str,
+    root_descriptor: int,
     allowed_links: set[int] | None = None,
 ) -> tuple[os.stat_result, str]:
+    if path.parent != RECEIPT_ROOT:
+        raise ReposkopContextError(f"{label} escaped its bound receipt root")
     links = {1} if allowed_links is None else allowed_links
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path.name, flags, dir_fd=root_descriptor)
     except FileNotFoundError:
         raise
     except OSError as exc:
@@ -584,7 +644,11 @@ def _read_exact_regular(
     finally:
         os.close(descriptor)
     try:
-        linked = path.stat(follow_symlinks=False)
+        linked = os.stat(
+            path.name,
+            dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
     except FileNotFoundError as exc:
         raise ReposkopContextError(f"{label} disappeared after read") from exc
     if (linked.st_dev, linked.st_ino) != (after.st_dev, after.st_ino):
@@ -593,10 +657,17 @@ def _read_exact_regular(
 
 
 @contextmanager
-def _receipt_lock(lock_path: Path) -> Iterator[None]:
+def _receipt_lock(lock_path: Path, *, root_descriptor: int) -> Iterator[None]:
+    if lock_path.parent != RECEIPT_ROOT:
+        raise ReposkopContextError("Reposkop receipt lock escaped its bound root")
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(lock_path, flags, 0o600)
+        descriptor = os.open(
+            lock_path.name,
+            flags,
+            0o600,
+            dir_fd=root_descriptor,
+        )
     except OSError as exc:
         raise ReposkopContextError("Reposkop receipt lock could not be opened") from exc
     try:
@@ -742,15 +813,21 @@ def _append_audit_binding(
     }
 
 
-def _discard_recoverable_pending(binding: dict[str, Any]) -> None:
+def _discard_recoverable_pending(
+    binding: dict[str, Any], *, root_descriptor: int
+) -> None:
     pending_path = binding["pending_path"]
-    if binding["receipt_path"].exists():
+    if _entry_exists(root_descriptor, binding["receipt_path"]):
         raise ReposkopContextError(
             "Reposkop pending receipt cannot be replaced after publication"
         )
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(pending_path, flags)
+        descriptor = os.open(
+            pending_path.name,
+            flags,
+            dir_fd=root_descriptor,
+        )
     except FileNotFoundError:
         return
     except OSError as exc:
@@ -785,7 +862,11 @@ def _discard_recoverable_pending(binding: dict[str, Any]) -> None:
                 "Reposkop pending receipt is not the exact expected byte prefix"
             )
         try:
-            linked = pending_path.stat(follow_symlinks=False)
+            linked = os.stat(
+                pending_path.name,
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             return
         if (linked.st_dev, linked.st_ino) != (metadata.st_dev, metadata.st_ino):
@@ -793,15 +874,15 @@ def _discard_recoverable_pending(binding: dict[str, Any]) -> None:
                 "Reposkop pending receipt path changed during recovery"
             )
         try:
-            pending_path.unlink()
+            os.unlink(pending_path.name, dir_fd=root_descriptor)
         except FileNotFoundError:
             return
-        _fsync_directory(RECEIPT_ROOT)
+        _fsync_directory(root_descriptor)
     finally:
         os.close(descriptor)
 
 
-def _create_pending(binding: dict[str, Any]) -> None:
+def _create_pending(binding: dict[str, Any], *, root_descriptor: int) -> None:
     pending_path = binding["pending_path"]
     flags = (
         os.O_WRONLY
@@ -810,18 +891,32 @@ def _create_pending(binding: dict[str, Any]) -> None:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     try:
-        descriptor = os.open(pending_path, flags, 0o600)
+        descriptor = os.open(
+            pending_path.name,
+            flags,
+            0o600,
+            dir_fd=root_descriptor,
+        )
     except FileExistsError:
         try:
             _read_exact_regular(
                 pending_path,
                 binding["data"],
                 label="Reposkop pending receipt",
+                root_descriptor=root_descriptor,
             )
         except ReposkopContextError:
-            _discard_recoverable_pending(binding)
+            _discard_recoverable_pending(
+                binding,
+                root_descriptor=root_descriptor,
+            )
             try:
-                descriptor = os.open(pending_path, flags, 0o600)
+                descriptor = os.open(
+                    pending_path.name,
+                    flags,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
             except FileExistsError as exc:
                 raise ReposkopContextError(
                     "Reposkop pending receipt changed during recovery"
@@ -849,8 +944,8 @@ def _create_pending(binding: dict[str, Any]) -> None:
     except BaseException:
         os.close(descriptor)
         try:
-            pending_path.unlink()
-            _fsync_directory(RECEIPT_ROOT)
+            os.unlink(pending_path.name, dir_fd=root_descriptor)
+            _fsync_directory(root_descriptor)
         except OSError:
             pass
         raise
@@ -860,25 +955,32 @@ def _create_pending(binding: dict[str, Any]) -> None:
         pending_path,
         binding["data"],
         label="Reposkop pending receipt",
+        root_descriptor=root_descriptor,
     )
 
 
-def _recover_linked_pending(binding: dict[str, Any]) -> bool:
+def _recover_linked_pending(
+    binding: dict[str, Any], *, root_descriptor: int
+) -> bool:
     receipt_path = binding["receipt_path"]
     pending_path = binding["pending_path"]
-    if not receipt_path.exists() or not pending_path.exists():
+    if not _entry_exists(root_descriptor, receipt_path) or not _entry_exists(
+        root_descriptor, pending_path
+    ):
         return False
     receipt_metadata, _receipt_sha = _read_exact_regular(
         receipt_path,
         binding["data"],
         label="Reposkop usage receipt",
         allowed_links={1, 2},
+        root_descriptor=root_descriptor,
     )
     pending_metadata, _pending_sha = _read_exact_regular(
         pending_path,
         binding["data"],
         label="Reposkop pending receipt",
         allowed_links={1, 2},
+        root_descriptor=root_descriptor,
     )
     if (receipt_metadata.st_dev, receipt_metadata.st_ino) != (
         pending_metadata.st_dev,
@@ -887,52 +989,67 @@ def _recover_linked_pending(binding: dict[str, Any]) -> bool:
         raise ReposkopContextError(
             "Reposkop receipt and pending file do not share one publication inode"
         )
-    pending_path.unlink()
-    _fsync_directory(RECEIPT_ROOT)
+    os.unlink(pending_path.name, dir_fd=root_descriptor)
+    _fsync_directory(root_descriptor)
     _read_exact_regular(
         receipt_path,
         binding["data"],
         label="Reposkop usage receipt",
+        root_descriptor=root_descriptor,
     )
     return True
 
 
-def _publish_receipt(binding: dict[str, Any]) -> None:
+def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
     receipt_path = binding["receipt_path"]
     pending_path = binding["pending_path"]
-    if _recover_linked_pending(binding):
+    if _recover_linked_pending(binding, root_descriptor=root_descriptor):
         return
-    if receipt_path.exists():
+    if _entry_exists(root_descriptor, receipt_path):
         _read_exact_regular(
             receipt_path,
             binding["data"],
             label="Reposkop usage receipt",
+            root_descriptor=root_descriptor,
         )
         return
-    _create_pending(binding)
+    _create_pending(binding, root_descriptor=root_descriptor)
     try:
-        os.link(pending_path, receipt_path, follow_symlinks=False)
+        os.link(
+            pending_path.name,
+            receipt_path.name,
+            src_dir_fd=root_descriptor,
+            dst_dir_fd=root_descriptor,
+            follow_symlinks=False,
+        )
     except FileExistsError:
-        _recover_linked_pending(binding)
-        if pending_path.exists():
+        _recover_linked_pending(binding, root_descriptor=root_descriptor)
+        if _entry_exists(root_descriptor, pending_path):
             raise ReposkopContextError(
                 "Reposkop receipt publication collided with a different file"
             )
         return
     except OSError as exc:
         raise ReposkopContextError("Reposkop receipt publication failed") from exc
-    _recover_linked_pending(binding)
+    _recover_linked_pending(binding, root_descriptor=root_descriptor)
 
 
-def _record_usage(binding: dict[str, Any]) -> dict[str, Any]:
-    with _receipt_lock(binding["lock_path"]):
-        existing = binding["receipt_path"].exists()
+def _record_usage(
+    binding: dict[str, Any], *, root_descriptor: int
+) -> dict[str, Any]:
+    with _receipt_lock(
+        binding["lock_path"],
+        root_descriptor=root_descriptor,
+    ):
+        _validate_receipt_root_descriptor(root_descriptor)
+        existing = _entry_exists(root_descriptor, binding["receipt_path"])
         if existing:
             _read_exact_regular(
                 binding["receipt_path"],
                 binding["data"],
                 label="Reposkop usage receipt",
                 allowed_links={1, 2},
+                root_descriptor=root_descriptor,
             )
         audit_binding = _find_audit_binding(binding)
         audit_preexisted = audit_binding is not None
@@ -946,11 +1063,13 @@ def _record_usage(binding: dict[str, Any]) -> dict[str, Any]:
                     else AUDIT_PUBLICATION_CONTRACT
                 ),
             )
-        _publish_receipt(binding)
+        _publish_receipt(binding, root_descriptor=root_descriptor)
+        _validate_receipt_root_descriptor(root_descriptor)
         _read_exact_regular(
             binding["receipt_path"],
             binding["data"],
             label="Reposkop usage receipt",
+            root_descriptor=root_descriptor,
         )
         verified_audit = _find_audit_binding(binding)
         if verified_audit is None:
@@ -1034,7 +1153,12 @@ def grabowski_reposkop_context(
                 "Reposkop receipt root identity changed during policy preflight"
             )
         _validate_binding_write_scope(binding)
-        usage_receipt = _record_usage(binding)
+        with _receipt_root_descriptor() as root_descriptor:
+            usage_receipt = _record_usage(
+                binding,
+                root_descriptor=root_descriptor,
+            )
+            _validate_receipt_root_descriptor(root_descriptor)
         return _context_result(
             target=target,
             purpose=selected_purpose,
