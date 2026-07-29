@@ -1618,24 +1618,37 @@ def select_contrast_routes(
     }
 
 
-def contrast_route_execution_contract(
-    route_id: str, *, paid_execution_authorized: bool = False
+def _advisory_route_execution_contract(
+    route_id: str,
+    *,
+    capability: str,
+    paid_execution_authorized: bool,
 ) -> dict[str, Any]:
-    """Resolve one concrete contrast route to a hash-bound runner contract."""
     if not isinstance(route_id, str) or not route_id or len(route_id) > 120:
         raise CodingAgentRouterError("route_id is invalid")
+    if capability not in {"any", "contrast", "review"}:
+        raise CodingAgentRouterError("advisory capability is invalid")
     if type(paid_execution_authorized) is not bool:
         raise CodingAgentRouterError("paid_execution_authorized must be boolean")
     catalog, validation = _load_catalog()
     routes = _route_map(catalog)
     route = routes.get(route_id)
     derivations = _route_derivations(catalog)
-    if (
-        route is None
-        or route.get("enabled") is not True
-        or not derivations.get(route_id, {}).get("capabilities", {}).get("contrast_capable", False)
-    ):
-        raise CodingAgentRouterError("route_id is not an enabled contrast route")
+    capabilities = derivations.get(route_id, {}).get("capabilities", {})
+    contrast_capable = capabilities.get("contrast_capable") is True
+    review_capable = capabilities.get("review_capable") is True
+    capability_matches = (
+        contrast_capable or review_capable
+        if capability == "any"
+        else contrast_capable
+        if capability == "contrast"
+        else review_capable
+    )
+    if route is None or route.get("enabled") is not True or not capability_matches:
+        label = "advisory" if capability == "any" else capability
+        raise CodingAgentRouterError(
+            f"route_id is not an enabled {label} route"
+        )
     paid_only = route.get("paid_only") is True
     if paid_only and route_id not in set(
         catalog["policy"].get("explicit_paid_route_exceptions", [])
@@ -1644,14 +1657,18 @@ def contrast_route_execution_contract(
             "paid-only route is not an explicit paid route exception"
         )
     if paid_only and not paid_execution_authorized:
-        raise CodingAgentRouterError("paid-only route requires explicit paid execution authorization")
+        raise CodingAgentRouterError(
+            "paid-only route requires explicit paid execution authorization"
+        )
     state, status, error_type = _current_contrast_state(catalog, validation)
     if state is None:
         suffix = f" ({error_type})" if error_type else ""
-        raise CodingAgentRouterError(f"contrast route state is not current: {status}{suffix}")
+        raise CodingAgentRouterError(
+            f"advisory route state is not current: {status}{suffix}"
+        )
     available, reason = _route_available(route, catalog, state)
     if not available:
-        raise CodingAgentRouterError(f"contrast route is unavailable: {reason}")
+        raise CodingAgentRouterError(f"advisory route is unavailable: {reason}")
     pool_reasons: list[str] = []
     for pool_id in _route_quota_pools(route, catalog):
         allowed, reasons, _scarcity, _execution = _pool_gate(
@@ -1660,7 +1677,7 @@ def contrast_route_execution_contract(
         pool_reasons.extend(f"{pool_id}: {item}" for item in reasons)
         if not allowed:
             raise CodingAgentRouterError(
-                "contrast route quota gate failed: " + "; ".join(pool_reasons)
+                "advisory route quota gate failed: " + "; ".join(pool_reasons)
             )
     argv_prefix = route.get("argv_prefix")
     if (
@@ -1668,11 +1685,15 @@ def contrast_route_execution_contract(
         or not argv_prefix
         or any(not isinstance(item, str) or not item for item in argv_prefix)
     ):
-        raise CodingAgentRouterError("contrast route argv_prefix is invalid")
+        raise CodingAgentRouterError("advisory route argv_prefix is invalid")
     harness = catalog["harnesses"][route["harness"]]
     permission_mode = derivations[route_id]["permission_mode"]
     if route["harness"] == "claude" and permission_mode is None:
-        permission_mode = "acceptEdits"
+        permission_mode = (
+            "plan"
+            if capability == "review" or route.get("review_only") is True
+            else "acceptEdits"
+        )
     contract = {
         "schema_version": 1,
         "catalog_sha256": validation["catalog_sha256"],
@@ -1689,6 +1710,39 @@ def contrast_route_execution_contract(
         "automatic_patch_apply": False,
     }
     return {**contract, "route_contract_sha256": _canonical_sha256(contract)}
+
+
+def advisory_route_execution_contract(
+    route_id: str, *, paid_execution_authorized: bool = False
+) -> dict[str, Any]:
+    """Resolve one enabled review or contrast route to a hash-bound contract."""
+    return _advisory_route_execution_contract(
+        route_id,
+        capability="any",
+        paid_execution_authorized=paid_execution_authorized,
+    )
+
+
+def contrast_route_execution_contract(
+    route_id: str, *, paid_execution_authorized: bool = False
+) -> dict[str, Any]:
+    """Resolve one concrete contrast route to a hash-bound runner contract."""
+    return _advisory_route_execution_contract(
+        route_id,
+        capability="contrast",
+        paid_execution_authorized=paid_execution_authorized,
+    )
+
+
+def review_route_execution_contract(
+    route_id: str, *, paid_execution_authorized: bool = False
+) -> dict[str, Any]:
+    """Resolve one concrete review route to a hash-bound runner contract."""
+    return _advisory_route_execution_contract(
+        route_id,
+        capability="review",
+        paid_execution_authorized=paid_execution_authorized,
+    )
 
 
 @mcp.tool(name="grabowski_coding_agent_catalog", annotations=READ_ONLY)

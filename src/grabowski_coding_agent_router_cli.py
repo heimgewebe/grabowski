@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -23,6 +25,7 @@ from typing import Any
 import grabowski_coding_agent_router as router
 
 MAX_COMMAND_OUTPUT_BYTES = 256 * 1024
+MAX_GROK_AUTH_BYTES = 128 * 1024
 COMMAND_TIMEOUT_SECONDS = 20
 PROBE_DIGEST_DOMAIN = b"grabowski-coding-agent-probe-v3"
 PROBE_DIGEST_FIELDS = (
@@ -293,6 +296,204 @@ def _claude_auth_summary(value: Any) -> dict[str, Any]:
     return _claude_auth_summary_from_codes(*_claude_auth_status_codes(value))
 
 
+def _grok_subscription_auth_status(
+    catalog: dict[str, Any],
+    *,
+    home: Path | None = None,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "authenticated": False,
+        "entitlement_verified": False,
+        "status": "missing",
+        "subscription_tier": None,
+        "account_binding_sha256": None,
+    }
+    contract = catalog.get("quota_pools", {}).get("grok-com", {}).get(
+        "entitlement_contract"
+    )
+    if (
+        not isinstance(contract, dict)
+        or set(contract)
+        != {"issuer", "kind", "plan", "principal_type", "tier_code"}
+        or contract.get("kind") != "grok_oidc_tier_claim_v1"
+        or not isinstance(contract.get("issuer"), str)
+        or not contract.get("issuer")
+        or not isinstance(contract.get("plan"), str)
+        or not contract.get("plan")
+        or not isinstance(contract.get("principal_type"), str)
+        or not contract.get("principal_type")
+        or isinstance(contract.get("tier_code"), bool)
+        or not isinstance(contract.get("tier_code"), int)
+    ):
+        status["status"] = "invalid-contract"
+        return status
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        status["status"] = "unsafe-storage"
+        return status
+
+    base = home or Path.home()
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptors: list[int] = []
+
+    def identity(metadata: os.stat_result) -> tuple[int, ...]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+
+    try:
+        descriptors.append(os.open(str(base), directory_flags))
+        home_metadata = os.fstat(descriptors[-1])
+        if not stat.S_ISDIR(home_metadata.st_mode) or home_metadata.st_uid != os.getuid():
+            status["status"] = "unsafe-home"
+            return status
+        descriptors.append(os.open(".grok", directory_flags, dir_fd=descriptors[-1]))
+        grok_metadata = os.fstat(descriptors[-1])
+        if (
+            not stat.S_ISDIR(grok_metadata.st_mode)
+            or grok_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(grok_metadata.st_mode) & 0o022
+        ):
+            status["status"] = "unsafe-directory"
+            return status
+        descriptors.append(os.open("auth.json", file_flags, dir_fd=descriptors[-1]))
+        descriptor = descriptors[-1]
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or not 1 <= before.st_size <= MAX_GROK_AUTH_BYTES
+        ):
+            status["status"] = "unsafe-file"
+            return status
+        chunks: list[bytes] = []
+        remaining = MAX_GROK_AUTH_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if identity(before) != identity(after) or len(raw) != before.st_size:
+            status["status"] = "changed-during-read"
+            return status
+        if len(raw) > MAX_GROK_AUTH_BYTES:
+            status["status"] = "oversized"
+            return status
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            status["status"] = "invalid-json"
+            return status
+        if not isinstance(payload, dict) or len(payload) != 1:
+            status["status"] = "ambiguous-account"
+            return status
+        account_key, record = next(iter(payload.items()))
+        if not isinstance(account_key, str) or not isinstance(record, dict):
+            status["status"] = "invalid-record"
+            return status
+        issuer = contract["issuer"]
+        client_id = record.get("oidc_client_id")
+        token = record.get("key")
+        if (
+            not isinstance(record.get("auth_mode"), str)
+            or record["auth_mode"].casefold() != "oidc"
+            or record.get("oidc_issuer") != issuer
+            or not isinstance(client_id, str)
+            or not client_id
+            or account_key != f"{issuer}::{client_id}"
+            or not isinstance(token, str)
+            or not 64 <= len(token) <= 32768
+            or token.count(".") != 2
+            or any(character.isspace() for character in token)
+        ):
+            status["status"] = "invalid-record"
+            return status
+        encoded_claims = token.split(".", 2)[1]
+        if not 1 <= len(encoded_claims) <= 16384:
+            status["status"] = "invalid-claims"
+            return status
+        padded = encoded_claims + "=" * (-len(encoded_claims) % 4)
+        try:
+            claims_raw = base64.b64decode(
+                padded.encode("ascii"), altchars=b"-_", validate=True
+            )
+            claims = json.loads(claims_raw.decode("utf-8"))
+        except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+            status["status"] = "invalid-claims"
+            return status
+        if not isinstance(claims, dict):
+            status["status"] = "invalid-claims"
+            return status
+        now = int(time.time()) if now_unix is None else now_unix
+        expires_at = claims.get("exp")
+        issued_at = claims.get("iat")
+        stable_fields = ("principal_id", "principal_type", "team_id")
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, int)
+            or isinstance(expires_at, bool)
+            or not isinstance(expires_at, int)
+            or expires_at <= now + 30
+            or isinstance(issued_at, bool)
+            or not isinstance(issued_at, int)
+            or issued_at > now + 300
+            or claims.get("iss") != issuer
+            or claims.get("principal_type") != contract["principal_type"]
+            or claims.get("tier") != contract["tier_code"]
+            or claims.get("sub") != record.get("user_id")
+            or claims.get("sub") != record.get("principal_id")
+            or any(
+                not isinstance(record.get(field), str)
+                or not record.get(field)
+                or claims.get(field) != record.get(field)
+                for field in stable_fields
+            )
+        ):
+            status["status"] = "entitlement-mismatch"
+            return status
+        binding = {
+            "issuer": issuer,
+            "client_id": client_id,
+            "principal_id": record["principal_id"],
+            "team_id": record["team_id"],
+        }
+        status.update(
+            {
+                "authenticated": True,
+                "entitlement_verified": True,
+                "status": "valid",
+                "subscription_tier": contract["plan"],
+                "account_binding_sha256": hashlib.sha256(
+                    json.dumps(
+                        binding,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+        )
+        return status
+    except OSError:
+        status["status"] = "missing"
+        return status
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def _configured_models(catalog: dict[str, Any], harness: str) -> list[str]:
     return sorted(
         {
@@ -491,9 +692,11 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
         "models": _configured_models(catalog, "openhands"),
     }
 
+    grok_auth_before = _grok_subscription_auth_status(catalog)
     grok_status = _run_harness_metadata(
         harnesses, "grok", ["models"], catalog
     )
+    grok_auth_after = _grok_subscription_auth_status(catalog)
     grok_models: list[str] = []
     if grok_status.get("ok") is True:
         active = False
@@ -504,10 +707,33 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
                 continue
             if active and clean.startswith("*"):
                 grok_models.append(clean[1:].strip().split(" ", 1)[0])
+    grok_logged_in = (
+        "logged in with grok.com" in str(grok_status.get("stdout", "")).lower()
+    )
+    before_binding = grok_auth_before.get("account_binding_sha256")
+    after_binding = grok_auth_after.get("account_binding_sha256")
+    grok_entitlement_verified = (
+        grok_logged_in
+        and grok_status.get("ok") is True
+        and grok_auth_before.get("authenticated") is True
+        and grok_auth_after.get("entitlement_verified") is True
+        and isinstance(before_binding, str)
+        and before_binding == after_binding
+        and "grok-4.5" in grok_models
+    )
     providers["grok"] = {
         "available": harnesses.get("grok", {}).get("available") is True,
-        "logged_in": "logged in with grok.com"
-        in str(grok_status.get("stdout", "")).lower(),
+        "logged_in": grok_logged_in,
+        "entitlement_verified": grok_entitlement_verified,
+        "subscription_tier": (
+            grok_auth_after.get("subscription_tier")
+            if grok_entitlement_verified
+            else None
+        ),
+        "account_binding_sha256": (
+            after_binding if grok_entitlement_verified else None
+        ),
+        "auth_status": grok_auth_after.get("status"),
         "models": grok_models,
     }
 
@@ -549,7 +775,7 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
     }
 
     verified_quota_pools: list[str] = []
-    if providers["grok"].get("logged_in") is True:
+    if providers["grok"].get("entitlement_verified") is True:
         verified_quota_pools.append("grok-com")
     if providers["jules"].get("authenticated") is True:
         verified_quota_pools.append("jules-account")

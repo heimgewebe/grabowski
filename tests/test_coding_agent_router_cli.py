@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import base64
 import contextlib
 import io
 import json
@@ -45,6 +46,57 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             status = cli.main(argv)
         text = stdout.getvalue() if status == 0 else stderr.getvalue()
         return status, json.loads(text)
+
+    def _grok_auth_home(
+        self,
+        *,
+        tier: int = 1,
+        issued_at: int = 1_000,
+        expires_at: int = 2_000,
+        file_mode: int = 0o600,
+        extra_account: bool = False,
+    ) -> Path:
+        home = self.root / f"grok-home-{len(list(self.root.glob('grok-home-*')))}"
+        home.mkdir(mode=0o700)
+        grok = home / ".grok"
+        grok.mkdir(mode=0o755)
+        issuer = "https://auth.x.ai"
+        client_id = "client-123"
+        principal_id = "user-123"
+        team_id = "team-123"
+        header = base64.urlsafe_b64encode(b'{"alg":"RS256"}').decode().rstrip("=")
+        claims = {
+            "iss": issuer,
+            "aud": client_id,
+            "sub": principal_id,
+            "principal_id": principal_id,
+            "principal_type": "User",
+            "team_id": team_id,
+            "tier": tier,
+            "iat": issued_at,
+            "exp": expires_at,
+        }
+        encoded_claims = base64.urlsafe_b64encode(
+            json.dumps(claims, separators=(",", ":"), sort_keys=True).encode()
+        ).decode().rstrip("=")
+        token = f"{header}.{encoded_claims}.{'s' * 64}"
+        record = {
+            "auth_mode": "Oidc",
+            "key": token,
+            "oidc_client_id": client_id,
+            "oidc_issuer": issuer,
+            "principal_id": principal_id,
+            "principal_type": "User",
+            "team_id": team_id,
+            "user_id": principal_id,
+        }
+        payload = {f"{issuer}::{client_id}": record}
+        if extra_account:
+            payload[f"{issuer}::other-client"] = dict(record)
+        auth = grok / "auth.json"
+        auth.write_text(json.dumps(payload), encoding="utf-8")
+        auth.chmod(file_mode)
+        return home
 
     def test_recommend_is_direct_first_for_large_work_and_review(self) -> None:
         status, coding = self._main(
@@ -156,6 +208,118 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             },
         )
 
+    def test_grok_subscription_auth_requires_exact_private_oidc_tier(self) -> None:
+        catalog, _ = router._load_catalog()
+        valid = cli._grok_subscription_auth_status(
+            catalog,
+            home=self._grok_auth_home(),
+            now_unix=1_100,
+        )
+        self.assertEqual(valid["status"], "valid")
+        self.assertTrue(valid["authenticated"])
+        self.assertTrue(valid["entitlement_verified"])
+        self.assertEqual(valid["subscription_tier"], "SuperGrok")
+        self.assertRegex(valid["account_binding_sha256"], r"^[0-9a-f]{64}$")
+
+        wrong_tier = cli._grok_subscription_auth_status(
+            catalog,
+            home=self._grok_auth_home(tier=0),
+            now_unix=1_100,
+        )
+        self.assertEqual(wrong_tier["status"], "entitlement-mismatch")
+        self.assertFalse(wrong_tier["entitlement_verified"])
+
+        expired = cli._grok_subscription_auth_status(
+            catalog,
+            home=self._grok_auth_home(expires_at=1_120),
+            now_unix=1_100,
+        )
+        self.assertEqual(expired["status"], "entitlement-mismatch")
+
+        unsafe = cli._grok_subscription_auth_status(
+            catalog,
+            home=self._grok_auth_home(file_mode=0o644),
+            now_unix=1_100,
+        )
+        self.assertEqual(unsafe["status"], "unsafe-file")
+
+        ambiguous = cli._grok_subscription_auth_status(
+            catalog,
+            home=self._grok_auth_home(extra_account=True),
+            now_unix=1_100,
+        )
+        self.assertEqual(ambiguous["status"], "ambiguous-account")
+
+    def test_probe_verifies_grok_pool_only_with_stable_supergrok_binding(self) -> None:
+        catalog, _ = router._load_catalog()
+        auth = {
+            "authenticated": True,
+            "entitlement_verified": True,
+            "status": "valid",
+            "subscription_tier": "SuperGrok",
+            "account_binding_sha256": "a" * 64,
+        }
+
+        def metadata(_harnesses, harness, arguments, _catalog):
+            if harness == "grok" and arguments == ["models"]:
+                return {
+                    "ok": True,
+                    "stdout": "Logged in with grok.com\nAvailable models:\n* grok-4.5 default\n",
+                    "stderr": "",
+                }
+            return {"ok": False, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(
+                cli,
+                "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli,
+                "_grok_subscription_auth_status",
+                side_effect=[dict(auth), dict(auth)],
+            ),
+            mock.patch.object(
+                cli,
+                "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            verified = cli._probe(catalog)
+        self.assertIn("grok-com", verified["verified_quota_pools"])
+        self.assertTrue(verified["providers"]["grok"]["entitlement_verified"])
+        self.assertEqual(
+            verified["providers"]["grok"]["subscription_tier"], "SuperGrok"
+        )
+
+        changed = dict(auth)
+        changed["account_binding_sha256"] = "b" * 64
+        with (
+            mock.patch.object(
+                cli,
+                "_binary_versions",
+                return_value={"grok": {"available": True, "binary": "/grok"}},
+            ),
+            mock.patch.object(cli, "_run_harness_metadata", side_effect=metadata),
+            mock.patch.object(
+                cli,
+                "_grok_subscription_auth_status",
+                side_effect=[dict(auth), changed],
+            ),
+            mock.patch.object(
+                cli,
+                "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(cli, "_resolve_executable", return_value=None),
+        ):
+            rejected = cli._probe(catalog)
+        self.assertNotIn("grok-com", rejected["verified_quota_pools"])
+        self.assertFalse(rejected["providers"]["grok"]["entitlement_verified"])
+
     def test_probe_digest_safety_guard_rejects_sensitive_fields(self) -> None:
         with self.assertRaisesRegex(
             cli.CodingAgentRouterCliError,
@@ -187,6 +351,22 @@ class CodingAgentRouterCliTests(unittest.TestCase):
                 return_value={"ok": False, "stdout": "", "stderr": ""},
             ),
             mock.patch.object(cli.shutil, "which", return_value=None),
+            mock.patch.object(
+                cli,
+                "_openhands_subscription_auth_status",
+                return_value={"authenticated": False},
+            ),
+            mock.patch.object(
+                cli,
+                "_grok_subscription_auth_status",
+                return_value={
+                    "authenticated": False,
+                    "entitlement_verified": False,
+                    "status": "missing",
+                    "subscription_tier": None,
+                    "account_binding_sha256": None,
+                },
+            ),
         ):
             probe = cli._probe(catalog)
         self.assertEqual(probe["model_invocations"], 0)
