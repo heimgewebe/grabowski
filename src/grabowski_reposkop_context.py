@@ -163,12 +163,20 @@ def _required_sha256(value: Any, *, label: str) -> str:
     return value
 
 
+def _is_schema_version_one(value: Any) -> bool:
+    return type(value) is int and value == 1
+
+
+def _reject_nonfinite_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant is unsupported: {value}")
+
+
 def _validate_report(report: Any, *, target: Path, purpose: str) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise ReposkopContextError("Reposkop report must be a JSON object")
     if (
         report.get("kind") != "reposkop_coherence_report"
-        or report.get("schema_version") != 1
+        or not _is_schema_version_one(report.get("schema_version"))
     ):
         raise ReposkopContextError("Reposkop report kind or schema is unsupported")
     if report.get("effect_authorized") is not False:
@@ -181,14 +189,14 @@ def _validate_report(report: Any, *, target: Path, purpose: str) -> dict[str, An
         )
     if (
         observation.get("kind") != "reposkop_checkout_observation"
-        or observation.get("schema_version") != 1
+        or not _is_schema_version_one(observation.get("schema_version"))
     ):
         raise ReposkopContextError(
             "Reposkop observation kind or schema is unsupported"
         )
     if (
         projection.get("kind") != "reposkop_coherence_projection"
-        or projection.get("schema_version") != 1
+        or not _is_schema_version_one(projection.get("schema_version"))
     ):
         raise ReposkopContextError(
             "Reposkop projection kind or schema is unsupported"
@@ -407,8 +415,10 @@ def _run_reposkop(
             "Reposkop report output is not valid UTF-8"
         ) from exc
     try:
-        report = json.loads(stdout)
-    except json.JSONDecodeError as exc:
+        report = json.loads(
+            stdout, parse_constant=_reject_nonfinite_json_constant
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
         raise ReposkopContextError(
             "Reposkop report output is not valid JSON"
         ) from exc
@@ -445,13 +455,94 @@ def _validate_binding_write_scope(
             )
 
 
+def _open_directory_descriptor(path: Path) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt directory could not be opened durably"
+        ) from exc
+    metadata = os.fstat(descriptor)
+    try:
+        linked = path.stat(follow_symlinks=False)
+    except OSError:
+        os.close(descriptor)
+        raise
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != (linked.st_dev, linked.st_ino)
+    ):
+        os.close(descriptor)
+        raise ReposkopContextError(
+            "Reposkop receipt directory identity is unsafe"
+        )
+    return descriptor
+
+
+def _fsync_directory_path(path: Path) -> None:
+    descriptor = _open_directory_descriptor(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _ensure_receipt_root() -> None:
     if RECEIPT_ROOT.is_symlink():
         raise ReposkopContextError("Reposkop receipt root may not be a symlink")
-    RECEIPT_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
-    metadata = RECEIPT_ROOT.stat()
+
+    missing: list[Path] = []
+    cursor = RECEIPT_ROOT
+    while not cursor.exists():
+        if cursor.is_symlink():
+            raise ReposkopContextError(
+                "Reposkop receipt root path may not contain a symlink leaf"
+            )
+        missing.append(cursor)
+        parent = cursor.parent
+        if parent == cursor:
+            raise ReposkopContextError(
+                "Reposkop receipt root has no existing directory ancestor"
+            )
+        cursor = parent
+
+    existing = cursor.stat(follow_symlinks=False)
+    if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
+        raise ReposkopContextError(
+            "Reposkop receipt root ancestor is not a stable directory"
+        )
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        metadata = directory.stat(follow_symlinks=False)
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ReposkopContextError(
+                "Reposkop newly created receipt directory is unsafe"
+            )
+        _fsync_directory_path(directory.parent)
+
+    if not missing:
+        _fsync_directory_path(RECEIPT_ROOT.parent)
+
+    metadata = RECEIPT_ROOT.stat(follow_symlinks=False)
     if (
-        not stat.S_ISDIR(metadata.st_mode)
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != os.getuid()
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):

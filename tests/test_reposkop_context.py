@@ -44,6 +44,7 @@ class ReposkopContextTests(unittest.TestCase):
         self,
         *,
         effect_authorized: bool = False,
+        schema_version: object = 1,
         observation_kind: str = "reposkop_checkout_observation",
         observation_schema_version: int = 1,
         projection_kind: str = "reposkop_coherence_projection",
@@ -53,7 +54,7 @@ class ReposkopContextTests(unittest.TestCase):
         purpose = "grabowski-repo-state-context"
         return {
             "kind": "reposkop_coherence_report",
-            "schema_version": 1,
+            "schema_version": schema_version,
             "generated_at": "2026-07-29T08:00:00Z",
             "effect_authorized": effect_authorized,
             "report_sha256": "a" * 64,
@@ -870,6 +871,60 @@ class ReposkopContextTests(unittest.TestCase):
         )
         recovery.pop("recovery")
         self.assertFalse(context._audit_record_matches(recovery, binding))
+
+    def test_new_receipt_root_creation_fsyncs_each_parent(self) -> None:
+        self.receipts = self.root / "nested" / "deeper" / "receipts"
+        patches = self.patches(self.report())
+        synced_directories: list[tuple[int, int]] = []
+        real_fsync = context.os.fsync
+
+        def record_fsync(descriptor: int) -> None:
+            metadata = context.os.fstat(descriptor)
+            if context.stat.S_ISDIR(metadata.st_mode):
+                synced_directories.append((metadata.st_dev, metadata.st_ino))
+            real_fsync(descriptor)
+
+        with (
+            self.patch_context(patches),
+            patch.object(context.os, "fsync", side_effect=record_fsync),
+        ):
+            result = context.grabowski_reposkop_context(str(self.repo))
+
+        expected = []
+        for directory in (
+            self.root,
+            self.root / "nested",
+            self.root / "nested" / "deeper",
+        ):
+            metadata = directory.stat()
+            expected.append((metadata.st_dev, metadata.st_ino))
+        for identity in expected:
+            self.assertIn(identity, synced_directories)
+        self.assertTrue(Path(result["usage_receipt"]["path"]).is_file())
+
+    def test_rejects_boolean_schema_versions(self) -> None:
+        cases = (
+            self.report(schema_version=True),
+            self.report(observation_schema_version=True),
+            self.report(projection_schema_version=True),
+        )
+        for report in cases:
+            with self.subTest(report=report):
+                patches = self.patches(report)
+                with self.patch_context(patches):
+                    with self.assertRaisesRegex(ValueError, "kind or schema"):
+                        context.grabowski_reposkop_context(str(self.repo))
+        self.assertFalse(self.receipts.exists())
+
+    def test_rejects_nonfinite_json_constants_before_publication(self) -> None:
+        report = self.report()
+        report["generated_at"] = float("nan")
+        patches = self.patches(report)
+        with self.patch_context(patches):
+            with self.assertRaisesRegex(ValueError, "not valid JSON"):
+                context.grabowski_reposkop_context(str(self.repo))
+        self.assertFalse(self.receipts.exists())
+
 
 
 if __name__ == "__main__":
