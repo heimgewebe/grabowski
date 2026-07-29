@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
 import sys
 import unittest
 from unittest.mock import patch
@@ -68,42 +70,110 @@ class TerminalConvergenceTests(unittest.TestCase):
         self.assertEqual(1, first["classification_counts"]["superseded"])
         self.assertEqual(4, len(first["current"]) + len(first["historical"]))
 
-    def test_attention_convergence_keeps_only_latest_identical_failed_task(self) -> None:
-        def failed(task_id: str, created: int, receipt: str) -> dict[str, object]:
-            return {
-                "task_id": task_id,
-                "attempt": 1,
-                "unit": f"grabowski-task-{task_id}-a1.service",
-                "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
-                "execution_envelope_sha256": None,
-                "host": "local",
-                "argv_sha256": "9" * 64,
-                "cwd": "/repo",
-                "resource_keys_json": '["path:/repo/out"]',
-                "runtime_seconds": 60,
-                "cpu_weight": 100,
-                "io_weight": 100,
-                "memory_max_bytes": None,
-                "resume_policy": "never",
-                "chronik_outbox_enabled": 1,
-                "chronik_outbox_state_root": None,
-                "chronik_context_json": '{"bureau_task_id":"T001"}',
-                "execution_backend": "systemd-user",
-                "systemd_scope": "user",
-                "state": "failed",
-                "created_at_unix": created,
-                "updated_at_unix": created,
-                "lifecycle_receipt_sha256": receipt * 64,
-            }
+    @staticmethod
+    def _failed_attention_record(
+        task_id: str,
+        created: int,
+        receipt: str,
+        terminalization: str,
+    ) -> dict[str, object]:
+        return {
+            "task_id": task_id,
+            "attempt": 1,
+            "unit": f"grabowski-task-{task_id}-a1.service",
+            "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+            "execution_envelope_sha256": None,
+            "host": "local",
+            "argv_sha256": "9" * 64,
+            "cwd": "/repo",
+            "resource_keys_json": '["path:/repo/out"]',
+            "runtime_seconds": 60,
+            "cpu_weight": 100,
+            "io_weight": 100,
+            "memory_max_bytes": None,
+            "resume_policy": "never",
+            "chronik_outbox_enabled": 1,
+            "chronik_outbox_state_root": None,
+            "chronik_context_json": '{"bureau_task_id":"T001"}',
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+            "state": "failed",
+            "created_at_unix": created,
+            "updated_at_unix": created,
+            "terminalized_at_unix": created,
+            "terminalization_sha256": terminalization * 64,
+            "lifecycle_receipt_sha256": receipt * 64,
+            "launcher_json": "{}",
+        }
 
-        older = failed("1" * 24, 10, "a")
-        newer = failed("2" * 24, 20, "b")
+    def test_attention_convergence_keeps_independent_identical_failures(self) -> None:
+        older = self._failed_attention_record("1" * 24, 10, "a", "c")
+        newer = self._failed_attention_record("2" * 24, 20, "b", "d")
+        result = convergence.converge_attention_records([older, newer])
+        self.assertEqual(2, result["current_count"])
+        self.assertEqual(
+            0,
+            result["classification_counts"]["superseded_by_verified_retry"],
+        )
+        projection = attention.current_attention_projection([older, newer])
+        self.assertEqual(2, projection["raw_attention_count"])
+        self.assertEqual(2, projection["deduplicated_attention_count"])
+        self.assertEqual(2, projection["current_attention_count"])
+        self.assertEqual(0, projection["convergence_excluded_attention_count"])
+
+    def test_attention_convergence_excludes_only_persisted_verified_retry_source(self) -> None:
+        older = self._failed_attention_record("1" * 24, 10, "a", "c")
+        newer = self._failed_attention_record("2" * 24, 20, "b", "d")
+        identity = convergence.attention_execution_identity(older)
+        assert identity is not None
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_named_terminal_retry",
+            "source_task_id": older["task_id"],
+            "source_attempt": older["attempt"],
+            "source_state": older["state"],
+            "source_resume_policy": older["resume_policy"],
+            "source_lifecycle_receipt_sha256": older[
+                "lifecycle_receipt_sha256"
+            ],
+            "source_terminalization_sha256": older[
+                "terminalization_sha256"
+            ],
+            "source_execution_identity_sha256": identity,
+            "named_state_change": "repository head advanced",
+            "observed_at_unix": 15,
+            "does_not_establish": [
+                "that_the_named_change_is_sufficient",
+                "that_the_retry_will_succeed",
+                "automatic_retry_authority",
+            ],
+        }
+        binding = {
+            **material,
+            "context_sha256": hashlib.sha256(
+                json.dumps(
+                    material,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        newer["launcher_json"] = json.dumps(
+            {"retry_binding": binding},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         result = convergence.converge_attention_records([older, newer])
         self.assertEqual(["2" * 24], [item["task_id"] for item in result["current"]])
-        self.assertEqual(1, result["classification_counts"]["superseded_by_identical_retry"])
+        self.assertEqual(1, result["classification_counts"]["superseded_by_verified_retry"])
+        self.assertEqual(1, result["verified_retry_edge_count"])
         historical = result["historical"][0]
         self.assertEqual("1" * 24, historical["task_id"])
         self.assertEqual("2" * 24, historical["successor_task_id"])
+        self.assertEqual(binding["context_sha256"], historical["retry_context_sha256"])
+        self.assertIs(True, historical["retry_binding_verified"])
         self.assertIs(False, historical["success_claimed"])
 
         projection = attention.current_attention_projection([older, newer])
@@ -112,6 +182,34 @@ class TerminalConvergenceTests(unittest.TestCase):
         self.assertEqual(1, projection["current_attention_count"])
         self.assertEqual(1, projection["convergence_excluded_attention_count"])
         self.assertIn("1" * 24, projection["excluded_task_ids"])
+
+    def test_attention_convergence_rejects_tampered_persisted_retry_binding(self) -> None:
+        older = self._failed_attention_record("1" * 24, 10, "a", "c")
+        newer = self._failed_attention_record("2" * 24, 20, "b", "d")
+        newer["launcher_json"] = json.dumps(
+            {
+                "retry_binding": {
+                    "schema_version": 1,
+                    "kind": "grabowski_named_terminal_retry",
+                    "source_task_id": older["task_id"],
+                    "source_attempt": 1,
+                    "source_state": "failed",
+                    "source_resume_policy": "never",
+                    "source_lifecycle_receipt_sha256": "a" * 64,
+                    "source_terminalization_sha256": "c" * 64,
+                    "source_execution_identity_sha256": "9" * 64,
+                    "named_state_change": "repository head advanced",
+                    "observed_at_unix": 15,
+                    "does_not_establish": [],
+                    "context_sha256": "0" * 64,
+                }
+            }
+        )
+        with self.assertRaisesRegex(
+            convergence.TerminalConvergenceError,
+            "integrity",
+        ):
+            convergence.converge_attention_records([older, newer])
 
     def test_attention_execution_identity_keeps_distinct_work_contexts(self) -> None:
         base = {
@@ -153,7 +251,7 @@ class TerminalConvergenceTests(unittest.TestCase):
         self.assertEqual(2, result["current_count"])
         self.assertEqual(
             0,
-            result["classification_counts"]["superseded_by_identical_retry"],
+            result["classification_counts"]["superseded_by_verified_retry"],
         )
 
     def test_attention_execution_identity_does_not_collapse_changed_limits(self) -> None:
@@ -189,7 +287,7 @@ class TerminalConvergenceTests(unittest.TestCase):
         }
         result = convergence.converge_attention_records([base, changed])
         self.assertEqual(2, result["current_count"])
-        self.assertEqual(0, result["classification_counts"]["superseded_by_identical_retry"])
+        self.assertEqual(0, result["classification_counts"]["superseded_by_verified_retry"])
 
     def test_task_attention_projection_converges_duplicate_rows(self) -> None:
         base = {

@@ -4854,6 +4854,20 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(first["task_id"], successor["retry_of_task_id"])
         self.assertEqual("manual", successor["resume_policy"])
         self.assertRegex(successor["retry_context_sha256"], r"^[0-9a-f]{64}$")
+        persisted_retry = successor["launcher"]["retry_binding"]
+        self.assertEqual(first["task_id"], persisted_retry["source_task_id"])
+        self.assertEqual(
+            source["lifecycle_receipt_sha256"],
+            persisted_retry["source_lifecycle_receipt_sha256"],
+        )
+        self.assertEqual(
+            source["terminalization_sha256"],
+            persisted_retry["source_terminalization_sha256"],
+        )
+        self.assertEqual(
+            successor["retry_context_sha256"],
+            persisted_retry["context_sha256"],
+        )
         retry_audit = next(
             item
             for item in audit_records

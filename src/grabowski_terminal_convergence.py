@@ -21,6 +21,10 @@ FAILURE_CLASSES = frozenset({
     "observation_denied",
 })
 TERMINAL_FAILURE_STATES = frozenset({"failed", "timed_out", "signalled", "interrupted"})
+RETRY_SOURCE_STATES = frozenset(
+    {"failed", "timed_out", "signalled", "interrupted", "outcome_unknown"}
+)
+TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 
 
 class TerminalConvergenceError(ValueError):
@@ -288,6 +292,92 @@ def attention_execution_identity(record: dict[str, Any]) -> str | None:
     )["identity_sha256"]
 
 
+def persisted_retry_binding(record: dict[str, Any]) -> dict[str, Any] | None:
+    raw_launcher = record.get("launcher_json")
+    if raw_launcher is None:
+        raw_launcher = record.get("launcher")
+    if raw_launcher is None:
+        return None
+    if isinstance(raw_launcher, str):
+        try:
+            launcher = json.loads(raw_launcher)
+        except json.JSONDecodeError as exc:
+            raise TerminalConvergenceError("persisted task launcher is invalid") from exc
+    elif isinstance(raw_launcher, dict):
+        launcher = raw_launcher
+    else:
+        raise TerminalConvergenceError("persisted task launcher is invalid")
+    binding = launcher.get("retry_binding")
+    if binding is None:
+        return None
+    if not isinstance(binding, dict):
+        raise TerminalConvergenceError("persisted retry binding is invalid")
+    required = {
+        "schema_version",
+        "kind",
+        "source_task_id",
+        "source_attempt",
+        "source_state",
+        "source_resume_policy",
+        "source_lifecycle_receipt_sha256",
+        "source_terminalization_sha256",
+        "source_execution_identity_sha256",
+        "named_state_change",
+        "observed_at_unix",
+        "does_not_establish",
+        "context_sha256",
+    }
+    if set(binding) != required:
+        raise TerminalConvergenceError("persisted retry binding shape is invalid")
+    material = {key: binding[key] for key in required - {"context_sha256"}}
+    context_sha256 = binding["context_sha256"]
+    if (
+        not isinstance(context_sha256, str)
+        or SHA256_RE.fullmatch(context_sha256) is None
+        or hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+        != context_sha256
+    ):
+        raise TerminalConvergenceError("persisted retry binding integrity is invalid")
+    if binding["schema_version"] != 1 or binding["kind"] != "grabowski_named_terminal_retry":
+        raise TerminalConvergenceError("persisted retry binding contract is invalid")
+    source_task_id = binding["source_task_id"]
+    source_attempt = binding["source_attempt"]
+    source_state = binding["source_state"]
+    source_resume_policy = binding["source_resume_policy"]
+    if not isinstance(source_task_id, str) or TASK_ID_RE.fullmatch(source_task_id) is None:
+        raise TerminalConvergenceError("persisted retry source task is invalid")
+    if isinstance(source_attempt, bool) or not isinstance(source_attempt, int) or source_attempt < 1:
+        raise TerminalConvergenceError("persisted retry source attempt is invalid")
+    if source_state not in RETRY_SOURCE_STATES:
+        raise TerminalConvergenceError("persisted retry source state is invalid")
+    if not isinstance(source_resume_policy, str) or not source_resume_policy:
+        raise TerminalConvergenceError("persisted retry source policy is invalid")
+    for key in (
+        "source_lifecycle_receipt_sha256",
+        "source_terminalization_sha256",
+        "source_execution_identity_sha256",
+    ):
+        value = binding[key]
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise TerminalConvergenceError(f"persisted retry {key} is invalid")
+    named_state_change = binding["named_state_change"]
+    if not isinstance(named_state_change, str) or not named_state_change.strip():
+        raise TerminalConvergenceError("persisted retry state change is invalid")
+    observed_at_unix = binding["observed_at_unix"]
+    if (
+        isinstance(observed_at_unix, bool)
+        or not isinstance(observed_at_unix, int)
+        or observed_at_unix < 0
+    ):
+        raise TerminalConvergenceError("persisted retry observation time is invalid")
+    non_claims = binding["does_not_establish"]
+    if not isinstance(non_claims, list) or any(
+        not isinstance(item, str) or not item for item in non_claims
+    ):
+        raise TerminalConvergenceError("persisted retry non-claims are invalid")
+    return dict(binding)
+
+
 def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not isinstance(records, list):
         raise TerminalConvergenceError("attention records must be a list")
@@ -334,44 +424,108 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
                 classification = "already_satisfied"
             seen_bindings.add(binding)
             historical.append({**item, "convergence_classification": classification})
-    identity_groups: dict[str, list[dict[str, Any]]] = {}
-    identity_free: list[dict[str, Any]] = []
-    for item in current:
-        identity = attention_execution_identity(item)
-        if identity is None:
-            identity_free.append(item)
-        else:
-            identity_groups.setdefault(identity, []).append(item)
-
-    converged_current = list(identity_free)
-    for identity in sorted(identity_groups):
-        ordered = sorted(
-            identity_groups[identity],
-            key=lambda item: (
-                int(item.get("created_at_unix") or 0),
-                int(item.get("updated_at_unix") or 0),
-                str(item["task_id"]),
-                int(item["attempt"]),
+    current_by_task = {str(item["task_id"]): item for item in current}
+    verified_retry_edges: dict[str, dict[str, Any]] = {}
+    verified_identities: set[str] = set()
+    for successor in current:
+        binding = persisted_retry_binding(successor)
+        if binding is None:
+            continue
+        source_task_id = str(binding["source_task_id"])
+        successor_task_id = str(successor["task_id"])
+        if source_task_id == successor_task_id:
+            raise TerminalConvergenceError("persisted retry binding is self-referential")
+        source = current_by_task.get(source_task_id)
+        if source is None:
+            raise TerminalConvergenceError("persisted retry source task is not current attention")
+        if source_task_id in verified_retry_edges:
+            raise TerminalConvergenceError("persisted retry source has multiple successors")
+        source_identity = attention_execution_identity(source)
+        successor_identity = attention_execution_identity(successor)
+        if source_identity is None or successor_identity is None:
+            raise TerminalConvergenceError("persisted retry execution identity is unavailable")
+        if (
+            source_identity != successor_identity
+            or binding["source_execution_identity_sha256"] != source_identity
+        ):
+            raise TerminalConvergenceError("persisted retry execution identity is stale")
+        source_checks = {
+            "source_attempt": int(source["attempt"]),
+            "source_state": source.get("state"),
+            "source_resume_policy": source.get("resume_policy"),
+            "source_lifecycle_receipt_sha256": source.get(
+                "lifecycle_receipt_sha256"
             ),
-        )
-        winner = ordered[-1]
-        converged_current.append(winner)
-        for item in ordered[:-1]:
-            historical.append(
-                {
-                    **item,
-                    "convergence_classification": "superseded_by_identical_retry",
-                    "execution_identity_sha256": identity,
-                    "successor_task_id": winner["task_id"],
-                    "success_claimed": False,
-                }
+            "source_terminalization_sha256": source.get(
+                "terminalization_sha256"
+            ),
+        }
+        for key, expected in source_checks.items():
+            if binding[key] != expected:
+                raise TerminalConvergenceError(
+                    f"persisted retry {key} binding is stale"
+                )
+        source_terminalized_at = source.get("terminalized_at_unix")
+        if source_terminalized_at is not None and (
+            isinstance(source_terminalized_at, bool)
+            or not isinstance(source_terminalized_at, int)
+            or source_terminalized_at < 0
+            or source_terminalized_at > int(binding["observed_at_unix"])
+        ):
+            raise TerminalConvergenceError(
+                "persisted retry source terminal time is invalid"
             )
+        successor_created_at = successor.get("created_at_unix")
+        if successor_created_at is not None and (
+            isinstance(successor_created_at, bool)
+            or not isinstance(successor_created_at, int)
+            or successor_created_at < int(binding["observed_at_unix"])
+        ):
+            raise TerminalConvergenceError(
+                "persisted retry successor predates its retry evidence"
+            )
+        verified_retry_edges[source_task_id] = {
+            "successor_task_id": successor_task_id,
+            "execution_identity_sha256": source_identity,
+            "retry_context_sha256": binding["context_sha256"],
+        }
+        verified_identities.add(source_identity)
+
+    for source_task_id in verified_retry_edges:
+        seen: set[str] = set()
+        cursor = source_task_id
+        while cursor in verified_retry_edges:
+            if cursor in seen:
+                raise TerminalConvergenceError("persisted retry bindings contain a cycle")
+            seen.add(cursor)
+            cursor = str(verified_retry_edges[cursor]["successor_task_id"])
+
+    converged_current = [
+        item
+        for item in current
+        if str(item["task_id"]) not in verified_retry_edges
+    ]
+    for source_task_id in sorted(verified_retry_edges):
+        edge = verified_retry_edges[source_task_id]
+        historical.append(
+            {
+                **current_by_task[source_task_id],
+                "convergence_classification": "superseded_by_verified_retry",
+                "execution_identity_sha256": edge[
+                    "execution_identity_sha256"
+                ],
+                "successor_task_id": edge["successor_task_id"],
+                "retry_context_sha256": edge["retry_context_sha256"],
+                "retry_binding_verified": True,
+                "success_claimed": False,
+            }
+        )
 
     classifications = (
         "duplicate",
         "superseded",
         "already_satisfied",
-        "superseded_by_identical_retry",
+        "superseded_by_verified_retry",
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -380,7 +534,8 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "raw_count": len(records),
         "current_count": len(converged_current),
         "converged_count": len(historical),
-        "execution_identity_group_count": len(identity_groups),
+        "execution_identity_group_count": len(verified_identities),
+        "verified_retry_edge_count": len(verified_retry_edges),
         "classification_counts": {
             name: sum(
                 1

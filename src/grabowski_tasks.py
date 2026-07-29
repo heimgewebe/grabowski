@@ -2149,13 +2149,25 @@ def _validate_terminal_retry_context(
     ):
         raise ValueError("terminal retry context timestamp is invalid")
     return {
+        "schema_version": TASK_RETRY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_terminal_retry",
         "source_task_id": expected["source_task_id"],
         "source_attempt": expected["source_attempt"],
         "source_state": expected["source_state"],
         "source_resume_policy": expected["source_resume_policy"],
-        "named_state_change": _redact_reason(named_state_change),
-        "context_sha256": context_sha256,
+        "source_lifecycle_receipt_sha256": expected[
+            "source_lifecycle_receipt_sha256"
+        ],
+        "source_terminalization_sha256": expected[
+            "source_terminalization_sha256"
+        ],
+        "source_execution_identity_sha256": expected[
+            "source_execution_identity_sha256"
+        ],
+        "named_state_change": named_state_change,
+        "observed_at_unix": observed_at_unix,
         "does_not_establish": list(context.get("does_not_establish") or []),
+        "context_sha256": context_sha256,
     }
 
 
@@ -3722,6 +3734,8 @@ def grabowski_task_start(
             resources.release_resources(lease_owner, task_resources)
         raise
     launcher = _launch(record)
+    if retry_binding is not None:
+        launcher = {**launcher, "retry_binding": dict(retry_binding)}
     state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
     lease_maintenance = _maintain_record_resources(stored, state)

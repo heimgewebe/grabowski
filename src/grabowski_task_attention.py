@@ -1724,7 +1724,7 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
         str(item["task_id"])
         for item in convergence["historical"]
         if item.get("convergence_classification")
-        == "superseded_by_identical_retry"
+        == "superseded_by_verified_retry"
     }
     excluded_task_ids: set[str] = set(convergence_excluded_task_ids)
     decision_excluded_task_ids: set[str] = set()
