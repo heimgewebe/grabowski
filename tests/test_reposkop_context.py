@@ -405,6 +405,63 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertFalse(binding["pending_path"].exists())
         self.assertEqual(binding["receipt_path"].stat().st_nlink, 1)
 
+    def test_recovers_partial_pending_after_interrupted_write(self) -> None:
+        patches = self.patches(self.report())
+        with self.patch_context(patches):
+            report, executable = context._run_reposkop(
+                self.repo.resolve(), "grabowski-repo-state-context"
+            )
+            binding = context._usage_binding(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+                executable=executable,
+            )
+            context._ensure_receipt_root()
+            self.audit_bindings[binding["usage_key_sha256"]] = {
+                "audit_ref": "audit-record-sha256:" + "d" * 64,
+                "recorded_at": "2026-07-29T10:00:00+00:00",
+                "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
+            }
+            binding["pending_path"].write_bytes(binding["data"][:17])
+            binding["pending_path"].chmod(0o600)
+            result = context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertTrue(result["usage_receipt"]["recovered_publication"])
+        self.assertFalse(binding["pending_path"].exists())
+        self.assertEqual(binding["receipt_path"].read_bytes(), binding["data"])
+
+    def test_partial_pending_with_extra_link_fails_closed(self) -> None:
+        patches = self.patches(self.report())
+        with self.patch_context(patches):
+            report, executable = context._run_reposkop(
+                self.repo.resolve(), "grabowski-repo-state-context"
+            )
+            binding = context._usage_binding(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+                executable=executable,
+            )
+            context._ensure_receipt_root()
+            self.audit_bindings[binding["usage_key_sha256"]] = {
+                "audit_ref": "audit-record-sha256:" + "d" * 64,
+                "recorded_at": "2026-07-29T10:00:00+00:00",
+                "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
+            }
+            external = self.root / "linked-partial-pending"
+            external.write_bytes(binding["data"][:17])
+            external.chmod(0o600)
+            os.link(external, binding["pending_path"])
+            with self.assertRaisesRegex(
+                ValueError, "not safely recoverable"
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertTrue(external.exists())
+        self.assertTrue(binding["pending_path"].exists())
+        self.assertFalse(binding["receipt_path"].exists())
+
     def test_bounded_process_kills_oversized_stdout_while_draining(self) -> None:
         executable = self.root / "oversized-reposkop"
         executable.write_text(
@@ -439,6 +496,31 @@ class ReposkopContextTests(unittest.TestCase):
             "    stdout=sys.stdout,\n"
             "    stderr=sys.stderr,\n"
             ")\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+
+        result = context._run_bounded_process(
+            [str(executable)],
+            cwd=self.root,
+            timeout_seconds=1,
+            stdout_limit=4096,
+            stderr_limit=4096,
+        )
+
+        self.assertTrue(result["timed_out"])
+        self.assertLess(result["duration_seconds"], 3)
+        self.assertFalse(result["stdout_limit_exceeded"])
+        self.assertFalse(result["stderr_limit_exceeded"])
+
+    def test_wait_after_closed_pipes_respects_remaining_deadline(self) -> None:
+        executable = self.root / "closed-pipe-reposkop"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "import os, time\n"
+            "os.close(1)\n"
+            "os.close(2)\n"
+            "time.sleep(30)\n",
             encoding="utf-8",
         )
         executable.chmod(0o700)

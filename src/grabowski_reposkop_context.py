@@ -292,11 +292,25 @@ def _run_bounded_process(
                         killed = True
                     _close_selector_streams(selector)
                     break
-        try:
-            returncode = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            _kill_process_group(process)
-            returncode = process.wait(timeout=5)
+        returncode = process.poll()
+        if returncode is None:
+            if killed:
+                returncode = process.wait()
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    _kill_process_group(process)
+                    killed = True
+                    returncode = process.wait()
+                else:
+                    try:
+                        returncode = process.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        _kill_process_group(process)
+                        killed = True
+                        returncode = process.wait()
     finally:
         selector.close()
         if process.poll() is None:
@@ -694,6 +708,50 @@ def _append_audit_binding(
     }
 
 
+def _discard_recoverable_pending(binding: dict[str, Any]) -> None:
+    pending_path = binding["pending_path"]
+    if binding["receipt_path"].exists():
+        raise ReposkopContextError(
+            "Reposkop pending receipt cannot be replaced after publication"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(pending_path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReposkopContextError(
+            "Reposkop pending receipt could not be inspected for recovery"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > len(binding["data"])
+        ):
+            raise ReposkopContextError(
+                "Reposkop pending receipt is not safely recoverable"
+            )
+        try:
+            linked = pending_path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (linked.st_dev, linked.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ReposkopContextError(
+                "Reposkop pending receipt path changed during recovery"
+            )
+        try:
+            pending_path.unlink()
+        except FileNotFoundError:
+            return
+        _fsync_directory(RECEIPT_ROOT)
+    finally:
+        os.close(descriptor)
+
+
 def _create_pending(binding: dict[str, Any]) -> None:
     pending_path = binding["pending_path"]
     flags = (
@@ -705,12 +763,26 @@ def _create_pending(binding: dict[str, Any]) -> None:
     try:
         descriptor = os.open(pending_path, flags, 0o600)
     except FileExistsError:
-        _read_exact_regular(
-            pending_path,
-            binding["data"],
-            label="Reposkop pending receipt",
-        )
-        return
+        try:
+            _read_exact_regular(
+                pending_path,
+                binding["data"],
+                label="Reposkop pending receipt",
+            )
+        except ReposkopContextError:
+            _discard_recoverable_pending(binding)
+            try:
+                descriptor = os.open(pending_path, flags, 0o600)
+            except FileExistsError as exc:
+                raise ReposkopContextError(
+                    "Reposkop pending receipt changed during recovery"
+                ) from exc
+            except OSError as exc:
+                raise ReposkopContextError(
+                    "Reposkop pending receipt could not be recreated"
+                ) from exc
+        else:
+            return
     except OSError as exc:
         raise ReposkopContextError(
             "Reposkop pending receipt could not be created"
