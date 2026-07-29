@@ -2171,45 +2171,76 @@ def _validate_terminal_retry_context(
     }
 
 
+def _persisted_retry_binding_or_raise(record: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        return terminal_convergence.persisted_retry_binding(record)
+    except terminal_convergence.TerminalConvergenceError as exc:
+        raise RuntimeError("stored retry admission evidence is invalid") from exc
+
+
+def _guard_linked_retry_successor(
+    latest: dict[str, Any] | None,
+    *,
+    source_task_id: str,
+) -> None:
+    if latest is None or str(latest["task_id"]) == source_task_id:
+        return
+    binding = _persisted_retry_binding_or_raise(latest)
+    if binding is None:
+        return
+    latest_state = str(latest["state"])
+    if latest_state in {"launching", "running", "outcome_unknown"}:
+        raise RuntimeError(
+            "unchanged task start blocked by unresolved retry successor; "
+            f"reconcile task {latest['task_id']} before another start"
+        )
+    if str(binding["source_task_id"]) == source_task_id and latest_state != "cancelled":
+        raise RuntimeError(
+            "named retry source already has a retained successor; "
+            f"reconcile task {latest['task_id']} instead"
+        )
+
+
 def _guard_unchanged_terminal_retry(
     identity: dict[str, Any],
     retry_context: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    predecessor = _latest_matching_execution_record(identity)
-    if predecessor is None:
-        if retry_context is not None:
-            raise ValueError("terminal retry context has no current failed predecessor")
+    latest = _latest_matching_execution_record(identity)
+    if retry_context is not None:
+        source_task_id = retry_context.get("source_task_id")
+        if not isinstance(source_task_id, str):
+            raise ValueError("terminal retry context source task is invalid")
+        source = _row_raw(source_task_id)
+        source_identity = _record_execution_identity(source)
+        if source_identity["identity_sha256"] != identity["identity_sha256"]:
+            raise ValueError("terminal retry context execution identity is stale")
+        _guard_linked_retry_successor(
+            latest,
+            source_task_id=str(source["task_id"]),
+        )
+        return _validate_terminal_retry_context(
+            retry_context,
+            predecessor=source,
+            identity=identity,
+        )
+
+    if latest is None:
         return None
-    predecessor_state = str(predecessor["state"])
-    if predecessor_state not in UNCHANGED_RETRY_STATES:
-        if retry_context is not None:
-            raise ValueError("terminal retry context has no current failed predecessor")
-        if predecessor_state in {"launching", "running"}:
-            try:
-                pending_retry = terminal_convergence.persisted_retry_binding(
-                    predecessor
-                )
-            except terminal_convergence.TerminalConvergenceError as exc:
-                raise RuntimeError(
-                    "stored retry admission evidence is invalid"
-                ) from exc
+    latest_state = str(latest["state"])
+    if latest_state not in UNCHANGED_RETRY_STATES:
+        if latest_state in {"launching", "running", "outcome_unknown"}:
+            pending_retry = _persisted_retry_binding_or_raise(latest)
             if pending_retry is not None:
                 raise RuntimeError(
                     "unchanged task start blocked by unresolved retry successor; "
                     "reconcile task "
-                    f"{predecessor['task_id']} before another start"
+                    f"{latest['task_id']} before another start"
                 )
         return None
-    if retry_context is None:
-        raise RuntimeError(
-            "unchanged terminal task retry blocked; use "
-            "grabowski_task_reconcile_resume for task "
-            f"{predecessor['task_id']} with a named state change"
-        )
-    return _validate_terminal_retry_context(
-        retry_context,
-        predecessor=predecessor,
-        identity=identity,
+    raise RuntimeError(
+        "unchanged terminal task retry blocked; use "
+        "grabowski_task_reconcile_resume for task "
+        f"{latest['task_id']} with a named state change"
     )
 
 

@@ -5005,6 +5005,73 @@ class TaskTests(unittest.TestCase):
         assert selected is not None
         self.assertEqual("0" * 24, selected["task_id"])
 
+    def test_named_retry_validation_uses_exact_source_not_latest_independent_failure(self) -> None:
+        source_id = "1" * 24
+        latest_id = "2" * 24
+        identity = {"identity_sha256": "a" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "failed"}
+        context = {"source_task_id": source_id}
+        validated = {"source_task_id": source_id, "context_sha256": "b" * 64}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=None
+        ), patch.object(
+            tasks, "_validate_terminal_retry_context", return_value=validated
+        ) as validate:
+            observed = tasks._guard_unchanged_terminal_retry(identity, context)
+
+        self.assertEqual(validated, observed)
+        validate.assert_called_once_with(
+            context, predecessor=source, identity=identity
+        )
+
+    def test_named_retry_validation_allows_source_after_cancelled_linked_successor(self) -> None:
+        source_id = "3" * 24
+        latest_id = "4" * 24
+        identity = {"identity_sha256": "c" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "cancelled"}
+        context = {"source_task_id": source_id}
+        binding = {"source_task_id": source_id}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=binding
+        ), patch.object(
+            tasks,
+            "_validate_terminal_retry_context",
+            return_value={"source_task_id": source_id},
+        ):
+            observed = tasks._guard_unchanged_terminal_retry(identity, context)
+
+        self.assertEqual(source_id, observed["source_task_id"])
+
+    def test_named_retry_validation_blocks_active_linked_successor(self) -> None:
+        source_id = "5" * 24
+        latest_id = "6" * 24
+        identity = {"identity_sha256": "d" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "running"}
+        context = {"source_task_id": source_id}
+        binding = {"source_task_id": source_id}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=binding
+        ), self.assertRaisesRegex(RuntimeError, "unresolved retry successor"):
+            tasks._guard_unchanged_terminal_retry(identity, context)
+
     def test_retry_binding_is_persisted_before_dispatch_and_blocks_duplicate_start(self) -> None:
         common = {
             "host": "local",
