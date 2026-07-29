@@ -530,5 +530,329 @@ class OperatorObligationTests(unittest.TestCase):
             obligation.status_obligation("goo-example-work-0001")
 
 
+    def test_blocked_resolution_moves_obligation_out_of_current_attention(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "lease",
+                        "detail": "Foreign lease.",
+                        "reference": "lease:foreign",
+                        "sha256": "d" * 64,
+                    }
+                ],
+                "next_action": "Recheck later.",
+            }
+        )
+        before = obligation.status_obligation("goo-example-work-0001")
+        self.assertTrue(before["continuation_required"])
+        result = obligation.resolve_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "disposition": "superseded",
+                "evidence": [
+                    {"source": "bureau", "reference": "task:NEW", "sha256": "a" * 64}
+                ],
+            }
+        )
+        self.assertFalse(result["continuation_required"])
+        self.assertEqual("historical", result["attention_class"])
+        self.assertEqual("superseded", result["resolution_disposition"])
+        self.assertEqual(
+            0, obligation.list_obligations({"state": "attention"})["record_count"]
+        )
+        self.assertEqual(
+            1, obligation.list_obligations({"state": "blocked"})["record_count"]
+        )
+
+
+    def test_deferred_resolution_remains_current_attention(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "external",
+                        "detail": "External blocker.",
+                        "reference": "probe:external",
+                        "sha256": "e" * 64,
+                    }
+                ],
+                "next_action": "Old next action.",
+            }
+        )
+        first_parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "disposition": "deferred",
+            "evidence": [
+                {
+                    "source": "runtime",
+                    "reference": "fresh-probe",
+                    "sha256": "b" * 64,
+                }
+            ],
+            "next_action": "Probe again when the target is reachable.",
+        }
+        first = obligation.resolve_obligation(first_parameters)
+        replay = obligation.resolve_obligation(first_parameters)
+        second = obligation.resolve_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "disposition": "deferred",
+                "evidence": [
+                    {
+                        "source": "runtime",
+                        "reference": "second-probe",
+                        "sha256": "c" * 64,
+                    }
+                ],
+                "next_action": "Retry after the second external checkpoint.",
+            }
+        )
+        terminal = obligation.resolve_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "disposition": "resolved",
+                "evidence": [
+                    {
+                        "source": "runtime",
+                        "reference": "final-probe",
+                        "sha256": "d" * 64,
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(first["continuation_required"])
+        self.assertEqual("current", first["attention_class"])
+        self.assertEqual(1, first["resolution_sequence"])
+        self.assertEqual(1, first["resolution_revision_count"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(1, replay["resolution_revision_count"])
+        self.assertEqual(2, second["resolution_sequence"])
+        self.assertEqual(2, second["resolution_revision_count"])
+        self.assertEqual(
+            "Retry after the second external checkpoint.",
+            second["recommended_next_action"],
+        )
+        self.assertFalse(terminal["continuation_required"])
+        self.assertEqual("historical", terminal["attention_class"])
+        self.assertEqual(3, terminal["resolution_sequence"])
+        self.assertEqual(3, terminal["resolution_revision_count"])
+        directory = self.root / "goo-example-work-0001"
+        self.assertTrue((directory / "resolution.json").is_file())
+        self.assertTrue((directory / "resolution-000002.json").is_file())
+        self.assertTrue((directory / "resolution-000003.json").is_file())
+
+
+
+    def test_resolution_is_create_only_and_conflict_bound(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "lease",
+                        "detail": "Foreign lease.",
+                        "reference": "lease:foreign",
+                        "sha256": "d" * 64,
+                    }
+                ],
+                "next_action": "Recheck later.",
+            }
+        )
+        parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "disposition": "resolved",
+            "evidence": [{"source": "github", "reference": "pr:1", "sha256": "c" * 64}],
+        }
+        self.assertTrue(obligation.resolve_obligation(parameters)["created"])
+        self.assertTrue(obligation.resolve_obligation(parameters)["replayed"])
+        changed = {**parameters, "disposition": "superseded"}
+        with self.assertRaises(obligation.OperatorObligationConflictError):
+            obligation.resolve_obligation(changed)
+
+
+    def test_open_and_completed_obligations_cannot_be_resolved(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.resolve_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "disposition": "superseded",
+                    "evidence": [
+                        {"source": "test", "reference": "open", "sha256": "a" * 64}
+                    ],
+                }
+            )
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "completed",
+                "evidence": [
+                    {
+                        "acceptance_id": "implementation",
+                        "status": "passed",
+                        "source": "git",
+                        "reference": "commit:a",
+                        "sha256": "b" * 64,
+                    },
+                    {
+                        "acceptance_id": "verification",
+                        "status": "passed",
+                        "source": "test",
+                        "reference": "test:a",
+                        "sha256": "c" * 64,
+                    },
+                ],
+            }
+        )
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.resolve_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "disposition": "resolved",
+                    "evidence": [
+                        {"source": "test", "reference": "done", "sha256": "d" * 64}
+                    ],
+                }
+            )
+
+    def test_resolution_next_action_contract_is_fail_closed(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "external",
+                        "detail": "External blocker.",
+                        "reference": "external:a",
+                        "sha256": "e" * 64,
+                    }
+                ],
+                "next_action": "Recheck later.",
+            }
+        )
+        evidence = [
+            {"source": "runtime", "reference": "probe:a", "sha256": "f" * 64}
+        ]
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.resolve_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "disposition": "deferred",
+                    "evidence": evidence,
+                }
+            )
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.resolve_obligation(
+                {
+                    "obligation_id": "goo-example-work-0001",
+                    "disposition": "resolved",
+                    "evidence": evidence,
+                    "next_action": "This must be empty.",
+                }
+            )
+
+    def test_tampered_resolution_record_is_rejected(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "blocked",
+                "evidence": [],
+                "blockers": [
+                    {
+                        "code": "old",
+                        "detail": "Old blocker.",
+                        "reference": "old:a",
+                        "sha256": "1" * 64,
+                    }
+                ],
+                "next_action": "Recheck later.",
+            }
+        )
+        obligation.resolve_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "disposition": "superseded",
+                "evidence": [
+                    {"source": "bureau", "reference": "task:new", "sha256": "2" * 64}
+                ],
+            }
+        )
+        path = self.root / "goo-example-work-0001" / "resolution.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["disposition"] = "resolved"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(obligation.OperatorObligationIntegrityError):
+            obligation.status_obligation("goo-example-work-0001")
+
+
+    def test_delegated_resolution_requires_bound_terminal_observation(self) -> None:
+        obligation.open_obligation(self._open_parameters())
+        obligation.close_obligation(
+            {
+                "obligation_id": "goo-example-work-0001",
+                "outcome": "delegated",
+                "evidence": [],
+                "delegation": self._delegation("running"),
+                "next_action": "Observe the delegated job.",
+            }
+        )
+        base_parameters = {
+            "obligation_id": "goo-example-work-0001",
+            "disposition": "superseded",
+            "evidence": [
+                {"source": "github", "reference": "pr:new", "sha256": "4" * 64}
+            ],
+        }
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.resolve_obligation(base_parameters)
+
+        terminal = self._delegation("succeeded")
+        with self.assertRaises(obligation.OperatorObligationInputError):
+            obligation.resolve_obligation(
+                {
+                    **base_parameters,
+                    "delegation_observation": terminal,
+                }
+            )
+        receipt_evidence = {
+            "source": "receipt",
+            "reference": "delegation:systemd_job:grabowski-job-17",
+            "sha256": terminal["observation_receipt_sha256"],
+        }
+        final_parameters = {
+            **base_parameters,
+            "evidence": [*base_parameters["evidence"], receipt_evidence],
+            "delegation_observation": terminal,
+        }
+        result = obligation.resolve_obligation(final_parameters)
+        replay = obligation.resolve_obligation(final_parameters)
+        self.assertEqual("historical", result["attention_class"])
+        self.assertFalse(result["continuation_required"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(1, replay["resolution_revision_count"])
+        self.assertEqual(
+            terminal,
+            result["resolution_delegation_observation"],
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()
