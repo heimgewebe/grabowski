@@ -608,6 +608,7 @@ def _read_exact_regular(
     label: str,
     root_descriptor: int,
     allowed_links: set[int] | None = None,
+    sync_data: bool = False,
 ) -> tuple[os.stat_result, str]:
     if path.parent != RECEIPT_ROOT:
         raise ReposkopContextError(f"{label} escaped its bound receipt root")
@@ -641,6 +642,22 @@ def _read_exact_regular(
             raise ReposkopContextError(f"{label} changed during read")
         if data != expected_data:
             raise ReposkopContextError(f"{label} content does not match its binding")
+        if sync_data:
+            os.fsync(descriptor)
+            durable = os.fstat(descriptor)
+            if (
+                durable.st_dev,
+                durable.st_ino,
+                durable.st_size,
+                durable.st_mtime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ):
+                raise ReposkopContextError(f"{label} changed while being synced")
+            after = durable
     finally:
         os.close(descriptor)
     try:
@@ -904,6 +921,7 @@ def _create_pending(binding: dict[str, Any], *, root_descriptor: int) -> None:
                 binding["data"],
                 label="Reposkop pending receipt",
                 root_descriptor=root_descriptor,
+                sync_data=True,
             )
         except ReposkopContextError:
             _discard_recoverable_pending(
@@ -1006,6 +1024,13 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
     if _recover_linked_pending(binding, root_descriptor=root_descriptor):
         return
     if _entry_exists(root_descriptor, receipt_path):
+        _read_exact_regular(
+            receipt_path,
+            binding["data"],
+            label="Reposkop usage receipt",
+            root_descriptor=root_descriptor,
+        )
+        _fsync_directory(root_descriptor)
         _read_exact_regular(
             receipt_path,
             binding["data"],

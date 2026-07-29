@@ -479,6 +479,65 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertFalse(binding["pending_path"].exists())
         self.assertEqual(binding["receipt_path"].stat().st_nlink, 1)
 
+    def test_reuses_complete_pending_only_after_inode_fsync(self) -> None:
+        patches = self.patches(self.report())
+        with self.patch_context(patches):
+            report, executable = context._run_reposkop(
+                self.repo.resolve(), "grabowski-repo-state-context"
+            )
+            binding = context._usage_binding(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+                executable=executable,
+            )
+            context._ensure_receipt_root()
+            self.audit_bindings[binding["usage_key_sha256"]] = {
+                "audit_ref": "audit-record-sha256:" + "d" * 64,
+                "recorded_at": "2026-07-29T10:00:00+00:00",
+                "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
+            }
+            binding["pending_path"].write_bytes(binding["data"])
+            binding["pending_path"].chmod(0o600)
+            pending_metadata = binding["pending_path"].stat()
+            pending_identity = (pending_metadata.st_dev, pending_metadata.st_ino)
+            synced_identities: list[tuple[int, int]] = []
+            real_fsync = context.os.fsync
+
+            def record_fsync(descriptor: int) -> None:
+                metadata = context.os.fstat(descriptor)
+                synced_identities.append((metadata.st_dev, metadata.st_ino))
+                real_fsync(descriptor)
+
+            with patch.object(context.os, "fsync", side_effect=record_fsync):
+                result = context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertIn(pending_identity, synced_identities)
+        self.assertTrue(result["usage_receipt"]["recovered_publication"])
+        self.assertFalse(binding["pending_path"].exists())
+        self.assertEqual(binding["receipt_path"].read_bytes(), binding["data"])
+
+    def test_replay_fsyncs_existing_final_receipt_directory(self) -> None:
+        patches = self.patches(self.report())
+        with self.patch_context(patches):
+            first = context.grabowski_reposkop_context(str(self.repo))
+            root_metadata = self.receipts.stat()
+            root_identity = (root_metadata.st_dev, root_metadata.st_ino)
+            synced_identities: list[tuple[int, int]] = []
+            real_fsync = context.os.fsync
+
+            def record_fsync(descriptor: int) -> None:
+                metadata = context.os.fstat(descriptor)
+                synced_identities.append((metadata.st_dev, metadata.st_ino))
+                real_fsync(descriptor)
+
+            with patch.object(context.os, "fsync", side_effect=record_fsync):
+                replay = context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertTrue(Path(first["usage_receipt"]["path"]).is_file())
+        self.assertTrue(replay["usage_receipt"]["replayed"])
+        self.assertIn(root_identity, synced_identities)
+
     def test_recovers_partial_pending_after_interrupted_write(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):
