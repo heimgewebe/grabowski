@@ -89,7 +89,7 @@ class ReposkopContextTests(unittest.TestCase):
                 "returncode": 0,
                 "timed_out": False,
                 "duration_seconds": 0.001,
-                "stdout": stdout,
+                "stdout_data": stdout.encode("utf-8"),
                 "stderr": "",
                 "stdout_bytes": len(stdout.encode("utf-8")),
                 "stderr_bytes": 0,
@@ -335,15 +335,42 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertTrue(result["stdout_limit_exceeded"])
         self.assertFalse(result["timed_out"])
         self.assertGreater(result["stdout_bytes"], 4096)
-        self.assertLessEqual(len(result["stdout"].encode("utf-8")), 4096)
+        self.assertLessEqual(len(result["stdout_data"]), 4096)
         self.assertNotEqual(result["returncode"], 0)
+
+    def test_deadline_closes_descendant_held_pipes_after_child_exit(self) -> None:
+        executable = self.root / "inherited-pipe-reposkop"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "import subprocess, sys\n"
+            "subprocess.Popen(\n"
+            "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+            "    stdout=sys.stdout,\n"
+            "    stderr=sys.stderr,\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+
+        result = context._run_bounded_process(
+            [str(executable)],
+            cwd=self.root,
+            timeout_seconds=1,
+            stdout_limit=4096,
+            stderr_limit=4096,
+        )
+
+        self.assertTrue(result["timed_out"])
+        self.assertLess(result["duration_seconds"], 3)
+        self.assertFalse(result["stdout_limit_exceeded"])
+        self.assertFalse(result["stderr_limit_exceeded"])
 
     def test_run_reposkop_rejects_streaming_limit_exceeded(self) -> None:
         result = {
             "returncode": -9,
             "timed_out": False,
             "duration_seconds": 0.001,
-            "stdout": "x" * 16,
+            "stdout_data": b"x" * 16,
             "stderr": "",
             "stdout_bytes": context.MAX_REPORT_BYTES + 1,
             "stderr_bytes": 0,
@@ -356,6 +383,29 @@ class ReposkopContextTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 context.ReposkopContextError, "streaming stdout byte limit"
+            ):
+                context._run_reposkop(
+                    self.repo.resolve(), "grabowski-repo-state-context"
+                )
+
+    def test_run_reposkop_rejects_invalid_utf8_stdout(self) -> None:
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "duration_seconds": 0.001,
+            "stdout_data": b'{"kind":"reposkop_coherence_report","value":"\xff"}',
+            "stderr": "",
+            "stdout_bytes": 49,
+            "stderr_bytes": 0,
+            "stdout_limit_exceeded": False,
+            "stderr_limit_exceeded": False,
+        }
+        with (
+            patch.object(context, "REPOSKOP_BIN", self.executable),
+            patch.object(context, "_run_bounded_process", return_value=result),
+        ):
+            with self.assertRaisesRegex(
+                context.ReposkopContextError, "not valid UTF-8"
             ):
                 context._run_reposkop(
                     self.repo.resolve(), "grabowski-repo-state-context"

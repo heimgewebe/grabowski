@@ -186,6 +186,17 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _close_selector_streams(selector: selectors.BaseSelector) -> None:
+    for registered in list(selector.get_map().values()):
+        stream = registered.fileobj
+        try:
+            selector.unregister(stream)
+        except KeyError:
+            pass
+        if not stream.closed:
+            stream.close()
+
+
 def _run_bounded_process(
     argv: list[str],
     *,
@@ -225,11 +236,14 @@ def _run_bounded_process(
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
-            if remaining <= 0 and process.poll() is None and not killed:
+            if remaining <= 0:
                 timed_out = True
-                _kill_process_group(process)
-                killed = True
-            events = selector.select(timeout=max(0.0, min(0.25, remaining)))
+                if not killed:
+                    _kill_process_group(process)
+                    killed = True
+                _close_selector_streams(selector)
+                break
+            events = selector.select(timeout=min(0.25, remaining))
             for key, _mask in events:
                 stream = key.fileobj
                 name = key.data
@@ -247,9 +261,12 @@ def _run_bounded_process(
                     buffers[name].extend(chunk[:capacity])
                 if counts[name] > limits[name]:
                     exceeded[name] = True
-                    if not killed:
-                        _kill_process_group(process)
-                        killed = True
+            if any(exceeded.values()):
+                if not killed:
+                    _kill_process_group(process)
+                    killed = True
+                _close_selector_streams(selector)
+                break
             if process.poll() is not None and not events:
                 for registered in list(selector.get_map().values()):
                     stream = registered.fileobj
@@ -268,6 +285,12 @@ def _run_bounded_process(
                         continue
                     selector.unregister(stream)
                     stream.close()
+                if any(exceeded.values()):
+                    if not killed:
+                        _kill_process_group(process)
+                        killed = True
+                    _close_selector_streams(selector)
+                    break
         try:
             returncode = process.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -285,7 +308,7 @@ def _run_bounded_process(
         "returncode": returncode,
         "timed_out": timed_out,
         "duration_seconds": round(time.monotonic() - started, 3),
-        "stdout": bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
+        "stdout_data": bytes(buffers["stdout"]),
         "stderr": bytes(buffers["stderr"]).decode("utf-8", errors="replace"),
         "stdout_bytes": counts["stdout"],
         "stderr_bytes": counts["stderr"],
@@ -325,7 +348,15 @@ def _run_reposkop(
         raise ReposkopContextError(
             "Reposkop executable identity changed during report execution"
         )
-    stdout = result["stdout"]
+    stdout_data = result.get("stdout_data")
+    if not isinstance(stdout_data, bytes):
+        raise ReposkopContextError("Reposkop report stdout bytes are unavailable")
+    try:
+        stdout = stdout_data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ReposkopContextError(
+            "Reposkop report output is not valid UTF-8"
+        ) from exc
     try:
         report = json.loads(stdout)
     except json.JSONDecodeError as exc:

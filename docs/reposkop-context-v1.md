@@ -17,12 +17,13 @@ The tool invokes only the owner-held, regular, singly linked and executable `${H
 reposkop report <absolute-target> --purpose <purpose> --json
 ```
 
-The command has a 20-second limit. stdout and stderr are drained concurrently through nonblocking pipes; the parent retains at most 512 KiB stdout and 64 KiB stderr. Crossing either limit kills the entire child process group before more output can accumulate in the MCP process. The target checkout cannot replace the executable through `PATH`, Python import precedence or a same-named file. The executable identity is checked again after execution; drift invalidates the result.
+The command has a 20-second wall-clock limit. stdout and stderr are drained concurrently through nonblocking pipes; the parent retains at most 512 KiB stdout and 64 KiB stderr. Crossing either byte limit kills the entire child process group and closes the local pipe readers. Reaching the deadline does the same even if the direct child has already exited while a descendant still holds an inherited pipe. The target checkout cannot replace the executable through `PATH`, Python import precedence or a same-named file. The executable identity is checked again after execution; drift invalidates the result.
 
 ## Validation boundary
 
 The result is accepted only when:
 
+- stdout is strict UTF-8 without replacement decoding;
 - the report is exactly `reposkop_coherence_report` schema 1;
 - its observation is exactly `reposkop_checkout_observation` schema 1;
 - its projection is exactly `reposkop_coherence_projection` schema 1;
@@ -30,7 +31,7 @@ The result is accepted only when:
 - reported target path and purpose exactly match the request;
 - observation, projection and report SHA-256 fields are present and well formed.
 
-Reposkop remains an observer. The output does not establish task, queue, pull-request or remote truth and never authorizes cleanup or another mutation.
+Malformed UTF-8 fails before JSON parsing. Replacement decoding is reserved for bounded stderr diagnostics. Reposkop remains an observer. The output does not establish task, queue, pull-request or remote truth and never authorizes cleanup or another mutation.
 
 ## Usage receipt
 
@@ -52,7 +53,7 @@ Every replay first validates the deterministic receipt bytes and then searches t
 
 ## Why this is a separate tool
 
-A generic terminal call can launch Reposkop, but cannot enforce the fixed executable, streaming output limits, target binding, authority-boundary validation, truthful publication/recovery audit contracts or semantic receipt deduplication. Combining generic terminal and file-write surfaces would grant broader caller-controlled command and path authority while producing weaker evidence.
+A generic terminal call can launch Reposkop, but cannot enforce the fixed executable, streaming output and inherited-pipe deadline limits, strict stdout encoding, target binding, authority-boundary validation, truthful publication/recovery audit contracts or semantic receipt deduplication. Combining generic terminal and file-write surfaces would grant broader caller-controlled command and path authority while producing weaker evidence.
 
 The dedicated tool has one narrow call shape: target in, validated coherence report and immutable, audit-bound usage evidence out.
 
