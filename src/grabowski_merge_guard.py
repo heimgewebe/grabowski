@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 import weakref
 
 import grabowski_merge_delivery
@@ -735,6 +736,233 @@ def _merge_guard_result_info(result: Any) -> dict[str, Any]:
         "stdout_bytes": stdout_bytes,
         "stderr_bytes": stderr_bytes,
     }
+
+
+_BASE_UPDATE_GUARD_MAX_ACTIVE_RULES = 100
+_BASE_UPDATE_GUARD_MAX_RULESETS = 16
+
+
+def _github_json_call(
+    repo_path: Path,
+    github_runner: Any,
+    args: list[str],
+    *,
+    label: str,
+) -> tuple[Any | None, dict[str, Any], list[str]]:
+    try:
+        raw = github_runner(repo_path, args)
+    except Exception as exc:
+        return None, {
+            "label": label,
+            "command": ["gh", *args],
+            "exception_type": type(exc).__name__,
+        }, [f"{label}_exception:{type(exc).__name__}"]
+    info = _merge_guard_result_info(raw)
+    evidence = {
+        "label": label,
+        "command": ["gh", *args],
+        "returncode": info["returncode"],
+        "stdout_sha256": hashlib.sha256(info["stdout"].encode("utf-8")).hexdigest(),
+        "stderr_sha256": hashlib.sha256(info["stderr"].encode("utf-8")).hexdigest(),
+    }
+    if info["returncode"] != 0:
+        return None, evidence, [f"{label}_query_failed"]
+    try:
+        value = json.loads(info["stdout"])
+    except json.JSONDecodeError:
+        return None, evidence, [f"{label}_invalid_json"]
+    evidence["value_sha256"] = _sha256_json(value)
+    return value, evidence, []
+
+
+def _ruleset_detail_endpoint(active_rule: dict[str, Any]) -> str | None:
+    ruleset_id = active_rule.get("ruleset_id")
+    source_type = active_rule.get("ruleset_source_type")
+    source = active_rule.get("ruleset_source")
+    if type(ruleset_id) is not int or ruleset_id <= 0 or not isinstance(source, str):
+        return None
+    if source_type == "Repository" and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", source):
+        return f"repos/{source}/rulesets/{ruleset_id}"
+    if source_type == "Organization" and re.fullmatch(r"[A-Za-z0-9_.-]+", source):
+        return f"orgs/{source}/rulesets/{ruleset_id}"
+    if source_type == "Enterprise" and re.fullmatch(r"[A-Za-z0-9_.-]+", source):
+        return f"enterprises/{source}/rulesets/{ruleset_id}"
+    return None
+
+
+def _strict_status_rule(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get("type") != "required_status_checks":
+        return None
+    parameters = value.get("parameters")
+    if not isinstance(parameters, dict):
+        return None
+    checks = parameters.get("required_status_checks")
+    if parameters.get("strict_required_status_checks_policy") is not True:
+        return None
+    if not isinstance(checks, list) or not checks:
+        return None
+    normalized_checks: list[dict[str, Any]] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            return None
+        context = check.get("context")
+        integration_id = check.get("integration_id")
+        if not isinstance(context, str) or not context.strip():
+            return None
+        if integration_id is not None and type(integration_id) is not int:
+            return None
+        normalized_checks.append(
+            {"context": context.strip(), "integration_id": integration_id}
+        )
+    return {
+        "strict_required_status_checks_policy": True,
+        "required_status_checks": sorted(
+            normalized_checks,
+            key=lambda item: (item["context"], item["integration_id"] or -1),
+        ),
+    }
+
+
+def verify_github_base_update_guard(
+    repo_path: Path,
+    github_runner: Any,
+    *,
+    repo_slug: str,
+    base_branch: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
+    """Prove a server-enforced, non-bypassable strict base-update barrier."""
+    encoded_branch = quote(base_branch, safe="")
+    active_args = ["api", f"repos/{repo_slug}/rules/branches/{encoded_branch}"]
+    active, active_evidence, errors = _github_json_call(
+        repo_path, github_runner, active_args, label="base_update_guard_active_rules"
+    )
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_github_base_update_guard_evidence",
+        "repository": repo_slug,
+        "base_branch": base_branch,
+        "active_rules": active_evidence,
+        "rulesets": [],
+    }
+    if errors:
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+    if not isinstance(active, list):
+        errors.append("base_update_guard_active_rules_not_list")
+    elif len(active) > _BASE_UPDATE_GUARD_MAX_ACTIVE_RULES:
+        errors.append("base_update_guard_active_rules_exceed_limit")
+    if errors:
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+
+    candidates: dict[int, dict[str, Any]] = {}
+    for rule in active:
+        if not isinstance(rule, dict):
+            errors.append("base_update_guard_active_rule_invalid")
+            continue
+        strict = _strict_status_rule(rule)
+        endpoint = _ruleset_detail_endpoint(rule)
+        ruleset_id = rule.get("ruleset_id")
+        if strict is None or endpoint is None or type(ruleset_id) is not int:
+            continue
+        candidates[ruleset_id] = {
+            "active_rule": rule,
+            "active_strict_rule": strict,
+            "endpoint": endpoint,
+        }
+    if len(candidates) > _BASE_UPDATE_GUARD_MAX_RULESETS:
+        errors.append("base_update_guard_candidate_rulesets_exceed_limit")
+    if not candidates:
+        errors.append("base_update_guard_strict_ruleset_missing")
+    if errors:
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+
+    accepted: list[dict[str, Any]] = []
+    rejection_codes: list[str] = []
+    for ruleset_id in sorted(candidates):
+        candidate = candidates[ruleset_id]
+        detail_args = ["api", candidate["endpoint"]]
+        detail, detail_evidence, detail_errors = _github_json_call(
+            repo_path,
+            github_runner,
+            detail_args,
+            label=f"base_update_guard_ruleset_{ruleset_id}",
+        )
+        record: dict[str, Any] = {
+            "ruleset_id": ruleset_id,
+            "active_rule_sha256": _sha256_json(candidate["active_rule"]),
+            "query": detail_evidence,
+            "accepted": False,
+            "errors": list(detail_errors),
+        }
+        if detail_errors:
+            rejection_codes.extend(detail_errors)
+            evidence["rulesets"].append(record)
+            continue
+        detail_codes: list[str] = []
+        if not isinstance(detail, dict) or detail.get("id") != ruleset_id:
+            detail_codes.append("base_update_guard_ruleset_detail_invalid")
+        else:
+            if detail.get("enforcement") != "active":
+                detail_codes.append("base_update_guard_ruleset_not_active")
+            if detail.get("current_user_can_bypass") != "never":
+                detail_codes.append("base_update_guard_current_actor_can_bypass")
+            bypass_actors = detail.get("bypass_actors")
+            if not isinstance(bypass_actors, list) or bypass_actors:
+                detail_codes.append("base_update_guard_bypass_actors_present")
+            detail_rules = detail.get("rules")
+            strict_rules = (
+                [item for item in detail_rules if _strict_status_rule(item) is not None]
+                if isinstance(detail_rules, list)
+                else []
+            )
+            if not strict_rules:
+                detail_codes.append("base_update_guard_ruleset_strict_rule_missing")
+        record["errors"] = detail_codes
+        record["accepted"] = not detail_codes
+        if isinstance(detail, dict):
+            record["detail_sha256"] = _sha256_json(detail)
+        evidence["rulesets"].append(record)
+        if detail_codes:
+            rejection_codes.extend(detail_codes)
+            continue
+        assert isinstance(detail, dict)
+        accepted.append(
+            {
+                "ruleset_id": ruleset_id,
+                "source_type": candidate["active_rule"].get("ruleset_source_type"),
+                "source": candidate["active_rule"].get("ruleset_source"),
+                "current_user_can_bypass": detail["current_user_can_bypass"],
+                "strict_status_rule": candidate["active_strict_rule"],
+                "detail_sha256": _sha256_json(detail),
+            }
+        )
+    if not accepted:
+        errors.append("base_update_guard_no_unbypassable_strict_ruleset")
+        errors.extend(sorted(set(rejection_codes)))
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+
+    policy: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_github_base_update_guard",
+        "repository": repo_slug,
+        "base_branch": base_branch,
+        "mode": "strict_required_status_checks_ruleset",
+        "accepted_rulesets": accepted,
+        "active_rules_sha256": _sha256_json(active),
+        "does_not_establish": [
+            "absence_of_external_ruleset_changes_after_observation",
+            "absence_of_noncooperating_external_github_actors",
+            "semantic_correctness_of_required_status_checks",
+            "exact_base_ref_compare_and_swap",
+        ],
+    }
+    policy["binding_sha256"] = _sha256_json(policy)
+    evidence["policy_sha256"] = _sha256_json(policy)
+    evidence["errors"] = []
+    return policy, evidence, []
 
 
 def _github_datetime(value: Any) -> datetime | None:
@@ -2044,6 +2272,19 @@ class CaptainMergeGuardRunner:
         self.receipt["dispatch_revalidation"]["binding_sha256"] = _sha256_json(
             {field: viewed.get(field) for field in sorted(expected)}
         )
+        (
+            base_update_guard,
+            base_update_guard_evidence,
+            base_update_guard_errors,
+        ) = verify_github_base_update_guard(
+            self.repo_path,
+            self.github_runner,
+            repo_slug=str(bindings["repository"]),
+            base_branch=str(bindings["base_branch"]),
+        )
+        base_update_guard_evidence["policy"] = base_update_guard
+        self.receipt["dispatch_base_update_guard"] = base_update_guard_evidence
+        errors.extend(base_update_guard_errors)
         if not errors:
             errors.extend(
                 self._revalidate_codex_review(bindings, phase="dispatch")

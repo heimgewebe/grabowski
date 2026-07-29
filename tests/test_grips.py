@@ -141,6 +141,8 @@ class FakeGh:
         repo_settings_sequence: list[dict[str, object]] | None = None,
         repo_settings_returncode: int = 0,
         repo_settings_invalid_json: bool = False,
+        active_rules: list[dict[str, object]] | None = None,
+        ruleset_details: dict[int, dict[str, object]] | None = None,
         diff_text: str = "captain-diff\n",
         codex_state: dict[str, object] | None = None,
         codex_state_sequence: list[dict[str, object]] | None = None,
@@ -204,6 +206,46 @@ class FakeGh:
         self.repo_settings_sequence = list(repo_settings_sequence or [])
         self.repo_settings_returncode = repo_settings_returncode
         self.repo_settings_invalid_json = repo_settings_invalid_json
+        default_ruleset_id = 18801517
+        default_strict_rule: dict[str, object] = {
+            "type": "required_status_checks",
+            "parameters": {
+                "strict_required_status_checks_policy": True,
+                "do_not_enforce_on_create": False,
+                "required_status_checks": [
+                    {"context": "validate", "integration_id": 15368}
+                ],
+            },
+            "ruleset_source_type": "Repository",
+            "ruleset_source": "heimgewebe/grabowski",
+            "ruleset_id": default_ruleset_id,
+        }
+        self.active_rules = deepcopy(
+            active_rules if active_rules is not None else [default_strict_rule]
+        )
+        self.ruleset_details = deepcopy(
+            ruleset_details
+            if ruleset_details is not None
+            else {
+                default_ruleset_id: {
+                    "id": default_ruleset_id,
+                    "name": "main-protected-pr-ci",
+                    "target": "branch",
+                    "source_type": "Repository",
+                    "source": "heimgewebe/grabowski",
+                    "enforcement": "active",
+                    "conditions": {
+                        "ref_name": {
+                            "exclude": [],
+                            "include": ["refs/heads/main"],
+                        }
+                    },
+                    "rules": [deepcopy(default_strict_rule)],
+                    "bypass_actors": [],
+                    "current_user_can_bypass": "never",
+                }
+            }
+        )
         self.merged = False
         self.calls: list[tuple[str, ...]] = []
 
@@ -245,9 +287,40 @@ class FakeGh:
                 else self.codex_state
             )
             endpoint = next(
-                (item for item in argv[1:] if item.startswith("repos/")),
+                (
+                    item
+                    for item in argv[1:]
+                    if item.startswith(("repos/", "orgs/", "enterprises/"))
+                ),
                 argv[1],
             )
+            if "/rules/branches/" in endpoint:
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(self.active_rules),
+                    "stderr": "",
+                }
+            if "/rulesets/" in endpoint:
+                try:
+                    ruleset_id = int(endpoint.rsplit("/", 1)[1])
+                except ValueError:
+                    return {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "invalid ruleset id",
+                    }
+                detail = self.ruleset_details.get(ruleset_id)
+                if detail is None:
+                    return {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "ruleset not found",
+                    }
+                return {
+                    "returncode": 0,
+                    "stdout": json.dumps(detail),
+                    "stderr": "",
+                }
             if "/issues/comments/" in endpoint and "/reactions" in endpoint:
                 if isinstance(state, dict) and "reaction_pages" in state:
                     payload = state["reaction_pages"]
@@ -3665,6 +3738,51 @@ def authorized_captain_run_parameters(**overrides) -> dict[str, object]:
     return parameters
 
 
+class GithubBaseUpdateGuardTests(unittest.TestCase):
+    def test_accepts_active_non_bypassable_strict_ruleset(self) -> None:
+        gh = FakeGh()
+        policy, evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            gh,
+            repo_slug="heimgewebe/grabowski",
+            base_branch="main",
+        )
+
+        self.assertEqual([], errors)
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        self.assertEqual("strict_required_status_checks_ruleset", policy["mode"])
+        self.assertEqual("never", policy["accepted_rulesets"][0]["current_user_can_bypass"])
+        self.assertEqual([], evidence["errors"])
+
+    def test_rejects_repository_without_strict_ruleset(self) -> None:
+        gh = FakeGh(active_rules=[])
+        policy, evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            gh,
+            repo_slug="heimgewebe/audio",
+            base_branch="main",
+        )
+
+        self.assertIsNone(policy)
+        self.assertIn("base_update_guard_strict_ruleset_missing", errors)
+        self.assertEqual(errors, evidence["errors"])
+
+    def test_rejects_ruleset_bypass_for_current_actor(self) -> None:
+        gh = FakeGh()
+        gh.ruleset_details[18801517]["current_user_can_bypass"] = "always"
+        policy, _evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            gh,
+            repo_slug="heimgewebe/grabowski",
+            base_branch="main",
+        )
+
+        self.assertIsNone(policy)
+        self.assertIn("base_update_guard_current_actor_can_bypass", errors)
+        self.assertIn("base_update_guard_no_unbypassable_strict_ruleset", errors)
+
+
 class CaptainAuthorityPathTests(unittest.TestCase):
     def setUp(self) -> None:
         self._resource_tempdir = tempfile.TemporaryDirectory()
@@ -4434,6 +4552,90 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(["merge", "squash", "rebase"], execution["merge_policy"]["allowed_methods"])
         self.assertEqual([], execution["automatic_platform_effects"])
         self.assertEqual("passed", execution["effect_scope_decision"]["decision"])
+
+    def test_captain_run_blocks_without_server_enforced_base_guard(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": CAPTAIN_BASE_SHA,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            active_rules=[],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        execution = result["output"]["executions"][0]
+        self.assertIn(
+            "base_update_guard_strict_ruleset_missing",
+            execution["preflight_errors"],
+        )
+        self.assertFalse(execution["execution_invoked"])
+
+    def test_atomic_guard_rechecks_base_guard_after_lease_acquisition(self) -> None:
+        class DriftingRulesGh(FakeGh):
+            def __init__(self) -> None:
+                super().__init__(
+                    view={
+                        "number": 96,
+                        "state": "OPEN",
+                        "baseRefName": "main",
+                        "baseRefOid": CAPTAIN_BASE_SHA,
+                        "headRefName": "feat/captain",
+                        "headRefOid": CAPTAIN_HEAD,
+                        "isDraft": False,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "CLEAN",
+                    }
+                )
+                self.active_rule_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if (
+                    argv[:1] == ["api"]
+                    and len(argv) >= 2
+                    and "/rules/branches/" in argv[1]
+                ):
+                    self.active_rule_reads += 1
+                    if self.active_rule_reads >= 2:
+                        self.active_rules = []
+                return super().__call__(repo, argv)
+
+        parameters = authorized_captain_run_parameters()
+        gh = DriftingRulesGh()
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        execution = result["output"]["executions"][0]
+        guard = execution["merge_lease_guard"]
+        self.assertFalse(guard["dispatch_called"])
+        self.assertEqual("blocked_after_guard_revalidation_released", guard["status"])
+        self.assertIn(
+            "base_update_guard_strict_ruleset_missing",
+            guard["errors"],
+        )
 
     def test_captain_run_uses_allowed_repository_merge_method(self) -> None:
         parameters = captain_parameters(

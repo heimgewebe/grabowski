@@ -18,6 +18,7 @@ The receipt binds one repository, pull request, base commit, head commit and com
 5. Only after that visible delivery, call `grabowski_merge_delivery_record` with the exact link and the artifact receipt.
 6. Build review evidence and Captain execution intent against the same repository, PR, base, head, diff and delivery-receipt SHA-256.
 7. Revalidate the durable delivery receipt in `captain-run`, in the atomic merge guard after acquisition, and again immediately before `gh pr merge` dispatch.
+8. Require an active GitHub ruleset that applies to the exact base branch, contains at least one nonempty strict required-status-check rule, has no bypass actors and reports `current_user_can_bypass=never`. Re-read this server-side base-update barrier after atomic lease acquisition. Repositories without that proof are not directly mergeable by Captain. This is a server-side stale-base barrier, not an exact base-ref compare-and-swap: a base move to content already contained in the reviewed head can remain mergeable without introducing unreviewed integration content.
 
 Creating or transferring the artifact without the user-visible delivery step is insufficient. A later delivery after an external merge is recorded as post-merge exposure and never converted into retrospective compliance.
 

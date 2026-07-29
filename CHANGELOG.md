@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added a server-enforced base-update guard to Captain PR merges: direct dispatch now requires an active GitHub ruleset with nonempty strict required status checks, no bypass actors and `current_user_can_bypass=never`; the policy is re-read after atomic lease acquisition so repositories without an exact reviewed-base barrier fail closed before merge.
 - Preserved literal argv across durable jobs and both user and root persistent-task launchers with a reversible systemd dollar transport encoding compatible with systemd 249 and newer; shell variables, command substitutions, heredocs and foreign template syntax now reach only the intended runtime while stored argv and SHA-256 identity remain unchanged.
 - Juno Operator beendet interaktive Warnläufe ohne rote `SystemExit`-Ausnahme; echte Laufzeitfehler bleiben weiterhin sichtbar.
 - Extended the commit-bound Rootbroker cutover to install the reviewed root-task systemd action as an exact, recovery-gated catalog contract; absent actions are added, exact preexisting actions remain idempotent, drifted actions, broadened patterns or command prefixes, and incoherent publisher/lifecycle gates fail closed before backup or mutation.
