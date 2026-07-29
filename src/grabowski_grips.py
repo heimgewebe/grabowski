@@ -428,6 +428,21 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="operator_obligation_close",
     ),
+    "operator-obligation-resolve": GripSpec(
+        name="operator-obligation-resolve",
+        version="1.0",
+        summary="Resolve a blocked or delegated obligation as historical, superseded, or explicitly deferred.",
+        effect=MUTATING,
+        required_parameters=("obligation_id", "disposition", "evidence"),
+        acceptance_ids=(
+            "open-and-close-binding",
+            "resolution-evidence-bound",
+            "delegation-terminal-observation",
+            "create-only-resolution",
+            "attention-projection",
+        ),
+        runner="operator_obligation_resolve",
+    ),
     "branch-publish": GripSpec(
         name="branch-publish",
         version="1.0",
@@ -478,6 +493,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "operator-obligation-list",
         "operator-obligation-status",
         "operator-obligation-close",
+        "operator-obligation-resolve",
         "branch-publish",
         "pr-create-or-update",
     }
@@ -511,6 +527,7 @@ GRIP_SURFACE_TARGETS = {
     "operator-obligation-list": "bounded operator obligation continuation inventory",
     "operator-obligation-status": "one integrity-bound operator obligation status",
     "operator-obligation-close": "one create-only operator obligation terminal record",
+    "operator-obligation-resolve": "one create-only historical operator obligation resolution",
     "branch-publish": "git branch publication",
     "pr-create-or-update": "GitHub pull request metadata",
 }
@@ -7345,6 +7362,187 @@ def _run_operator_obligation_status(
     return {**output, "receipt_status": "passed"}
 
 
+def _run_operator_obligation_resolve(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    dispatch_parameters = dict(parameters)
+    try:
+        current = grabowski_operator_obligation.status_obligation(
+            dispatch_parameters.get("obligation_id")
+        )
+    except grabowski_operator_obligation.OperatorObligationInputError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except FileNotFoundError as exc:
+        _check(receipt, "open_and_close_binding", "fail", "obligation record not found")
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["obligation_not_found"],
+            "error": str(exc),
+        }
+    except grabowski_operator_obligation.OperatorObligationError as exc:
+        raise GripActionError(str(exc)) from exc
+
+    requested_disposition = dispatch_parameters.get("disposition")
+    existing_disposition = current.get("resolution_disposition")
+    stored_terminal_replay = False
+    if existing_disposition in {"resolved", "superseded"}:
+        if requested_disposition != existing_disposition:
+            _check(
+                receipt,
+                "create_only_resolution",
+                "fail",
+                "terminal resolution already exists",
+            )
+            return {
+                "receipt_status": "blocked",
+                "decision": "blocked",
+                "blocked_reasons": ["resolution_conflict"],
+                "error": "operator obligation already has a terminal resolution",
+            }
+        stored_terminal_replay = True
+    output = None
+
+    if output is None:
+        terminal_disposition = requested_disposition in {"resolved", "superseded"}
+        if stored_terminal_replay:
+            stored_observation = current.get("resolution_delegation_observation") or {}
+            if not isinstance(stored_observation, dict):
+                raise GripActionError("stored terminal delegation observation is invalid")
+            if stored_observation:
+                dispatch_parameters["delegation_observation"] = stored_observation
+                stored_receipt = {
+                    "source": "receipt",
+                    "reference": (
+                        f"delegation:{stored_observation['kind']}:"
+                        f"{stored_observation['id']}"
+                    ),
+                    "sha256": stored_observation["observation_receipt_sha256"],
+                }
+                evidence = list(dispatch_parameters.get("evidence") or [])
+                if stored_receipt not in evidence:
+                    evidence.append(stored_receipt)
+                dispatch_parameters["evidence"] = evidence
+            _check(
+                receipt,
+                "delegation_terminal_observation",
+                "pass",
+                "stored_resolution_replay",
+            )
+        elif current.get("state") == "delegated" and terminal_disposition:
+            delegation = current.get("delegation")
+            delegation_request = {
+                "kind": delegation.get("kind")
+                if isinstance(delegation, dict)
+                else None,
+                "id": delegation.get("id")
+                if isinstance(delegation, dict)
+                else None,
+            }
+            try:
+                terminal_observation = _operator_delegation_terminal_observation(
+                    delegation_request
+                )
+            except (GripPreflightError, OSError, RuntimeError, ValueError) as exc:
+                _check(receipt, "delegation_terminal_observation", "fail", str(exc))
+                return {
+                    "receipt_status": "blocked",
+                    "decision": "blocked",
+                    "blocked_reasons": ["delegation_not_terminal_or_unverifiable"],
+                    "error": str(exc),
+                    "continuation_required": True,
+                    "response_may_end": False,
+                    "work_complete": False,
+                }
+            dispatch_parameters["delegation_observation"] = terminal_observation
+            evidence = list(dispatch_parameters.get("evidence") or [])
+            evidence.append(
+                {
+                    "source": "receipt",
+                    "reference": (
+                        f"delegation:{terminal_observation['kind']}:"
+                        f"{terminal_observation['id']}"
+                    ),
+                    "sha256": terminal_observation[
+                        "observation_receipt_sha256"
+                    ],
+                }
+            )
+            dispatch_parameters["evidence"] = evidence
+            _check(
+                receipt,
+                "delegation_terminal_observation",
+                "pass",
+                terminal_observation["observation_receipt_sha256"],
+            )
+        else:
+            _check(
+                receipt,
+                "delegation_terminal_observation",
+                "pass",
+                "not_applicable",
+            )
+        try:
+            output = grabowski_operator_obligation.resolve_obligation(
+                dispatch_parameters
+            )
+        except grabowski_operator_obligation.OperatorObligationInputError as exc:
+            raise GripPreflightError(str(exc)) from exc
+        except FileNotFoundError as exc:
+            _check(
+                receipt,
+                "open_and_close_binding",
+                "fail",
+                "obligation record not found",
+            )
+            return {
+                "receipt_status": "blocked",
+                "decision": "blocked",
+                "blocked_reasons": ["obligation_not_found"],
+                "error": str(exc),
+            }
+        except grabowski_operator_obligation.OperatorObligationConflictError as exc:
+            _check(receipt, "create_only_resolution", "fail", str(exc))
+            return {
+                "receipt_status": "blocked",
+                "decision": "blocked",
+                "blocked_reasons": ["resolution_conflict"],
+                "error": str(exc),
+            }
+        except grabowski_operator_obligation.OperatorObligationError as exc:
+            raise GripActionError(str(exc)) from exc
+
+    _check(
+        receipt,
+        "open_and_close_binding",
+        "pass",
+        f"open={output['open_file_sha256']}; close={output['close_file_sha256']}",
+    )
+    _check(
+        receipt,
+        "resolution_evidence_bound",
+        "pass",
+        output["resolution_file_sha256"],
+    )
+    _check(
+        receipt,
+        "create_only_resolution",
+        "pass",
+        "created" if output["created"] else "replayed",
+    )
+    _check(
+        receipt,
+        "attention_projection",
+        "warn" if output["continuation_required"] else "pass",
+        f"attention_class={output['attention_class']}; disposition={output['resolution_disposition']}",
+    )
+    return {**output, "receipt_status": "passed"}
+
+
 def _observe_operator_systemd_job(identifier: str) -> dict[str, Any]:
     import grabowski_operator_core as operator
 
@@ -7498,6 +7696,184 @@ def _operator_delegation_observation(value: Any) -> dict[str, str]:
     }
 
 
+def _operator_delegation_terminal_observation(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"kind", "id"}:
+        raise GripPreflightError(
+            "delegated resolution requires delegation with exactly kind and id"
+        )
+    kind = value.get("kind")
+    identifier = value.get("id")
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise GripPreflightError("delegation.id must be a non-empty string")
+    identifier = identifier.strip()
+
+    observation_tool: str
+    terminal_status: str
+    identity_material: dict[str, Any]
+    if kind == "systemd_job":
+        observation_tool = "grabowski_job_status"
+        observed = _observe_operator_systemd_job(identifier)
+        if not isinstance(observed, dict):
+            raise GripPreflightError("delegation observation returned a non-object")
+        terminal_status = str(observed.get("final_status") or "")
+        if terminal_status not in {
+            "completed",
+            "succeeded",
+            "failed",
+            "timed_out",
+            "signalled",
+            "terminated_unclear",
+        }:
+            raise GripPreflightError(
+                f"delegated systemd job is not terminal: status={terminal_status or 'unknown'}"
+            )
+        metadata = observed.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        finalization = observed.get("finalization_receipt")
+        finalization = finalization if isinstance(finalization, dict) else {}
+        identity_material = {
+            "kind": kind,
+            "id": identifier,
+            "unit": observed.get("unit"),
+            "job_id": metadata.get("job_id"),
+            "origin_sha256": metadata.get("origin_sha256"),
+            "argv_sha256": metadata.get("argv_sha256"),
+            "final_status": terminal_status,
+            "finalization_receipt_sha256": finalization.get("receipt_sha256"),
+        }
+        expected_job_id = identifier.removeprefix("grabowski-job-")
+        if (
+            identity_material["unit"] != identifier
+            or identity_material["job_id"] != expected_job_id
+        ):
+            raise GripPreflightError("delegated systemd job identity mismatch")
+        for field in ("origin_sha256", "argv_sha256"):
+            if not _is_sha256_hex(identity_material[field]):
+                raise GripPreflightError(
+                    f"delegated systemd job {field} is invalid"
+                )
+        finalization_receipt = identity_material["finalization_receipt_sha256"]
+        if finalization_receipt is not None and not _is_sha256_hex(
+            finalization_receipt
+        ):
+            raise GripPreflightError(
+                "delegated systemd job finalization receipt is invalid"
+            )
+    elif kind == "grabowski_task":
+        observation_tool = "grabowski_task_status"
+        observed = _observe_operator_task(identifier)
+        if not isinstance(observed, dict):
+            raise GripPreflightError("delegation observation returned a non-object")
+        terminal_status = str(observed.get("state") or "")
+        if terminal_status not in {
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
+            "signalled",
+        }:
+            raise GripPreflightError(
+                f"delegated Grabowski task is not terminal: status={terminal_status or 'unknown'}"
+            )
+        identity_material = {
+            "kind": kind,
+            "id": identifier,
+            "task_id": observed.get("task_id"),
+            "unit": observed.get("unit"),
+            "attempt": observed.get("attempt"),
+            "argv_sha256": observed.get("argv_sha256"),
+            "terminalization_sha256": observed.get("terminalization_sha256"),
+            "lifecycle_receipt_sha256": observed.get("lifecycle_receipt_sha256"),
+            "updated_at_unix": observed.get("updated_at_unix"),
+            "status": terminal_status,
+        }
+        if identity_material["task_id"] != identifier:
+            raise GripPreflightError("delegated Grabowski task identity mismatch")
+        if not isinstance(identity_material["unit"], str) or not identity_material["unit"]:
+            raise GripPreflightError("delegated Grabowski task unit is missing")
+        if not isinstance(identity_material["attempt"], int) or isinstance(
+            identity_material["attempt"], bool
+        ):
+            raise GripPreflightError("delegated Grabowski task attempt is invalid")
+        for field in (
+            "argv_sha256",
+            "terminalization_sha256",
+            "lifecycle_receipt_sha256",
+        ):
+            if not _is_sha256_hex(identity_material[field]):
+                raise GripPreflightError(
+                    f"delegated Grabowski task {field} is invalid"
+                )
+        if not isinstance(identity_material["updated_at_unix"], int) or isinstance(
+            identity_material["updated_at_unix"], bool
+        ):
+            raise GripPreflightError(
+                "delegated Grabowski task observation time is invalid"
+            )
+    elif kind == "agent_workspace":
+        observation_tool = "grabowski_agent_workspace_status"
+        observed = _observe_operator_workspace(identifier)
+        if not isinstance(observed, dict):
+            raise GripPreflightError("delegation observation returned a non-object")
+        raw_tasks = observed.get("tasks")
+        raw_tasks = raw_tasks if isinstance(raw_tasks, dict) else {}
+        task_states: dict[str, dict[str, Any]] = {}
+        active_roles: list[str] = []
+        for role in ("writer", "tests", "review"):
+            task = raw_tasks.get(role)
+            task = task if isinstance(task, dict) else {}
+            state = str(task.get("state") or "")
+            task_states[role] = {
+                "task_id": task.get("task_id"),
+                "state": state,
+                "terminal": task.get("terminal"),
+            }
+            if state in {"launching", "running"}:
+                active_roles.append(role)
+        if observed.get("workspace_id") != identifier:
+            raise GripPreflightError("delegated workspace identity mismatch")
+        if observed.get("closed") is not True or active_roles:
+            raise GripPreflightError("delegated workspace is not terminal")
+        terminal_status = "closed"
+        identity_material = {
+            "kind": kind,
+            "id": identifier,
+            "workspace_id": observed.get("workspace_id"),
+            "creation_state": observed.get("creation_state"),
+            "expected_base_head": observed.get("expected_base_head"),
+            "closed": observed.get("closed"),
+            "writer_terminal_failure": observed.get("writer_terminal_failure"),
+            "tasks": task_states,
+            "status": terminal_status,
+        }
+        expected_base_head = identity_material["expected_base_head"]
+        if not isinstance(expected_base_head, str) or _normalize_40_sha(
+            expected_base_head
+        ) is None:
+            raise GripPreflightError(
+                "delegated workspace base identity is invalid"
+            )
+    else:
+        raise GripPreflightError(
+            "delegation.kind must be systemd_job, grabowski_task, or agent_workspace"
+        )
+
+    observed_at = utc_now()
+    identity_sha256 = sha256_json(identity_material)
+    observation_material = {
+        "kind": str(kind),
+        "id": identifier,
+        "observation_tool": observation_tool,
+        "status": terminal_status,
+        "observed_at": observed_at,
+        "identity_sha256": identity_sha256,
+    }
+    return {
+        **observation_material,
+        "observation_receipt_sha256": sha256_json(observation_material),
+    }
+
+
 def _run_operator_obligation_close(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -7607,6 +7983,7 @@ _RUNNERS = {
     "operator_obligation_list": _run_operator_obligation_list,
     "operator_obligation_status": _run_operator_obligation_status,
     "operator_obligation_close": _run_operator_obligation_close,
+    "operator_obligation_resolve": _run_operator_obligation_resolve,
     "mechanic_loop": _run_mechanic_loop,
     "captain_preflight": _run_captain_preflight,
     "captain_run": _run_captain_run,
