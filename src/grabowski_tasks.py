@@ -305,7 +305,7 @@ TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS = frozenset(
         "source_authoritative_unit",
         "source_updated_at_unix",
         "source_execution_identity_sha256",
-        "source_observation_sha256",
+        "source_recovery_evidence_sha256",
         "named_state_change",
         "admitted_at_unix",
         "does_not_establish",
@@ -2118,6 +2118,53 @@ def _latest_matching_execution_record(
     return record
 
 
+def _matching_attention_execution_records(
+    identity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
+    placeholders = ",".join("?" for _ in attention_states)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND state IN ({placeholders}) "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+                *attention_states,
+            ),
+        ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("matching attention execution scan limit exceeded")
+    records = [dict(row) for row in rows]
+    if any(
+        _record_execution_identity(record)["identity_sha256"]
+        != identity["identity_sha256"]
+        for record in records
+    ):
+        raise RuntimeError("stored task execution identity is inconsistent")
+    return records
+
+
 def _build_terminal_retry_context(
     record: dict[str, Any],
     *,
@@ -2225,6 +2272,75 @@ def _validate_terminal_retry_context(
     }
 
 
+def _interrupted_recovery_evidence_projection(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    if str(record.get("state")) != "interrupted":
+        raise ValueError("interrupted recovery source task is not interrupted")
+    if not isinstance(observation, dict):
+        raise ValueError("interrupted recovery observation is invalid")
+    properties = observation.get("properties")
+    probe = observation.get("probe")
+    observer = observation.get("observer")
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(probe, dict)
+        or not isinstance(observer, dict)
+    ):
+        raise ValueError("interrupted recovery observation evidence is incomplete")
+    if properties.get("LoadState") != "not-found":
+        raise ValueError("interrupted recovery old unit is not confirmed absent")
+    if properties.get("ActiveState") not in {None, "", "inactive"}:
+        raise ValueError("interrupted recovery old unit state is not safely absent")
+    if properties.get("SubState") not in {None, "", "dead"}:
+        raise ValueError("interrupted recovery old unit substate is not safely absent")
+    if properties.get("Result") not in {None, "", "success"}:
+        raise ValueError("interrupted recovery old unit retains a material result")
+    if properties.get("ExecMainCode") not in {None, "", "0"}:
+        raise ValueError("interrupted recovery old unit retains a material exit code")
+    if properties.get("ExecMainStatus") not in {None, "", "0"}:
+        raise ValueError("interrupted recovery old unit retains a material exit status")
+    returncode = probe.get("returncode")
+    if (
+        isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or returncode not in {0, 1, 3, 4}
+        or bool(probe.get("timed_out"))
+        or bool(probe.get("outcome_unknown"))
+    ):
+        raise ValueError("interrupted recovery probe transport is not authoritative")
+    expected_backend = _execution_backend(record)
+    expected_scope = _systemd_scope(record)
+    if (
+        observer.get("execution_backend") != expected_backend
+        or observer.get("systemd_scope") != expected_scope
+        or not isinstance(observer.get("kind"), str)
+        or not str(observer.get("kind")).strip()
+    ):
+        raise ValueError("interrupted recovery observer binding is invalid")
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_interrupted_unit_absence_evidence",
+        "source_task_id": str(record["task_id"]),
+        "source_unit": str(record["unit"]),
+        "source_authoritative_unit": _authoritative_unit(record),
+        "execution_backend": expected_backend,
+        "systemd_scope": expected_scope,
+        "observer_kind": str(observer["kind"]),
+        "observation_state": str(observation.get("state") or ""),
+        "load_state": "not-found",
+        "active_state": str(properties.get("ActiveState") or ""),
+        "sub_state": str(properties.get("SubState") or ""),
+        "result": str(properties.get("Result") or ""),
+        "exec_main_code": str(properties.get("ExecMainCode") or ""),
+        "exec_main_status": str(properties.get("ExecMainStatus") or ""),
+        "probe_returncode": returncode,
+        "probe_timed_out": False,
+        "probe_outcome_unknown": False,
+    }
+
+
 def _build_interrupted_recovery_context(
     record: dict[str, Any],
     observation: dict[str, Any],
@@ -2234,17 +2350,7 @@ def _build_interrupted_recovery_context(
     normalized_reason = _redact_reason(reason.strip())
     if not normalized_reason:
         raise ValueError("named interrupted recovery state change is required")
-    if str(record.get("state")) != "interrupted":
-        raise ValueError("interrupted recovery source task is not interrupted")
-    if str(observation.get("state")) != "interrupted":
-        raise ValueError("interrupted recovery observation is stale")
-    raw_observation = record.get("last_observation_json")
-    try:
-        persisted_observation = json.loads(str(raw_observation))
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError("interrupted recovery source observation is missing") from exc
-    if not isinstance(persisted_observation, dict) or persisted_observation != observation:
-        raise ValueError("interrupted recovery source observation is stale")
+    recovery_evidence = _interrupted_recovery_evidence_projection(record, observation)
     material = {
         "schema_version": TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION,
         "kind": "grabowski_named_interrupted_recovery",
@@ -2258,7 +2364,7 @@ def _build_interrupted_recovery_context(
         "source_execution_identity_sha256": _record_execution_identity(record)[
             "identity_sha256"
         ],
-        "source_observation_sha256": _sha256_json(persisted_observation),
+        "source_recovery_evidence_sha256": _sha256_json(recovery_evidence),
         "named_state_change": normalized_reason,
         "admitted_at_unix": _now(),
         "does_not_establish": [
@@ -2289,17 +2395,7 @@ def _validate_interrupted_recovery_context(
         or context.get("kind") != "grabowski_named_interrupted_recovery"
     ):
         raise ValueError("interrupted recovery context contract is invalid")
-    if str(record.get("state")) != "interrupted":
-        raise ValueError("interrupted recovery source task is no longer interrupted")
-    if str(observation.get("state")) != "interrupted":
-        raise ValueError("interrupted recovery observation is no longer current")
-    raw_observation = record.get("last_observation_json")
-    try:
-        persisted_observation = json.loads(str(raw_observation))
-    except (json.JSONDecodeError, TypeError) as exc:
-        raise ValueError("interrupted recovery source observation is missing") from exc
-    if not isinstance(persisted_observation, dict):
-        raise ValueError("interrupted recovery source observation is invalid")
+    recovery_evidence = _interrupted_recovery_evidence_projection(record, observation)
     expected = {
         "source_task_id": str(record["task_id"]),
         "source_attempt": int(record["attempt"]),
@@ -2311,7 +2407,7 @@ def _validate_interrupted_recovery_context(
         "source_execution_identity_sha256": _record_execution_identity(record)[
             "identity_sha256"
         ],
-        "source_observation_sha256": _sha256_json(persisted_observation),
+        "source_recovery_evidence_sha256": _sha256_json(recovery_evidence),
     }
     for key, value in expected.items():
         if context.get(key) != value:
@@ -2334,6 +2430,7 @@ def _validate_interrupted_recovery_context(
     ):
         raise ValueError("interrupted recovery context non-claims are invalid")
     return dict(context)
+
 
 
 def _persisted_retry_binding_or_raise(record: dict[str, Any]) -> dict[str, Any] | None:
@@ -2395,7 +2492,7 @@ def _persisted_interrupted_recovery_binding_or_raise(
     source_updated_at_unix = binding.get("source_updated_at_unix")
     admitted_at_unix = binding.get("admitted_at_unix")
     named_state_change = binding.get("named_state_change")
-    source_observation_sha256 = binding.get("source_observation_sha256")
+    source_recovery_evidence_sha256 = binding.get("source_recovery_evidence_sha256")
     non_claims = binding.get("does_not_establish")
     if (
         binding.get("context_sha256") != _sha256_json(material)
@@ -2408,8 +2505,8 @@ def _persisted_interrupted_recovery_binding_or_raise(
         or admitted_at_unix < source_updated_at_unix
         or not isinstance(named_state_change, str)
         or not named_state_change.strip()
-        or not isinstance(source_observation_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", source_observation_sha256) is None
+        or not isinstance(source_recovery_evidence_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_recovery_evidence_sha256) is None
         or not isinstance(non_claims, list)
         or any(not isinstance(item, str) or not item for item in non_claims)
     ):
@@ -2575,6 +2672,52 @@ def _latest_matching_unprepared_managed_cargo_record(
                     return record
 
 
+def _matching_attention_unprepared_managed_cargo_records(
+    identity: dict[str, Any],
+    command: list[str],
+) -> list[dict[str, Any]]:
+    attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
+    placeholders = ",".join("?" for _ in attention_states)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND state IN ({placeholders}) "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            (
+                identity["host"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+                *attention_states,
+            ),
+        ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("matching managed Cargo attention scan limit exceeded")
+    return [
+        record
+        for row in rows
+        if _record_matches_unprepared_managed_cargo_command(
+            record := dict(row), command
+        )
+    ]
+
+
 def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
     if record is None:
         return
@@ -2628,6 +2771,15 @@ def _guard_unprepared_managed_cargo_retry(
     if retry_context is None:
         latest = _latest_matching_unprepared_managed_cargo_record(identity, command)
         _guard_direct_terminal_retry_record(latest)
+        latest_task_id = str(latest["task_id"]) if latest is not None else None
+        for source in _matching_attention_unprepared_managed_cargo_records(
+            identity, command
+        ):
+            if str(source["task_id"]) == latest_task_id:
+                continue
+            if _retained_retry_successor_for_source(str(source["task_id"])) is not None:
+                continue
+            _guard_direct_terminal_retry_record(source)
         return
     source_task_id = retry_context.get("source_task_id")
     if not isinstance(source_task_id, str):
@@ -2667,6 +2819,13 @@ def _guard_unchanged_terminal_retry(
         )
 
     _guard_direct_terminal_retry_record(latest)
+    latest_task_id = str(latest["task_id"]) if latest is not None else None
+    for source in _matching_attention_execution_records(identity):
+        if str(source["task_id"]) == latest_task_id:
+            continue
+        if _retained_retry_successor_for_source(str(source["task_id"])) is not None:
+            continue
+        _guard_direct_terminal_retry_record(source)
     return None
 
 
@@ -4575,6 +4734,13 @@ def grabowski_task_resume(
         raise RuntimeError("Terminal task cannot be resumed")
     if record["resume_policy"] == "never":
         raise PermissionError("Task resume policy does not permit automatic retry")
+    if (
+        str(record["state"]) == "interrupted"
+        and _interrupted_recovery_context is None
+    ):
+        raise PermissionError(
+            "Interrupted task resume requires exact recovery evidence"
+        )
     if record["resume_policy"] == "manual" and _interrupted_recovery_context is None:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
@@ -4582,14 +4748,20 @@ def grabowski_task_resume(
     observation = _observe(record)
     if observation["state"] == "running":
         raise RuntimeError("Task is still running")
-    if observation["state"] == "completed":
+    if (
+        observation["state"] == "completed"
+        and _interrupted_recovery_context is None
+    ):
         stored = _set_state(
             task_id,
             "completed",
             observation=observation,
         )
         raise RuntimeError("Task already completed; refusing retry")
-    if observation["state"] == "outcome_unknown":
+    if (
+        observation["state"] == "outcome_unknown"
+        and _interrupted_recovery_context is None
+    ):
         _set_state(
             task_id,
             "outcome_unknown",
@@ -5542,6 +5714,92 @@ def reconcile_tasks_resume(
                 raise
             blocked.append(_reconcile_unknown_host(record, exc))
             continue
+
+        if str(record["state"]) == "interrupted":
+            if not task_id:
+                blocked.append(
+                    {
+                        "task_id": record["task_id"],
+                        "resume_policy": record["resume_policy"],
+                        "reason": (
+                            "interrupted recovery requires an exact task target "
+                            "and named state change"
+                        ),
+                        "reason_class": "evidence_drift",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+                continue
+            try:
+                _interrupted_recovery_evidence_projection(record, observation)
+            except ValueError as exc:
+                blocked.append(
+                    {
+                        "task_id": record["task_id"],
+                        "resume_policy": record["resume_policy"],
+                        "reason": _redact_reason(str(exc)),
+                        "reason_class": "evidence_drift",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+                continue
+            if len(resumed) >= max_resumes:
+                blocked.append(
+                    {
+                        "task_id": record["task_id"],
+                        "resume_policy": record["resume_policy"],
+                        "reason": "max_resumes reached",
+                        "reason_class": "retry_exhausted",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+                continue
+            stored = _set_state(
+                record["task_id"],
+                "interrupted",
+                observation=observation,
+            )
+            public = _public(stored)
+            public["lease_maintenance"] = None
+            refreshed.append(public)
+            try:
+                interrupted_context = _build_interrupted_recovery_context(
+                    stored,
+                    observation,
+                    reason=reason,
+                )
+                resumed_task = dict(
+                    grabowski_task_resume(
+                        stored["task_id"],
+                        _interrupted_recovery_context=interrupted_context,
+                    )["task"]
+                )
+                resumed_task["explicit_interrupted_recovery"] = True
+                resumed_task["recovery_reason"] = _redact_reason(reason.strip())
+                resumed_task["interrupted_recovery_context_sha256"] = (
+                    interrupted_context["context_sha256"]
+                )
+                resumed.append(resumed_task)
+            except Exception as exc:
+                blocked.append(
+                    {
+                        "task_id": stored["task_id"],
+                        "resume_policy": stored["resume_policy"],
+                        "reason": _redact_reason(str(exc)),
+                        "reason_class": "evidence_drift",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+            continue
+
         effective_state = _effective_observed_state(record, observation["state"])
         lease_maintenance = _maintain_record_resources(record, effective_state)
         if lease_maintenance is not None:
@@ -5575,18 +5833,7 @@ def reconcile_tasks_resume(
                 )
             )
         )
-        explicit_interrupted_recovery = bool(task_id) and bool(blocker) and (
-            str(stored["state"]) == "interrupted"
-            and str(observation.get("state")) == "interrupted"
-            and str(stored["resume_policy"])
-            in {"manual", "verify-then-retry", "retry-safe"}
-            and blocker.get("reason_class") == "evidence_drift"
-        )
-        if (
-            blocker is not None
-            and not explicit_policy_override
-            and not explicit_interrupted_recovery
-        ):
+        if blocker is not None and not explicit_policy_override:
             blocked.append(blocker)
             continue
         if len(resumed) >= max_resumes:
@@ -5611,24 +5858,6 @@ def reconcile_tasks_resume(
                         explicit_policy_override=explicit_policy_override,
                     )
                 )
-            elif explicit_interrupted_recovery:
-                interrupted_context = _build_interrupted_recovery_context(
-                    stored,
-                    observation,
-                    reason=reason,
-                )
-                resumed_task = dict(
-                    grabowski_task_resume(
-                        stored["task_id"],
-                        _interrupted_recovery_context=interrupted_context,
-                    )["task"]
-                )
-                resumed_task["explicit_interrupted_recovery"] = True
-                resumed_task["recovery_reason"] = _redact_reason(reason.strip())
-                resumed_task["interrupted_recovery_context_sha256"] = (
-                    interrupted_context["context_sha256"]
-                )
-                resumed.append(resumed_task)
             else:
                 resumed.append(grabowski_task_resume(stored["task_id"])["task"])
         except Exception as exc:

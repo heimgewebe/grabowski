@@ -87,6 +87,34 @@ def _launcher(returncode: int = 0) -> dict[str, object]:
     }
 
 
+def _missing_unit_observation(
+    *,
+    observed_at_unix: int,
+    duration_seconds: float,
+    returncode: int = 0,
+) -> dict[str, object]:
+    probe = _launcher(returncode)
+    probe["duration_seconds"] = duration_seconds
+    return {
+        "state": "completed",
+        "properties": {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "ExecMainCode": "0",
+            "ExecMainStatus": "0",
+        },
+        "probe": probe,
+        "observer": {
+            "kind": "fleet-dispatch-v1",
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+        },
+        "observed_at_unix": observed_at_unix,
+    }
+
+
 class TaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -2275,15 +2303,18 @@ class TaskTests(unittest.TestCase):
     def test_exact_reconcile_resume_allows_named_interrupted_recovery(self) -> None:
         started = self._start()
         task_id = str(started["task"]["task_id"])
-        observation = {
-            "state": "interrupted",
-            "source": "test-authoritative-observation",
-            "observed_at_unix": 170,
-        }
         source = tasks._set_state(
             task_id,
             "interrupted",
-            observation=observation,
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=170,
+            duration_seconds=0.01,
+        )
+        revalidated = _missing_unit_observation(
+            observed_at_unix=171,
+            duration_seconds=0.99,
         )
         launch_bindings: list[dict[str, object]] = []
 
@@ -2303,8 +2334,8 @@ class TaskTests(unittest.TestCase):
             return _launcher()
 
         with (
-            patch.object(tasks, "_reconcile_observation", return_value=observation),
-            patch.object(tasks, "_observe", return_value=observation),
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=revalidated),
             patch.object(tasks, "_launch", side_effect=launch_with_persisted_binding),
             patch.object(tasks.base, "_append_audit"),
             patch.object(
@@ -2335,14 +2366,18 @@ class TaskTests(unittest.TestCase):
     def test_interrupted_recovery_requires_exact_task_target(self) -> None:
         started = self._start()
         task_id = str(started["task"]["task_id"])
-        observation = {
-            "state": "interrupted",
-            "source": "test-authoritative-observation",
-            "observed_at_unix": 172,
-        }
-        tasks._set_state(task_id, "interrupted", observation=observation)
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        observation = _missing_unit_observation(
+            observed_at_unix=172,
+            duration_seconds=0.01,
+        )
         with (
             patch.object(tasks, "_reconcile_observation", return_value=observation),
+            patch.object(tasks, "_set_state") as set_state,
             patch.object(tasks, "_launch") as launch,
         ):
             result = tasks.reconcile_tasks_resume(
@@ -2352,7 +2387,75 @@ class TaskTests(unittest.TestCase):
         self.assertEqual([], result["resumed"])
         self.assertEqual(task_id, result["blocked"][0]["task_id"])
         self.assertEqual("evidence_drift", result["blocked"][0]["reason_class"])
+        set_state.assert_not_called()
         launch.assert_not_called()
+
+    def test_interrupted_recovery_revalidates_material_evidence_before_effects(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=173,
+            duration_seconds=0.01,
+            returncode=0,
+        )
+        changed = _missing_unit_observation(
+            observed_at_unix=174,
+            duration_seconds=0.02,
+            returncode=4,
+        )
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=changed),
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 174},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted dependency state",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["resumed"])
+        self.assertEqual("evidence_drift", result["blocked"][0]["reason_class"])
+        self.assertIn("binding is stale", result["blocked"][0]["reason"])
+        acquire.assert_not_called()
+        launch.assert_not_called()
+
+    def test_direct_resume_requires_recovery_evidence_for_every_interrupted_policy(self) -> None:
+        for policy in ("manual", "verify-then-retry", "retry-safe"):
+            with self.subTest(policy=policy):
+                started = self._start()
+                task_id = str(started["task"]["task_id"])
+                with tasks._database() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET resume_policy=? WHERE task_id=?",
+                        (policy, task_id),
+                    )
+                tasks._set_state(
+                    task_id,
+                    "interrupted",
+                    observation={"state": "interrupted", "source": "startup-recovery"},
+                )
+                with (
+                    patch.object(tasks, "_observe") as observe,
+                    patch.object(tasks, "_launch") as launch,
+                    self.assertRaisesRegex(
+                        PermissionError,
+                        "requires exact recovery evidence",
+                    ),
+                ):
+                    tasks.grabowski_task_resume(task_id)
+                observe.assert_not_called()
+                launch.assert_not_called()
 
     def test_terminal_retry_replays_managed_cargo_binding_once(self) -> None:
         cache_key = "a" * 64
@@ -5240,6 +5343,54 @@ class TaskTests(unittest.TestCase):
             tasks.grabowski_task_start(**common)
         prepare_lock.assert_not_called()
 
+    def test_unprepared_managed_cargo_blocks_exposed_cancelled_successor_source(self) -> None:
+        raw_command = ["/usr/bin/cargo", "check"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        source = {"task_id": "c" * 24, "state": "failed"}
+        cancelled = {"task_id": "d" * 24, "state": "cancelled"}
+        with (
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks,
+                "_latest_matching_unprepared_managed_cargo_record",
+                return_value=cancelled,
+            ),
+            patch.object(
+                tasks,
+                "_matching_attention_unprepared_managed_cargo_records",
+                return_value=[source],
+            ),
+            patch.object(
+                tasks, "_retained_retry_successor_for_source", return_value=None
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks._guard_unprepared_managed_cargo_retry(
+                raw_command,
+                target=LOCAL_HOST,
+                cwd=str(self.root),
+                execution_backend="systemd-user",
+                identity=identity,
+                retry_context=None,
+            )
+
     def test_invalid_named_managed_cargo_retry_is_rejected_before_preparation(self) -> None:
         raw_command = ["/usr/bin/cargo", "check"]
         identity = tasks._task_execution_identity(
@@ -5406,6 +5557,23 @@ class TaskTests(unittest.TestCase):
             observed = tasks._guard_unchanged_terminal_retry(identity, context)
 
         self.assertEqual(source_id, observed["source_task_id"])
+
+    def test_direct_start_blocks_exposed_source_after_cancelled_successor(self) -> None:
+        source_id = "a" * 24
+        cancelled_id = "b" * 24
+        identity = {"identity_sha256": "c" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": cancelled_id, "state": "cancelled"}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(
+            tasks, "_matching_attention_execution_records", return_value=[source]
+        ), patch.object(
+            tasks, "_retained_retry_successor_for_source", return_value=None
+        ), self.assertRaisesRegex(RuntimeError, "unchanged terminal task retry blocked"):
+            tasks._guard_unchanged_terminal_retry(identity, None)
+
 
     def test_named_retry_validation_blocks_active_linked_successor(self) -> None:
         source_id = "5" * 24
