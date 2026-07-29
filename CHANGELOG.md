@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reworked external model routing around verified subscription baselines for ChatGPT Pro, Claude Pro, Google AI and SuperGrok: task fit and review quality outrank provider traffic balancing; API pay-as-you-go, purchased credits and overage are never automatic; current Opus 5, Sonnet 5, Gemini 3.1 Pro, Gemini 3.6 Flash, GPT-5.6 Sol and Grok 4.5 evidence supersedes stale catalog generations; Fable 5 remains explicit-paid-only; Codex is contrast-only; and a receipt-bound, single-turn, offline Grok review path is now available.
 - Added a server-enforced base-update guard to Captain PR merges: direct dispatch now requires an active GitHub ruleset with nonempty strict required status checks, no bypass actors and `current_user_can_bypass=never`; the policy is re-read after atomic lease acquisition so repositories without an exact reviewed-base barrier fail closed before merge.
 - Preserved literal argv across durable jobs and both user and root persistent-task launchers with a reversible systemd dollar transport encoding compatible with systemd 249 and newer; shell variables, command substitutions, heredocs and foreign template syntax now reach only the intended runtime while stored argv and SHA-256 identity remain unchanged.
 - Juno Operator beendet interaktive Warnläufe ohne rote `SystemExit`-Ausnahme; echte Laufzeitfehler bleiben weiterhin sichtbar.

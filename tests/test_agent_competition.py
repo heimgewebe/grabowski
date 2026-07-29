@@ -150,6 +150,22 @@ class AgentCompetitionTests(unittest.TestCase):
                 "authority": "advisory_only",
                 "automatic_patch_apply": False,
             }
+        elif route_id == "grok-4.5-review-high":
+            contract = {
+                "schema_version": 1,
+                "catalog_sha256": "a" * 64,
+                "route_id": route_id,
+                "harness": "grok",
+                "harness_binary": "grok",
+                "model": "grok-4.5",
+                "effort": "high",
+                "argv_prefix": ["grok", "--model", "grok-4.5"],
+                "permission_mode": None,
+                "quota_pools": ["grok-com"],
+                "paid_only": False,
+                "authority": "advisory_only",
+                "automatic_patch_apply": False,
+            }
         elif route_id == "opencode-deepseek-v4-flash-free":
             contract = {
                 "schema_version": 1,
@@ -318,6 +334,22 @@ class AgentCompetitionTests(unittest.TestCase):
                 "--mode",
                 "plan",
                 "--sandbox",
+            ]
+        elif manifest["schema_version"] == 3 and manifest["provider"] == "grok":
+            command = [
+                *manifest["route_contract"]["argv_prefix"],
+                "--prompt-file",
+                str(prompt_path),
+                "--max-turns",
+                "1",
+                "--disable-web-search",
+                "--no-subagents",
+                "--no-memory",
+                "--permission-mode",
+                "plan",
+                "--tools=",
+                "--json-schema",
+                json.dumps({"type": "object"}, separators=(",", ":")),
             ]
         elif manifest["schema_version"] == 3 and manifest["provider"] in {"opencode", "openhands"}:
             command = [
@@ -1400,6 +1432,11 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(receipt["route_contract"], contract)
         self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
         self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
+
+    def test_route_bound_grok_receipt_preserves_offline_single_turn_binding(self) -> None:
+        self._assert_zero_budget_route_receipt(
+            provider="grok", route_id="grok-4.5-review-high"
+        )
 
     def test_route_bound_opencode_receipt_preserves_route_and_zero_budget_binding(self) -> None:
         self._assert_zero_budget_route_receipt(
