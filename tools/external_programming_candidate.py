@@ -29,7 +29,7 @@ STALE_SCRATCH_SWEEP_LIMIT = 64
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TEMP_OUTPUT_RE = re.compile(r"^\.(?P<target>[A-Za-z0-9._-]{1,100})\.(?P<pid>[0-9]+)\.(?P<nonce>[0-9a-f]{16})\.tmp$")
-PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex"}
+PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex", "grok"}
 LEGACY_PROVIDERS = {"agy"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
@@ -703,7 +703,7 @@ def validate_packet(packet: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(summary, str) or "\x00" in summary or len(summary.encode("utf-8")) > 32_000:
         raise CandidateError("primary_summary is invalid")
     competition_id = packet["competition_id"]
-    if not isinstance(competition_id, str) or re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", competition_id) is None:
+    if not isinstance(competition_id, str) or re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex|grok)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", competition_id) is None:
         raise CandidateError("competition_id is invalid")
     repository = packet["repository"]
     if not isinstance(repository, str) or not Path(repository).is_absolute() or "\x00" in repository:
@@ -840,6 +840,40 @@ def parse_claude_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
     candidate = envelope.get("structured_output")
     if not isinstance(candidate, dict):
         raise CandidateError("Claude result has no structured_output object")
+    return envelope, candidate
+
+
+def parse_grok_json(stdout: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise CandidateError(f"Grok output is invalid JSON: {exc}") from exc
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("stopReason") != "EndTurn"
+        or envelope.get("num_turns") != 1
+    ):
+        raise CandidateError("Grok result envelope is not one completed turn")
+    candidate = envelope.get("structuredOutput")
+    if not isinstance(candidate, dict):
+        raise CandidateError("Grok result has no structuredOutput object")
+    text = envelope.get("text")
+    if not isinstance(text, str):
+        raise CandidateError("Grok result has no structured text")
+    try:
+        text_candidate = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise CandidateError(f"Grok structured text is invalid JSON: {exc}") from exc
+    if text_candidate != candidate:
+        raise CandidateError("Grok structured text disagrees with structuredOutput")
+    total_cost = envelope.get("total_cost_usd")
+    if (
+        isinstance(total_cost, bool)
+        or not isinstance(total_cost, (int, float))
+        or not math.isfinite(float(total_cost))
+        or float(total_cost) < 0
+    ):
+        raise CandidateError("Grok result cost metadata is invalid")
     return envelope, candidate
 
 
@@ -1065,6 +1099,36 @@ def provider_command(
                 prompt_path.parent,
                 False,
             )
+        if packet["provider"] == "grok":
+            prefix = list(route["argv_prefix"])
+            if not prefix or prefix[0] != "grok":
+                raise CandidateError("Grok route must use a grok argv_prefix")
+            schema = json.dumps(
+                CANDIDATE_SCHEMA,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            return (
+                prefix
+                + [
+                    "--prompt-file",
+                    str(prompt_path),
+                    "--max-turns",
+                    "1",
+                    "--disable-web-search",
+                    "--no-subagents",
+                    "--no-memory",
+                    "--permission-mode",
+                    "plan",
+                    "--tools=",
+                    "--json-schema",
+                    schema,
+                ],
+                None,
+                prompt_path.parent,
+                False,
+            )
         if packet["provider"] == "opencode":
             prefix = list(route["argv_prefix"])
             if not prefix or prefix[0] != "opencode":
@@ -1119,6 +1183,55 @@ def bound_output_path(raw: str, *, directory: Path, expected_name: str) -> Path:
     if path.exists() or path.is_symlink():
         raise CandidateError(f"{expected_name} already exists")
     return path
+
+def resolve_provider_executable(
+    command: list[str],
+    *,
+    packet: dict[str, Any],
+    environment: dict[str, str],
+) -> str:
+    if not command or not isinstance(command[0], str) or not command[0]:
+        raise CandidateError("provider command has no executable")
+    if packet.get("schema_version") == 3 and packet.get("provider") == "grok":
+        home_raw = environment.get("HOME")
+        if not home_raw or not Path(home_raw).is_absolute() or "\x00" in home_raw:
+            raise CandidateError("Grok native binary home is unavailable")
+        try:
+            home_path = Path(home_raw)
+            home = home_path.resolve(strict=True)
+            bin_directory = home / ".grok" / "bin"
+            bin_metadata = bin_directory.lstat()
+            resolved_bin_directory = bin_directory.resolve(strict=True)
+            canonical = bin_directory / "grok"
+            canonical_metadata = canonical.lstat()
+            native = canonical.resolve(strict=True)
+            native_metadata = native.stat()
+        except OSError as exc:
+            raise CandidateError(f"Grok native binary is unavailable: {exc}") from exc
+        if (
+            not stat.S_ISDIR(bin_metadata.st_mode)
+            or bin_metadata.st_uid != os.getuid()
+            or bin_metadata.st_mode & 0o022
+            or resolved_bin_directory != bin_directory
+            or canonical_metadata.st_uid != os.getuid()
+            or not stat.S_ISLNK(canonical_metadata.st_mode)
+            or native.parent != resolved_bin_directory
+            or re.fullmatch(r"grok-[A-Za-z0-9][A-Za-z0-9._-]{0,79}", native.name) is None
+            or not stat.S_ISREG(native_metadata.st_mode)
+            or native_metadata.st_uid != os.getuid()
+            or native_metadata.st_mode & 0o022
+            or not os.access(native, os.X_OK)
+        ):
+            raise CandidateError("Grok native binary identity is invalid")
+        return str(native)
+    executable = shutil.which(command[0], path=environment["PATH"])
+    if not executable:
+        raise CandidateError(f"provider executable is unavailable: {command[0]}")
+    try:
+        return str(Path(executable).resolve(strict=True))
+    except OSError as exc:
+        raise CandidateError(f"provider executable cannot be resolved: {exc}") from exc
+
 
 def provider_environment() -> dict[str, str]:
     allowed = {
@@ -1418,10 +1531,11 @@ def main(argv: list[str] | None = None) -> int:
             prompt_path=prompt_path,
         )
         environment = provider_environment()
-        executable = shutil.which(command[0], path=environment["PATH"])
-        if not executable:
-            raise CandidateError(f"provider executable is unavailable: {command[0]}")
-        executable = str(Path(executable).resolve(strict=True))
+        executable = resolve_provider_executable(
+            command,
+            packet=packet,
+            environment=environment,
+        )
         version_command = (
             [executable, packet["route_contract"]["argv_prefix"][1], "--print-route"]
             if packet["schema_version"] == 3 and packet["provider"] == "codex"
@@ -1467,6 +1581,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         if packet["provider"] == "claude":
             envelope, candidate_raw = parse_claude_json(text)
+        elif packet["provider"] == "grok":
+            envelope, candidate_raw = parse_grok_json(text)
         elif packet["provider"] in {"opencode", "openhands"}:
             envelope, candidate_raw = parse_agent_jsonl(text)
         else:

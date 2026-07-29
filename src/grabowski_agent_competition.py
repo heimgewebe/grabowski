@@ -32,7 +32,15 @@ COMPETITION_ROOT = Path(
     )
 ).expanduser()
 RUNNER = Path(__file__).resolve().parent.parent / "tools" / "external_programming_candidate.py"
-PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex"}
+PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex", "grok"}
+ROUTABLE_EXTERNAL_PROVIDERS = (
+    "codex",
+    "claude",
+    "antigravity",
+    "opencode",
+    "openhands",
+    "grok",
+)
 LEGACY_PROVIDERS = {"agy"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
@@ -392,7 +400,7 @@ def _competition_root() -> Path:
 
 def _competition_dir(identifier: str) -> Path:
     clean = workspace._required_string(identifier, "competition_id", max_length=100)
-    if re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
+    if re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex|grok)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
         raise AgentCompetitionError("competition_id has an invalid format")
     return _competition_root() / clean
 
@@ -1429,6 +1437,44 @@ def _validate_receipt_execution(receipt: dict[str, Any], packet: dict[str, Any])
                 or "--sandbox" not in command
             ):
                 raise AgentCompetitionError("candidate receipt Antigravity route command shape is invalid")
+        elif receipt["provider"] == "grok":
+            prefix = route_contract["argv_prefix"]
+            prompt_index = command.index("--prompt-file") if "--prompt-file" in command else -1
+            max_turns_index = command.index("--max-turns") if "--max-turns" in command else -1
+            permission_index = command.index("--permission-mode") if "--permission-mode" in command else -1
+            schema_index = command.index("--json-schema") if "--json-schema" in command else -1
+            if (
+                command[: len(prefix)] != prefix
+                or "--single" in command
+                or prompt_index < 0
+                or prompt_index + 1 >= len(command)
+                or not Path(command[prompt_index + 1]).is_absolute()
+                or Path(command[prompt_index + 1]).name != "prompt.txt"
+                or max_turns_index < 0
+                or max_turns_index + 1 >= len(command)
+                or command[max_turns_index + 1] != "1"
+                or "--disable-web-search" not in command
+                or "--no-subagents" not in command
+                or "--no-memory" not in command
+                or permission_index < 0
+                or permission_index + 1 >= len(command)
+                or command[permission_index + 1] != "plan"
+                or "--tools=" not in command
+                or schema_index < 0
+                or schema_index + 1 >= len(command)
+                or not command[schema_index + 1].strip()
+            ):
+                raise AgentCompetitionError("candidate receipt Grok route command shape is invalid")
+            try:
+                schema = json.loads(command[schema_index + 1])
+            except json.JSONDecodeError as exc:
+                raise AgentCompetitionError(
+                    "candidate receipt Grok route schema is invalid"
+                ) from exc
+            if not isinstance(schema, dict) or schema.get("type") != "object":
+                raise AgentCompetitionError(
+                    "candidate receipt Grok route schema is invalid"
+                )
         elif receipt["provider"] == "opencode":
             prefix = route_contract["argv_prefix"]
             if (
@@ -1892,7 +1938,7 @@ def grabowski_agent_execution_route(
     if available_external_agents is None:
         normalized_agents = [
             provider
-            for provider in ("codex", "claude", "antigravity", "opencode", "openhands")
+            for provider in ROUTABLE_EXTERNAL_PROVIDERS
             if (
                 (provider == "codex" and (shutil.which("codex") or shutil.which("codexr")))
                 or (provider == "antigravity" and shutil.which("agy"))
@@ -1918,7 +1964,7 @@ def grabowski_agent_execution_route(
             )
         normalized_agents = [
             provider
-            for provider in ("codex", "claude", "antigravity", "opencode", "openhands")
+            for provider in ROUTABLE_EXTERNAL_PROVIDERS
             if provider in requested_agents
         ]
     paid_authorized = _strict_bool(
@@ -1960,7 +2006,7 @@ def grabowski_agent_execution_route(
             risk_flags=normalized_flags,
             max_candidates=requested_candidates,
             allow_paid=paid_authorized,
-            allowed_harnesses=set(normalized_agents) & {"codex", "claude", "antigravity", "opencode", "openhands"},
+            allowed_harnesses=set(normalized_agents) & {"codex", "claude", "antigravity", "opencode", "openhands", "grok"},
         )
         selected_routes = list(contrast_selection["routes"])
         input_facts["available_external_agents"] = [
@@ -2113,7 +2159,7 @@ def grabowski_agent_competition_start(
     route_contract: dict[str, Any] | None = None
     if route_value:
         try:
-            route_contract = coding_router.contrast_route_execution_contract(
+            route_contract = coding_router.advisory_route_execution_contract(
                 route_value, paid_execution_authorized=paid_authorized
             )
         except coding_router.CodingAgentRouterError as exc:

@@ -13,7 +13,7 @@
       "kind": "local-cloud-client",
       "mutating": true,
       "plan_mode": true,
-      "structured_output": false
+      "structured_output": true
     },
     "aider": {
       "async": false,
@@ -132,9 +132,9 @@
   "kind": "coding-agent-catalog",
   "models": {
     "claude-fable-5": {
-      "availability": "paid-only",
+      "availability": "usage-credits-required",
       "base_quality_rank": 100,
-      "evidence": "owner-confirmed-paid-only-2026-07-23; capability heuristic",
+      "evidence": "claude-pro-live-429-usage-credits-required-2026-07-29",
       "family": "anthropic-fable",
       "identity_kind": "model",
       "name": "Claude Fable 5",
@@ -172,9 +172,9 @@
       "quality_prior_class": "C"
     },
     "claude-opus-4.8": {
-      "availability": "live-verified",
+      "availability": "compatibility-only-superseded",
       "base_quality_rank": 88,
-      "evidence": "live-access-verified; capability heuristic",
+      "evidence": "superseded-by-live-opus-alias-2026-07-29",
       "family": "anthropic-opus",
       "identity_kind": "model",
       "name": "Claude Opus 4.8",
@@ -230,9 +230,9 @@
     },
     "claude-sonnet-5": {
       "alias_resolution_observed_at": "2026-07-18T12:14:34Z",
-      "availability": "live-alias-resolved",
+      "availability": "live-verified-via-claude-pro",
       "base_quality_rank": 87,
-      "evidence": "local-cli-2.1.214-alias-contract-and-model-table; no model invocation",
+      "evidence": "claude-pro-sonnet-alias-resolved-to-claude-sonnet-5-smoke-2026-07-29",
       "family": "anthropic-sonnet-5",
       "identity_kind": "model",
       "name": "Claude Sonnet 5",
@@ -269,9 +269,9 @@
       }
     },
     "gemini-3.1-pro": {
-      "availability": "live",
+      "availability": "live-verified-via-google-ai",
       "base_quality_rank": 76,
-      "evidence": "configured-heuristic",
+      "evidence": "antigravity-gemini-3.1-pro-high-smoke-2026-07-29",
       "family": "google-gemini-pro",
       "identity_kind": "model",
       "name": "Gemini 3.1 Pro",
@@ -363,9 +363,9 @@
       "quality_prior_class": "B"
     },
     "gpt-5.6-sol": {
-      "availability": "live",
+      "availability": "live-verified-via-chatgpt-pro",
       "base_quality_rank": 100,
-      "evidence": "configured-heuristic",
+      "evidence": "codex-chatgpt-login-and-gpt-5.6-sol-xhigh-smoke-2026-07-29",
       "family": "openai-gpt-5.6",
       "identity_kind": "model",
       "name": "GPT-5.6 Sol",
@@ -440,9 +440,9 @@
       }
     },
     "grok-4.5": {
-      "availability": "live",
+      "availability": "live-verified-via-supergrok",
       "base_quality_rank": 84,
-      "evidence": "configured-heuristic",
+      "evidence": "grok-subscription-tier-supergrok-and-grok-4.5-build-smoke-2026-07-29",
       "family": "xai-grok-4.5",
       "identity_kind": "model",
       "name": "Grok 4.5",
@@ -566,6 +566,48 @@
         "speed": 4
       },
       "quality_prior_class": null
+    },
+    "claude-opus-5": {
+      "availability": "live-verified-via-claude-pro",
+      "base_quality_rank": 92,
+      "evidence": "claude-pro-opus-alias-resolved-to-claude-opus-5-smoke-2026-07-29",
+      "family": "anthropic-opus",
+      "identity_kind": "model",
+      "name": "Claude Opus 5",
+      "provider_family": "anthropic",
+      "quality": {
+        "architecture": 10,
+        "autonomy": 8,
+        "coding": 9,
+        "context": 10,
+        "debugging": 10,
+        "reliability": 10,
+        "review": 10,
+        "speed": 5
+      },
+      "quality_prior_class": "A",
+      "resolved_alias": "opus",
+      "resolved_model": "claude-opus-5"
+    },
+    "gemini-3.6-flash": {
+      "availability": "live-listed",
+      "base_quality_rank": 67,
+      "evidence": "antigravity-model-list-1.1.8-2026-07-29",
+      "family": "google-gemini-flash",
+      "identity_kind": "model",
+      "name": "Gemini 3.6 Flash",
+      "provider_family": "google",
+      "quality": {
+        "architecture": 6,
+        "autonomy": 8,
+        "coding": 7,
+        "context": 8,
+        "debugging": 7,
+        "reliability": 7,
+        "review": 6,
+        "speed": 9
+      },
+      "quality_prior_class": "C"
     }
   },
   "nonclaims": [
@@ -577,9 +619,10 @@
     "frontier-peer-benchmark-equivalence",
     "local-quality-superiority-before-five-comparable-runs",
     "merge-readiness",
-    "provider-parity-objective"
+    "provider-parity-objective",
+    "Subscription inclusion never establishes permission to consume purchased credits or API pay-as-you-go."
   ],
-  "observed_at": "2026-07-24",
+  "observed_at": "2026-07-29",
   "policy": {
     "adaptive_learning": {
       "access_probes_are_not_outcomes": true,
@@ -672,7 +715,7 @@
     "frontier_model_policy": {
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
-      "opus_role": "Upper-frontier independent review and judgment contrast; never an authoritative writer.",
+      "opus_role": "Upper-frontier Anthropic review via the Claude Pro baseline; live alias resolves to Claude Opus 5. Never an authoritative writer.",
       "principle": "Grabowski/ChatGPT performs every authoritative implementation directly, independent of size. External frontier models are ranked only for advisory review or explicitly requested isolated contrast work.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
@@ -680,10 +723,11 @@
       ],
       "upper_review_or_contrast_routes": [
         "codex-sol-medium",
-        "claude-opus-4.8-high",
+        "claude-opus-5-high",
         "codex-terra-high",
         "claude-sonnet-5-high",
-        "grok-4.5-high"
+        "grok-4.5-review-high",
+        "antigravity-gemini-pro-review-high"
       ],
       "paid_contrast_routes": [
         "claude-fable-5-contrast-high"
@@ -704,7 +748,7 @@
       "A": {
         "description": "strong frontier and upper work profiles",
         "models": [
-          "claude-opus-4.8",
+          "claude-opus-5",
           "gpt-5.6-terra",
           "claude-sonnet-5",
           "grok-4.5"
@@ -720,7 +764,7 @@
       "C": {
         "description": "fallback and low-cost throughput profiles",
         "models": [
-          "gemini-3.5-flash",
+          "gemini-3.6-flash",
           "gpt-oss-120b",
           "claude-sonnet-4.6",
           "claude-opus-4.6"
@@ -776,58 +820,125 @@
     "zero_marginal_cost_only_scope": "automatic-and-legacy-provider-only-routes",
     "explicit_paid_route_exceptions": [
       "claude-fable-5-contrast-high"
-    ]
+    ],
+    "subscription_routing_policy": {
+      "automatic_overage": "forbidden",
+      "baseline_quota_only": true,
+      "credits_and_api_payg_are_separate_cost_surfaces": true,
+      "entitlement_evidence_precedence": [
+        "live_server_auth_or_model_smoke",
+        "provider_plan_contract",
+        "owner_plan_assertion",
+        "configured_heuristic"
+      ],
+      "plans": {
+        "anthropic": "Claude Pro",
+        "google": "Google AI subscription (exact tier owner-asserted, harness access verified)",
+        "openai": "ChatGPT Pro (owner-asserted, Codex ChatGPT login verified)",
+        "xai": "SuperGrok"
+      },
+      "quota_exhaustion_action": "block_and_surface",
+      "route_selection": "quality_and_task_fit_within_remaining_subscription_baselines",
+      "traffic_balancing_by_provider": false
+    }
   },
   "quota_pools": {
     "antigravity-account": {
-      "cost_mode": "signed-in-account",
+      "cost_mode": "subscription_included",
       "credits_allowed": false,
       "marginal_cost_usd": 0,
       "max_concurrency": 2,
       "payg_fallback_allowed": false,
-      "quota_mode": "opaque-parent-account",
+      "quota_mode": "google-ai-antigravity-baseline",
       "reserve_floor": 0.15,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "excluded_cost_surfaces": [
+        "vertex-ai-api",
+        "google-ai-studio-api",
+        "purchased-ai-credits"
+      ],
+      "included_surfaces": [
+        "google-antigravity",
+        "jules"
+      ],
+      "overage_action": "block_and_surface",
+      "plan": "Google AI subscription",
+      "plan_evidence": "owner-asserted-2026-07-29; antigravity-gemini-3.1-pro-smoke-2026-07-29"
     },
     "antigravity-claude": {
-      "cost_mode": "signed-in-account",
+      "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
       "parent_pool": "antigravity-account",
       "payg_fallback_allowed": false,
       "quota_mode": "opaque-child-family",
       "reserve_floor": 0.15,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "purchased-ai-credits"
+      ],
+      "overage_action": "block_and_surface"
     },
     "antigravity-gemini": {
-      "cost_mode": "signed-in-account",
+      "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 2,
       "parent_pool": "antigravity-account",
       "payg_fallback_allowed": false,
       "quota_mode": "opaque-child-family",
       "reserve_floor": 0.1,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "purchased-ai-credits"
+      ],
+      "overage_action": "block_and_surface"
     },
     "antigravity-gptoss": {
-      "cost_mode": "signed-in-account",
+      "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
       "parent_pool": "antigravity-account",
       "payg_fallback_allowed": false,
       "quota_mode": "opaque-child-family",
       "reserve_floor": 0.05,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "purchased-ai-credits"
+      ],
+      "overage_action": "block_and_surface"
     },
     "claude-pro": {
       "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
-      "note": "Sonnet and Opus share this subscription pool; Claude Fable 5 is paid-only and requires separate explicit paid authorization. The announced separate Agent SDK credit is paused.",
+      "note": "Sonnet 5 and Opus 5 share one Claude Pro baseline. Fable 5 returned usage-credits-required and remains explicit-paid only.",
       "payg_fallback_allowed": false,
       "quota_mode": "shared-five-hour-and-weekly-plan-limits",
       "reserve_floor": 0.3,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "anthropic-api",
+        "usage-credits"
+      ],
+      "included_models_live_verified": [
+        "claude-sonnet-5",
+        "claude-opus-5"
+      ],
+      "included_surfaces": [
+        "claude-code"
+      ],
+      "overage_action": "block_and_surface",
+      "plan": "Claude Pro",
+      "plan_evidence": "claude-auth-status-subscriptionType-pro; sonnet-5-and-opus-5-smoke-2026-07-29"
     },
     "cline-account": {
       "blocked_reason": "Exact FREE model entitlement not verified.",
@@ -838,25 +949,50 @@
       "quota_mode": "unknown"
     },
     "grok-com": {
-      "cost_mode": "temporary-free-account",
+      "cost_mode": "subscription_included",
       "freshness_seconds": 86400,
       "marginal_cost_usd": 0,
       "max_concurrency": 1,
       "payg_fallback_allowed": false,
-      "quota_mode": "opaque-account",
+      "quota_mode": "shared-weekly-supergrok-pool",
       "reserve_floor": 0.1,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "xai-api",
+        "extra-usage-credits",
+        "pay-as-you-go-overage"
+      ],
+      "included_surfaces": [
+        "grok-build"
+      ],
+      "overage_action": "block_and_surface",
+      "plan": "SuperGrok",
+      "plan_evidence": "grok-auth-subscription-tier-supergrok; grok-4.5-build-smoke-2026-07-29",
+      "entitlement_contract": {
+        "kind": "grok_oidc_tier_claim_v1",
+        "issuer": "https://auth.x.ai",
+        "principal_type": "User",
+        "tier_code": 1,
+        "plan": "SuperGrok"
+      }
     },
     "jules-account": {
       "conservative_daily_tasks": 15,
-      "cost_mode": "free-or-subscription-account",
+      "cost_mode": "subscription_included",
       "marginal_cost_usd": 0,
       "max_concurrency": 3,
       "payg_fallback_allowed": false,
-      "plan": "unknown",
-      "quota_mode": "rolling-daily-tasks",
+      "plan": "Google AI subscription",
+      "quota_mode": "google-ai-jules-baseline",
       "reserve_floor": 0.2,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "overage_action": "block_and_surface",
+      "parent_pool": "antigravity-account",
+      "plan_evidence": "owner-asserted-2026-07-29; provider-plan-contract"
     },
     "local-compute": {
       "blocked_reason": "Local LLM use disabled by owner preference.",
@@ -872,9 +1008,22 @@
       "marginal_cost_usd": 0,
       "max_concurrency": 2,
       "payg_fallback_allowed": false,
-      "quota_mode": "opaque-shared-agentic",
+      "quota_mode": "chatgpt-pro-codex-plan-limits",
       "reserve_floor": 0.15,
-      "unknown_execution": "advisory-only"
+      "unknown_execution": "advisory-only",
+      "automatic_overage": false,
+      "credits_allowed": false,
+      "excluded_cost_surfaces": [
+        "openai-api",
+        "purchased-codex-credits"
+      ],
+      "included_surfaces": [
+        "chatgpt-controller",
+        "codex-cli"
+      ],
+      "overage_action": "block_and_surface",
+      "plan": "ChatGPT Pro",
+      "plan_evidence": "owner-asserted-2026-07-29; codex-login-status-chatgpt; gpt-5.6-sol-smoke-2026-07-29"
     },
     "openrouter-paid": {
       "blocked_reason": "Paid OpenRouter route forbidden.",
@@ -1067,10 +1216,10 @@
         "frontend",
         "refactor",
         "complex-patch",
-        "independent-review",
         "long-agent"
       ],
-      "tier": "balanced"
+      "tier": "balanced",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -1110,10 +1259,10 @@
         "tests",
         "frontend",
         "refactor",
-        "migration",
-        "independent-review"
+        "migration"
       ],
-      "tier": "deep"
+      "tier": "deep",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -1145,24 +1294,20 @@
         "architecture": 16,
         "complex-patch": 18,
         "deep-debug": 18,
-        "independent-review": 12,
         "long-agent": 18,
         "migration": 22,
-        "refactor": 8,
-        "security-review": 12
+        "refactor": 8
       },
       "task_classes": [
         "refactor",
         "complex-patch",
         "deep-debug",
         "architecture",
-        "independent-review",
-        "critical-review",
         "long-agent",
-        "migration",
-        "security-review"
+        "migration"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -1198,10 +1343,10 @@
         "complex-patch",
         "deep-debug",
         "refactor",
-        "tests",
-        "independent-review"
+        "tests"
       ],
-      "tier": "deep"
+      "tier": "deep",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -1232,17 +1377,14 @@
       },
       "task_affinity": {
         "architecture": 16,
-        "critical-review": 20,
-        "deep-debug": 20,
-        "security-review": 30
+        "deep-debug": 20
       },
       "task_classes": [
-        "critical-review",
-        "security-review",
         "architecture",
         "deep-debug"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -1260,7 +1402,7 @@
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-sonnet-5-high",
-      "independence_group": "anthropic-sonnet",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 15,
       "model": "claude-sonnet-5",
       "priority": 106,
@@ -1312,7 +1454,7 @@
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-sonnet-5-medium",
-      "independence_group": "anthropic-sonnet-5",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 10,
       "model": "claude-sonnet-5",
       "priority": 103,
@@ -1355,13 +1497,13 @@
       "base_quality_rank": 100,
       "burn_weight": 2.4,
       "delegation_overhead_minutes": 7,
-      "disabled_reason": "Compatibility alias retained as plan-only. Authoritative implementation stays with grabowski-primary; use claude-fable-5-review-high for review or claude-fable-5-contrast-high for explicitly requested advisory contrast. Fable is paid-only and never an automatic fallback.",
+      "disabled_reason": "Compatibility alias retained as plan-only. Authoritative implementation stays with grabowski-primary; use claude-fable-5-review-high for review or claude-fable-5-contrast-high for explicitly requested advisory contrast. Fable is paid-only and never an automatic fallback. Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline.",
       "effort": "high",
       "enabled": false,
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-fable-5-high",
-      "independence_group": "anthropic-fable",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
       "paid_only": true,
@@ -1399,13 +1541,13 @@
       "burn_weight": 2.4,
       "contrast_only": true,
       "delegation_overhead_minutes": 7,
-      "disabled_reason": "Compatibility alias retired by the direct-first policy; authoritative writing stays with grabowski-primary. Use claude-fable-5-contrast-high only for explicit advisory contrast. Fable is paid-only and never an automatic fallback.",
+      "disabled_reason": "Compatibility alias retired by the direct-first policy; authoritative writing stays with grabowski-primary. Use claude-fable-5-contrast-high only for explicit advisory contrast. Fable is paid-only and never an automatic fallback. Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline.",
       "effort": "high",
       "enabled": false,
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-fable-5-writer-high",
-      "independence_group": "anthropic-fable",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
       "paid_only": true,
@@ -1458,7 +1600,7 @@
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-fable-5-contrast-high",
-      "independence_group": "anthropic-fable",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
       "paid_only": true,
@@ -1488,7 +1630,8 @@
         "refactor",
         "migration"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "paid_reason": "Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline."
     },
     {
       "argv_prefix": [
@@ -1510,7 +1653,7 @@
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-fable-5-review-high",
-      "independence_group": "anthropic-fable",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 20,
       "model": "claude-fable-5",
       "paid_only": true,
@@ -1535,7 +1678,8 @@
         "critical-review",
         "security-review"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "paid_reason": "Live verification on 2026-07-29 returned usage-credits-required; never select from subscription baseline."
     },
     {
       "argv_prefix": [
@@ -1553,11 +1697,11 @@
       "burn_weight": 2.1,
       "delegation_overhead_minutes": 7,
       "effort": "high",
-      "enabled": true,
+      "enabled": false,
       "harness": "claude",
       "harness_quality": 9,
       "id": "claude-opus-4.8-high",
-      "independence_group": "anthropic-opus",
+      "independence_group": "anthropic-claude-pro",
       "min_duration_minutes": 20,
       "model": "claude-opus-4.8",
       "priority": 108,
@@ -1582,13 +1726,14 @@
         "critical-review",
         "security-review"
       ],
-      "tier": "critical"
+      "tier": "critical",
+      "disabled_reason": "Compatibility route superseded by live Claude Opus 5 alias verification."
     },
     {
       "argv_prefix": [
         "agy",
         "--model",
-        "gemini-3.5-flash-low"
+        "gemini-3.6-flash-low"
       ],
       "base_quality_rank": 61,
       "burn_weight": 0.4,
@@ -1601,7 +1746,7 @@
       "id": "antigravity-gemini-flash-low",
       "independence_group": "google-gemini-flash",
       "min_duration_minutes": 5,
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.6-flash",
       "priority": 88,
       "quality_class": "C",
       "quota_pools": [
@@ -1620,7 +1765,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "gemini-3.5-flash-medium"
+        "gemini-3.6-flash-medium"
       ],
       "base_quality_rank": 64,
       "burn_weight": 0.8,
@@ -1633,7 +1778,7 @@
       "id": "antigravity-gemini-flash-medium",
       "independence_group": "google-gemini-flash",
       "min_duration_minutes": 5,
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.6-flash",
       "priority": 92,
       "quality_class": "C",
       "quota_pools": [
@@ -1653,7 +1798,7 @@
       "argv_prefix": [
         "agy",
         "--model",
-        "gemini-3.5-flash-high"
+        "gemini-3.6-flash-high"
       ],
       "base_quality_rank": 66,
       "burn_weight": 1.2,
@@ -1666,7 +1811,7 @@
       "id": "antigravity-gemini-flash-high",
       "independence_group": "google-gemini-flash",
       "min_duration_minutes": 5,
-      "model": "gemini-3.5-flash",
+      "model": "gemini-3.6-flash",
       "priority": 90,
       "quality_class": "C",
       "quota_pools": [
@@ -1722,7 +1867,6 @@
       ],
       "base_quality_rank": 76,
       "burn_weight": 1.6,
-      "critical_eligible": true,
       "delegation_overhead_minutes": 5,
       "effort": "high",
       "enabled": true,
@@ -1747,11 +1891,10 @@
         "refactor",
         "complex-patch",
         "deep-debug",
-        "architecture",
-        "independent-review",
-        "critical-review"
+        "architecture"
       ],
-      "tier": "deep"
+      "tier": "deep",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -1859,7 +2002,6 @@
       ],
       "base_quality_rank": 84,
       "burn_weight": 1.4,
-      "critical_eligible": true,
       "delegation_overhead_minutes": 5,
       "effort": "high",
       "enabled": true,
@@ -1888,10 +2030,10 @@
         "complex-patch",
         "deep-debug",
         "architecture",
-        "independent-review",
         "long-agent"
       ],
-      "tier": "deep"
+      "tier": "deep",
+      "contrast_only": true
     },
     {
       "argv_prefix": [
@@ -2192,6 +2334,123 @@
         "architecture",
         "long-agent",
         "migration"
+      ],
+      "tier": "deep"
+    },
+    {
+      "argv_prefix": [
+        "claude",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "plan"
+      ],
+      "base_quality_rank": 92,
+      "burn_weight": 2.1,
+      "delegation_overhead_minutes": 6,
+      "effort": "high",
+      "enabled": true,
+      "harness": "claude",
+      "harness_quality": 9,
+      "id": "claude-opus-5-high",
+      "independence_group": "anthropic-claude-pro",
+      "min_duration_minutes": 20,
+      "model": "claude-opus-5",
+      "priority": 110,
+      "quality_class": "A",
+      "quota_pools": [
+        "claude-pro"
+      ],
+      "review_only": true,
+      "risk_affinity": {
+        "judgment-critical": 14,
+        "root-cause": 10,
+        "uncertainty-heavy": 12
+      },
+      "task_affinity": {
+        "critical-review": 28,
+        "independent-review": 20,
+        "security-review": 25
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "critical"
+    },
+    {
+      "argv_prefix": [
+        "agy",
+        "--model",
+        "gemini-3.1-pro-high"
+      ],
+      "base_quality_rank": 76,
+      "burn_weight": 1.6,
+      "critical_eligible": true,
+      "delegation_overhead_minutes": 5,
+      "effort": "high",
+      "enabled": true,
+      "harness": "antigravity",
+      "harness_quality": 7,
+      "id": "antigravity-gemini-pro-review-high",
+      "independence_group": "google-gemini-pro",
+      "min_duration_minutes": 15,
+      "model": "gemini-3.1-pro",
+      "priority": 101,
+      "quality_class": "B",
+      "quota_pools": [
+        "antigravity-gemini",
+        "antigravity-account"
+      ],
+      "review_only": true,
+      "task_affinity": {
+        "critical-review": 16,
+        "independent-review": 16,
+        "security-review": 10
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
+      ],
+      "tier": "deep"
+    },
+    {
+      "argv_prefix": [
+        "grok",
+        "--model",
+        "grok-4.5"
+      ],
+      "base_quality_rank": 84,
+      "burn_weight": 1.4,
+      "critical_eligible": true,
+      "delegation_overhead_minutes": 5,
+      "effort": "high",
+      "enabled": true,
+      "harness": "grok",
+      "harness_quality": 8,
+      "id": "grok-4.5-review-high",
+      "independence_group": "xai-grok-4.5",
+      "min_duration_minutes": 10,
+      "model": "grok-4.5",
+      "priority": 104,
+      "quality_class": "A",
+      "quota_pools": [
+        "grok-com"
+      ],
+      "review_only": true,
+      "task_affinity": {
+        "critical-review": 18,
+        "independent-review": 18,
+        "security-review": 12
+      },
+      "task_classes": [
+        "independent-review",
+        "critical-review",
+        "security-review"
       ],
       "tier": "deep"
     }
