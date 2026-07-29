@@ -11,7 +11,7 @@ Inputs:
 - `repo`: one existing absolute, non-symlink directory;
 - `purpose`: one bounded token, default `grabowski-repo-state-context`.
 
-The tool invokes only the owner-held, regular, singly linked and executable `${HOME}/.local/bin/reposkop` path:
+The tool invokes only the owner-held, regular, singly linked, executable and neither group- nor world-writable `${HOME}/.local/bin/reposkop` path. Shared read and execute permissions such as mode `0755` remain valid; any `0o022` write bit fails closed before process execution:
 
 ```text
 reposkop report <absolute-target> --purpose <purpose> --json

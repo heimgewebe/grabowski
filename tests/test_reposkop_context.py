@@ -153,6 +153,25 @@ class ReposkopContextTests(unittest.TestCase):
                 stack.enter_context(patcher)
             yield
 
+    def test_accepts_shared_read_execute_without_shared_write(self) -> None:
+        self.executable.chmod(0o755)
+        executable, digest = context._validate_executable(self.executable)
+        self.assertEqual(executable, self.executable)
+        self.assertEqual(digest, context._sha256_file(self.executable))
+
+    def test_rejects_group_or_world_writable_executable_before_execution(self) -> None:
+        patches = self.patches(self.report())
+        with self.patch_context(patches):
+            for mode in (0o720, 0o702, 0o777):
+                with self.subTest(mode=oct(mode)):
+                    self.executable.chmod(mode)
+                    with self.assertRaisesRegex(ValueError, "group/world-write"):
+                        context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertEqual(self.run_calls, [])
+        self.assertFalse(self.receipts.exists())
+        self.assertEqual(self.audit_records, [])
+
     def test_records_one_receipt_and_replays_unchanged_semantic_state(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):

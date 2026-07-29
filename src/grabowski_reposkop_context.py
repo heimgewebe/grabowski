@@ -91,10 +91,11 @@ def _validate_executable(path: Path) -> tuple[Path, str]:
         or metadata.st_nlink != 1
         or metadata.st_size <= 0
         or metadata.st_size > MAX_EXECUTABLE_BYTES
+        or stat.S_IMODE(metadata.st_mode) & 0o022
         or not os.access(path, os.X_OK)
     ):
         raise ReposkopContextError(
-            "Reposkop executable failed ownership, type, link, size or mode checks"
+            "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
         )
     return path, _sha256_file(path)
 
