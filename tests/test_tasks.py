@@ -2272,6 +2272,88 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(successor["explicit_policy_override"])
         self.assertEqual(source["task_id"], successor["retry_of_task_id"])
 
+    def test_exact_reconcile_resume_allows_named_interrupted_recovery(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        observation = {
+            "state": "interrupted",
+            "source": "test-authoritative-observation",
+            "observed_at_unix": 170,
+        }
+        source = tasks._set_state(
+            task_id,
+            "interrupted",
+            observation=observation,
+        )
+        launch_bindings: list[dict[str, object]] = []
+
+        def launch_with_persisted_binding(record: dict[str, object]) -> dict[str, object]:
+            pending = tasks._row_raw(task_id)
+            launcher = json.loads(str(pending["launcher_json"]))
+            binding = launcher["interrupted_recovery_binding"]
+            launch_bindings.append(binding)
+            self.assertEqual("launching", pending["state"])
+            self.assertEqual(source["task_id"], binding["source_task_id"])
+            self.assertEqual(
+                tasks._record_execution_identity(source)["identity_sha256"],
+                binding["source_execution_identity_sha256"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "unresolved recovery attempt"):
+                tasks._guard_direct_terminal_retry_record(pending)
+            return _launcher()
+
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=observation),
+            patch.object(tasks, "_observe", return_value=observation),
+            patch.object(tasks, "_launch", side_effect=launch_with_persisted_binding),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 171},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted dependency state",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], result["blocked"])
+        self.assertEqual(1, len(result["resumed"]))
+        resumed = result["resumed"][0]
+        self.assertTrue(resumed["explicit_interrupted_recovery"])
+        self.assertEqual(2, resumed["attempt"])
+        self.assertEqual(1, len(launch_bindings))
+        persisted = tasks._row_raw(task_id)
+        persisted_launcher = json.loads(str(persisted["launcher_json"]))
+        self.assertEqual(
+            launch_bindings[0]["context_sha256"],
+            persisted_launcher["interrupted_recovery_binding"]["context_sha256"],
+        )
+
+    def test_interrupted_recovery_requires_exact_task_target(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        observation = {
+            "state": "interrupted",
+            "source": "test-authoritative-observation",
+            "observed_at_unix": 172,
+        }
+        tasks._set_state(task_id, "interrupted", observation=observation)
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=observation),
+            patch.object(tasks, "_launch") as launch,
+        ):
+            result = tasks.reconcile_tasks_resume(
+                reason="broad scans do not establish interrupted recovery authority",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["resumed"])
+        self.assertEqual(task_id, result["blocked"][0]["task_id"])
+        self.assertEqual("evidence_drift", result["blocked"][0]["reason_class"])
+        launch.assert_not_called()
+
     def test_terminal_retry_replays_managed_cargo_binding_once(self) -> None:
         cache_key = "a" * 64
         target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"

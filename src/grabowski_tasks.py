@@ -292,6 +292,26 @@ TASK_SCHEMA_V5_ADDITIVE_COLUMNS = {
 LEASE_MAINTENANCE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
 TASK_RETRY_CONTEXT_SCHEMA_VERSION = 1
+TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION = 1
+TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "source_task_id",
+        "source_attempt",
+        "source_state",
+        "source_resume_policy",
+        "source_unit",
+        "source_authoritative_unit",
+        "source_updated_at_unix",
+        "source_execution_identity_sha256",
+        "source_observation_sha256",
+        "named_state_change",
+        "admitted_at_unix",
+        "does_not_establish",
+        "context_sha256",
+    }
+)
 UNCHANGED_RETRY_STATES = frozenset(TASK_STATE_PROJECTIONS["attention"])
 
 
@@ -2205,11 +2225,196 @@ def _validate_terminal_retry_context(
     }
 
 
+def _build_interrupted_recovery_context(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    normalized_reason = _redact_reason(reason.strip())
+    if not normalized_reason:
+        raise ValueError("named interrupted recovery state change is required")
+    if str(record.get("state")) != "interrupted":
+        raise ValueError("interrupted recovery source task is not interrupted")
+    if str(observation.get("state")) != "interrupted":
+        raise ValueError("interrupted recovery observation is stale")
+    raw_observation = record.get("last_observation_json")
+    try:
+        persisted_observation = json.loads(str(raw_observation))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("interrupted recovery source observation is missing") from exc
+    if not isinstance(persisted_observation, dict) or persisted_observation != observation:
+        raise ValueError("interrupted recovery source observation is stale")
+    material = {
+        "schema_version": TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_interrupted_recovery",
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]),
+        "source_state": "interrupted",
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_unit": str(record["unit"]),
+        "source_authoritative_unit": _authoritative_unit(record),
+        "source_updated_at_unix": int(record["updated_at_unix"]),
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+        "source_observation_sha256": _sha256_json(persisted_observation),
+        "named_state_change": normalized_reason,
+        "admitted_at_unix": _now(),
+        "does_not_establish": [
+            "that_the_interrupted_execution_failed",
+            "that_the_named_change_is_sufficient",
+            "that_the_recovery_will_succeed",
+            "automatic_retry_authority",
+        ],
+    }
+    return {**material, "context_sha256": _sha256_json(material)}
+
+
+def _validate_interrupted_recovery_context(
+    context: dict[str, Any],
+    *,
+    record: dict[str, Any],
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    required = TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS
+    if not isinstance(context, dict) or set(context) != required:
+        raise ValueError("interrupted recovery context shape is invalid")
+    material = {key: context[key] for key in required - {"context_sha256"}}
+    if context.get("context_sha256") != _sha256_json(material):
+        raise ValueError("interrupted recovery context integrity is invalid")
+    if (
+        context.get("schema_version")
+        != TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION
+        or context.get("kind") != "grabowski_named_interrupted_recovery"
+    ):
+        raise ValueError("interrupted recovery context contract is invalid")
+    if str(record.get("state")) != "interrupted":
+        raise ValueError("interrupted recovery source task is no longer interrupted")
+    if str(observation.get("state")) != "interrupted":
+        raise ValueError("interrupted recovery observation is no longer current")
+    raw_observation = record.get("last_observation_json")
+    try:
+        persisted_observation = json.loads(str(raw_observation))
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("interrupted recovery source observation is missing") from exc
+    if not isinstance(persisted_observation, dict):
+        raise ValueError("interrupted recovery source observation is invalid")
+    expected = {
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]),
+        "source_state": "interrupted",
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_unit": str(record["unit"]),
+        "source_authoritative_unit": _authoritative_unit(record),
+        "source_updated_at_unix": int(record["updated_at_unix"]),
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+        "source_observation_sha256": _sha256_json(persisted_observation),
+    }
+    for key, value in expected.items():
+        if context.get(key) != value:
+            raise ValueError(f"interrupted recovery context {key} binding is stale")
+    named_state_change = context.get("named_state_change")
+    if not isinstance(named_state_change, str) or not named_state_change.strip():
+        raise ValueError("interrupted recovery context requires a named state change")
+    admitted_at_unix = context.get("admitted_at_unix")
+    now = _now()
+    if (
+        isinstance(admitted_at_unix, bool)
+        or not isinstance(admitted_at_unix, int)
+        or admitted_at_unix < 0
+        or admitted_at_unix > now + 300
+    ):
+        raise ValueError("interrupted recovery context timestamp is invalid")
+    non_claims = context.get("does_not_establish")
+    if not isinstance(non_claims, list) or any(
+        not isinstance(item, str) or not item for item in non_claims
+    ):
+        raise ValueError("interrupted recovery context non-claims are invalid")
+    return dict(context)
+
+
 def _persisted_retry_binding_or_raise(record: dict[str, Any]) -> dict[str, Any] | None:
     try:
         return terminal_convergence.persisted_retry_binding(record)
     except terminal_convergence.TerminalConvergenceError as exc:
         raise RuntimeError("stored retry admission evidence is invalid") from exc
+
+
+def _persisted_interrupted_recovery_binding_or_raise(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw_launcher = record.get("launcher_json")
+    if raw_launcher in {None, ""}:
+        return None
+    try:
+        launcher = json.loads(str(raw_launcher))
+    except (json.JSONDecodeError, TypeError) as exc:
+        if "interrupted_recovery_binding" in str(raw_launcher):
+            raise RuntimeError(
+                "stored interrupted recovery admission evidence is invalid"
+            ) from exc
+        return None
+    if not isinstance(launcher, dict):
+        return None
+    binding = launcher.get("interrupted_recovery_binding")
+    if binding is None:
+        return None
+    if not isinstance(binding, dict) or set(binding) != set(
+        TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS
+    ):
+        raise RuntimeError("stored interrupted recovery admission evidence is invalid")
+    material = {
+        key: binding[key]
+        for key in TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS
+        if key != "context_sha256"
+    }
+    source_attempt = binding.get("source_attempt")
+    if (
+        isinstance(source_attempt, bool)
+        or not isinstance(source_attempt, int)
+        or source_attempt < 1
+    ):
+        raise RuntimeError("stored interrupted recovery admission evidence is invalid")
+    source_unit = _task_unit(str(record["task_id"]), source_attempt)
+    expected = {
+        "schema_version": TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_interrupted_recovery",
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]) - 1,
+        "source_state": "interrupted",
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_unit": source_unit,
+        "source_authoritative_unit": source_unit,
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+    }
+    source_updated_at_unix = binding.get("source_updated_at_unix")
+    admitted_at_unix = binding.get("admitted_at_unix")
+    named_state_change = binding.get("named_state_change")
+    source_observation_sha256 = binding.get("source_observation_sha256")
+    non_claims = binding.get("does_not_establish")
+    if (
+        binding.get("context_sha256") != _sha256_json(material)
+        or any(binding.get(key) != value for key, value in expected.items())
+        or isinstance(source_updated_at_unix, bool)
+        or not isinstance(source_updated_at_unix, int)
+        or source_updated_at_unix < 0
+        or isinstance(admitted_at_unix, bool)
+        or not isinstance(admitted_at_unix, int)
+        or admitted_at_unix < source_updated_at_unix
+        or not isinstance(named_state_change, str)
+        or not named_state_change.strip()
+        or not isinstance(source_observation_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_observation_sha256) is None
+        or not isinstance(non_claims, list)
+        or any(not isinstance(item, str) or not item for item in non_claims)
+    ):
+        raise RuntimeError("stored interrupted recovery admission evidence is invalid")
+    return dict(binding)
 
 
 def _retained_retry_successor_for_source(
@@ -2382,9 +2587,17 @@ def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
         )
     if state in {"launching", "running", "outcome_unknown"}:
         pending_retry = _persisted_retry_binding_or_raise(record)
+        pending_interrupted_recovery = (
+            _persisted_interrupted_recovery_binding_or_raise(record)
+        )
         if pending_retry is not None:
             raise RuntimeError(
                 "unchanged task start blocked by unresolved retry successor; "
+                f"reconcile task {record['task_id']} before another start"
+            )
+        if pending_interrupted_recovery is not None:
+            raise RuntimeError(
+                "unchanged task start blocked by unresolved recovery attempt; "
                 f"reconcile task {record['task_id']} before another start"
             )
 
@@ -4342,7 +4555,11 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
 
 
 @_serialize_task_mutation
-def grabowski_task_resume(task_id: str) -> dict[str, Any]:
+def grabowski_task_resume(
+    task_id: str,
+    *,
+    _interrupted_recovery_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Recreate a missing or stopped task unit from its persistent record."""
     record = _row(task_id)
     operator._require_operator_mutation(
@@ -4356,7 +4573,9 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     )
     if _is_terminal_state(record["state"]):
         raise RuntimeError("Terminal task cannot be resumed")
-    if record["resume_policy"] in {"never", "manual"}:
+    if record["resume_policy"] == "never":
+        raise PermissionError("Task resume policy does not permit automatic retry")
+    if record["resume_policy"] == "manual" and _interrupted_recovery_context is None:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
     recovery_gate = _require_recovery_gate(command)
@@ -4377,6 +4596,13 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
             observation=observation,
         )
         raise RuntimeError("Task outcome is unknown; verify the authoritative unit before retry")
+    interrupted_recovery_binding = None
+    if _interrupted_recovery_context is not None:
+        interrupted_recovery_binding = _validate_interrupted_recovery_context(
+            _interrupted_recovery_context,
+            record=record,
+            observation=observation,
+        )
     attempt = int(record["attempt"]) + 1
     unit = _task_unit(task_id, attempt)
     candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
@@ -4398,7 +4624,25 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
                 "attempt": attempt,
             },
         )
+    if interrupted_recovery_binding is not None:
+        _set_state(
+            task_id,
+            "launching",
+            launcher={
+                "pending": True,
+                "interrupted_recovery_binding": interrupted_recovery_binding,
+            },
+            observation=observation,
+            unit=unit,
+            authoritative_unit=unit,
+            attempt=attempt,
+        )
     launcher = _launch(candidate)
+    if interrupted_recovery_binding is not None:
+        launcher = {
+            **launcher,
+            "interrupted_recovery_binding": interrupted_recovery_binding,
+        }
     state = _launch_state(launcher)
     stored = _set_state(
         task_id,
@@ -4429,6 +4673,7 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
             lease_result["expires_at_unix"] if lease_result else None
         ),
         "resource_lease_maintenance": lease_maintenance,
+        "interrupted_recovery_binding": interrupted_recovery_binding,
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
@@ -5330,7 +5575,18 @@ def reconcile_tasks_resume(
                 )
             )
         )
-        if blocker is not None and not explicit_policy_override:
+        explicit_interrupted_recovery = bool(task_id) and bool(blocker) and (
+            str(stored["state"]) == "interrupted"
+            and str(observation.get("state")) == "interrupted"
+            and str(stored["resume_policy"])
+            in {"manual", "verify-then-retry", "retry-safe"}
+            and blocker.get("reason_class") == "evidence_drift"
+        )
+        if (
+            blocker is not None
+            and not explicit_policy_override
+            and not explicit_interrupted_recovery
+        ):
             blocked.append(blocker)
             continue
         if len(resumed) >= max_resumes:
@@ -5355,6 +5611,24 @@ def reconcile_tasks_resume(
                         explicit_policy_override=explicit_policy_override,
                     )
                 )
+            elif explicit_interrupted_recovery:
+                interrupted_context = _build_interrupted_recovery_context(
+                    stored,
+                    observation,
+                    reason=reason,
+                )
+                resumed_task = dict(
+                    grabowski_task_resume(
+                        stored["task_id"],
+                        _interrupted_recovery_context=interrupted_context,
+                    )["task"]
+                )
+                resumed_task["explicit_interrupted_recovery"] = True
+                resumed_task["recovery_reason"] = _redact_reason(reason.strip())
+                resumed_task["interrupted_recovery_context_sha256"] = (
+                    interrupted_context["context_sha256"]
+                )
+                resumed.append(resumed_task)
             else:
                 resumed.append(grabowski_task_resume(stored["task_id"])["task"])
         except Exception as exc:
