@@ -295,9 +295,14 @@ class FakeGh:
                 argv[1],
             )
             if "/rules/branches/" in endpoint:
+                rules_payload: object = (
+                    [self.active_rules]
+                    if "--paginate" in argv and "--slurp" in argv
+                    else self.active_rules[:30]
+                )
                 return {
                     "returncode": 0,
-                    "stdout": json.dumps(self.active_rules),
+                    "stdout": json.dumps(rules_payload),
                     "stderr": "",
                 }
             if "/rulesets/" in endpoint:
@@ -3755,6 +3760,41 @@ class GithubBaseUpdateGuardTests(unittest.TestCase):
         self.assertEqual("never", policy["accepted_rulesets"][0]["current_user_can_bypass"])
         self.assertEqual([], evidence["errors"])
 
+    def test_fetches_strict_rule_beyond_default_first_page(self) -> None:
+        strict_rule = deepcopy(FakeGh().active_rules[0])
+        non_strict_rules = [
+            {
+                "type": "pull_request",
+                "parameters": {"required_approving_review_count": 0},
+                "ruleset_source_type": "Repository",
+                "ruleset_source": "heimgewebe/grabowski",
+                "ruleset_id": 20000000 + index,
+            }
+            for index in range(30)
+        ]
+        gh = FakeGh(active_rules=[*non_strict_rules, strict_rule])
+
+        policy, evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            gh,
+            repo_slug="heimgewebe/grabowski",
+            base_branch="main",
+        )
+
+        self.assertEqual([], errors)
+        self.assertIsNotNone(policy)
+        active_calls = [
+            call
+            for call in gh.calls
+            if any("/rules/branches/" in item for item in call)
+        ]
+        self.assertEqual(2, len(active_calls))
+        for call in active_calls:
+            self.assertIn("--paginate", call)
+            self.assertIn("--slurp", call)
+            self.assertIn("per_page=100", call)
+        self.assertEqual(1, evidence["active_rules"]["page_count"])
+
     def test_rejects_repository_without_strict_ruleset(self) -> None:
         gh = FakeGh(active_rules=[])
         policy, evidence, errors = merge_guard.verify_github_base_update_guard(
@@ -3777,8 +3817,7 @@ class GithubBaseUpdateGuardTests(unittest.TestCase):
             def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
                 if (
                     argv[:1] == ["api"]
-                    and len(argv) >= 2
-                    and "/rules/branches/" in argv[1]
+                    and any("/rules/branches/" in item for item in argv[1:])
                 ):
                     self.active_rule_reads += 1
                     if self.active_rule_reads >= 2:
@@ -4673,8 +4712,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
                 if (
                     argv[:1] == ["api"]
-                    and len(argv) >= 2
-                    and "/rules/branches/" in argv[1]
+                    and any("/rules/branches/" in item for item in argv[1:])
                 ):
                     self.active_rule_reads += 1
                     if self.active_rule_reads >= 3:

@@ -775,6 +775,21 @@ def _github_json_call(
     return value, evidence, []
 
 
+def _normalize_active_rule_pages(value: Any) -> tuple[list[Any] | None, int]:
+    if not isinstance(value, list):
+        return None, 0
+    if not value:
+        return [], 0
+    if all(isinstance(item, dict) for item in value):
+        return list(value), 1
+    if not all(isinstance(page, list) for page in value):
+        return None, 0
+    flattened: list[Any] = []
+    for page in value:
+        flattened.extend(page)
+    return flattened, len(value)
+
+
 def _ruleset_detail_endpoint(active_rule: dict[str, Any]) -> str | None:
     ruleset_id = active_rule.get("ruleset_id")
     source_type = active_rule.get("ruleset_source_type")
@@ -832,10 +847,21 @@ def verify_github_base_update_guard(
 ) -> tuple[dict[str, Any] | None, dict[str, Any], list[str]]:
     """Prove a server-enforced, non-bypassable strict base-update barrier."""
     encoded_branch = quote(base_branch, safe="")
-    active_args = ["api", f"repos/{repo_slug}/rules/branches/{encoded_branch}"]
-    active, active_evidence, errors = _github_json_call(
+    active_args = [
+        "api",
+        "--method",
+        "GET",
+        "--paginate",
+        "--slurp",
+        "-f",
+        f"per_page={_BASE_UPDATE_GUARD_MAX_ACTIVE_RULES}",
+        f"repos/{repo_slug}/rules/branches/{encoded_branch}",
+    ]
+    active_payload, active_evidence, errors = _github_json_call(
         repo_path, github_runner, active_args, label="base_update_guard_active_rules"
     )
+    active, active_page_count = _normalize_active_rule_pages(active_payload)
+    active_evidence["page_count"] = active_page_count
     evidence: dict[str, Any] = {
         "schema_version": 1,
         "kind": "grabowski_github_base_update_guard_evidence",
@@ -947,7 +973,7 @@ def verify_github_base_update_guard(
         return None, evidence, errors
 
     (
-        active_revalidated,
+        active_revalidated_payload,
         active_revalidation_evidence,
         active_revalidation_errors,
     ) = _github_json_call(
@@ -956,9 +982,15 @@ def verify_github_base_update_guard(
         active_args,
         label="base_update_guard_active_rules_revalidation",
     )
+    active_revalidated, active_revalidation_page_count = (
+        _normalize_active_rule_pages(active_revalidated_payload)
+    )
+    active_revalidation_evidence["page_count"] = active_revalidation_page_count
     evidence["active_rules_revalidation"] = active_revalidation_evidence
     errors.extend(active_revalidation_errors)
-    if not active_revalidation_errors and active_revalidated != active:
+    if not active_revalidation_errors and active_revalidated is None:
+        errors.append("base_update_guard_active_rules_revalidation_not_list")
+    elif not active_revalidation_errors and active_revalidated != active:
         errors.append("base_update_guard_active_rules_drift")
 
     detail_revalidation_records: list[dict[str, Any]] = []
