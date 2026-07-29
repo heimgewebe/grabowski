@@ -3123,23 +3123,39 @@ def _task_current_records_for_states(
 def _task_retry_successor_records(
     connection: sqlite3.Connection,
     *,
+    source_task_ids: set[str],
     limit: int,
 ) -> list[dict[str, Any]]:
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise ValueError("retry successor limit must be a non-negative integer")
+    if not isinstance(source_task_ids, set) or any(
+        not isinstance(task_id, str)
+        or terminal_convergence.TASK_ID_RE.fullmatch(task_id) is None
+        for task_id in source_task_ids
+    ):
+        raise ValueError("retry successor source task ids must be a set of task ids")
+    if not source_task_ids:
+        return []
     support_states = tuple(
         sorted(terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES)
     )
     placeholders = ",".join("?" for _ in support_states)
     rows = connection.execute(
         f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
-        "AND CASE "
-        "WHEN json_valid(launcher_json) "
-        "THEN json_type(launcher_json, '$.retry_binding') "
-        "WHEN instr(launcher_json, ?) > 0 THEN 'invalid' "
-        "ELSE NULL END IS NOT NULL "
+        "AND ("
+        "(json_valid(launcher_json) "
+        "AND json_type(launcher_json, '$.retry_binding.source_task_id') = 'text' "
+        "AND json_extract(launcher_json, '$.retry_binding.source_task_id') "
+        "IN (SELECT value FROM json_each(?))) "
+        "OR (NOT json_valid(launcher_json) AND instr(launcher_json, ?) > 0)"
+        ") "
         "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
-        (*support_states, '"retry_binding"', limit + 1),
+        (
+            *support_states,
+            _canonical_json(sorted(source_task_ids)),
+            '"retry_binding"',
+            limit + 1,
+        ),
     ).fetchall()
     if len(rows) > limit:
         raise RuntimeError("retry successor convergence scan limit exceeded")
@@ -3210,6 +3226,7 @@ def _task_attention_projection(
             return degraded("attention_convergence_scan_limit_exceeded")
         retry_successors = _task_retry_successor_records(
             connection,
+            source_task_ids={str(record["task_id"]) for record in records},
             limit=(
                 task_attention.MAX_CURRENT_CONVERGENCE_ROWS - len(records)
             ),

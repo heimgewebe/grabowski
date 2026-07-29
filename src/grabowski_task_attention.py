@@ -2006,6 +2006,9 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                     try:
                         retry_successors = tasks._task_retry_successor_records(
                             connection,
+                            source_task_ids={
+                                str(row["task_id"]) for row in convergence_rows
+                            },
                             limit=(
                                 MAX_CURRENT_CONVERGENCE_ROWS
                                 - len(convergence_rows)

@@ -5260,8 +5260,58 @@ class TaskTests(unittest.TestCase):
                     task_id,
                 ),
             )
-            records = tasks._task_retry_successor_records(connection, limit=0)
+            records = tasks._task_retry_successor_records(
+                connection,
+                source_task_ids={task_id},
+                limit=0,
+            )
         self.assertEqual([], records)
+
+    def test_retry_successor_scan_scopes_support_to_current_sources(self) -> None:
+        relevant = self._start()
+        unrelated = self._start()
+        relevant_id = str(relevant["task"]["task_id"])
+        unrelated_id = str(unrelated["task"]["task_id"])
+        relevant_successor = self._start()
+        unrelated_successor = self._start()
+        relevant_successor_id = str(relevant_successor["task"]["task_id"])
+        unrelated_successor_id = str(unrelated_successor["task"]["task_id"])
+        for task_id in (relevant_successor_id, unrelated_successor_id):
+            tasks._set_state(
+                task_id,
+                "completed",
+                observation={"state": "completed", "source": "test"},
+            )
+        with tasks._database() as connection:
+            for task_id, source_task_id in (
+                (relevant_successor_id, relevant_id),
+                (unrelated_successor_id, unrelated_id),
+            ):
+                connection.execute(
+                    "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                    (
+                        tasks._canonical_json(
+                            {"retry_binding": {"source_task_id": source_task_id}}
+                        ),
+                        task_id,
+                    ),
+                )
+            with patch.object(
+                tasks.terminal_convergence,
+                "persisted_retry_binding",
+                side_effect=lambda record: json.loads(record["launcher_json"])[
+                    "retry_binding"
+                ],
+            ):
+                records = tasks._task_retry_successor_records(
+                    connection,
+                    source_task_ids={relevant_id},
+                    limit=1,
+                )
+        self.assertEqual(
+            [relevant_successor_id],
+            [str(record["task_id"]) for record in records],
+        )
 
     def test_retry_successor_scan_rejects_malformed_potential_binding(self) -> None:
         started = self._start()
@@ -5277,7 +5327,11 @@ class TaskTests(unittest.TestCase):
                 ('{"retry_binding":', task_id),
             )
             with self.assertRaisesRegex(ValueError, "persisted task launcher is invalid"):
-                tasks._task_retry_successor_records(connection, limit=1)
+                tasks._task_retry_successor_records(
+                    connection,
+                    source_task_ids={task_id},
+                    limit=1,
+                )
 
 
 class RuntimeContractTests(unittest.TestCase):
