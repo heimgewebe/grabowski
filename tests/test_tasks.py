@@ -1217,6 +1217,80 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(payload["state"], "completed")
         self.assertIn("receipt_sha256", payload)
 
+    def test_status_resolves_legacy_local_host_to_unique_registered_local_host(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=not-found\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        registry = {"schema_version": 1, "hosts": {"heim-pc": LOCAL_HOST}}
+        with patch.object(
+            tasks.fleet,
+            "fleet_host",
+            side_effect=ValueError("Unknown fleet host: local"),
+        ), patch.object(tasks.fleet, "load_fleet", return_value=registry), patch.object(
+            tasks.operator, "_run", return_value=probe
+        ) as run:
+            status = tasks.grabowski_task_status(task_id)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["last_observation"]["probe"]["task_host_resolution"],
+            {
+                "kind": "legacy-local-task-host-v1",
+                "stored_host": "local",
+                "resolved_host": "heim-pc",
+                "transport": "local",
+            },
+        )
+        run.assert_called_once()
+
+    def test_status_rejects_legacy_local_host_when_local_registry_is_ambiguous(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        registry = {
+            "schema_version": 1,
+            "hosts": {
+                "heim-pc": LOCAL_HOST,
+                "other-local": {**LOCAL_HOST, "roles": ["other"]},
+            },
+        }
+        with patch.object(
+            tasks.fleet,
+            "fleet_host",
+            side_effect=ValueError("Unknown fleet host: local"),
+        ), patch.object(tasks.fleet, "load_fleet", return_value=registry), patch.object(
+            tasks.operator, "_run"
+        ) as run:
+            with self.assertRaisesRegex(ValueError, "Unknown fleet host: local"):
+                tasks.grabowski_task_status(task_id)
+        run.assert_not_called()
+        self.assertEqual(tasks._row(task_id)["state"], "running")
+
+    def test_start_keeps_legacy_local_alias_rejected_after_registry_rename(self) -> None:
+        registry = {"schema_version": 1, "hosts": {"heim-pc": LOCAL_HOST}}
+        with patch.object(
+            tasks.fleet,
+            "fleet_host",
+            side_effect=ValueError("Unknown fleet host: local"),
+        ), patch.object(tasks.fleet, "load_fleet", return_value=registry) as load_fleet, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            with self.assertRaisesRegex(ValueError, "Unknown fleet host: local"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["/bin/true"],
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                )
+        load_fleet.assert_not_called()
+        dispatch.assert_not_called()
+
     def test_status_maps_successful_inactive_unit_to_completed(self) -> None:
         started = self._start()
         task_id = started["task"]["task_id"]

@@ -2057,22 +2057,53 @@ def _validate_command(argv: list[str]) -> list[str]:
     return command
 
 
+def _resolve_task_dispatch_host(host: str) -> tuple[str, dict[str, Any], bool]:
+    """Resolve one persisted task host, including the bounded legacy local alias."""
+    try:
+        return host, fleet.fleet_host(host), False
+    except ValueError as exc:
+        if host != "local" or str(exc) != f"Unknown fleet host: {host}":
+            raise
+        registered = fleet.load_fleet()
+        local_hosts = [
+            (name, candidate)
+            for name, candidate in registered["hosts"].items()
+            if candidate["enabled"]
+            and candidate["transport"] == "local"
+            and candidate["target"] == "local"
+        ]
+        if len(local_hosts) != 1:
+            raise
+        resolved_host, target = local_hosts[0]
+        return resolved_host, target, True
+
+
 def _dispatch(host: str, argv: list[str], *, timeout_seconds: int = 60) -> dict[str, Any]:
-    target = fleet.fleet_host(host)
+    resolved_host, target, legacy_local_alias = _resolve_task_dispatch_host(host)
     if target["transport"] == "local":
-        return operator._run(
+        result = operator._run(
             argv,
             cwd=operator.HOME,
             timeout_seconds=timeout_seconds,
             max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
         )
-    remote = fleet.run_fleet_host(
-        host,
-        argv,
-        timeout_seconds=timeout_seconds,
-        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
-    )
-    return remote["result"]
+    else:
+        remote = fleet.run_fleet_host(
+            resolved_host,
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+        result = remote["result"]
+    if legacy_local_alias:
+        result = dict(result)
+        result["task_host_resolution"] = {
+            "kind": "legacy-local-task-host-v1",
+            "stored_host": host,
+            "resolved_host": resolved_host,
+            "transport": target["transport"],
+        }
+    return result
 
 
 def _launch_argv(record: dict[str, Any]) -> list[str]:
