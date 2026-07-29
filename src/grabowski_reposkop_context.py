@@ -725,15 +725,30 @@ def _discard_recoverable_pending(binding: dict[str, Any]) -> None:
         ) from exc
     try:
         metadata = os.fstat(descriptor)
+        expected = binding["data"]
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.getuid()
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
-            or metadata.st_size > len(binding["data"])
+            or metadata.st_size >= len(expected)
         ):
             raise ReposkopContextError(
                 "Reposkop pending receipt is not safely recoverable"
+            )
+        observed = bytearray()
+        while len(observed) < metadata.st_size:
+            chunk = os.read(descriptor, metadata.st_size - len(observed))
+            if not chunk:
+                break
+            observed.extend(chunk)
+        post_read = os.fstat(descriptor)
+        if (
+            post_read.st_size != metadata.st_size
+            or bytes(observed) != expected[: metadata.st_size]
+        ):
+            raise ReposkopContextError(
+                "Reposkop pending receipt is not the exact expected byte prefix"
             )
         try:
             linked = pending_path.stat(follow_symlinks=False)

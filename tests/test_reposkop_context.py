@@ -431,6 +431,35 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertFalse(binding["pending_path"].exists())
         self.assertEqual(binding["receipt_path"].read_bytes(), binding["data"])
 
+    def test_partial_pending_with_wrong_bytes_fails_closed(self) -> None:
+        patches = self.patches(self.report())
+        with self.patch_context(patches):
+            report, executable = context._run_reposkop(
+                self.repo.resolve(), "grabowski-repo-state-context"
+            )
+            binding = context._usage_binding(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+                executable=executable,
+            )
+            context._ensure_receipt_root()
+            self.audit_bindings[binding["usage_key_sha256"]] = {
+                "audit_ref": "audit-record-sha256:" + "d" * 64,
+                "recorded_at": "2026-07-29T10:00:00+00:00",
+                "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
+            }
+            binding["pending_path"].write_bytes(b"x" * 17)
+            binding["pending_path"].chmod(0o600)
+            with self.assertRaisesRegex(
+                ValueError, "not the exact expected byte prefix"
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertTrue(binding["pending_path"].exists())
+        self.assertEqual(binding["pending_path"].read_bytes(), b"x" * 17)
+        self.assertFalse(binding["receipt_path"].exists())
+
     def test_partial_pending_with_extra_link_fails_closed(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):

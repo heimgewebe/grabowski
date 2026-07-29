@@ -922,6 +922,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             )
             target = work / "future" / "nested" / "receipt.json"
             outside = root / "outside" / "nested" / "receipt.json"
+            traversal = work / "new" / ".." / ".." / "outside" / "receipts"
             with patches[0], patches[1], patches[2], patches[3], patches[4]:
                 with self.assertRaises(FileNotFoundError):
                     grabowski_mcp._resolve_write_target(str(target))
@@ -931,6 +932,14 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 self.assertEqual(resolved, target)
                 self.assertFalse(exists)
                 self.assertFalse((work / "future").exists())
+                with self.assertRaisesRegex(
+                    PermissionError, "Parent traversal is forbidden"
+                ):
+                    grabowski_mcp._resolve_write_target(
+                        str(traversal), allow_missing_parents=True
+                    )
+                self.assertFalse((work / "new").exists())
+                self.assertFalse((root / "outside").exists())
                 with self.assertRaisesRegex(
                     PermissionError, "outside configured write roots"
                 ):

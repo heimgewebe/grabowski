@@ -1755,6 +1755,10 @@ def _resolve_missing_write_target(candidate: Path) -> Path:
             raise FileNotFoundError(str(candidate))
         missing_parts.append(ancestor.name)
         ancestor = parent
+    if any(part == ".." for part in missing_parts):
+        raise PermissionError(
+            f"Parent traversal is forbidden for missing write targets: {candidate}"
+        )
     _reject_symlink_components(ancestor)
     resolved_ancestor = ancestor.resolve(strict=True)
     if not resolved_ancestor.is_dir():
