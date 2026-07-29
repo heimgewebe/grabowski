@@ -5005,6 +5005,95 @@ class TaskTests(unittest.TestCase):
         assert selected is not None
         self.assertEqual("0" * 24, selected["task_id"])
 
+    def test_retry_binding_is_persisted_before_dispatch_and_blocks_duplicate_start(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "predispatch-retry-binding"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+        source = tasks._set_state(
+            str(first["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        retry_context = tasks._build_terminal_retry_context(
+            source,
+            reason="repository head advanced after the failed validation",
+        )
+        dispatched: dict[str, object] = {}
+
+        def launch_after_persist(record: dict[str, object]) -> dict[str, object]:
+            stored = tasks._row_raw(str(record["task_id"]))
+            pending = json.loads(str(stored["launcher_json"]))
+            self.assertIs(True, pending["pending"])
+            self.assertEqual(
+                retry_context["context_sha256"],
+                pending["retry_binding"]["context_sha256"],
+            )
+            dispatched["task_id"] = record["task_id"]
+            return _launcher()
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_launch", side_effect=launch_after_persist),
+            patch.object(
+                tasks,
+                "_set_state",
+                side_effect=RuntimeError("simulated crash after dispatch"),
+            ),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash after dispatch"),
+        ):
+            tasks.grabowski_task_start(
+                **common,
+                _retry_context=retry_context,
+            )
+
+        successor_id = str(dispatched["task_id"])
+        successor = tasks._row_raw(successor_id)
+        self.assertEqual("launching", successor["state"])
+        persisted = json.loads(str(successor["launcher_json"]))
+        self.assertEqual(
+            source["task_id"],
+            persisted["retry_binding"]["source_task_id"],
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unresolved retry successor",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+
     def test_reconcile_resume_allows_one_named_state_bound_successor(self) -> None:
         common = {
             "host": "local",

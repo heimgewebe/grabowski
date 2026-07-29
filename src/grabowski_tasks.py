@@ -2176,9 +2176,29 @@ def _guard_unchanged_terminal_retry(
     retry_context: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     predecessor = _latest_matching_execution_record(identity)
-    if predecessor is None or str(predecessor["state"]) not in UNCHANGED_RETRY_STATES:
+    if predecessor is None:
         if retry_context is not None:
             raise ValueError("terminal retry context has no current failed predecessor")
+        return None
+    predecessor_state = str(predecessor["state"])
+    if predecessor_state not in UNCHANGED_RETRY_STATES:
+        if retry_context is not None:
+            raise ValueError("terminal retry context has no current failed predecessor")
+        if predecessor_state in {"launching", "running"}:
+            try:
+                pending_retry = terminal_convergence.persisted_retry_binding(
+                    predecessor
+                )
+            except terminal_convergence.TerminalConvergenceError as exc:
+                raise RuntimeError(
+                    "stored retry admission evidence is invalid"
+                ) from exc
+            if pending_retry is not None:
+                raise RuntimeError(
+                    "unchanged task start blocked by unresolved retry successor; "
+                    "reconcile task "
+                    f"{predecessor['task_id']} before another start"
+                )
         return None
     if retry_context is None:
         raise RuntimeError(
@@ -3671,7 +3691,16 @@ def grabowski_task_start(
         "memory_max_bytes": memory,
         "created_at_unix": now,
         "updated_at_unix": now,
-        "launcher_json": _canonical_json({"pending": True}),
+        "launcher_json": _canonical_json(
+            {
+                "pending": True,
+                **(
+                    {"retry_binding": dict(retry_binding)}
+                    if retry_binding is not None
+                    else {}
+                ),
+            }
+        ),
         "last_observation_json": None,
         "resource_keys_json": _canonical_json(task_resources),
         "lease_owner_id": lease_owner,
