@@ -56,6 +56,14 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             "_checkout_payloads",
             return_value=[{"repository": REPOSITORY, "worktrees": []}],
         ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
+        ), patch.object(
             surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
         ), patch.object(
             surface, "_process_payload", return_value={"returncode": 0, "lines": []}
@@ -94,6 +102,14 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
             surface,
             "_checkout_payloads",
             return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
         ), patch.object(
             surface, "_process_payload", return_value={"returncode": 0, "lines": []}
         ), patch.object(
@@ -144,6 +160,14 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         ), patch.object(
             surface, "_checkout_payloads",
             return_value=[{"repository": REPOSITORY, "worktrees": []}],
+        ), patch.object(
+            surface,
+            "_reconciliation_payload",
+            return_value={
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            },
         ), patch.object(
             surface, "_tmux_payload", return_value={"returncode": 0, "stdout": ""}
         ), patch.object(

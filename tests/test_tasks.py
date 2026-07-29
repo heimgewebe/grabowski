@@ -4820,6 +4820,61 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
+    def test_latest_matching_execution_breaks_same_second_ties_by_rowid(self) -> None:
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            original = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "rowid-order"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+                cpu_weight=50,
+                io_weight=25,
+                memory_max_bytes=64 * 1024 * 1024,
+            )["task"]
+        template = tasks._row_raw(str(original["task_id"]))
+        columns = list(template)
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=1 WHERE task_id=?",
+                (original["task_id"],),
+            )
+            for task_id, marker in (("f" * 24, "a"), ("0" * 24, "b")):
+                clone = dict(template)
+                clone.update(
+                    {
+                        "task_id": task_id,
+                        "unit": f"grabowski-task-{task_id}-a1.service",
+                        "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+                        "state": "failed",
+                        "created_at_unix": 100,
+                        "updated_at_unix": 100,
+                        "terminalized_at_unix": 100,
+                        "terminalization_sha256": marker * 64,
+                        "lifecycle_receipt_sha256": marker * 64,
+                    }
+                )
+                connection.execute(
+                    f"INSERT INTO tasks ({','.join(columns)}) VALUES "
+                    f"({','.join('?' for _ in columns)})",
+                    tuple(clone[column] for column in columns),
+                )
+        newest = tasks._row_raw("0" * 24)
+        identity = tasks._record_execution_identity(newest)
+        selected = tasks._latest_matching_execution_record(identity)
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual("0" * 24, selected["task_id"])
+
     def test_reconcile_resume_allows_one_named_state_bound_successor(self) -> None:
         common = {
             "host": "local",

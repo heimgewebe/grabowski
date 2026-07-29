@@ -43,6 +43,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 
+import grabowski_current_work_surface as current_work_surface
 import grabowski_task_attention as attention
 import grabowski_tasks as tasks
 
@@ -132,6 +133,47 @@ class TaskAttentionTests(unittest.TestCase):
         task_id = started["task"]["task_id"]
         tasks._set_state(task_id, "failed", observation={"state": "failed"})
         return tasks._row(task_id)
+
+
+    def _verified_retry_pair(self) -> tuple[dict[str, object], dict[str, object]]:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "verified-retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+            source = tasks._set_state(
+                str(first["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            resumed = tasks.reconcile_tasks_resume(
+                task_id=str(first["task_id"]),
+                max_resumes=1,
+                reason="repository head advanced after the failed validation",
+            )
+            successor_id = str(resumed["resumed"][0]["task_id"])
+            successor = tasks._set_state(
+                successor_id,
+                "failed",
+                observation={"state": "failed", "source": "test-successor"},
+            )
+        return source, successor
 
     def _completed_task(
         self, resource_keys: list[str] | None = None
@@ -866,6 +908,76 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(1, result["filtered_classification_counts"]["decision_superseded"])
         self.assertEqual(4, result["total_attention"])
         self.assertEqual("raw_task_state_projection_before_decisions", result["total_attention_scope"])
+
+    def test_current_user_surfaces_apply_verified_retry_convergence_without_decision_store(self) -> None:
+        source, successor = self._verified_retry_pair()
+        self.assertFalse(self.decisions.exists())
+
+        reconciled = attention.reconcile_attention({"limit": 20})
+        reconciled_ids = {item["task_id"] for item in reconciled["records"]}
+        self.assertNotIn(source["task_id"], reconciled_ids)
+        self.assertIn(successor["task_id"], reconciled_ids)
+        self.assertEqual("verified", reconciled["attention_convergence_status"])
+        self.assertEqual(
+            1,
+            reconciled["filtered_classification_counts"][
+                "superseded_by_verified_retry"
+            ],
+        )
+        self.assertEqual(1, reconciled["convergence_excluded_attention_count"])
+        self.assertEqual("absent", reconciled["decision_snapshot_status"])
+
+        listed = tasks.grabowski_task_list(
+            state="attention",
+            view="evidence",
+            limit=20,
+        )
+        listed_ids = {item["task_id"] for item in listed["tasks"]}
+        self.assertNotIn(source["task_id"], listed_ids)
+        self.assertIn(successor["task_id"], listed_ids)
+        self.assertEqual(2, listed["raw_projection_counts"]["attention"])
+        self.assertEqual(1, listed["projection_counts"]["attention"])
+        self.assertEqual(
+            1,
+            listed["attention_projection"][
+                "convergence_excluded_attention_count"
+            ],
+        )
+
+        surface = current_work_surface._attention_payload("current")
+        surface_ids = {item["task_id"] for item in surface["records"]}
+        self.assertNotIn(source["task_id"], surface_ids)
+        self.assertIn(successor["task_id"], surface_ids)
+
+    def test_current_reconciliation_keeps_retry_source_visible_when_binding_is_invalid(self) -> None:
+        source, successor = self._verified_retry_pair()
+        successor_row = tasks._row_raw(str(successor["task_id"]))
+        launcher = json.loads(str(successor_row["launcher_json"]))
+        launcher["retry_binding"]["context_sha256"] = "0" * 64
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    json.dumps(
+                        launcher,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    successor["task_id"],
+                ),
+            )
+
+        reconciled = attention.reconcile_attention({"limit": 20})
+        reconciled_ids = {item["task_id"] for item in reconciled["records"]}
+        self.assertIn(source["task_id"], reconciled_ids)
+        self.assertIn(successor["task_id"], reconciled_ids)
+        self.assertEqual("degraded", reconciled["attention_convergence_status"])
+        self.assertEqual(
+            "TaskAttentionIntegrityError",
+            reconciled["attention_convergence_error"],
+        )
+        self.assertEqual(0, reconciled["convergence_excluded_attention_count"])
 
     def test_current_attention_projection_separates_operational_signal_from_raw_history(self) -> None:
         closed = self._failed_task()
