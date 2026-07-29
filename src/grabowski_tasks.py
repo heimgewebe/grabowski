@@ -1418,13 +1418,13 @@ def _managed_cargo_profile(command: list[str]) -> str:
     return "dev"
 
 
-def _resolve_managed_cargo_target_dir(
+def _managed_cargo_request_root(
     command: list[str],
     *,
     target: dict[str, Any],
     cwd: str,
     execution_backend: str,
-) -> str | None:
+) -> Path | None:
     if target["transport"] != "local" or execution_backend != "systemd-user":
         return None
     if _explicit_cargo_target_dir(command):
@@ -1433,6 +1433,24 @@ def _resolve_managed_cargo_target_dir(
     if root is None or not _regular_cargo_lock(root):
         return None
     if not _command_may_invoke_cargo(command, cwd=cwd, root=root):
+        return None
+    return root
+
+
+def _resolve_managed_cargo_target_dir(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+) -> str | None:
+    root = _managed_cargo_request_root(
+        command,
+        target=target,
+        cwd=cwd,
+        execution_backend=execution_backend,
+    )
+    if root is None:
         return None
     try:
         resolver_info = MANAGED_BUILD_RESOLVER.lstat()
@@ -1524,7 +1542,7 @@ def _resolve_managed_cargo_target_dir(
     return str(target_dir)
 
 
-def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
+def _managed_cargo_lifecycle_lock_path(cargo_target_dir: str) -> Path:
     target_dir = Path(cargo_target_dir)
     cache_path = target_dir.parent
     try:
@@ -1536,6 +1554,11 @@ def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
     cache_key = relative.parts[0]
     if SHA256.fullmatch(cache_key) is None:
         raise RuntimeError("managed Cargo cache key is invalid for lifecycle lock")
+    return MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+
+
+def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
+    lifecycle_lock = _managed_cargo_lifecycle_lock_path(cargo_target_dir)
     try:
         MANAGED_CARGO_LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         resolved_lock_root = MANAGED_CARGO_LOCK_ROOT.resolve(strict=True)
@@ -1549,7 +1572,7 @@ def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
         raise RuntimeError("managed Cargo lifecycle lock root is unsafe")
     if not Path(FLOCK_EXECUTABLE).is_file() or not os.access(FLOCK_EXECUTABLE, os.X_OK):
         raise RuntimeError("managed Cargo lifecycle lock executable is unavailable")
-    return MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+    return lifecycle_lock
 
 
 def _bind_managed_cargo_environment(
@@ -2251,6 +2274,139 @@ def _guard_linked_retry_successor(
     )
 
 
+def _execution_identity_without_command(identity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in identity.items()
+        if key not in {"argv_sha256", "identity_sha256"}
+    }
+
+
+def _record_matches_unprepared_managed_cargo_command(
+    record: dict[str, Any],
+    command: list[str],
+) -> bool:
+    try:
+        stored = json.loads(str(record["argv_json"]))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("stored task argv is invalid") from exc
+    if not isinstance(stored, list) or any(not isinstance(item, str) for item in stored):
+        raise RuntimeError("stored task argv is invalid")
+    if stored == command:
+        return True
+    if len(stored) != len(command) + 5 or stored[5:] != command:
+        return False
+    if (
+        stored[0] != FLOCK_EXECUTABLE
+        or stored[1] != "--shared"
+        or Path(stored[3]).name != Path(SYSTEMD_ENV_EXECUTABLE).name
+        or not stored[4].startswith("CARGO_TARGET_DIR=")
+    ):
+        raise RuntimeError("stored managed Cargo task wrapper is invalid")
+    target_dir = stored[4].removeprefix("CARGO_TARGET_DIR=")
+    expected_lock = _managed_cargo_lifecycle_lock_path(target_dir)
+    if stored[2] != str(expected_lock):
+        raise RuntimeError("stored managed Cargo task lock binding is invalid")
+    return True
+
+
+def _latest_matching_unprepared_managed_cargo_record(
+    identity: dict[str, Any],
+    command: list[str],
+) -> dict[str, Any] | None:
+    with _database_connection() as connection:
+        cursor = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, rowid DESC",
+            (
+                identity["host"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+            ),
+        )
+        while True:
+            rows = cursor.fetchmany(256)
+            if not rows:
+                return None
+            for row in rows:
+                record = dict(row)
+                if _record_matches_unprepared_managed_cargo_command(record, command):
+                    return record
+
+
+def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
+    if record is None:
+        return
+    state = str(record["state"])
+    if state in UNCHANGED_RETRY_STATES:
+        raise RuntimeError(
+            "unchanged terminal task retry blocked; use "
+            "grabowski_task_reconcile_resume for task "
+            f"{record['task_id']} with a named state change"
+        )
+    if state in {"launching", "running", "outcome_unknown"}:
+        pending_retry = _persisted_retry_binding_or_raise(record)
+        if pending_retry is not None:
+            raise RuntimeError(
+                "unchanged task start blocked by unresolved retry successor; "
+                f"reconcile task {record['task_id']} before another start"
+            )
+
+
+def _guard_unprepared_managed_cargo_retry(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+    identity: dict[str, Any],
+    retry_context: dict[str, Any] | None,
+) -> None:
+    if (
+        _managed_cargo_request_root(
+            command,
+            target=target,
+            cwd=cwd,
+            execution_backend=execution_backend,
+        )
+        is None
+    ):
+        return
+    if retry_context is None:
+        latest = _latest_matching_unprepared_managed_cargo_record(identity, command)
+        _guard_direct_terminal_retry_record(latest)
+        return
+    source_task_id = retry_context.get("source_task_id")
+    if not isinstance(source_task_id, str):
+        raise ValueError("terminal retry context source task is invalid")
+    source = _row_raw(source_task_id)
+    source_identity = _record_execution_identity(source)
+    if _execution_identity_without_command(source_identity) != _execution_identity_without_command(
+        identity
+    ):
+        raise ValueError("terminal retry context execution identity is stale")
+    if not _record_matches_unprepared_managed_cargo_command(source, command):
+        raise ValueError("terminal retry context command binding is stale")
+    _guard_unchanged_terminal_retry(source_identity, retry_context)
+
+
 def _guard_unchanged_terminal_retry(
     identity: dict[str, Any],
     retry_context: dict[str, Any] | None,
@@ -2274,24 +2430,8 @@ def _guard_unchanged_terminal_retry(
             identity=identity,
         )
 
-    if latest is None:
-        return None
-    latest_state = str(latest["state"])
-    if latest_state not in UNCHANGED_RETRY_STATES:
-        if latest_state in {"launching", "running", "outcome_unknown"}:
-            pending_retry = _persisted_retry_binding_or_raise(latest)
-            if pending_retry is not None:
-                raise RuntimeError(
-                    "unchanged task start blocked by unresolved retry successor; "
-                    "reconcile task "
-                    f"{latest['task_id']} before another start"
-                )
-        return None
-    raise RuntimeError(
-        "unchanged terminal task retry blocked; use "
-        "grabowski_task_reconcile_resume for task "
-        f"{latest['task_id']} with a named state change"
-    )
+    _guard_direct_terminal_retry_record(latest)
+    return None
 
 
 def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
@@ -3782,6 +3922,29 @@ def grabowski_task_start(
         owner_id=lease_owner,
         host=host,
         opaque_command=True,
+    )
+    unprepared_identity = _task_execution_identity(
+        host=host,
+        argv_sha256=command_identity.argv_sha256(command),
+        cwd=working_directory,
+        resource_keys=task_resources,
+        runtime_seconds=runtime,
+        cpu_weight=cpu,
+        io_weight=io,
+        memory_max_bytes=memory,
+        chronik_outbox_enabled=bool(chronik_enabled),
+        chronik_outbox_state_root=chronik_state_root,
+        chronik_context_json=chronik_context_json,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+    _guard_unprepared_managed_cargo_retry(
+        command,
+        target=target,
+        cwd=working_directory,
+        execution_backend=execution_backend,
+        identity=unprepared_identity,
+        retry_context=_retry_context,
     )
     command = _bind_managed_cargo_environment(
         command,
