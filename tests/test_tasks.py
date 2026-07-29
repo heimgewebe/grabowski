@@ -1220,6 +1220,96 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(payload["state"], "completed")
         self.assertIn("receipt_sha256", payload)
 
+    def test_status_resolves_legacy_local_host_to_unique_registered_local_host(self) -> None:
+        started = self._start()
+        task_id = started["task"]["task_id"]
+        probe = _launcher()
+        probe["stdout"] = (
+            "LoadState=not-found\n"
+            "ActiveState=inactive\n"
+            "SubState=dead\n"
+            "Result=success\n"
+            "ExecMainCode=0\n"
+            "ExecMainStatus=0\n"
+        )
+        registry = {"schema_version": 1, "hosts": {"heim-pc": LOCAL_HOST}}
+        with patch.object(
+            tasks.fleet,
+            "fleet_host",
+            side_effect=ValueError("Unknown fleet host: local"),
+        ), patch.object(tasks.fleet, "load_fleet", return_value=registry), patch.object(
+            tasks.operator, "_run", return_value=probe
+        ) as run:
+            status = tasks.grabowski_task_status(task_id)
+        self.assertEqual(status["state"], "completed")
+        self.assertEqual(
+            status["last_observation"]["probe"]["task_host_resolution"],
+            {
+                "kind": "legacy-local-task-host-v1",
+                "stored_host": "local",
+                "resolved_host": "heim-pc",
+                "transport": "local",
+            },
+        )
+        run.assert_called_once()
+
+    def test_status_rejects_legacy_local_host_without_unique_local_target(self) -> None:
+        for hosts in (
+            {},
+            {
+                "heim-pc": LOCAL_HOST,
+                "other-local": {**LOCAL_HOST, "roles": ["other"]},
+            },
+        ):
+            with self.subTest(hosts=sorted(hosts)):
+                started = self._start()
+                task_id = started["task"]["task_id"]
+                registry = {"schema_version": 1, "hosts": hosts}
+                with patch.object(
+                    tasks.fleet,
+                    "fleet_host",
+                    side_effect=ValueError("Unknown fleet host: local"),
+                ), patch.object(tasks.fleet, "load_fleet", return_value=registry), patch.object(
+                    tasks.operator, "_run"
+                ) as run:
+                    with self.assertRaisesRegex(ValueError, "Unknown fleet host: local"):
+                        tasks.grabowski_task_status(task_id)
+                run.assert_not_called()
+                self.assertEqual(tasks._row(task_id)["state"], "running")
+
+    def test_dispatch_keeps_legacy_local_alias_disabled_by_default(self) -> None:
+        registry = {"schema_version": 1, "hosts": {"heim-pc": LOCAL_HOST}}
+        with patch.object(
+            tasks.fleet,
+            "fleet_host",
+            side_effect=ValueError("Unknown fleet host: local"),
+        ), patch.object(tasks.fleet, "load_fleet", return_value=registry) as load_fleet, patch.object(
+            tasks.operator, "_run"
+        ) as run:
+            with self.assertRaisesRegex(ValueError, "Unknown fleet host: local"):
+                tasks._dispatch("local", ["/bin/true"])
+        load_fleet.assert_not_called()
+        run.assert_not_called()
+
+    def test_start_keeps_legacy_local_alias_rejected_after_registry_rename(self) -> None:
+        registry = {"schema_version": 1, "hosts": {"heim-pc": LOCAL_HOST}}
+        with patch.object(
+            tasks.fleet,
+            "fleet_host",
+            side_effect=ValueError("Unknown fleet host: local"),
+        ), patch.object(tasks.fleet, "load_fleet", return_value=registry) as load_fleet, patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            with self.assertRaisesRegex(ValueError, "Unknown fleet host: local"):
+                tasks.grabowski_task_start(
+                    "local",
+                    ["/bin/true"],
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                )
+        load_fleet.assert_not_called()
+        dispatch.assert_not_called()
+
     def test_status_maps_successful_inactive_unit_to_completed(self) -> None:
         started = self._start()
         task_id = started["task"]["task_id"]
@@ -2217,6 +2307,34 @@ class TaskTests(unittest.TestCase):
             return_value=lock,
         ), self.assertRaisesRegex(RuntimeError, "lock binding is invalid"):
             tasks._terminal_retry_command(record)
+
+    def test_terminal_retry_replays_every_accepted_env_spelling(self) -> None:
+        cache_key = "b" * 64
+        target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        for env_executable in ("env", "/bin/env", tasks.SYSTEMD_ENV_EXECUTABLE):
+            with self.subTest(env_executable=env_executable):
+                bound = [
+                    tasks.FLOCK_EXECUTABLE,
+                    "--shared",
+                    str(lock),
+                    env_executable,
+                    f"CARGO_TARGET_DIR={target}",
+                    "/usr/bin/cargo",
+                    "test",
+                ]
+                record = {
+                    "argv_json": json.dumps(bound),
+                    "host": "local",
+                    "execution_backend": "systemd-user",
+                }
+                with patch.object(
+                    tasks,
+                    "_managed_cargo_lifecycle_lock",
+                    return_value=lock,
+                ):
+                    replay = tasks._terminal_retry_command(record)
+                self.assertEqual(bound[3:], replay)
 
     def test_exact_reconcile_resume_allows_named_retry_safe_budget_override(self) -> None:
         with (
@@ -5070,6 +5188,67 @@ class TaskTests(unittest.TestCase):
         ), patch.object(
             tasks, "_persisted_retry_binding_or_raise", return_value=binding
         ), self.assertRaisesRegex(RuntimeError, "unresolved retry successor"):
+            tasks._guard_unchanged_terminal_retry(identity, context)
+
+    def test_retained_retry_successor_search_is_bound_to_exact_source(self) -> None:
+        source = self._start()["task"]
+        relevant = self._start()["task"]
+        unrelated = self._start()["task"]
+        source_id = str(source["task_id"])
+        relevant_id = str(relevant["task_id"])
+        unrelated_id = str(unrelated["task_id"])
+        for task_id, bound_source in (
+            (relevant_id, source_id),
+            (unrelated_id, "f" * 24),
+        ):
+            tasks._set_state(
+                task_id,
+                "completed",
+                observation={"state": "completed", "source": "test"},
+            )
+            with tasks._database() as connection:
+                connection.execute(
+                    "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                    (
+                        tasks._canonical_json(
+                            {"retry_binding": {"source_task_id": bound_source}}
+                        ),
+                        task_id,
+                    ),
+                )
+        with patch.object(
+            tasks,
+            "_persisted_retry_binding_or_raise",
+            side_effect=lambda record: json.loads(str(record["launcher_json"]))[
+                "retry_binding"
+            ],
+        ):
+            retained = tasks._retained_retry_successor_for_source(source_id)
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertEqual(relevant_id, retained["task_id"])
+
+    def test_named_retry_blocks_retained_successor_behind_newer_ordinary_task(self) -> None:
+        source_id = "7" * 24
+        retained_id = "8" * 24
+        latest_id = "9" * 24
+        identity = {"identity_sha256": "e" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "running"}
+        retained = {"task_id": retained_id, "state": "completed"}
+        context = {"source_task_id": source_id}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=None
+        ), patch.object(
+            tasks,
+            "_retained_retry_successor_for_source",
+            return_value=retained,
+        ), self.assertRaisesRegex(RuntimeError, "already has a retained successor"):
             tasks._guard_unchanged_terminal_retry(identity, context)
 
     def test_retry_binding_is_persisted_before_dispatch_and_blocks_duplicate_start(self) -> None:

@@ -2189,27 +2189,66 @@ def _persisted_retry_binding_or_raise(record: dict[str, Any]) -> dict[str, Any] 
         raise RuntimeError("stored retry admission evidence is invalid") from exc
 
 
+def _retained_retry_successor_for_source(
+    source_task_id: str,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(source_task_id, str)
+        or terminal_convergence.TASK_ID_RE.fullmatch(source_task_id) is None
+    ):
+        raise ValueError("retry successor source task id is invalid")
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE task_id<>? AND state<>'cancelled' "
+            "AND launcher_json IS NOT NULL AND ("
+            "(json_valid(launcher_json) "
+            "AND json_type(launcher_json, '$.retry_binding.source_task_id') = 'text' "
+            "AND json_extract(launcher_json, '$.retry_binding.source_task_id')=?) "
+            "OR (NOT json_valid(launcher_json) AND instr(launcher_json, ?) > 0)"
+            ") ORDER BY created_at_unix DESC, rowid DESC LIMIT 2",
+            (source_task_id, source_task_id, '"retry_binding"'),
+        ).fetchall()
+    if not rows:
+        return None
+    records = [dict(row) for row in rows]
+    for record in records:
+        binding = _persisted_retry_binding_or_raise(record)
+        if binding is None or str(binding.get("source_task_id")) != source_task_id:
+            raise RuntimeError("stored retry admission evidence is invalid")
+    if len(records) > 1:
+        raise RuntimeError("named retry source has multiple retained successors")
+    return records[0]
+
+
 def _guard_linked_retry_successor(
     latest: dict[str, Any] | None,
     *,
     source_task_id: str,
 ) -> None:
-    if latest is None or str(latest["task_id"]) == source_task_id:
+    if latest is not None and str(latest["task_id"]) != source_task_id:
+        binding = _persisted_retry_binding_or_raise(latest)
+        if binding is not None and str(latest["state"]) in {
+            "launching",
+            "running",
+            "outcome_unknown",
+        }:
+            raise RuntimeError(
+                "unchanged task start blocked by unresolved retry successor; "
+                f"reconcile task {latest['task_id']} before another start"
+            )
+    retained = _retained_retry_successor_for_source(source_task_id)
+    if retained is None:
         return
-    binding = _persisted_retry_binding_or_raise(latest)
-    if binding is None:
-        return
-    latest_state = str(latest["state"])
-    if latest_state in {"launching", "running", "outcome_unknown"}:
+    retained_state = str(retained["state"])
+    if retained_state in {"launching", "running", "outcome_unknown"}:
         raise RuntimeError(
             "unchanged task start blocked by unresolved retry successor; "
-            f"reconcile task {latest['task_id']} before another start"
+            f"reconcile task {retained['task_id']} before another start"
         )
-    if str(binding["source_task_id"]) == source_task_id and latest_state != "cancelled":
-        raise RuntimeError(
-            "named retry source already has a retained successor; "
-            f"reconcile task {latest['task_id']} instead"
-        )
+    raise RuntimeError(
+        "named retry source already has a retained successor; "
+        f"reconcile task {retained['task_id']} instead"
+    )
 
 
 def _guard_unchanged_terminal_retry(
@@ -2353,22 +2392,62 @@ def _validate_command(argv: list[str]) -> list[str]:
     return command
 
 
-def _dispatch(host: str, argv: list[str], *, timeout_seconds: int = 60) -> dict[str, Any]:
-    target = fleet.fleet_host(host)
+def _resolve_task_dispatch_host(host: str) -> tuple[str, dict[str, Any], bool]:
+    """Resolve one persisted task host, including the bounded legacy local alias."""
+    try:
+        return host, fleet.fleet_host(host), False
+    except ValueError as exc:
+        if host != "local" or str(exc) != f"Unknown fleet host: {host}":
+            raise
+        registered = fleet.load_fleet()
+        local_hosts = [
+            (name, candidate)
+            for name, candidate in registered["hosts"].items()
+            if candidate["enabled"]
+            and candidate["transport"] == "local"
+            and candidate["target"] == "local"
+        ]
+        if len(local_hosts) != 1:
+            raise
+        resolved_host, target = local_hosts[0]
+        return resolved_host, target, True
+
+
+def _dispatch(
+    host: str,
+    argv: list[str],
+    *,
+    timeout_seconds: int = 60,
+    allow_legacy_local_alias: bool = False,
+) -> dict[str, Any]:
+    if allow_legacy_local_alias:
+        resolved_host, target, legacy_local_alias = _resolve_task_dispatch_host(host)
+    else:
+        resolved_host, target, legacy_local_alias = host, fleet.fleet_host(host), False
     if target["transport"] == "local":
-        return operator._run(
+        result = operator._run(
             argv,
             cwd=operator.HOME,
             timeout_seconds=timeout_seconds,
             max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
         )
-    remote = fleet.run_fleet_host(
-        host,
-        argv,
-        timeout_seconds=timeout_seconds,
-        max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
-    )
-    return remote["result"]
+    else:
+        remote = fleet.run_fleet_host(
+            resolved_host,
+            argv,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
+        )
+        result = remote["result"]
+    if legacy_local_alias:
+        result = dict(result)
+        result["task_host_resolution"] = {
+            "kind": "legacy-local-task-host-v1",
+            "stored_host": host,
+            "resolved_host": resolved_host,
+            "transport": target["transport"],
+        }
+    return result
 
 
 def _launch_argv(record: dict[str, Any]) -> list[str]:
@@ -3504,7 +3583,12 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
         "systemd_scope": _systemd_scope(record),
     }
     try:
-        result = _dispatch(record["host"], command, timeout_seconds=30)
+        result = _dispatch(
+            record["host"],
+            command,
+            timeout_seconds=30,
+            allow_legacy_local_alias=True,
+        )
     except fleet.FleetCommandDenied:
         # Production hosts intentionally do not expose generic systemctl through
         # fleet_run.  Reconcile still needs one fixed read-only observation shape
@@ -4725,7 +4809,7 @@ def _terminal_retry_command(record: dict[str, Any]) -> list[str]:
         or len(command) < 6
         or command[0] != FLOCK_EXECUTABLE
         or command[1] != "--shared"
-        or command[3] != SYSTEMD_ENV_EXECUTABLE
+        or Path(command[3]).name != Path(SYSTEMD_ENV_EXECUTABLE).name
     ):
         return command
     replay = command[3:]
