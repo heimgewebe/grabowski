@@ -2026,7 +2026,11 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                         OSError,
                     ) as exc:
                         convergence_status = "degraded"
-                        convergence_error = type(exc).__name__
+                        convergence_error = (
+                            str(exc) or type(exc).__name__
+                            if type(exc) is RuntimeError
+                            else type(exc).__name__
+                        )
                     else:
                         convergence_status = "verified"
                         convergence_counts = dict(

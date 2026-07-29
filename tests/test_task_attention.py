@@ -1388,5 +1388,35 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual({first["task_id"], second["task_id"]}, ids)
 
 
+    def test_current_surfaces_preserve_runtime_convergence_error_detail(self) -> None:
+        self._failed_task()
+        message = "retry successor convergence scan limit exceeded"
+
+        with patch.object(
+            tasks,
+            "_task_retry_successor_records",
+            side_effect=RuntimeError(message),
+        ):
+            reconciled = attention.reconcile_attention({"limit": 20})
+        self.assertEqual("degraded", reconciled["attention_convergence_status"])
+        self.assertEqual(message, reconciled["attention_convergence_error"])
+
+        with patch.object(
+            tasks,
+            "_task_retry_successor_records",
+            side_effect=RuntimeError(message),
+        ):
+            listed = tasks.grabowski_task_list(
+                state="attention",
+                view="evidence",
+                limit=20,
+            )
+        self.assertEqual("degraded", listed["attention_projection"]["status"])
+        self.assertEqual(
+            message,
+            listed["attention_projection"]["evidence_error"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

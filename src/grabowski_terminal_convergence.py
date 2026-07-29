@@ -543,13 +543,19 @@ def converge_attention_records(
         }
         verified_identities.add(source_identity)
 
+    globally_seen: set[str] = set()
     for source_task_id in verified_retry_edges:
-        seen: set[str] = set()
+        if source_task_id in globally_seen:
+            continue
+        current_path: set[str] = set()
         cursor = source_task_id
         while cursor in verified_retry_edges:
-            if cursor in seen:
+            if cursor in current_path:
                 raise TerminalConvergenceError("persisted retry bindings contain a cycle")
-            seen.add(cursor)
+            if cursor in globally_seen:
+                break
+            current_path.add(cursor)
+            globally_seen.add(cursor)
             cursor = str(verified_retry_edges[cursor]["successor_task_id"])
 
     converged_current = [

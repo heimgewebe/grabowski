@@ -5216,6 +5216,69 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(source["lifecycle_receipt_sha256"], retry_audit["source_lifecycle_receipt_sha256"])
         self.assertEqual(successor["retry_context_sha256"], retry_audit["retry_context_sha256"])
+    def test_record_execution_identity_rejects_malformed_stored_json(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+
+        record = tasks._row_raw(task_id)
+        record["resource_keys_json"] = "{"
+        with self.assertRaisesRegex(
+            RuntimeError, "stored task resource keys are invalid"
+        ):
+            tasks._record_execution_identity(record)
+
+        record = tasks._row_raw(task_id)
+        record["chronik_context_json"] = "{"
+        with self.assertRaisesRegex(
+            RuntimeError, "stored task Chronik context is invalid"
+        ):
+            tasks._record_execution_identity(record)
+
+    def test_resource_keys_are_canonicalized_before_identity_lookup(self) -> None:
+        started = self._start(resource_keys=["display:12", "display:11"])
+        record = tasks._row_raw(str(started["task"]["task_id"]))
+        self.assertEqual(
+            ["display:11", "display:12"],
+            json.loads(str(record["resource_keys_json"])),
+        )
+
+    def test_retry_successor_scan_ignores_nested_retry_binding_keys(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "source": "test"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    tasks._canonical_json(
+                        {"diagnostic": {"retry_binding": "not-a-top-level-binding"}}
+                    ),
+                    task_id,
+                ),
+            )
+            records = tasks._task_retry_successor_records(connection, limit=0)
+        self.assertEqual([], records)
+
+    def test_retry_successor_scan_rejects_malformed_potential_binding(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "source": "test"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                ('{"retry_binding":', task_id),
+            )
+            with self.assertRaisesRegex(ValueError, "persisted task launcher is invalid"):
+                tasks._task_retry_successor_records(connection, limit=1)
+
 
 class RuntimeContractTests(unittest.TestCase):
     def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:
@@ -5956,6 +6019,7 @@ else:
                 "._require_operator_capability"
             )
         )
+
 
 
 if __name__ == "__main__":

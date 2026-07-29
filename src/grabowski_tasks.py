@@ -1955,10 +1955,16 @@ def _lease_owner(task_id: str) -> str:
 
 def _record_resource_keys(record: dict[str, Any]) -> list[str]:
     raw = record.get("resource_keys_json") or "[]"
-    values = json.loads(raw)
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("stored task resource keys are invalid") from exc
     if not isinstance(values, list):
-        raise RuntimeError("Stored task resource keys are invalid")
-    return [resources.normalize_resource_key(value) for value in values]
+        raise RuntimeError("stored task resource keys are invalid")
+    try:
+        return [resources.normalize_resource_key(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("stored task resource keys are invalid") from exc
 
 
 def _task_execution_identity(
@@ -1977,6 +1983,15 @@ def _task_execution_identity(
     execution_backend: str,
     systemd_scope: str,
 ) -> dict[str, Any]:
+    chronik_context: dict[str, Any] | None = None
+    if chronik_context_json is not None:
+        try:
+            decoded_chronik_context = json.loads(chronik_context_json)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("stored task Chronik context is invalid") from exc
+        if not isinstance(decoded_chronik_context, dict):
+            raise RuntimeError("stored task Chronik context is invalid")
+        chronik_context = decoded_chronik_context
     return terminal_convergence.task_execution_identity(
         host=host,
         argv_sha256=argv_sha256,
@@ -1990,11 +2005,7 @@ def _task_execution_identity(
         memory_max_bytes=memory_max_bytes,
         chronik_outbox_enabled=chronik_outbox_enabled,
         chronik_outbox_state_root=chronik_outbox_state_root,
-        chronik_context=(
-            json.loads(chronik_context_json)
-            if chronik_context_json is not None
-            else None
-        ),
+        chronik_context=chronik_context,
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
@@ -3122,7 +3133,12 @@ def _task_retry_successor_records(
     placeholders = ",".join("?" for _ in support_states)
     rows = connection.execute(
         f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
-        "AND instr(launcher_json, ?) > 0 LIMIT ?",
+        "AND CASE "
+        "WHEN json_valid(launcher_json) "
+        "THEN json_type(launcher_json, '$.retry_binding') "
+        "WHEN instr(launcher_json, ?) > 0 THEN 'invalid' "
+        "ELSE NULL END IS NOT NULL "
+        "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
         (*support_states, '"retry_binding"', limit + 1),
     ).fetchall()
     if len(rows) > limit:
@@ -3211,7 +3227,12 @@ def _task_attention_projection(
         RuntimeError,
         OSError,
     ) as exc:
-        return degraded(type(exc).__name__)
+        error = (
+            str(exc) or type(exc).__name__
+            if type(exc) is RuntimeError
+            else type(exc).__name__
+        )
+        return degraded(error)
     excluded_task_ids = set(projected["excluded_task_ids"])
     public_projection = {
         key: value
