@@ -4635,17 +4635,17 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             active_rules=[],
         )
 
-        result = grips.grip_run(
-            "captain-run",
+        action = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )[0]
+        execution = grips._run_captain_pr_merge(
+            Path.cwd(),
+            action,
             parameters,
-            profile="captain",
-            allow_mutation=True,
-            command_runner=FakeGit(),
-            github_runner=gh,
+            gh,
         )
 
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
-        execution = result["output"]["executions"][0]
         self.assertIn(
             "base_update_guard_strict_ruleset_missing",
             execution["preflight_errors"],
