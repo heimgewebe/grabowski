@@ -532,7 +532,7 @@ class ReposkopContextTests(unittest.TestCase):
             state["creates"] += 1
             return real_create(binding, root_descriptor=root_descriptor)
 
-        def open_then_fail_after_create():
+        def open_then_fail_after_create(*args, **kwargs):
             state["opens"] += 1
             # 1: outer lock/record_usage root
             # 2: publish recover/exists probe
@@ -544,7 +544,7 @@ class ReposkopContextTests(unittest.TestCase):
                 raise context.ReposkopContextError(
                     "Reposkop receipt root left its authorized write-root path"
                 )
-            return real_open()
+            return real_open(*args, **kwargs)
 
         with (
             self.patch_context(patches),
@@ -581,14 +581,14 @@ class ReposkopContextTests(unittest.TestCase):
             state["creates"] += 1
             return real_create(binding, root_descriptor=root_descriptor)
 
-        def open_then_raise_file_not_found():
+        def open_then_raise_file_not_found(*args, **kwargs):
             state["opens"] += 1
             if state["opens"] == 4 and self.receipts.exists():
                 self.receipts.rename(moved_root)
             if state["opens"] >= 4:
                 # Simulate component disappearing mid-walk before translation.
                 raise FileNotFoundError("receipt component vanished mid-walk")
-            return real_open()
+            return real_open(*args, **kwargs)
 
         with (
             self.patch_context(patches),
@@ -654,6 +654,50 @@ class ReposkopContextTests(unittest.TestCase):
             self.assertEqual(list(self.receipts.glob("*.json")), [])
             self.assertEqual(list(self.receipts.glob("*.pending")), [])
 
+    def test_descriptor_open_rejects_parent_swap_after_policy_preflight(self) -> None:
+        """Pre-open leaf swap must not bind a different directory than ensure validated.
+
+        Write-root walks already reject intermediate symlinks. This regression uses a
+        real directory rename so open would otherwise succeed on a different inode;
+        expected_identity must still fail closed.
+        """
+        trusted_parent = self.root / "trusted" / "state"
+        self.receipts = trusted_parent / "receipts"
+        moved_receipts = trusted_parent / "receipts-moved"
+        attacker_root = self.root / "attacker" / "receipts"
+        attacker_root.mkdir(parents=True, mode=0o700)
+        attacker_root.chmod(0o700)
+        patches = self.patches(self.report())
+        real_root_descriptor = context._receipt_root_descriptor
+
+        @contextmanager
+        def replace_leaf_then_open(*, expected_identity=None):
+            self.receipts.rename(moved_receipts)
+            attacker_root.rename(self.receipts)
+            with real_root_descriptor(
+                expected_identity=expected_identity
+            ) as root_descriptor:
+                yield root_descriptor
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context,
+                "_receipt_root_descriptor",
+                side_effect=replace_leaf_then_open,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "descriptor does not match the validated directory",
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertFalse(attacker_root.exists())
+        self.assertEqual(list(self.receipts.iterdir()), [])
+        self.assertEqual(list(moved_receipts.iterdir()), [])
+        self.assertEqual(self.audit_records, [])
+
     def test_recovers_linked_pending_after_interruption(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):
@@ -666,13 +710,15 @@ class ReposkopContextTests(unittest.TestCase):
                 purpose="grabowski-repo-state-context",
                 executable=executable,
             )
-            context._ensure_receipt_root()
+            expected_root_identity = context._ensure_receipt_root()
             self.audit_bindings[binding["usage_key_sha256"]] = {
                 "audit_ref": "audit-record-sha256:" + "d" * 64,
                 "recorded_at": "2026-07-29T10:00:00+00:00",
                 "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
             }
-            with context._receipt_root_descriptor() as root_descriptor:
+            with context._receipt_root_descriptor(
+                expected_identity=expected_root_identity
+            ) as root_descriptor:
                 context._create_pending(
                     binding,
                     root_descriptor=root_descriptor,
