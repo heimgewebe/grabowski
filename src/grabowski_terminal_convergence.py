@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
+import re
 from typing import Any
 
 SCHEMA_VERSION = 1
+EXECUTION_IDENTITY_SCHEMA_VERSION = 1
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 FAILURE_CLASSES = frozenset({
     "completed",
     "running",
@@ -120,6 +125,169 @@ def classify_terminal_failure(
     return result.to_json()
 
 
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def task_execution_identity(
+    *,
+    host: str,
+    argv_sha256: str,
+    cwd: str,
+    resource_keys: list[str],
+    runtime_seconds: int,
+    cpu_weight: int,
+    io_weight: int,
+    memory_max_bytes: int | None,
+    chronik_outbox_enabled: bool,
+    chronik_outbox_state_root: str | None,
+    chronik_context: dict[str, Any] | None,
+    execution_backend: str,
+    systemd_scope: str,
+) -> dict[str, Any]:
+    material = {
+        "schema_version": EXECUTION_IDENTITY_SCHEMA_VERSION,
+        "host": host,
+        "argv_sha256": argv_sha256,
+        "cwd": cwd,
+        "resource_keys": sorted(set(resource_keys)),
+        "runtime_seconds": runtime_seconds,
+        "cpu_weight": cpu_weight,
+        "io_weight": io_weight,
+        "memory_max_bytes": memory_max_bytes,
+        "chronik_outbox_enabled": chronik_outbox_enabled,
+        "chronik_outbox_state_root": chronik_outbox_state_root,
+        "chronik_context": chronik_context,
+        "execution_backend": execution_backend,
+        "systemd_scope": systemd_scope,
+    }
+    return {
+        **material,
+        "identity_sha256": hashlib.sha256(
+            _canonical_json(material).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def attention_execution_identity(record: dict[str, Any]) -> str | None:
+    required = (
+        "host",
+        "argv_sha256",
+        "cwd",
+        "runtime_seconds",
+        "cpu_weight",
+        "io_weight",
+        "chronik_outbox_enabled",
+        "chronik_outbox_state_root",
+        "chronik_context_json",
+        "execution_backend",
+        "systemd_scope",
+    )
+    identity_signals = (
+        "host",
+        "cwd",
+        "resource_keys_json",
+        "resource_keys",
+        "runtime_seconds",
+        "execution_backend",
+        "systemd_scope",
+    )
+    if not any(key in record for key in identity_signals):
+        return None
+    if any(key not in record for key in required):
+        raise TerminalConvergenceError("attention execution identity is incomplete")
+    host = record["host"]
+    argv_sha256 = record["argv_sha256"]
+    cwd = record["cwd"]
+    if not isinstance(host, str) or not host:
+        raise TerminalConvergenceError("attention execution identity host is invalid")
+    if not isinstance(argv_sha256, str) or SHA256_RE.fullmatch(argv_sha256) is None:
+        raise TerminalConvergenceError("attention execution identity argv hash is invalid")
+    if not isinstance(cwd, str) or not cwd:
+        raise TerminalConvergenceError("attention execution identity cwd is invalid")
+    raw_resources = record.get("resource_keys_json")
+    if raw_resources is None:
+        raw_resources = record.get("resource_keys", [])
+    elif isinstance(raw_resources, str):
+        try:
+            raw_resources = json.loads(raw_resources)
+        except json.JSONDecodeError as exc:
+            raise TerminalConvergenceError(
+                "attention execution identity resource keys are invalid"
+            ) from exc
+    if not isinstance(raw_resources, list) or any(
+        not isinstance(value, str) or not value for value in raw_resources
+    ):
+        raise TerminalConvergenceError(
+            "attention execution identity resource keys are invalid"
+        )
+    integer_fields = ("runtime_seconds", "cpu_weight", "io_weight")
+    for key in integer_fields:
+        value = record[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TerminalConvergenceError(
+                f"attention execution identity {key} is invalid"
+            )
+    memory_max_bytes = record.get("memory_max_bytes")
+    if memory_max_bytes is not None and (
+        isinstance(memory_max_bytes, bool)
+        or not isinstance(memory_max_bytes, int)
+        or memory_max_bytes < 0
+    ):
+        raise TerminalConvergenceError(
+            "attention execution identity memory limit is invalid"
+        )
+    chronik_outbox_enabled = record["chronik_outbox_enabled"]
+    if chronik_outbox_enabled not in {0, 1, False, True}:
+        raise TerminalConvergenceError(
+            "attention execution identity Chronik flag is invalid"
+        )
+    chronik_state_root = record["chronik_outbox_state_root"]
+    if chronik_state_root is not None and not isinstance(chronik_state_root, str):
+        raise TerminalConvergenceError(
+            "attention execution identity Chronik state root is invalid"
+        )
+    raw_chronik_context = record["chronik_context_json"]
+    if raw_chronik_context is None:
+        chronik_context = None
+    elif isinstance(raw_chronik_context, str):
+        try:
+            chronik_context = json.loads(raw_chronik_context)
+        except json.JSONDecodeError as exc:
+            raise TerminalConvergenceError(
+                "attention execution identity Chronik context is invalid"
+            ) from exc
+    else:
+        raise TerminalConvergenceError(
+            "attention execution identity Chronik context is invalid"
+        )
+    execution_backend = record["execution_backend"]
+    systemd_scope = record["systemd_scope"]
+    if not isinstance(execution_backend, str) or not execution_backend:
+        raise TerminalConvergenceError(
+            "attention execution identity backend is invalid"
+        )
+    if not isinstance(systemd_scope, str) or not systemd_scope:
+        raise TerminalConvergenceError(
+            "attention execution identity systemd scope is invalid"
+        )
+    return task_execution_identity(
+        host=host,
+        argv_sha256=argv_sha256,
+        cwd=cwd,
+        resource_keys=raw_resources,
+        runtime_seconds=record["runtime_seconds"],
+        cpu_weight=record["cpu_weight"],
+        io_weight=record["io_weight"],
+        memory_max_bytes=memory_max_bytes,
+        chronik_outbox_enabled=bool(chronik_outbox_enabled),
+        chronik_outbox_state_root=chronik_state_root,
+        chronik_context=chronik_context,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )["identity_sha256"]
+
+
 def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not isinstance(records, list):
         raise TerminalConvergenceError("attention records must be a list")
@@ -166,15 +334,59 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
                 classification = "already_satisfied"
             seen_bindings.add(binding)
             historical.append({**item, "convergence_classification": classification})
+    identity_groups: dict[str, list[dict[str, Any]]] = {}
+    identity_free: list[dict[str, Any]] = []
+    for item in current:
+        identity = attention_execution_identity(item)
+        if identity is None:
+            identity_free.append(item)
+        else:
+            identity_groups.setdefault(identity, []).append(item)
+
+    converged_current = list(identity_free)
+    for identity in sorted(identity_groups):
+        ordered = sorted(
+            identity_groups[identity],
+            key=lambda item: (
+                int(item.get("created_at_unix") or 0),
+                int(item.get("updated_at_unix") or 0),
+                str(item["task_id"]),
+                int(item["attempt"]),
+            ),
+        )
+        winner = ordered[-1]
+        converged_current.append(winner)
+        for item in ordered[:-1]:
+            historical.append(
+                {
+                    **item,
+                    "convergence_classification": "superseded_by_identical_retry",
+                    "execution_identity_sha256": identity,
+                    "successor_task_id": winner["task_id"],
+                    "success_claimed": False,
+                }
+            )
+
+    classifications = (
+        "duplicate",
+        "superseded",
+        "already_satisfied",
+        "superseded_by_identical_retry",
+    )
     return {
         "schema_version": SCHEMA_VERSION,
-        "current": current,
+        "current": sorted(converged_current, key=lambda item: str(item["task_id"])),
         "historical": historical,
         "raw_count": len(records),
-        "current_count": len(current),
+        "current_count": len(converged_current),
         "converged_count": len(historical),
+        "execution_identity_group_count": len(identity_groups),
         "classification_counts": {
-            name: sum(1 for item in historical if item["convergence_classification"] == name)
-            for name in ("duplicate", "superseded", "already_satisfied")
+            name: sum(
+                1
+                for item in historical
+                if item["convergence_classification"] == name
+            )
+            for name in classifications
         },
     }

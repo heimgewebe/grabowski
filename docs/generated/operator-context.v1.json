@@ -2998,10 +2998,10 @@
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_system_map.py": "86eb6fe760aea800052d74b7c45ff3986adc130c6e3a78954cd65a472565a7de",
-      "src/grabowski_task_attention.py": "f75a87d3b05456472d298dd2fc9ee960057b31b2a6dd46d85f472706d956658a",
+      "src/grabowski_task_attention.py": "fe0433a8bf24f774004af32be2d343ccf42384e4057dc7f5ff037b0b1c83b49a",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "a4b82ceccb6a3fe0066ad7c9403b17a2b4ad3f315fc13c97abf1a68ee1a4f61d",
-      "src/grabowski_terminal_convergence.py": "5383579e275a9d07c2930faaada6d1a616b2dbdf442cc111d8e8dd1525aa6f9b",
+      "src/grabowski_tasks.py": "0f5f148c0e93e2afeafdbbecbc943af2b709f92f3540de328bac2d73f558b947",
+      "src/grabowski_terminal_convergence.py": "6b4dca1bfd2bcb9106dcd112f882248de2e0df92435891baf6e508f62fc3bea8",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"

@@ -113,6 +113,7 @@ class TaskTests(unittest.TestCase):
         self.db_patch.start()
         self.outcomes_patch.start()
         self.resource_patch.start()
+        self.start_counter = 0
 
     def tearDown(self) -> None:
         self.resource_patch.stop()
@@ -199,6 +200,8 @@ class TaskTests(unittest.TestCase):
         resource_keys: list[str] | None = None,
     ) -> dict[str, object]:
         selected = LOCAL_HOST if host == "local" else REMOTE_HOST
+        self.start_counter += 1
+        command_argument = "ok" if self.start_counter == 1 else f"ok-{self.start_counter}"
         with patch.object(tasks.fleet, "fleet_host", return_value=selected), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
@@ -206,7 +209,7 @@ class TaskTests(unittest.TestCase):
         ):
             result = tasks.grabowski_task_start(
                 host,
-                ["/bin/echo", "ok"],
+                ["/bin/echo", command_argument],
                 cwd=str(self.root),
                 runtime_seconds=60,
                 resume_policy="verify-then-retry",
@@ -231,7 +234,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=ProtectHome=no", launch)
         self.assertIn("--property=MemoryDenyWriteExecute=no", launch)
         self.assertIn("--property=UMask=0077", launch)
-        self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
+        self.assertEqual(launch[-3:], ["--", "/bin/echo", command_argument])
         return result
 
     def _prepare_pending_terminalization(
@@ -2150,6 +2153,34 @@ class TaskTests(unittest.TestCase):
             )
         )
         self.assertIsNotNone(tasks.resources.inspect_resource("display:12"))
+
+    def test_exact_reconcile_resume_allows_named_manual_policy_override(self) -> None:
+        started = self._start()
+        source = tasks._set_state(
+            str(started["task"]["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=str(source["task_id"]),
+                reason="repository dependency changed after the failed attempt",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["blocked"])
+        self.assertEqual(1, len(result["resumed"]))
+        successor = result["resumed"][0]
+        self.assertTrue(successor["explicit_policy_override"])
+        self.assertEqual(source["task_id"], successor["retry_of_task_id"])
 
     def test_reconcile_resume_blocks_unverified_policy(self) -> None:
         started = self._start()
@@ -4756,6 +4787,80 @@ class TaskTests(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError, "may not be a symlink"):
             tasks.grabowski_task_list()
 
+
+
+    def test_task_start_blocks_unchanged_terminal_failure_without_named_change(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+            tasks._set_state(
+                str(first["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ):
+                tasks.grabowski_task_start(**common)
+        rows = tasks.grabowski_task_list(limit=20, view="evidence")
+        self.assertEqual(1, rows["total_matching"])
+
+    def test_reconcile_resume_allows_one_named_state_bound_successor(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        audit_records: list[dict[str, object]] = []
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit", side_effect=audit_records.append),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+            source = tasks._set_state(
+                str(first["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            result = tasks.reconcile_tasks_resume(
+                task_id=str(first["task_id"]),
+                max_resumes=1,
+                reason="repository head advanced after the failed validation",
+            )
+        self.assertEqual(1, len(result["resumed"]))
+        successor = result["resumed"][0]
+        self.assertEqual(first["task_id"], successor["retry_of_task_id"])
+        self.assertEqual("manual", successor["resume_policy"])
+        self.assertRegex(successor["retry_context_sha256"], r"^[0-9a-f]{64}$")
+        retry_audit = next(
+            item
+            for item in audit_records
+            if item.get("operation") == "task-reconcile-retry-successor"
+        )
+        self.assertEqual(source["lifecycle_receipt_sha256"], retry_audit["source_lifecycle_receipt_sha256"])
+        self.assertEqual(successor["retry_context_sha256"], retry_audit["retry_context_sha256"])
 
 class RuntimeContractTests(unittest.TestCase):
     def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:

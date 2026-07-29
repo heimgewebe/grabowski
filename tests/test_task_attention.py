@@ -101,6 +101,7 @@ class TaskAttentionTests(unittest.TestCase):
         ]
         for item in self.patches:
             item.start()
+        self.start_counter = 0
 
     def tearDown(self) -> None:
         for item in reversed(self.patches):
@@ -110,6 +111,8 @@ class TaskAttentionTests(unittest.TestCase):
     def _start(
         self, resource_keys: list[str] | None = None
     ) -> dict[str, object]:
+        self.start_counter += 1
+        command_argument = "ok" if self.start_counter == 1 else f"ok-{self.start_counter}"
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ), patch.object(tasks.base, "_append_audit"), patch.object(
@@ -117,7 +120,7 @@ class TaskAttentionTests(unittest.TestCase):
         ):
             return tasks.grabowski_task_start(
                 "local",
-                ["/bin/echo", "ok"],
+                ["/bin/echo", command_argument],
                 cwd=str(self.root),
                 runtime_seconds=60,
                 resume_policy="verify-then-retry",

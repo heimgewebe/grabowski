@@ -1720,7 +1720,14 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
         str(record["task_id"]): record for record in convergence["current"]
     }
 
-    excluded_task_ids: set[str] = set()
+    convergence_excluded_task_ids = {
+        str(item["task_id"])
+        for item in convergence["historical"]
+        if item.get("convergence_classification")
+        == "superseded_by_identical_retry"
+    }
+    excluded_task_ids: set[str] = set(convergence_excluded_task_ids)
+    decision_excluded_task_ids: set[str] = set()
     decision_classification_counts: dict[str, int] = {}
     decision_candidate_count = 0
     root = _state_root()
@@ -1747,14 +1754,19 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
                 decision_classification_counts.get(classification, 0) + 1
             )
             if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
-                excluded_task_ids.add(str(record["task_id"]))
+                task_id = str(record["task_id"])
+                decision_excluded_task_ids.add(task_id)
+                excluded_task_ids.add(task_id)
 
     excluded_counts = {
         classification: decision_classification_counts.get(classification, 0)
         for classification in sorted(CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS)
     }
-    raw_attention_count = len(current_by_task)
-    current_attention_count = raw_attention_count - len(excluded_task_ids)
+    deduplicated_attention_count = len(current_by_task)
+    current_attention_count = (
+        deduplicated_attention_count - len(decision_excluded_task_ids)
+    )
+    excluded_attention_count = convergence["raw_count"] - current_attention_count
     projection_material = {
         "schema_version": 1,
         "task_bindings": [
@@ -1762,6 +1774,7 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
             for _task_id, record in sorted(current_by_task.items())
         ],
         "excluded_task_ids": sorted(excluded_task_ids),
+        "convergence_excluded_task_ids": sorted(convergence_excluded_task_ids),
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
         "attention_convergence_counts": convergence["classification_counts"],
         "attention_converged_bindings": [
@@ -1770,6 +1783,8 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
                 "attempt": item["attempt"],
                 "lifecycle_receipt_sha256": item.get("lifecycle_receipt_sha256"),
                 "classification": item["convergence_classification"],
+                "success_claimed": bool(item.get("success_claimed", False)),
+                "successor_task_id": item.get("successor_task_id"),
             }
             for item in convergence["historical"]
         ],
@@ -1779,9 +1794,12 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
         "evidence_error": None,
         "projection_sha256": _sha256_json(projection_material),
         "raw_attention_count": convergence["raw_count"],
-        "deduplicated_attention_count": raw_attention_count,
+        "deduplicated_attention_count": deduplicated_attention_count,
         "current_attention_count": current_attention_count,
-        "excluded_attention_count": len(excluded_task_ids),
+        "excluded_attention_count": excluded_attention_count,
+        "convergence_excluded_attention_count": len(
+            convergence_excluded_task_ids
+        ),
         "excluded_classification_counts": excluded_counts,
         "decision_candidate_count": decision_candidate_count,
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),

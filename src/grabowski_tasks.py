@@ -291,6 +291,8 @@ TASK_SCHEMA_V5_ADDITIVE_COLUMNS = {
 }
 LEASE_MAINTENANCE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
+TASK_RETRY_CONTEXT_SCHEMA_VERSION = 1
+UNCHANGED_RETRY_STATES = frozenset(TASK_STATE_PROJECTIONS["attention"])
 
 
 def _now() -> int:
@@ -1959,6 +1961,226 @@ def _record_resource_keys(record: dict[str, Any]) -> list[str]:
     return [resources.normalize_resource_key(value) for value in values]
 
 
+def _task_execution_identity(
+    *,
+    host: str,
+    argv_sha256: str,
+    cwd: str,
+    resource_keys: list[str],
+    runtime_seconds: int,
+    cpu_weight: int,
+    io_weight: int,
+    memory_max_bytes: int | None,
+    chronik_outbox_enabled: bool,
+    chronik_outbox_state_root: str | None,
+    chronik_context_json: str | None,
+    execution_backend: str,
+    systemd_scope: str,
+) -> dict[str, Any]:
+    return terminal_convergence.task_execution_identity(
+        host=host,
+        argv_sha256=argv_sha256,
+        cwd=cwd,
+        resource_keys=[
+            resources.normalize_resource_key(value) for value in resource_keys
+        ],
+        runtime_seconds=runtime_seconds,
+        cpu_weight=cpu_weight,
+        io_weight=io_weight,
+        memory_max_bytes=memory_max_bytes,
+        chronik_outbox_enabled=chronik_outbox_enabled,
+        chronik_outbox_state_root=chronik_outbox_state_root,
+        chronik_context=(
+            json.loads(chronik_context_json)
+            if chronik_context_json is not None
+            else None
+        ),
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+
+
+def _record_execution_identity(record: dict[str, Any]) -> dict[str, Any]:
+    return _task_execution_identity(
+        host=str(record["host"]),
+        argv_sha256=str(record["argv_sha256"]),
+        cwd=str(record["cwd"]),
+        resource_keys=_record_resource_keys(record),
+        runtime_seconds=int(record["runtime_seconds"]),
+        cpu_weight=int(record["cpu_weight"]),
+        io_weight=int(record["io_weight"]),
+        memory_max_bytes=(
+            None
+            if record.get("memory_max_bytes") is None
+            else int(record["memory_max_bytes"])
+        ),
+        chronik_outbox_enabled=bool(record.get("chronik_outbox_enabled")),
+        chronik_outbox_state_root=record.get("chronik_outbox_state_root"),
+        chronik_context_json=record.get("chronik_context_json"),
+        execution_backend=_execution_backend(record),
+        systemd_scope=_systemd_scope(record),
+    )
+
+
+def _latest_matching_execution_record(
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, task_id DESC LIMIT 1",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    if (
+        _record_execution_identity(record)["identity_sha256"]
+        != identity["identity_sha256"]
+    ):
+        raise RuntimeError("stored task execution identity is inconsistent")
+    return record
+
+
+def _build_terminal_retry_context(
+    record: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    normalized_reason = _redact_reason(reason.strip())
+    if not normalized_reason:
+        raise ValueError("named retry state change is required")
+    state = str(record["state"])
+    if state not in UNCHANGED_RETRY_STATES:
+        raise ValueError("retry source task is not an attention state")
+    lifecycle_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    terminalization_sha256 = record.get("terminalization_sha256")
+    if not isinstance(lifecycle_receipt_sha256, str) or len(lifecycle_receipt_sha256) != 64:
+        raise ValueError("retry source lifecycle receipt is missing")
+    if not isinstance(terminalization_sha256, str) or len(terminalization_sha256) != 64:
+        raise ValueError("retry source terminalization receipt is missing")
+    material = {
+        "schema_version": TASK_RETRY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_terminal_retry",
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]),
+        "source_state": state,
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        "source_terminalization_sha256": terminalization_sha256,
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+        "named_state_change": normalized_reason,
+        "observed_at_unix": _now(),
+        "does_not_establish": [
+            "that_the_named_change_is_sufficient",
+            "that_the_retry_will_succeed",
+            "automatic_retry_authority",
+        ],
+    }
+    return {**material, "context_sha256": _sha256_json(material)}
+
+
+def _validate_terminal_retry_context(
+    context: dict[str, Any],
+    *,
+    predecessor: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise ValueError("terminal retry context must be an object")
+    context_sha256 = context.get("context_sha256")
+    material = {key: value for key, value in context.items() if key != "context_sha256"}
+    if not isinstance(context_sha256, str) or context_sha256 != _sha256_json(material):
+        raise ValueError("terminal retry context integrity is invalid")
+    expected = {
+        "source_task_id": str(predecessor["task_id"]),
+        "source_attempt": int(predecessor["attempt"]),
+        "source_state": str(predecessor["state"]),
+        "source_resume_policy": str(predecessor["resume_policy"]),
+        "source_lifecycle_receipt_sha256": predecessor.get(
+            "lifecycle_receipt_sha256"
+        ),
+        "source_terminalization_sha256": predecessor.get(
+            "terminalization_sha256"
+        ),
+        "source_execution_identity_sha256": identity["identity_sha256"],
+    }
+    if context.get("schema_version") != TASK_RETRY_CONTEXT_SCHEMA_VERSION:
+        raise ValueError("terminal retry context schema is invalid")
+    if context.get("kind") != "grabowski_named_terminal_retry":
+        raise ValueError("terminal retry context kind is invalid")
+    for key, value in expected.items():
+        if context.get(key) != value:
+            raise ValueError(f"terminal retry context {key} binding is stale")
+    named_state_change = context.get("named_state_change")
+    if not isinstance(named_state_change, str) or not named_state_change.strip():
+        raise ValueError("terminal retry context requires a named state change")
+    observed_at_unix = context.get("observed_at_unix")
+    now = _now()
+    if (
+        isinstance(observed_at_unix, bool)
+        or not isinstance(observed_at_unix, int)
+        or observed_at_unix < 0
+        or observed_at_unix > now + 300
+    ):
+        raise ValueError("terminal retry context timestamp is invalid")
+    return {
+        "source_task_id": expected["source_task_id"],
+        "source_attempt": expected["source_attempt"],
+        "source_state": expected["source_state"],
+        "source_resume_policy": expected["source_resume_policy"],
+        "named_state_change": _redact_reason(named_state_change),
+        "context_sha256": context_sha256,
+        "does_not_establish": list(context.get("does_not_establish") or []),
+    }
+
+
+def _guard_unchanged_terminal_retry(
+    identity: dict[str, Any],
+    retry_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    predecessor = _latest_matching_execution_record(identity)
+    if predecessor is None or str(predecessor["state"]) not in UNCHANGED_RETRY_STATES:
+        if retry_context is not None:
+            raise ValueError("terminal retry context has no current failed predecessor")
+        return None
+    if retry_context is None:
+        raise RuntimeError(
+            "unchanged terminal task retry blocked; use "
+            "grabowski_task_reconcile_resume for task "
+            f"{predecessor['task_id']} with a named state change"
+        )
+    return _validate_terminal_retry_context(
+        retry_context,
+        predecessor=predecessor,
+        identity=identity,
+    )
+
+
 def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
     if state == "outcome_unknown":
         # Unknown root truth must remain protected long enough for operator
@@ -3276,6 +3498,7 @@ def grabowski_task_start(
     chronik_pr_number: int | None = None,
     runtime_python: bool = False,
     route_evidence: dict[str, Any] | None = None,
+    _retry_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -3378,6 +3601,25 @@ def grabowski_task_start(
         execution_backend=execution_backend,
     )
     argv_sha256 = command_identity.argv_sha256(command)
+    execution_identity = _task_execution_identity(
+        host=host,
+        argv_sha256=argv_sha256,
+        cwd=working_directory,
+        resource_keys=task_resources,
+        runtime_seconds=runtime,
+        cpu_weight=cpu,
+        io_weight=io,
+        memory_max_bytes=memory,
+        chronik_outbox_enabled=bool(chronik_enabled),
+        chronik_outbox_state_root=chronik_state_root,
+        chronik_context_json=chronik_context_json,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+    retry_binding = _guard_unchanged_terminal_retry(
+        execution_identity,
+        _retry_context,
+    )
     routing_shadow_capture: dict[str, Any] | None = None
     if normalized_route_evidence is not None:
         import grabowski_operator_routing_shadow_capture as routing_shadow
@@ -3493,6 +3735,8 @@ def grabowski_task_start(
         "systemd_scope": systemd_scope,
         "authoritative_unit": unit,
         "argv_sha256": record["argv_sha256"],
+        "execution_identity_sha256": execution_identity["identity_sha256"],
+        "retry_binding": retry_binding,
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
@@ -3518,6 +3762,8 @@ def grabowski_task_start(
     return {
         "task": _public(stored),
         "audit": audit,
+        "execution_identity": execution_identity,
+        "retry_binding": retry_binding,
         "routing_shadow_capture": routing_shadow_capture,
     }
 
@@ -4353,12 +4599,14 @@ def _terminal_retry_successor(
     record: dict[str, Any],
     *,
     reason: str,
+    explicit_policy_override: bool = False,
 ) -> dict[str, Any]:
     context = (
         json.loads(record["chronik_context_json"])
         if record.get("chronik_context_json")
         else {}
     )
+    retry_context = _build_terminal_retry_context(record, reason=reason)
     started = grabowski_task_start(
         str(record["host"]),
         json.loads(record["argv_json"]),
@@ -4379,10 +4627,13 @@ def _terminal_retry_successor(
             if isinstance(context.get("pr_number"), int)
             else None
         ),
+        _retry_context=retry_context,
     )
     task = dict(started["task"])
     task["retry_of_task_id"] = record["task_id"]
     task["retry_reason"] = _redact_reason(reason)
+    task["retry_context_sha256"] = retry_context["context_sha256"]
+    task["explicit_policy_override"] = explicit_policy_override
     task["automatic_retry_budget_exhausted_after_start"] = True
     base._append_audit(
         {
@@ -4394,6 +4645,12 @@ def _terminal_retry_successor(
             ),
             "successor_task_id": task["task_id"],
             "successor_resume_policy": task["resume_policy"],
+            "source_execution_identity_sha256": retry_context[
+                "source_execution_identity_sha256"
+            ],
+            "retry_context_sha256": retry_context["context_sha256"],
+            "explicit_policy_override": explicit_policy_override,
+            "source_resume_policy": retry_context["source_resume_policy"],
             "reason": _redact_reason(reason),
         }
     )
@@ -4644,7 +4901,13 @@ def reconcile_tasks_resume(
         if observation["state"] == "running":
             continue
         blocker = _reconcile_blocker(stored, observation)
-        if blocker is not None:
+        explicit_policy_override = bool(task_id) and bool(blocker) and (
+            blocker.get("reason_class") == "non_retryable_failure"
+            and blocker.get("reason")
+            == "task resume policy does not permit automatic retry"
+            and _is_terminal_state(str(stored["state"]))
+        )
+        if blocker is not None and not explicit_policy_override:
             blocked.append(blocker)
             continue
         if len(resumed) >= max_resumes:
@@ -4666,6 +4929,7 @@ def reconcile_tasks_resume(
                     _terminal_retry_successor(
                         stored,
                         reason=reason,
+                        explicit_policy_override=explicit_policy_override,
                     )
                 )
             else:
