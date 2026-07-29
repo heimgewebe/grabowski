@@ -4780,6 +4780,19 @@ def grabowski_task_resume(
     candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
     task_resources = _record_resource_keys(record)
     lease_owner = record.get("lease_owner_id") or _lease_owner(task_id)
+    if interrupted_recovery_binding is not None:
+        _set_state(
+            task_id,
+            "launching",
+            launcher={
+                "pending": True,
+                "interrupted_recovery_binding": interrupted_recovery_binding,
+            },
+            observation=observation,
+            unit=unit,
+            authoritative_unit=unit,
+            attempt=attempt,
+        )
     lease_result = None
     if task_resources:
         lease_result = resources.acquire_resources(
@@ -4795,19 +4808,6 @@ def grabowski_task_resume(
                 "host": record["host"],
                 "attempt": attempt,
             },
-        )
-    if interrupted_recovery_binding is not None:
-        _set_state(
-            task_id,
-            "launching",
-            launcher={
-                "pending": True,
-                "interrupted_recovery_binding": interrupted_recovery_binding,
-            },
-            observation=observation,
-            unit=unit,
-            authoritative_unit=unit,
-            attempt=attempt,
         )
     launcher = _launch(candidate)
     if interrupted_recovery_binding is not None:

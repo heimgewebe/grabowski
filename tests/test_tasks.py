@@ -2430,6 +2430,66 @@ class TaskTests(unittest.TestCase):
         acquire.assert_not_called()
         launch.assert_not_called()
 
+    def test_interrupted_recovery_persists_binding_before_lease_effect(self) -> None:
+        resource_key = f"path:{self.root}"
+        started = self._start(resource_keys=[resource_key])
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=175,
+            duration_seconds=0.01,
+        )
+        revalidated = _missing_unit_observation(
+            observed_at_unix=176,
+            duration_seconds=0.02,
+        )
+
+        def fail_after_binding(*args: object, **kwargs: object) -> dict[str, object]:
+            pending = tasks._row_raw(task_id)
+            launcher = json.loads(str(pending["launcher_json"]))
+            self.assertEqual("launching", pending["state"])
+            self.assertEqual(2, pending["attempt"])
+            self.assertIn("interrupted_recovery_binding", launcher)
+            with self.assertRaisesRegex(RuntimeError, "unresolved recovery attempt"):
+                tasks._guard_direct_terminal_retry_record(pending)
+            raise RuntimeError("synthetic lease acquisition failure")
+
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=revalidated),
+            patch.object(
+                tasks.resources,
+                "acquire_resources",
+                side_effect=fail_after_binding,
+            ) as acquire,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 176},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted dependency state",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], result["resumed"])
+        self.assertIn("lease acquisition failure", result["blocked"][0]["reason"])
+        acquire.assert_called_once()
+        launch.assert_not_called()
+        persisted = tasks._row_raw(task_id)
+        self.assertEqual("launching", persisted["state"])
+        self.assertIn(
+            "interrupted_recovery_binding",
+            json.loads(str(persisted["launcher_json"])),
+        )
+
     def test_direct_resume_requires_recovery_evidence_for_every_interrupted_policy(self) -> None:
         for policy in ("manual", "verify-then-retry", "retry-safe"):
             with self.subTest(policy=policy):
