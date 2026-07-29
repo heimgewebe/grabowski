@@ -2182,6 +2182,44 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(successor["explicit_policy_override"])
         self.assertEqual(source["task_id"], successor["retry_of_task_id"])
 
+    def test_exact_reconcile_resume_keeps_never_policy_non_overridable(self) -> None:
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "never-retry"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+            source = tasks._set_state(
+                str(started["task"]["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            result = tasks.reconcile_tasks_resume(
+                task_id=str(source["task_id"]),
+                reason="repository dependency changed after the failed attempt",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], result["resumed"])
+        self.assertEqual(1, len(result["blocked"]))
+        self.assertEqual(source["task_id"], result["blocked"][0]["task_id"])
+        self.assertEqual("never", result["blocked"][0]["resume_policy"])
+        self.assertEqual(
+            "non_retryable_failure",
+            result["blocked"][0]["reason_class"],
+        )
+
     def test_reconcile_resume_blocks_unverified_policy(self) -> None:
         started = self._start()
         missing = _launcher(returncode=1)

@@ -3058,6 +3058,33 @@ def _task_current_records_for_states(
     ]
 
 
+def _task_retry_successor_records(
+    connection: sqlite3.Connection,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("retry successor limit must be a non-negative integer")
+    support_states = tuple(
+        sorted(terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES)
+    )
+    placeholders = ",".join("?" for _ in support_states)
+    rows = connection.execute(
+        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+        "AND instr(launcher_json, ?) > 0 LIMIT ?",
+        (*support_states, '"retry_binding"', limit + 1),
+    ).fetchall()
+    if len(rows) > limit:
+        raise RuntimeError("retry successor convergence scan limit exceeded")
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        binding = terminal_convergence.persisted_retry_binding(record)
+        if binding is not None:
+            records.append(record)
+    return records
+
+
 def _task_attention_projection(
     connection: sqlite3.Connection,
     projection: dict[str, Any],
@@ -3100,6 +3127,7 @@ def _task_attention_projection(
                 "excluded_classification_counts": {},
                 "decision_candidate_count": None,
                 "decision_classification_counts": {},
+                "retry_successor_record_count": 0,
                 "scope": "current_task_projection_after_valid_attention_decisions",
                 "raw_scope": "current_task_projection_before_attention_decisions",
             },
@@ -3111,13 +3139,25 @@ def _task_attention_projection(
     if snapshot_status == "degraded":
         return degraded(str(snapshot_error or "TaskAttentionDecisionSnapshotError"))
     try:
+        if len(records) > task_attention.MAX_CURRENT_CONVERGENCE_ROWS:
+            return degraded("attention_convergence_scan_limit_exceeded")
+        retry_successors = _task_retry_successor_records(
+            connection,
+            limit=(
+                task_attention.MAX_CURRENT_CONVERGENCE_ROWS - len(records)
+            ),
+        )
         projected = task_attention.current_attention_projection(
             records,
             include_decisions=snapshot_status != "absent",
+            retry_successor_records=retry_successors,
         )
+    except terminal_convergence.TerminalConvergenceError:
+        return degraded("TaskAttentionIntegrityError")
     except (
         task_attention.TaskAttentionError,
         task_attention.TaskAttentionInputError,
+        RuntimeError,
         OSError,
     ) as exc:
         return degraded(type(exc).__name__)
@@ -4880,7 +4920,8 @@ def reconcile_tasks_resume(
             continue
         blocker = _reconcile_blocker(stored, observation)
         explicit_policy_override = bool(task_id) and bool(blocker) and (
-            blocker.get("reason_class") == "non_retryable_failure"
+            str(stored["resume_policy"]) in {"manual", "verify-then-retry"}
+            and blocker.get("reason_class") == "non_retryable_failure"
             and blocker.get("reason")
             == "task resume policy does not permit automatic retry"
             and _is_terminal_state(str(stored["state"]))

@@ -183,6 +183,89 @@ class TerminalConvergenceTests(unittest.TestCase):
         self.assertEqual(1, projection["convergence_excluded_attention_count"])
         self.assertIn("1" * 24, projection["excluded_task_ids"])
 
+    def test_attention_convergence_uses_non_attention_retry_successor_as_support(self) -> None:
+        source = self._failed_attention_record("1" * 24, 10, "a", "c")
+        successor = self._failed_attention_record("2" * 24, 20, "b", "d")
+        identity = convergence.attention_execution_identity(source)
+        assert identity is not None
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski_named_terminal_retry",
+            "source_task_id": source["task_id"],
+            "source_attempt": source["attempt"],
+            "source_state": source["state"],
+            "source_resume_policy": source["resume_policy"],
+            "source_lifecycle_receipt_sha256": source["lifecycle_receipt_sha256"],
+            "source_terminalization_sha256": source["terminalization_sha256"],
+            "source_execution_identity_sha256": identity,
+            "named_state_change": "repository head advanced",
+            "observed_at_unix": 15,
+            "does_not_establish": [
+                "that_the_named_change_is_sufficient",
+                "that_the_retry_will_succeed",
+                "automatic_retry_authority",
+            ],
+        }
+        successor["state"] = "running"
+        successor["terminalized_at_unix"] = None
+        successor["terminalization_sha256"] = None
+        successor["lifecycle_receipt_sha256"] = None
+        successor["launcher_json"] = json.dumps(
+            {
+                "retry_binding": {
+                    **material,
+                    "context_sha256": hashlib.sha256(
+                        json.dumps(
+                            material,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                }
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+        result = convergence.converge_attention_records(
+            [source, successor],
+            attention_task_ids={str(source["task_id"])},
+        )
+        self.assertEqual([], result["current"])
+        self.assertEqual(1, result["raw_count"])
+        self.assertEqual(1, result["support_record_count"])
+        self.assertEqual(1, result["verified_retry_edge_count"])
+
+        projection = attention.current_attention_projection(
+            [source],
+            retry_successor_records=[successor],
+        )
+        self.assertEqual(1, projection["raw_attention_count"])
+        self.assertEqual(0, projection["current_attention_count"])
+        self.assertEqual(1, projection["retry_successor_record_count"])
+        self.assertIn(source["task_id"], projection["excluded_task_ids"])
+
+        successor["state"] = "completed"
+        with self.assertRaisesRegex(
+            convergence.TerminalConvergenceError,
+            "completed retry successor terminal evidence is invalid",
+        ):
+            convergence.converge_attention_records(
+                [source, successor],
+                attention_task_ids={str(source["task_id"])},
+            )
+        successor["terminalized_at_unix"] = 25
+        successor["terminalization_sha256"] = "d" * 64
+        successor["lifecycle_receipt_sha256"] = "b" * 64
+        completed = convergence.converge_attention_records(
+            [source, successor],
+            attention_task_ids={str(source["task_id"])},
+        )
+        self.assertEqual([], completed["current"])
+        self.assertEqual(1, completed["verified_retry_edge_count"])
+
     def test_attention_convergence_rejects_tampered_persisted_retry_binding(self) -> None:
         older = self._failed_attention_record("1" * 24, 10, "a", "c")
         newer = self._failed_attention_record("2" * 24, 20, "b", "d")

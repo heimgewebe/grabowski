@@ -1710,6 +1710,7 @@ def current_attention_projection(
     records: list[dict[str, Any]],
     *,
     include_decisions: bool = True,
+    retry_successor_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Project operational attention without rewriting retained task history.
 
@@ -1727,8 +1728,53 @@ def current_attention_projection(
             raise TaskAttentionInputError("current attention record has a non-attention state")
         _task_binding(record)
         validated_records.append(record)
+    attention_task_ids = {str(record["task_id"]) for record in validated_records}
+    convergence_records = list(validated_records)
+    support_task_ids: set[str] = set()
+    if retry_successor_records is not None and not isinstance(
+        retry_successor_records, list
+    ):
+        raise TaskAttentionInputError(
+            "retry_successor_records must be a list when provided"
+        )
+    for value in list(retry_successor_records or []):
+        if not isinstance(value, dict):
+            raise TaskAttentionInputError(
+                "retry successor records must be objects"
+            )
+        record = dict(value)
+        if (
+            record.get("state")
+            not in terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES
+        ):
+            raise TaskAttentionInputError(
+                "retry successor record state is not support-eligible"
+            )
+        binding = _task_binding(record)
+        try:
+            persisted_binding = terminal_convergence.persisted_retry_binding(record)
+        except terminal_convergence.TerminalConvergenceError as exc:
+            raise TaskAttentionIntegrityError(str(exc)) from exc
+        if persisted_binding is None:
+            raise TaskAttentionInputError(
+                "retry successor record lacks persisted retry evidence"
+            )
+        task_id = str(binding["task_id"])
+        if task_id in attention_task_ids:
+            raise TaskAttentionIntegrityError(
+                "retry successor record overlaps the attention scope"
+            )
+        if task_id in support_task_ids:
+            raise TaskAttentionIntegrityError(
+                "retry successor record is duplicated in the support snapshot"
+            )
+        support_task_ids.add(task_id)
+        convergence_records.append(record)
     try:
-        convergence = terminal_convergence.converge_attention_records(validated_records)
+        convergence = terminal_convergence.converge_attention_records(
+            convergence_records,
+            attention_task_ids=attention_task_ids,
+        )
     except terminal_convergence.TerminalConvergenceError as exc:
         raise TaskAttentionIntegrityError(str(exc)) from exc
     current_by_task = {
@@ -1825,6 +1871,7 @@ def current_attention_projection(
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
         "attention_convergence_counts": convergence["classification_counts"],
         "converged_attention_count": convergence["converged_count"],
+        "retry_successor_record_count": convergence["support_record_count"],
         "excluded_task_ids": excluded_task_ids,
         "convergence_excluded_task_ids": convergence_excluded_task_ids,
         "decision_excluded_task_ids": decision_excluded_task_ids,
@@ -1907,6 +1954,7 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         "superseded_by_verified_retry": 0,
     }
     converged_attention_count = 0
+    retry_successor_record_count = 0
     convergence_excluded_task_ids: set[str] = set()
     decision_excluded_task_ids: set[str] = set()
     page_records: list[dict[str, Any]] = []
@@ -1956,13 +2004,25 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                     convergence_error = "attention_convergence_snapshot_count_mismatch"
                 else:
                     try:
+                        retry_successors = tasks._task_retry_successor_records(
+                            connection,
+                            limit=(
+                                MAX_CURRENT_CONVERGENCE_ROWS
+                                - len(convergence_rows)
+                            ),
+                        )
                         projection = current_attention_projection(
                             [dict(row) for row in convergence_rows],
                             include_decisions=snapshot_status == "locked",
+                            retry_successor_records=retry_successors,
                         )
+                    except terminal_convergence.TerminalConvergenceError:
+                        convergence_status = "degraded"
+                        convergence_error = "TaskAttentionIntegrityError"
                     except (
                         TaskAttentionError,
                         TaskAttentionInputError,
+                        RuntimeError,
                         OSError,
                     ) as exc:
                         convergence_status = "degraded"
@@ -1974,6 +2034,9 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                         )
                         converged_attention_count = int(
                             projection["converged_attention_count"]
+                        )
+                        retry_successor_record_count = int(
+                            projection["retry_successor_record_count"]
                         )
                         convergence_excluded_task_ids = set(
                             projection["convergence_excluded_task_ids"]
@@ -2114,6 +2177,7 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         "attention_convergence_error": convergence_error,
         "attention_convergence_counts": convergence_counts,
         "converged_attention_count": converged_attention_count,
+        "retry_successor_record_count": retry_successor_record_count,
         "convergence_excluded_attention_count": len(
             convergence_excluded_task_ids
         ),

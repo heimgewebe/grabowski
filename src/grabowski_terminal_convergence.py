@@ -24,6 +24,7 @@ TERMINAL_FAILURE_STATES = frozenset({"failed", "timed_out", "signalled", "interr
 RETRY_SOURCE_STATES = frozenset(
     {"failed", "timed_out", "signalled", "interrupted", "outcome_unknown"}
 )
+RETRY_SUCCESSOR_SUPPORT_STATES = frozenset({"launching", "running", "completed"})
 TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 
 
@@ -378,7 +379,11 @@ def persisted_retry_binding(record: dict[str, Any]) -> dict[str, Any] | None:
     return dict(binding)
 
 
-def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+def converge_attention_records(
+    records: list[dict[str, Any]],
+    *,
+    attention_task_ids: set[str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(records, list):
         raise TerminalConvergenceError("attention records must be a list")
     groups: dict[str, list[dict[str, Any]]] = {}
@@ -398,6 +403,23 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(updated_at, bool) or not isinstance(updated_at, int) or updated_at < 0:
             raise TerminalConvergenceError(f"attention record {index} updated_at_unix is invalid")
         groups.setdefault(task_id, []).append(dict(raw))
+
+    if attention_task_ids is None:
+        scoped_task_ids = set(groups)
+    else:
+        if not isinstance(attention_task_ids, set) or any(
+            not isinstance(task_id, str) or not task_id
+            for task_id in attention_task_ids
+        ):
+            raise TerminalConvergenceError(
+                "attention_task_ids must be a set of non-empty strings"
+            )
+        scoped_task_ids = set(attention_task_ids)
+        missing_task_ids = scoped_task_ids - set(groups)
+        if missing_task_ids:
+            raise TerminalConvergenceError(
+                "attention scope references missing task records"
+            )
 
     current: list[dict[str, Any]] = []
     historical: list[dict[str, Any]] = []
@@ -423,7 +445,10 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             else:
                 classification = "already_satisfied"
             seen_bindings.add(binding)
-            historical.append({**item, "convergence_classification": classification})
+            if task_id in scoped_task_ids:
+                historical.append(
+                    {**item, "convergence_classification": classification}
+                )
     current_by_task = {str(item["task_id"]): item for item in current}
     verified_retry_edges: dict[str, dict[str, Any]] = {}
     verified_identities: set[str] = set()
@@ -432,7 +457,34 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         if binding is None:
             continue
         source_task_id = str(binding["source_task_id"])
+        if source_task_id not in scoped_task_ids:
+            continue
         successor_task_id = str(successor["task_id"])
+        support_successor = successor_task_id not in scoped_task_ids
+        successor_state = successor.get("state")
+        if (
+            support_successor
+            and successor_state not in RETRY_SUCCESSOR_SUPPORT_STATES
+        ):
+            raise TerminalConvergenceError(
+                "persisted retry successor state is not support-eligible"
+            )
+        if support_successor and successor_state == "completed":
+            lifecycle_receipt = successor.get("lifecycle_receipt_sha256")
+            terminalization = successor.get("terminalization_sha256")
+            terminalized_at = successor.get("terminalized_at_unix")
+            if (
+                not isinstance(lifecycle_receipt, str)
+                or SHA256_RE.fullmatch(lifecycle_receipt) is None
+                or not isinstance(terminalization, str)
+                or SHA256_RE.fullmatch(terminalization) is None
+                or isinstance(terminalized_at, bool)
+                or not isinstance(terminalized_at, int)
+                or terminalized_at < int(binding["observed_at_unix"])
+            ):
+                raise TerminalConvergenceError(
+                    "completed retry successor terminal evidence is invalid"
+                )
         if source_task_id == successor_task_id:
             raise TerminalConvergenceError("persisted retry binding is self-referential")
         source = current_by_task.get(source_task_id)
@@ -503,7 +555,8 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     converged_current = [
         item
         for item in current
-        if str(item["task_id"]) not in verified_retry_edges
+        if str(item["task_id"]) in scoped_task_ids
+        and str(item["task_id"]) not in verified_retry_edges
     ]
     for source_task_id in sorted(verified_retry_edges):
         edge = verified_retry_edges[source_task_id]
@@ -531,7 +584,12 @@ def converge_attention_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "current": sorted(converged_current, key=lambda item: str(item["task_id"])),
         "historical": historical,
-        "raw_count": len(records),
+        "raw_count": sum(
+            1 for item in records if str(item["task_id"]) in scoped_task_ids
+        ),
+        "support_record_count": sum(
+            1 for item in records if str(item["task_id"]) not in scoped_task_ids
+        ),
         "current_count": len(converged_current),
         "converged_count": len(historical),
         "execution_identity_group_count": len(verified_identities),
