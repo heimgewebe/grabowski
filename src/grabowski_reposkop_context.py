@@ -369,6 +369,33 @@ def _run_reposkop(
     }
 
 
+def _resolve_exact_write_target(
+    path: Path, *, allow_missing_parents: bool = False
+) -> tuple[Path, bool]:
+    resolved, exists = base._resolve_write_target(
+        str(path), allow_missing_parents=allow_missing_parents
+    )
+    if resolved != path:
+        raise ReposkopContextError(
+            f"Reposkop write target resolved unexpectedly: {path}"
+        )
+    return resolved, exists
+
+
+def _validate_binding_write_scope(
+    binding: dict[str, Any], *, allow_missing_parents: bool = False
+) -> None:
+    for key in ("receipt_path", "pending_path", "lock_path"):
+        path = binding[key]
+        resolved, _exists = _resolve_exact_write_target(
+            path, allow_missing_parents=allow_missing_parents
+        )
+        if resolved.parent != RECEIPT_ROOT:
+            raise ReposkopContextError(
+                f"Reposkop derived write target escaped its root: {key}"
+            )
+
+
 def _ensure_receipt_root() -> None:
     if RECEIPT_ROOT.is_symlink():
         raise ReposkopContextError("Reposkop receipt root may not be a symlink")
@@ -776,7 +803,6 @@ def _publish_receipt(binding: dict[str, Any]) -> None:
 
 
 def _record_usage(binding: dict[str, Any]) -> dict[str, Any]:
-    _ensure_receipt_root()
     with _receipt_lock(binding["lock_path"]):
         existing = binding["receipt_path"].exists()
         if existing:
@@ -868,15 +894,24 @@ def grabowski_reposkop_context(
             purpose=selected_purpose,
             executable=executable,
         )
-        base._require_mutations_enabled(
-            "file_write", path=str(binding["receipt_path"]), host="heim-pc"
+        root_path, _root_exists = _resolve_exact_write_target(
+            RECEIPT_ROOT, allow_missing_parents=True
         )
+        _validate_binding_write_scope(binding, allow_missing_parents=True)
         base._require_mutations_enabled(
-            "file_write", path=str(binding["pending_path"]), host="heim-pc"
+            "file_write", path=str(root_path), host="heim-pc"
         )
-        base._require_mutations_enabled(
-            "file_write", path=str(binding["lock_path"]), host="heim-pc"
-        )
+        for key in ("receipt_path", "pending_path", "lock_path"):
+            base._require_mutations_enabled(
+                "file_write", path=str(binding[key]), host="heim-pc"
+            )
+        _ensure_receipt_root()
+        post_root_path, _post_root_exists = _resolve_exact_write_target(RECEIPT_ROOT)
+        if post_root_path != root_path:
+            raise ReposkopContextError(
+                "Reposkop receipt root identity changed during policy preflight"
+            )
+        _validate_binding_write_scope(binding)
         usage_receipt = _record_usage(binding)
         return _context_result(
             target=target,

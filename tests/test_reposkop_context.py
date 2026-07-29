@@ -35,6 +35,7 @@ class ReposkopContextTests(unittest.TestCase):
         self.audit_records: list[dict[str, object]] = []
         self.audit_bindings: dict[str, dict[str, str]] = {}
         self.audit_lock = threading.Lock()
+        self.write_scope_calls: list[tuple[Path, bool]] = []
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -97,6 +98,11 @@ class ReposkopContextTests(unittest.TestCase):
                 "stderr_limit_exceeded": False,
             }
 
+        def fake_write_target(value, *, allow_missing_parents=False):
+            path = Path(value)
+            self.write_scope_calls.append((path, allow_missing_parents))
+            return path, path.exists()
+
         def fake_find(binding):
             with self.audit_lock:
                 stored = self.audit_bindings.get(binding["usage_key_sha256"])
@@ -131,6 +137,9 @@ class ReposkopContextTests(unittest.TestCase):
                 side_effect=lambda value, _kind: Path(value).resolve(strict=True),
             ),
             patch.object(context.operator, "_require_operator_mutation"),
+            patch.object(
+                context.base, "_resolve_write_target", side_effect=fake_write_target
+            ),
             patch.object(context.base, "_require_mutations_enabled"),
             patch.object(context, "_find_audit_binding", side_effect=fake_find),
             patch.object(context, "_append_audit_binding", side_effect=fake_append),
@@ -193,6 +202,28 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertNotIn("report_sha256", receipt)
         self.assertEqual(first["report"]["effect_authorized"], False)
         self.assertEqual(len(self.run_calls), 2)
+        self.assertTrue(
+            {
+                self.receipts,
+                Path(first["usage_receipt"]["path"]),
+                self.receipts / f".{first['usage_receipt']['usage_key_sha256']}.pending",
+                self.receipts / f".{first['usage_receipt']['usage_key_sha256']}.lock",
+            }.issubset({path for path, _allow_missing in self.write_scope_calls})
+        )
+        self.assertTrue(
+            {
+                self.receipts,
+                Path(first["usage_receipt"]["path"]),
+                self.receipts / f".{first['usage_receipt']['usage_key_sha256']}.pending",
+                self.receipts / f".{first['usage_receipt']['usage_key_sha256']}.lock",
+            }.issubset(
+                {
+                    path
+                    for path, allow_missing in self.write_scope_calls
+                    if allow_missing
+                }
+            )
+        )
         self.assertEqual(
             self.run_calls[0][0],
             [
@@ -204,6 +235,47 @@ class ReposkopContextTests(unittest.TestCase):
                 "--json",
             ],
         )
+
+    def test_write_root_policy_blocks_before_receipt_root_creation(self) -> None:
+        patches = self.patches(self.report())
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context.base,
+                "_resolve_write_target",
+                side_effect=PermissionError("outside configured write roots"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "outside configured write roots"
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+        self.assertFalse(self.receipts.exists())
+        self.assertEqual(self.audit_records, [])
+
+    def test_derived_write_policy_blocks_before_receipt_root_creation(self) -> None:
+        patches = self.patches(self.report())
+
+        def reject_pending(value, *, allow_missing_parents=False):
+            path = Path(value)
+            if allow_missing_parents and path.name.endswith(".pending"):
+                raise PermissionError("derived target outside configured write roots")
+            return path, path.exists()
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context.base,
+                "_resolve_write_target",
+                side_effect=reject_pending,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                PermissionError, "derived target outside configured write roots"
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+        self.assertFalse(self.receipts.exists())
+        self.assertEqual(self.audit_records, [])
 
     def test_audit_failure_prevents_any_receipt_publication(self) -> None:
         patches = self.patches(self.report(), audit_error=RuntimeError("audit failed"))

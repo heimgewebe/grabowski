@@ -913,6 +913,32 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 ):
                     grabowski_mcp.grabowski_create_text(str(outside), "blocked\n")
 
+    def test_write_target_missing_parent_preflight_is_opt_in_and_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, _secret, _browser, _export, _state, *patches = self._patched_runtime(
+                root,
+                capabilities=["file_read", "file_write", "audit_verify"],
+            )
+            target = work / "future" / "nested" / "receipt.json"
+            outside = root / "outside" / "nested" / "receipt.json"
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                with self.assertRaises(FileNotFoundError):
+                    grabowski_mcp._resolve_write_target(str(target))
+                resolved, exists = grabowski_mcp._resolve_write_target(
+                    str(target), allow_missing_parents=True
+                )
+                self.assertEqual(resolved, target)
+                self.assertFalse(exists)
+                self.assertFalse((work / "future").exists())
+                with self.assertRaisesRegex(
+                    PermissionError, "outside configured write roots"
+                ):
+                    grabowski_mcp._resolve_write_target(
+                        str(outside), allow_missing_parents=True
+                    )
+                self.assertFalse((root / "outside").exists())
+
     def test_audit_chain_rejects_unhashed_record_after_v2_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
