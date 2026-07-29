@@ -7389,21 +7389,9 @@ def _run_operator_obligation_resolve(
 
     requested_disposition = dispatch_parameters.get("disposition")
     existing_disposition = current.get("resolution_disposition")
-    if existing_disposition is not None:
-        if requested_disposition == existing_disposition:
-            output = {
-                **current,
-                "created": False,
-                "replayed": True,
-                "resolution_file_sha256": current["resolution_file_sha256"],
-            }
-            _check(
-                receipt,
-                "delegation_terminal_observation",
-                "pass",
-                "stored_resolution_replay",
-            )
-        elif existing_disposition != "deferred":
+    stored_terminal_replay = False
+    if existing_disposition in {"resolved", "superseded"}:
+        if requested_disposition != existing_disposition:
             _check(
                 receipt,
                 "create_only_resolution",
@@ -7416,14 +7404,36 @@ def _run_operator_obligation_resolve(
                 "blocked_reasons": ["resolution_conflict"],
                 "error": "operator obligation already has a terminal resolution",
             }
-        else:
-            output = None
-    else:
-        output = None
+        stored_terminal_replay = True
+    output = None
 
     if output is None:
         terminal_disposition = requested_disposition in {"resolved", "superseded"}
-        if current.get("state") == "delegated" and terminal_disposition:
+        if stored_terminal_replay:
+            stored_observation = current.get("resolution_delegation_observation") or {}
+            if not isinstance(stored_observation, dict):
+                raise GripActionError("stored terminal delegation observation is invalid")
+            if stored_observation:
+                dispatch_parameters["delegation_observation"] = stored_observation
+                stored_receipt = {
+                    "source": "receipt",
+                    "reference": (
+                        f"delegation:{stored_observation['kind']}:"
+                        f"{stored_observation['id']}"
+                    ),
+                    "sha256": stored_observation["observation_receipt_sha256"],
+                }
+                evidence = list(dispatch_parameters.get("evidence") or [])
+                if stored_receipt not in evidence:
+                    evidence.append(stored_receipt)
+                dispatch_parameters["evidence"] = evidence
+            _check(
+                receipt,
+                "delegation_terminal_observation",
+                "pass",
+                "stored_resolution_replay",
+            )
+        elif current.get("state") == "delegated" and terminal_disposition:
             delegation = current.get("delegation")
             delegation_request = {
                 "kind": delegation.get("kind")

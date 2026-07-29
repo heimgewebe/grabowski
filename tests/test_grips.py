@@ -1256,6 +1256,107 @@ class GripFoundationTests(unittest.TestCase):
         )
 
 
+    def test_delegated_terminal_resolution_retry_is_exact_and_offline(self) -> None:
+        live_material = {
+            "kind": "systemd_job",
+            "id": "grabowski-job-replay01",
+            "observation_tool": "grabowski_job_status",
+            "status": "running",
+            "observed_at": "2026-07-29T06:00:00Z",
+            "identity_sha256": "a" * 64,
+        }
+        live = {
+            **live_material,
+            "observation_receipt_sha256": grips.sha256_json(live_material),
+        }
+        terminal_material = {
+            **live_material,
+            "status": "completed",
+            "observed_at": "2026-07-29T06:05:00Z",
+            "identity_sha256": "b" * 64,
+        }
+        terminal = {
+            **terminal_material,
+            "observation_receipt_sha256": grips.sha256_json(terminal_material),
+        }
+        parameters = {
+            "obligation_id": "goo-grip-delegated-replay-0001",
+            "disposition": "superseded",
+            "evidence": [
+                {
+                    "source": "github",
+                    "reference": "pr:replacement",
+                    "sha256": "c" * 64,
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"GRABOWSKI_OPERATOR_OBLIGATION_ROOT": str(Path(tmp) / "obligations")},
+        ):
+            grips.grip_run(
+                "operator-obligation-open",
+                {
+                    "obligation_id": parameters["obligation_id"],
+                    "objective": "Replay a terminal delegated resolution exactly.",
+                    "acceptance": [{"id": "done", "description": "Work is terminal."}],
+                },
+                allow_mutation=True,
+            )
+            with patch.object(
+                grips, "_operator_delegation_observation", return_value=live
+            ):
+                grips.grip_run(
+                    "operator-obligation-close",
+                    {
+                        "obligation_id": parameters["obligation_id"],
+                        "outcome": "delegated",
+                        "evidence": [],
+                        "delegation": {
+                            "kind": "systemd_job",
+                            "id": "grabowski-job-replay01",
+                        },
+                        "next_action": "Observe the delegated job.",
+                    },
+                    allow_mutation=True,
+                )
+            with patch.object(
+                grips,
+                "_operator_delegation_terminal_observation",
+                return_value=terminal,
+            ):
+                first = grips.grip_run(
+                    "operator-obligation-resolve", parameters, allow_mutation=True
+                )
+            with patch.object(
+                grips,
+                "_operator_delegation_terminal_observation",
+                side_effect=AssertionError("stored replay must not perform a live observation"),
+            ):
+                replay = grips.grip_run(
+                    "operator-obligation-resolve", parameters, allow_mutation=True
+                )
+                conflict = grips.grip_run(
+                    "operator-obligation-resolve",
+                    {
+                        **parameters,
+                        "evidence": [
+                            {
+                                "source": "github",
+                                "reference": "pr:different",
+                                "sha256": "d" * 64,
+                            }
+                        ],
+                    },
+                    allow_mutation=True,
+                )
+
+        self.assertTrue(first["output"]["created"])
+        self.assertEqual("completed", first["output"]["resolution_delegation_observation"]["status"])
+        self.assertTrue(replay["output"]["replayed"])
+        self.assertEqual("blocked", conflict["receipt"]["status"])
+        self.assertEqual(["resolution_conflict"], conflict["output"]["blocked_reasons"])
+
     def test_operator_delegation_observer_uses_live_job_status(self) -> None:
         live = {
             "unit": "grabowski-job-live01",
