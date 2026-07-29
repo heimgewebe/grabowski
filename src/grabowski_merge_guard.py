@@ -879,6 +879,7 @@ def verify_github_base_update_guard(
         return None, evidence, errors
 
     accepted: list[dict[str, Any]] = []
+    accepted_details: dict[int, Any] = {}
     rejection_codes: list[str] = []
     for ruleset_id in sorted(candidates):
         candidate = candidates[ruleset_id]
@@ -938,6 +939,7 @@ def verify_github_base_update_guard(
                 "detail_sha256": _sha256_json(detail),
             }
         )
+        accepted_details[ruleset_id] = detail
     if not accepted:
         errors.append("base_update_guard_no_unbypassable_strict_ruleset")
         errors.extend(sorted(set(rejection_codes)))
@@ -958,6 +960,36 @@ def verify_github_base_update_guard(
     errors.extend(active_revalidation_errors)
     if not active_revalidation_errors and active_revalidated != active:
         errors.append("base_update_guard_active_rules_drift")
+
+    detail_revalidation_records: list[dict[str, Any]] = []
+    if not errors:
+        for accepted_ruleset in accepted:
+            ruleset_id = int(accepted_ruleset["ruleset_id"])
+            detail_revalidated, detail_revalidation_evidence, detail_revalidation_errors = (
+                _github_json_call(
+                    repo_path,
+                    github_runner,
+                    ["api", str(candidates[ruleset_id]["endpoint"])],
+                    label=f"base_update_guard_ruleset_{ruleset_id}_revalidation",
+                )
+            )
+            record = {
+                "ruleset_id": ruleset_id,
+                "query": detail_revalidation_evidence,
+                "errors": list(detail_revalidation_errors),
+                "matches_initial_detail": False,
+            }
+            errors.extend(detail_revalidation_errors)
+            if not detail_revalidation_errors:
+                record["matches_initial_detail"] = (
+                    detail_revalidated == accepted_details[ruleset_id]
+                )
+                if not record["matches_initial_detail"]:
+                    errors.append(
+                        f"base_update_guard_ruleset_detail_drift:{ruleset_id}"
+                    )
+            detail_revalidation_records.append(record)
+    evidence["ruleset_detail_revalidation"] = detail_revalidation_records
     if errors:
         evidence["errors"] = list(errors)
         return None, evidence, errors

@@ -3796,6 +3796,43 @@ class GithubBaseUpdateGuardTests(unittest.TestCase):
         self.assertIn("base_update_guard_active_rules_drift", errors)
         self.assertIn("active_rules_revalidation", evidence)
 
+    def test_rejects_bypass_detail_drift_during_policy_proof(self) -> None:
+        class DetailDriftGh(FakeGh):
+            def __init__(self) -> None:
+                super().__init__()
+                self.detail_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if (
+                    argv[:1] == ["api"]
+                    and len(argv) >= 2
+                    and "/rulesets/" in argv[1]
+                ):
+                    self.detail_reads += 1
+                    if self.detail_reads >= 2:
+                        self.ruleset_details[18801517][
+                            "current_user_can_bypass"
+                        ] = "always"
+                return super().__call__(repo, argv)
+
+        policy, evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            DetailDriftGh(),
+            repo_slug="heimgewebe/grabowski",
+            base_branch="main",
+        )
+
+        self.assertIsNone(policy)
+        self.assertIn(
+            "base_update_guard_ruleset_detail_drift:18801517", errors
+        )
+        self.assertEqual(
+            False,
+            evidence["ruleset_detail_revalidation"][0][
+                "matches_initial_detail"
+            ],
+        )
+
     def test_rejects_ruleset_bypass_for_current_actor(self) -> None:
         gh = FakeGh()
         gh.ruleset_details[18801517]["current_user_can_bypass"] = "always"
