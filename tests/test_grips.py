@@ -3768,6 +3768,34 @@ class GithubBaseUpdateGuardTests(unittest.TestCase):
         self.assertIn("base_update_guard_strict_ruleset_missing", errors)
         self.assertEqual(errors, evidence["errors"])
 
+    def test_rejects_active_rule_drift_during_policy_proof(self) -> None:
+        class ActiveRuleDriftGh(FakeGh):
+            def __init__(self) -> None:
+                super().__init__()
+                self.active_rule_reads = 0
+
+            def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
+                if (
+                    argv[:1] == ["api"]
+                    and len(argv) >= 2
+                    and "/rules/branches/" in argv[1]
+                ):
+                    self.active_rule_reads += 1
+                    if self.active_rule_reads >= 2:
+                        self.active_rules = []
+                return super().__call__(repo, argv)
+
+        policy, evidence, errors = merge_guard.verify_github_base_update_guard(
+            Path.cwd(),
+            ActiveRuleDriftGh(),
+            repo_slug="heimgewebe/grabowski",
+            base_branch="main",
+        )
+
+        self.assertIsNone(policy)
+        self.assertIn("base_update_guard_active_rules_drift", errors)
+        self.assertIn("active_rules_revalidation", evidence)
+
     def test_rejects_ruleset_bypass_for_current_actor(self) -> None:
         gh = FakeGh()
         gh.ruleset_details[18801517]["current_user_can_bypass"] = "always"
@@ -4612,7 +4640,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                     and "/rules/branches/" in argv[1]
                 ):
                     self.active_rule_reads += 1
-                    if self.active_rule_reads >= 2:
+                    if self.active_rule_reads >= 3:
                         self.active_rules = []
                 return super().__call__(repo, argv)
 

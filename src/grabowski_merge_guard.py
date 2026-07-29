@@ -944,6 +944,24 @@ def verify_github_base_update_guard(
         evidence["errors"] = list(errors)
         return None, evidence, errors
 
+    (
+        active_revalidated,
+        active_revalidation_evidence,
+        active_revalidation_errors,
+    ) = _github_json_call(
+        repo_path,
+        github_runner,
+        active_args,
+        label="base_update_guard_active_rules_revalidation",
+    )
+    evidence["active_rules_revalidation"] = active_revalidation_evidence
+    errors.extend(active_revalidation_errors)
+    if not active_revalidation_errors and active_revalidated != active:
+        errors.append("base_update_guard_active_rules_drift")
+    if errors:
+        evidence["errors"] = list(errors)
+        return None, evidence, errors
+
     policy: dict[str, Any] = {
         "schema_version": 1,
         "kind": "grabowski_github_base_update_guard",
