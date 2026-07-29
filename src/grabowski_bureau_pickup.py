@@ -34,6 +34,15 @@ STATE_ROOT = Path(
         str(operator.STATE_DIR / "bureau-pickup"),
     )
 ).expanduser()
+LEGACY_COORDINATION_ROOT = Path(
+    os.environ.get("BUREAU_STATE_DIR", "~/.local/state/bureau")
+).expanduser()
+COORDINATION_ROOT = Path(
+    os.environ.get(
+        "GRABOWSKI_BUREAU_COORDINATION_ROOT",
+        str(LEGACY_COORDINATION_ROOT),
+    )
+).expanduser()
 RUN_ID_RE = re.compile(r"^BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -299,6 +308,84 @@ def _private_root() -> Path:
             os.close(root_descriptor)
         return root_path
     finally:
+        os.close(parent_descriptor)
+
+
+def _default_coordination_root() -> Path:
+    return _absolute_path(COORDINATION_ROOT)
+
+
+def _legacy_coordination_root() -> Path:
+    return _absolute_path(LEGACY_COORDINATION_ROOT)
+
+
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def _validate_existing_private_directory(path: Path, *, label: str) -> None:
+    descriptor = _open_existing_directory_chain(path, label=label)
+    try:
+        _assert_private_directory_binding(descriptor, path, label=label)
+    finally:
+        os.close(descriptor)
+
+
+def _normalize_coordination_root(
+    value: Any, *, registry_root: str, require_current_binding: bool = True
+) -> str:
+    raw = Path(_text(value, label="coordination_root", maximum=4096)).expanduser()
+    if not raw.is_absolute():
+        raise ValueError("coordination_root must be absolute")
+    normalized = _absolute_path(raw)
+    expected = _default_coordination_root()
+    if require_current_binding and normalized != expected:
+        raise BureauPickupError(
+            "coordination-root-not-adapter-owned",
+            details={"observed": str(normalized), "expected": str(expected)},
+        )
+    registry = Path(registry_root)
+    if _paths_overlap(normalized, registry):
+        raise BureauPickupError(
+            "coordination-root-overlaps-registry",
+            details={
+                "coordination_root": str(normalized),
+                "registry_root": str(registry),
+            },
+        )
+    if os.path.lexists(normalized):
+        _validate_existing_private_directory(
+            normalized, label="pickup-coordination"
+        )
+    return str(normalized)
+
+
+def _ensure_coordination_root(expected: str) -> str:
+    normalized = Path(expected)
+    if normalized != _default_coordination_root():
+        raise BureauPickupError("coordination-root-binding-changed")
+    parent = normalized.parent
+    parent_descriptor = _open_existing_directory_chain(
+        parent, label="pickup-coordination-parent"
+    )
+    coordination_descriptor = -1
+    try:
+        path, coordination_descriptor = _open_or_create_private_child(
+            parent_descriptor,
+            parent,
+            normalized.name,
+            label="pickup-coordination",
+            create=True,
+        )
+        _assert_private_directory_binding(
+            coordination_descriptor, path, label="pickup-coordination"
+        )
+        if path != normalized:
+            raise BureauPickupError("coordination-root-binding-changed")
+        return str(path)
+    finally:
+        if coordination_descriptor >= 0:
+            os.close(coordination_descriptor)
         os.close(parent_descriptor)
 
 
@@ -570,7 +657,9 @@ def _normalize_registry_root(value: Any) -> str:
     return str(resolved)
 
 
-def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
+def _normalize_request(
+    request: dict[str, Any], *, allow_internal_bindings: bool = False
+) -> dict[str, Any]:
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
     allowed = {
@@ -587,6 +676,8 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
         "nonconflict_proofs",
         "registry_root",
     }
+    if allow_internal_bindings:
+        allowed.add("coordination_root")
     extra = sorted(set(request) - allowed)
     if extra:
         raise ValueError(f"unsupported request fields: {extra}")
@@ -602,6 +693,10 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
     )
     registry_root = _normalize_registry_root(
         request.get("registry_root", str(bureau.BUREAU_ROOT))
+    )
+    coordination_root = _normalize_coordination_root(
+        request.get("coordination_root", str(_default_coordination_root())),
+        registry_root=registry_root,
     )
     resource = request.get("resource")
     if resource is not None:
@@ -623,6 +718,7 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
         "base_dir": base_dir,
         "approval_source": approval_source,
         "registry_root": registry_root,
+        "coordination_root": coordination_root,
         "lease_ttl_seconds": _ttl(request.get("lease_ttl_seconds", 900)),
         "create_workspace": create_workspace,
         "repository_scope_manifests": _normalize_scope_manifests(
@@ -634,19 +730,21 @@ def _normalize_request(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _bureau_arguments(command: str, *, registry_root: str) -> list[str]:
-    return [
-        "--root",
-        registry_root,
-        "--json",
-        "--json-envelope",
-        command,
-    ]
+def _bureau_arguments(
+    command: str, *, registry_root: str, coordination_root: str | None
+) -> list[str]:
+    arguments = ["--root", registry_root]
+    if coordination_root is not None:
+        arguments.extend(["--state-root", coordination_root])
+    arguments.extend(["--json", "--json-envelope", command])
+    return arguments
 
 
 def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
     arguments = _bureau_arguments(
-        "claim-intent", registry_root=request["registry_root"]
+        "claim-intent",
+        registry_root=request["registry_root"],
+        coordination_root=request["coordination_root"],
     )
     arguments.extend(["--worker", request["worker_id"]])
     arguments.extend(["--kind", request["kind"]])
@@ -898,7 +996,9 @@ def _commit_claim(
 ) -> dict[str, Any]:
     intent_path = run_dir / "intent.json"
     arguments = _bureau_arguments(
-        "claim-commit", registry_root=request["registry_root"]
+        "claim-commit",
+        registry_root=request["registry_root"],
+        coordination_root=request["coordination_root"],
     )
     arguments.extend(["--intent", str(intent_path)])
     if intent["required_resource_keys"]:
@@ -916,11 +1016,15 @@ def _commit_claim(
     )
 
 
-def _coordination_status(run_id: str, *, registry_root: str) -> dict[str, Any]:
+def _coordination_status(
+    run_id: str, *, registry_root: str, coordination_root: str | None
+) -> dict[str, Any]:
     return bureau._invoke_bureau(
         [
             *_bureau_arguments(
-                "claim-coordination-status", registry_root=registry_root
+                "claim-coordination-status",
+                registry_root=registry_root,
+                coordination_root=coordination_root,
             ),
             run_id,
         ]
@@ -941,10 +1045,13 @@ def _recover_after_commit(
     run_dir: Path,
     *,
     registry_root: str,
+    coordination_root: str,
 ) -> dict[str, Any]:
     try:
         status = _coordination_status(
-            intent["run_id"], registry_root=registry_root
+            intent["run_id"],
+            registry_root=registry_root,
+            coordination_root=coordination_root,
         )
         _write_bound_json(run_dir / "commit-readback.json", status)
     except Exception as exc:
@@ -1002,14 +1109,35 @@ def grabowski_bureau_pickup_execute(
     operator._require_operator_mutation(
         "terminal_execute", path=normalized["registry_root"]
     )
+    operator._require_operator_mutation(
+        "terminal_execute", path=normalized["coordination_root"]
+    )
     operator._require_operator_mutation("resource_lease")
+    ensured_coordination_root = _ensure_coordination_root(
+        normalized["coordination_root"]
+    )
+    if ensured_coordination_root != normalized["coordination_root"]:
+        raise BureauPickupError("coordination-root-binding-changed")
     request_sha256 = _sha256(normalized)
     intent_payload = _claim_intent(normalized)
     intent, existing = _validate_intent_result(intent_payload, normalized)
     run_dir = _run_directory(intent["run_id"])
     if existing:
+        stored_request_payload = _read_bound_json(
+            run_dir / "request.json", label="request"
+        )
+        if "coordination_root" not in stored_request_payload:
+            if Path(normalized["coordination_root"]) != _legacy_coordination_root():
+                raise BureauPickupError(
+                    "legacy-assignment-retry-requires-status",
+                    details={"run_id": intent["run_id"]},
+                )
+            stored_request_payload = {
+                **stored_request_payload,
+                "coordination_root": normalized["coordination_root"],
+            }
         stored_request = _normalize_request(
-            _read_bound_json(run_dir / "request.json", label="request")
+            stored_request_payload, allow_internal_bindings=True
         )
         if stored_request != normalized:
             raise BureauPickupError("existing-assignment-request-mismatch")
@@ -1023,7 +1151,9 @@ def grabowski_bureau_pickup_execute(
         if acquisition.get("claim_intent_sha256") != intent["intent_sha256"]:
             raise BureauPickupError("existing-assignment-acquisition-mismatch")
         coordination = _coordination_status(
-            intent["run_id"], registry_root=normalized["registry_root"]
+            intent["run_id"],
+            registry_root=normalized["registry_root"],
+            coordination_root=normalized["coordination_root"],
         )
         result = {
             "schema_version": SCHEMA_VERSION,
@@ -1117,6 +1247,7 @@ def grabowski_bureau_pickup_execute(
             acquisition,
             run_dir,
             registry_root=normalized["registry_root"],
+            coordination_root=normalized["coordination_root"],
         )
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -1160,19 +1291,87 @@ def _journal_available(run_id: str) -> bool:
     return True
 
 
-def _registry_root_for_run(run_id: str) -> str:
-    default = _normalize_registry_root(str(bureau.BUREAU_ROOT))
+def _current_root_binding(default_registry: str, *, source: str) -> dict[str, Any]:
+    default_coordination = _normalize_coordination_root(
+        str(_default_coordination_root()), registry_root=default_registry
+    )
+    legacy_fallback_allowed = (
+        Path(default_coordination) != _legacy_coordination_root()
+    )
+    return {
+        "registry_root": default_registry,
+        "coordination_root": default_coordination,
+        "source": (
+            source
+            if legacy_fallback_allowed
+            else source.removesuffix("-with-legacy-fallback")
+        ),
+        "legacy_fallback_allowed": legacy_fallback_allowed,
+    }
+
+
+def _root_binding_for_run(run_id: str) -> dict[str, Any]:
+    default_registry = _normalize_registry_root(str(bureau.BUREAU_ROOT))
     if not _journal_available(run_id):
-        return default
+        return _current_root_binding(
+            default_registry, source="current-default-with-legacy-fallback"
+        )
     try:
         stored = _read_bound_json(
             STATE_ROOT / "runs" / run_id / "request.json", label="request"
         )
     except BureauPickupError as exc:
         if exc.code == "request-missing":
-            return default
+            return _current_root_binding(
+                default_registry, source="missing-request-with-legacy-fallback"
+            )
         raise
-    return _normalize_registry_root(stored.get("registry_root", default))
+    registry_root = _normalize_registry_root(
+        stored.get("registry_root", default_registry)
+    )
+    if "coordination_root" not in stored:
+        return {
+            "registry_root": registry_root,
+            "coordination_root": None,
+            "source": "legacy-journal-implicit-state",
+            "legacy_fallback_allowed": False,
+        }
+    coordination_root = _normalize_coordination_root(
+        stored["coordination_root"],
+        registry_root=registry_root,
+        require_current_binding=False,
+    )
+    return {
+        "registry_root": registry_root,
+        "coordination_root": coordination_root,
+        "source": "journal-bound",
+        "legacy_fallback_allowed": False,
+    }
+
+
+def _coordination_status_for_binding(
+    run_id: str, binding: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = _coordination_status(
+        run_id,
+        registry_root=binding["registry_root"],
+        coordination_root=binding["coordination_root"],
+    )
+    if not binding["legacy_fallback_allowed"] or not _definitive_missing_run(payload):
+        return payload, binding
+    legacy_payload = _coordination_status(
+        run_id,
+        registry_root=binding["registry_root"],
+        coordination_root=None,
+    )
+    if _definitive_missing_run(legacy_payload):
+        return payload, binding
+    return legacy_payload, {
+        **binding,
+        "coordination_root": None,
+        "source": "legacy-implicit-fallback",
+        "legacy_fallback_allowed": False,
+    }
 
 
 @mcp.tool(name="grabowski_bureau_pickup_status", annotations=READ_ONLY)
@@ -1181,17 +1380,20 @@ def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
     if RUN_ID_RE.fullmatch(normalized_run_id) is None:
         raise ValueError("run_id is invalid")
-    payload = _coordination_status(
-        normalized_run_id, registry_root=_registry_root_for_run(normalized_run_id)
+    binding = _root_binding_for_run(normalized_run_id)
+    payload, effective_binding = _coordination_status_for_binding(
+        normalized_run_id, binding
     )
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup_status",
         "run_id": normalized_run_id,
+        "registry_root": effective_binding["registry_root"],
+        "coordination_root": effective_binding["coordination_root"],
+        "root_binding_source": effective_binding["source"],
         "coordination": payload,
         "journal_available": _journal_available(normalized_run_id),
     }
-
 
 
 
@@ -1208,6 +1410,7 @@ def _validate_acquisition(acquisition: dict[str, Any]) -> None:
         raise BureauPickupError("acquisition-resource-set-invalid")
     if acquisition.get("owner_id") != f"bureau-run:{acquisition.get('run_id')}":
         raise BureauPickupError("acquisition-owner-invalid")
+
 
 def _verify_release_binding(
     run_id: str, status: dict[str, Any], acquisition: dict[str, Any]
@@ -1263,9 +1466,18 @@ def _verify_release_binding(
 def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     """Release exactly one terminal coordinated run's unchanged Grabowski leases."""
     normalized_run_id = _text(run_id, label="run_id", maximum=128)
-    registry_root = _registry_root_for_run(normalized_run_id)
+    binding = _root_binding_for_run(normalized_run_id)
+    registry_root = binding["registry_root"]
     operator._require_operator_mutation(
         "terminal_execute", path=registry_root
+    )
+    coordination_effect_root = (
+        Path(binding["coordination_root"])
+        if binding["coordination_root"] is not None
+        else _legacy_coordination_root()
+    )
+    operator._require_operator_mutation(
+        "terminal_execute", path=str(coordination_effect_root)
     )
     operator._require_operator_mutation("resource_lease")
     run_dir = _run_directory(normalized_run_id)
@@ -1284,6 +1496,9 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
                 "kind": "grabowski_bureau_pickup_release",
                 "status": "already-released",
                 "run_id": normalized_run_id,
+                "registry_root": binding["registry_root"],
+                "coordination_root": binding["coordination_root"],
+                "root_binding_source": binding["source"],
                 "owner_id": acquisition["owner_id"],
                 "resource_keys": acquisition["resource_keys"],
                 "release": _read_bound_json(
@@ -1291,8 +1506,8 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
                 ),
                 "journal": str(run_dir),
             }
-    status = _coordination_status(
-        normalized_run_id, registry_root=registry_root
+    status, effective_binding = _coordination_status_for_binding(
+        normalized_run_id, binding
     )
     _write_bound_json(run_dir / "terminal-readback.json", status)
     owner_id, keys = _verify_release_binding(
@@ -1314,6 +1529,9 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         "kind": "grabowski_bureau_pickup_release",
         "status": "released",
         "run_id": normalized_run_id,
+        "registry_root": effective_binding["registry_root"],
+        "coordination_root": effective_binding["coordination_root"],
+        "root_binding_source": effective_binding["source"],
         "owner_id": owner_id,
         "resource_keys": keys,
         "release": result,

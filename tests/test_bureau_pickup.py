@@ -19,8 +19,13 @@ class BureauPickupTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.registry_root = self.root / "bureau"
         self.registry_root.mkdir()
+        self.coordination_root = self.root / "bureau-state"
         self.patches = [
             mock.patch.object(pickup, "STATE_ROOT", self.root / "state"),
+            mock.patch.object(
+                pickup, "LEGACY_COORDINATION_ROOT", self.coordination_root
+            ),
+            mock.patch.object(pickup, "COORDINATION_ROOT", self.coordination_root),
             mock.patch.object(pickup.bureau, "BUREAU_ROOT", self.registry_root),
             mock.patch.object(pickup.operator, "_require_operator_mutation"),
             mock.patch.object(pickup.bureau, "_audit"),
@@ -136,6 +141,10 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("interactive-agent", normalized["kind"])
         self.assertEqual(900, normalized["lease_ttl_seconds"])
         self.assertTrue(normalized["create_workspace"])
+        self.assertEqual(
+            str(pickup.COORDINATION_ROOT),
+            normalized["coordination_root"],
+        )
 
     def test_normalizer_still_rejects_unknown_request_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported request fields"):
@@ -196,6 +205,51 @@ class BureauPickupTests(unittest.TestCase):
                 pickup.BureauPickupError, "pickup-root-directory-unsafe"
             ):
                 pickup._private_root()
+
+    def test_coordination_root_rejects_public_override(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported request fields"):
+            pickup._normalize_request(
+                self.request(coordination_root=str(self.root / "other-state"))
+            )
+
+    def test_coordination_root_rejects_registry_overlap(self) -> None:
+        with mock.patch.object(pickup, "COORDINATION_ROOT", self.registry_root):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "coordination-root-overlaps-registry"
+            ):
+                pickup._normalize_request(self.request())
+
+    def test_coordination_root_rejects_symlink(self) -> None:
+        pickup._private_root()
+        target = self.root / "redirected-coordination"
+        target.mkdir(mode=0o700)
+        pickup.COORDINATION_ROOT.symlink_to(
+            target, target_is_directory=True
+        )
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "pickup-coordination-open-failed"
+        ):
+            pickup._normalize_request(self.request())
+
+    def test_coordination_root_rejects_nonprivate_mode(self) -> None:
+        pickup._private_root()
+        coordination = pickup.COORDINATION_ROOT
+        coordination.mkdir(mode=0o700)
+        coordination.chmod(0o755)
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "pickup-coordination-directory-unsafe"
+        ):
+            pickup._normalize_request(self.request())
+
+    def test_coordination_root_is_created_private_and_stable(self) -> None:
+        normalized = pickup._normalize_request(self.request())
+        path = Path(pickup._ensure_coordination_root(normalized["coordination_root"]))
+        self.assertEqual(pickup.COORDINATION_ROOT, path)
+        self.assertEqual(0o700, path.stat().st_mode & 0o777)
+        self.assertEqual(
+            normalized["coordination_root"],
+            pickup._ensure_coordination_root(normalized["coordination_root"]),
+        )
 
     def test_concurrent_identical_artifact_winner_is_idempotent(self) -> None:
         run_dir = pickup._run_directory(self.intent()["run_id"])
@@ -335,14 +389,20 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(metadata["claim_intent_sha256"], intent["intent_sha256"])
         intent_argv = invoke.call_args_list[0].args[0]
         commit_argv = invoke.call_args_list[1].args[0]
+        expected_coordination = str(pickup.COORDINATION_ROOT)
         for argv in (intent_argv, commit_argv):
             root_index = argv.index("--root")
             self.assertEqual(argv[root_index + 1], str(self.registry_root))
+            state_index = argv.index("--state-root")
+            self.assertEqual(argv[state_index + 1], expected_coordination)
         self.assertIn("--workspace", commit_argv)
+        self.assertEqual(0o700, Path(expected_coordination).stat().st_mode & 0o777)
         run_dir = Path(result["journal"])
         self.assertTrue((run_dir / "intent.json").is_file())
         self.assertTrue((run_dir / "acquisition.json").is_file())
         self.assertTrue((run_dir / "commit-result.json").is_file())
+        stored_request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
+        self.assertEqual(expected_coordination, stored_request["coordination_root"])
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
 
     def test_relative_registry_root_is_rejected_before_any_effect(self) -> None:
@@ -624,6 +684,65 @@ class BureauPickupTests(unittest.TestCase):
                 "claim_intent_sha256": intent["intent_sha256"],
             },
         }
+
+    def test_release_uses_journal_bound_coordination_root(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
+        request = pickup._normalize_request(self.request())
+        pickup._write_bound_json(run_dir / "request.json", request)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[lease, None]
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ),
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        argv = invoke.call_args.args[0]
+        self.assertEqual(
+            request["coordination_root"], argv[argv.index("--state-root") + 1]
+        )
+        self.assertEqual("journal-bound", result["root_binding_source"])
+
+    def test_legacy_release_uses_implicit_state_and_gates_legacy_path(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
+        legacy_request = pickup._normalize_request(self.request())
+        legacy_request.pop("coordination_root")
+        pickup._write_bound_json(run_dir / "request.json", legacy_request)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[lease, None]
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ),
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertNotIn("--state-root", invoke.call_args.args[0])
+        self.assertEqual("legacy-journal-implicit-state", result["root_binding_source"])
+        pickup.operator._require_operator_mutation.assert_any_call(
+            "terminal_execute", path=str(pickup.LEGACY_COORDINATION_ROOT)
+        )
 
     def test_release_requires_terminal_readback(self) -> None:
         intent = self.intent()
@@ -909,6 +1028,170 @@ class BureauPickupTests(unittest.TestCase):
                 pickup.grabowski_bureau_pickup_execute(self.request())
         acquire.assert_not_called()
 
+    def test_legacy_existing_assignment_retry_uses_same_default_state(self) -> None:
+        request = self.request()
+        intent = self.intent()
+        run_dir = pickup._run_directory(intent["run_id"])
+        legacy_request = pickup._normalize_request(request)
+        legacy_request.pop("coordination_root")
+        pickup._write_bound_json(run_dir / "request.json", legacy_request)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        _run_dir, acquisition = self.create_acquisition_journal(
+            intent, self.lease(intent["required_resource_keys"][0], intent["lease_owner_id"])
+        )
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        coordinated = {
+            "status": "coordinated",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+        }
+        with mock.patch.object(
+            pickup.bureau, "_invoke_bureau", side_effect=[existing, coordinated]
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-assignment", result["status"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
+
+    def test_legacy_existing_assignment_retry_fails_after_configured_cutover(
+        self,
+    ) -> None:
+        request = self.request()
+        intent = self.intent()
+        run_dir = pickup._run_directory(intent["run_id"])
+        legacy_request = pickup._normalize_request(request)
+        legacy_request.pop("coordination_root")
+        pickup._write_bound_json(run_dir / "request.json", legacy_request)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        self.create_acquisition_journal(
+            intent, self.lease(intent["required_resource_keys"][0], intent["lease_owner_id"])
+        )
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        with (
+            mock.patch.object(
+                pickup, "COORDINATION_ROOT", self.root / "custom-state"
+            ),
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=existing),
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "legacy-assignment-retry-requires-status",
+            ):
+                pickup.grabowski_bureau_pickup_execute(request)
+
+    def test_status_uses_journal_bound_coordination_root(self) -> None:
+        intent = self.intent()
+        normalized = pickup._normalize_request(self.request())
+        run_dir = pickup._run_directory(intent["run_id"])
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        with mock.patch.object(
+            pickup.bureau,
+            "_invoke_bureau",
+            return_value={"status": "coordinated"},
+        ) as invoke:
+            result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        argv = invoke.call_args.args[0]
+        self.assertEqual(
+            normalized["coordination_root"], argv[argv.index("--state-root") + 1]
+        )
+        self.assertEqual("journal-bound", result["root_binding_source"])
+        self.assertEqual(normalized["coordination_root"], result["coordination_root"])
+
+    def test_journal_bound_status_survives_configured_root_change(self) -> None:
+        intent = self.intent()
+        request = pickup._normalize_request(self.request())
+        run_dir = pickup._run_directory(intent["run_id"])
+        pickup._write_bound_json(run_dir / "request.json", request)
+        with (
+            mock.patch.object(
+                pickup, "COORDINATION_ROOT", self.root / "new-configured-state"
+            ),
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "coordinated"},
+            ) as invoke,
+        ):
+            result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        argv = invoke.call_args.args[0]
+        self.assertEqual(
+            request["coordination_root"], argv[argv.index("--state-root") + 1]
+        )
+        self.assertEqual("journal-bound", result["root_binding_source"])
+        self.assertEqual(request["coordination_root"], result["coordination_root"])
+
+    def test_legacy_journal_status_uses_implicit_bureau_state(self) -> None:
+        intent = self.intent()
+        legacy_request = pickup._normalize_request(self.request())
+        legacy_request.pop("coordination_root")
+        run_dir = pickup._run_directory(intent["run_id"])
+        pickup._write_bound_json(run_dir / "request.json", legacy_request)
+        with mock.patch.object(
+            pickup.bureau,
+            "_invoke_bureau",
+            return_value={"status": "coordinated"},
+        ) as invoke:
+            result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        self.assertNotIn("--state-root", invoke.call_args.args[0])
+        self.assertIsNone(result["coordination_root"])
+        self.assertEqual("legacy-journal-implicit-state", result["root_binding_source"])
+
+    def test_status_without_journal_falls_back_only_after_unknown_run(self) -> None:
+        intent = self.intent()
+        with (
+            mock.patch.object(
+                pickup, "COORDINATION_ROOT", self.root / "custom-state"
+            ),
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "error", "code": "unknown-run"},
+                    {
+                        "status": "coordinated",
+                        "run": {"run_id": intent["run_id"]},
+                    },
+                ],
+            ) as invoke,
+        ):
+            result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        self.assertEqual(2, invoke.call_count)
+        self.assertIn("--state-root", invoke.call_args_list[0].args[0])
+        self.assertNotIn("--state-root", invoke.call_args_list[1].args[0])
+        self.assertEqual("legacy-implicit-fallback", result["root_binding_source"])
+        self.assertIsNone(result["coordination_root"])
+        self.assertFalse(pickup.STATE_ROOT.exists())
+
+    def test_status_without_journal_does_not_fallback_on_transport_error(self) -> None:
+        intent = self.intent()
+        failure = {
+            "kind": "grabowski_bureau_intake_adapter_failure",
+            "code": "bureau-runtime-timeout",
+            "status": "unknown",
+        }
+        with (
+            mock.patch.object(
+                pickup, "COORDINATION_ROOT", self.root / "custom-state"
+            ),
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=failure
+            ) as invoke,
+        ):
+            result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        self.assertEqual(1, invoke.call_count)
+        self.assertEqual(failure, result["coordination"])
+        self.assertEqual(
+            "current-default-with-legacy-fallback", result["root_binding_source"]
+        )
+
     def test_status_does_not_create_private_state(self) -> None:
         intent = self.intent()
         self.assertFalse(pickup.STATE_ROOT.exists())
@@ -919,6 +1202,10 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
         self.assertFalse(result["journal_available"])
+        self.assertEqual(
+            str(pickup.COORDINATION_ROOT), result["coordination_root"]
+        )
+        self.assertEqual("current-default", result["root_binding_source"])
         self.assertFalse(pickup.STATE_ROOT.exists())
 
     def test_status_is_read_only_and_reports_journal_presence(self) -> None:
