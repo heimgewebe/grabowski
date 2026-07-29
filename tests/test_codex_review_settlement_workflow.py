@@ -35,33 +35,24 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertNotIn("actions/checkout@v", self.text)
         self.assertNotIn("github.event.pull_request.head", self.text)
 
-    def test_permissions_are_bounded_to_review_status_workflow(self) -> None:
+    def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
-        self.assertIn("  pull-requests: write\n", self.text)
+        self.assertIn("  pull-requests: read\n", self.text)
+        self.assertNotIn("  pull-requests: write\n", self.text)
         self.assertNotIn("  issues: write\n", self.text)
         self.assertIn("  statuses: write\n", self.text)
         self.assertNotIn("contents: write", self.text)
 
-    def test_supported_events_create_requests_without_bot_recursion(self) -> None:
-        request_section = self.text.split(
-            "      - name: Request current-head Codex review\n", 1
-        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
-        self.assertIn("        if: >-", request_section)
-        self.assertNotIn(
-            "github.event_name != 'workflow_dispatch'",
-            request_section,
-        )
-        self.assertIn(
-            "github.event_name != 'issue_comment'",
-            request_section,
-        )
-        self.assertIn(
-            "github.event.comment.user.login != 'chatgpt-codex-connector[bot]'",
-            request_section,
-        )
-        self.assertIn("tools/codex_review_settlement.py", request_section)
-        self.assertIn("--require", request_section)
-        self.assertIn("request > codex-review-request.json", request_section)
+    def test_workflow_observes_only_and_never_posts_codex_request(self) -> None:
+        self.assertNotIn("Request current-head Codex review", self.text)
+        self.assertNotIn("request > codex-review-request.json", self.text)
+        self.assertNotIn("@codex review", self.text)
+        evaluate_section = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        self.assertIn("tools/codex_review_settlement.py", evaluate_section)
+        self.assertIn("--require", evaluate_section)
+        self.assertIn("evaluate > codex-review-settlement.json", evaluate_section)
 
     def test_github_actions_issue_comments_do_not_retrigger_settlement(self) -> None:
         self.assertIn(
@@ -69,32 +60,25 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
             self.text,
         )
 
-    def test_github_actions_issue_comments_do_not_cancel_originating_run(self) -> None:
+    def test_concurrency_is_bound_to_pull_request_without_bot_special_case(self) -> None:
         concurrency = self.text.split("concurrency:\n", 1)[1].split("\njobs:\n", 1)[0]
-        self.assertIn("github.event_name == 'issue_comment'", concurrency)
-        self.assertIn(
-            "github.event.comment.user.login == 'github-actions[bot]'",
-            concurrency,
-        )
-        self.assertIn("&& github.run_id", concurrency)
-        self.assertIn("|| github.event.issue.number", concurrency)
+        self.assertIn("github.event.pull_request.number", concurrency)
+        self.assertIn("github.event.issue.number", concurrency)
+        self.assertIn("inputs.pr", concurrency)
+        self.assertIn("github.run_id", concurrency)
+        self.assertNotIn("github.event.comment.user.login", concurrency)
         self.assertIn("cancel-in-progress: true", concurrency)
 
     def test_bootstrap_without_default_branch_evaluator_fails_explicitly(self) -> None:
-        request_section = self.text.split(
-            "      - name: Request current-head Codex review\n", 1
-        )[1].split("      - name: Evaluate current-head settlement\n", 1)[0]
         evaluate_section = self.text.split(
             "      - name: Evaluate current-head settlement\n", 1
         )[1].split("      - name: Publish settlement status\n", 1)[0]
-        for section in (request_section, evaluate_section):
-            self.assertIn(
-                "if [ ! -f tools/codex_review_settlement.py ]; then", section
-            )
-            self.assertIn(
-                "trusted_evaluator_missing_on_default_branch", section
-            )
-        self.assertNotIn("github.event.pull_request.head", request_section)
+        self.assertIn(
+            "if [ ! -f tools/codex_review_settlement.py ]; then", evaluate_section
+        )
+        self.assertIn(
+            "trusted_evaluator_missing_on_default_branch", evaluate_section
+        )
         self.assertNotIn("github.event.pull_request.head", evaluate_section)
 
     def test_malformed_evaluator_output_becomes_explicit_failure(self) -> None:
@@ -118,6 +102,10 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn('github_state="failure"', self.text)
         self.assertIn(
             "Current-head Codex review requirement satisfied",
+            self.text,
+        )
+        self.assertIn(
+            "Connected user must request current-head Codex review",
             self.text,
         )
         self.assertNotIn("usage limit reached", self.text)

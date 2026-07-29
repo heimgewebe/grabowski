@@ -712,25 +712,28 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("reaction", result["evidence"]["completion"]["mode"])
         self.assertEqual(1002, result["evidence"]["completion"]["comment_id"])
 
-    def test_graphql_actions_actor_without_bot_suffix_is_trusted(self) -> None:
-        state = base_state()
-        state["comments"] = connection(
-            [
-                request_comment(
-                    actor="github-actions",
-                    association="CONTRIBUTOR",
+    def test_github_actions_request_markers_are_ignored(self) -> None:
+        for actor, association in (
+            ("github-actions", "CONTRIBUTOR"),
+            ("github-actions[bot]", "OWNER"),
+            ("trusted-app[bot]", "COLLABORATOR"),
+        ):
+            with self.subTest(actor=actor):
+                state = base_state()
+                state["comments"] = connection(
+                    [request_comment(actor=actor, association=association)],
+                    hasPreviousPage=False,
                 )
-            ],
-            hasPreviousPage=False,
-        )
-        state["reviews"] = connection([codex_review()], hasPreviousPage=False)
+                state["reviews"] = connection(
+                    [codex_review()], hasPreviousPage=False
+                )
 
-        result = self.evaluate(state)
+                result = self.evaluate(state)
 
-        self.assertEqual(result["status"], "pass")
-        self.assertTrue(result["request_present"])
-        self.assertTrue(result["review_performed"])
-        self.assertTrue(result["settled"])
+                self.assertEqual(result["status"], "pending")
+                self.assertFalse(result["request_present"])
+                self.assertFalse(result["review_performed"])
+                self.assertFalse(result["settled"])
 
     def test_untrusted_request_marker_is_ignored(self) -> None:
         state = base_state()

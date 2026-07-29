@@ -23,7 +23,6 @@ TRUSTED_CODEX_ACTORS = frozenset(
     {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 )
 TRUSTED_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-TRUSTED_REQUEST_ACTORS = frozenset({"github-actions", "github-actions[bot]"})
 ACCEPTED_REVIEW_STATES = frozenset({"APPROVED", "COMMENTED"})
 BLOCKING_REVIEW_STATES = frozenset({"CHANGES_REQUESTED", "PENDING"})
 REQUEST_RE = re.compile(
@@ -323,7 +322,9 @@ def _parse_request(comment: dict[str, Any]) -> dict[str, Any] | None:
 def _request_actor_allowed(comment: dict[str, Any]) -> bool:
     association = comment.get("authorAssociation")
     actor = _actor_login(comment.get("author"))
-    return association in TRUSTED_REQUEST_ASSOCIATIONS or actor in TRUSTED_REQUEST_ACTORS
+    if not actor or actor == "github-actions" or actor.endswith("[bot]"):
+        return False
+    return association in TRUSTED_REQUEST_ASSOCIATIONS
 
 
 def _canonical_request_payload(
