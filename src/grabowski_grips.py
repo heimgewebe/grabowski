@@ -21,6 +21,7 @@ import grabowski_client_snapshot
 import grabowski_operator_obligation
 import grabowski_worktree_ensure
 import grabowski_merge_delivery
+import grabowski_merge_guard
 
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -6798,6 +6799,30 @@ def _run_captain_pr_merge(
         execution_result["preflight_errors"].extend(merge_policy_errors)
         detail = "; ".join(merge_policy_errors) if merge_policy_errors else "repository_merge_policy_unavailable"
         execution_result["verification_error"] = f"repository merge policy unavailable; merge not attempted: {detail}"
+        return execution_result
+    (
+        base_update_guard,
+        base_update_guard_evidence,
+        base_update_guard_errors,
+    ) = grabowski_merge_guard.verify_github_base_update_guard(
+        repo_path,
+        github_runner,
+        repo_slug=repo_slug,
+        base_branch=expected_base,
+    )
+    execution_result["base_update_guard"] = base_update_guard
+    execution_result["base_update_guard_evidence"] = base_update_guard_evidence
+    if base_update_guard_errors or base_update_guard is None:
+        execution_result["preflight_errors"].extend(base_update_guard_errors)
+        detail = (
+            "; ".join(base_update_guard_errors)
+            if base_update_guard_errors
+            else "base_update_guard_unavailable"
+        )
+        execution_result["verification_error"] = (
+            "GitHub cannot enforce the reviewed base revision for this merge; "
+            f"merge not attempted: {detail}"
+        )
         return execution_result
     effect_scope_decision = _captain_pr_merge_effect_scope_decision(
         action,
