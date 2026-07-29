@@ -737,6 +737,32 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(fable["paid_only"])
         self.assertEqual(fable["model"], "claude-fable-5")
 
+    def test_review_execution_contract_accepts_review_only_grok_route(self) -> None:
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "enabled contrast route"
+        ):
+            router.contrast_route_execution_contract("grok-4.5-review-high")
+        review = router.review_route_execution_contract("grok-4.5-review-high")
+        advisory = router.advisory_route_execution_contract(
+            "grok-4.5-review-high"
+        )
+        self.assertEqual(review, advisory)
+        self.assertEqual(review["harness"], "grok")
+        self.assertEqual(review["model"], "grok-4.5")
+        self.assertEqual(review["quota_pools"], ["grok-com"])
+        self.assertFalse(review["paid_only"])
+        self.assertIsNone(review["permission_mode"])
+        self.assertEqual(
+            review["route_contract_sha256"],
+            router._canonical_sha256(
+                {
+                    key: value
+                    for key, value in review.items()
+                    if key != "route_contract_sha256"
+                }
+            ),
+        )
+
     def test_task_specific_defaults_keep_all_implementation_direct(self) -> None:
         for task_class, kwargs in (
             ("complex-patch", {}),

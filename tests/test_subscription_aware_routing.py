@@ -33,6 +33,19 @@ class SubscriptionAwareRoutingTests(unittest.TestCase):
                 self.assertFalse(pool["automatic_overage"])
                 self.assertEqual(pool["overage_action"], "block_and_surface")
 
+    def test_supergrok_pool_requires_exact_oidc_entitlement_claim(self) -> None:
+        contract = self.catalog["quota_pools"]["grok-com"]["entitlement_contract"]
+        self.assertEqual(
+            contract,
+            {
+                "kind": "grok_oidc_tier_claim_v1",
+                "issuer": "https://auth.x.ai",
+                "principal_type": "User",
+                "tier_code": 1,
+                "plan": "SuperGrok",
+            },
+        )
+
     def test_provider_specific_paid_surfaces_are_explicitly_excluded(self) -> None:
         expected = {
             "openai-agentic": {"openai-api", "purchased-codex-credits"},

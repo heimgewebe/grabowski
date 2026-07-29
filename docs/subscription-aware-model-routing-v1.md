@@ -62,7 +62,7 @@ Provider diversity is used only when it improves independence or technical cover
 
 - `claude-opus-5-high`: judgment-heavy, security, architecture, and critical review through the Claude Pro baseline.
 - `antigravity-gemini-pro-review-high`: independent Google-family review through the Google AI baseline.
-- `grok-4.5-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, plain structured output.
+- `grok-4.5-review-high`: independent xAI review through SuperGrok; one turn, no web search, no subagents, no memory, no tools, and schema-constrained structured output.
 
 All direct Claude Pro routes use the same `anthropic-claude-pro` independence group. Two Claude models therefore never satisfy a two-provider independence requirement.
 
@@ -73,6 +73,20 @@ Codex routes are contrast-only. Legacy Gemini Pro and Grok high routes remain co
 ### Paid-only routes
 
 Fable 5 remains disabled or explicit-paid-only. Its live probe required usage credits. It may run only after separate paid authorization and a positive hard budget. It is never selected from the Claude Pro baseline.
+
+## Entitlement probes
+
+The recurring metadata probe does not spend Grok model quota. It marks `grok-com` verified only when all of these checks agree:
+
+1. the catalog requires the exact `SuperGrok` OIDC entitlement contract;
+2. the owner-private `~/.grok/auth.json` record is opened descriptor-bound without following symlinks;
+3. its JWT claim is unexpired and its issuer, principal, team, account and numeric tier match the private record and catalog contract;
+4. a server-side `grok models` readback accepts the same account and exposes `grok-4.5`;
+5. the account-binding hash is unchanged before and after that server readback.
+
+The probe publishes only the canonical plan label, verification state and a non-secret binding hash. Tokens, email addresses and raw account identifiers are never copied into router state. Generic Grok login is insufficient to enable the SuperGrok pool.
+
+Review-only and contrast-only routes use separate capability gates but the same hash-bound advisory runner contract. The strict contrast API continues to reject review-only routes; the competition runner uses the broader advisory contract so selected review routes are executable without gaining writer authority.
 
 ## Quota exhaustion
 

@@ -737,6 +737,51 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertFalse(result["applied_to_live_route"])
 
+    def test_route_normalizes_explicit_and_discovered_grok_agents(self) -> None:
+        empty_selection = {
+            "status": "no-eligible-contrast-route",
+            "state_error_type": None,
+            "catalog_sha256": "a" * 64,
+            "routes": [],
+            "excluded": {},
+        }
+        with mock.patch.object(
+            competition.coding_router,
+            "select_contrast_routes",
+            return_value=empty_selection,
+        ) as select:
+            competition.grabowski_agent_execution_route(
+                "code",
+                12,
+                180,
+                "high",
+                risk_flags=["security"],
+                user_requested_external=True,
+                available_external_agents=["grok"],
+            )
+        self.assertEqual(select.call_args.kwargs["allowed_harnesses"], {"grok"})
+
+        def discovered(binary: str) -> str | None:
+            return "/usr/bin/grok" if binary == "grok" else None
+
+        with (
+            mock.patch.object(competition.shutil, "which", side_effect=discovered),
+            mock.patch.object(
+                competition.coding_router,
+                "select_contrast_routes",
+                return_value=empty_selection,
+            ) as select,
+        ):
+            competition.grabowski_agent_execution_route(
+                "code",
+                12,
+                180,
+                "high",
+                risk_flags=["security"],
+                user_requested_external=True,
+            )
+        self.assertEqual(select.call_args.kwargs["allowed_harnesses"], {"grok"})
+
     def test_route_rejects_coercive_bools_and_unknown_agents(self) -> None:
         with self.assertRaisesRegex(competition.AgentCompetitionError, "must be boolean"):
             competition.grabowski_agent_execution_route("code", 1, 1, "low", connector_instability="false")  # type: ignore[arg-type]
@@ -1245,7 +1290,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "contrast_route_execution_contract",
+                "advisory_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1280,7 +1325,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "contrast_route_execution_contract",
+                "advisory_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1319,7 +1364,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "contrast_route_execution_contract",
+                "advisory_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1360,7 +1405,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "contrast_route_execution_contract",
+                "advisory_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1399,7 +1444,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "contrast_route_execution_contract",
+                "advisory_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1451,7 +1496,7 @@ class AgentCompetitionTests(unittest.TestCase):
     def test_route_bound_fable_requires_paid_authorization_and_positive_policy_cap(self) -> None:
         with mock.patch.object(
             competition.coding_router,
-            "contrast_route_execution_contract",
+            "advisory_route_execution_contract",
             side_effect=competition.coding_router.CodingAgentRouterError(
                 "paid-only route requires explicit paid execution authorization"
             ),
@@ -1476,7 +1521,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "contrast_route_execution_contract",
+                "advisory_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.dict(

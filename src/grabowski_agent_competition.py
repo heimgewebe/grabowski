@@ -33,6 +33,14 @@ COMPETITION_ROOT = Path(
 ).expanduser()
 RUNNER = Path(__file__).resolve().parent.parent / "tools" / "external_programming_candidate.py"
 PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex", "grok"}
+ROUTABLE_EXTERNAL_PROVIDERS = (
+    "codex",
+    "claude",
+    "antigravity",
+    "opencode",
+    "openhands",
+    "grok",
+)
 LEGACY_PROVIDERS = {"agy"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
 MODES = {"competitor", "contrast"}
@@ -1930,7 +1938,7 @@ def grabowski_agent_execution_route(
     if available_external_agents is None:
         normalized_agents = [
             provider
-            for provider in ("codex", "claude", "antigravity", "opencode", "openhands")
+            for provider in ROUTABLE_EXTERNAL_PROVIDERS
             if (
                 (provider == "codex" and (shutil.which("codex") or shutil.which("codexr")))
                 or (provider == "antigravity" and shutil.which("agy"))
@@ -1956,7 +1964,7 @@ def grabowski_agent_execution_route(
             )
         normalized_agents = [
             provider
-            for provider in ("codex", "claude", "antigravity", "opencode", "openhands")
+            for provider in ROUTABLE_EXTERNAL_PROVIDERS
             if provider in requested_agents
         ]
     paid_authorized = _strict_bool(
@@ -2151,7 +2159,7 @@ def grabowski_agent_competition_start(
     route_contract: dict[str, Any] | None = None
     if route_value:
         try:
-            route_contract = coding_router.contrast_route_execution_contract(
+            route_contract = coding_router.advisory_route_execution_contract(
                 route_value, paid_execution_authorized=paid_authorized
             )
         except coding_router.CodingAgentRouterError as exc:

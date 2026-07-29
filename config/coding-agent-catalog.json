@@ -969,7 +969,14 @@
       ],
       "overage_action": "block_and_surface",
       "plan": "SuperGrok",
-      "plan_evidence": "grok-auth-subscription-tier-supergrok; grok-4.5-build-smoke-2026-07-29"
+      "plan_evidence": "grok-auth-subscription-tier-supergrok; grok-4.5-build-smoke-2026-07-29",
+      "entitlement_contract": {
+        "kind": "grok_oidc_tier_claim_v1",
+        "issuer": "https://auth.x.ai",
+        "principal_type": "User",
+        "tier_code": 1,
+        "plan": "SuperGrok"
+      }
     },
     "jules-account": {
       "conservative_daily_tasks": 15,
