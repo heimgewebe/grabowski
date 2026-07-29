@@ -172,6 +172,46 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertFalse(self.receipts.exists())
         self.assertEqual(self.audit_records, [])
 
+    def test_accepts_executable_under_trusted_sticky_writable_ancestor(self) -> None:
+        sticky = self.root / "sticky"
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        executable = sticky / "reposkop"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+
+        selected, digest = context._validate_executable(executable)
+
+        self.assertEqual(selected, executable)
+        self.assertEqual(digest, context._sha256_file(executable))
+
+    def test_rejects_executable_under_nonsticky_writable_ancestor(self) -> None:
+        unsafe = self.root / "unsafe"
+        unsafe.mkdir()
+        unsafe.chmod(0o777)
+        executable = unsafe / "reposkop"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+
+        with self.assertRaisesRegex(
+            context.ReposkopContextError, "executable ancestor failed"
+        ):
+            context._validate_executable(executable)
+
+    def test_rejects_executable_beneath_symlink_ancestor(self) -> None:
+        real = self.root / "real-bin"
+        real.mkdir()
+        linked = self.root / "linked-bin"
+        linked.symlink_to(real, target_is_directory=True)
+        executable = real / "reposkop"
+        executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        executable.chmod(0o700)
+
+        with self.assertRaisesRegex(
+            context.ReposkopContextError, "executable ancestor failed"
+        ):
+            context._validate_executable(linked / "reposkop")
+
     def test_records_one_receipt_and_replays_unchanged_semantic_state(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):

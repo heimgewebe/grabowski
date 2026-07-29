@@ -17,7 +17,7 @@ The tool invokes only the owner-held, regular, singly linked, executable and nei
 reposkop report <absolute-target> --purpose <purpose> --json
 ```
 
-The command has a 20-second wall-clock limit. stdout and stderr are drained concurrently through nonblocking pipes; the parent retains at most 512 KiB stdout and 64 KiB stderr. Crossing either byte limit kills the entire child process group and closes the local pipe readers. Reaching the deadline does the same even if the direct child has already exited while a descendant still holds an inherited pipe. The target checkout cannot replace the executable through `PATH`, Python import precedence or a same-named file. The executable identity is checked again after execution; drift invalidates the result.
+The command has a 20-second wall-clock limit. stdout and stderr are drained concurrently through nonblocking pipes; the parent retains at most 512 KiB stdout and 64 KiB stderr. Crossing either byte limit kills the entire child process group and closes the local pipe readers. Reaching the deadline does the same even if the direct child has already exited while a descendant still holds an inherited pipe. The target checkout cannot replace the executable through `PATH`, Python import precedence or a same-named file. Every executable ancestor must be a real directory owned by root or the service UID; non-sticky group/world-writable ancestors and ancestor symlinks fail closed. Root-owned sticky directories such as `/tmp` remain valid. The executable identity is checked again after execution; drift invalidates the result.
 
 ## Validation boundary
 

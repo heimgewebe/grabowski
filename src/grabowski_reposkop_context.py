@@ -76,11 +76,45 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_executable_directory(path: Path, *, trusted_uids: set[int]) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise ReposkopContextError(
+            f"Reposkop executable ancestor is missing: {path}"
+        ) from exc
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid not in trusted_uids
+        or (mode & 0o022 and not mode & stat.S_ISVTX)
+    ):
+        raise ReposkopContextError(
+            "Reposkop executable ancestor failed directory, ownership, symlink or writable-mode checks: "
+            f"{path}"
+        )
+
+
+def _validate_executable_ancestors(path: Path) -> None:
+    if ".." in path.parts:
+        raise ReposkopContextError(
+            "Reposkop executable path may not contain parent traversal"
+        )
+    trusted_uids = {0, os.getuid()}
+    current = Path(path.anchor)
+    _validate_executable_directory(current, trusted_uids=trusted_uids)
+    for component in path.parts[1:-1]:
+        current /= component
+        _validate_executable_directory(current, trusted_uids=trusted_uids)
+
+
 def _validate_executable(path: Path) -> tuple[Path, str]:
     if not path.is_absolute() or path.is_symlink():
         raise ReposkopContextError(
             "Reposkop executable must be an absolute non-symlink path"
         )
+    _validate_executable_ancestors(path)
     try:
         metadata = path.stat()
     except FileNotFoundError as exc:
