@@ -17,7 +17,7 @@ The tool invokes only the owner-held, regular, singly linked and executable `${H
 reposkop report <absolute-target> --purpose <purpose> --json
 ```
 
-The command has fixed runtime and output limits. The target checkout cannot replace the executable through `PATH`, Python import precedence or a same-named file. The executable identity is checked again after execution; drift invalidates the result.
+The command has a 20-second limit. stdout and stderr are drained concurrently through nonblocking pipes; the parent retains at most 512 KiB stdout and 64 KiB stderr. Crossing either limit kills the entire child process group before more output can accumulate in the MCP process. The target checkout cannot replace the executable through `PATH`, Python import precedence or a same-named file. The executable identity is checked again after execution; drift invalidates the result.
 
 ## Validation boundary
 
@@ -46,13 +46,13 @@ The receipt bytes are fully deterministic. Generated timestamps and the encompas
 
 Receipt, pending-file and lock paths are authorized before state creation. The receipt directory is owner-held mode `0700`; lock, pending and final files use mode `0600` and reject symlinks, foreign ownership, unexpected link counts, size drift, inode drift and any byte mismatch.
 
-Publication is serialized by a per-key advisory file lock. The verified Grabowski audit binding is appended **before** any receipt bytes are published and binds the exact expected receipt SHA-256 and byte count. The receipt is then written to a deterministic pending file, fsynced, linked create-only to its final name and reduced to one final link. A crash after the audit append but before final publication is recoverable from the same exact audit binding. A crash after linking but before pending-file removal is recovered only when both paths resolve to the same exactly bound inode.
+Publication is serialized by a per-key advisory file lock. A normal first publication appends the audit contract `audit-before-create-exact-bytes-v1` **before** any receipt bytes are published and binds the exact expected receipt SHA-256 and byte count. The receipt is then written to a deterministic pending file, fsynced, linked create-only to its final name and reduced to one final link. A crash after the audit append but before final publication is recoverable from the same exact audit binding. A crash after linking but before pending-file removal is recovered only when both paths resolve to the same exactly bound inode.
 
-Every replay first validates the deterministic receipt bytes and then searches the verified audit chain for the exact byte and identity binding. If that exact binding is absent or older than the bounded search window, the fresh current Reposkop observation appends a new exact audit binding before the receipt is returned. A byte mismatch still fails closed. Concurrent identical calls wait on the same lock, yielding one publication and ordinary replay results rather than exposing a partial file.
+Every replay first validates the deterministic receipt bytes and then searches the verified audit chain for the exact byte and identity binding. If an exact receipt already exists but its binding is absent or older than the bounded search window, the fresh current Reposkop observation appends the distinct durable contract `audit-recovered-existing-exact-bytes-v1`. That record explicitly states `receipt_observed_before_audit: true`; it never claims audit-before-create ordering. The tool exposes the accepted contract as `usage_receipt.audit_contract`. A byte mismatch still fails closed. Concurrent identical calls wait on the same lock, yielding one publication and ordinary replay results rather than exposing a partial file.
 
 ## Why this is a separate tool
 
-A generic terminal call can launch Reposkop, but cannot enforce the fixed executable, target binding, authority-boundary validation, audit-before-create contract or semantic receipt deduplication. Combining generic terminal and file-write surfaces would grant broader caller-controlled command and path authority while producing weaker evidence.
+A generic terminal call can launch Reposkop, but cannot enforce the fixed executable, streaming output limits, target binding, authority-boundary validation, truthful publication/recovery audit contracts or semantic receipt deduplication. Combining generic terminal and file-write surfaces would grant broader caller-controlled command and path authority while producing weaker evidence.
 
 The dedicated tool has one narrow call shape: target in, validated coherence report and immutable, audit-bound usage evidence out.
 

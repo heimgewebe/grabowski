@@ -8,7 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import stat
+import subprocess
+import time
 from typing import Any, Iterator
 
 import grabowski_audit_query as audit_query
@@ -37,10 +41,14 @@ PURPOSE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 MAX_EXECUTABLE_BYTES = 4 * 1024 * 1024
 MAX_REPORT_BYTES = 512 * 1024
+MAX_STDERR_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 64 * 1024
 MAX_AUDIT_SCAN_RECORDS = 100_000
 RECEIPT_KIND = "grabowski.reposkop_context_usage_receipt"
 AUDIT_OPERATION = "reposkop-context-usage-publication"
+AUDIT_PUBLICATION_CONTRACT = "audit-before-create-exact-bytes-v1"
+AUDIT_RECOVERY_CONTRACT = "audit-recovered-existing-exact-bytes-v1"
+AUDIT_CONTRACTS = frozenset({AUDIT_PUBLICATION_CONTRACT, AUDIT_RECOVERY_CONTRACT})
 TOOL_KIND = "grabowski_reposkop_context"
 SCHEMA_VERSION = 1
 
@@ -171,31 +179,153 @@ def _validate_report(report: Any, *, target: Path, purpose: str) -> dict[str, An
     return report
 
 
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def _run_bounded_process(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout_seconds: int,
+    stdout_limit: int,
+    stderr_limit: int,
+) -> dict[str, Any]:
+    if timeout_seconds <= 0 or stdout_limit <= 0 or stderr_limit <= 0:
+        raise ValueError("Reposkop process limits must be positive")
+    started = time.monotonic()
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=operator._safe_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:
+        _kill_process_group(process)
+        process.wait()
+        raise ReposkopContextError("Reposkop bounded output pipes are unavailable")
+    selector = selectors.DefaultSelector()
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    limits = {"stdout": stdout_limit, "stderr": stderr_limit}
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    counts = {"stdout": 0, "stderr": 0}
+    exceeded = {"stdout": False, "stderr": False}
+    for name, stream in streams.items():
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, name)
+    deadline = started + timeout_seconds
+    timed_out = False
+    killed = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 and process.poll() is None and not killed:
+                timed_out = True
+                _kill_process_group(process)
+                killed = True
+            events = selector.select(timeout=max(0.0, min(0.25, remaining)))
+            for key, _mask in events:
+                stream = key.fileobj
+                name = key.data
+                try:
+                    chunk = os.read(stream.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                counts[name] += len(chunk)
+                capacity = max(0, limits[name] - len(buffers[name]))
+                if capacity:
+                    buffers[name].extend(chunk[:capacity])
+                if counts[name] > limits[name]:
+                    exceeded[name] = True
+                    if not killed:
+                        _kill_process_group(process)
+                        killed = True
+            if process.poll() is not None and not events:
+                for registered in list(selector.get_map().values()):
+                    stream = registered.fileobj
+                    try:
+                        chunk = os.read(stream.fileno(), 64 * 1024)
+                    except BlockingIOError:
+                        continue
+                    if chunk:
+                        name = registered.data
+                        counts[name] += len(chunk)
+                        capacity = max(0, limits[name] - len(buffers[name]))
+                        if capacity:
+                            buffers[name].extend(chunk[:capacity])
+                        if counts[name] > limits[name]:
+                            exceeded[name] = True
+                        continue
+                    selector.unregister(stream)
+                    stream.close()
+        try:
+            returncode = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(process)
+            returncode = process.wait(timeout=5)
+    finally:
+        selector.close()
+        if process.poll() is None:
+            _kill_process_group(process)
+            process.wait()
+        for stream in streams.values():
+            if not stream.closed:
+                stream.close()
+    return {
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "stdout": bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
+        "stderr": bytes(buffers["stderr"]).decode("utf-8", errors="replace"),
+        "stdout_bytes": counts["stdout"],
+        "stderr_bytes": counts["stderr"],
+        "stdout_limit_exceeded": exceeded["stdout"],
+        "stderr_limit_exceeded": exceeded["stderr"],
+    }
+
+
 def _run_reposkop(
     target: Path, purpose: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     executable, executable_sha256 = _validate_executable(REPOSKOP_BIN)
-    result = operator._run(
+    result = _run_bounded_process(
         [str(executable), "report", str(target), "--purpose", purpose, "--json"],
         cwd=HOME,
         timeout_seconds=20,
-        max_output_bytes=MAX_REPORT_BYTES,
+        stdout_limit=MAX_REPORT_BYTES,
+        stderr_limit=MAX_STDERR_BYTES,
     )
-    if result.get("returncode") != 0:
+    if result["timed_out"]:
+        raise ReposkopContextError("Reposkop report timed out")
+    if result["stdout_limit_exceeded"]:
         raise ReposkopContextError(
-            f"Reposkop report failed with returncode {result.get('returncode')}: "
-            f"{str(result.get('stderr', ''))[:1000]}"
+            "Reposkop report exceeded the streaming stdout byte limit"
+        )
+    if result["stderr_limit_exceeded"]:
+        raise ReposkopContextError(
+            "Reposkop report exceeded the streaming stderr byte limit"
+        )
+    if result["returncode"] != 0:
+        raise ReposkopContextError(
+            f"Reposkop report failed with returncode {result['returncode']}: "
+            f"{str(result['stderr'])[:1000]}"
         )
     post_executable, post_executable_sha256 = _validate_executable(REPOSKOP_BIN)
     if post_executable != executable or post_executable_sha256 != executable_sha256:
         raise ReposkopContextError(
             "Reposkop executable identity changed during report execution"
         )
-    stdout = result.get("stdout")
-    if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > MAX_REPORT_BYTES:
-        raise ReposkopContextError(
-            "Reposkop report output is missing or exceeds the byte limit"
-        )
+    stdout = result["stdout"]
     try:
         report = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -382,10 +512,15 @@ def _receipt_lock(lock_path: Path) -> Iterator[None]:
 
 
 def _audit_record(
-    binding: dict[str, Any], *, recorded_at: str
+    binding: dict[str, Any],
+    *,
+    recorded_at: str,
+    publication_contract: str,
 ) -> dict[str, Any]:
+    if publication_contract not in AUDIT_CONTRACTS:
+        raise ReposkopContextError("Reposkop audit publication contract is invalid")
     identity = binding["identity"]
-    return {
+    record: dict[str, Any] = {
         "timestamp": recorded_at,
         "operation": AUDIT_OPERATION,
         "path": str(binding["receipt_path"]),
@@ -398,8 +533,27 @@ def _audit_record(
         "observation_sha256": identity["observation_sha256"],
         "projection_sha256": identity["projection_sha256"],
         "effect_authorized": False,
-        "publication_contract": "audit-before-create-exact-bytes-v1",
+        "publication_contract": publication_contract,
     }
+    if publication_contract == AUDIT_RECOVERY_CONTRACT:
+        record["recovery"] = {
+            "kind": "existing-exact-receipt-audit-rebinding",
+            "receipt_observed_before_audit": True,
+        }
+    return record
+
+
+def _audit_contract_matches(record: dict[str, Any]) -> bool:
+    publication_contract = record.get("publication_contract")
+    recovery = record.get("recovery")
+    if publication_contract == AUDIT_PUBLICATION_CONTRACT:
+        return recovery is None
+    if publication_contract == AUDIT_RECOVERY_CONTRACT:
+        return recovery == {
+            "kind": "existing-exact-receipt-audit-rebinding",
+            "receipt_observed_before_audit": True,
+        }
+    return False
 
 
 def _audit_record_matches(record: dict[str, Any], binding: dict[str, Any]) -> bool:
@@ -417,8 +571,7 @@ def _audit_record_matches(record: dict[str, Any], binding: dict[str, Any]) -> bo
         and record.get("observation_sha256") == identity["observation_sha256"]
         and record.get("projection_sha256") == identity["projection_sha256"]
         and record.get("effect_authorized") is False
-        and record.get("publication_contract")
-        == "audit-before-create-exact-bytes-v1"
+        and _audit_contract_matches(record)
     )
 
 
@@ -449,23 +602,36 @@ def _find_audit_binding(binding: dict[str, Any]) -> dict[str, str] | None:
                 raise ReposkopContextError(
                     "Reposkop audit binding is missing its timestamp"
                 )
+            publication_contract = record.get("publication_contract")
+            if not isinstance(publication_contract, str):
+                raise ReposkopContextError(
+                    "Reposkop audit binding is missing its publication contract"
+                )
             return {
                 "audit_ref": f"audit-record-sha256:{digest}",
                 "recorded_at": recorded_at,
+                "publication_contract": publication_contract,
             }
     return None
 
 
-def _append_audit_binding(binding: dict[str, Any]) -> dict[str, str]:
+def _append_audit_binding(
+    binding: dict[str, Any], *, publication_contract: str
+) -> dict[str, str]:
     recorded_at = datetime.now(timezone.utc).isoformat()
     digest = base._append_audit_with_digest(
-        _audit_record(binding, recorded_at=recorded_at)
+        _audit_record(
+            binding,
+            recorded_at=recorded_at,
+            publication_contract=publication_contract,
+        )
     )
     if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
         raise ReposkopContextError("Reposkop audit binding digest is invalid")
     return {
         "audit_ref": f"audit-record-sha256:{digest}",
         "recorded_at": recorded_at,
+        "publication_contract": publication_contract,
     }
 
 
@@ -593,7 +759,14 @@ def _record_usage(binding: dict[str, Any]) -> dict[str, Any]:
         audit_preexisted = audit_binding is not None
         recovered_audit_binding = bool(existing and audit_binding is None)
         if audit_binding is None:
-            audit_binding = _append_audit_binding(binding)
+            audit_binding = _append_audit_binding(
+                binding,
+                publication_contract=(
+                    AUDIT_RECOVERY_CONTRACT
+                    if existing
+                    else AUDIT_PUBLICATION_CONTRACT
+                ),
+            )
         _publish_receipt(binding)
         _read_exact_regular(
             binding["receipt_path"],
@@ -613,6 +786,7 @@ def _record_usage(binding: dict[str, Any]) -> dict[str, Any]:
             "replayed": existing,
             "recovered_publication": bool(audit_preexisted and not existing),
             "recovered_audit_binding": recovered_audit_binding,
+            "audit_contract": verified_audit["publication_contract"],
             "audit_ref": verified_audit["audit_ref"],
         }
 

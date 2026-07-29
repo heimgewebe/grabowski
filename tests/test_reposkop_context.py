@@ -76,15 +76,25 @@ class ReposkopContextTests(unittest.TestCase):
         *,
         audit_error: BaseException | None = None,
     ):
-        def fake_run(argv, *, cwd, timeout_seconds, max_output_bytes):
+        def fake_run(
+            argv, *, cwd, timeout_seconds, stdout_limit, stderr_limit
+        ):
             with self.audit_lock:
                 self.run_calls.append((list(argv), Path(cwd)))
             self.assertEqual(timeout_seconds, 20)
-            self.assertEqual(max_output_bytes, context.MAX_REPORT_BYTES)
+            self.assertEqual(stdout_limit, context.MAX_REPORT_BYTES)
+            self.assertEqual(stderr_limit, context.MAX_STDERR_BYTES)
+            stdout = json.dumps(report)
             return {
                 "returncode": 0,
-                "stdout": json.dumps(report),
+                "timed_out": False,
+                "duration_seconds": 0.001,
+                "stdout": stdout,
                 "stderr": "",
+                "stdout_bytes": len(stdout.encode("utf-8")),
+                "stderr_bytes": 0,
+                "stdout_limit_exceeded": False,
+                "stderr_limit_exceeded": False,
             }
 
         def fake_find(binding):
@@ -92,10 +102,11 @@ class ReposkopContextTests(unittest.TestCase):
                 stored = self.audit_bindings.get(binding["usage_key_sha256"])
                 return dict(stored) if stored is not None else None
 
-        def fake_append(binding):
+        def fake_append(binding, *, publication_contract):
             record = context._audit_record(
                 binding,
                 recorded_at="2026-07-29T10:00:00+00:00",
+                publication_contract=publication_contract,
             )
             with self.audit_lock:
                 self.audit_records.append(record)
@@ -104,6 +115,7 @@ class ReposkopContextTests(unittest.TestCase):
                 result = {
                     "audit_ref": "audit-record-sha256:" + "d" * 64,
                     "recorded_at": record["timestamp"],
+                    "publication_contract": publication_contract,
                 }
                 self.audit_bindings[binding["usage_key_sha256"]] = result
                 return dict(result)
@@ -111,7 +123,7 @@ class ReposkopContextTests(unittest.TestCase):
         return (
             patch.object(context, "REPOSKOP_BIN", self.executable),
             patch.object(context, "RECEIPT_ROOT", self.receipts),
-            patch.object(context.operator, "_run", side_effect=fake_run),
+            patch.object(context, "_run_bounded_process", side_effect=fake_run),
             patch.object(context.base, "_require_capability"),
             patch.object(
                 context.base,
@@ -142,10 +154,18 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertFalse(first["usage_receipt"]["recovered_publication"])
         self.assertFalse(first["usage_receipt"]["recovered_audit_binding"])
         self.assertEqual(
+            first["usage_receipt"]["audit_contract"],
+            context.AUDIT_PUBLICATION_CONTRACT,
+        )
+        self.assertEqual(
             first["usage_receipt"]["audit_ref"],
             "audit-record-sha256:" + "d" * 64,
         )
         self.assertTrue(second["usage_receipt"]["replayed"])
+        self.assertEqual(
+            second["usage_receipt"]["audit_contract"],
+            context.AUDIT_PUBLICATION_CONTRACT,
+        )
         self.assertEqual(
             second["usage_receipt"]["audit_ref"],
             first["usage_receipt"]["audit_ref"],
@@ -223,8 +243,26 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertTrue(Path(first["usage_receipt"]["path"]).is_file())
         self.assertTrue(recovered["usage_receipt"]["replayed"])
         self.assertTrue(recovered["usage_receipt"]["recovered_audit_binding"])
-        self.assertEqual(recovered["usage_receipt"]["sha256"], first["usage_receipt"]["sha256"])
+        self.assertEqual(
+            recovered["usage_receipt"]["audit_contract"],
+            context.AUDIT_RECOVERY_CONTRACT,
+        )
+        self.assertEqual(
+            recovered["usage_receipt"]["sha256"],
+            first["usage_receipt"]["sha256"],
+        )
         self.assertEqual(len(self.audit_records), 2)
+        self.assertEqual(
+            self.audit_records[1]["publication_contract"],
+            context.AUDIT_RECOVERY_CONTRACT,
+        )
+        self.assertEqual(
+            self.audit_records[1]["recovery"],
+            {
+                "kind": "existing-exact-receipt-audit-rebinding",
+                "receipt_observed_before_audit": True,
+            },
+        )
 
     def test_concurrent_identical_calls_serialize_to_one_receipt(self) -> None:
         patches = self.patches(self.report())
@@ -265,6 +303,7 @@ class ReposkopContextTests(unittest.TestCase):
             self.audit_bindings[binding["usage_key_sha256"]] = {
                 "audit_ref": "audit-record-sha256:" + "d" * 64,
                 "recorded_at": "2026-07-29T10:00:00+00:00",
+                "publication_contract": context.AUDIT_PUBLICATION_CONTRACT,
             }
             context._create_pending(binding)
             os.link(binding["pending_path"], binding["receipt_path"])
@@ -274,6 +313,53 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertTrue(result["usage_receipt"]["replayed"])
         self.assertFalse(binding["pending_path"].exists())
         self.assertEqual(binding["receipt_path"].stat().st_nlink, 1)
+
+    def test_bounded_process_kills_oversized_stdout_while_draining(self) -> None:
+        executable = self.root / "oversized-reposkop"
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "import os\n"
+            "os.write(1, b'x' * (1024 * 1024))\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+
+        result = context._run_bounded_process(
+            [str(executable)],
+            cwd=self.root,
+            timeout_seconds=5,
+            stdout_limit=4096,
+            stderr_limit=4096,
+        )
+
+        self.assertTrue(result["stdout_limit_exceeded"])
+        self.assertFalse(result["timed_out"])
+        self.assertGreater(result["stdout_bytes"], 4096)
+        self.assertLessEqual(len(result["stdout"].encode("utf-8")), 4096)
+        self.assertNotEqual(result["returncode"], 0)
+
+    def test_run_reposkop_rejects_streaming_limit_exceeded(self) -> None:
+        result = {
+            "returncode": -9,
+            "timed_out": False,
+            "duration_seconds": 0.001,
+            "stdout": "x" * 16,
+            "stderr": "",
+            "stdout_bytes": context.MAX_REPORT_BYTES + 1,
+            "stderr_bytes": 0,
+            "stdout_limit_exceeded": True,
+            "stderr_limit_exceeded": False,
+        }
+        with (
+            patch.object(context, "REPOSKOP_BIN", self.executable),
+            patch.object(context, "_run_bounded_process", return_value=result),
+        ):
+            with self.assertRaisesRegex(
+                context.ReposkopContextError, "streaming stdout byte limit"
+            ):
+                context._run_reposkop(
+                    self.repo.resolve(), "grabowski-repo-state-context"
+                )
 
     def test_rejects_any_effect_authorization_from_reposkop(self) -> None:
         patches = self.patches(self.report(effect_authorized=True))
@@ -346,6 +432,7 @@ class ReposkopContextTests(unittest.TestCase):
         record = context._audit_record(
             binding,
             recorded_at="2026-07-29T10:00:00+00:00",
+            publication_contract=context.AUDIT_PUBLICATION_CONTRACT,
         )
         record["record_sha256"] = "f" * 64
         raw = context._canonical_json(record)
@@ -370,7 +457,34 @@ class ReposkopContextTests(unittest.TestCase):
 
         self.assertEqual(match["audit_ref"], "audit-record-sha256:" + "f" * 64)
         self.assertEqual(match["recorded_at"], "2026-07-29T10:00:00+00:00")
+        self.assertEqual(
+            match["publication_contract"], context.AUDIT_PUBLICATION_CONTRACT
+        )
         self.assertIsNone(mismatch)
+
+    def test_recovery_audit_requires_truthful_durable_marker(self) -> None:
+        report = self.report()
+        binding = context._usage_binding(
+            report,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+            executable={"path": str(self.executable), "sha256": "e" * 64},
+        )
+        recovery = context._audit_record(
+            binding,
+            recorded_at="2026-07-29T10:00:00+00:00",
+            publication_contract=context.AUDIT_RECOVERY_CONTRACT,
+        )
+        self.assertTrue(context._audit_record_matches(recovery, binding))
+        self.assertEqual(
+            recovery["recovery"],
+            {
+                "kind": "existing-exact-receipt-audit-rebinding",
+                "receipt_observed_before_audit": True,
+            },
+        )
+        recovery.pop("recovery")
+        self.assertFalse(context._audit_record_matches(recovery, binding))
 
 
 if __name__ == "__main__":
