@@ -628,6 +628,35 @@ class AgentWorkspaceTests(unittest.TestCase):
         mutation.assert_not_called()
         self.assertFalse((self.root / "legacy-v21").exists())
 
+    def test_current_route_evidence_accepts_grok_as_an_advisory_external_agent(self) -> None:
+        evidence = complete_route_evidence()
+        evidence["input_facts"]["available_external_agents"] = ["grok"]
+        decision = workspace._route_decision(evidence["input_facts"])
+        recommendation = {
+            "schema_version": 2,
+            "route_policy_version": decision["route_policy_version"],
+            "risk_tier": decision["risk_tier"],
+            "score": decision["score"],
+            "execution_mode": decision["execution_mode"],
+            "input_facts": evidence["input_facts"],
+            "external_candidates": decision["external_candidates"],
+            "parallel_writer_pilot": decision["parallel_writer_pilot"],
+        }
+        evidence.update(
+            {
+                "route_policy_version": decision["route_policy_version"],
+                "risk_tier": decision["risk_tier"],
+                "parallel_writer_pilot": decision["parallel_writer_pilot"],
+                "recommendation_id": workspace._sha256_json(recommendation),
+                "score": decision["score"],
+                "recommended_route": decision["execution_mode"],
+                "external_candidates": decision["external_candidates"],
+            }
+        )
+        normalized = workspace._normalize_route_evidence(evidence)
+        self.assertEqual(normalized["status"], "verified")
+        self.assertEqual(normalized["input_facts"]["available_external_agents"], ["grok"])
+
     def test_route_evidence_is_hash_bound_and_missing_evidence_fails_closed(self) -> None:
         normalized = workspace._normalize_route_evidence(complete_route_evidence())
         self.assertTrue(normalized["evidence_complete"])

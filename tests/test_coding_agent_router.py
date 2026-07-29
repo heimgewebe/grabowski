@@ -88,7 +88,7 @@ class CodingAgentRouterTests(unittest.TestCase):
                         },
                         "models": [
                             "claude-fable-5",
-                            "claude-opus-4.8",
+                            "claude-opus-5",
                             "claude-sonnet-5",
                         ],
                     },
@@ -583,7 +583,8 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertNotIn("claude-sonnet-current", self.catalog["models"])
         model = self.catalog["models"]["claude-sonnet-5"]
         self.assertEqual(model["resolved_alias"], "sonnet")
-        self.assertIn("no model invocation", model["evidence"])
+        self.assertIn("smoke-2026-07-29", model["evidence"])
+        self.assertEqual(model["availability"], "live-verified-via-claude-pro")
         routes = {route["id"]: route for route in self.catalog["routes"]}
         self.assertEqual(routes["claude-sonnet-5-high"]["argv_prefix"][2], "sonnet")
 
@@ -736,6 +737,32 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertTrue(fable["paid_only"])
         self.assertEqual(fable["model"], "claude-fable-5")
 
+    def test_review_execution_contract_accepts_review_only_grok_route(self) -> None:
+        with self.assertRaisesRegex(
+            router.CodingAgentRouterError, "enabled contrast route"
+        ):
+            router.contrast_route_execution_contract("grok-4.5-review-high")
+        review = router.review_route_execution_contract("grok-4.5-review-high")
+        advisory = router.advisory_route_execution_contract(
+            "grok-4.5-review-high"
+        )
+        self.assertEqual(review, advisory)
+        self.assertEqual(review["harness"], "grok")
+        self.assertEqual(review["model"], "grok-4.5")
+        self.assertEqual(review["quota_pools"], ["grok-com"])
+        self.assertFalse(review["paid_only"])
+        self.assertIsNone(review["permission_mode"])
+        self.assertEqual(
+            review["route_contract_sha256"],
+            router._canonical_sha256(
+                {
+                    key: value
+                    for key, value in review.items()
+                    if key != "route_contract_sha256"
+                }
+            ),
+        )
+
     def test_task_specific_defaults_keep_all_implementation_direct(self) -> None:
         for task_class, kwargs in (
             ("complex-patch", {}),
@@ -773,7 +800,7 @@ class CodingAgentRouterTests(unittest.TestCase):
             for model in router.grabowski_coding_agent_catalog(include_disabled=True)["models"]
             for route in model["routes"]
         }
-        opus = public["claude-opus-4.8-high"]
+        opus = public["claude-opus-5-high"]
         self.assertEqual(opus["permission_mode"], "plan")
         self.assertTrue(opus["review_only"])
         self.assertTrue(opus["review_capable"])
@@ -783,7 +810,7 @@ class CodingAgentRouterTests(unittest.TestCase):
     def test_learning_applies_to_review_routes_not_authoritative_writing(
         self,
     ) -> None:
-        route_id = "claude-opus-4.8-high"
+        route_id = "claude-opus-5-high"
         self.state["routes"] = {
             route_id: {
                 "by_task_class": {
@@ -840,12 +867,29 @@ class CodingAgentRouterTests(unittest.TestCase):
             "reset_at": "2099-01-01T00:00:00Z",
         }
         self._write_state()
-        review = self._route("independent-review")
-        self.assertEqual(review["decision"], "controller")
-        self.assertEqual(review["primary_role"], "direct-reviewer")
-        self.assertEqual(review["reviewers"], [])
-        self.assertEqual(review["review_status"], "no-independent-review-route")
-        self.assertEqual(review["review_gap"], 1)
+        fallback_review = self._route("independent-review")
+        self.assertEqual(fallback_review["decision"], "controller")
+        self.assertEqual(fallback_review["primary_role"], "direct-reviewer")
+        self.assertTrue(fallback_review["reviewers"])
+        self.assertNotEqual(
+            fallback_review["reviewers"][0]["provider_family"], "anthropic"
+        )
+        self.assertEqual(fallback_review["review_gap"], 0)
+
+        for pool_id in ("grok-com", "antigravity-account"):
+            self.state["pools"][pool_id] = {
+                "status": "exhausted",
+                "reset_at": "2099-01-01T00:00:00Z",
+            }
+        self._write_state()
+        exhausted_review = self._route("independent-review")
+        self.assertEqual(exhausted_review["decision"], "controller")
+        self.assertEqual(exhausted_review["primary_role"], "direct-reviewer")
+        self.assertEqual(exhausted_review["reviewers"], [])
+        self.assertEqual(
+            exhausted_review["review_status"], "no-independent-review-route"
+        )
+        self.assertEqual(exhausted_review["review_gap"], 1)
 
         cline = router._pool_gate("cline-account", self.catalog, self.state, critical=False)
         openrouter = router._pool_gate("openrouter-paid", self.catalog, self.state, critical=True)
@@ -947,9 +991,9 @@ class CodingAgentRouterTests(unittest.TestCase):
             .replace("+00:00", "Z")
         )
         state = self._fresh_state()
-        state["pools"]["grok-com"] = {"verified_at": future}
+        state["pools"]["opencode-free"] = {"verified_at": future}
         allowed, reasons, _, execution = router._pool_gate(
-            "grok-com", self.catalog, state, critical=False
+            "opencode-free", self.catalog, state, critical=False
         )
         self.assertFalse(allowed)
         self.assertFalse(execution)
