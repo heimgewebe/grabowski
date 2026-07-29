@@ -2182,6 +2182,98 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(successor["explicit_policy_override"])
         self.assertEqual(source["task_id"], successor["retry_of_task_id"])
 
+    def test_terminal_retry_replays_managed_cargo_binding_once(self) -> None:
+        cache_key = "a" * 64
+        target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        bound = [
+            tasks.FLOCK_EXECUTABLE,
+            "--shared",
+            str(lock),
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target}",
+            "/usr/bin/cargo",
+            "test",
+        ]
+        record = {
+            "argv_json": json.dumps(bound),
+            "host": "local",
+            "execution_backend": "systemd-user",
+        }
+        with patch.object(
+            tasks,
+            "_managed_cargo_lifecycle_lock",
+            return_value=lock,
+        ):
+            replay = tasks._terminal_retry_command(record)
+        self.assertEqual(bound[3:], replay)
+
+        record["argv_json"] = json.dumps(
+            [bound[0], bound[1], "/tmp/wrong.lock", *bound[3:]]
+        )
+        with patch.object(
+            tasks,
+            "_managed_cargo_lifecycle_lock",
+            return_value=lock,
+        ), self.assertRaisesRegex(RuntimeError, "lock binding is invalid"):
+            tasks._terminal_retry_command(record)
+
+    def test_exact_reconcile_resume_allows_named_retry_safe_budget_override(self) -> None:
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "retry-safe-exhausted"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+            )["task"]
+        task_id = str(started["task_id"])
+        with tasks._database() as connection:
+            unit = f"grabowski-task-{task_id}-a2.service"
+            connection.execute(
+                "UPDATE tasks SET attempt=2, unit=?, authoritative_unit=? "
+                "WHERE task_id=?",
+                (unit, unit, task_id),
+            )
+        source = tasks._set_state(
+            task_id,
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        successor = {
+            "task_id": "f" * 24,
+            "state": "running",
+            "explicit_policy_override": True,
+        }
+        with patch.object(
+            tasks,
+            "_terminal_retry_successor",
+            return_value=successor,
+        ) as retry:
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                max_resumes=1,
+                reason="repository dependency changed after retry budget exhaustion",
+            )
+
+        self.assertEqual([], result["blocked"])
+        self.assertEqual([successor], result["resumed"])
+        retry.assert_called_once_with(
+            tasks._row_raw(task_id),
+            reason="repository dependency changed after retry budget exhaustion",
+            explicit_policy_override=True,
+        )
+        self.assertEqual("retry-safe", source["resume_policy"])
+
     def test_exact_reconcile_resume_keeps_never_policy_non_overridable(self) -> None:
         with (
             patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),

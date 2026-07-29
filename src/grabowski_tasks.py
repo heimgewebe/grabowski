@@ -4613,6 +4613,33 @@ def _terminal_convergence_classification(
     )
 
 
+def _terminal_retry_command(record: dict[str, Any]) -> list[str]:
+    command = json.loads(record["argv_json"])
+    if (
+        not isinstance(command, list)
+        or any(not isinstance(item, str) for item in command)
+        or not command
+    ):
+        raise RuntimeError("stored task argv is invalid for retry")
+    if (
+        str(record["host"]) != "local"
+        or _execution_backend(record) != "systemd-user"
+        or len(command) < 6
+        or command[0] != FLOCK_EXECUTABLE
+        or command[1] != "--shared"
+        or command[3] != SYSTEMD_ENV_EXECUTABLE
+    ):
+        return command
+    replay = command[3:]
+    managed_target = _explicit_managed_cargo_target_dir(replay)
+    if managed_target is None:
+        return command
+    expected_lock = _managed_cargo_lifecycle_lock(managed_target)
+    if command[2] != str(expected_lock):
+        raise RuntimeError("stored managed Cargo retry lock binding is invalid")
+    return replay
+
+
 def _terminal_retry_successor(
     record: dict[str, Any],
     *,
@@ -4627,7 +4654,7 @@ def _terminal_retry_successor(
     retry_context = _build_terminal_retry_context(record, reason=reason)
     started = grabowski_task_start(
         str(record["host"]),
-        json.loads(record["argv_json"]),
+        _terminal_retry_command(record),
         cwd=str(record["cwd"]),
         runtime_seconds=int(record["runtime_seconds"]),
         resume_policy="manual",
@@ -4920,11 +4947,20 @@ def reconcile_tasks_resume(
             continue
         blocker = _reconcile_blocker(stored, observation)
         explicit_policy_override = bool(task_id) and bool(blocker) and (
-            str(stored["resume_policy"]) in {"manual", "verify-then-retry"}
-            and blocker.get("reason_class") == "non_retryable_failure"
-            and blocker.get("reason")
-            == "task resume policy does not permit automatic retry"
-            and _is_terminal_state(str(stored["state"]))
+            _is_terminal_state(str(stored["state"]))
+            and (
+                (
+                    str(stored["resume_policy"])
+                    in {"manual", "verify-then-retry"}
+                    and blocker.get("reason_class") == "non_retryable_failure"
+                    and blocker.get("reason")
+                    == "task resume policy does not permit automatic retry"
+                )
+                or (
+                    str(stored["resume_policy"]) == "retry-safe"
+                    and blocker.get("reason_class") == "retry_exhausted"
+                )
+            )
         )
         if blocker is not None and not explicit_policy_override:
             blocked.append(blocker)
