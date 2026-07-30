@@ -151,7 +151,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_connector_transport_diagnostics` | operations-observability | yes | low | Run bounded read-only diagnostics for connector transport failures. |
 | `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
-| `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one Bureau candidate read-only against current Registry and Live Register truth. |
+| `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
 | `grabowski_bureau_task_review` | bureau | no | medium | Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation. |
 | `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |

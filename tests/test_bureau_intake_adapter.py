@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -417,21 +419,147 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertFalse(result["effect_started"])
         self.assertFalse(result["ambiguity"])
 
-    def test_candidate_assess_requires_exactly_one_selector(self) -> None:
-        with self.assertRaises(ValueError):
+    def test_candidate_assess_exposes_one_required_typed_selector(self) -> None:
+        signature = inspect.signature(intake.grabowski_bureau_candidate_assess)
+        self.assertEqual(
+            [
+                "selector",
+                "expected_initiative",
+                "expected_task_id",
+            ],
+            list(signature.parameters),
+        )
+        self.assertIs(
+            inspect.Parameter.empty, signature.parameters["selector"].default
+        )
+        self.assertNotIn("task_id", signature.parameters)
+        self.assertNotIn("initiative", signature.parameters)
+        with self.assertRaises(TypeError):
             intake.grabowski_bureau_candidate_assess()
         with self.assertRaises(ValueError):
-            intake.grabowski_bureau_candidate_assess("candidate-a", 1)
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "candidate_id", "candidate_id": 1}
+            )
+        with self.assertRaises(ValueError):
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "event_id", "event_id": 0}
+            )
         with mock.patch.object(
             intake,
             "_invoke_bureau",
             return_value={"kind": "bureau_candidate_assessment"},
         ) as invoke:
             result = intake.grabowski_bureau_candidate_assess(
-                candidate_id="candidate-a", initiative="INIT", task_id="INIT-T001"
+                {"kind": "candidate_id", "candidate_id": "candidate-a"},
+                expected_initiative="INIT",
+                expected_task_id="INIT-T001",
             )
         self.assertEqual(result["kind"], "bureau_candidate_assessment")
-        self.assertIn("--candidate-id", invoke.call_args.args[0])
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--candidate-id",
+                "candidate-a",
+                "--initiative",
+                "INIT",
+                "--task-id",
+                "INIT-T001",
+            ],
+            invoke.call_args.args[0],
+        )
+
+    def test_candidate_assess_registered_schema_requires_typed_selector(self) -> None:
+        if not hasattr(intake.mcp, "list_tools"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        tool = next(
+            item
+            for item in asyncio.run(intake.mcp.list_tools())
+            if item.name == "grabowski_bureau_candidate_assess"
+        )
+        schema = tool.inputSchema
+        self.assertEqual(
+            {
+                "selector",
+                "expected_initiative",
+                "expected_task_id",
+            },
+            set(schema["properties"]),
+        )
+        self.assertEqual({"selector"}, set(schema["required"]))
+        self.assertEqual(
+            {
+                "#/$defs/BureauCandidateIdSelector",
+                "#/$defs/BureauEventIdSelector",
+            },
+            {
+                variant["$ref"]
+                for variant in schema["properties"]["selector"]["anyOf"]
+            },
+        )
+        candidate = schema["$defs"]["BureauCandidateIdSelector"]
+        event = schema["$defs"]["BureauEventIdSelector"]
+        self.assertFalse(candidate["additionalProperties"])
+        self.assertFalse(event["additionalProperties"])
+        self.assertEqual({"kind", "candidate_id"}, set(candidate["required"]))
+        self.assertEqual({"kind", "event_id"}, set(event["required"]))
+        self.assertEqual("candidate_id", candidate["properties"]["kind"]["const"])
+        self.assertEqual("event_id", event["properties"]["kind"]["const"])
+        self.assertEqual("string", candidate["properties"]["candidate_id"]["type"])
+        self.assertEqual("integer", event["properties"]["event_id"]["type"])
+        self.assertNotIn("candidate_id", schema["properties"])
+        self.assertNotIn("event_id", schema["properties"])
+        self.assertNotIn("task_id", schema["properties"])
+        self.assertNotIn("initiative", schema["properties"])
+
+    def test_candidate_assess_rejects_malformed_selector_objects(self) -> None:
+        invalid = [
+            "candidate-a",
+            {},
+            {"kind": "other", "candidate_id": "candidate-a"},
+            {"kind": "candidate_id"},
+            {"kind": "candidate_id", "candidate_id": ""},
+            {"kind": "candidate_id", "candidate_id": "candidate\x00a"},
+            {
+                "kind": "candidate_id",
+                "candidate_id": "candidate-a",
+                "event_id": 31,
+            },
+            {"kind": "event_id"},
+            {"kind": "event_id", "event_id": True},
+            {"kind": "event_id", "event_id": "31"},
+            {"kind": "event_id", "event_id": -1},
+            {
+                "kind": "event_id",
+                "event_id": 31,
+                "candidate_id": "candidate-a",
+            },
+        ]
+        for selector in invalid:
+            with self.subTest(selector=selector):
+                with self.assertRaises(ValueError):
+                    intake.grabowski_bureau_candidate_assess(selector)
+
+    def test_candidate_assess_routes_event_selector_without_task_guessing(self) -> None:
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={"kind": "bureau_candidate_assessment"},
+        ) as invoke:
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "event_id", "event_id": 31}
+            )
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--event-id",
+                "31",
+            ],
+            invoke.call_args.args[0],
+        )
 
     def test_task_propose_is_adapter_idempotent(self) -> None:
         task = {"schema_version": 1, "id": "INIT-T099"}
