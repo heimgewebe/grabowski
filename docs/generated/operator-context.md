@@ -172,7 +172,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_artifact_pull` | artifact | no | high | Pull one hash-bound regular file from a registered SSH fleet host. |
 | `grabowski_text_artifact_publish` | artifact | no | high | Produce one bounded .txt unified diff from two exact Git commit SHAs. |
 | `grabowski_text_artifact_read` | artifact | yes | low | Transfer a verified text artifact across isolated runtime filesystems. |
-| `grabowski_merge_delivery_record` | artifact | unknown | high | Record one durable, exact user-visible diff delivery before a possible PR merge. |
+| `grabowski_merge_delivery_record` | artifact | unknown | high | Optionally record one durable, exact user-visible diff artifact handoff. |
 | `grabowski_browser_worker_start` | browser-worker | no | high | Start an agent-owned browser with a loopback-only debugging endpoint. |
 | `grabowski_browser_worker_stored_form_action` | browser-worker | no | high | Use browser-managed stored form data on one exact local-device origin without returning field contents. |
 | `grabowski_browser_worker_status` | browser-worker | yes | low | Observe one isolated browser worker and reconcile terminal leases. |

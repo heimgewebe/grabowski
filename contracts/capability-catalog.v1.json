@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "cf391fa244b994ad1425d9d09acec328433c77bcb3f8bf9a8299e4dbde3b8fe9",
+  "capability_source_sha256": "10b2e79ae244ea6c4098412e76c4fc3f12e51f428b2ae0be20a9f538609c744b",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "b0d032e607e5c537de0e203bd19fb5210ab654d24509a34355cda2a3fe5d9d54",
   "integrity": {
@@ -496,7 +496,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Project bounded current operator work without creating a second lifecycle truth.",
+      "description": "Project bounded current operator work without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_current_work",
       "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
@@ -507,7 +507,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Audit bounded operator friction and optimization potential on manual request.",
+      "description": "Audit bounded operator friction without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_operator_optimization_report",
       "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
@@ -751,7 +751,7 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Compare durable checkout bindings with current Git state, strictly read-only.",
+      "description": "Compare checkout bindings without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_checkout_binding_reconciliation",
       "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
@@ -1805,13 +1805,13 @@
     },
     {
       "category": "artifact",
-      "description": "Record one durable, exact user-visible diff delivery before merge.",
+      "description": "Optionally record one durable, exact user-visible diff artifact handoff.",
       "effects": [
         "local-file-create",
         "receipt-create"
       ],
       "id": "grabowski_merge_delivery_record",
-      "purpose": "Record one durable, exact user-visible diff delivery before a possible PR merge.",
+      "purpose": "Optionally record one durable, exact user-visible diff artifact handoff.",
       "read_only": null,
       "reversibility": "receipt-retention-dependent",
       "risk_class": "high",
