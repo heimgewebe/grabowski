@@ -55,6 +55,7 @@ def request_payloads() -> tuple[dict, dict, dict]:
         "databaseId": 101,
         "body": body,
         "createdAt": REQUEST_TIME,
+        "updatedAt": REQUEST_TIME,
         "url": "https://github.com/example/request/101",
         "authorAssociation": "NONE",
         "author": {"login": "github-actions[bot]"},
