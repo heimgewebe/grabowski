@@ -603,13 +603,56 @@ class ReposkopContextTests(unittest.TestCase):
                 side_effect=open_then_raise_file_not_found,
             ),
         ):
-            with self.assertRaises((ValueError, FileNotFoundError)):
+            with self.assertRaises(ValueError) as raised:
                 context.grabowski_reposkop_context(str(self.repo))
+            self.assertIn("re-open failed after pending create", str(raised.exception))
 
         self.assertGreaterEqual(state["creates"], 1)
         self.assertGreaterEqual(state["opens"], 4)
         self.assertEqual(list(moved_root.glob("*.json")), [])
         self.assertEqual(list(moved_root.glob("*.pending")), [])
+
+    def test_post_link_raw_failure_rolls_back_receipt_and_pending(self) -> None:
+        """Ordinary post-link failures must roll back via create and link dirfds."""
+        patches = self.patches(self.report())
+        outside = self.root / "outside-post-link-fnf"
+        outside.mkdir(mode=0o700)
+        moved_root = outside / "receipts-moved"
+        real_recover = context._recover_linked_pending
+        state = {"recover_calls": 0}
+
+        def recover_then_raise(binding, *, root_descriptor):
+            state["recover_calls"] += 1
+            # First call may be pre-create probe; only fail after a successful link.
+            if state["recover_calls"] >= 2:
+                if self.receipts.exists():
+                    self.receipts.rename(moved_root)
+                raise FileNotFoundError("post-link component vanished")
+            return real_recover(binding, root_descriptor=root_descriptor)
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context,
+                "_recover_linked_pending",
+                side_effect=recover_then_raise,
+            ),
+        ):
+            with self.assertRaises(ValueError) as raised:
+                context.grabowski_reposkop_context(str(self.repo))
+            self.assertRegex(
+                str(raised.exception),
+                r"post-link authorization or recovery failed|left its authorized",
+            )
+
+        self.assertGreaterEqual(state["recover_calls"], 2)
+        # Debris must not remain in the escaped tree.
+        if moved_root.exists():
+            self.assertEqual(list(moved_root.glob("*.json")), [])
+            self.assertEqual(list(moved_root.glob("*.pending")), [])
+        if self.receipts.exists():
+            self.assertEqual(list(self.receipts.glob("*.json")), [])
+            self.assertEqual(list(self.receipts.glob("*.pending")), [])
 
     def test_recovers_linked_pending_after_interruption(self) -> None:
         patches = self.patches(self.report())

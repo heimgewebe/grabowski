@@ -1211,6 +1211,10 @@ def _audit_record_matches(record: dict[str, Any], binding: dict[str, Any]) -> bo
 
 def _find_audit_binding(binding: dict[str, Any]) -> dict[str, str] | None:
     snapshot = audit_query.capture_verified_audit_snapshot()
+    # Cheap prefilter: operation token is fixed ASCII from our own append path.
+    # Non-matching lines still count toward the scan budget so the bound stays
+    # deterministic under adversarial bulk audit traffic.
+    operation_token = AUDIT_OPERATION.encode("ascii")
     scanned = 0
     for segment in reversed(snapshot.segments):
         data = audit_query._load_snapshot_segment(segment)
@@ -1218,6 +1222,8 @@ def _find_audit_binding(binding: dict[str, Any]) -> dict[str, str] | None:
             if scanned >= MAX_AUDIT_SCAN_RECORDS:
                 return None
             scanned += 1
+            if operation_token not in raw_line:
+                continue
             try:
                 record = json.loads(raw_line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1501,11 +1507,15 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
         _create_pending_on_descriptor(binding, root_descriptor=create_root)
         try:
             link_write_root, link_root = _open_receipt_root_under_write_root()
-        except Exception:
+        except Exception as exc:
             # FileNotFoundError and other ordinary open failures must still
             # roll back the pending created under create_root; only then raise.
             _rollback_leaf_names(create_root, pending_path.name)
-            raise
+            if isinstance(exc, ReposkopContextError):
+                raise
+            raise ReposkopContextError(
+                "Reposkop receipt root re-open failed after pending create"
+            ) from exc
         try:
             try:
                 os.link(
@@ -1535,7 +1545,7 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
                 _assert_live_root_still_authorized(link_root)
                 _recover_linked_pending(binding, root_descriptor=link_root)
                 _assert_live_root_still_authorized(link_root)
-            except ReposkopContextError:
+            except Exception as exc:
                 _rollback_leaf_names(
                     link_root,
                     receipt_path.name,
@@ -1546,7 +1556,11 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
                     receipt_path.name,
                     pending_path.name,
                 )
-                raise
+                if isinstance(exc, ReposkopContextError):
+                    raise
+                raise ReposkopContextError(
+                    "Reposkop receipt post-link authorization or recovery failed"
+                ) from exc
         finally:
             os.close(link_root)
             os.close(link_write_root)
