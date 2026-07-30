@@ -52,30 +52,7 @@ jobs:
           python-version: "3.10"
 
       - name: Relax receipt insertion anchor
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path("tools/pr514_review_fix.py")
-          text = path.read_text(encoding="utf-8")
-          start = text.index("    create_call = (\n")
-          end = text.index("    clean_call = (\n", start)
-          replacement = '''    create_function_at = source.index(
-              "_create_quarantine_locked(",
-              source.index("quarantine_receipt = _build_quarantine_receipt("),
-          )
-          inventory_line = source.index("inventory=inventory,", create_function_at)
-          inventory_line_end = source.index("\\n", inventory_line) + 1
-          inventory_indent = source[source.rfind("\\n", 0, inventory_line) + 1 : inventory_line]
-          source = (
-              source[:inventory_line_end]
-              + inventory_indent
-              + "receipt=quarantine_receipt,\\n"
-              + source[inventory_line_end:]
-          )
-
-'''
-          path.write_text(text[:start] + replacement + text[end:], encoding="utf-8")
-          PY
+        run: python tools/pr514_relax_anchor.py
 
       - name: Apply deterministic review patch
         run: python tools/pr514_review_fix.py
@@ -102,6 +79,7 @@ jobs:
           git rm .github/workflows/pr514-review-fix.yml
           git rm .github/workflows/pr514-review-fix-v2.yml
           git rm tools/pr514_review_fix.py
+          git rm tools/pr514_relax_anchor.py
           git rm .pr514-review-fix-trigger
           git add .github/workflows/validate.yml config/runtime-entrypoint.json contracts/capability-catalog.v1.json contracts/publication-profiles.v1.json docs/generated/operator-context.v1.json docs/generated/operator-context.md docs/text-artifact-export.md pyproject.toml src/grabowski_text_artifact_reconcile.py tests/test_text_artifact_reconcile.py
           git config user.name "github-actions[bot]"
