@@ -667,7 +667,7 @@ def _rollback_created_directories(
         ) from first_error
 
 
-def _ensure_receipt_root() -> None:
+def _ensure_receipt_root() -> tuple[int, int]:
     root_path, _root_exists = _resolve_exact_write_target(
         RECEIPT_ROOT, allow_missing_parents=True
     )
@@ -796,13 +796,14 @@ def _ensure_receipt_root() -> None:
                     "Reposkop receipt root left its authorized write-root path during creation"
                 ) from exc
             try:
-                _validate_receipt_root_descriptor(root_descriptor)
+                metadata = _validate_receipt_root_descriptor(root_descriptor)
                 os.fsync(root_descriptor)
                 _validate_directory_path_binding(
                     write_root_descriptor,
                     write_root,
                     label="Reposkop authorized write root",
                 )
+                root_identity = metadata.st_dev, metadata.st_ino
             finally:
                 os.close(root_descriptor)
         except BaseException as exc:
@@ -821,6 +822,7 @@ def _ensure_receipt_root() -> None:
             _close_created_directory_records(created_directories)
     finally:
         os.close(write_root_descriptor)
+    return root_identity
 
 
 def _receipt_root_components() -> tuple[Path, Path, tuple[str, ...]]:
@@ -837,7 +839,11 @@ def _receipt_root_components() -> tuple[Path, Path, tuple[str, ...]]:
     return root_path, write_root, components
 
 
-def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
+def _validate_receipt_root_descriptor(
+    descriptor: int,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> os.stat_result:
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISDIR(metadata.st_mode)
@@ -846,6 +852,11 @@ def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
     ):
         raise ReposkopContextError(
             "Reposkop receipt root descriptor has unsafe ownership, type or mode"
+        )
+    descriptor_identity = metadata.st_dev, metadata.st_ino
+    if expected_identity is not None and descriptor_identity != expected_identity:
+        raise ReposkopContextError(
+            "Reposkop receipt root descriptor does not match the validated directory"
         )
     try:
         linked = RECEIPT_ROOT.stat(follow_symlinks=False)
@@ -874,11 +885,16 @@ def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
     return metadata
 
 
-def _open_receipt_root_under_write_root() -> tuple[int, int]:
+def _open_receipt_root_under_write_root(
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[int, int]:
     """Open receipt root only by walking from an authorized write-root descriptor.
 
     Existing intermediate ancestors may use normal shared modes (e.g. 0755 under
     ${HOME}). Only the final receipt-root component must be owner-private 0700.
+    When expected_identity is provided, the opened descriptor must name exactly that
+    directory (pre-open TOCTOU binding from _ensure_receipt_root).
     """
     root_path, write_root, components = _receipt_root_components()
     write_root_descriptor = _open_directory_descriptor(write_root)
@@ -899,7 +915,10 @@ def _open_receipt_root_under_write_root() -> tuple[int, int]:
         else:
             receipt_descriptor = os.dup(write_root_descriptor)
         try:
-            _validate_receipt_root_descriptor(receipt_descriptor)
+            _validate_receipt_root_descriptor(
+                receipt_descriptor,
+                expected_identity=expected_identity,
+            )
             return write_root_descriptor, receipt_descriptor
         except BaseException:
             os.close(receipt_descriptor)
@@ -910,9 +929,13 @@ def _open_receipt_root_under_write_root() -> tuple[int, int]:
 
 
 @contextmanager
-def _receipt_root_descriptor() -> Iterator[int]:
+def _receipt_root_descriptor(
+    *, expected_identity: tuple[int, int] | None = None
+) -> Iterator[int]:
     """Open the receipt root via an authorized write-root walk for one critical section."""
-    write_root_descriptor, receipt_descriptor = _open_receipt_root_under_write_root()
+    write_root_descriptor, receipt_descriptor = _open_receipt_root_under_write_root(
+        expected_identity=expected_identity,
+    )
     try:
         yield receipt_descriptor
     finally:
@@ -1683,19 +1706,32 @@ def grabowski_reposkop_context(
             base._require_mutations_enabled(
                 "file_write", path=str(binding[key]), host="heim-pc"
             )
-        _ensure_receipt_root()
+        expected_root_identity = _ensure_receipt_root()
         post_root_path, _post_root_exists = _resolve_exact_write_target(RECEIPT_ROOT)
         if post_root_path != root_path:
             raise ReposkopContextError(
                 "Reposkop receipt root identity changed during policy preflight"
             )
         _validate_binding_write_scope(binding)
-        with _receipt_root_descriptor() as root_descriptor:
+        with _receipt_root_descriptor(
+            expected_identity=expected_root_identity
+        ) as root_descriptor:
+            descriptor_root_path, _descriptor_root_exists = (
+                _resolve_exact_write_target(RECEIPT_ROOT)
+            )
+            if descriptor_root_path != root_path:
+                raise ReposkopContextError(
+                    "Reposkop receipt root changed after descriptor binding"
+                )
+            _validate_binding_write_scope(binding)
             usage_receipt = _record_usage(
                 binding,
                 root_descriptor=root_descriptor,
             )
-            _validate_receipt_root_descriptor(root_descriptor)
+            _validate_receipt_root_descriptor(
+                root_descriptor,
+                expected_identity=expected_root_identity,
+            )
         return _context_result(
             target=target,
             purpose=selected_purpose,
