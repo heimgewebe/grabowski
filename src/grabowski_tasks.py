@@ -5513,7 +5513,10 @@ def _terminal_retry_command(record: dict[str, Any]) -> list[str]:
     managed_target = _explicit_managed_cargo_target_dir(replay)
     if managed_target is None:
         return command
-    expected_lock = _managed_cargo_lifecycle_lock(managed_target)
+    # Pure path validation only: do not prepare the lock root here. Named
+    # reconcile retries must remain effect-free until grabowski_task_start has
+    # run retained-successor admission.
+    expected_lock = _managed_cargo_lifecycle_lock_path(managed_target)
     if command[2] != str(expected_lock):
         raise RuntimeError("stored managed Cargo retry lock binding is invalid")
     return replay

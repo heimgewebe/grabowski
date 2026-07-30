@@ -2692,23 +2692,21 @@ class TaskTests(unittest.TestCase):
             "host": "local",
             "execution_backend": "systemd-user",
         }
-        with patch.object(
-            tasks,
-            "_managed_cargo_lifecycle_lock",
-            return_value=lock,
-        ):
+        with patch.object(tasks, "_managed_cargo_lifecycle_lock") as prepare_lock:
             replay = tasks._terminal_retry_command(record)
         self.assertEqual(bound[3:], replay)
+        prepare_lock.assert_not_called()
 
         record["argv_json"] = json.dumps(
             [bound[0], bound[1], "/tmp/wrong.lock", *bound[3:]]
         )
         with patch.object(
-            tasks,
-            "_managed_cargo_lifecycle_lock",
-            return_value=lock,
-        ), self.assertRaisesRegex(RuntimeError, "lock binding is invalid"):
+            tasks, "_managed_cargo_lifecycle_lock"
+        ) as prepare_lock, self.assertRaisesRegex(
+            RuntimeError, "lock binding is invalid"
+        ):
             tasks._terminal_retry_command(record)
+        prepare_lock.assert_not_called()
 
     def test_terminal_retry_replays_every_accepted_env_spelling(self) -> None:
         cache_key = "b" * 64
@@ -2731,12 +2729,11 @@ class TaskTests(unittest.TestCase):
                     "execution_backend": "systemd-user",
                 }
                 with patch.object(
-                    tasks,
-                    "_managed_cargo_lifecycle_lock",
-                    return_value=lock,
-                ):
+                    tasks, "_managed_cargo_lifecycle_lock"
+                ) as prepare_lock:
                     replay = tasks._terminal_retry_command(record)
                 self.assertEqual(bound[3:], replay)
+                prepare_lock.assert_not_called()
 
     def test_exact_reconcile_resume_allows_named_retry_safe_budget_override(self) -> None:
         with (
@@ -6001,6 +5998,32 @@ class TaskTests(unittest.TestCase):
             return_value=retained,
         ), self.assertRaisesRegex(RuntimeError, "already has a retained successor"):
             tasks._guard_unchanged_terminal_retry(identity, context)
+
+    def test_terminal_retry_command_does_not_prepare_lock_for_retained_successor(
+        self,
+    ) -> None:
+        """Named reconcile must not mkdir lock roots before successor admission."""
+        cache_key = "c" * 64
+        target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        bound = [
+            tasks.FLOCK_EXECUTABLE,
+            "--shared",
+            str(lock),
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target}",
+            "/usr/bin/cargo",
+            "test",
+        ]
+        record = {
+            "argv_json": json.dumps(bound),
+            "host": "local",
+            "execution_backend": "systemd-user",
+        }
+        with patch.object(tasks, "_managed_cargo_lifecycle_lock") as prepare_lock:
+            replay = tasks._terminal_retry_command(record)
+        self.assertEqual(bound[3:], replay)
+        prepare_lock.assert_not_called()
 
     def test_retry_binding_is_persisted_before_dispatch_and_blocks_duplicate_start(self) -> None:
         common = {
