@@ -1532,6 +1532,39 @@ class ReposkopContextTests(unittest.TestCase):
 
 
 
+    def test_unlinked_fallback_returns_readonly_executable_descriptor(self) -> None:
+        payload = b"#!/bin/sh\nexit 0\n"
+        with (
+            patch.object(context, "STATE_DIR", self.root / "state"),
+            patch.object(context.os, "memfd_create", None, create=True),
+        ):
+            descriptor = context._seal_executable_bytes(payload)
+        try:
+            metadata = context.os.fstat(descriptor)
+            self.assertEqual(0, metadata.st_nlink)
+            self.assertEqual(len(payload), metadata.st_size)
+            self.assertEqual(
+                context.os.O_RDONLY,
+                context.fcntl.fcntl(descriptor, context.fcntl.F_GETFL)
+                & context.os.O_ACCMODE,
+            )
+            completed = context.subprocess.run(
+                [f"/proc/self/fd/{descriptor}"],
+                stdin=context.subprocess.DEVNULL,
+                stdout=context.subprocess.PIPE,
+                stderr=context.subprocess.PIPE,
+                pass_fds=(descriptor,),
+                check=False,
+                timeout=5,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual(
+                [],
+                list((self.root / "state" / "reposkop-exec-staging").iterdir()),
+            )
+        finally:
+            context.os.close(descriptor)
+
     @unittest.skipUnless(
         hasattr(context.os, "memfd_create")
         and isinstance(getattr(context.os, "MFD_ALLOW_SEALING", None), int)

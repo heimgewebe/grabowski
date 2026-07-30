@@ -171,9 +171,9 @@ def _seal_executable_bytes(payload: bytes) -> int:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     name = f".exec-{os.getpid()}-{time.time_ns()}"
-    staging_descriptor = os.open(
-        str(staging_root / name), flags, 0o700
-    )
+    staging_path = staging_root / name
+    staging_descriptor = os.open(str(staging_path), flags, 0o700)
+    readonly_descriptor: int | None = None
     try:
         view = memoryview(payload)
         written = 0
@@ -184,14 +184,50 @@ def _seal_executable_bytes(payload: bytes) -> int:
             written += count
         os.fsync(staging_descriptor)
         os.fchmod(staging_descriptor, 0o700)
-        os.lseek(staging_descriptor, 0, os.SEEK_SET)
-        # Unlink while holding the fd so only this process can execute the bytes.
-        os.unlink(str(staging_root / name))
-        return staging_descriptor
-    except BaseException:
+
+        readonly_descriptor = os.open(
+            f"/proc/self/fd/{staging_descriptor}",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        writable_metadata = os.fstat(staging_descriptor)
+        readonly_metadata = os.fstat(readonly_descriptor)
+        if (
+            not stat.S_ISREG(readonly_metadata.st_mode)
+            or (writable_metadata.st_dev, writable_metadata.st_ino)
+            != (readonly_metadata.st_dev, readonly_metadata.st_ino)
+            or readonly_metadata.st_uid != os.getuid()
+            or readonly_metadata.st_nlink != 1
+            or readonly_metadata.st_size != len(payload)
+            or stat.S_IMODE(readonly_metadata.st_mode) != 0o700
+            or fcntl.fcntl(readonly_descriptor, fcntl.F_GETFL) & os.O_ACCMODE
+            != os.O_RDONLY
+        ):
+            raise ReposkopContextError(
+                "Reposkop fallback executable descriptor is not a safe read-only copy"
+            )
+
+        os.unlink(str(staging_path))
         os.close(staging_descriptor)
+        staging_descriptor = -1
+        unlinked_metadata = os.fstat(readonly_descriptor)
+        if (
+            (unlinked_metadata.st_dev, unlinked_metadata.st_ino)
+            != (readonly_metadata.st_dev, readonly_metadata.st_ino)
+            or unlinked_metadata.st_nlink != 0
+        ):
+            raise ReposkopContextError(
+                "Reposkop fallback executable did not become one private unlinked inode"
+            )
+        result = readonly_descriptor
+        readonly_descriptor = None
+        return result
+    except BaseException:
+        if readonly_descriptor is not None:
+            os.close(readonly_descriptor)
+        if staging_descriptor >= 0:
+            os.close(staging_descriptor)
         try:
-            os.unlink(str(staging_root / name))
+            os.unlink(str(staging_path))
         except OSError:
             pass
         raise
