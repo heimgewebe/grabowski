@@ -3596,21 +3596,34 @@ def _run_worktree_hygiene_reconcile(
             expected_head=head,
             expected_branch=branch,
         )
+        archive_record = result.get("archive") if isinstance(result, dict) else None
+        if not isinstance(archive_record, dict):
+            raise GripActionError("checkout archive returned no structured archive record")
+        archive_created_at = archive_record.get("created_at_unix")
+        archive_retention_until = archive_record.get("retention_until_unix")
+        if (
+            isinstance(archive_created_at, bool)
+            or not isinstance(archive_created_at, int)
+            or isinstance(archive_retention_until, bool)
+            or not isinstance(archive_retention_until, int)
+        ):
+            raise GripActionError(
+                "checkout archive receipt lacks bounded cleanup timing evidence"
+            )
+        cleanup_available_at = max(
+            archive_created_at
+            + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+            archive_retention_until,
+        )
         archived.append({
             "path": path,
-            "archive_id": result["archive"]["archive_id"],
+            "archive_id": archive_record["archive_id"],
             "head": head,
             "branch": branch,
             "merged_pr": terminal,
             "ownership_mode": owner_mode,
-            "cleanup_not_before_unix": (
-                result["archive"]["created_at_unix"]
-                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-            ),
-            "cleanup_available_at_unix": (
-                result["archive"]["created_at_unix"]
-                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-            ),
+            "cleanup_not_before_unix": cleanup_available_at,
+            "cleanup_available_at_unix": cleanup_available_at,
         })
         actions += 1
 

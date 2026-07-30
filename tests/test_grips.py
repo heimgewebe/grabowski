@@ -9846,10 +9846,12 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                     "stderr": "",
                 }
 
+            retention_deadline = 1000 + (24 * 60 * 60) + 7200
             archive_result = {
                 "archive": {
                     "archive_id": "20260722T010000Z-aaaaaaaaaaaa",
                     "created_at_unix": 1000,
+                    "retention_until_unix": retention_deadline,
                 }
             }
             with (
@@ -9870,7 +9872,12 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"] )
         self.assertEqual(1, result["output"]["actions"])
         self.assertEqual(1, len(result["output"]["archived"]))
-        self.assertEqual(77, result["output"]["archived"][0]["merged_pr"]["number"])
+        archived_item = result["output"]["archived"][0]
+        self.assertEqual(77, archived_item["merged_pr"]["number"])
+        self.assertEqual(retention_deadline, archived_item["cleanup_not_before_unix"])
+        self.assertEqual(
+            retention_deadline, archived_item["cleanup_available_at_unix"]
+        )
         archive.assert_called_once()
         self.assertEqual(self.HEAD, archive.call_args.kwargs["expected_head"])
         self.assertEqual(self.BRANCH, archive.call_args.kwargs["expected_branch"])
@@ -10102,6 +10109,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                         "archive": {
                             "archive_id": "20260722T010000Z-cccccccccccc",
                             "created_at_unix": 1000,
+                            "retention_until_unix": 1000 + (24 * 60 * 60),
                         }
                     },
                 ) as archive,
@@ -10292,6 +10300,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                         "archive": {
                             "archive_id": "20260722T010000Z-ffffffffffff",
                             "created_at_unix": 1000,
+                            "retention_until_unix": 1000 + (24 * 60 * 60),
                         }
                     },
                 ) as archive,

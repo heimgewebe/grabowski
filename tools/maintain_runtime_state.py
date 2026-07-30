@@ -1686,6 +1686,7 @@ def _normalize_periodic_paths(
     *,
     label: str,
     maximum: int,
+    allow_missing: bool = False,
 ) -> list[str]:
     if values is None:
         return []
@@ -1695,7 +1696,13 @@ def _normalize_periodic_paths(
     for raw in values:
         if not isinstance(raw, str) or not raw or "\x00" in raw:
             raise ValueError(f"{label} entries must be non-empty paths")
-        path = Path(raw).expanduser().resolve(strict=True)
+        candidate = Path(raw).expanduser()
+        try:
+            path = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            if allow_missing:
+                continue
+            raise ValueError(f"{label} entries must exist") from None
         if not path.is_dir():
             raise ValueError(f"{label} entries must be directories")
         value = str(path)
@@ -1721,6 +1728,7 @@ def _apply_periodic_worktree_hygiene(
         allowed_checkout_roots,
         label="worktree_hygiene_allowed_roots",
         maximum=MAX_WORKTREE_HYGIENE_ROOTS,
+        allow_missing=True,
     )
     if not repos:
         return {
@@ -1731,10 +1739,6 @@ def _apply_periodic_worktree_hygiene(
             "actions": 0,
             "receipts": [],
         }
-    if not roots:
-        raise ValueError(
-            "periodic worktree hygiene requires at least one allowed checkout root"
-        )
     if (
         isinstance(max_actions, bool)
         or not isinstance(max_actions, int)
@@ -1746,6 +1750,26 @@ def _apply_periodic_worktree_hygiene(
         )
     if not isinstance(owner_id, str) or not owner_id:
         raise ValueError("worktree_hygiene_owner must be a non-empty string")
+    if not roots:
+        if not allowed_checkout_roots:
+            raise ValueError(
+                "periodic worktree hygiene requires at least one allowed checkout root"
+            )
+        return {
+            "schema_version": 1,
+            "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "completed": True,
+            "mutated": False,
+            "actions": 0,
+            "maximum_actions": max_actions,
+            "repositories": repos,
+            "allowed_checkout_roots": [],
+            "owner_id": owner_id,
+            "receipts": [],
+            "bounded": True,
+            "single_producer": "grabowski-runtime-retention.timer",
+            "reason": "configured_optional_checkout_roots_absent",
+        }
 
     source = str(SRC)
     if source not in sys.path:
