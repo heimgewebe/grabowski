@@ -378,6 +378,15 @@ def wait_for_admission_idle(
 
 
 def parse_tunnel_metrics(text: str) -> dict[str, float]:
+    """Parse required tunnel counters and optional final-response series.
+
+    Cold Prometheus exporters often omit histogram/summary series until the first
+    sample is observed. Missing
+    ``command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response"}``
+    is therefore treated as idle ``commands_final_responses_total=0``. Balance
+    checks still reject traffic without matching final responses because
+    ``polled``/``enqueued`` would then exceed zero.
+    """
     direct: dict[str, float] = {}
     duplicates: set[str] = set()
     final_responses = 0.0
@@ -417,9 +426,12 @@ def parse_tunnel_metrics(text: str) -> dict[str, float]:
                 raise WatchdogError("watchdog-tunnel-metric-invalid")
             direct[name] = value
     missing = [name for name in TUNNEL_METRIC_NAMES if name not in direct]
-    if missing or duplicates or final_series == 0:
+    if missing or duplicates:
         raise WatchdogError("watchdog-tunnel-metrics-incomplete")
-    direct["commands_final_responses_total"] = final_responses
+    # Idle tunnels may never have exported the final-response series.
+    direct["commands_final_responses_total"] = (
+        final_responses if final_series > 0 else 0.0
+    )
     return direct
 
 

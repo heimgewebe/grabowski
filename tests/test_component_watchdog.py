@@ -1656,6 +1656,54 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             10.0, result["metrics"]["commands_final_responses_total"]
         )
 
+    def test_tunnel_metrics_treat_missing_final_series_as_idle_zero(self) -> None:
+        """Cold exporters may omit histogram series until the first sample."""
+        metrics = "\n".join(
+            [
+                "commands_queue_length 0",
+                "commands_polled_total 0",
+                "commands_enqueued_total 0",
+                "process_start_time_seconds 12",
+            ]
+        )
+        parsed = watchdog.admission_recovery.parse_tunnel_metrics(metrics)
+        self.assertEqual(0.0, parsed["commands_final_responses_total"])
+        self.assertEqual(0.0, parsed["commands_queue_length"])
+        self.assertEqual(0.0, parsed["commands_polled_total"])
+        self.assertEqual(0.0, parsed["commands_enqueued_total"])
+
+        with (
+            patch.object(watchdog, "get_bounded_text", return_value=metrics),
+            patch.object(watchdog.time, "sleep"),
+            patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=itertools.count(),
+            ),
+        ):
+            result = watchdog.wait_for_watchdog_tunnel_idle(
+                metrics_url="http://127.0.0.1:18080/metrics", timeout=10
+            )
+        self.assertEqual(3, result["attempts"])
+        self.assertEqual(
+            0.0, result["metrics"]["commands_final_responses_total"]
+        )
+
+    def test_tunnel_metrics_still_require_core_counters(self) -> None:
+        with self.assertRaisesRegex(
+            watchdog.WatchdogError, "watchdog-tunnel-metrics-incomplete"
+        ):
+            watchdog.admission_recovery.parse_tunnel_metrics(
+                "\n".join(
+                    [
+                        "commands_queue_length 0",
+                        "commands_polled_total 0",
+                        # missing commands_enqueued_total
+                        "process_start_time_seconds 1",
+                    ]
+                )
+            )
+
     def test_transient_liveness_recovers_after_drain_without_restart(self) -> None:
         args = watchdog.normalize_args(
             watchdog.parser().parse_args(
@@ -1763,7 +1811,9 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             patch.object(
                 watchdog,
                 "service_action",
-                side_effect=lambda service, action: actions.append((service, action)),
+                side_effect=lambda service, action, **_kwargs: actions.append(
+                    (service, action)
+                ),
             ),
             patch.object(
                 watchdog,

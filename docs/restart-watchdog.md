@@ -135,9 +135,11 @@ Admission-Vertrag wie das Runtime-Deployment:
    angenommene Aufrufe dürfen enden. Zwei stabile Messungen müssen
    `active_tool_calls == 0` bestätigen.
 3. Der Tunnel muss dreimal stabil `queue == 0` sowie
-   `polled == enqueued == final_responses` melden. Nach dem abschließenden
-   Liveness-Readback wird diese Bilanz unmittelbar vor der Mutation nochmals
-   bestätigt.
+   `polled == enqueued == final_responses` melden. Fehlt die
+   Final-Response-Histogrammserie (kalt/idle, noch kein Traffic), zählt
+   `final_responses` als `0` und blockiert den Drain nicht. Nach dem
+   abschließenden Liveness-Readback wird diese Bilanz unmittelbar vor der
+   Mutation nochmals bestätigt.
 4. Hat sich die Live-Liveness während des Drains erholt, wird zusätzlich
    MainPID, Startidentität, exakte Runtime-Kommandozeile und Listenerbindung
    erneut geprüft. Nur ein vollständig identitätsgültiger Operator darf den
