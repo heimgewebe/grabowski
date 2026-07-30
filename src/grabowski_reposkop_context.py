@@ -1490,56 +1490,65 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
                 root_descriptor=live_root,
             )
             return
-    # Leaf create re-anchors independently so a rename cannot use a stale dir_fd.
-    _create_pending(binding, root_descriptor=-1)
-    with _publication_receipt_root() as live_root:
+
+    # Create pending while retaining the create dir_fd until link re-anchoring
+    # succeeds. If re-open fails after create (rename out of write roots), the
+    # create fd is the only handle that can still unlink the escaped .pending.
+    write_root_descriptor, create_root = _open_receipt_root_under_write_root()
+    try:
+        _create_pending_on_descriptor(binding, root_descriptor=create_root)
         try:
-            os.link(
-                pending_path.name,
-                receipt_path.name,
-                src_dir_fd=live_root,
-                dst_dir_fd=live_root,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            _recover_linked_pending(binding, root_descriptor=live_root)
-            if _entry_exists(live_root, pending_path):
-                raise ReposkopContextError(
-                    "Reposkop receipt publication collided with a different file"
+            link_write_root, link_root = _open_receipt_root_under_write_root()
+        except ReposkopContextError:
+            _rollback_leaf_names(create_root, pending_path.name)
+            raise
+        try:
+            try:
+                os.link(
+                    pending_path.name,
+                    receipt_path.name,
+                    src_dir_fd=link_root,
+                    dst_dir_fd=link_root,
+                    follow_symlinks=False,
                 )
-            return
-        except OSError as exc:
-            raise ReposkopContextError("Reposkop receipt publication failed") from exc
-        # Close the residual same-UID TOCTOU window: if the receipt root was
-        # renamed out of authorized write roots between open and link, remove
-        # debris via the still-valid dir_fd and fail closed.
-        try:
-            _assert_live_root_still_authorized(live_root)
-        except ReposkopContextError:
-            _rollback_leaf_names(
-                live_root,
-                receipt_path.name,
-                pending_path.name,
-            )
-            raise
-        try:
-            _recover_linked_pending(binding, root_descriptor=live_root)
-        except ReposkopContextError:
-            _rollback_leaf_names(
-                live_root,
-                receipt_path.name,
-                pending_path.name,
-            )
-            raise
-        try:
-            _assert_live_root_still_authorized(live_root)
-        except ReposkopContextError:
-            _rollback_leaf_names(
-                live_root,
-                receipt_path.name,
-                pending_path.name,
-            )
-            raise
+            except FileExistsError:
+                _recover_linked_pending(binding, root_descriptor=link_root)
+                if _entry_exists(link_root, pending_path):
+                    raise ReposkopContextError(
+                        "Reposkop receipt publication collided with a different file"
+                    )
+                return
+            except OSError as exc:
+                _rollback_leaf_names(link_root, pending_path.name)
+                # Best effort via create_root if link_root cannot see the pending.
+                _rollback_leaf_names(create_root, pending_path.name)
+                raise ReposkopContextError(
+                    "Reposkop receipt publication failed"
+                ) from exc
+            # Close residual same-UID TOCTOU between open and link: if the root
+            # left authorized write roots, remove debris via bound dir_fds.
+            try:
+                _assert_live_root_still_authorized(link_root)
+                _recover_linked_pending(binding, root_descriptor=link_root)
+                _assert_live_root_still_authorized(link_root)
+            except ReposkopContextError:
+                _rollback_leaf_names(
+                    link_root,
+                    receipt_path.name,
+                    pending_path.name,
+                )
+                _rollback_leaf_names(
+                    create_root,
+                    receipt_path.name,
+                    pending_path.name,
+                )
+                raise
+        finally:
+            os.close(link_root)
+            os.close(link_write_root)
+    finally:
+        os.close(create_root)
+        os.close(write_root_descriptor)
 
 
 def _record_usage(
