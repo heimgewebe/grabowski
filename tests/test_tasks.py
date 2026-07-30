@@ -5483,6 +5483,137 @@ class TaskTests(unittest.TestCase):
             )
         row.assert_not_called()
 
+
+    def test_managed_cargo_attention_limit_counts_only_command_matches(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def start_failed(command: list[str], cache_key: str) -> dict[str, object]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            bound = [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *command,
+            ]
+            with (
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_managed_cargo_request_root", return_value=self.root
+                ),
+                patch.object(
+                    tasks, "_bind_managed_cargo_environment", return_value=bound
+                ),
+                patch.object(tasks, "_dispatch", return_value=_launcher()),
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(
+                    tasks,
+                    "_require_recovery_gate",
+                    return_value={"checked_at_unix": 123},
+                ),
+            ):
+                started = tasks.grabowski_task_start(
+                    "local",
+                    command,
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                    resume_policy="retry-safe",
+                    cpu_weight=50,
+                    io_weight=25,
+                )["task"]
+            return tasks._set_state(
+                str(started["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+
+        relevant = start_failed(raw_command, "a" * 64)
+        start_failed(["/usr/bin/cargo", "check"], "b" * 64)
+        start_failed(["/usr/bin/cargo", "clippy"], "c" * 64)
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        with patch.object(tasks, "MANAGED_CARGO_ATTENTION_MATCH_LIMIT", 1):
+            records = tasks._matching_attention_unprepared_managed_cargo_records(
+                identity, raw_command
+            )
+        self.assertEqual(
+            [relevant["task_id"]],
+            [item["task_id"] for item in records],
+        )
+
+        duplicate = dict(tasks._row_raw(str(relevant["task_id"])))
+        duplicate["task_id"] = "f" * 24
+        duplicate["unit"] = tasks._task_unit(duplicate["task_id"], 1)
+        duplicate["authoritative_unit"] = duplicate["unit"]
+        duplicate["lease_owner_id"] = f"task:{duplicate['task_id']}"
+        duplicate["created_at_unix"] = int(duplicate["created_at_unix"]) + 1
+        duplicate["updated_at_unix"] = int(duplicate["updated_at_unix"]) + 1
+        columns = tuple(duplicate)
+        with tasks._database() as connection:
+            connection.execute(
+                f"INSERT INTO tasks ({','.join(columns)}) VALUES "
+                f"({','.join('?' for _ in columns)})",
+                tuple(duplicate[column] for column in columns),
+            )
+            connection.commit()
+        with (
+            patch.object(tasks, "MANAGED_CARGO_ATTENTION_MATCH_LIMIT", 1),
+            self.assertRaisesRegex(RuntimeError, "scan limit exceeded"),
+        ):
+            tasks._matching_attention_unprepared_managed_cargo_records(
+                identity, raw_command
+            )
+
+    def test_managed_cargo_attention_scan_keeps_corrupt_argv_fail_closed(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        relevant = self._start()["task"]
+        task_id = str(relevant["task_id"])
+        tasks._set_state(
+            task_id,
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET argv_json='{' WHERE task_id=?",
+                (task_id,),
+            )
+            connection.commit()
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=64 * 1024 * 1024,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        with self.assertRaisesRegex(RuntimeError, "stored task argv is invalid"):
+            tasks._matching_attention_unprepared_managed_cargo_records(
+                identity, raw_command
+            )
+
     def test_task_start_blocks_unchanged_terminal_failure_without_named_change(self) -> None:
         common = {
             "host": "local",

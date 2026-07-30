@@ -82,6 +82,7 @@ CARGO_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])cargo(?:$|[^A-Za-z0-9_])")
 JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
+MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
 # One re-entrant in-process lock plus one shared file lock serializes every
 # persistent-task mutation across the MCP runtime and the timer-driven
@@ -2631,10 +2632,83 @@ def _record_matches_unprepared_managed_cargo_command(
     return True
 
 
+def _managed_cargo_command_sql_predicate(
+    command: list[str],
+) -> tuple[str, tuple[Any, ...]]:
+    if not command or any(not isinstance(item, str) for item in command):
+        raise ValueError("managed Cargo command must contain only strings")
+
+    clauses = ["argv_json=?"]
+    parameters: list[Any] = [_canonical_json(command)]
+    explicit_target = _explicit_managed_cargo_target_dir(command)
+    if explicit_target is not None:
+        clauses.append("argv_json=?")
+        parameters.append(
+            _canonical_json(
+                [
+                    FLOCK_EXECUTABLE,
+                    "--shared",
+                    str(_managed_cargo_lifecycle_lock_path(explicit_target)),
+                    *command,
+                ]
+            )
+        )
+
+    target_prefix = "CARGO_TARGET_DIR="
+    wrapper_terms = [
+        "json_valid(argv_json)",
+        "json_type(argv_json)='array'",
+        "json_array_length(argv_json)=?",
+        "json_type(argv_json, '$[0]')='text'",
+        "json_extract(argv_json, '$[0]')=?",
+        "json_type(argv_json, '$[1]')='text'",
+        "json_extract(argv_json, '$[1]')=?",
+        "json_type(argv_json, '$[2]')='text'",
+        "json_type(argv_json, '$[3]')='text'",
+        "(json_extract(argv_json, '$[3]')=? "
+        "OR json_extract(argv_json, '$[3]') GLOB '*/env')",
+        "json_type(argv_json, '$[4]')='text'",
+        "substr(json_extract(argv_json, '$[4]'), 1, ?)=?",
+    ]
+    wrapper_parameters: list[Any] = [
+        len(command) + 5,
+        FLOCK_EXECUTABLE,
+        "--shared",
+        Path(SYSTEMD_ENV_EXECUTABLE).name,
+        len(target_prefix),
+        target_prefix,
+    ]
+    for index, item in enumerate(command, start=5):
+        wrapper_terms.extend(
+            [
+                f"json_type(argv_json, '$[{index}]')='text'",
+                f"json_extract(argv_json, '$[{index}]')=?",
+            ]
+        )
+        wrapper_parameters.append(item)
+    clauses.append("(" + " AND ".join(wrapper_terms) + ")")
+    parameters.extend(wrapper_parameters)
+
+    # Preserve the old fail-closed behavior for corrupt stored argv.
+    # CASE prevents JSON table functions from evaluating malformed JSON.
+    invalid_stored_argv = (
+        "CASE WHEN NOT json_valid(argv_json) THEN 1 "
+        "WHEN json_type(argv_json)<>'array' THEN 1 "
+        "WHEN EXISTS (SELECT 1 FROM json_each(argv_json) WHERE type<>'text') "
+        "THEN 1 ELSE 0 END=1"
+    )
+    clauses.append(invalid_stored_argv)
+    return (
+        "(" + " OR ".join(f"({clause})" for clause in clauses) + ")",
+        tuple(parameters),
+    )
+
+
 def _latest_matching_unprepared_managed_cargo_record(
     identity: dict[str, Any],
     command: list[str],
 ) -> dict[str, Any] | None:
+    argv_predicate, argv_parameters = _managed_cargo_command_sql_predicate(command)
     with _database_connection() as connection:
         cursor = connection.execute(
             "SELECT * FROM tasks WHERE host=? AND cwd=? "
@@ -2642,6 +2716,7 @@ def _latest_matching_unprepared_managed_cargo_record(
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
             "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {argv_predicate} "
             "ORDER BY created_at_unix DESC, rowid DESC",
             (
                 identity["host"],
@@ -2660,6 +2735,7 @@ def _latest_matching_unprepared_managed_cargo_record(
                 ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
+                *argv_parameters,
             ),
         )
         while True:
@@ -2668,9 +2744,10 @@ def _latest_matching_unprepared_managed_cargo_record(
                 return None
             for row in rows:
                 record = dict(row)
-                if _record_matches_unprepared_managed_cargo_command(record, command):
+                if _record_matches_unprepared_managed_cargo_command(
+                    record, command
+                ):
                     return record
-
 
 def _matching_attention_unprepared_managed_cargo_records(
     identity: dict[str, Any],
@@ -2678,6 +2755,14 @@ def _matching_attention_unprepared_managed_cargo_records(
 ) -> list[dict[str, Any]]:
     attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
     placeholders = ",".join("?" for _ in attention_states)
+    argv_predicate, argv_parameters = _managed_cargo_command_sql_predicate(command)
+    scan_limit = MANAGED_CARGO_ATTENTION_MATCH_LIMIT
+    if (
+        isinstance(scan_limit, bool)
+        or not isinstance(scan_limit, int)
+        or scan_limit < 1
+    ):
+        raise RuntimeError("managed Cargo attention scan limit is invalid")
     with _database_connection() as connection:
         rows = connection.execute(
             "SELECT * FROM tasks WHERE host=? AND cwd=? "
@@ -2685,8 +2770,9 @@ def _matching_attention_unprepared_managed_cargo_records(
             "AND io_weight=? AND memory_max_bytes IS ? "
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
             "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {argv_predicate} "
             f"AND state IN ({placeholders}) "
-            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
             (
                 identity["host"],
                 identity["cwd"],
@@ -2704,10 +2790,12 @@ def _matching_attention_unprepared_managed_cargo_records(
                 ),
                 identity["execution_backend"],
                 identity["systemd_scope"],
+                *argv_parameters,
                 *attention_states,
+                scan_limit + 1,
             ),
         ).fetchall()
-    if len(rows) > 50000:
+    if len(rows) > scan_limit:
         raise RuntimeError("matching managed Cargo attention scan limit exceeded")
     return [
         record
@@ -2716,7 +2804,6 @@ def _matching_attention_unprepared_managed_cargo_records(
             record := dict(row), command
         )
     ]
-
 
 def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
     if record is None:
