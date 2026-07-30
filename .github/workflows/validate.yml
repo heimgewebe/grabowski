@@ -57,14 +57,38 @@ jobs:
         run: |
           set -euo pipefail
           subject=$(git log -1 --format=%s)
-          if [ "$subject" != 'chore(ci): activate PR 506 fix publisher' ]; then
+          if [ "$subject" != 'chore(ci): retry PR 506 fix publisher' ]; then
             echo "publisher skipped for commit: $subject"
             exit 0
           fi
 
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tools/pr506_exact_head_fix.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '    tests_block = textwrap.dedent(\n',
+              '    tests_block = textwrap.indent(\n        textwrap.dedent(\n',
+              1,
+          )
+          text = text.replace(
+              "        '''\n    )\n    test_anchor = (\n",
+              "        '''\n        ),\n        '    ',\n    )\n    test_anchor = (\n",
+              1,
+          )
+          path.write_text(text, encoding='utf-8')
+          PY
+
           python3 tools/pr506_exact_head_fix.py
           make context-refresh
-          python3 -m unittest -v \
+
+          test_home=$(mktemp -d)
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 \
+            config/access.home-wide-operator.example.json \
+            "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" python3 -m unittest -v \
             tests.test_tasks.TaskTests.test_managed_cargo_attention_limit_counts_only_command_matches \
             tests.test_tasks.TaskTests.test_managed_cargo_attention_scan_keeps_corrupt_argv_fail_closed \
             tests.test_tasks.TaskTests.test_managed_cargo_retry_is_blocked_before_environment_preparation \
