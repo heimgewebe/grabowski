@@ -1414,6 +1414,83 @@ globalThis.fetch = async () => ({
         self.assertEqual(terminalization["release"]["status"], "released")
         self.assertEqual(terminalization["cleanup"]["status"], "completed")
 
+    def test_stopped_status_preserves_explicit_state_over_timeout_evidence(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9351, runtime_seconds=60)
+        worker_id = started["worker"]["worker_id"]
+        timeout_probe = result(
+            stdout=(
+                "LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                "Result=timeout\nExecMainStatus=0\n"
+            )
+        )
+        with patch.object(workers.operator, "_run", return_value=timeout_probe):
+            failed = workers.worker_status(worker_id, expected_kind="browser")
+        self.assertEqual(failed["state"], "failed")
+
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker_id, expected_kind="browser")
+        self.assertEqual(stopped["worker"]["state"], "stopped")
+        prior = stopped["worker"]["last_observation"]["prior_observation"]
+        self.assertEqual(prior["state"], "failed")
+        self.assertEqual(prior["properties"]["Result"], "timeout")
+
+        with patch.object(
+            workers, "_observe", side_effect=AssertionError("stopped status must not probe systemd")
+        ):
+            readback = workers.worker_status(worker_id, expected_kind="browser")
+        self.assertEqual(readback["state"], "stopped")
+        self.assertEqual(
+            readback["last_observation"]["terminalization"]["release"]["status"],
+            "already-absent",
+        )
+        self.assertEqual(
+            readback["last_observation"]["prior_observation"]["properties"]["Result"],
+            "timeout",
+        )
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+        history = workers.worker_list("browser", limit=10, view="history")
+        self.assertEqual(history["count"], 1)
+        self.assertEqual(history["workers"][0]["state"], "stopped")
+
+    def test_stopped_status_retries_incomplete_terminalization_without_probe(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9352, runtime_seconds=60)
+        worker = started["worker"]
+        owner = f"worker:{worker['worker_id']}"
+        workers.resources.release_resources(owner, ["port:9352"])
+        workers.resources.acquire_resources(
+            "foreign-owner",
+            ["port:9352"],
+            purpose="foreign replacement",
+            ttl_seconds=60,
+        )
+        with patch.object(workers.operator, "_run", return_value=result()):
+            stopped = workers.worker_stop(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(stopped["worker"]["state"], "stopped")
+        self.assertEqual(
+            stopped["worker"]["last_observation"]["terminalization"]["release"]["status"],
+            "partial",
+        )
+        current = workers.worker_list("browser", limit=10)
+        self.assertEqual(current["count"], 1)
+        self.assertEqual(
+            current["workers"][0]["projection"]["reason"],
+            "terminalization-incomplete",
+        )
+
+        workers.resources.release_resources("foreign-owner", ["port:9352"])
+        with patch.object(
+            workers, "_observe", side_effect=AssertionError("stopped retry must not probe systemd")
+        ):
+            reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(reconciled["state"], "stopped")
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
     def test_worker_list_cursor_is_bound_to_kind_and_view(self) -> None:
         with self.assertRaisesRegex(ValueError, "bound to another worker view"):
             workers.worker_list(
