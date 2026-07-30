@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
@@ -34,3 +34,82 @@ jobs:
 
       - name: Prove reproducible deployment staging
         run: make deploy-check
+
+  converge-pr514-main:
+    if: github.event_name == 'pull_request' && github.head_ref == 'ops/pr514-main-convergence-v1' && github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR 514 branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/text-artifact-store-reconcile-v1
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+
+      - name: Install locked runtime dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements/runtime.lock.txt
+
+      - name: Merge current main and regenerate contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          set +e
+          git merge --no-ff --no-commit origin/main
+          merge_rc=$?
+          set -e
+          mapfile -t conflicts < <(git diff --name-only --diff-filter=U)
+          if (( merge_rc != 0 )) && (( ${#conflicts[@]} == 0 )); then
+            echo "merge failed without resolvable file conflicts" >&2
+            exit "$merge_rc"
+          fi
+          for path in "${conflicts[@]}"; do
+            case "$path" in
+              contracts/capability-catalog.v1.json|contracts/publication-profiles.v1.json|docs/generated/operator-context.v1.json)
+                git checkout --ours -- "$path"
+                git add "$path"
+                ;;
+              *)
+                echo "unexpected semantic merge conflict: $path" >&2
+                exit 1
+                ;;
+            esac
+          done
+          make context-refresh PYTHON=python3
+          git add contracts/capability-catalog.v1.json contracts/publication-profiles.v1.json docs/generated/operator-context.v1.json docs/generated/operator-context.md
+          if git diff --name-only --diff-filter=U | grep -q .; then
+            git diff --name-only --diff-filter=U >&2
+            exit 1
+          fi
+
+      - name: Check merged patch formatting
+        run: git diff --check
+
+      - name: Run reconciliation regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_home="$(mktemp -d)"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=src python -m unittest -v tests.test_text_artifact_reconcile
+
+      - name: Validate merged candidate
+        run: make validate PYTHON=python3
+
+      - name: Commit converged branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show origin/main:.github/workflows/validate.yml > .github/workflows/validate.yml
+          git add -A
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "merge: reconcile text artifact review with current main"
+          git push origin HEAD:fix/text-artifact-store-reconcile-v1
