@@ -59,6 +59,7 @@ def request_comment(
     association: str = "OWNER",
     comment_id: int = 1001,
     created_at: str = REQUEST_TIME,
+    updated_at: str | None = None,
     head: str = HEAD,
     diff_sha256: str = DIFF,
 ) -> dict:
@@ -69,6 +70,7 @@ def request_comment(
         "databaseId": comment_id,
         "body": settlement._request_body(payload),
         "createdAt": created_at,
+        "updatedAt": updated_at or created_at,
         "authorAssociation": association,
         "author": {"login": actor},
         "reactions": connection([], hasNextPage=False),
@@ -767,6 +769,59 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(result["comment_id"], 1001)
         run_json.assert_not_called()
 
+    def test_request_posts_fresh_marker_after_edited_cutoff(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(
+                    created_at=REQUEST_TIME,
+                    updated_at="2026-07-26T08:02:00Z",
+                )
+            ],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection(
+            [codex_review(submitted_at=REVIEW_TIME)],
+            hasPreviousPage=False,
+        )
+        with mock.patch.object(
+            settlement, "_live_state", return_value=state
+        ), mock.patch.object(
+            settlement, "_run_json", return_value={"id": 4002}
+        ) as run_json:
+            result = settlement.ensure_request(
+                ROOT, REPOSITORY, PR, force=True
+            )
+        self.assertTrue(result["requested"])
+        self.assertEqual(4002, result["comment_id"])
+        run_json.assert_called_once()
+
+    def test_request_deduplicates_fresh_marker_after_edit(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(
+                    comment_id=1001,
+                    created_at=REQUEST_TIME,
+                    updated_at="2026-07-26T08:02:00Z",
+                ),
+                request_comment(
+                    comment_id=1002,
+                    created_at="2026-07-26T08:03:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+        with mock.patch.object(
+            settlement, "_live_state", return_value=state
+        ), mock.patch.object(settlement, "_run_json") as run_json:
+            result = settlement.ensure_request(
+                ROOT, REPOSITORY, PR, force=True
+            )
+        self.assertFalse(result["requested"])
+        self.assertEqual(1002, result["comment_id"])
+        run_json.assert_not_called()
+
     def test_request_posts_exact_bound_marker(self) -> None:
         state = base_state()
         with mock.patch.object(settlement, "_live_state", return_value=state), mock.patch.object(
@@ -781,6 +836,45 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertIn("@codex review", body_arg)
         self.assertIn(HEAD, body_arg)
         self.assertIn(DIFF, body_arg)
+
+
+    def test_edited_request_uses_updated_at_as_review_cutoff(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(
+                    created_at=REQUEST_TIME,
+                    updated_at="2026-07-26T08:02:00Z",
+                )
+            ],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection(
+            [codex_review(submitted_at=REVIEW_TIME)],
+            hasPreviousPage=False,
+        )
+        result = self.evaluate(state)
+        self.assertEqual("pending", result["status"])
+        self.assertTrue(result["request_present"])
+        self.assertFalse(result["review_performed"])
+        self.assertFalse(result["settled"])
+
+    def test_collect_comments_paginates_older_windows(self) -> None:
+        initial = connection([{"databaseId": 200}], hasPreviousPage=True, startCursor="cursor-new")
+        payload = {"data": {"repository": {"pullRequest": {"comments": connection([{"databaseId": 100}], hasPreviousPage=False, startCursor="cursor-old")}}}}
+        with mock.patch.object(settlement, "_run_json", return_value=payload) as run_json:
+            result = settlement._collect_comments(ROOT, "heimgewebe", "grabowski", PR, initial)
+        self.assertEqual([item["databaseId"] for item in result["nodes"]], [100, 200])
+        self.assertEqual(result["pageInfo"], {"hasPreviousPage": False, "pages_loaded": 2})
+        self.assertIn("before=cursor-new", run_json.call_args.args[1])
+
+    def test_collect_comments_fails_closed_at_page_bound(self) -> None:
+        initial = connection([{"databaseId": 300}], hasPreviousPage=True, startCursor="cursor-3")
+        payload = {"data": {"repository": {"pullRequest": {"comments": connection([{"databaseId": 200}], hasPreviousPage=True, startCursor="cursor-2")}}}}
+        with mock.patch.object(settlement, "MAX_COMMENT_PAGES", 2), mock.patch.object(settlement, "MAX_COMMENT_ITEMS", 200), mock.patch.object(settlement, "_run_json", return_value=payload):
+            with self.assertRaisesRegex(settlement.SettlementError, "bounded 200-item history"):
+                settlement._collect_comments(ROOT, "heimgewebe", "grabowski", PR, initial)
+
 
 
 if __name__ == "__main__":

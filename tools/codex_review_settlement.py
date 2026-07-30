@@ -19,6 +19,8 @@ EVIDENCE_KIND = "github_codex_review_settlement"
 REQUEST_KIND = "grabowski_codex_review_request"
 STATUS_CONTEXT = "Codex review settled"
 MAX_ITEMS = 100
+MAX_COMMENT_PAGES = 10
+MAX_COMMENT_ITEMS = MAX_ITEMS * MAX_COMMENT_PAGES
 TRUSTED_CODEX_ACTORS = frozenset(
     {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 )
@@ -73,6 +75,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           databaseId
           body
           createdAt
+          updatedAt
           url
           authorAssociation
           author { login }
@@ -81,7 +84,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
-        pageInfo { hasPreviousPage }
+        pageInfo { hasPreviousPage startCursor }
       }
       reviews(last: 100) {
         nodes {
@@ -111,6 +114,32 @@ query($owner: String!, $name: String!, $number: Int!) {
           }
         }
         pageInfo { hasNextPage }
+      }
+    }
+  }
+}
+""".strip()
+
+
+COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $before: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(last: 100, before: $before) {
+        nodes {
+          databaseId
+          body
+          createdAt
+          updatedAt
+          url
+          authorAssociation
+          author { login }
+          reactions(first: 100) {
+            nodes { content createdAt user { login } }
+            pageInfo { hasNextPage }
+          }
+        }
+        pageInfo { hasPreviousPage startCursor }
       }
     }
   }
@@ -203,6 +232,57 @@ def _run_json(repo: Path, argv: list[str]) -> Any:
         raise SettlementError("command returned invalid JSON") from exc
 
 
+def _collect_comments(
+    repo: Path, owner: str, name: str, pr_number: int, initial: Any
+) -> dict[str, Any]:
+    if not isinstance(initial, dict):
+        raise SettlementError("comments connection is missing")
+    nodes = _list_nodes(initial, label="comments")
+    page = initial.get("pageInfo")
+    if not isinstance(page, dict):
+        raise SettlementError("comments pageInfo is missing")
+    pages = 1
+    cursors: set[str] = set()
+    seen_ids: set[int] = set()
+
+    def remember(items: list[dict[str, Any]]) -> None:
+        for item in items:
+            comment_id = item.get("databaseId")
+            if isinstance(comment_id, bool) or not isinstance(comment_id, int):
+                raise SettlementError("comment databaseId is missing or invalid")
+            if comment_id in seen_ids:
+                raise SettlementError("comment pagination returned duplicate identities")
+            seen_ids.add(comment_id)
+
+    remember(nodes)
+    while page.get("hasPreviousPage") is True:
+        if pages >= MAX_COMMENT_PAGES:
+            raise SettlementError(f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history")
+        before = page.get("startCursor")
+        if not isinstance(before, str) or not before or before in cursors:
+            raise SettlementError("comments pagination cursor is missing or repeated")
+        cursors.add(before)
+        payload = _run_json(repo, ["gh","api","graphql","-f",f"query={COMMENTS_QUERY}","-F",f"owner={owner}","-F",f"name={name}","-F",f"number={pr_number}","-f",f"before={before}"])
+        try:
+            connection = payload["data"]["repository"]["pullRequest"]["comments"]
+        except (KeyError, TypeError) as exc:
+            raise SettlementError("GitHub GraphQL response lacks comment history") from exc
+        if not isinstance(connection, dict):
+            raise SettlementError("pull-request comments do not exist")
+        older = _list_nodes(connection, label="comments")
+        remember(older)
+        nodes = [*older, *nodes]
+        if len(nodes) > MAX_COMMENT_ITEMS:
+            raise SettlementError(f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history")
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict):
+            raise SettlementError("comments pageInfo is missing")
+        pages += 1
+    if page.get("hasPreviousPage") is not False:
+        raise SettlementError("comments pagination state is invalid")
+    return {"nodes": nodes, "pageInfo": {"hasPreviousPage": False, "pages_loaded": pages}}
+
+
 def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
     _, owner, name = _normalize_repo(repository)
     payload = _run_json(
@@ -227,6 +307,8 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         raise SettlementError("GitHub GraphQL response lacks pull-request state") from exc
     if not isinstance(pull_request, dict):
         raise SettlementError("pull request does not exist")
+    pull_request = dict(pull_request)
+    pull_request["comments"] = _collect_comments(repo, owner, name, pr_number, pull_request.get("comments"))
     diff_bytes = subprocess.run(
         ["gh", "pr", "diff", str(pr_number), "--repo", repository],
         cwd=repo,
@@ -242,7 +324,6 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         raise SettlementError("cannot read current PR diff: " + " ".join(detail.split())[:400])
     if not diff_bytes.stdout:
         raise SettlementError("current PR diff is empty")
-    pull_request = dict(pull_request)
     pull_request["diff_sha256"] = hashlib.sha256(diff_bytes.stdout).hexdigest()
     return pull_request
 
@@ -384,15 +465,25 @@ def _canonical_requests(
             pr_number=pr_number,
         )
         created = _parse_time(comment.get("createdAt"))
+        effective = _parse_time(comment.get("updatedAt"))
         comment_id = comment.get("databaseId")
         if (
             parsed is None
             or created is None
+            or effective is None
+            or effective < created
             or isinstance(comment_id, bool)
             or not isinstance(comment_id, int)
         ):
             continue
-        result.append({**comment, "_created": created, "_request": parsed})
+        result.append(
+            {
+                **comment,
+                "_created": effective,
+                "_original_created": created,
+                "_request": parsed,
+            }
+        )
     return sorted(result, key=lambda item: (item["_created"], item["databaseId"]))
 
 
@@ -760,6 +851,7 @@ def evaluate(
             "comment_id": request["databaseId"],
             "request_id": expected_request["request_id"],
             "created_at": request["createdAt"],
+            "effective_at": request["updatedAt"],
             "actor": _actor_login(request.get("author")),
             "author_association": request.get("authorAssociation"),
             "body_sha256": _sha256_text(str(request.get("body") or "")),
@@ -845,18 +937,45 @@ def ensure_request(
     payload = _request_payload(repository, pr_number, head_sha, diff_sha256)
     existing = _matching_requests(pr, payload)
     if existing:
-        comment = existing[0]
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "github_codex_review_request_result",
-            "requested": False,
-            "required": policy["required"],
-            "reason": "current-head request already exists",
-            "request_id": payload["request_id"],
-            "comment_id": comment["databaseId"],
-            "head_sha": head_sha,
-            "diff_sha256": diff_sha256,
-        }
+        adequate = existing[0]
+        edited_cutoffs = [
+            item["_created"]
+            for item in existing
+            if item["_created"] > item["_original_created"]
+        ]
+        needs_fresh_request = False
+        if edited_cutoffs:
+            latest_edit = max(edited_cutoffs)
+            completion = _review_completion(
+                pr,
+                requests=existing,
+                head_sha=head_sha,
+            )
+            fresh = [
+                item
+                for item in existing
+                if item["_created"] == item["_original_created"]
+                and item["_created"] >= latest_edit
+            ]
+            if completion is None and not fresh:
+                needs_fresh_request = True
+            elif fresh:
+                adequate = min(
+                    fresh,
+                    key=lambda item: (item["_created"], item["databaseId"]),
+                )
+        if not needs_fresh_request:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "github_codex_review_request_result",
+                "requested": False,
+                "required": policy["required"],
+                "reason": "current-head request already exists",
+                "request_id": payload["request_id"],
+                "comment_id": adequate["databaseId"],
+                "head_sha": head_sha,
+                "diff_sha256": diff_sha256,
+            }
     response = _run_json(
         repo,
         [
