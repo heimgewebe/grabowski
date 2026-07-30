@@ -455,35 +455,79 @@ def _validate_binding_write_scope(
             )
 
 
-def _open_directory_descriptor(path: Path) -> int:
-    flags = (
+def _directory_open_flags() -> int:
+    return (
         os.O_RDONLY
         | getattr(os, "O_DIRECTORY", 0)
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0)
     )
+
+
+def _open_directory_descriptor(path: Path) -> int:
+    if not path.is_absolute() or ".." in path.parts:
+        raise ReposkopContextError(
+            "Reposkop receipt directory path must be absolute without parent traversal"
+        )
+    flags = _directory_open_flags()
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path.anchor, flags)
     except OSError as exc:
         raise ReposkopContextError(
-            "Reposkop receipt directory could not be opened durably"
+            "Reposkop receipt directory root could not be opened safely"
         ) from exc
-    metadata = os.fstat(descriptor)
     try:
-        linked = path.stat(follow_symlinks=False)
-    except OSError:
+        for component in path.parts[1:]:
+            try:
+                child_descriptor = os.open(
+                    component, flags, dir_fd=descriptor
+                )
+            except OSError as exc:
+                raise ReposkopContextError(
+                    "Reposkop receipt directory component could not be opened safely"
+                ) from exc
+            try:
+                metadata = os.fstat(child_descriptor)
+                linked = os.stat(
+                    component,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_ISLNK(linked.st_mode)
+                    or (metadata.st_dev, metadata.st_ino)
+                    != (linked.st_dev, linked.st_ino)
+                ):
+                    raise ReposkopContextError(
+                        "Reposkop receipt directory component identity is unsafe"
+                    )
+            except BaseException:
+                os.close(child_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = child_descriptor
+
+        metadata = os.fstat(descriptor)
+        try:
+            linked = path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ReposkopContextError(
+                "Reposkop receipt directory path changed during descriptor binding"
+            ) from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (linked.st_dev, linked.st_ino)
+        ):
+            raise ReposkopContextError(
+                "Reposkop receipt directory identity is unsafe"
+            )
+        return descriptor
+    except BaseException:
         os.close(descriptor)
         raise
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_ISLNK(linked.st_mode)
-        or (metadata.st_dev, metadata.st_ino) != (linked.st_dev, linked.st_ino)
-    ):
-        os.close(descriptor)
-        raise ReposkopContextError(
-            "Reposkop receipt directory identity is unsafe"
-        )
-    return descriptor
 
 
 def _open_relative_receipt_directory(
@@ -498,12 +542,7 @@ def _open_relative_receipt_directory(
         raise ReposkopContextError(
             "Reposkop receipt directory component is invalid"
         )
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    flags = _directory_open_flags()
     try:
         descriptor = os.open(component, flags, dir_fd=parent_descriptor)
     except OSError as exc:

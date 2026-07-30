@@ -902,6 +902,40 @@ class ReposkopContextTests(unittest.TestCase):
             self.assertIn(identity, synced_directories)
         self.assertTrue(Path(result["usage_receipt"]["path"]).is_file())
 
+    def test_missing_root_creation_rejects_swapped_symlink_ancestor(self) -> None:
+        anchor = self.root / "receipt-anchor-race"
+        anchor.mkdir(mode=0o700)
+        moved_anchor = self.root / "receipt-anchor-race-moved"
+        outside = self.root / "receipt-anchor-race-outside"
+        outside.mkdir(mode=0o700)
+        self.receipts = anchor / "nested" / "receipts"
+        real_open = context.os.open
+        swapped = False
+
+        def swap_before_component_open(
+            path, flags, mode=0o777, *, dir_fd=None
+        ):
+            nonlocal swapped
+            if path == anchor.name and dir_fd is not None and not swapped:
+                anchor.rename(moved_anchor)
+                anchor.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with (
+            patch.object(context, "RECEIPT_ROOT", self.receipts),
+            patch.object(context.os, "open", side_effect=swap_before_component_open),
+        ):
+            with self.assertRaisesRegex(
+                context.ReposkopContextError,
+                "component could not be opened safely",
+            ):
+                context._ensure_receipt_root()
+
+        self.assertTrue(swapped)
+        self.assertEqual(list(moved_anchor.iterdir()), [])
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_missing_root_creation_uses_bound_ancestor_descriptor(self) -> None:
         anchor = self.root / "receipt-anchor"
         anchor.mkdir(mode=0o700)
