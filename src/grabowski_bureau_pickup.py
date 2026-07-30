@@ -776,6 +776,19 @@ def _claim_intent_rejection(payload: dict[str, Any]) -> BureauPickupError:
         "status": status,
         "source_code": source_code,
     }
+    if payload.get("kind") == "grabowski_bureau_intake_adapter_failure":
+        details["adapter_failure"] = {
+            key: payload[key]
+            for key in (
+                "schema_version",
+                "effect_started",
+                "retryable",
+                "ambiguity",
+                "required_readback",
+                "details",
+            )
+            if key in payload
+        }
     detail = payload.get("detail")
     if isinstance(detail, str):
         try:

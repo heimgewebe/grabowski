@@ -66,4 +66,4 @@ The adapter does not establish:
 
 ## Claim refusal diagnostics
 
-The pickup adapter preserves the Bureau envelope runtime identity for the claim-intent read and converts refusals into stable, specific error codes such as `claim-intent-no-eligible-task`. Structured rejection detail and a bounded runtime-identity summary remain attached to the error. This distinguishes task-state rejection from stale release/Registry identity without acquiring any lease or starting a workspace.
+The pickup adapter preserves the Bureau envelope runtime identity for the claim-intent read and converts refusals into stable, specific error codes such as `claim-intent-no-eligible-task`. Structured rejection detail, adapter retry metadata and a bounded runtime-identity summary remain attached to the error. This distinguishes task-state rejection from stale release/Registry identity without acquiring any lease or starting a workspace.

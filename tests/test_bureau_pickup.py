@@ -516,6 +516,47 @@ class BureauPickupTests(unittest.TestCase):
         )
         acquire.assert_not_called()
 
+    def test_claim_intent_adapter_failure_preserves_retry_contract(self) -> None:
+        for code, retryable in (
+            ("bureau-runtime-timeout", True),
+            ("bureau-runtime-drift", False),
+        ):
+            with self.subTest(code=code):
+                payload = {
+                    "schema_version": 1,
+                    "kind": "grabowski_bureau_intake_adapter_failure",
+                    "code": code,
+                    "effect_started": False,
+                    "retryable": retryable,
+                    "ambiguity": False,
+                    "required_readback": [],
+                    "details": {"error_type": "RuntimeError"},
+                }
+                with (
+                    mock.patch.object(
+                        pickup.bureau, "_invoke_bureau", return_value=payload
+                    ),
+                    mock.patch.object(
+                        pickup.resources, "acquire_resources"
+                    ) as acquire,
+                ):
+                    with self.assertRaisesRegex(
+                        pickup.BureauPickupError, f"claim-intent-{code}"
+                    ) as raised:
+                        pickup.grabowski_bureau_pickup_execute(self.request())
+                self.assertEqual(
+                    raised.exception.details["adapter_failure"],
+                    {
+                        "schema_version": 1,
+                        "effect_started": False,
+                        "retryable": retryable,
+                        "ambiguity": False,
+                        "required_readback": [],
+                        "details": {"error_type": "RuntimeError"},
+                    },
+                )
+                acquire.assert_not_called()
+
     def test_repository_scope_is_required_before_any_acquisition(self) -> None:
         key = "repo:/tmp/repository"
         intent = self.intent([key])
