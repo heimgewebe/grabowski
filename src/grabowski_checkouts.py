@@ -1132,8 +1132,8 @@ def _read_resource_leases() -> list[dict[str, Any]]:
             "SELECT * FROM leases WHERE expires_at_unix>? ORDER BY resource_key",
             (_now(),),
         ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError("Resource lease projection is unavailable") from exc
     finally:
         connection.close()
     return [

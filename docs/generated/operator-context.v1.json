@@ -2969,7 +2969,7 @@
       "src/grabowski_bureau_pickup.py": "2f1f3d68c955061892d88152f25e88f21e6d956605f19dce45f43898cb10a06d",
       "src/grabowski_capabilities.py": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19",
       "src/grabowski_checkout_binding_reconciler.py": "6198f9614b41f67412fec575410fa2b2fa63ff0fcc0db349cce55c4c29950733",
-      "src/grabowski_checkouts.py": "ad1d8b5944858c30198fc38d5e88bc4bea06d09e55fe3de34af24baaa2bc0999",
+      "src/grabowski_checkouts.py": "42b1418868122dde8b3e68773e5da1662a59e7d2afe8da3f0291f7c54e139dec",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
       "src/grabowski_coding_agent_catalog_data.py": "1e839a7f0e851e1ed7421fd5d4e859c3f22aa87ab00932dd2a48763b01e156bc",

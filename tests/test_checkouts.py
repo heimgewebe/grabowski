@@ -322,6 +322,29 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
         self.assertEqual(lease_queries, [])
 
+    def test_resource_lease_reader_does_not_hide_sqlite_failure(self) -> None:
+        class Connection:
+            def execute(self, query, _parameters=()):
+                if query.startswith("SELECT * FROM leases"):
+                    raise sqlite3.OperationalError("database is locked")
+                raise AssertionError(f"unexpected query: {query}")
+
+            def close(self):
+                pass
+
+        with (
+            patch.object(checkouts, "_readonly_connection", return_value=Connection()),
+            patch.object(
+                checkouts.resources,
+                "_begin_resource_lease_projection_read",
+                return_value="1",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Resource lease projection is unavailable"
+            ):
+                checkouts._read_resource_leases()
+
     def test_resource_lease_reader_accepts_future_aggregate_schema_with_contract_v1(self) -> None:
         checkouts.resources.acquire_resources(
             "future-schema-owner",
