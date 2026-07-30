@@ -959,6 +959,97 @@ class AuditQueryTests(unittest.TestCase):
             ["chronik_source_unverifiable"],
         )
 
+    def test_lease_external_evidence_rejects_unsafe_store_path_before_open(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        opened: list[Path] = []
+        fake_resources = types.ModuleType("grabowski_resources")
+        fake_resources.RESOURCE_DB = Path("/tmp/unsafe-resource-link.sqlite3")
+
+        def reject_unsafe_path():
+            raise PermissionError("Resource database must be a regular file")
+
+        fake_resources._resource_store_file_ready = reject_unsafe_path
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(path):
+            opened.append(path)
+            raise AssertionError("unsafe resource path must not be opened")
+            yield
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        previous_resources = sys.modules.get("grabowski_resources")
+        previous_sqlite = sys.modules.get("grabowski_sqlite_store")
+        sys.modules["grabowski_resources"] = fake_resources
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        try:
+            evidence, gaps = module._lease_external_evidence("repo:/srv/example")
+        finally:
+            if previous_resources is None:
+                sys.modules.pop("grabowski_resources", None)
+            else:
+                sys.modules["grabowski_resources"] = previous_resources
+            if previous_sqlite is None:
+                sys.modules.pop("grabowski_sqlite_store", None)
+            else:
+                sys.modules["grabowski_sqlite_store"] = previous_sqlite
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(opened, [])
+        self.assertEqual(gaps[0]["reason"], "lease_store_unverifiable")
+        self.assertEqual(gaps[0]["context"]["error"], "PermissionError")
+
+    def test_lease_external_evidence_rejects_missing_contract_before_lease_read(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        lease_queries: list[str] = []
+
+        class Connection:
+            def execute(self, query, _parameters):
+                lease_queries.append(query)
+                raise AssertionError("lease rows must not be read without a contract")
+
+        fake_resources = types.ModuleType("grabowski_resources")
+        fake_resources.RESOURCE_DB = Path(__file__)
+        fake_resources._resource_store_file_ready = lambda: True
+        fake_resources.normalize_resource_key = lambda value: value
+
+        def reject_missing_contract(_connection, *, quick_integrity=False):
+            self.assertTrue(quick_integrity)
+            raise RuntimeError("Resource lease contract metadata is missing")
+
+        fake_resources._begin_resource_lease_projection_read = reject_missing_contract
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(_path):
+            yield Connection()
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        previous_resources = sys.modules.get("grabowski_resources")
+        previous_sqlite = sys.modules.get("grabowski_sqlite_store")
+        sys.modules["grabowski_resources"] = fake_resources
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        try:
+            evidence, gaps = module._lease_external_evidence("repo:/srv/example")
+        finally:
+            if previous_resources is None:
+                sys.modules.pop("grabowski_resources", None)
+            else:
+                sys.modules["grabowski_resources"] = previous_resources
+            if previous_sqlite is None:
+                sys.modules.pop("grabowski_sqlite_store", None)
+            else:
+                sys.modules["grabowski_sqlite_store"] = previous_sqlite
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(lease_queries, [])
+        self.assertEqual(gaps[0]["reason"], "lease_store_unverifiable")
+        self.assertEqual(gaps[0]["context"]["error"], "RuntimeError")
+
     def test_expired_lease_is_reported_as_inactive_gap(self) -> None:
         module = self._load_module([])
         from contextlib import contextmanager
@@ -984,8 +1075,14 @@ class AuditQueryTests(unittest.TestCase):
                 return row
 
         fake_resources = types.ModuleType("grabowski_resources")
-        fake_resources.RESOURCE_DB = Path("/tmp/resources.sqlite3")
-        fake_resources._preflight_resource_store = lambda: "2"
+        fake_resources.RESOURCE_DB = Path(__file__)
+        fake_resources._resource_store_file_ready = lambda: True
+        projection_reads: list[bool] = []
+        fake_resources._begin_resource_lease_projection_read = (
+            lambda _connection, *, quick_integrity=False: (
+                projection_reads.append(quick_integrity) or "1"
+            )
+        )
         fake_resources.normalize_resource_key = lambda value: value
         fake_resources._public = lambda value: {key: item for key, item in dict(value).items() if key != "metadata_json"}
         fake_resources._row_metadata = lambda _value: {}
@@ -1017,6 +1114,7 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(evidence, [])
         self.assertEqual(gaps[0]["reason"], "lease_not_active")
         self.assertEqual(gaps[0]["context"]["expires_at_unix"], 10)
+        self.assertEqual(projection_reads, [True])
 
 
 if __name__ == "__main__":

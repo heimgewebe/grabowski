@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import sqlite3
 import time
 import types
 import unittest
@@ -296,6 +297,72 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(self.checkout.exists())
         self.assertNotIn("--force", applied["result"]["argv"])
         self.assertEqual(checkouts._read_resource_leases(), [])
+
+    def test_resource_lease_reader_fails_before_query_when_contract_is_invalid(self) -> None:
+        lease_queries: list[str] = []
+
+        class Connection:
+            def execute(self, query, _parameters):
+                lease_queries.append(query)
+                raise AssertionError("lease rows must not be read without a valid contract")
+
+            def close(self):
+                pass
+
+        with (
+            patch.object(checkouts, "_readonly_connection", return_value=Connection()),
+            patch.object(
+                checkouts.resources,
+                "_begin_resource_lease_projection_read",
+                side_effect=RuntimeError("Resource lease contract metadata is missing"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "contract metadata is missing"):
+                checkouts._read_resource_leases()
+
+        self.assertEqual(lease_queries, [])
+
+    def test_resource_lease_reader_does_not_hide_sqlite_failure(self) -> None:
+        class Connection:
+            def execute(self, query, _parameters=()):
+                if query.startswith("SELECT * FROM leases"):
+                    raise sqlite3.OperationalError("database is locked")
+                raise AssertionError(f"unexpected query: {query}")
+
+            def close(self):
+                pass
+
+        with (
+            patch.object(checkouts, "_readonly_connection", return_value=Connection()),
+            patch.object(
+                checkouts.resources,
+                "_begin_resource_lease_projection_read",
+                return_value="1",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Resource lease projection is unavailable"
+            ):
+                checkouts._read_resource_leases()
+
+    def test_resource_lease_reader_accepts_future_aggregate_schema_with_contract_v1(self) -> None:
+        checkouts.resources.acquire_resources(
+            "future-schema-owner",
+            [f"path:{self.checkout.resolve()}"],
+            purpose="future aggregate schema lease projection proof",
+            ttl_seconds=3600,
+        )
+        with sqlite3.connect(self.resource_db) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='4' WHERE key='schema_version'"
+            )
+            connection.commit()
+
+        leases = checkouts._read_resource_leases()
+
+        self.assertEqual(1, len(leases))
+        self.assertEqual("future-schema-owner", leases[0]["owner_id"])
+        self.assertEqual(f"path:{self.checkout.resolve()}", leases[0]["resource_key"])
 
     def test_mixed_bureau_and_non_bureau_acquire_remains_forbidden(self) -> None:
         bureau_key = f"path:{self.checkout.resolve()}"
