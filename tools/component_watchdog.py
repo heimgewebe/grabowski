@@ -580,7 +580,8 @@ def safe_operator_restart(
     args: argparse.Namespace,
     previous_probe: ProbeResult,
 ) -> tuple[str, ProbeResult | None, dict[str, object]]:
-    lifetime = int(
+    # Ceil so the admission marker never under-covers the recovery envelope.
+    lifetime = math.ceil(
         2 * args.restart_drain_timeout
         + 4 * args.recovery_timeout
         + 2 * WATCHDOG_TUNNEL_STOP_TIMEOUT_SECONDS
