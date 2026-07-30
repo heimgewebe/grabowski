@@ -2057,6 +2057,15 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(before, self.database.read_bytes())
         self.assertEqual([], self._resource_migration_backups())
 
+    def test_resource_store_file_ready_rejects_symlink(self) -> None:
+        target = self.root / "resource-store-target.sqlite3"
+        target.write_bytes(b"sqlite")
+        self.database.parent.mkdir(parents=True)
+        self.database.symlink_to(target)
+
+        with self.assertRaisesRegex(PermissionError, "regular file"):
+            resources._resource_store_file_ready()
+
     def test_database_rejects_symlink(self) -> None:
         target = self.root / "real.sqlite3"
         target.write_bytes(b"")

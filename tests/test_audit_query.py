@@ -959,6 +959,48 @@ class AuditQueryTests(unittest.TestCase):
             ["chronik_source_unverifiable"],
         )
 
+    def test_lease_external_evidence_rejects_unsafe_store_path_before_open(self) -> None:
+        module = self._load_module([])
+        from contextlib import contextmanager
+
+        opened: list[Path] = []
+        fake_resources = types.ModuleType("grabowski_resources")
+        fake_resources.RESOURCE_DB = Path("/tmp/unsafe-resource-link.sqlite3")
+
+        def reject_unsafe_path():
+            raise PermissionError("Resource database must be a regular file")
+
+        fake_resources._resource_store_file_ready = reject_unsafe_path
+        fake_sqlite = types.ModuleType("grabowski_sqlite_store")
+
+        @contextmanager
+        def readonly_sqlite(path):
+            opened.append(path)
+            raise AssertionError("unsafe resource path must not be opened")
+            yield
+
+        fake_sqlite.readonly_sqlite = readonly_sqlite
+        previous_resources = sys.modules.get("grabowski_resources")
+        previous_sqlite = sys.modules.get("grabowski_sqlite_store")
+        sys.modules["grabowski_resources"] = fake_resources
+        sys.modules["grabowski_sqlite_store"] = fake_sqlite
+        try:
+            evidence, gaps = module._lease_external_evidence("repo:/srv/example")
+        finally:
+            if previous_resources is None:
+                sys.modules.pop("grabowski_resources", None)
+            else:
+                sys.modules["grabowski_resources"] = previous_resources
+            if previous_sqlite is None:
+                sys.modules.pop("grabowski_sqlite_store", None)
+            else:
+                sys.modules["grabowski_sqlite_store"] = previous_sqlite
+
+        self.assertEqual(evidence, [])
+        self.assertEqual(opened, [])
+        self.assertEqual(gaps[0]["reason"], "lease_store_unverifiable")
+        self.assertEqual(gaps[0]["context"]["error"], "PermissionError")
+
     def test_lease_external_evidence_rejects_missing_contract_before_lease_read(self) -> None:
         module = self._load_module([])
         from contextlib import contextmanager
@@ -972,6 +1014,7 @@ class AuditQueryTests(unittest.TestCase):
 
         fake_resources = types.ModuleType("grabowski_resources")
         fake_resources.RESOURCE_DB = Path(__file__)
+        fake_resources._resource_store_file_ready = lambda: True
         fake_resources.normalize_resource_key = lambda value: value
 
         def reject_missing_contract(_connection):
@@ -1032,6 +1075,7 @@ class AuditQueryTests(unittest.TestCase):
 
         fake_resources = types.ModuleType("grabowski_resources")
         fake_resources.RESOURCE_DB = Path(__file__)
+        fake_resources._resource_store_file_ready = lambda: True
         fake_resources._validate_resource_lease_contract = lambda _connection: "1"
         fake_resources.normalize_resource_key = lambda value: value
         fake_resources._public = lambda value: {key: item for key, item in dict(value).items() if key != "metadata_json"}

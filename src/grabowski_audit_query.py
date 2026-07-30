@@ -859,7 +859,7 @@ def _lease_external_evidence(resource_key: str) -> tuple[list[dict[str, Any]], l
     import grabowski_sqlite_store as sqlite_store
 
     try:
-        if not resources.RESOURCE_DB.exists():
+        if not resources._resource_store_file_ready():
             return [], [_external_gap("lease", "lease_store_uninitialized", resource_key=resource_key)]
         key = resources.normalize_resource_key(resource_key)
         with sqlite_store.readonly_sqlite(resources.RESOURCE_DB) as connection:

@@ -611,12 +611,18 @@ def _verified_resource_migration_backup(
                 pass
 
 
-def _preflight_resource_store() -> str | None:
-    if not RESOURCE_DB.exists():
-        return None
-    if RESOURCE_DB.is_symlink() or not RESOURCE_DB.is_file():
+def _resource_store_file_ready() -> bool:
+    try:
+        observed = RESOURCE_DB.lstat()
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode):
         raise PermissionError(f"Resource database must be a regular file: {RESOURCE_DB}")
-    if RESOURCE_DB.stat().st_size == 0:
+    return observed.st_size > 0
+
+
+def _preflight_resource_store() -> str | None:
+    if not _resource_store_file_ready():
         return None
     with _resource_readonly_sqlite(RESOURCE_DB) as connection:
         _resource_sqlite_integrity(connection, "Resource database", quick=True)
