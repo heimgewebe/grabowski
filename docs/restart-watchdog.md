@@ -50,8 +50,11 @@ Der Tod des Hauptprozesses bleibt Aufgabe von `Restart=on-failure`.
 
 Neben dem kombinierten Wächter (`tools/watchdog_runtime.py`) existieren zwei
 getrennte Komponenten-Watchdogs auf Basis von `tools/component_watchdog.py`:
-`grabowski-operator-watchdog` und `grabowski-tunnel-watchdog`. Jeder startet
-ausschließlich seinen eigenen Dienst neu.
+`grabowski-operator-watchdog` und `grabowski-tunnel-watchdog`. Der leichte
+Tunnel-Watchdog startet nur den Tunnel neu. Der Operator-Watchdog koordiniert
+für einen sicheren Operator-Recovery dagegen kurz beide Dienste: Er drainiert
+den Tunnel, stoppt ihn, ersetzt den Operator und startet den Tunnel erst nach
+bestätigter Operator-Readiness wieder.
 
 ### Vollständige read-only Operatorprüfung
 
@@ -65,11 +68,13 @@ Der Operator-Watchdog kombiniert zwei voneinander unabhängige Belege:
 3. Zusätzlich startet der Watchdog aus derselben Runtime einen isolierten,
    kurzlebigen stdio-Prozess. Dort läuft der vollständige MCP-Lebenszyklus mit
    `initialize`, `notifications/initialized` und exakt dem Read-Tool
-   `grabowski_runtime_health`.
-4. Ein fachliches `healthy: false` bleibt `indeterminate` und löst keine
-   Restart-Schleife aus. Eine nicht antwortende Eventloop, ein dauerhaft
-   belegter Session-Erzeugungslock oder ein konkreter stdio-Transportfehler
-   gelten dagegen als Operatorfehler.
+   `grabowski_runtime_health`. Dieser Pfad bleibt Diagnose des deployten
+   Artefakts; er darf einen über HTTP antwortenden Live-Operator nicht allein
+   restartfähig machen.
+4. Nur ein Fehler des gebundenen Live-Prozesses ist Restart-Autorität. Ein
+   isolierter stdio-Timeout unter Hostlast wird als Diagnosegrund am gesunden
+   Live-Probe sichtbar. Damit führt ein regulärer langer Read nicht mehr zu
+   einem Watchdog-Neustart.
 
 Diese Aufteilung vermeidet den früheren Blindflug, ohne den bekannten
 Session-Erzeugungslock durch einen konkurrierenden Watchdog-Handshake selbst
@@ -117,6 +122,44 @@ der Session-Erzeugungslock nicht mehr verfügbar sind. Die vom Tunnel
 abgefragten Pfade `/.well-known/oauth-protected-resource` und
 `/.well-known/oauth-protected-resource/mcp` liefern deterministisches JSON für
 den auth-freien Loopback-Betrieb statt einer nicht parsebaren 404-Antwort.
+
+### Verlustfreier Operator-Recovery
+
+Vor einem semantischen Operator-Neustart verwendet der Watchdog denselben
+Admission-Vertrag wie das Runtime-Deployment:
+
+1. Eine create-only Markerdatei mit Modus `0600` bindet Token, laufenden
+   Runtime-Head und Quell-Digest. Symlinks, Hardlinks, Austausch und fremde
+   Marker werden fail-closed abgewiesen.
+2. Neue Toolaufrufe werden vor ihrem Werkzeugeffekt gesperrt. Bereits
+   angenommene Aufrufe dürfen enden. Zwei stabile Messungen müssen
+   `active_tool_calls == 0` bestätigen.
+3. Der Tunnel muss dreimal stabil `queue == 0` sowie
+   `polled == enqueued == final_responses` melden. Nach dem abschließenden
+   Liveness-Readback wird diese Bilanz unmittelbar vor der Mutation nochmals
+   bestätigt.
+4. Hat sich die Live-Liveness während des Drains erholt, wird der Neustart
+   vollständig verworfen und der Marker entfernt.
+5. Andernfalls stoppt der Watchdog zuerst den Tunnel. Ein neuer Operator muss
+   als neue Prozessidentität antworten und den exakten Marker mit null aktiven
+   Aufrufen bestätigen. Erst dann startet der Tunnel. Nach dessen Health- und
+   Readiness-Beleg wird der Marker entfernt.
+
+Kann irgendein Vorbedingungsbeleg nicht erbracht werden, erfolgt keine
+Dienstmutation. Scheitert der Ablauf nach dem Tunnelstopp, versucht der
+Watchdog zuerst, einen markergebundenen gesunden Operator nachzuweisen, den
+Tunnel wieder zu starten und erst nach dessen Health-/Readiness-Beleg den
+Marker zu entfernen. Scheitert auch dieser Rollback, bleiben Tunnel und
+Admission-Sperre fail-closed; der separate Tunnel-Watchdog respektiert den
+aktiven Marker und greift nicht dazwischen. Nach Ablauf des Markers ist ein
+expliziter Recovery-Readback erforderlich. Die maximal erlaubten Parameter sind 60 Sekunden
+Drain und 120 Sekunden je Recovery-Fenster. Die systemd-Unit erlaubt dafür
+900 Sekunden und bleibt damit über dem konservativen Vorwärts- und Rollbackbudget.
+
+Schwere read-only Oberflächen (`current_work`, Checkout-Binding-Reconcile und
+der manuelle Operator-Optimierungsbericht) laufen über `asyncio.to_thread`.
+Git- und Checkout-Abfragen blockieren dadurch nicht mehr den MCP-Eventloop und
+werden nicht als vermeintlicher Operatorausfall klassifiziert.
 
 ### Backoff mit Jitter und persistenter Sperrzeit
 
@@ -169,8 +212,9 @@ nicht deklariert werden. Die Aufteilung ist deshalb:
 - `SuccessExitStatus=1` wertet Routine-Evidenz (Fehlmessung, aufgeschobener
   Neustart) nicht als Unit-Fehler; Exit 2/3/4 (indeterminate, Budget
   erschöpft, Neustart ohne Genesung) bleiben sichtbare Fehler.
-  `TimeoutStartSec=90` deckt den ungünstigsten Pfad Probe + Neustart +
-  begrenzte Genesungsprüfung ab.
+  Der Tunnel-Watchdog behält `TimeoutStartSec=90`. Der koordinierte
+  Operator-Recovery nutzt `TimeoutStartSec=900`; Parametergrenzen und ein
+  konservatives Rechenbudget verhindern unbeschränkte Läufe.
 
 ### Geltungsbereich und Grenzen
 
@@ -185,8 +229,10 @@ OpenAI-Control-Plane und die korrekte Zuordnung einer konkreten ChatGPT-Sitzung.
 Connection-Generation, das Verwerfen veralteter Antworten und die
 Neuerkennung des Tool-Katalogs durch den Client liegen außerhalb dieses
 Repositories. Der Probe selbst führt keine Zielmutation aus. Der produktive
-Watchdog besitzt als eng begrenzte Eingriffsautorität ausschließlich
-`systemctl --user restart` für genau seine eigene Komponente.
+Tunnel-Watchdog besitzt ausschließlich Restart-Autorität für den Tunnel. Der
+Operator-Watchdog besitzt zusätzlich die eng begrenzte, admissiongebundene
+Autorität, den Tunnel zu stoppen und erst nach bestätigtem Ersatzoperator
+wieder zu starten. Ohne Drain- und Readiness-Beleg bleibt jede Mutation aus.
 
 ### Installation der Komponenten-Watchdogs
 
