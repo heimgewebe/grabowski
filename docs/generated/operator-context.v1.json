@@ -1517,10 +1517,10 @@
     },
     {
       "category": "bureau",
-      "description": "Assess one Bureau candidate read-only against current canonical Registry truth.",
+      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors and cannot make an otherwise incomplete call valid.",
       "effects": [],
       "id": "grabowski_bureau_candidate_assess",
-      "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+      "purpose": "Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -2916,7 +2916,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "2b0d868d3da69f634586d543a98a7984dbafbd87ac32c020ee35fbe1a2dfa998"
+      "sha256": "10b2e79ae244ea6c4098412e76c4fc3f12e51f428b2ae0be20a9f538609c744b"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2941,10 +2941,10 @@
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
-      "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
+      "src/grabowski_bureau_intake.py": "1ea3bd85f017d7a40e14051851584e4bc28a7afec477184b9bfda8b904f8e887",
       "src/grabowski_bureau_leases.py": "c22a6bc66330bcd8a39639a5e10d92f056cecc2cdbd67f1176a566ba9807184b",
-      "src/grabowski_bureau_pickup.py": "70d78e65f58dc353ccfd22f21a10ad7421b014d22d347173c952dde727d7fcac",
-      "src/grabowski_capabilities.py": "2b0d868d3da69f634586d543a98a7984dbafbd87ac32c020ee35fbe1a2dfa998",
+      "src/grabowski_bureau_pickup.py": "2f1f3d68c955061892d88152f25e88f21e6d956605f19dce45f43898cb10a06d",
+      "src/grabowski_capabilities.py": "10b2e79ae244ea6c4098412e76c4fc3f12e51f428b2ae0be20a9f538609c744b",
       "src/grabowski_checkout_binding_reconciler.py": "6198f9614b41f67412fec575410fa2b2fa63ff0fcc0db349cce55c4c29950733",
       "src/grabowski_checkouts.py": "6fb1b94b58f4b511954cdc18fe894f2ef5b14deeea443153e10a370f325fde11",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
