@@ -902,6 +902,40 @@ class ReposkopContextTests(unittest.TestCase):
             self.assertIn(identity, synced_directories)
         self.assertTrue(Path(result["usage_receipt"]["path"]).is_file())
 
+    def test_missing_root_creation_uses_bound_ancestor_descriptor(self) -> None:
+        anchor = self.root / "receipt-anchor"
+        anchor.mkdir(mode=0o700)
+        moved_anchor = self.root / "receipt-anchor-moved"
+        self.receipts = anchor / "nested" / "receipts"
+        real_open_directory = context._open_directory_descriptor
+        replaced = False
+
+        def bind_then_replace(path: Path) -> int:
+            nonlocal replaced
+            descriptor = real_open_directory(path)
+            if Path(path) == anchor and not replaced:
+                anchor.rename(moved_anchor)
+                anchor.mkdir(mode=0o700)
+                replaced = True
+            return descriptor
+
+        with (
+            patch.object(context, "RECEIPT_ROOT", self.receipts),
+            patch.object(
+                context,
+                "_open_directory_descriptor",
+                side_effect=bind_then_replace,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                context.ReposkopContextError,
+                "disappeared after descriptor binding",
+            ):
+                context._ensure_receipt_root()
+
+        self.assertEqual(list(anchor.iterdir()), [])
+        self.assertTrue((moved_anchor / "nested" / "receipts").is_dir())
+
     def test_rejects_boolean_schema_versions(self) -> None:
         cases = (
             self.report(schema_version=True),

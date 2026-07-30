@@ -486,26 +486,71 @@ def _open_directory_descriptor(path: Path) -> int:
     return descriptor
 
 
-def _fsync_directory_path(path: Path) -> None:
-    descriptor = _open_directory_descriptor(path)
+def _open_relative_receipt_directory(
+    parent_descriptor: int, component: str
+) -> int:
+    if (
+        not component
+        or component in {".", ".."}
+        or "/" in component
+        or "\x00" in component
+    ):
+        raise ReposkopContextError(
+            "Reposkop receipt directory component is invalid"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        os.fsync(descriptor)
-    finally:
+        descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+    except OSError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt directory could not be opened relative to its bound parent"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        linked = os.stat(
+            component,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or (metadata.st_dev, metadata.st_ino)
+            != (linked.st_dev, linked.st_ino)
+        ):
+            raise ReposkopContextError(
+                "Reposkop receipt directory has unsafe ownership, mode or identity"
+            )
+    except BaseException:
         os.close(descriptor)
+        raise
+    return descriptor
 
 
 def _ensure_receipt_root() -> None:
     if RECEIPT_ROOT.is_symlink():
         raise ReposkopContextError("Reposkop receipt root may not be a symlink")
 
-    missing: list[Path] = []
+    missing_components: list[str] = []
     cursor = RECEIPT_ROOT
     while not cursor.exists():
         if cursor.is_symlink():
             raise ReposkopContextError(
                 "Reposkop receipt root path may not contain a symlink leaf"
             )
-        missing.append(cursor)
+        component = cursor.name
+        if not component or component in {".", ".."}:
+            raise ReposkopContextError(
+                "Reposkop receipt root has an invalid missing component"
+            )
+        missing_components.append(component)
         parent = cursor.parent
         if parent == cursor:
             raise ReposkopContextError(
@@ -519,36 +564,34 @@ def _ensure_receipt_root() -> None:
             "Reposkop receipt root ancestor is not a stable directory"
         )
 
-    for directory in reversed(missing):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        metadata = directory.stat(follow_symlinks=False)
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-        ):
-            raise ReposkopContextError(
-                "Reposkop newly created receipt directory is unsafe"
+    descriptor = _open_directory_descriptor(cursor)
+    try:
+        for component in reversed(missing_components):
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ReposkopContextError(
+                    "Reposkop receipt directory could not be created relative to its bound parent"
+                ) from exc
+
+            child_descriptor = _open_relative_receipt_directory(
+                descriptor, component
             )
-        _fsync_directory_path(directory.parent)
+            try:
+                os.fsync(child_descriptor)
+                os.fsync(descriptor)
+            except BaseException:
+                os.close(child_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = child_descriptor
 
-    if not missing:
-        _fsync_directory_path(RECEIPT_ROOT.parent)
-
-    metadata = RECEIPT_ROOT.stat(follow_symlinks=False)
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-    ):
-        raise ReposkopContextError(
-            "Reposkop receipt root has unsafe ownership, type or mode"
-        )
+        _validate_receipt_root_descriptor(descriptor)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
