@@ -87,6 +87,34 @@ def _launcher(returncode: int = 0) -> dict[str, object]:
     }
 
 
+def _missing_unit_observation(
+    *,
+    observed_at_unix: int,
+    duration_seconds: float,
+    returncode: int = 0,
+) -> dict[str, object]:
+    probe = _launcher(returncode)
+    probe["duration_seconds"] = duration_seconds
+    return {
+        "state": "completed",
+        "properties": {
+            "LoadState": "not-found",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "Result": "success",
+            "ExecMainCode": "0",
+            "ExecMainStatus": "0",
+        },
+        "probe": probe,
+        "observer": {
+            "kind": "fleet-dispatch-v1",
+            "execution_backend": "systemd-user",
+            "systemd_scope": "user",
+        },
+        "observed_at_unix": observed_at_unix,
+    }
+
+
 class TaskTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -113,6 +141,7 @@ class TaskTests(unittest.TestCase):
         self.db_patch.start()
         self.outcomes_patch.start()
         self.resource_patch.start()
+        self.start_counter = 0
 
     def tearDown(self) -> None:
         self.resource_patch.stop()
@@ -199,6 +228,8 @@ class TaskTests(unittest.TestCase):
         resource_keys: list[str] | None = None,
     ) -> dict[str, object]:
         selected = LOCAL_HOST if host == "local" else REMOTE_HOST
+        self.start_counter += 1
+        command_argument = "ok" if self.start_counter == 1 else f"ok-{self.start_counter}"
         with patch.object(tasks.fleet, "fleet_host", return_value=selected), patch.object(
             tasks, "_dispatch", return_value=_launcher()
         ) as dispatch, patch.object(tasks.base, "_append_audit"), patch.object(
@@ -206,7 +237,7 @@ class TaskTests(unittest.TestCase):
         ):
             result = tasks.grabowski_task_start(
                 host,
-                ["/bin/echo", "ok"],
+                ["/bin/echo", command_argument],
                 cwd=str(self.root),
                 runtime_seconds=60,
                 resume_policy="verify-then-retry",
@@ -231,7 +262,7 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=ProtectHome=no", launch)
         self.assertIn("--property=MemoryDenyWriteExecute=no", launch)
         self.assertIn("--property=UMask=0077", launch)
-        self.assertEqual(launch[-3:], ["--", "/bin/echo", "ok"])
+        self.assertEqual(launch[-3:], ["--", "/bin/echo", command_argument])
         return result
 
     def _prepare_pending_terminalization(
@@ -2240,6 +2271,563 @@ class TaskTests(unittest.TestCase):
             )
         )
         self.assertIsNotNone(tasks.resources.inspect_resource("display:12"))
+
+    def test_exact_reconcile_resume_allows_named_manual_policy_override(self) -> None:
+        started = self._start()
+        source = tasks._set_state(
+            str(started["task"]["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=str(source["task_id"]),
+                reason="repository dependency changed after the failed attempt",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["blocked"])
+        self.assertEqual(1, len(result["resumed"]))
+        successor = result["resumed"][0]
+        self.assertTrue(successor["explicit_policy_override"])
+        self.assertEqual(source["task_id"], successor["retry_of_task_id"])
+
+    def test_exact_reconcile_resume_allows_named_interrupted_recovery(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        source = tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=170,
+            duration_seconds=0.01,
+        )
+        revalidated = _missing_unit_observation(
+            observed_at_unix=171,
+            duration_seconds=0.99,
+        )
+        launch_bindings: list[dict[str, object]] = []
+
+        def launch_with_persisted_binding(record: dict[str, object]) -> dict[str, object]:
+            pending = tasks._row_raw(task_id)
+            launcher = json.loads(str(pending["launcher_json"]))
+            binding = launcher["interrupted_recovery_binding"]
+            launch_bindings.append(binding)
+            self.assertEqual("launching", pending["state"])
+            self.assertEqual(source["task_id"], binding["source_task_id"])
+            self.assertEqual(
+                tasks._record_execution_identity(source)["identity_sha256"],
+                binding["source_execution_identity_sha256"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "unresolved recovery attempt"):
+                tasks._guard_direct_terminal_retry_record(pending)
+            return _launcher()
+
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=revalidated),
+            patch.object(tasks, "_launch", side_effect=launch_with_persisted_binding),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 171},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted dependency state",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], result["blocked"])
+        self.assertEqual(1, len(result["resumed"]))
+        resumed = result["resumed"][0]
+        self.assertTrue(resumed["explicit_interrupted_recovery"])
+        self.assertEqual(2, resumed["attempt"])
+        self.assertEqual(1, len(launch_bindings))
+        persisted = tasks._row_raw(task_id)
+        persisted_launcher = json.loads(str(persisted["launcher_json"]))
+        self.assertEqual(
+            launch_bindings[0]["context_sha256"],
+            persisted_launcher["interrupted_recovery_binding"]["context_sha256"],
+        )
+
+
+    def test_interrupted_retry_successor_recovery_preserves_retry_binding(self) -> None:
+        started = self._start()
+        source = tasks._set_state(
+            str(started["task"]["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 180},
+            ),
+        ):
+            first_retry = tasks.reconcile_tasks_resume(
+                task_id=str(source["task_id"]),
+                reason="operator repaired the original failure",
+                max_resumes=1,
+            )
+        self.assertEqual([], first_retry["blocked"])
+        successor_id = str(first_retry["resumed"][0]["task_id"])
+        successor = tasks._row_raw(successor_id)
+        retry_binding = tasks._persisted_retry_binding_or_raise(successor)
+        self.assertIsNotNone(retry_binding)
+
+        tasks._set_state(
+            successor_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "host-restart"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=181,
+            duration_seconds=0.01,
+        )
+        revalidated = _missing_unit_observation(
+            observed_at_unix=182,
+            duration_seconds=0.02,
+        )
+        observed_launchers: list[dict[str, object]] = []
+
+        def launch_with_retry_edge(record: dict[str, object]) -> dict[str, object]:
+            pending = tasks._row_raw(successor_id)
+            launcher = json.loads(str(pending["launcher_json"]))
+            self.assertEqual("launching", pending["state"])
+            self.assertEqual(retry_binding, launcher["retry_binding"])
+            self.assertIn("interrupted_recovery_binding", launcher)
+            observed_launchers.append(launcher)
+            return _launcher()
+
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=revalidated),
+            patch.object(tasks, "_launch", side_effect=launch_with_retry_edge),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 182},
+            ),
+        ):
+            recovered = tasks.reconcile_tasks_resume(
+                task_id=successor_id,
+                reason="operator repaired the interrupted successor",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], recovered["blocked"])
+        self.assertEqual(1, len(recovered["resumed"]))
+        self.assertEqual(1, len(observed_launchers))
+        persisted = tasks._row_raw(successor_id)
+        persisted_launcher = json.loads(str(persisted["launcher_json"]))
+        self.assertEqual(retry_binding, persisted_launcher["retry_binding"])
+        self.assertIn("interrupted_recovery_binding", persisted_launcher)
+        self.assertEqual(
+            retry_binding,
+            tasks._persisted_retry_binding_or_raise(persisted),
+        )
+        retained = tasks._retained_retry_successor_for_source(
+            str(source["task_id"])
+        )
+        self.assertIsNotNone(retained)
+        self.assertEqual(successor_id, retained["task_id"])
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 183},
+            ),
+        ):
+            duplicate = tasks.reconcile_tasks_resume(
+                task_id=str(source["task_id"]),
+                reason="attempted duplicate successor",
+                max_resumes=1,
+            )
+        self.assertEqual([], duplicate["resumed"])
+        self.assertIn("retry successor", duplicate["blocked"][0]["reason"])
+
+    def test_interrupted_recovery_rejects_malformed_retry_binding_before_effects(
+        self,
+    ) -> None:
+        resource_key = f"path:{self.root}"
+        started = self._start(resource_keys=[resource_key])
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "host-restart"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (json.dumps({"retry_binding": {"source_task_id": "bad"}}), task_id),
+            )
+            connection.commit()
+        admitted = _missing_unit_observation(
+            observed_at_unix=184,
+            duration_seconds=0.01,
+        )
+        revalidated = _missing_unit_observation(
+            observed_at_unix=185,
+            duration_seconds=0.02,
+        )
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=revalidated),
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 185},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted task",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["resumed"])
+        self.assertIn(
+            "stored retry admission evidence is invalid",
+            result["blocked"][0]["reason"],
+        )
+        acquire.assert_not_called()
+        launch.assert_not_called()
+        persisted = tasks._row_raw(task_id)
+        self.assertEqual("interrupted", persisted["state"])
+        self.assertEqual(1, persisted["attempt"])
+
+    def test_interrupted_recovery_requires_exact_task_target(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        observation = _missing_unit_observation(
+            observed_at_unix=172,
+            duration_seconds=0.01,
+        )
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=observation),
+            patch.object(tasks, "_set_state") as set_state,
+            patch.object(tasks, "_launch") as launch,
+        ):
+            result = tasks.reconcile_tasks_resume(
+                reason="broad scans do not establish interrupted recovery authority",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["resumed"])
+        self.assertEqual(task_id, result["blocked"][0]["task_id"])
+        self.assertEqual("evidence_drift", result["blocked"][0]["reason_class"])
+        set_state.assert_not_called()
+        launch.assert_not_called()
+
+    def test_interrupted_recovery_revalidates_material_evidence_before_effects(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=173,
+            duration_seconds=0.01,
+            returncode=0,
+        )
+        changed = _missing_unit_observation(
+            observed_at_unix=174,
+            duration_seconds=0.02,
+            returncode=4,
+        )
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=changed),
+            patch.object(tasks.resources, "acquire_resources") as acquire,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 174},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted dependency state",
+                max_resumes=1,
+            )
+        self.assertEqual([], result["resumed"])
+        self.assertEqual("evidence_drift", result["blocked"][0]["reason_class"])
+        self.assertIn("binding is stale", result["blocked"][0]["reason"])
+        acquire.assert_not_called()
+        launch.assert_not_called()
+
+    def test_interrupted_recovery_persists_binding_before_lease_effect(self) -> None:
+        resource_key = f"path:{self.root}"
+        started = self._start(resource_keys=[resource_key])
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "interrupted",
+            observation={"state": "interrupted", "source": "startup-recovery"},
+        )
+        admitted = _missing_unit_observation(
+            observed_at_unix=175,
+            duration_seconds=0.01,
+        )
+        revalidated = _missing_unit_observation(
+            observed_at_unix=176,
+            duration_seconds=0.02,
+        )
+
+        def fail_after_binding(*args: object, **kwargs: object) -> dict[str, object]:
+            pending = tasks._row_raw(task_id)
+            launcher = json.loads(str(pending["launcher_json"]))
+            self.assertEqual("launching", pending["state"])
+            self.assertEqual(2, pending["attempt"])
+            self.assertIn("interrupted_recovery_binding", launcher)
+            with self.assertRaisesRegex(RuntimeError, "unresolved recovery attempt"):
+                tasks._guard_direct_terminal_retry_record(pending)
+            raise RuntimeError("synthetic lease acquisition failure")
+
+        with (
+            patch.object(tasks, "_reconcile_observation", return_value=admitted),
+            patch.object(tasks, "_observe", return_value=revalidated),
+            patch.object(
+                tasks.resources,
+                "acquire_resources",
+                side_effect=fail_after_binding,
+            ) as acquire,
+            patch.object(tasks, "_launch") as launch,
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 176},
+            ),
+        ):
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                reason="operator repaired the interrupted dependency state",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], result["resumed"])
+        self.assertIn("lease acquisition failure", result["blocked"][0]["reason"])
+        acquire.assert_called_once()
+        launch.assert_not_called()
+        persisted = tasks._row_raw(task_id)
+        self.assertEqual("launching", persisted["state"])
+        self.assertIn(
+            "interrupted_recovery_binding",
+            json.loads(str(persisted["launcher_json"])),
+        )
+
+    def test_direct_resume_requires_recovery_evidence_for_every_interrupted_policy(self) -> None:
+        for policy in ("manual", "verify-then-retry", "retry-safe"):
+            with self.subTest(policy=policy):
+                started = self._start()
+                task_id = str(started["task"]["task_id"])
+                with tasks._database() as connection:
+                    connection.execute(
+                        "UPDATE tasks SET resume_policy=? WHERE task_id=?",
+                        (policy, task_id),
+                    )
+                tasks._set_state(
+                    task_id,
+                    "interrupted",
+                    observation={"state": "interrupted", "source": "startup-recovery"},
+                )
+                with (
+                    patch.object(tasks, "_observe") as observe,
+                    patch.object(tasks, "_launch") as launch,
+                    self.assertRaisesRegex(
+                        PermissionError,
+                        "requires exact recovery evidence",
+                    ),
+                ):
+                    tasks.grabowski_task_resume(task_id)
+                observe.assert_not_called()
+                launch.assert_not_called()
+
+    def test_terminal_retry_replays_managed_cargo_binding_once(self) -> None:
+        cache_key = "a" * 64
+        target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        bound = [
+            tasks.FLOCK_EXECUTABLE,
+            "--shared",
+            str(lock),
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target}",
+            "/usr/bin/cargo",
+            "test",
+        ]
+        record = {
+            "argv_json": json.dumps(bound),
+            "host": "local",
+            "execution_backend": "systemd-user",
+        }
+        with patch.object(tasks, "_managed_cargo_lifecycle_lock") as prepare_lock:
+            replay = tasks._terminal_retry_command(record)
+        self.assertEqual(bound[3:], replay)
+        prepare_lock.assert_not_called()
+
+        record["argv_json"] = json.dumps(
+            [bound[0], bound[1], "/tmp/wrong.lock", *bound[3:]]
+        )
+        with patch.object(
+            tasks, "_managed_cargo_lifecycle_lock"
+        ) as prepare_lock, self.assertRaisesRegex(
+            RuntimeError, "lock binding is invalid"
+        ):
+            tasks._terminal_retry_command(record)
+        prepare_lock.assert_not_called()
+
+    def test_terminal_retry_replays_every_accepted_env_spelling(self) -> None:
+        cache_key = "b" * 64
+        target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        for env_executable in ("env", "/bin/env", tasks.SYSTEMD_ENV_EXECUTABLE):
+            with self.subTest(env_executable=env_executable):
+                bound = [
+                    tasks.FLOCK_EXECUTABLE,
+                    "--shared",
+                    str(lock),
+                    env_executable,
+                    f"CARGO_TARGET_DIR={target}",
+                    "/usr/bin/cargo",
+                    "test",
+                ]
+                record = {
+                    "argv_json": json.dumps(bound),
+                    "host": "local",
+                    "execution_backend": "systemd-user",
+                }
+                with patch.object(
+                    tasks, "_managed_cargo_lifecycle_lock"
+                ) as prepare_lock:
+                    replay = tasks._terminal_retry_command(record)
+                self.assertEqual(bound[3:], replay)
+                prepare_lock.assert_not_called()
+
+    def test_exact_reconcile_resume_allows_named_retry_safe_budget_override(self) -> None:
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "retry-safe-exhausted"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+            )["task"]
+        task_id = str(started["task_id"])
+        with tasks._database() as connection:
+            unit = f"grabowski-task-{task_id}-a2.service"
+            connection.execute(
+                "UPDATE tasks SET attempt=2, unit=?, authoritative_unit=? "
+                "WHERE task_id=?",
+                (unit, unit, task_id),
+            )
+        source = tasks._set_state(
+            task_id,
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        successor = {
+            "task_id": "f" * 24,
+            "state": "running",
+            "explicit_policy_override": True,
+        }
+        with patch.object(
+            tasks,
+            "_terminal_retry_successor",
+            return_value=successor,
+        ) as retry:
+            result = tasks.reconcile_tasks_resume(
+                task_id=task_id,
+                max_resumes=1,
+                reason="repository dependency changed after retry budget exhaustion",
+            )
+
+        self.assertEqual([], result["blocked"])
+        self.assertEqual([successor], result["resumed"])
+        retry.assert_called_once_with(
+            tasks._row_raw(task_id),
+            reason="repository dependency changed after retry budget exhaustion",
+            explicit_policy_override=True,
+        )
+        self.assertEqual("retry-safe", source["resume_policy"])
+
+    def test_exact_reconcile_resume_keeps_never_policy_non_overridable(self) -> None:
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            started = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "never-retry"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="never",
+            )
+            source = tasks._set_state(
+                str(started["task"]["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            result = tasks.reconcile_tasks_resume(
+                task_id=str(source["task_id"]),
+                reason="repository dependency changed after the failed attempt",
+                max_resumes=1,
+            )
+
+        self.assertEqual([], result["resumed"])
+        self.assertEqual(1, len(result["blocked"]))
+        self.assertEqual(source["task_id"], result["blocked"][0]["task_id"])
+        self.assertEqual("never", result["blocked"][0]["resume_policy"])
+        self.assertEqual(
+            "non_retryable_failure",
+            result["blocked"][0]["reason_class"],
+        )
 
     def test_reconcile_resume_blocks_unverified_policy(self) -> None:
         started = self._start()
@@ -4847,6 +5435,858 @@ class TaskTests(unittest.TestCase):
             tasks.grabowski_task_list()
 
 
+
+    def test_managed_cargo_retry_is_blocked_before_environment_preparation(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        cache_key = "c" * 64
+        target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        bound_command = [
+            tasks.FLOCK_EXECUTABLE,
+            "--shared",
+            str(lifecycle_lock),
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target_dir}",
+            *raw_command,
+        ]
+        common = {
+            "host": "local",
+            "argv": raw_command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks,
+                "_bind_managed_cargo_environment",
+                return_value=bound_command,
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+        tasks._set_state(
+            str(first["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(tasks, "_bind_managed_cargo_environment") as prepare,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        prepare.assert_not_called()
+
+    def test_explicit_managed_cargo_retry_is_blocked_before_lock_preparation(self) -> None:
+        cache_key = "d" * 64
+        target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        command = [
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target_dir}",
+            "/usr/bin/cargo",
+            "test",
+        ]
+        common = {
+            "host": "local",
+            "argv": command,
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(
+                tasks,
+                "_managed_cargo_lifecycle_lock",
+                return_value=lifecycle_lock,
+            ),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+        tasks._set_state(
+            str(first["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_managed_cargo_lifecycle_lock") as prepare_lock,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+        prepare_lock.assert_not_called()
+
+    def test_unprepared_managed_cargo_blocks_exposed_cancelled_successor_source(self) -> None:
+        raw_command = ["/usr/bin/cargo", "check"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        source = {"task_id": "c" * 24, "state": "failed"}
+        cancelled = {"task_id": "d" * 24, "state": "cancelled"}
+        with (
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(
+                tasks,
+                "_latest_matching_unprepared_managed_cargo_record",
+                return_value=cancelled,
+            ),
+            patch.object(
+                tasks,
+                "_matching_attention_unprepared_managed_cargo_records",
+                return_value=[source],
+            ),
+            patch.object(
+                tasks, "_retained_retry_successor_for_source", return_value=None
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ),
+        ):
+            tasks._guard_unprepared_managed_cargo_retry(
+                raw_command,
+                target=LOCAL_HOST,
+                cwd=str(self.root),
+                execution_backend="systemd-user",
+                identity=identity,
+                retry_context=None,
+            )
+
+    def test_invalid_named_managed_cargo_retry_is_rejected_before_preparation(self) -> None:
+        raw_command = ["/usr/bin/cargo", "check"]
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        with (
+            patch.object(tasks, "_managed_cargo_request_root", return_value=self.root),
+            patch.object(tasks, "_row_raw") as row,
+            self.assertRaisesRegex(ValueError, "source task is invalid"),
+        ):
+            tasks._guard_unprepared_managed_cargo_retry(
+                raw_command,
+                target=LOCAL_HOST,
+                cwd=str(self.root),
+                execution_backend="systemd-user",
+                identity=identity,
+                retry_context={},
+            )
+        row.assert_not_called()
+
+
+    def test_managed_cargo_attention_limit_counts_only_command_matches(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+
+        def start_failed(command: list[str], cache_key: str) -> dict[str, object]:
+            target_dir = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+            lifecycle_lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+            bound = [
+                tasks.FLOCK_EXECUTABLE,
+                "--shared",
+                str(lifecycle_lock),
+                tasks.SYSTEMD_ENV_EXECUTABLE,
+                f"CARGO_TARGET_DIR={target_dir}",
+                *command,
+            ]
+            with (
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(
+                    tasks, "_managed_cargo_request_root", return_value=self.root
+                ),
+                patch.object(
+                    tasks, "_bind_managed_cargo_environment", return_value=bound
+                ),
+                patch.object(tasks, "_dispatch", return_value=_launcher()),
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(
+                    tasks,
+                    "_require_recovery_gate",
+                    return_value={"checked_at_unix": 123},
+                ),
+            ):
+                started = tasks.grabowski_task_start(
+                    "local",
+                    command,
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                    resume_policy="retry-safe",
+                    cpu_weight=50,
+                    io_weight=25,
+                )["task"]
+            return tasks._set_state(
+                str(started["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+
+        relevant = start_failed(raw_command, "a" * 64)
+        start_failed(["/usr/bin/cargo", "check"], "b" * 64)
+        start_failed(["/usr/bin/cargo", "clippy"], "c" * 64)
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=None,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        with patch.object(tasks, "MANAGED_CARGO_ATTENTION_MATCH_LIMIT", 1):
+            records = tasks._matching_attention_unprepared_managed_cargo_records(
+                identity, raw_command
+            )
+        self.assertEqual(
+            [relevant["task_id"]],
+            [item["task_id"] for item in records],
+        )
+
+        duplicate = dict(tasks._row_raw(str(relevant["task_id"])))
+        duplicate["task_id"] = "f" * 24
+        duplicate["unit"] = tasks._task_unit(duplicate["task_id"], 1)
+        duplicate["authoritative_unit"] = duplicate["unit"]
+        duplicate["lease_owner_id"] = f"task:{duplicate['task_id']}"
+        duplicate["created_at_unix"] = int(duplicate["created_at_unix"]) + 1
+        duplicate["updated_at_unix"] = int(duplicate["updated_at_unix"]) + 1
+        columns = tuple(duplicate)
+        with tasks._database() as connection:
+            connection.execute(
+                f"INSERT INTO tasks ({','.join(columns)}) VALUES "
+                f"({','.join('?' for _ in columns)})",
+                tuple(duplicate[column] for column in columns),
+            )
+            connection.commit()
+        with (
+            patch.object(tasks, "MANAGED_CARGO_ATTENTION_MATCH_LIMIT", 1),
+            self.assertRaisesRegex(RuntimeError, "scan limit exceeded"),
+        ):
+            tasks._matching_attention_unprepared_managed_cargo_records(
+                identity, raw_command
+            )
+
+    def test_managed_cargo_attention_scan_keeps_corrupt_argv_fail_closed(self) -> None:
+        raw_command = ["/usr/bin/cargo", "test"]
+        relevant = self._start()["task"]
+        task_id = str(relevant["task_id"])
+        tasks._set_state(
+            task_id,
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET argv_json='{' WHERE task_id=?",
+                (task_id,),
+            )
+            connection.commit()
+        identity = tasks._task_execution_identity(
+            host="local",
+            argv_sha256=tasks.command_identity.argv_sha256(raw_command),
+            cwd=str(self.root),
+            resource_keys=[],
+            runtime_seconds=60,
+            cpu_weight=50,
+            io_weight=25,
+            memory_max_bytes=64 * 1024 * 1024,
+            chronik_outbox_enabled=False,
+            chronik_outbox_state_root=None,
+            chronik_context_json=None,
+            execution_backend="systemd-user",
+            systemd_scope="user",
+        )
+        with self.assertRaisesRegex(RuntimeError, "stored task argv is invalid"):
+            tasks._matching_attention_unprepared_managed_cargo_records(
+                identity, raw_command
+            )
+
+    def test_task_start_blocks_unchanged_terminal_failure_without_named_change(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+            tasks._set_state(
+                str(first["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "unchanged terminal task retry blocked",
+            ):
+                tasks.grabowski_task_start(**common)
+        rows = tasks.grabowski_task_list(limit=20, view="evidence")
+        self.assertEqual(1, rows["total_matching"])
+
+    def test_latest_matching_execution_breaks_same_second_ties_by_rowid(self) -> None:
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            original = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "rowid-order"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resume_policy="retry-safe",
+                cpu_weight=50,
+                io_weight=25,
+                memory_max_bytes=64 * 1024 * 1024,
+            )["task"]
+        template = tasks._row_raw(str(original["task_id"]))
+        columns = list(template)
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET created_at_unix=1 WHERE task_id=?",
+                (original["task_id"],),
+            )
+            for task_id, marker in (("f" * 24, "a"), ("0" * 24, "b")):
+                clone = dict(template)
+                clone.update(
+                    {
+                        "task_id": task_id,
+                        "unit": f"grabowski-task-{task_id}-a1.service",
+                        "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+                        "state": "failed",
+                        "created_at_unix": 100,
+                        "updated_at_unix": 100,
+                        "terminalized_at_unix": 100,
+                        "terminalization_sha256": marker * 64,
+                        "lifecycle_receipt_sha256": marker * 64,
+                    }
+                )
+                connection.execute(
+                    f"INSERT INTO tasks ({','.join(columns)}) VALUES "
+                    f"({','.join('?' for _ in columns)})",
+                    tuple(clone[column] for column in columns),
+                )
+        newest = tasks._row_raw("0" * 24)
+        identity = tasks._record_execution_identity(newest)
+        selected = tasks._latest_matching_execution_record(identity)
+        self.assertIsNotNone(selected)
+        assert selected is not None
+        self.assertEqual("0" * 24, selected["task_id"])
+
+    def test_named_retry_validation_uses_exact_source_not_latest_independent_failure(self) -> None:
+        source_id = "1" * 24
+        latest_id = "2" * 24
+        identity = {"identity_sha256": "a" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "failed"}
+        context = {"source_task_id": source_id}
+        validated = {"source_task_id": source_id, "context_sha256": "b" * 64}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=None
+        ), patch.object(
+            tasks, "_validate_terminal_retry_context", return_value=validated
+        ) as validate:
+            observed = tasks._guard_unchanged_terminal_retry(identity, context)
+
+        self.assertEqual(validated, observed)
+        validate.assert_called_once_with(
+            context, predecessor=source, identity=identity
+        )
+
+    def test_named_retry_validation_allows_source_after_cancelled_linked_successor(self) -> None:
+        source_id = "3" * 24
+        latest_id = "4" * 24
+        identity = {"identity_sha256": "c" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "cancelled"}
+        context = {"source_task_id": source_id}
+        binding = {"source_task_id": source_id}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=binding
+        ), patch.object(
+            tasks,
+            "_validate_terminal_retry_context",
+            return_value={"source_task_id": source_id},
+        ):
+            observed = tasks._guard_unchanged_terminal_retry(identity, context)
+
+        self.assertEqual(source_id, observed["source_task_id"])
+
+    def test_direct_start_blocks_exposed_source_after_cancelled_successor(self) -> None:
+        source_id = "a" * 24
+        cancelled_id = "b" * 24
+        identity = {"identity_sha256": "c" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": cancelled_id, "state": "cancelled"}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(
+            tasks, "_matching_attention_execution_records", return_value=[source]
+        ), patch.object(
+            tasks, "_retained_retry_successor_for_source", return_value=None
+        ), self.assertRaisesRegex(RuntimeError, "unchanged terminal task retry blocked"):
+            tasks._guard_unchanged_terminal_retry(identity, None)
+
+
+    def test_named_retry_validation_blocks_active_linked_successor(self) -> None:
+        source_id = "5" * 24
+        latest_id = "6" * 24
+        identity = {"identity_sha256": "d" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "running"}
+        context = {"source_task_id": source_id}
+        binding = {"source_task_id": source_id}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=binding
+        ), self.assertRaisesRegex(RuntimeError, "unresolved retry successor"):
+            tasks._guard_unchanged_terminal_retry(identity, context)
+
+    def test_retained_retry_successor_search_is_bound_to_exact_source(self) -> None:
+        source = self._start()["task"]
+        relevant = self._start()["task"]
+        unrelated = self._start()["task"]
+        source_id = str(source["task_id"])
+        relevant_id = str(relevant["task_id"])
+        unrelated_id = str(unrelated["task_id"])
+        for task_id, bound_source in (
+            (relevant_id, source_id),
+            (unrelated_id, "f" * 24),
+        ):
+            tasks._set_state(
+                task_id,
+                "completed",
+                observation={"state": "completed", "source": "test"},
+            )
+            with tasks._database() as connection:
+                connection.execute(
+                    "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                    (
+                        tasks._canonical_json(
+                            {"retry_binding": {"source_task_id": bound_source}}
+                        ),
+                        task_id,
+                    ),
+                )
+        with patch.object(
+            tasks,
+            "_persisted_retry_binding_or_raise",
+            side_effect=lambda record: json.loads(str(record["launcher_json"]))[
+                "retry_binding"
+            ],
+        ):
+            retained = tasks._retained_retry_successor_for_source(source_id)
+        self.assertIsNotNone(retained)
+        assert retained is not None
+        self.assertEqual(relevant_id, retained["task_id"])
+
+    def test_named_retry_blocks_retained_successor_behind_newer_ordinary_task(self) -> None:
+        source_id = "7" * 24
+        retained_id = "8" * 24
+        latest_id = "9" * 24
+        identity = {"identity_sha256": "e" * 64}
+        source = {"task_id": source_id, "state": "failed"}
+        latest = {"task_id": latest_id, "state": "running"}
+        retained = {"task_id": retained_id, "state": "completed"}
+        context = {"source_task_id": source_id}
+
+        with patch.object(
+            tasks, "_latest_matching_execution_record", return_value=latest
+        ), patch.object(tasks, "_row_raw", return_value=source), patch.object(
+            tasks, "_record_execution_identity", return_value=identity
+        ), patch.object(
+            tasks, "_persisted_retry_binding_or_raise", return_value=None
+        ), patch.object(
+            tasks,
+            "_retained_retry_successor_for_source",
+            return_value=retained,
+        ), self.assertRaisesRegex(RuntimeError, "already has a retained successor"):
+            tasks._guard_unchanged_terminal_retry(identity, context)
+
+    def test_terminal_retry_command_does_not_prepare_lock_for_retained_successor(
+        self,
+    ) -> None:
+        """Named reconcile must not mkdir lock roots before successor admission."""
+        cache_key = "c" * 64
+        target = tasks.MANAGED_CARGO_CACHE_ROOT / cache_key / "target"
+        lock = tasks.MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+        bound = [
+            tasks.FLOCK_EXECUTABLE,
+            "--shared",
+            str(lock),
+            tasks.SYSTEMD_ENV_EXECUTABLE,
+            f"CARGO_TARGET_DIR={target}",
+            "/usr/bin/cargo",
+            "test",
+        ]
+        record = {
+            "argv_json": json.dumps(bound),
+            "host": "local",
+            "execution_backend": "systemd-user",
+        }
+        with patch.object(tasks, "_managed_cargo_lifecycle_lock") as prepare_lock:
+            replay = tasks._terminal_retry_command(record)
+        self.assertEqual(bound[3:], replay)
+        prepare_lock.assert_not_called()
+
+    def test_retry_binding_is_persisted_before_dispatch_and_blocks_duplicate_start(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "predispatch-retry-binding"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+        source = tasks._set_state(
+            str(first["task_id"]),
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        retry_context = tasks._build_terminal_retry_context(
+            source,
+            reason="repository head advanced after the failed validation",
+        )
+        dispatched: dict[str, object] = {}
+
+        def launch_after_persist(record: dict[str, object]) -> dict[str, object]:
+            stored = tasks._row_raw(str(record["task_id"]))
+            pending = json.loads(str(stored["launcher_json"]))
+            self.assertIs(True, pending["pending"])
+            self.assertEqual(
+                retry_context["context_sha256"],
+                pending["retry_binding"]["context_sha256"],
+            )
+            dispatched["task_id"] = record["task_id"]
+            return _launcher()
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_launch", side_effect=launch_after_persist),
+            patch.object(
+                tasks,
+                "_set_state",
+                side_effect=RuntimeError("simulated crash after dispatch"),
+            ),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash after dispatch"),
+        ):
+            tasks.grabowski_task_start(
+                **common,
+                _retry_context=retry_context,
+            )
+
+        successor_id = str(dispatched["task_id"])
+        successor = tasks._row_raw(successor_id)
+        self.assertEqual("launching", successor["state"])
+        persisted = json.loads(str(successor["launcher_json"]))
+        self.assertEqual(
+            source["task_id"],
+            persisted["retry_binding"]["source_task_id"],
+        )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "unresolved retry successor",
+            ),
+        ):
+            tasks.grabowski_task_start(**common)
+
+    def test_reconcile_resume_allows_one_named_state_bound_successor(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "retry"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "retry-safe",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        audit_records: list[dict[str, object]] = []
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit", side_effect=audit_records.append),
+            patch.object(tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}),
+        ):
+            first = tasks.grabowski_task_start(**common)["task"]
+            source = tasks._set_state(
+                str(first["task_id"]),
+                "failed",
+                observation={"state": "failed", "source": "test"},
+            )
+            result = tasks.reconcile_tasks_resume(
+                task_id=str(first["task_id"]),
+                max_resumes=1,
+                reason="repository head advanced after the failed validation",
+            )
+        self.assertEqual(1, len(result["resumed"]))
+        successor = result["resumed"][0]
+        self.assertEqual(first["task_id"], successor["retry_of_task_id"])
+        self.assertEqual("manual", successor["resume_policy"])
+        self.assertRegex(successor["retry_context_sha256"], r"^[0-9a-f]{64}$")
+        persisted_retry = successor["launcher"]["retry_binding"]
+        self.assertEqual(first["task_id"], persisted_retry["source_task_id"])
+        self.assertEqual(
+            source["lifecycle_receipt_sha256"],
+            persisted_retry["source_lifecycle_receipt_sha256"],
+        )
+        self.assertEqual(
+            source["terminalization_sha256"],
+            persisted_retry["source_terminalization_sha256"],
+        )
+        self.assertEqual(
+            successor["retry_context_sha256"],
+            persisted_retry["context_sha256"],
+        )
+        retry_audit = next(
+            item
+            for item in audit_records
+            if item.get("operation") == "task-reconcile-retry-successor"
+        )
+        self.assertEqual(source["lifecycle_receipt_sha256"], retry_audit["source_lifecycle_receipt_sha256"])
+        self.assertEqual(successor["retry_context_sha256"], retry_audit["retry_context_sha256"])
+    def test_record_execution_identity_rejects_malformed_stored_json(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+
+        record = tasks._row_raw(task_id)
+        record["resource_keys_json"] = "{"
+        with self.assertRaisesRegex(
+            RuntimeError, "stored task resource keys are invalid"
+        ):
+            tasks._record_execution_identity(record)
+
+        record = tasks._row_raw(task_id)
+        record["chronik_context_json"] = "{"
+        with self.assertRaisesRegex(
+            RuntimeError, "stored task Chronik context is invalid"
+        ):
+            tasks._record_execution_identity(record)
+
+    def test_resource_keys_are_canonicalized_before_identity_lookup(self) -> None:
+        started = self._start(resource_keys=["display:12", "display:11"])
+        record = tasks._row_raw(str(started["task"]["task_id"]))
+        self.assertEqual(
+            ["display:11", "display:12"],
+            json.loads(str(record["resource_keys_json"])),
+        )
+
+    def test_retry_successor_scan_ignores_nested_retry_binding_keys(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "source": "test"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (
+                    tasks._canonical_json(
+                        {"diagnostic": {"retry_binding": "not-a-top-level-binding"}}
+                    ),
+                    task_id,
+                ),
+            )
+            records = tasks._task_retry_successor_records(
+                connection,
+                source_task_ids={task_id},
+                limit=0,
+            )
+        self.assertEqual([], records)
+
+    def test_retry_successor_scan_scopes_support_to_current_sources(self) -> None:
+        relevant = self._start()
+        unrelated = self._start()
+        relevant_id = str(relevant["task"]["task_id"])
+        unrelated_id = str(unrelated["task"]["task_id"])
+        relevant_successor = self._start()
+        unrelated_successor = self._start()
+        relevant_successor_id = str(relevant_successor["task"]["task_id"])
+        unrelated_successor_id = str(unrelated_successor["task"]["task_id"])
+        for task_id in (relevant_successor_id, unrelated_successor_id):
+            tasks._set_state(
+                task_id,
+                "completed",
+                observation={"state": "completed", "source": "test"},
+            )
+        with tasks._database() as connection:
+            for task_id, source_task_id in (
+                (relevant_successor_id, relevant_id),
+                (unrelated_successor_id, unrelated_id),
+            ):
+                connection.execute(
+                    "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                    (
+                        tasks._canonical_json(
+                            {"retry_binding": {"source_task_id": source_task_id}}
+                        ),
+                        task_id,
+                    ),
+                )
+            with patch.object(
+                tasks.terminal_convergence,
+                "persisted_retry_binding",
+                side_effect=lambda record: json.loads(record["launcher_json"])[
+                    "retry_binding"
+                ],
+            ):
+                records = tasks._task_retry_successor_records(
+                    connection,
+                    source_task_ids={relevant_id},
+                    limit=1,
+                )
+        self.assertEqual(
+            [relevant_successor_id],
+            [str(record["task_id"]) for record in records],
+        )
+
+    def test_retry_successor_scan_rejects_malformed_potential_binding(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "completed",
+            observation={"state": "completed", "source": "test"},
+        )
+        with tasks._database() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                ('{"retry_binding":', task_id),
+            )
+            with self.assertRaisesRegex(ValueError, "persisted task launcher is invalid"):
+                tasks._task_retry_successor_records(
+                    connection,
+                    source_task_ids={task_id},
+                    limit=1,
+                )
+
+
 class RuntimeContractTests(unittest.TestCase):
     def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:
         source = (
@@ -5586,6 +7026,7 @@ else:
                 "._require_operator_capability"
             )
         )
+
 
 
 if __name__ == "__main__":

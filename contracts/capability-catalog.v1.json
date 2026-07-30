@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2b0d868d3da69f634586d543a98a7984dbafbd87ac32c020ee35fbe1a2dfa998",
+  "capability_source_sha256": "10b2e79ae244ea6c4098412e76c4fc3f12e51f428b2ae0be20a9f538609c744b",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "b0d032e607e5c537de0e203bd19fb5210ab654d24509a34355cda2a3fe5d9d54",
   "integrity": {
@@ -1529,10 +1529,10 @@
     },
     {
       "category": "bureau",
-      "description": "Assess one Bureau candidate read-only against current canonical Registry truth.",
+      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors and cannot make an otherwise incomplete call valid.",
       "effects": [],
       "id": "grabowski_bureau_candidate_assess",
-      "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+      "purpose": "Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
