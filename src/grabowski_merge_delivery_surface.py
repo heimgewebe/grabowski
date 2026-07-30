@@ -45,7 +45,7 @@ def grabowski_merge_delivery_record(
     delivery_channel: str,
     delivery_reference: str,
 ) -> dict[str, Any]:
-    """Record one durable, exact diff delivery before a possible PR merge."""
+    """Optionally record one durable, exact diff artifact handoff."""
     try:
         result = delivery.record_merge_delivery(
             repository=repository,
