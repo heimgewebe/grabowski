@@ -18,7 +18,31 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("KillMode=mixed", text)
         self.assertNotIn("tunnel-client", text)
 
-    def test_component_watchdogs_restart_only_their_service(self) -> None:
+    def test_component_watchdogs_require_both_installed_python_assets(self) -> None:
+        helper_condition = (
+            "ConditionPathExists=%h/.local/libexec/grabowski/"
+            "watchdog_admission_recovery.py"
+        )
+        script_condition = (
+            "ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py"
+        )
+        for unit_name in (
+            "grabowski-operator-watchdog.service.example",
+            "grabowski-tunnel-watchdog.service.example",
+        ):
+            unit = (ROOT / "systemd" / unit_name).read_text(encoding="utf-8")
+            self.assertIn(script_condition, unit)
+            self.assertIn(helper_condition, unit)
+        docs = (ROOT / "docs" / "restart-watchdog.md").read_text(
+            encoding="utf-8"
+        )
+        helper_position = docs.index("tools/watchdog_admission_recovery.py")
+        watchdog_position = docs.index(
+            "tools/component_watchdog.py", helper_position
+        )
+        self.assertLess(helper_position, watchdog_position)
+
+    def test_component_watchdogs_keep_explicit_recovery_scope(self) -> None:
         operator = (
             ROOT / "systemd" / "grabowski-operator-watchdog.service.example"
         ).read_text(encoding="utf-8")
@@ -27,7 +51,9 @@ class DurableSystemdContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("--component operator", operator)
         self.assertIn("--service grabowski-operator.service", operator)
-        self.assertNotIn("tunnel-client-grabowski.service", operator)
+        self.assertIn(
+            "--tunnel-service tunnel-client-grabowski.service", operator
+        )
         self.assertIn("--component tunnel", tunnel)
         self.assertIn("--service tunnel-client-grabowski.service", tunnel)
         self.assertNotIn("grabowski-operator.service", tunnel)
@@ -84,7 +110,6 @@ class DurableSystemdContractTests(unittest.TestCase):
             text = (ROOT / "systemd" / name).read_text(encoding="utf-8")
             self.assertNotIn("--check-only", text)
             self.assertIn("SuccessExitStatus=1", text)
-            self.assertIn("TimeoutStartSec=90", text)
             self.assertIn("--max-restarts 3", text)
             self.assertIn("--restart-window 900", text)
             self.assertIn("--backoff-base 60", text)
@@ -94,11 +119,13 @@ class DurableSystemdContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", operator)
         self.assertIn("--failure-threshold 5", operator)
+        self.assertIn("TimeoutStartSec=900", operator)
         self.assertNotIn("--mcp-url", operator)
         tunnel = (
             ROOT / "systemd" / "grabowski-tunnel-watchdog.service.example"
         ).read_text(encoding="utf-8")
         self.assertIn("--failure-threshold 3", tunnel)
+        self.assertIn("TimeoutStartSec=90", tunnel)
         self.assertIn("SuccessExitStatus=1 5", tunnel)
 
     def test_timers_keep_decorrelation_while_watchdog_owns_backoff(self) -> None:

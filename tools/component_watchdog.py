@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
@@ -22,6 +22,8 @@ import time
 from typing import Callable, Iterator
 from urllib.parse import urlsplit
 import uuid
+
+import watchdog_admission_recovery as admission_recovery
 
 
 DEFAULT_STATE_DIR = Path.home() / ".local/state/grabowski"
@@ -46,6 +48,13 @@ CONNECTOR_SNAPSHOT_REFRESH_TIMEOUT_SECONDS = 8.0
 SERVICE_RESTART_REQUEST_TIMEOUT_SECONDS = 5.0
 SERVICE_RESTART_ERROR_MAX_CHARS = 512
 DEFAULT_RECOVERY_TIMEOUT_SECONDS = 60.0
+WATCHDOG_MAX_RECOVERY_TIMEOUT_SECONDS = 120.0
+WATCHDOG_MAX_RESTART_DRAIN_TIMEOUT_SECONDS = 60.0
+WATCHDOG_SERVICE_ACTION_TIMEOUT_SECONDS = 15.0
+# Tunnel stop can wait for an in-flight poll before SIGKILL; keep start tighter.
+WATCHDOG_TUNNEL_STOP_TIMEOUT_SECONDS = 30.0
+WATCHDOG_MAX_RUN_SECONDS = 900.0
+WATCHDOG_RECOVERY_MARGIN_SECONDS = 30.0
 STACK_DUMP_DIRECTORY_NAME = "operator-stackdumps-v1"
 STACK_DUMP_SLOT_COUNT = 8
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
@@ -55,10 +64,19 @@ DEFAULT_BACKOFF_MAX = 900
 BACKOFF_MAX_LEVEL = 32
 BACKOFF_JITTER_RATIO = 0.2
 DEPENDENCY_UNAVAILABLE_EXIT = 5
+WATCHDOG_ADMISSION_MARKER_NAME = admission_recovery.ADMISSION_MARKER_NAME
+WATCHDOG_ADMISSION_MAX_LIFETIME_SECONDS = (
+    admission_recovery.ADMISSION_MAX_LIFETIME_SECONDS
+)
+WATCHDOG_ADMISSION_DRAIN_TIMEOUT_SECONDS = 30.0
+WATCHDOG_RUNTIME_MANIFEST_NAME = admission_recovery.RUNTIME_MANIFEST_NAME
+WatchdogError = admission_recovery.WatchdogError
 
 
-class WatchdogError(RuntimeError):
-    pass
+class RecoveryMutationError(WatchdogError):
+    def __init__(self, reason: str, *, rollback_recovered: bool) -> None:
+        super().__init__(reason)
+        self.rollback_recovered = rollback_recovered
 
 
 class LockBusy(WatchdogError):
@@ -340,6 +358,403 @@ def get_bounded_text(url: str, timeout: float, max_bytes: int) -> str | None:
         return None
     finally:
         connection.close()
+
+
+
+def read_watchdog_admission_marker(
+    path: Path,
+) -> dict[str, object] | None:
+    return admission_recovery.read_admission_marker(path)
+
+
+def engage_watchdog_admission(
+    *, state_dir: Path, runtime_root: Path, lifetime_seconds: int
+) -> dict[str, object]:
+    return admission_recovery.engage_admission(
+        state_dir=state_dir,
+        runtime_root=runtime_root,
+        lifetime_seconds=lifetime_seconds,
+    )
+
+
+def release_watchdog_admission(
+    *, state_dir: Path, marker: dict[str, object]
+) -> None:
+    admission_recovery.release_admission(state_dir=state_dir, marker=marker)
+
+
+def operator_admission_observation(
+    *, host: str, port: int, timeout: float
+) -> dict[str, object]:
+    return admission_recovery.operator_admission_observation(
+        host=host, port=port, timeout=timeout
+    )
+
+
+def wait_for_watchdog_admission_idle(
+    marker: dict[str, object],
+    *,
+    host: str,
+    port: int,
+    timeout: float,
+) -> dict[str, object]:
+    return admission_recovery.wait_for_admission_idle(
+        marker,
+        host=host,
+        port=port,
+        timeout=timeout,
+        observation_fn=operator_admission_observation,
+    )
+
+
+def _watchdog_tunnel_metrics(text: str) -> dict[str, float]:
+    return admission_recovery.parse_tunnel_metrics(text)
+
+
+def wait_for_watchdog_tunnel_idle(
+    *, metrics_url: str, timeout: float
+) -> dict[str, object]:
+    return admission_recovery.wait_for_tunnel_idle(
+        metrics_url=metrics_url,
+        timeout=timeout,
+        text_getter=get_bounded_text,
+    )
+
+
+def service_action(
+    service: str,
+    action: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> None:
+    if action not in {"start", "stop"}:
+        raise WatchdogError("invalid-service-action")
+    timeout = (
+        WATCHDOG_SERVICE_ACTION_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    if type(timeout) is not float and type(timeout) is not int:
+        raise WatchdogError("invalid-service-action-timeout")
+    if float(timeout) <= 0:
+        raise WatchdogError("invalid-service-action-timeout")
+    try:
+        subprocess.run(
+            ["systemctl", "--user", action, service],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=float(timeout),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WatchdogError(f"service-{action}-timeout") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = _bounded_restart_stderr(exc.stderr)
+        suffix = f": {detail}" if detail else ""
+        raise WatchdogError(f"service-{action}-failed{suffix}") from exc
+    except OSError as exc:
+        raise WatchdogError(f"service-{action}-exec-failed") from exc
+
+
+def _operator_process_is_live(
+    previous: ProbeResult | None,
+    *,
+    service: str,
+    runtime_root: Path,
+    module: str,
+    host: str,
+    port: int,
+    mcp_url: str,
+    timeout: float,
+    proc_root: Path = Path("/proc"),
+) -> ProbeResult:
+    try:
+        properties = service_properties(service)
+        pid = int(properties["MainPID"])
+        start_ticks = process_start_ticks(proc_root, pid)
+        age = process_age_seconds(proc_root, pid, start_ticks=start_ticks)
+    except (KeyError, OSError, ValueError, WatchdogError):
+        return ProbeResult("indeterminate", ("operator-recovery-identity-unavailable",))
+    if (
+        properties.get("LoadState") != "loaded"
+        or properties.get("ActiveState") != "active"
+        or properties.get("SubState") != "running"
+        or pid <= 0
+        or not operator_identity_ok(proc_root, pid, runtime_root, module, host, port)
+    ):
+        return ProbeResult("unhealthy", ("operator-recovery-service-unhealthy",), pid, age, start_ticks)
+    failure = mcp_http_probe(mcp_url, timeout)
+    if failure is not None:
+        return ProbeResult("unhealthy", (failure,), pid, age, start_ticks)
+    current = ProbeResult("healthy", pid=pid, age_seconds=age, start_ticks=start_ticks)
+    if previous is not None and not _is_new_process_instance(previous, current):
+        return ProbeResult(
+            "indeterminate",
+            ("operator-recovery-process-not-replaced",),
+            pid,
+            age,
+            start_ticks,
+        )
+    return current
+
+
+def _restore_service_pair_after_failed_recovery(
+    args: argparse.Namespace, marker: dict[str, object]
+) -> dict[str, object] | None:
+    try:
+        service_action(args.service, "start")
+    except WatchdogError:
+        return None
+    operator_deadline = time.monotonic() + args.recovery_timeout
+    recovered = ProbeResult(
+        "indeterminate", ("operator-rollback-recovery-not-started",)
+    )
+    while time.monotonic() < operator_deadline:
+        time.sleep(1)
+        recovered = _operator_process_is_live(
+            None,
+            service=args.service,
+            runtime_root=args.runtime_root,
+            module=args.module,
+            host=args.host,
+            port=args.port,
+            mcp_url=args.mcp_url,
+            timeout=args.http_timeout,
+        )
+        if recovered.status != "healthy":
+            continue
+        observed = operator_admission_observation(
+            host=args.host, port=args.port, timeout=args.http_timeout
+        )
+        if (
+            observed.get("active") is True
+            and observed.get("valid") is True
+            and observed.get("admission_gate_installed") is True
+            and observed.get("token") == marker.get("token")
+            and observed.get("expected_head") == marker.get("expected_head")
+            and observed.get("source_identity_sha256")
+            == marker.get("source_identity_sha256")
+            and observed.get("active_tool_calls") == 0
+        ):
+            break
+    else:
+        return None
+
+    try:
+        service_action(args.tunnel_service, "start")
+    except WatchdogError:
+        return None
+    tunnel_deadline = time.monotonic() + args.recovery_timeout
+    while time.monotonic() < tunnel_deadline:
+        time.sleep(1)
+        if (
+            get_probe(args.health_url, "live", args.http_timeout)
+            and get_probe(args.ready_url, "ready", args.http_timeout)
+        ):
+            release_watchdog_admission(state_dir=args.state_dir, marker=marker)
+            return {
+                "operator_pid": recovered.pid,
+                "operator_start_ticks": recovered.start_ticks,
+                "tunnel_restarted": True,
+            }
+    return None
+
+
+def _operator_recovered_without_replacement(
+    args: argparse.Namespace,
+) -> ProbeResult:
+    return _operator_process_is_live(
+        None,
+        service=args.service,
+        runtime_root=args.runtime_root,
+        module=args.module,
+        host=args.host,
+        port=args.port,
+        mcp_url=args.mcp_url,
+        timeout=args.http_timeout,
+    )
+
+
+def safe_operator_restart(
+    args: argparse.Namespace,
+    previous_probe: ProbeResult,
+) -> tuple[str, ProbeResult | None, dict[str, object]]:
+    # Ceil so the admission marker never under-covers the recovery envelope.
+    lifetime = math.ceil(
+        2 * args.restart_drain_timeout
+        + 4 * args.recovery_timeout
+        + 2 * WATCHDOG_TUNNEL_STOP_TIMEOUT_SECONDS
+        + 2 * WATCHDOG_SERVICE_ACTION_TIMEOUT_SECONDS
+        + WATCHDOG_RECOVERY_MARGIN_SECONDS
+    )
+    if lifetime > WATCHDOG_ADMISSION_MAX_LIFETIME_SECONDS:
+        raise WatchdogError("watchdog-admission-lifetime-unrepresentable")
+    marker = engage_watchdog_admission(
+        state_dir=args.state_dir,
+        runtime_root=args.runtime_root,
+        lifetime_seconds=lifetime,
+    )
+    mutated = False
+    proof: dict[str, object] = {"marker": marker}
+    try:
+        proof["admission"] = wait_for_watchdog_admission_idle(
+            marker,
+            host=args.host,
+            port=args.port,
+            timeout=args.restart_drain_timeout,
+        )
+        proof["tunnel"] = wait_for_watchdog_tunnel_idle(
+            metrics_url=args.metrics_url,
+            timeout=args.restart_drain_timeout,
+        )
+        recovered_without_restart = _operator_recovered_without_replacement(args)
+        proof["operator_recheck"] = {
+            "status": recovered_without_restart.status,
+            "reasons": list(recovered_without_restart.reasons),
+            "pid": recovered_without_restart.pid,
+            "start_ticks": recovered_without_restart.start_ticks,
+        }
+        if recovered_without_restart.status == "healthy":
+            release_watchdog_admission(state_dir=args.state_dir, marker=marker)
+            return "recovered-without-restart", recovered_without_restart, proof
+
+        # The first tunnel proof can become stale while liveness is rechecked.
+        # Admission is already closed, so a second stable balance proof directly
+        # before mutation establishes that every polled command received a final
+        # response and that no queue item remains.
+        proof["tunnel_final"] = wait_for_watchdog_tunnel_idle(
+            metrics_url=args.metrics_url,
+            timeout=args.restart_drain_timeout,
+        )
+        recovered_without_restart = _operator_recovered_without_replacement(args)
+        proof["operator_recheck"] = {
+            "status": recovered_without_restart.status,
+            "reasons": list(recovered_without_restart.reasons),
+            "pid": recovered_without_restart.pid,
+            "start_ticks": recovered_without_restart.start_ticks,
+        }
+        if recovered_without_restart.status == "healthy":
+            release_watchdog_admission(state_dir=args.state_dir, marker=marker)
+            return "recovered-without-restart", recovered_without_restart, proof
+        emit(
+            "grabowski.component_watchdog.restart_drained",
+            component=args.component,
+            service=args.service,
+            tunnel_service=args.tunnel_service,
+            admission=proof["admission"],
+            tunnel=proof["tunnel_final"],
+        )
+        # A timed-out systemctl stop may already have taken effect. Mark the
+        # recovery as mutating before issuing the request so every ambiguous
+        # outcome retains admission and enters rollback handling.
+        mutated = True
+        service_action(
+            args.tunnel_service,
+            "stop",
+            timeout_seconds=WATCHDOG_TUNNEL_STOP_TIMEOUT_SECONDS,
+        )
+        restart_service(args.service)
+        deadline = time.monotonic() + args.recovery_timeout
+        recovered = ProbeResult("indeterminate", ("operator-recovery-not-started",))
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            recovered = _operator_process_is_live(
+                previous_probe,
+                service=args.service,
+                runtime_root=args.runtime_root,
+                module=args.module,
+                host=args.host,
+                port=args.port,
+                mcp_url=args.mcp_url,
+                timeout=args.http_timeout,
+            )
+            if recovered.status == "healthy":
+                observed = operator_admission_observation(
+                    host=args.host, port=args.port, timeout=args.http_timeout
+                )
+                if (
+                    observed.get("active") is True
+                    and observed.get("valid") is True
+                    and observed.get("admission_gate_installed") is True
+                    and observed.get("token") == marker.get("token")
+                    and observed.get("expected_head")
+                    == marker.get("expected_head")
+                    and observed.get("source_identity_sha256")
+                    == marker.get("source_identity_sha256")
+                    and observed.get("active_tool_calls") == 0
+                ):
+                    break
+        else:
+            raise WatchdogError("operator-safe-recovery-timeout")
+
+        service_action(args.tunnel_service, "start")
+        tunnel_deadline = time.monotonic() + args.recovery_timeout
+        while time.monotonic() < tunnel_deadline:
+            time.sleep(1)
+            if (
+                get_probe(args.health_url, "live", args.http_timeout)
+                and get_probe(args.ready_url, "ready", args.http_timeout)
+            ):
+                release_watchdog_admission(state_dir=args.state_dir, marker=marker)
+                return "restarted", recovered, proof
+        raise WatchdogError("tunnel-safe-recovery-timeout")
+    except RecoveryMutationError:
+        raise
+    except Exception as exc:
+        if not mutated:
+            try:
+                release_watchdog_admission(state_dir=args.state_dir, marker=marker)
+            except WatchdogError:
+                pass
+            raise
+
+        emit(
+            "grabowski.component_watchdog.recovery_exception",
+            component=args.component,
+            service=args.service,
+            tunnel_service=args.tunnel_service,
+            exception_type=type(exc).__name__,
+            reason=str(exc),
+            mutated=True,
+        )
+        rollback = None
+        try:
+            rollback = _restore_service_pair_after_failed_recovery(args, marker)
+        except WatchdogError as rollback_exc:
+            emit(
+                "grabowski.component_watchdog.rollback_exception",
+                component=args.component,
+                service=args.service,
+                tunnel_service=args.tunnel_service,
+                exception_type=type(rollback_exc).__name__,
+                reason=str(rollback_exc),
+            )
+            rollback = None
+        if rollback is not None:
+            emit(
+                "grabowski.component_watchdog.rollback_recovered",
+                component=args.component,
+                service=args.service,
+                tunnel_service=args.tunnel_service,
+                rollback=rollback,
+            )
+            raise RecoveryMutationError(
+                str(exc), rollback_recovered=True
+            ) from exc
+
+        emit(
+            "grabowski.component_watchdog.rollback_fail_closed",
+            component=args.component,
+            service=args.service,
+            tunnel_service=args.tunnel_service,
+            marker_expires_at_unix=marker["expires_at_unix"],
+            exception_type=type(exc).__name__,
+            reason=str(exc),
+        )
+        raise RecoveryMutationError(
+            str(exc), rollback_recovered=False
+        ) from exc
 
 
 def prometheus_metric_samples(text: str, metric_name: str) -> tuple[float, ...]:
@@ -762,24 +1177,24 @@ def probe_component(
             )
         except WatchdogError as exc:
             return ProbeResult("indeterminate", (str(exc),), pid, age, start_ticks)
-        failures = tuple(
-            failure
-            for failure in (live_failure, isolated_failure)
-            if failure is not None
-        )
-        concrete_failures = tuple(
-            failure
-            for failure in failures
-            if failure != "mcp-runtime-unhealthy"
-        )
-        if concrete_failures:
-            reasons.extend(concrete_failures)
-        elif "mcp-runtime-unhealthy" in failures:
+        if live_failure is None:
             if not reasons:
-                return ProbeResult(
-                    "indeterminate", ("mcp-runtime-unhealthy",), pid, age, start_ticks
+                diagnostic = (
+                    (f"isolated-probe-{isolated_failure}",)
+                    if isolated_failure is not None
+                    else ()
                 )
-            reasons.append("mcp-runtime-unhealthy")
+                return ProbeResult(
+                    "healthy", diagnostic, pid, age, start_ticks
+                )
+            if isolated_failure is not None:
+                reasons.append(f"isolated-probe-{isolated_failure}")
+        else:
+            # Only the live process probe may make the running operator restartable.
+            # The isolated stdio probe validates the deployed artifact, but under host
+            # pressure it must not turn a responsive live operator into a restart
+            # candidate and destroy in-flight tunnel work.
+            reasons.append(live_failure)
     elif component == "tunnel":
         try:
             final_boot_id = read_boot_id(proc_root)
@@ -1795,11 +2210,17 @@ def run_watchdog(args: argparse.Namespace) -> int:
         raise WatchdogError("invalid-backoff-policy")
 
     state_dir = ensure_state_dir(args.state_dir)
+    # All admission operations must use the same canonical, owner-checked path
+    # as the watchdog state and deployment lock.
+    args.state_dir = state_dir
     state_path = state_dir / f"{args.component}-watchdog-state.json"
     lock_path = state_dir / f"{args.component}-watchdog.lock"
+    recovery_lock_path = state_dir / "component-recovery.lock"
     deploy_lock = state_dir / "deploy.lock"
 
-    with exclusive_lock(lock_path):
+    with ExitStack() as locks:
+        locks.enter_context(exclusive_lock(lock_path))
+        locks.enter_context(exclusive_lock(recovery_lock_path))
         with deployment_shared_lock(deploy_lock) as deployment_clear:
             if not deployment_clear:
                 emit(
@@ -1808,6 +2229,27 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     reason="deployment-in-progress",
                 )
                 return 0
+
+            if args.component == "tunnel":
+                marker = read_watchdog_admission_marker(
+                    state_dir / WATCHDOG_ADMISSION_MARKER_NAME
+                )
+                if marker is not None:
+                    now = int(time.time())
+                    marker_state = (
+                        "active"
+                        if int(marker["expires_at_unix"]) > now
+                        else "expired-unreconciled"
+                    )
+                    emit(
+                        "grabowski.component_watchdog.recovery_admission_present",
+                        component=args.component,
+                        service=args.service,
+                        marker_state=marker_state,
+                        expected_head=marker["expected_head"],
+                        expires_at_unix=marker["expires_at_unix"],
+                    )
+                    return 1
 
             probe = probe_component(
                 component=args.component,
@@ -1922,6 +2364,182 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     expected_start_ticks=probe.start_ticks,
                 )
             stack_dump_requested = stack_dump_receipt is not None
+
+            if args.component == "operator":
+                emit(
+                    "grabowski.component_watchdog.restart_preparing",
+                    **common,
+                    stack_dump_requested=stack_dump_requested,
+                    stack_dump_receipt=stack_dump_receipt,
+                    restart_generation=next_state.restart_generation,
+                )
+                try:
+                    outcome, final_probe, safety_proof = safe_operator_restart(
+                        args, probe
+                    )
+                except RecoveryMutationError as exc:
+                    if stack_dump_requested:
+                        emit(
+                            "grabowski.component_watchdog.stack_dump_finalized",
+                            component=args.component,
+                            service=args.service,
+                            persisted=True,
+                            receipt=stack_dump_receipt,
+                            max_bytes=STACK_DUMP_MAX_BYTES,
+                            recovery_outcome=(
+                                "rollback_recovered"
+                                if exc.rollback_recovered
+                                else "fail_closed"
+                            ),
+                        )
+                    if exc.rollback_recovered:
+                        deferred_state = replace(
+                            state,
+                            consecutive_failures=max(
+                                state.consecutive_failures,
+                                args.failure_threshold,
+                            ),
+                            next_restart_not_before=(
+                                decision_now + args.backoff_base
+                            ),
+                        )
+                        save_state(state_path, deferred_state)
+                        emit(
+                            "grabowski.component_watchdog.restart_rolled_back",
+                            **common,
+                            reason=str(exc),
+                            next_restart_not_before=(
+                                deferred_state.next_restart_not_before
+                            ),
+                            restart_generation=state.restart_generation,
+                        )
+                        return 1
+
+                    failed_state = replace(
+                        next_state, consecutive_failures=1
+                    )
+                    save_state(state_path, failed_state)
+                    emit(
+                        "grabowski.component_watchdog.restart_fail_closed",
+                        **common,
+                        reason=str(exc),
+                        marker_present=True,
+                        restart_generation=failed_state.restart_generation,
+                    )
+                    return 4
+                except WatchdogError as exc:
+                    if stack_dump_requested:
+                        emit(
+                            "grabowski.component_watchdog.stack_dump_finalized",
+                            component=args.component,
+                            service=args.service,
+                            persisted=True,
+                            receipt=stack_dump_receipt,
+                            max_bytes=STACK_DUMP_MAX_BYTES,
+                            recovery_outcome="safety_deferred",
+                        )
+                    deferred_state = replace(
+                        state,
+                        consecutive_failures=max(
+                            state.consecutive_failures, args.failure_threshold
+                        ),
+                        next_restart_not_before=decision_now + args.backoff_base,
+                    )
+                    save_state(state_path, deferred_state)
+                    emit(
+                        "grabowski.component_watchdog.restart_safety_deferred",
+                        **common,
+                        reason=str(exc),
+                        stack_dump_requested=stack_dump_requested,
+                        stack_dump_receipt=stack_dump_receipt,
+                        next_restart_not_before=(
+                            deferred_state.next_restart_not_before
+                        ),
+                        restart_generation=state.restart_generation,
+                    )
+                    return 1
+
+                if stack_dump_requested:
+                    emit(
+                        "grabowski.component_watchdog.stack_dump_finalized",
+                        component=args.component,
+                        service=args.service,
+                        persisted=True,
+                        receipt=stack_dump_receipt,
+                        max_bytes=STACK_DUMP_MAX_BYTES,
+                        recovery_outcome=outcome,
+                    )
+                if outcome == "recovered-without-restart":
+                    recovered_state = reset_after_healthy(
+                        state,
+                        now=int(time.time()),
+                        restart_window=args.restart_window,
+                    )
+                    save_state(state_path, recovered_state)
+                    emit(
+                        "grabowski.component_watchdog.recovered_without_restart",
+                        component=args.component,
+                        service=args.service,
+                        pid=(
+                            final_probe.pid
+                            if final_probe is not None
+                            else probe.pid
+                        ),
+                        safety_proof=safety_proof,
+                        restart_generation=recovered_state.restart_generation,
+                    )
+                    return 0
+                if outcome != "restarted" or final_probe is None:
+                    raise WatchdogError("operator-safe-recovery-outcome-invalid")
+
+                final_probe = probe_component(
+                    component=args.component,
+                    service=args.service,
+                    runtime_root=args.runtime_root,
+                    module=args.module,
+                    profile=args.profile,
+                    host=args.host,
+                    port=args.port,
+                    health_url=args.health_url,
+                    ready_url=args.ready_url,
+                    startup_grace=0,
+                    http_timeout=args.http_timeout,
+                    mcp_url=args.mcp_url,
+                    metrics_url=args.metrics_url,
+                    control_plane_poll_max_age=args.control_plane_poll_max_age,
+                )
+                if final_probe.status == "healthy":
+                    recovered_state = reset_after_healthy(
+                        next_state,
+                        now=int(time.time()),
+                        restart_window=args.restart_window,
+                    )
+                    save_state(state_path, recovered_state)
+                    emit(
+                        "grabowski.component_watchdog.recovered",
+                        component=args.component,
+                        service=args.service,
+                        pid=final_probe.pid,
+                        safety_proof=safety_proof,
+                        backoff_level=recovered_state.backoff_level,
+                        next_restart_not_before=(
+                            recovered_state.next_restart_not_before
+                        ),
+                        restart_generation=recovered_state.restart_generation,
+                    )
+                    return 0
+                next_state.consecutive_failures = 1
+                save_state(state_path, next_state)
+                emit(
+                    "grabowski.component_watchdog.restart_unhealthy",
+                    component=args.component,
+                    service=args.service,
+                    status=final_probe.status,
+                    reasons=list(final_probe.reasons),
+                    restart_generation=next_state.restart_generation,
+                )
+                return 4
+
             emit(
                 "grabowski.component_watchdog.restarting",
                 **common,
@@ -1932,15 +2550,6 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 restart_generation=next_state.restart_generation,
             )
             restart_service(args.service)
-            if stack_dump_requested:
-                emit(
-                    "grabowski.component_watchdog.stack_dump_finalized",
-                    component=args.component,
-                    service=args.service,
-                    persisted=True,
-                    receipt=stack_dump_receipt,
-                    max_bytes=STACK_DUMP_MAX_BYTES,
-                )
             deadline = time.monotonic() + args.recovery_timeout
             final_probe = probe
             while time.monotonic() < deadline:
@@ -1997,10 +2606,12 @@ def run_watchdog(args: argparse.Namespace) -> int:
             return 4
 
 
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Grabowski component watchdog")
     result.add_argument("--component", choices=("operator", "tunnel"), required=True)
     result.add_argument("--service")
+    result.add_argument("--tunnel-service", default=DEFAULT_TUNNEL_SERVICE)
     result.add_argument("--runtime-root", type=Path, default=DEFAULT_RUNTIME_ROOT)
     result.add_argument("--module", default=DEFAULT_MODULE)
     result.add_argument("--profile", default=DEFAULT_PROFILE)
@@ -2028,6 +2639,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--recovery-timeout", type=float, default=DEFAULT_RECOVERY_TIMEOUT_SECONDS
     )
+    result.add_argument(
+        "--restart-drain-timeout",
+        type=float,
+        default=WATCHDOG_ADMISSION_DRAIN_TIMEOUT_SECONDS,
+    )
     result.add_argument("--check-only", action="store_true")
     return result
 
@@ -2043,6 +2659,24 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise WatchdogError("invalid-operator-listener")
     if args.control_plane_poll_max_age <= 0:
         raise WatchdogError("invalid-control-plane-poll-max-age")
+    if (
+        args.restart_drain_timeout <= 0
+        or args.restart_drain_timeout > WATCHDOG_MAX_RESTART_DRAIN_TIMEOUT_SECONDS
+        or args.recovery_timeout <= 0
+        or args.recovery_timeout > WATCHDOG_MAX_RECOVERY_TIMEOUT_SECONDS
+    ):
+        raise WatchdogError("invalid-recovery-time-policy")
+    recovery_envelope = (
+        2 * args.restart_drain_timeout
+        + 4 * args.recovery_timeout
+        + 2 * WATCHDOG_TUNNEL_STOP_TIMEOUT_SECONDS
+        + 2 * WATCHDOG_SERVICE_ACTION_TIMEOUT_SECONDS
+        + WATCHDOG_RECOVERY_MARGIN_SECONDS
+    )
+    if recovery_envelope > WATCHDOG_MAX_RUN_SECONDS:
+        raise WatchdogError("recovery-time-policy-exceeds-service-budget")
+    if not args.tunnel_service or len(args.tunnel_service) > 255:
+        raise WatchdogError("invalid-tunnel-service")
     loopback_http_url(args.metrics_url)
     if args.mcp_url is None:
         args.mcp_url = (

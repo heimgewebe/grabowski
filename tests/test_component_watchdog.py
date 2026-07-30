@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tools" / "component_watchdog.py"
+TOOLS = ROOT / "tools"
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
 
 spec = importlib.util.spec_from_file_location("component_watchdog_test", SOURCE)
 if spec is None or spec.loader is None:
@@ -170,7 +173,7 @@ class McpLifecycleProbeTests(unittest.TestCase):
                 self.probe(linger_on_eof=True, linger_seconds=5),
             )
 
-    def test_runtime_unhealthy_is_indeterminate_not_restartable(self) -> None:
+    def test_live_healthy_isolated_runtime_failure_is_diagnostic_only(self) -> None:
         with (
             patch.object(
                 watchdog,
@@ -205,8 +208,10 @@ class McpLifecycleProbeTests(unittest.TestCase):
                 startup_grace=20,
                 http_timeout=2,
             )
-        self.assertEqual("indeterminate", result.status)
-        self.assertEqual(("mcp-runtime-unhealthy",), result.reasons)
+        self.assertEqual("healthy", result.status)
+        self.assertEqual(
+            ("isolated-probe-mcp-runtime-unhealthy",), result.reasons
+        )
 
     def test_runtime_probe_rejects_invalid_module_or_root(self) -> None:
         with self.assertRaisesRegex(watchdog.WatchdogError, "runtime-root"):
@@ -938,7 +943,7 @@ class McpHttpLivenessProbeTests(unittest.TestCase):
                 http_timeout=2,
             )
         self.assertEqual("unhealthy", result.status)
-        self.assertEqual(("mcp-stdio-process-exited",), result.reasons)
+        self.assertEqual(("mcp-runtime-unhealthy",), result.reasons)
 
     def test_stack_dump_atomic_replace_preserves_hardlink_victim(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1538,6 +1543,896 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
                 refresh.assert_not_called()
 
 
+class WatchdogAdmissionRecoveryTests(unittest.TestCase):
+    def _manifest_root(self, root: Path) -> Path:
+        runtime = root / "runtime"
+        runtime.mkdir()
+        (runtime / watchdog.WATCHDOG_RUNTIME_MANIFEST_NAME).write_text(
+            json.dumps(
+                {
+                    "repo_head": "a" * 40,
+                    "source_sha256": "b" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return runtime
+
+    def test_watchdog_admission_marker_roundtrip_is_private_and_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            runtime = self._manifest_root(root)
+            with patch.object(watchdog.time, "time", return_value=100):
+                marker = watchdog.engage_watchdog_admission(
+                    state_dir=state,
+                    runtime_root=runtime,
+                    lifetime_seconds=180,
+                )
+            path = state / watchdog.WATCHDOG_ADMISSION_MARKER_NAME
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            self.assertEqual("a" * 40, marker["expected_head"])
+            self.assertEqual("b" * 64, marker["source_identity_sha256"])
+            watchdog.release_watchdog_admission(state_dir=state, marker=marker)
+            self.assertFalse(path.exists())
+
+    def test_admission_wait_requires_stable_zero_active_calls(self) -> None:
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+        }
+        observations = [
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                **marker,
+                "active_tool_calls": 1,
+            },
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                **marker,
+                "active_tool_calls": 0,
+            },
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                **marker,
+                "active_tool_calls": 0,
+            },
+        ]
+        with (
+            patch.object(
+                watchdog,
+                "operator_admission_observation",
+                side_effect=observations,
+            ),
+            patch.object(watchdog.time, "sleep"),
+            patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=itertools.count(),
+            ),
+        ):
+            result = watchdog.wait_for_watchdog_admission_idle(
+                marker, host="127.0.0.1", port=18181, timeout=10
+            )
+        self.assertEqual(3, result["attempts"])
+        self.assertEqual(2, result["consecutive_idle_samples"])
+
+    def test_tunnel_drain_requires_balanced_stable_final_responses(self) -> None:
+        metrics = "\n".join(
+            [
+                "commands_queue_length 0",
+                "commands_polled_total 10",
+                "commands_enqueued_total 10",
+                "process_start_time_seconds 5",
+                'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response",request_method="initialize"} 4',
+                'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response",request_method="tools/call"} 6',
+            ]
+        )
+        with (
+            patch.object(watchdog, "get_bounded_text", return_value=metrics),
+            patch.object(watchdog.time, "sleep"),
+            patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=itertools.count(),
+            ),
+        ):
+            result = watchdog.wait_for_watchdog_tunnel_idle(
+                metrics_url="http://127.0.0.1:18080/metrics", timeout=10
+            )
+        self.assertEqual(3, result["attempts"])
+        self.assertEqual(
+            10.0, result["metrics"]["commands_final_responses_total"]
+        )
+
+    def test_tunnel_metrics_treat_missing_final_series_as_idle_zero(self) -> None:
+        """Cold exporters may omit histogram series until the first sample."""
+        metrics = "\n".join(
+            [
+                "commands_queue_length 0",
+                "commands_polled_total 0",
+                "commands_enqueued_total 0",
+                "process_start_time_seconds 12",
+            ]
+        )
+        parsed = watchdog.admission_recovery.parse_tunnel_metrics(metrics)
+        self.assertEqual(0.0, parsed["commands_final_responses_total"])
+        self.assertEqual(0.0, parsed["commands_queue_length"])
+        self.assertEqual(0.0, parsed["commands_polled_total"])
+        self.assertEqual(0.0, parsed["commands_enqueued_total"])
+
+        with (
+            patch.object(watchdog, "get_bounded_text", return_value=metrics),
+            patch.object(watchdog.time, "sleep"),
+            patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=itertools.count(),
+            ),
+        ):
+            result = watchdog.wait_for_watchdog_tunnel_idle(
+                metrics_url="http://127.0.0.1:18080/metrics", timeout=10
+            )
+        self.assertEqual(3, result["attempts"])
+        self.assertEqual(
+            0.0, result["metrics"]["commands_final_responses_total"]
+        )
+
+    def test_tunnel_metrics_still_require_core_counters(self) -> None:
+        with self.assertRaisesRegex(
+            watchdog.WatchdogError, "watchdog-tunnel-metrics-incomplete"
+        ):
+            watchdog.admission_recovery.parse_tunnel_metrics(
+                "\n".join(
+                    [
+                        "commands_queue_length 0",
+                        "commands_polled_total 0",
+                        # missing commands_enqueued_total
+                        "process_start_time_seconds 1",
+                    ]
+                )
+            )
+
+    def test_transient_liveness_recovers_after_drain_without_restart(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                ["--component", "operator", "--restart-drain-timeout", "5"]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+        }
+        with (
+            patch.object(
+                watchdog, "engage_watchdog_admission", return_value=marker
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_admission_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_tunnel_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "healthy", pid=123, age_seconds=61, start_ticks=10
+                ),
+            ),
+            patch.object(watchdog, "release_watchdog_admission") as release,
+            patch.object(watchdog, "service_action") as service_action,
+            patch.object(watchdog, "restart_service") as restart,
+        ):
+            outcome, probe, _proof = watchdog.safe_operator_restart(
+                args,
+                watchdog.ProbeResult(
+                    "unhealthy", ("mcp-http-request-failed",), 123, 60, 10
+                ),
+            )
+        self.assertEqual("recovered-without-restart", outcome)
+        self.assertEqual(
+            watchdog.ProbeResult(
+                "healthy", pid=123, age_seconds=61, start_ticks=10
+            ),
+            probe,
+        )
+        release.assert_called_once()
+        service_action.assert_not_called()
+        restart.assert_not_called()
+
+    def test_identity_mismatch_remains_restartable_after_http_recovers(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                [
+                    "--component",
+                    "operator",
+                    "--restart-drain-timeout",
+                    "5",
+                    "--recovery-timeout",
+                    "5",
+                ]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+        }
+        replacement = watchdog.ProbeResult(
+            "healthy", pid=456, age_seconds=1, start_ticks=20
+        )
+        observation = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            **marker,
+            "active_tool_calls": 0,
+        }
+        actions: list[tuple[str, str]] = []
+        with (
+            patch.object(
+                watchdog, "engage_watchdog_admission", return_value=marker
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_admission_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_tunnel_idle",
+                return_value={"bounded": True},
+            ) as tunnel_drain,
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "service_action",
+                side_effect=lambda service, action, **_kwargs: actions.append(
+                    (service, action)
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "restart_service",
+                side_effect=lambda service: actions.append((service, "restart")),
+            ),
+            patch.object(
+                watchdog, "_operator_process_is_live", return_value=replacement
+            ),
+            patch.object(
+                watchdog,
+                "operator_admission_observation",
+                return_value=observation,
+            ),
+            patch.object(watchdog, "get_probe", return_value=True),
+            patch.object(watchdog, "release_watchdog_admission") as release,
+            patch.object(watchdog.time, "sleep"),
+            patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=itertools.count(),
+            ),
+        ):
+            outcome, probe, _proof = watchdog.safe_operator_restart(
+                args,
+                watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 60, 10
+                ),
+            )
+        self.assertEqual("restarted", outcome)
+        self.assertEqual(replacement, probe)
+        self.assertEqual(
+            [
+                (watchdog.DEFAULT_TUNNEL_SERVICE, "stop"),
+                (watchdog.DEFAULT_OPERATOR_SERVICE, "restart"),
+                (watchdog.DEFAULT_TUNNEL_SERVICE, "start"),
+            ],
+            actions,
+        )
+        release.assert_called_once()
+        self.assertEqual(2, tunnel_drain.call_count)
+
+    def test_final_tunnel_drain_failure_prevents_service_mutation(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                ["--component", "operator", "--restart-drain-timeout", "5"]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+        }
+        with (
+            patch.object(
+                watchdog, "engage_watchdog_admission", return_value=marker
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_admission_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_tunnel_idle",
+                side_effect=[
+                    {"bounded": True},
+                    watchdog.WatchdogError("watchdog-tunnel-drain-timeout"),
+                ],
+            ),
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
+            ),
+            patch.object(watchdog, "release_watchdog_admission") as release,
+            patch.object(watchdog, "service_action") as service_action,
+            patch.object(watchdog, "restart_service") as restart,
+        ):
+            with self.assertRaisesRegex(
+                watchdog.WatchdogError, "watchdog-tunnel-drain-timeout"
+            ):
+                watchdog.safe_operator_restart(
+                    args,
+                    watchdog.ProbeResult(
+                        "unhealthy",
+                        ("mcp-http-request-failed",),
+                        123,
+                        60,
+                        10,
+                    ),
+                )
+        release.assert_called_once()
+        service_action.assert_not_called()
+        restart.assert_not_called()
+
+    def test_recovery_timeout_policy_is_bounded_by_service_budget(self) -> None:
+        with self.assertRaisesRegex(
+            watchdog.WatchdogError, "invalid-recovery-time-policy"
+        ):
+            watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "operator",
+                        "--restart-drain-timeout",
+                        "61",
+                    ]
+                )
+            )
+        with self.assertRaisesRegex(
+            watchdog.WatchdogError, "invalid-recovery-time-policy"
+        ):
+            watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "operator",
+                        "--recovery-timeout",
+                        "121",
+                    ]
+                )
+            )
+
+    def test_marker_symlink_hardlink_and_owner_drift_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            victim = root / "victim"
+            victim.write_text("{}", encoding="utf-8")
+            victim.chmod(0o600)
+            marker_path = root / watchdog.WATCHDOG_ADMISSION_MARKER_NAME
+            marker_path.symlink_to(victim)
+            with self.assertRaises(watchdog.WatchdogError):
+                watchdog.read_watchdog_admission_marker(marker_path)
+            marker_path.unlink()
+            marker_path.hardlink_to(victim)
+            with self.assertRaisesRegex(
+                watchdog.WatchdogError, "watchdog-admission-marker-unsafe"
+            ):
+                watchdog.read_watchdog_admission_marker(marker_path)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            runtime = self._manifest_root(root)
+            marker = watchdog.engage_watchdog_admission(
+                state_dir=state,
+                runtime_root=runtime,
+                lifetime_seconds=180,
+            )
+            drifted = dict(marker)
+            drifted["token"] = "f" * 64
+            with self.assertRaisesRegex(
+                watchdog.WatchdogError,
+                "watchdog-admission-marker-owner-drift",
+            ):
+                watchdog.release_watchdog_admission(
+                    state_dir=state, marker=drifted
+                )
+            self.assertTrue(
+                (state / watchdog.WATCHDOG_ADMISSION_MARKER_NAME).exists()
+            )
+            watchdog.release_watchdog_admission(
+                state_dir=state, marker=marker
+            )
+
+    def test_tunnel_watchdog_defers_for_active_or_expired_recovery_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", temp_dir]
+                )
+            )
+            for expires, expected_state in (
+                (1200, "active"),
+                (999, "expired-unreconciled"),
+            ):
+                marker = {
+                    "schema_version": 1,
+                    "kind": "grabowski_deployment_admission_drain",
+                    "token": "a" * 64,
+                    "expected_head": "b" * 40,
+                    "source_identity_sha256": "c" * 64,
+                    "created_at_unix": 900,
+                    "expires_at_unix": expires,
+                }
+                with (
+                    self.subTest(marker_state=expected_state),
+                    patch.object(
+                        watchdog,
+                        "read_watchdog_admission_marker",
+                        return_value=marker,
+                    ),
+                    patch.object(watchdog, "probe_component") as probe,
+                    patch.object(watchdog, "restart_service") as restart,
+                    patch.object(watchdog, "emit") as emit,
+                    patch.object(watchdog.time, "time", return_value=1000),
+                ):
+                    self.assertEqual(1, watchdog.run_watchdog(args))
+                probe.assert_not_called()
+                restart.assert_not_called()
+                self.assertEqual(
+                    "grabowski.component_watchdog.recovery_admission_present",
+                    emit.call_args.args[0],
+                )
+                self.assertEqual(
+                    expected_state, emit.call_args.kwargs["marker_state"]
+                )
+
+    def test_failed_forward_recovery_restores_service_pair_and_re_raises(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                [
+                    "--component",
+                    "operator",
+                    "--restart-drain-timeout",
+                    "5",
+                    "--recovery-timeout",
+                    "5",
+                ]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+            "expires_at_unix": 2000,
+        }
+        with (
+            patch.object(
+                watchdog, "engage_watchdog_admission", return_value=marker
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_admission_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_tunnel_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
+            ),
+            patch.object(watchdog, "service_action"),
+            patch.object(
+                watchdog,
+                "restart_service",
+                side_effect=watchdog.WatchdogError(
+                    "service-restart-request-failed"
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "_restore_service_pair_after_failed_recovery",
+                return_value={"tunnel_restarted": True},
+            ) as rollback,
+            patch.object(watchdog, "emit") as emit,
+        ):
+            with self.assertRaisesRegex(
+                watchdog.WatchdogError,
+                "service-restart-request-failed",
+            ):
+                watchdog.safe_operator_restart(
+                    args,
+                    watchdog.ProbeResult(
+                        "unhealthy",
+                        ("mcp-http-request-failed",),
+                        123,
+                        60,
+                        10,
+                    ),
+                )
+        rollback.assert_called_once_with(args, marker)
+        self.assertEqual(
+            "grabowski.component_watchdog.rollback_recovered",
+            emit.call_args.args[0],
+        )
+
+    def test_failed_rollback_keeps_admission_fail_closed(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                ["--component", "operator", "--restart-drain-timeout", "5"]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+            "expires_at_unix": 2000,
+        }
+        with (
+            patch.object(
+                watchdog, "engage_watchdog_admission", return_value=marker
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_admission_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_tunnel_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
+            ),
+            patch.object(watchdog, "service_action"),
+            patch.object(
+                watchdog,
+                "restart_service",
+                side_effect=watchdog.WatchdogError(
+                    "service-restart-request-failed"
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "_restore_service_pair_after_failed_recovery",
+                return_value=None,
+            ),
+            patch.object(
+                watchdog, "release_watchdog_admission"
+            ) as release,
+            patch.object(watchdog, "emit") as emit,
+        ):
+            with self.assertRaises(watchdog.WatchdogError):
+                watchdog.safe_operator_restart(
+                    args,
+                    watchdog.ProbeResult(
+                        "unhealthy",
+                        ("mcp-http-request-failed",),
+                        123,
+                        60,
+                        10,
+                    ),
+                )
+        release.assert_not_called()
+        self.assertEqual(
+            "grabowski.component_watchdog.rollback_fail_closed",
+            emit.call_args.args[0],
+        )
+
+    def test_rollback_helper_requires_marker_bound_operator_before_tunnel(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                ["--component", "operator", "--recovery-timeout", "5"]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+        }
+        replacement = watchdog.ProbeResult(
+            "healthy", pid=456, age_seconds=1, start_ticks=20
+        )
+        observation = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            **marker,
+            "active_tool_calls": 0,
+        }
+        with (
+            patch.object(
+                watchdog, "_operator_process_is_live", return_value=replacement
+            ) as operator_probe,
+            patch.object(
+                watchdog,
+                "operator_admission_observation",
+                return_value=observation,
+            ),
+            patch.object(watchdog, "service_action") as service_action,
+            patch.object(watchdog, "get_probe", return_value=True),
+            patch.object(watchdog, "release_watchdog_admission") as release,
+            patch.object(watchdog.time, "sleep"),
+            patch.object(
+                watchdog.time,
+                "monotonic",
+                side_effect=itertools.count(),
+            ),
+        ):
+            result = watchdog._restore_service_pair_after_failed_recovery(
+                args, marker
+            )
+        self.assertEqual(
+            {
+                "operator_pid": 456,
+                "operator_start_ticks": 20,
+                "tunnel_restarted": True,
+            },
+            result,
+        )
+        self.assertIsNone(operator_probe.call_args.args[0])
+        self.assertEqual(
+            [
+                ((watchdog.DEFAULT_OPERATOR_SERVICE, "start"),),
+                ((watchdog.DEFAULT_TUNNEL_SERVICE, "start"),),
+            ],
+            service_action.call_args_list,
+        )
+        release.assert_called_once_with(state_dir=args.state_dir, marker=marker)
+
+    def test_ambiguous_tunnel_stop_enters_rollback_handling(self) -> None:
+        args = watchdog.normalize_args(
+            watchdog.parser().parse_args(
+                ["--component", "operator", "--restart-drain-timeout", "5"]
+            )
+        )
+        marker = {
+            "token": "a" * 64,
+            "expected_head": "b" * 40,
+            "source_identity_sha256": "c" * 64,
+            "expires_at_unix": 2000,
+        }
+        with (
+            patch.object(
+                watchdog, "engage_watchdog_admission", return_value=marker
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_admission_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "wait_for_watchdog_tunnel_idle",
+                return_value={"bounded": True},
+            ),
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
+            ),
+            patch.object(
+                watchdog,
+                "service_action",
+                side_effect=watchdog.WatchdogError("service-stop-timeout"),
+            ),
+            patch.object(watchdog, "restart_service") as restart,
+            patch.object(
+                watchdog,
+                "_restore_service_pair_after_failed_recovery",
+                return_value={"tunnel_restarted": True},
+            ) as rollback,
+            patch.object(
+                watchdog, "release_watchdog_admission"
+            ) as release,
+            patch.object(watchdog, "emit"),
+        ):
+            with self.assertRaises(watchdog.RecoveryMutationError) as raised:
+                watchdog.safe_operator_restart(
+                    args,
+                    watchdog.ProbeResult(
+                        "unhealthy",
+                        ("mcp-http-request-failed",),
+                        123,
+                        60,
+                        10,
+                    ),
+                )
+        self.assertTrue(raised.exception.rollback_recovered)
+        rollback.assert_called_once_with(args, marker)
+        restart.assert_not_called()
+        release.assert_not_called()
+
+    def test_run_watchdog_marks_failed_rollback_as_unit_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "operator",
+                        "--state-dir",
+                        temp_dir,
+                        "--failure-threshold",
+                        "1",
+                        "--startup-grace",
+                        "0",
+                    ]
+                )
+            )
+            probe = watchdog.ProbeResult(
+                "unhealthy", ("mcp-http-request-failed",), 123, 60, 10
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "safe_operator_restart",
+                    side_effect=watchdog.RecoveryMutationError(
+                        "operator-safe-recovery-timeout",
+                        rollback_recovered=False,
+                    ),
+                ),
+                patch.object(watchdog, "request_python_stack_dump"),
+                patch.object(watchdog, "emit") as emit,
+                patch.object(watchdog.time, "time", return_value=1000),
+            ):
+                self.assertEqual(4, watchdog.run_watchdog(args))
+        self.assertEqual(
+            "grabowski.component_watchdog.restart_fail_closed",
+            emit.call_args.args[0],
+        )
+        self.assertTrue(emit.call_args.kwargs["marker_present"])
+
+    def test_run_watchdog_defers_after_successful_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "operator",
+                        "--state-dir",
+                        temp_dir,
+                        "--failure-threshold",
+                        "1",
+                        "--startup-grace",
+                        "0",
+                    ]
+                )
+            )
+            probe = watchdog.ProbeResult(
+                "unhealthy", ("mcp-http-request-failed",), 123, 60, 10
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "safe_operator_restart",
+                    side_effect=watchdog.RecoveryMutationError(
+                        "service-restart-request-failed",
+                        rollback_recovered=True,
+                    ),
+                ),
+                patch.object(watchdog, "request_python_stack_dump"),
+                patch.object(watchdog, "emit") as emit,
+                patch.object(watchdog.time, "time", return_value=1000),
+            ):
+                self.assertEqual(1, watchdog.run_watchdog(args))
+        self.assertEqual(
+            "grabowski.component_watchdog.restart_rolled_back",
+            emit.call_args.args[0],
+        )
+
+    def test_shared_recovery_lock_serializes_both_component_watchdogs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", temp_dir]
+                )
+            )
+            with (
+                watchdog.exclusive_lock(root / "component-recovery.lock"),
+                patch.object(watchdog, "probe_component") as probe,
+            ):
+                with self.assertRaises(watchdog.LockBusy):
+                    watchdog.run_watchdog(args)
+            probe.assert_not_called()
+
+    def test_run_watchdog_defers_when_safe_drain_cannot_be_proven(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    [
+                        "--component",
+                        "operator",
+                        "--state-dir",
+                        temp_dir,
+                        "--failure-threshold",
+                        "1",
+                        "--startup-grace",
+                        "0",
+                    ]
+                )
+            )
+            probe = watchdog.ProbeResult(
+                "unhealthy", ("mcp-http-request-failed",), 123, 60, 10
+            )
+            with (
+                patch.object(watchdog, "probe_component", return_value=probe),
+                patch.object(
+                    watchdog,
+                    "safe_operator_restart",
+                    side_effect=watchdog.WatchdogError(
+                        "watchdog-admission-active-calls-timeout"
+                    ),
+                ),
+                patch.object(watchdog, "request_python_stack_dump"),
+                patch.object(watchdog, "restart_service") as restart,
+                patch.object(watchdog, "emit") as emit,
+                patch.object(watchdog.time, "time", return_value=1000),
+            ):
+                self.assertEqual(1, watchdog.run_watchdog(args))
+        restart.assert_not_called()
+        self.assertEqual(
+            "grabowski.component_watchdog.restart_safety_deferred",
+            emit.call_args.args[0],
+        )
+
+
+
 class WatchdogPolicyTests(unittest.TestCase):
     def test_services_are_independent(self) -> None:
         operator = watchdog.normalize_args(watchdog.parser().parse_args(["--component", "operator"]))
@@ -1706,11 +2601,21 @@ class WatchdogPolicyTests(unittest.TestCase):
                 watchdog.ProbeResult(
                     "unhealthy", ("test-failure",), 123, 100.0, start_ticks=10
                 ),
-                watchdog.ProbeResult("healthy", pid=123, age_seconds=101.0, start_ticks=10),
                 watchdog.ProbeResult("healthy", pid=456, age_seconds=1.0, start_ticks=20),
             ]
             with (
                 patch.object(watchdog, "probe_component", side_effect=probes) as probe_component,
+                patch.object(
+                    watchdog,
+                    "safe_operator_restart",
+                    return_value=(
+                        "restarted",
+                        watchdog.ProbeResult(
+                            "healthy", pid=456, age_seconds=1.0, start_ticks=20
+                        ),
+                        {"bounded": True},
+                    ),
+                ),
                 patch.object(watchdog, "restart_service"),
                 patch.object(watchdog, "emit"),
                 patch.object(watchdog.time, "sleep"),
@@ -1727,7 +2632,7 @@ class WatchdogPolicyTests(unittest.TestCase):
             ):
                 self.assertEqual(0, watchdog.run_watchdog(args))
 
-            self.assertEqual(3, probe_component.call_count)
+            self.assertEqual(2, probe_component.call_count)
             state = watchdog.load_state(Path(tmp) / "operator-watchdog-state.json")
             self.assertEqual(0, state.consecutive_failures)
             self.assertEqual(0, state.backoff_level)
@@ -1757,6 +2662,17 @@ class WatchdogPolicyTests(unittest.TestCase):
             ]
             with (
                 patch.object(watchdog, "probe_component", side_effect=probes),
+                patch.object(
+                    watchdog,
+                    "safe_operator_restart",
+                    return_value=(
+                        "restarted",
+                        watchdog.ProbeResult(
+                            "healthy", pid=456, age_seconds=1.0
+                        ),
+                        {"bounded": True},
+                    ),
+                ),
                 patch.object(watchdog, "restart_service"),
                 patch.object(watchdog, "emit"),
                 patch.object(watchdog.time, "sleep"),
