@@ -1794,11 +1794,56 @@ def gui_start(
     )
 
 
+def _prior_observation_summary(record: dict[str, Any]) -> dict[str, Any] | None:
+    raw = record.get("last_observation_json")
+    if not raw:
+        return None
+    previous = json.loads(raw)
+    preserved = previous.get("prior_observation")
+    if isinstance(preserved, dict):
+        previous = preserved
+    summary = {
+        key: previous[key]
+        for key in ("state", "properties", "observed_at_unix")
+        if key in previous
+    }
+    return summary or None
+
+
+def _reconcile_stopped_record(
+    record: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    observation = (
+        json.loads(record["last_observation_json"])
+        if record["last_observation_json"]
+        else {"state": "stopped"}
+    )
+    terminalization = observation.get("terminalization")
+    if isinstance(terminalization, dict) and not _terminalization_action_required(
+        observation
+    ):
+        return record, observation
+    observation = {
+        **observation,
+        "state": "stopped",
+        "observed_at_unix": _now(),
+        "terminalization": {
+            "release": _release(record),
+            "cleanup": _cleanup(record),
+        },
+    }
+    stored = _update(record["worker_id"], "stopped", observation=observation)
+    return stored, observation
+
+
 def worker_status(worker_id: str, *, expected_kind: str | None = None) -> dict[str, Any]:
     record = _row(worker_id)
     if expected_kind is not None and record["kind"] != expected_kind:
         raise ValueError(f"Worker is not a {expected_kind} worker")
-    stored, _observation = _reconcile_record(record)
+    if record["state"] == "stopped":
+        stored, _observation = _reconcile_stopped_record(record)
+    else:
+        stored, _observation = _reconcile_record(record)
     return _public(stored)
 
 
@@ -1818,6 +1863,9 @@ def worker_stop(worker_id: str, *, expected_kind: str | None = None) -> dict[str
         "stop": result,
         "observed_at_unix": _now(),
     }
+    prior_observation = _prior_observation_summary(record)
+    if prior_observation is not None:
+        observation["prior_observation"] = prior_observation
     stored = _update(worker_id, state, observation=observation)
     if result["returncode"] == 0:
         observation["terminalization"] = {
