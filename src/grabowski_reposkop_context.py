@@ -821,6 +821,20 @@ def _ensure_receipt_root() -> None:
         os.close(write_root_descriptor)
 
 
+def _receipt_root_components() -> tuple[Path, Path, tuple[str, ...]]:
+    root_path, exists = _resolve_exact_write_target(RECEIPT_ROOT)
+    if not exists:
+        raise ReposkopContextError("Reposkop receipt root is missing")
+    write_root = _authorized_write_root(root_path)
+    try:
+        components = root_path.relative_to(write_root).parts
+    except ValueError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt root could not be made relative to its write root"
+        ) from exc
+    return root_path, write_root, components
+
+
 def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
     metadata = os.fstat(descriptor)
     if (
@@ -844,28 +858,57 @@ def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
         raise ReposkopContextError(
             "Reposkop receipt root path identity changed after descriptor binding"
         )
+    # Path must still resolve under configured write roots (catches rename out of scope).
+    try:
+        root_path, write_root, _components = _receipt_root_components()
+    except ReposkopContextError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt root left its authorized write-root path"
+        ) from exc
+    if write_root not in root_path.parents and root_path != write_root:
+        raise ReposkopContextError(
+            "Reposkop receipt root left its authorized write-root path"
+        )
     return metadata
+
+
+def _open_receipt_root_under_write_root() -> tuple[int, int]:
+    """Open receipt root only by walking from an authorized write-root descriptor."""
+    root_path, write_root, components = _receipt_root_components()
+    write_root_descriptor = _open_directory_descriptor(write_root)
+    try:
+        _validate_directory_path_binding(
+            write_root_descriptor,
+            write_root,
+            label="Reposkop authorized write root",
+        )
+        if components:
+            receipt_descriptor = _open_from_write_root(
+                write_root_descriptor,
+                components,
+                private_from_index=0,
+            )
+        else:
+            receipt_descriptor = os.dup(write_root_descriptor)
+        try:
+            _validate_receipt_root_descriptor(receipt_descriptor)
+            return write_root_descriptor, receipt_descriptor
+        except BaseException:
+            os.close(receipt_descriptor)
+            raise
+    except BaseException:
+        os.close(write_root_descriptor)
+        raise
 
 
 @contextmanager
 def _receipt_root_descriptor() -> Iterator[int]:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    write_root_descriptor, receipt_descriptor = _open_receipt_root_under_write_root()
     try:
-        descriptor = os.open(RECEIPT_ROOT, flags)
-    except OSError as exc:
-        raise ReposkopContextError(
-            "Reposkop receipt root could not be opened as a stable directory"
-        ) from exc
-    try:
-        _validate_receipt_root_descriptor(descriptor)
-        yield descriptor
+        yield receipt_descriptor
     finally:
-        os.close(descriptor)
+        os.close(receipt_descriptor)
+        os.close(write_root_descriptor)
 
 
 def _entry_exists(root_descriptor: int, path: Path) -> bool:
@@ -1380,44 +1423,50 @@ def _recover_linked_pending(
 
 
 def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
-    receipt_path = binding["receipt_path"]
-    pending_path = binding["pending_path"]
-    if _recover_linked_pending(binding, root_descriptor=root_descriptor):
-        return
-    if _entry_exists(root_descriptor, receipt_path):
-        _read_exact_regular(
-            receipt_path,
-            binding["data"],
-            label="Reposkop usage receipt",
-            root_descriptor=root_descriptor,
-        )
-        _fsync_directory(root_descriptor)
-        _read_exact_regular(
-            receipt_path,
-            binding["data"],
-            label="Reposkop usage receipt",
-            root_descriptor=root_descriptor,
-        )
-        return
-    _create_pending(binding, root_descriptor=root_descriptor)
+    del root_descriptor  # callers may pass a prior fd; publication always re-anchors
+    write_root_descriptor, live_root = _open_receipt_root_under_write_root()
     try:
-        os.link(
-            pending_path.name,
-            receipt_path.name,
-            src_dir_fd=root_descriptor,
-            dst_dir_fd=root_descriptor,
-            follow_symlinks=False,
-        )
-    except FileExistsError:
-        _recover_linked_pending(binding, root_descriptor=root_descriptor)
-        if _entry_exists(root_descriptor, pending_path):
-            raise ReposkopContextError(
-                "Reposkop receipt publication collided with a different file"
+        receipt_path = binding["receipt_path"]
+        pending_path = binding["pending_path"]
+        if _recover_linked_pending(binding, root_descriptor=live_root):
+            return
+        if _entry_exists(live_root, receipt_path):
+            _read_exact_regular(
+                receipt_path,
+                binding["data"],
+                label="Reposkop usage receipt",
+                root_descriptor=live_root,
             )
-        return
-    except OSError as exc:
-        raise ReposkopContextError("Reposkop receipt publication failed") from exc
-    _recover_linked_pending(binding, root_descriptor=root_descriptor)
+            _fsync_directory(live_root)
+            _read_exact_regular(
+                receipt_path,
+                binding["data"],
+                label="Reposkop usage receipt",
+                root_descriptor=live_root,
+            )
+            return
+        _create_pending(binding, root_descriptor=live_root)
+        try:
+            os.link(
+                pending_path.name,
+                receipt_path.name,
+                src_dir_fd=live_root,
+                dst_dir_fd=live_root,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _recover_linked_pending(binding, root_descriptor=live_root)
+            if _entry_exists(live_root, pending_path):
+                raise ReposkopContextError(
+                    "Reposkop receipt publication collided with a different file"
+                )
+            return
+        except OSError as exc:
+            raise ReposkopContextError("Reposkop receipt publication failed") from exc
+        _recover_linked_pending(binding, root_descriptor=live_root)
+    finally:
+        os.close(live_root)
+        os.close(write_root_descriptor)
 
 
 def _record_usage(
@@ -1449,14 +1498,22 @@ def _record_usage(
                     else AUDIT_PUBLICATION_CONTRACT
                 ),
             )
-        _publish_receipt(binding, root_descriptor=root_descriptor)
-        _validate_receipt_root_descriptor(root_descriptor)
-        _read_exact_regular(
-            binding["receipt_path"],
-            binding["data"],
-            label="Reposkop usage receipt",
-            root_descriptor=root_descriptor,
-        )
+        # Re-open receipt root from the authorized write root immediately before
+        # mutation so a same-UID rename out of write roots cannot publish via a
+        # stale dir_fd that still points at the moved inode.
+        write_root_descriptor, live_root = _open_receipt_root_under_write_root()
+        try:
+            _publish_receipt(binding, root_descriptor=live_root)
+            _validate_receipt_root_descriptor(live_root)
+            _read_exact_regular(
+                binding["receipt_path"],
+                binding["data"],
+                label="Reposkop usage receipt",
+                root_descriptor=live_root,
+            )
+        finally:
+            os.close(live_root)
+            os.close(write_root_descriptor)
         verified_audit = _find_audit_binding(binding)
         if verified_audit is None:
             raise ReposkopContextError(

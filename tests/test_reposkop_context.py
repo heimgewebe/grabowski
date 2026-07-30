@@ -447,12 +447,38 @@ class ReposkopContextTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 ValueError,
-                "receipt root path identity changed after descriptor binding",
+                "receipt root|write-root|symlink|disappeared|identity|could not be opened safely",
             ):
                 context.grabowski_reposkop_context(str(self.repo))
 
+        # Publication must fail closed without writing into the moved or attacker tree.
         self.assertEqual(list(attacker_root.iterdir()), [])
-        self.assertEqual(len(list(moved_root.glob("*.json"))), 1)
+        self.assertEqual(list(moved_root.glob("*.json")), [])
+        self.assertEqual(list(moved_root.glob("*.pending")), [])
+
+    def test_publication_rejects_rename_outside_write_roots_before_mutation(self) -> None:
+        patches = self.patches(self.report())
+        outside = self.root / "outside-of-write-roots"
+        outside.mkdir(mode=0o700)
+        moved_root = outside / "receipts-moved"
+        real_publish_receipt = context._publish_receipt
+
+        def rename_outside_then_publish(binding, *, root_descriptor):
+            self.receipts.rename(moved_root)
+            return real_publish_receipt(binding, root_descriptor=root_descriptor)
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context,
+                "_publish_receipt",
+                side_effect=rename_outside_then_publish,
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertEqual(list(moved_root.glob("*.json")), [])
         self.assertEqual(list(moved_root.glob("*.pending")), [])
 
     def test_recovers_linked_pending_after_interruption(self) -> None:
