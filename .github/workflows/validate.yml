@@ -67,9 +67,14 @@ jobs:
         run: git diff --check
 
       - name: Run reconciliation regressions
-        env:
-          PYTHONPATH: src
-        run: python -m unittest -v tests.test_text_artifact_reconcile
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_home="$(mktemp -d)"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" PYTHONPATH=src python -m unittest -v tests.test_text_artifact_reconcile
 
       - name: Validate exact candidate
         run: make validate PYTHON=python3
