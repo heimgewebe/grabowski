@@ -115,7 +115,10 @@ def _seal_executable_bytes(payload: bytes) -> int:
     # immediately-unlinked private temporary file that only our fd can open.
     create = getattr(os, "memfd_create", None)
     if create is not None:
-        sealed = create("grabowski-reposkop-exec", getattr(os, "MFD_CLOEXEC", 0))
+        memfd_flags = getattr(os, "MFD_CLOEXEC", 0) | getattr(
+            os, "MFD_ALLOW_SEALING", 0
+        )
+        sealed = create("grabowski-reposkop-exec", memfd_flags)
         try:
             view = memoryview(payload)
             written = 0
