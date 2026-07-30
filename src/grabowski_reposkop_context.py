@@ -527,6 +527,8 @@ def _run_reposkop(
     )
     target_descriptor = _open_validated_target_directory(target)
     try:
+        target_stat = os.fstat(target_descriptor)
+        target_identity = (target_stat.st_dev, target_stat.st_ino)
         executable_path = f"/proc/self/fd/{executable_descriptor}"
         target_path = f"/proc/self/fd/{target_descriptor}"
         try:
@@ -577,6 +579,17 @@ def _run_reposkop(
         raise ReposkopContextError(
             "Reposkop executable identity changed during report execution"
         )
+    # Path may have been renamed/replaced while the child observed the bound
+    # inode; re-walk and require the canonical path still names that inode.
+    post_target_descriptor = _open_validated_target_directory(target)
+    try:
+        post_target = os.fstat(post_target_descriptor)
+        if (post_target.st_dev, post_target.st_ino) != target_identity:
+            raise ReposkopContextError(
+                "Reposkop target identity changed during report execution"
+            )
+    finally:
+        os.close(post_target_descriptor)
     stdout_data = result.get("stdout_data")
     if not isinstance(stdout_data, bytes):
         raise ReposkopContextError("Reposkop report stdout bytes are unavailable")
