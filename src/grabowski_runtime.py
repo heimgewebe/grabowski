@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import grabowski_operator_core
 import grabowski_checkouts
 import grabowski_checkout_binding_reconciler
@@ -38,14 +40,15 @@ READ_ONLY = grabowski_operator_core.READ_ONLY
 
 
 @mcp.tool(name="grabowski_current_work", annotations=READ_ONLY)
-def grabowski_current_work(
+async def grabowski_current_work(
     repositories: list[str],
     view: str = "current",
     limit: int = 20,
     cursor: str | None = None,
 ) -> dict[str, object]:
-    """Project bounded current operator work without creating a second lifecycle truth."""
-    return grabowski_current_work_surface.grabowski_current_work(
+    """Project bounded current operator work without blocking the MCP event loop."""
+    return await asyncio.to_thread(
+        grabowski_current_work_surface.grabowski_current_work,
         repositories,
         view=view,
         limit=limit,
@@ -54,7 +57,7 @@ def grabowski_current_work(
 
 
 @mcp.tool(name="grabowski_operator_optimization_report", annotations=READ_ONLY)
-def grabowski_operator_optimization_report(
+async def grabowski_operator_optimization_report(
     repositories: list[str],
     window: str = "7d",
     view: str = "minimal",
@@ -63,8 +66,9 @@ def grabowski_operator_optimization_report(
     outcome_limit: int = 200,
     current_work_limit: int = 50,
 ) -> dict[str, object]:
-    """Audit bounded operator friction and optimization potential on manual request."""
-    return grabowski_operator_optimization.build_operator_optimization_report(
+    """Audit bounded operator friction without blocking the MCP event loop."""
+    return await asyncio.to_thread(
+        grabowski_operator_optimization.build_operator_optimization_report,
         repositories,
         window=window,
         view=view,
@@ -76,13 +80,14 @@ def grabowski_operator_optimization_report(
 
 
 @mcp.tool(name="grabowski_checkout_binding_reconciliation", annotations=READ_ONLY)
-def grabowski_checkout_binding_reconciliation(
+async def grabowski_checkout_binding_reconciliation(
     repository_filters: list[str] | None = None,
     limit: int = 20,
     cursor: str | None = None,
 ) -> dict[str, object]:
-    """Compare durable checkout bindings with current Git state, strictly read-only."""
-    return grabowski_checkout_binding_reconciler.reconcile_checkout_bindings(
+    """Compare checkout bindings without blocking the MCP event loop."""
+    return await asyncio.to_thread(
+        grabowski_checkout_binding_reconciler.reconcile_checkout_bindings,
         repository_filters=repository_filters,
         limit=limit,
         cursor=cursor,

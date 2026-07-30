@@ -1400,10 +1400,11 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(8, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(9, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
+                "tools/watchdog_admission_recovery.py",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
@@ -1424,6 +1425,22 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
                 "grabowski-runtime-retention.timer",
             },
             {asset.unit for asset in dual.WATCHDOG_HOST_ASSETS if asset.unit},
+        )
+
+    def test_watchdog_helper_is_installed_before_importing_script(self) -> None:
+        sources = [asset.source.as_posix() for asset in dual.WATCHDOG_HOST_ASSETS]
+        self.assertLess(
+            sources.index("tools/watchdog_admission_recovery.py"),
+            sources.index("tools/component_watchdog.py"),
+        )
+        helper = next(
+            asset
+            for asset in dual.WATCHDOG_HOST_ASSETS
+            if asset.source.as_posix() == "tools/watchdog_admission_recovery.py"
+        )
+        self.assertEqual(0o600, helper.mode)
+        self.assertEqual(
+            "watchdog_admission_recovery.py", helper.target.name
         )
 
     def test_dependency_dropin_requires_reload_and_has_no_fragment_unit(self) -> None:

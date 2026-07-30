@@ -109,6 +109,82 @@ def _validate_executable_ancestors(path: Path) -> None:
         _validate_executable_directory(current, trusted_uids=trusted_uids)
 
 
+def _seal_executable_bytes(payload: bytes) -> int:
+    """Return a private executable fd whose bytes cannot be rewritten by path races."""
+    # Prefer memfd+seals when the platform exposes them; otherwise use an
+    # immediately-unlinked private temporary file that only our fd can open.
+    create = getattr(os, "memfd_create", None)
+    if create is not None:
+        sealed = create("grabowski-reposkop-exec", getattr(os, "MFD_CLOEXEC", 0))
+        try:
+            view = memoryview(payload)
+            written = 0
+            while written < len(view):
+                count = os.write(sealed, view[written:])
+                if count <= 0:
+                    raise OSError("short write")
+                written += count
+            os.lseek(sealed, 0, os.SEEK_SET)
+            add_seals = getattr(fcntl, "F_ADD_SEALS", None)
+            if add_seals is not None:
+                seal_mask = 0
+                for name in ("F_SEAL_WRITE", "F_SEAL_SHRINK", "F_SEAL_GROW"):
+                    value = getattr(fcntl, name, 0)
+                    if isinstance(value, int):
+                        seal_mask |= value
+                if seal_mask:
+                    fcntl.fcntl(sealed, add_seals, seal_mask)
+            os.fchmod(sealed, 0o700)
+            return sealed
+        except BaseException:
+            os.close(sealed)
+            raise
+
+    staging_root = STATE_DIR / "reposkop-exec-staging"
+    staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if (
+        staging_root.is_symlink()
+        or not staging_root.is_dir()
+        or staging_root.stat().st_uid != os.getuid()
+        or stat.S_IMODE(staging_root.stat().st_mode) != 0o700
+    ):
+        raise ReposkopContextError(
+            "Reposkop executable staging directory is unsafe"
+        )
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    name = f".exec-{os.getpid()}-{time.time_ns()}"
+    staging_descriptor = os.open(
+        str(staging_root / name), flags, 0o700
+    )
+    try:
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(staging_descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short write")
+            written += count
+        os.fsync(staging_descriptor)
+        os.fchmod(staging_descriptor, 0o700)
+        os.lseek(staging_descriptor, 0, os.SEEK_SET)
+        # Unlink while holding the fd so only this process can execute the bytes.
+        os.unlink(str(staging_root / name))
+        return staging_descriptor
+    except BaseException:
+        os.close(staging_descriptor)
+        try:
+            os.unlink(str(staging_root / name))
+        except OSError:
+            pass
+        raise
+
+
 def _open_validated_executable(path: Path) -> tuple[int, str]:
     """Open the executable via an O_NOFOLLOW ancestor walk, hash that inode.
 
@@ -202,19 +278,19 @@ def _open_validated_executable(path: Path) -> tuple[int, str]:
                     "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
                 )
             digest = hashlib.sha256()
-            total = 0
+            payload = bytearray()
             os.lseek(descriptor, 0, os.SEEK_SET)
             while True:
                 chunk = os.read(descriptor, 64 * 1024)
                 if not chunk:
                     break
-                total += len(chunk)
-                if total > MAX_EXECUTABLE_BYTES:
+                if len(payload) + len(chunk) > MAX_EXECUTABLE_BYTES:
                     raise ReposkopContextError(
                         "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
                     )
+                payload.extend(chunk)
                 digest.update(chunk)
-            if total != metadata.st_size or total <= 0:
+            if len(payload) != metadata.st_size or len(payload) <= 0:
                 raise ReposkopContextError(
                     "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
                 )
@@ -228,8 +304,11 @@ def _open_validated_executable(path: Path) -> tuple[int, str]:
                 raise ReposkopContextError(
                     "Reposkop executable changed while being validated"
                 )
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            return descriptor, digest.hexdigest()
+            # Execute an immutable private copy so the source inode cannot be
+            # rewritten between hash and Popen while still using /proc/self/fd.
+            sealed = _seal_executable_bytes(bytes(payload))
+            os.close(descriptor)
+            return sealed, digest.hexdigest()
         except BaseException:
             os.close(descriptor)
             raise
@@ -571,7 +650,11 @@ def _run_reposkop(
     executable_descriptor, executable_sha256 = _open_validated_executable(
         REPOSKOP_BIN
     )
-    target_descriptor = _open_validated_target_directory(target)
+    try:
+        target_descriptor = _open_validated_target_directory(target)
+    except BaseException:
+        os.close(executable_descriptor)
+        raise
     try:
         target_stat = os.fstat(target_descriptor)
         target_identity = (target_stat.st_dev, target_stat.st_ino)

@@ -403,6 +403,37 @@ class OperatorContractTests(unittest.TestCase):
         }
         self.assertEqual(expected, declared)
 
+    def test_heavy_read_surfaces_offload_from_the_mcp_event_loop(self) -> None:
+        tree = ast.parse(
+            (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
+        )
+        expected = {
+            "grabowski_current_work",
+            "grabowski_operator_optimization_report",
+            "grabowski_checkout_binding_reconciliation",
+        }
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in expected
+        }
+        self.assertEqual(expected, set(functions))
+        for name, function in functions.items():
+            with self.subTest(name=name):
+                calls = [
+                    node
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "asyncio"
+                    and node.func.attr == "to_thread"
+                ]
+                self.assertEqual(1, len(calls))
+                self.assertTrue(
+                    any(isinstance(node, ast.Await) for node in ast.walk(function))
+                )
+
     def test_bureau_pickup_runtime_capability_contract(self) -> None:
         runtime = (ROOT / "src" / "grabowski_runtime.py").read_text(encoding="utf-8")
         self.assertIn("import grabowski_bureau_pickup", runtime)
