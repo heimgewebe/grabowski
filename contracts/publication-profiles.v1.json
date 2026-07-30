@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "b0d032e607e5c537de0e203bd19fb5210ab654d24509a34355cda2a3fe5d9d54"
+    "sha256": "cfc439b302d70c151b03ceb8db7f8eaf68ede81b6d452af42ceb6989dbb688f5"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "6fec71a2d82cddc79db99939917a5cff9d764a3212c155c46b0c91d180ab01e7"
+    "sha256": "a1c2b57269a546ecae5e6f7ae21ff5d38f67a60f1ea731275b59512bd83ba27c"
   },
   "counts": {
     "core": 22,
-    "full": 176,
-    "operator": 161
+    "full": 177,
+    "operator": 162
   },
   "profiles": {
     "core": [
@@ -80,6 +80,7 @@
       "grabowski_contract_drift",
       "grabowski_checkout_summary",
       "grabowski_current_work",
+      "grabowski_reposkop_context",
       "grabowski_operator_optimization_report",
       "grabowski_git_status",
       "grabowski_git_diff",
@@ -255,6 +256,7 @@
       "grabowski_audit_projection",
       "grabowski_contract_drift",
       "grabowski_current_work",
+      "grabowski_reposkop_context",
       "grabowski_operator_optimization_report",
       "grabowski_runtime_deploy_schedule",
       "grabowski_terminal_run",

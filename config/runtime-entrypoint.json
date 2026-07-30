@@ -42,6 +42,7 @@
     "grabowski_contract_drift",
     "grabowski_checkout_summary",
     "grabowski_current_work",
+    "grabowski_reposkop_context",
     "grabowski_operator_optimization_report",
     "grabowski_git_status",
     "grabowski_git_diff",
@@ -309,6 +310,10 @@
     {
       "module": "grabowski_operations",
       "source": "src/grabowski_operations.py"
+    },
+    {
+      "module": "grabowski_reposkop_context",
+      "source": "src/grabowski_reposkop_context.py"
     },
     {
       "module": "grabowski_privileged",

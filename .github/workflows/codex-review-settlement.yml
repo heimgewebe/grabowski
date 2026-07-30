@@ -19,18 +19,13 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
+  pull-requests: read
   statuses: write
 
 concurrency:
-  # Self-authored request comments must not enter the pull request cancellation
-  # group before the job-level recursion guard can skip them.
   group: >-
     codex-review-settlement-${{
-      github.event_name == 'issue_comment'
-      && github.event.comment.user.login == 'github-actions[bot]'
-      && github.run_id
-      || github.event.pull_request.number
+      github.event.pull_request.number
       || github.event.issue.number
       || inputs.pr
       || github.run_id
@@ -91,41 +86,11 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Request current-head Codex review
-        if: >-
-          github.event_name != 'issue_comment'
-          || github.event.comment.user.login != 'chatgpt-codex-connector[bot]'
-        id: request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          set +e
-          if [ ! -f tools/codex_review_settlement.py ]; then
-            jq -nc \
-              --arg error trusted_evaluator_missing_on_default_branch \
-              '{requested:false,errors:[$error]}' \
-              > codex-review-request.json
-            rc=2
-          else
-            python3 tools/codex_review_settlement.py \
-              --repository "$GITHUB_REPOSITORY" \
-              --pr "$PR_NUMBER" \
-              --require \
-              --json \
-              request > codex-review-request.json
-            rc=$?
-          fi
-          set -e
-          cat codex-review-request.json
-          echo "returncode=$rc" >> "$GITHUB_OUTPUT"
-
       - name: Evaluate current-head settlement
         id: evaluate
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
-          REQUEST_RETURN_CODE: ${{ steps.request.outputs.returncode || '0' }}
         run: |
           set +e
           if [ ! -f tools/codex_review_settlement.py ]; then
@@ -159,9 +124,6 @@ jobs:
           fi
           cat codex-review-settlement.json
           status="$(jq -r '.status // "block"' codex-review-settlement.json)"
-          if [ "$REQUEST_RETURN_CODE" != "0" ]; then
-            status="block"
-          fi
           case "$status" in
             pass)
               github_state="success"
@@ -169,7 +131,7 @@ jobs:
               ;;
             pending)
               github_state="pending"
-              description="Waiting for current-head Codex review"
+              description="Connected user must request current-head Codex review"
               ;;
             *)
               github_state="failure"

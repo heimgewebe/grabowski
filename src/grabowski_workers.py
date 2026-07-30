@@ -663,6 +663,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const digest = (value) => crypto.createHash('sha256').update(value, 'utf8').digest('hex');
 const FORM_READY_POLL_MS = 50;
 const FORM_READY_TIMEOUT_MS = 1000;
+const EXIT_FLUSH_TIMEOUT_MS = 1000;
 const FORM_ALLOWED_IDENTITY_TYPES = new Set(['text', 'email', 'select']);
 const FORM_ALLOWED_SUBMIT_TYPES = new Set(['submit', 'button']);
 const RESULT_CODES = new Set([
@@ -684,10 +685,22 @@ let actionEffectObserved = false;
 let navigationObserved = false;
 let formDisappeared = false;
 let remoteAddressSha256 = null;
+let receiptEmitted = false;
 
 function emit(payload, status = 0) {
-  process.stdout.write(JSON.stringify(payload) + '\n');
+  if (receiptEmitted) return;
+  receiptEmitted = true;
+  const line = JSON.stringify(payload) + '\n';
   process.exitCode = status;
+  const finish = () => {
+    try { if (ws) ws.close(); } catch {}
+    process.exit(status);
+  };
+  const forcedExit = setTimeout(finish, EXIT_FLUSH_TIMEOUT_MS);
+  process.stdout.write(line, () => {
+    clearTimeout(forcedExit);
+    finish();
+  });
 }
 
 function expression(selectors, body) {

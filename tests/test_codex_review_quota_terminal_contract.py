@@ -57,8 +57,8 @@ def request_payloads() -> tuple[dict, dict, dict]:
         "createdAt": REQUEST_TIME,
         "updatedAt": REQUEST_TIME,
         "url": "https://github.com/example/request/101",
-        "authorAssociation": "NONE",
-        "author": {"login": "github-actions[bot]"},
+        "authorAssociation": "OWNER",
+        "author": {"login": "alexdermohr"},
         "reactions": connection([], hasNextPage=False),
     }
     rest = {
@@ -66,8 +66,8 @@ def request_payloads() -> tuple[dict, dict, dict]:
         "body": body,
         "created_at": REQUEST_TIME,
         "html_url": graph["url"],
-        "author_association": "NONE",
-        "user": {"login": "github-actions[bot]"},
+        "author_association": "OWNER",
+        "user": {"login": "alexdermohr"},
     }
     return payload, graph, rest
 
