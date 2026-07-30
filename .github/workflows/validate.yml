@@ -58,6 +58,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           set +e
           git merge --no-ff --no-commit origin/main
@@ -109,7 +111,5 @@ jobs:
           set -euo pipefail
           git show origin/main:.github/workflows/validate.yml > .github/workflows/validate.yml
           git add -A
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "merge: reconcile text artifact review with current main"
           git push origin HEAD:fix/text-artifact-store-reconcile-v1
