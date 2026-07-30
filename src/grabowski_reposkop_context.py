@@ -459,39 +459,61 @@ def _run_bounded_process(
     }
 
 
+def _authorized_read_root(path: Path) -> Path:
+    candidates = [
+        root
+        for root in base._roots("read")
+        if path == root or root in path.parents
+    ]
+    if not candidates:
+        raise ReposkopContextError("repo is outside configured read roots")
+    return max(candidates, key=lambda root: len(root.parts))
+
+
 def _open_validated_target_directory(path: Path) -> int:
-    """Open the target checkout O_DIRECTORY|O_NOFOLLOW and bind that inode."""
+    """Open the target via a component walk from an authorized read root.
+
+    A single pathname open only protects the final component with O_NOFOLLOW.
+    Walking each ancestor with O_NOFOLLOW blocks same-UID symlink swaps in the
+    middle of the path after the earlier path-based resolve.
+    """
     if not path.is_absolute() or path.is_symlink():
         raise ReposkopContextError("repo must be an absolute non-symlink directory")
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    read_root = _authorized_read_root(path)
     try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError as exc:
-        raise ReposkopContextError(f"repo does not exist: {path}") from exc
-    except OSError as exc:
-        raise ReposkopContextError("repo could not be opened safely") from exc
+        components = path.relative_to(read_root).parts
+    except ValueError as exc:
+        raise ReposkopContextError(
+            "repo could not be made relative to its read root"
+        ) from exc
+    root_descriptor = _open_directory_descriptor(read_root)
     try:
-        metadata = os.fstat(descriptor)
+        _validate_directory_path_binding(
+            root_descriptor,
+            read_root,
+            label="Reposkop authorized read root",
+        )
+        if components:
+            # Checkouts may use shared modes; never require private 0700 here.
+            descriptor = _open_from_write_root(
+                root_descriptor,
+                components,
+                private_from_index=len(components),
+            )
+        else:
+            descriptor = os.dup(root_descriptor)
         try:
-            linked = path.lstat()
-        except FileNotFoundError as exc:
-            raise ReposkopContextError(f"repo does not exist: {path}") from exc
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or stat.S_ISLNK(linked.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != (linked.st_dev, linked.st_ino)
-        ):
-            raise ReposkopContextError("repo identity is unsafe")
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
+            _validate_directory_path_binding(
+                descriptor,
+                path,
+                label="Reposkop target directory",
+            )
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+    finally:
+        os.close(root_descriptor)
 
 
 def _run_reposkop(
@@ -1647,11 +1669,18 @@ def _recover_linked_pending(
     return True
 
 
-def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
+def _publish_receipt(
+    binding: dict[str, Any],
+    *,
+    root_descriptor: int,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     del root_descriptor  # callers may pass a prior fd; publication always re-anchors
     receipt_path = binding["receipt_path"]
     pending_path = binding["pending_path"]
-    with _publication_receipt_root() as live_root:
+    with _publication_receipt_root(
+        expected_identity=expected_identity
+    ) as live_root:
         if _recover_linked_pending(binding, root_descriptor=live_root):
             return
         if _entry_exists(live_root, receipt_path):
@@ -1673,12 +1702,23 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
     # Create pending while retaining the create dir_fd until link re-anchoring
     # succeeds. If re-open fails after create (rename out of write roots), the
     # create fd is the only handle that can still unlink the escaped .pending.
-    write_root_descriptor, create_root = _open_receipt_root_under_write_root()
+    write_root_descriptor, create_root = _open_receipt_root_under_write_root(
+        expected_identity=expected_identity
+    )
     try:
         create_identity = os.fstat(create_root)
+        if expected_identity is not None and (
+            create_identity.st_dev,
+            create_identity.st_ino,
+        ) != expected_identity:
+            raise ReposkopContextError(
+                "Reposkop receipt root descriptor does not match the validated directory"
+            )
         _create_pending_on_descriptor(binding, root_descriptor=create_root)
         try:
-            link_write_root, link_root = _open_receipt_root_under_write_root()
+            link_write_root, link_root = _open_receipt_root_under_write_root(
+                expected_identity=expected_identity
+            )
         except Exception as exc:
             # FileNotFoundError and other ordinary open failures must still
             # roll back the pending created under create_root; only then raise.
@@ -1754,13 +1794,19 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
 
 
 def _record_usage(
-    binding: dict[str, Any], *, root_descriptor: int
+    binding: dict[str, Any],
+    *,
+    root_descriptor: int,
+    expected_identity: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     with _receipt_lock(
         binding["lock_path"],
         root_descriptor=root_descriptor,
     ):
-        _validate_receipt_root_descriptor(root_descriptor)
+        _validate_receipt_root_descriptor(
+            root_descriptor,
+            expected_identity=expected_identity,
+        )
         existing = _entry_exists(root_descriptor, binding["receipt_path"])
         if existing:
             _read_exact_regular(
@@ -1782,10 +1828,19 @@ def _record_usage(
                     else AUDIT_PUBLICATION_CONTRACT
                 ),
             )
-        # Publication re-anchors and rolls back debris on write-root escape.
-        _publish_receipt(binding, root_descriptor=root_descriptor)
-        with _receipt_root_descriptor() as live_root:
-            _validate_receipt_root_descriptor(live_root)
+        # Publication re-anchors under the same validated root identity.
+        _publish_receipt(
+            binding,
+            root_descriptor=root_descriptor,
+            expected_identity=expected_identity,
+        )
+        with _receipt_root_descriptor(
+            expected_identity=expected_identity
+        ) as live_root:
+            _validate_receipt_root_descriptor(
+                live_root,
+                expected_identity=expected_identity,
+            )
             _read_exact_regular(
                 binding["receipt_path"],
                 binding["data"],
@@ -1888,6 +1943,7 @@ def grabowski_reposkop_context(
             usage_receipt = _record_usage(
                 binding,
                 root_descriptor=root_descriptor,
+                expected_identity=expected_root_identity,
             )
             _validate_receipt_root_descriptor(
                 root_descriptor,

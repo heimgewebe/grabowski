@@ -155,7 +155,9 @@ class ReposkopContextTests(unittest.TestCase):
             patch.object(
                 context.base,
                 "_roots",
-                side_effect=lambda kind: [self.root] if kind == "write" else [],
+                side_effect=lambda kind: (
+                    [self.root] if kind in {"write", "read"} else []
+                ),
             ),
             patch.object(context.base, "_require_mutations_enabled"),
             patch.object(context, "_find_audit_binding", side_effect=fake_find),
@@ -442,11 +444,13 @@ class ReposkopContextTests(unittest.TestCase):
         attacker_root = self.root / "attacker-receipts"
         real_publish_receipt = context._publish_receipt
 
-        def replace_root_then_publish(binding, *, root_descriptor):
+        def replace_root_then_publish(binding, *, root_descriptor, **kwargs):
             self.receipts.rename(moved_root)
             attacker_root.mkdir(mode=0o700)
             self.receipts.symlink_to(attacker_root, target_is_directory=True)
-            return real_publish_receipt(binding, root_descriptor=root_descriptor)
+            return real_publish_receipt(
+                binding, root_descriptor=root_descriptor, **kwargs
+            )
 
         with (
             self.patch_context(patches),
@@ -474,9 +478,11 @@ class ReposkopContextTests(unittest.TestCase):
         moved_root = outside / "receipts-moved"
         real_publish_receipt = context._publish_receipt
 
-        def rename_outside_then_publish(binding, *, root_descriptor):
+        def rename_outside_then_publish(binding, *, root_descriptor, **kwargs):
             self.receipts.rename(moved_root)
-            return real_publish_receipt(binding, root_descriptor=root_descriptor)
+            return real_publish_receipt(
+                binding, root_descriptor=root_descriptor, **kwargs
+            )
 
         with (
             self.patch_context(patches),
@@ -662,6 +668,13 @@ class ReposkopContextTests(unittest.TestCase):
         report = self.report()
         with (
             patch.object(context, "REPOSKOP_BIN", script),
+            patch.object(
+                context.base,
+                "_roots",
+                side_effect=lambda kind: (
+                    [self.root] if kind in {"write", "read"} else []
+                ),
+            ),
             patch.object(context, "_run_bounded_process", side_effect=capture_run),
             patch.object(context, "_validate_report", return_value=report),
         ):
@@ -1136,6 +1149,13 @@ class ReposkopContextTests(unittest.TestCase):
         }
         with (
             patch.object(context, "REPOSKOP_BIN", self.executable),
+            patch.object(
+                context.base,
+                "_roots",
+                side_effect=lambda kind: (
+                    [self.root] if kind in {"write", "read"} else []
+                ),
+            ),
             patch.object(context, "_run_bounded_process", return_value=result),
         ):
             with self.assertRaisesRegex(
@@ -1159,6 +1179,13 @@ class ReposkopContextTests(unittest.TestCase):
         }
         with (
             patch.object(context, "REPOSKOP_BIN", self.executable),
+            patch.object(
+                context.base,
+                "_roots",
+                side_effect=lambda kind: (
+                    [self.root] if kind in {"write", "read"} else []
+                ),
+            ),
             patch.object(context, "_run_bounded_process", return_value=result),
         ):
             with self.assertRaisesRegex(
