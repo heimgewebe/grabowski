@@ -496,7 +496,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Project bounded current operator work without blocking the MCP event loop.",
+      "description": "Project work for absolute local repository paths without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_current_work",
       "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
