@@ -647,6 +647,40 @@ class BureauPickupTests(unittest.TestCase):
         )
         release.assert_called_once_with(intent["lease_owner_id"], [key])
 
+    def test_coordinated_readback_text_cannot_trigger_missing_run_compensation(
+        self,
+    ) -> None:
+        intent = self.intent()
+        intent["worker_id"] = "agent unknown run"
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    coordinated,
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(
+                self.request(worker_id=intent["worker_id"])
+            )
+        self.assertEqual("claimed", result["status"])
+        self.assertEqual(
+            pickup._sha256(coordinated), result["run_readback_sha256"]
+        )
+        release.assert_not_called()
+
     def test_definitive_missing_run_compensates_after_commit_failure(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]

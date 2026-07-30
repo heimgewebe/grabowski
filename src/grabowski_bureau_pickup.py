@@ -1032,8 +1032,7 @@ def _coordination_status(
 
 
 def _definitive_missing_run(payload: dict[str, Any]) -> bool:
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True).lower()
-    return "unknown run" in text or payload.get("code") in {
+    return payload.get("status") != "coordinated" and payload.get("code") in {
         "unknown-run",
         "state-error-unknown-run",
     }
