@@ -94,8 +94,9 @@ class ReposkopContextTests(unittest.TestCase):
             self.assertEqual(stdout_limit, context.MAX_REPORT_BYTES)
             self.assertEqual(stderr_limit, context.MAX_STDERR_BYTES)
             self.assertIsInstance(pass_fds, tuple)
-            self.assertEqual(len(pass_fds), 1)
+            self.assertEqual(len(pass_fds), 2)
             self.assertTrue(str(argv[0]).startswith("/proc/self/fd/"))
+            self.assertTrue(str(argv[2]).startswith("/proc/self/fd/"))
             stdout = json.dumps(report)
             return {
                 "returncode": 0,
@@ -301,11 +302,11 @@ class ReposkopContextTests(unittest.TestCase):
         )
         run_argv = self.run_calls[0][0]
         self.assertTrue(run_argv[0].startswith("/proc/self/fd/"))
+        self.assertEqual(run_argv[1], "report")
+        self.assertTrue(run_argv[2].startswith("/proc/self/fd/"))
         self.assertEqual(
-            run_argv[1:],
+            run_argv[3:],
             [
-                "report",
-                str(self.repo.resolve()),
                 "--purpose",
                 "grabowski-repo-state-context",
                 "--json",
@@ -671,10 +672,12 @@ class ReposkopContextTests(unittest.TestCase):
         argv = captured["argv"]
         assert isinstance(argv, list)
         self.assertTrue(str(argv[0]).startswith("/proc/self/fd/"))
-        self.assertEqual(argv[1:4], ["report", str(self.repo.resolve()), "--purpose"])
+        self.assertEqual(argv[1], "report")
+        self.assertTrue(str(argv[2]).startswith("/proc/self/fd/"))
+        self.assertEqual(argv[3], "--purpose")
         pass_fds = captured["pass_fds"]
         self.assertIsInstance(pass_fds, tuple)
-        self.assertEqual(len(pass_fds), 1)
+        self.assertEqual(len(pass_fds), 2)
         self.assertEqual(executable["path"], str(script))
         self.assertEqual(executable["sha256"], context._sha256_file(script))
 

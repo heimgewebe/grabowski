@@ -234,7 +234,13 @@ def _reject_nonfinite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is unsupported: {value}")
 
 
-def _validate_report(report: Any, *, target: Path, purpose: str) -> dict[str, Any]:
+def _validate_report(
+    report: Any,
+    *,
+    target: Path,
+    purpose: str,
+    allowed_paths: set[str] | None = None,
+) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise ReposkopContextError("Reposkop report must be a JSON object")
     if (
@@ -271,7 +277,13 @@ def _validate_report(report: Any, *, target: Path, purpose: str) -> dict[str, An
     identities = observation.get("identities")
     if not isinstance(identities, dict):
         raise ReposkopContextError("Reposkop observation is missing identities")
-    if identities.get("path") != str(target) or identities.get("purpose") != purpose:
+    accepted_paths = {str(target)}
+    if allowed_paths is not None:
+        accepted_paths.update(allowed_paths)
+    if (
+        identities.get("path") not in accepted_paths
+        or identities.get("purpose") != purpose
+    ):
         raise ReposkopContextError(
             "Reposkop report target or purpose does not match the request"
         )
@@ -447,20 +459,66 @@ def _run_bounded_process(
     }
 
 
+def _open_validated_target_directory(path: Path) -> int:
+    """Open the target checkout O_DIRECTORY|O_NOFOLLOW and bind that inode."""
+    if not path.is_absolute() or path.is_symlink():
+        raise ReposkopContextError("repo must be an absolute non-symlink directory")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise ReposkopContextError(f"repo does not exist: {path}") from exc
+    except OSError as exc:
+        raise ReposkopContextError("repo could not be opened safely") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        try:
+            linked = path.lstat()
+        except FileNotFoundError as exc:
+            raise ReposkopContextError(f"repo does not exist: {path}") from exc
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (linked.st_dev, linked.st_ino)
+        ):
+            raise ReposkopContextError("repo identity is unsafe")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _run_reposkop(
     target: Path, purpose: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     # Bind validation to the executed inode: open O_NOFOLLOW, hash that fd, and
     # exec via /proc/self/fd/N so a same-UID path replace cannot swap the image.
+    # Likewise bind the target checkout directory so the child observes that inode.
     executable_descriptor, executable_sha256 = _open_validated_executable(
         REPOSKOP_BIN
     )
+    target_descriptor = _open_validated_target_directory(target)
     try:
+        executable_path = f"/proc/self/fd/{executable_descriptor}"
+        target_path = f"/proc/self/fd/{target_descriptor}"
+        try:
+            target_link = os.readlink(f"/proc/self/fd/{target_descriptor}")
+        except OSError:
+            target_link = ""
+        allowed_paths = {str(target), target_path}
+        if target_link:
+            allowed_paths.add(target_link)
         result = _run_bounded_process(
             [
-                f"/proc/self/fd/{executable_descriptor}",
+                executable_path,
                 "report",
-                str(target),
+                target_path,
                 "--purpose",
                 purpose,
                 "--json",
@@ -469,9 +527,10 @@ def _run_reposkop(
             timeout_seconds=20,
             stdout_limit=MAX_REPORT_BYTES,
             stderr_limit=MAX_STDERR_BYTES,
-            pass_fds=(executable_descriptor,),
+            pass_fds=(executable_descriptor, target_descriptor),
         )
     finally:
+        os.close(target_descriptor)
         os.close(executable_descriptor)
     if result["timed_out"]:
         raise ReposkopContextError("Reposkop report timed out")
@@ -513,7 +572,12 @@ def _run_reposkop(
         raise ReposkopContextError(
             "Reposkop report output is not valid JSON"
         ) from exc
-    return _validate_report(report, target=target, purpose=purpose), {
+    return _validate_report(
+        report,
+        target=target,
+        purpose=purpose,
+        allowed_paths=allowed_paths,
+    ), {
         "path": str(REPOSKOP_BIN),
         "sha256": executable_sha256,
     }
@@ -1630,12 +1694,10 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
                 link_identity.st_dev,
                 link_identity.st_ino,
             ):
-                # Re-anchor selected a different authorized directory; remove
-                # debris via both bound roots before failing closed.
+                # Only roll back the pending this invocation created under
+                # create_root. link_root may already hold unrelated published
+                # evidence that we must not delete.
                 _rollback_leaf_names(create_root, pending_path.name)
-                _rollback_leaf_names(
-                    link_root, pending_path.name, receipt_path.name
-                )
                 raise ReposkopContextError(
                     "Reposkop receipt root identity changed between create and link re-anchor"
                 )
