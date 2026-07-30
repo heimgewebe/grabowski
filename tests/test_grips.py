@@ -42,6 +42,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.server.fastmcp"] = fake_fastmcp
     sys.modules["mcp.types"] = fake_types
 
+import grabowski_checkouts as checkouts
 import grabowski_grips as grips
 import grabowski_grip_orchestration as grip_orchestration
 import grabowski_merge_guard as merge_guard
@@ -9815,9 +9816,18 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
     def test_exact_merged_pr_archives_owned_clean_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             checkout = str(Path(tmp) / "worktree")
+            created_at_unix = int(time.time())
+            retention_until_unix = (
+                created_at_unix
+                + 2 * checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            )
+            item = self._owned_item(checkout)
+            item["lifecycle"]["retention"]["retention_until_unix"] = (
+                retention_until_unix
+            )
             inventory = {
                 "inventory_sha256": "1" * 64,
-                "worktrees": [self._owned_item(checkout)],
+                "worktrees": [item],
             }
 
             def github_runner(_repo: Path, argv: list[str]) -> dict[str, object]:
@@ -9849,7 +9859,8 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
             archive_result = {
                 "archive": {
                     "archive_id": "20260722T010000Z-aaaaaaaaaaaa",
-                    "created_at_unix": 1000,
+                    "created_at_unix": created_at_unix,
+                    "retention_until_unix": retention_until_unix,
                 }
             }
             with (
@@ -9874,6 +9885,13 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
         archive.assert_called_once()
         self.assertEqual(self.HEAD, archive.call_args.kwargs["expected_head"])
         self.assertEqual(self.BRANCH, archive.call_args.kwargs["expected_branch"])
+        archived = result["output"]["archived"][0]
+        self.assertEqual(
+            archived["cleanup_not_before_unix"], retention_until_unix
+        )
+        self.assertEqual(
+            archived["cleanup_available_at_unix"], retention_until_unix
+        )
 
     def test_head_mismatch_does_not_archive(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -10102,6 +10120,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                         "archive": {
                             "archive_id": "20260722T010000Z-cccccccccccc",
                             "created_at_unix": 1000,
+                            "retention_until_unix": 2000,
                         }
                     },
                 ) as archive,
@@ -10292,6 +10311,7 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
                         "archive": {
                             "archive_id": "20260722T010000Z-ffffffffffff",
                             "created_at_unix": 1000,
+                            "retention_until_unix": 2000,
                         }
                     },
                 ) as archive,

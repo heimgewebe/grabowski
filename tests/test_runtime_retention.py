@@ -1749,6 +1749,130 @@ class RuntimeRetentionTests(unittest.TestCase):
             "blocked",
         )
 
+    def test_periodic_worktree_hygiene_treats_configured_absent_roots_as_noop(self) -> None:
+        plan = {
+            "plan_sha256": "0" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            absent = root / "not-created"
+            repo.mkdir()
+            runner = Mock()
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ):
+                result = RETENTION.apply_periodic_plan(
+                    worktree_hygiene_repositories=[str(repo)],
+                    worktree_hygiene_allowed_roots=[str(absent)],
+                    worktree_hygiene_runner=runner,
+                )
+
+        runner.assert_not_called()
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["mutated"])
+        hygiene = result["worktree_hygiene"]
+        self.assertEqual(
+            hygiene["operation"],
+            "grabowski-worktree-hygiene-periodic-noop",
+        )
+        self.assertEqual(hygiene["reason"], "configured_checkout_roots_absent")
+        self.assertEqual(
+            hygiene["missing_allowed_checkout_roots"],
+            [str(absent.resolve(strict=False))],
+        )
+        self.assertEqual(hygiene["allowed_checkout_roots"], [])
+
+    def test_absent_roots_do_not_hide_invalid_action_bound(self) -> None:
+        plan = {
+            "plan_sha256": "4" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            absent = root / "not-created"
+            repo.mkdir()
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "max_worktree_hygiene_actions"
+                ):
+                    RETENTION.apply_periodic_plan(
+                        worktree_hygiene_repositories=[str(repo)],
+                        worktree_hygiene_allowed_roots=[str(absent)],
+                        max_worktree_hygiene_actions=0,
+                    )
+
+    def test_periodic_worktree_hygiene_uses_existing_roots_and_reports_absent_ones(self) -> None:
+        plan = {
+            "plan_sha256": "2" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            existing = root / "existing"
+            absent = root / "not-created"
+            repo.mkdir()
+            existing.mkdir()
+            runner = Mock(
+                return_value={
+                    "status": "passed",
+                    "output": {"actions": 0, "archived": [], "cleaned": []},
+                }
+            )
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ):
+                result = RETENTION.apply_periodic_plan(
+                    worktree_hygiene_repositories=[str(repo)],
+                    worktree_hygiene_allowed_roots=[str(absent), str(existing)],
+                    worktree_hygiene_runner=runner,
+                )
+
+        runner.assert_called_once()
+        parameters = runner.call_args.args[1]
+        self.assertEqual(
+            parameters["allowed_checkout_roots"], [str(existing.resolve())]
+        )
+        hygiene = result["worktree_hygiene"]
+        self.assertEqual(
+            hygiene["missing_allowed_checkout_roots"],
+            [str(absent.resolve(strict=False))],
+        )
+        self.assertEqual(
+            hygiene["allowed_checkout_roots"], [str(existing.resolve())]
+        )
+
+    def test_periodic_worktree_hygiene_rejects_symlinked_allowed_root(self) -> None:
+        plan = {
+            "plan_sha256": "3" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            target = root / "target"
+            linked = root / "linked"
+            repo.mkdir()
+            target.mkdir()
+            linked.symlink_to(target, target_is_directory=True)
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ):
+                with self.assertRaisesRegex(ValueError, "may not be symlinks"):
+                    RETENTION.apply_periodic_plan(
+                        worktree_hygiene_repositories=[str(repo)],
+                        worktree_hygiene_allowed_roots=[str(linked)],
+                    )
+
     def test_periodic_worktree_hygiene_rejects_missing_allowed_root(self) -> None:
         plan = {
             "plan_sha256": "1" * 64,

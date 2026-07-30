@@ -1686,22 +1686,35 @@ def _normalize_periodic_paths(
     *,
     label: str,
     maximum: int,
-) -> list[str]:
+    allow_missing: bool = False,
+) -> tuple[list[str], list[str]]:
     if values is None:
-        return []
+        return [], []
     if not isinstance(values, (list, tuple)) or len(values) > maximum:
         raise ValueError(f"{label} must contain at most {maximum} paths")
     normalized: list[str] = []
+    missing: list[str] = []
     for raw in values:
         if not isinstance(raw, str) or not raw or "\x00" in raw:
             raise ValueError(f"{label} entries must be non-empty paths")
-        path = Path(raw).expanduser().resolve(strict=True)
-        if not path.is_dir():
+        path = Path(raw).expanduser()
+        if path.is_symlink():
+            raise ValueError(f"{label} entries may not be symlinks")
+        try:
+            resolved = path.resolve(strict=True)
+        except FileNotFoundError:
+            if not allow_missing:
+                raise
+            value = str(path.resolve(strict=False))
+            if value not in missing:
+                missing.append(value)
+            continue
+        if not resolved.is_dir():
             raise ValueError(f"{label} entries must be directories")
-        value = str(path)
+        value = str(resolved)
         if value not in normalized:
             normalized.append(value)
-    return normalized
+    return normalized, missing
 
 
 def _apply_periodic_worktree_hygiene(
@@ -1712,15 +1725,16 @@ def _apply_periodic_worktree_hygiene(
     max_actions: int,
     grip_runner: Any | None = None,
 ) -> dict[str, Any]:
-    repos = _normalize_periodic_paths(
+    repos, _missing_repositories = _normalize_periodic_paths(
         repositories,
         label="worktree_hygiene_repositories",
         maximum=MAX_WORKTREE_HYGIENE_REPOSITORIES,
     )
-    roots = _normalize_periodic_paths(
+    roots, missing_roots = _normalize_periodic_paths(
         allowed_checkout_roots,
         label="worktree_hygiene_allowed_roots",
         maximum=MAX_WORKTREE_HYGIENE_ROOTS,
+        allow_missing=True,
     )
     if not repos:
         return {
@@ -1731,10 +1745,6 @@ def _apply_periodic_worktree_hygiene(
             "actions": 0,
             "receipts": [],
         }
-    if not roots:
-        raise ValueError(
-            "periodic worktree hygiene requires at least one allowed checkout root"
-        )
     if (
         isinstance(max_actions, bool)
         or not isinstance(max_actions, int)
@@ -1746,6 +1756,25 @@ def _apply_periodic_worktree_hygiene(
         )
     if not isinstance(owner_id, str) or not owner_id:
         raise ValueError("worktree_hygiene_owner must be a non-empty string")
+    if not roots:
+        if not allowed_checkout_roots:
+            raise ValueError(
+                "periodic worktree hygiene requires at least one allowed checkout root"
+            )
+        return {
+            "schema_version": 1,
+            "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "completed": True,
+            "mutated": False,
+            "actions": 0,
+            "receipts": [],
+            "repositories": repos,
+            "allowed_checkout_roots": [],
+            "missing_allowed_checkout_roots": missing_roots,
+            "reason": "configured_checkout_roots_absent",
+            "bounded": True,
+            "single_producer": "grabowski-runtime-retention.timer",
+        }
 
     source = str(SRC)
     if source not in sys.path:
@@ -1805,6 +1834,7 @@ def _apply_periodic_worktree_hygiene(
         "maximum_actions": max_actions,
         "repositories": repos,
         "allowed_checkout_roots": roots,
+        "missing_allowed_checkout_roots": missing_roots,
         "owner_id": owner_id,
         "receipts": receipts,
         "bounded": True,

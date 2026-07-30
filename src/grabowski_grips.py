@@ -3596,21 +3596,21 @@ def _run_worktree_hygiene_reconcile(
             expected_head=head,
             expected_branch=branch,
         )
+        archive_record = result["archive"]
+        cleanup_available_at_unix = max(
+            int(archive_record["created_at_unix"])
+            + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+            int(archive_record["retention_until_unix"]),
+        )
         archived.append({
             "path": path,
-            "archive_id": result["archive"]["archive_id"],
+            "archive_id": archive_record["archive_id"],
             "head": head,
             "branch": branch,
             "merged_pr": terminal,
             "ownership_mode": owner_mode,
-            "cleanup_not_before_unix": (
-                result["archive"]["created_at_unix"]
-                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-            ),
-            "cleanup_available_at_unix": (
-                result["archive"]["created_at_unix"]
-                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
-            ),
+            "cleanup_not_before_unix": cleanup_available_at_unix,
+            "cleanup_available_at_unix": cleanup_available_at_unix,
         })
         actions += 1
 
