@@ -19,6 +19,8 @@ The optional receipt can bind one repository, pull request, base commit, head co
 
 This sequence is used only when the artifact itself is wanted. Normal merges continue to require exact live base/head/diff binding, diff-bound review, green required CI, current GitHub state, resource leases and post-merge readback, but no user-visible diff file.
 
+For rolling compatibility, Captain tolerates the former `merge_delivery_receipt_sha256` execution-intent evidence field when an older caller still sends it. The field remains format-checked and may be receipt-bound by that caller, but it is optional, creates no gate and grants no merge authority.
+
 ## Receipt contract
 
 The create-only private receipt records repository and PR identity, full base and head SHAs, complete diff SHA-256, artifact identity and size, delivery channel and reference, timestamps, expiry and deterministic hashes. Owner-control, file integrity and freshness checks remain fail-closed for consumers that explicitly choose to verify such a receipt.

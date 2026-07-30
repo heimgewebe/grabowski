@@ -3972,6 +3972,14 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
         },
         "issued_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+    legacy_delivery_sha256 = parameters.get("merge_delivery_receipt_sha256")
+    if (
+        isinstance(legacy_delivery_sha256, str)
+        and grips._is_sha256_hex(legacy_delivery_sha256)
+    ):
+        evidence_sha256 = intent["evidence_sha256"]
+        assert isinstance(evidence_sha256, dict)
+        evidence_sha256["merge_delivery_receipt_sha256"] = legacy_delivery_sha256
     if action["action"] == "pr-merge":
         intent["expected_base_sha"] = parameters.get("expected_base_sha")
     intent.update(overrides)
@@ -9131,6 +9139,46 @@ class CaptainExecutionIntentTests(unittest.TestCase):
         self.assertEqual([], gh.calls)
         intent_checks = [check for check in result["receipt"]["checks"] if check["id"] == "execution-intent-bound"]
         self.assertEqual("fail", intent_checks[-1]["status"])
+
+    def test_legacy_merge_delivery_digest_is_optional_and_compatible(self) -> None:
+        parameters = self.executable_parameters()
+        parameters["merge_delivery_receipt"] = {"schema": "legacy-advisory"}
+        parameters["merge_delivery_receipt_sha256"] = "a" * 64
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        actions = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )
+
+        info, errors = grips._captain_execution_intent_review(parameters, actions)
+
+        self.assertEqual([], errors)
+        self.assertTrue(info["valid"])
+        self.assertEqual(
+            "a" * 64,
+            info["evidence_sha256"]["merge_delivery_receipt_sha256"],
+        )
+        self.assertNotIn(
+            "diff-delivery-recorded",
+            grips.CAPTAIN_GATE_IDS,
+        )
+
+    def test_optional_legacy_merge_delivery_digest_must_be_canonical(self) -> None:
+        parameters = self.executable_parameters()
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        evidence = parameters["execution_intent"]["evidence_sha256"]
+        assert isinstance(evidence, dict)
+        evidence["merge_delivery_receipt_sha256"] = "A" * 64
+        actions = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )
+
+        info, errors = grips._captain_execution_intent_review(parameters, actions)
+
+        self.assertFalse(info["valid"])
+        self.assertIn(
+            "execution_intent_evidence_not_canonical:merge_delivery_receipt_sha256",
+            errors,
+        )
 
     def test_captain_run_blocks_missing_execution_intent_before_any_executor(self) -> None:
         parameters = self.executable_parameters()

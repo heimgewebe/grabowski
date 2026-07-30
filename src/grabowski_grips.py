@@ -675,6 +675,13 @@ CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
     "ci_evidence_sha256",
     "authorization_sha256",
 )
+CAPTAIN_EXECUTION_INTENT_LEGACY_OPTIONAL_EVIDENCE_KEYS = (
+    "merge_delivery_receipt_sha256",
+)
+CAPTAIN_EXECUTION_INTENT_ALLOWED_EVIDENCE_KEYS = (
+    *CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS,
+    *CAPTAIN_EXECUTION_INTENT_LEGACY_OPTIONAL_EVIDENCE_KEYS,
+)
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 CAPTAIN_DOES_NOT_ESTABLISH = (
     "automatic_merge_authority",
@@ -5992,6 +5999,7 @@ def _captain_execution_intent_expected_evidence(
     codex_exception = parameters.get("codex_review_exception")
     ci = parameters.get("ci_evidence")
     diff = parameters.get("diff_sha256")
+    legacy_merge_delivery = parameters.get("merge_delivery_receipt_sha256")
     return {
         "actions_sha256": _captain_actions_sha256(actions),
         "status_projection_sha256": sha256_json(projection) if isinstance(projection, dict) and projection else None,
@@ -6009,6 +6017,11 @@ def _captain_execution_intent_expected_evidence(
         ),
         "ci_evidence_sha256": sha256_json(ci) if isinstance(ci, dict) and ci else None,
         "authorization_sha256": _captain_execution_intent_authorization_sha256(parameters),
+        "merge_delivery_receipt_sha256": (
+            legacy_merge_delivery
+            if _is_sha256_hex(legacy_merge_delivery)
+            else None
+        ),
     }
 
 
@@ -6174,19 +6187,18 @@ def _captain_execution_intent_review(
         if not isinstance(declared_evidence, dict) or not declared_evidence:
             errors.append("execution_intent_field_invalid:evidence_sha256")
         else:
-            if any(key not in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS for key in declared_evidence):
+            if any(key not in CAPTAIN_EXECUTION_INTENT_ALLOWED_EVIDENCE_KEYS for key in declared_evidence):
                 errors.append("execution_intent_evidence_unknown_keys_present")
             expected_evidence = _captain_execution_intent_expected_evidence(parameters, actions)
-            required_evidence_keys = (
-                CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
-                if action_name == "pr-merge"
-                else tuple(
-                    key
-                    for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
-                    if key not in CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS
+            required_evidence_keys = tuple(
+                key
+                for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
+                if (
+                    action_name == "pr-merge"
+                    or key not in CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS
                 )
             )
-            for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS:
+            for key in CAPTAIN_EXECUTION_INTENT_ALLOWED_EVIDENCE_KEYS:
                 if key not in declared_evidence:
                     if key in required_evidence_keys:
                         errors.append(f"execution_intent_evidence_missing:{key}")
@@ -6200,7 +6212,12 @@ def _captain_execution_intent_review(
                     errors.append(f"execution_intent_evidence_not_canonical:{key}")
                     continue
                 expected_value = expected_evidence.get(key)
-                if expected_value is None:
+                if (
+                    expected_value is None
+                    and key in CAPTAIN_EXECUTION_INTENT_LEGACY_OPTIONAL_EVIDENCE_KEYS
+                ):
+                    info["evidence_sha256"][key] = declared_value
+                elif expected_value is None:
                     errors.append(f"execution_intent_evidence_unverifiable:{key}")
                 elif declared_value != expected_value:
                     errors.append(f"execution_intent_evidence_drift:{key}")
