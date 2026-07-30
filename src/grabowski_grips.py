@@ -20,7 +20,6 @@ import grabowski_convergence
 import grabowski_client_snapshot
 import grabowski_operator_obligation
 import grabowski_worktree_ensure
-import grabowski_merge_delivery
 import grabowski_merge_guard
 
 Receipt = dict[str, Any]
@@ -602,7 +601,6 @@ CAPTAIN_GATE_IDS = (
     "review-evidence-present",
     "codex-review-settled",
     "diff-bound",
-    "diff-delivery-recorded",
     "ci-green",
     "autonomy-policy",
     "human-authorization-present",
@@ -672,11 +670,17 @@ CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS = (
     "actions_sha256",
     "status_projection_sha256",
     "diff_sha256",
-    "merge_delivery_receipt_sha256",
     "review_evidence_sha256",
     *CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS,
     "ci_evidence_sha256",
     "authorization_sha256",
+)
+CAPTAIN_EXECUTION_INTENT_LEGACY_OPTIONAL_EVIDENCE_KEYS = (
+    "merge_delivery_receipt_sha256",
+)
+CAPTAIN_EXECUTION_INTENT_ALLOWED_EVIDENCE_KEYS = (
+    *CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS,
+    *CAPTAIN_EXECUTION_INTENT_LEGACY_OPTIONAL_EVIDENCE_KEYS,
 )
 CAPTAIN_BASE_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 CAPTAIN_DOES_NOT_ESTABLISH = (
@@ -5652,85 +5656,6 @@ def _captain_diff_bound_gate(parameters: dict[str, Any]) -> dict[str, Any]:
     return _captain_gate("diff-bound", "pass", "decision is bound to one reviewed diff hash")
 
 
-def _captain_merge_delivery_gate(
-    parameters: dict[str, Any],
-    actions: list[dict[str, Any]],
-) -> dict[str, Any]:
-    targets = [
-        action.get("target")
-        for action in actions
-        if action.get("action") == "pr-merge"
-        and isinstance(action.get("target"), dict)
-    ]
-    if not targets:
-        return _captain_gate(
-            "diff-delivery-recorded",
-            "pass",
-            "user-visible diff delivery is not applicable because no pr-merge action is requested",
-        )
-    if len(targets) != 1:
-        return _captain_gate(
-            "diff-delivery-recorded",
-            "blocked",
-            "one delivery receipt can bind exactly one pr-merge action",
-            ["merge_delivery_target_count_invalid"],
-        )
-    receipt = parameters.get("merge_delivery_receipt")
-    receipt_sha256 = parameters.get("merge_delivery_receipt_sha256")
-    expected_head = parameters.get("expected_head")
-    expected_base_sha = parameters.get("expected_base_sha")
-    expected_diff = parameters.get("diff_sha256")
-    target = targets[0]
-    if not isinstance(receipt, dict) or not receipt:
-        return _captain_gate(
-            "diff-delivery-recorded",
-            "blocked",
-            "a durable user-visible diff delivery receipt is required before merge",
-            ["merge_delivery_receipt_missing"],
-        )
-    if not _is_sha256_hex(receipt_sha256):
-        return _captain_gate(
-            "diff-delivery-recorded",
-            "blocked",
-            "merge_delivery_receipt_sha256 is missing or invalid",
-            ["merge_delivery_receipt_sha256_missing_or_invalid"],
-        )
-    if (
-        not _is_hex_sha(expected_head, lengths=(40,))
-        or not _is_hex_sha(expected_base_sha, lengths=(40,))
-        or not _is_sha256_hex(expected_diff)
-    ):
-        return _captain_gate(
-            "diff-delivery-recorded",
-            "blocked",
-            "merge-delivery binding cannot be checked without exact base, head and diff identities",
-            ["merge_delivery_binding_unverifiable"],
-        )
-    try:
-        info = grabowski_merge_delivery.validate_delivery_receipt_snapshot(
-            receipt,
-            expected_repository=str(target.get("repo", "")),
-            expected_pull_request=target.get("pr"),
-            expected_base_sha=str(expected_base_sha),
-            expected_head_sha=str(expected_head),
-            expected_diff_sha256=str(expected_diff),
-            expected_receipt_sha256=str(receipt_sha256),
-        )
-    except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
-        return _captain_gate(
-            "diff-delivery-recorded",
-            "blocked",
-            "the user-visible diff delivery receipt is invalid, stale or bound to another target",
-            [f"merge_delivery_receipt_invalid:{type(exc).__name__}:{exc}"],
-        )
-    return _captain_gate(
-        "diff-delivery-recorded",
-        "pass",
-        "a fresh delivery receipt binds the downloadable artifact to the same repository, PR, base, head and diff; user opening is not claimed",
-        info,
-    )
-
-
 def _captain_ci_gate(parameters: dict[str, Any], actions: list[dict[str, Any]]) -> dict[str, Any]:
     evidence = _captain_evidence_object(parameters, "ci_evidence")
     if evidence is None:
@@ -5900,7 +5825,6 @@ def _captain_action_record(
             "configured_automatic_platform_effects",
             "automatic_platform_effects",
             "effect_scope_decision",
-            "merge_delivery",
             "external_merge_reconciliation",
         ):
             if key in execution_result:
@@ -5953,7 +5877,6 @@ def _captain_authority_gates(
         _captain_review_evidence_gate(parameters, actions),
         _captain_codex_review_gate(parameters, actions),
         _captain_diff_bound_gate(parameters),
-        _captain_merge_delivery_gate(parameters, actions),
         _captain_ci_gate(parameters, actions),
         _captain_autonomy_policy_gate(parameters, actions),
         _captain_human_authorization_gate(parameters, actions),
@@ -6076,16 +5999,11 @@ def _captain_execution_intent_expected_evidence(
     codex_exception = parameters.get("codex_review_exception")
     ci = parameters.get("ci_evidence")
     diff = parameters.get("diff_sha256")
-    merge_delivery_receipt_sha256 = parameters.get("merge_delivery_receipt_sha256")
+    legacy_merge_delivery = parameters.get("merge_delivery_receipt_sha256")
     return {
         "actions_sha256": _captain_actions_sha256(actions),
         "status_projection_sha256": sha256_json(projection) if isinstance(projection, dict) and projection else None,
         "diff_sha256": diff if _is_sha256_hex(diff) else None,
-        "merge_delivery_receipt_sha256": (
-            merge_delivery_receipt_sha256
-            if _is_sha256_hex(merge_delivery_receipt_sha256)
-            else None
-        ),
         "review_evidence_sha256": sha256_json(review) if isinstance(review, dict) and review else None,
         "codex_review_evidence_sha256": (
             sha256_json(codex_review)
@@ -6099,6 +6017,11 @@ def _captain_execution_intent_expected_evidence(
         ),
         "ci_evidence_sha256": sha256_json(ci) if isinstance(ci, dict) and ci else None,
         "authorization_sha256": _captain_execution_intent_authorization_sha256(parameters),
+        "merge_delivery_receipt_sha256": (
+            legacy_merge_delivery
+            if _is_sha256_hex(legacy_merge_delivery)
+            else None
+        ),
     }
 
 
@@ -6264,19 +6187,18 @@ def _captain_execution_intent_review(
         if not isinstance(declared_evidence, dict) or not declared_evidence:
             errors.append("execution_intent_field_invalid:evidence_sha256")
         else:
-            if any(key not in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS for key in declared_evidence):
+            if any(key not in CAPTAIN_EXECUTION_INTENT_ALLOWED_EVIDENCE_KEYS for key in declared_evidence):
                 errors.append("execution_intent_evidence_unknown_keys_present")
             expected_evidence = _captain_execution_intent_expected_evidence(parameters, actions)
-            required_evidence_keys = (
-                CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
-                if action_name == "pr-merge"
-                else tuple(
-                    key
-                    for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
-                    if key not in CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS
+            required_evidence_keys = tuple(
+                key
+                for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS
+                if (
+                    action_name == "pr-merge"
+                    or key not in CAPTAIN_EXECUTION_INTENT_CODEX_EVIDENCE_KEYS
                 )
             )
-            for key in CAPTAIN_EXECUTION_INTENT_EVIDENCE_KEYS:
+            for key in CAPTAIN_EXECUTION_INTENT_ALLOWED_EVIDENCE_KEYS:
                 if key not in declared_evidence:
                     if key in required_evidence_keys:
                         errors.append(f"execution_intent_evidence_missing:{key}")
@@ -6290,7 +6212,12 @@ def _captain_execution_intent_review(
                     errors.append(f"execution_intent_evidence_not_canonical:{key}")
                     continue
                 expected_value = expected_evidence.get(key)
-                if expected_value is None:
+                if (
+                    expected_value is None
+                    and key in CAPTAIN_EXECUTION_INTENT_LEGACY_OPTIONAL_EVIDENCE_KEYS
+                ):
+                    info["evidence_sha256"][key] = declared_value
+                elif expected_value is None:
                     errors.append(f"execution_intent_evidence_unverifiable:{key}")
                 elif declared_value != expected_value:
                     errors.append(f"execution_intent_evidence_drift:{key}")
@@ -6745,32 +6672,6 @@ def _run_captain_pr_merge(
         "effect_scope_decision": _captain_effect_scope_not_evaluated(),
         "verification_passed": False,
     }
-    try:
-        delivery_info = grabowski_merge_delivery.verify_merge_delivery(
-            parameters.get("merge_delivery_receipt"),
-            expected_repository=repo_slug,
-            expected_pull_request=target["pr"],
-            expected_base_sha=expected_base_sha,
-            expected_head_sha=expected_head,
-            expected_diff_sha256=str(parameters.get("diff_sha256", "")),
-            expected_receipt_sha256=str(
-                parameters.get("merge_delivery_receipt_sha256", "")
-            ),
-        )
-    except (ValueError, grabowski_merge_delivery.MergeDeliveryError) as exc:
-        execution_result["merge_delivery"] = {
-            "valid": False,
-            "error": f"{type(exc).__name__}:{exc}",
-        }
-        execution_result["preflight_errors"].append(
-            "merge_delivery_receipt_durable_verification_failed"
-        )
-        execution_result["verification_error"] = (
-            "durable user-visible diff delivery could not be revalidated; "
-            "merge not attempted"
-        )
-        return execution_result
-    execution_result["merge_delivery"] = delivery_info
     pre_view, preflight_summary, preflight_errors = _captain_pr_merge_preflight_view(
         repo_path,
         github_runner,
@@ -6790,19 +6691,18 @@ def _run_captain_pr_merge(
     if preflight_errors:
         execution_result["preflight_errors"].extend(preflight_errors)
         if "pr_already_merged_before_execution" in preflight_errors:
-            merged_at = _parse_captain_projection_generated_at(
-                pre_view.get("mergedAt")
-            )
-            merged_at_unix_ns = (
-                int(merged_at.timestamp() * 1_000_000_000)
-                if merged_at is not None
-                else None
-            )
-            execution_result["external_merge_reconciliation"] = (
-                grabowski_merge_delivery.github_merge_ordering(
-                    delivery_info, merged_at_unix_ns
-                )
-            )
+            execution_result["external_merge_reconciliation"] = {
+                "schema_version": 1,
+                "kind": "grabowski_external_merge_reconciliation",
+                "external_merge_observed": True,
+                "dispatch_called": False,
+                "duplicate_dispatch_prevented": True,
+                "does_not_establish": [
+                    "identity_of_external_merger",
+                    "review_or_ci_completeness",
+                    "absence_of_external_side_effects",
+                ],
+            }
         execution_result["verification_error"] = "pre-execution PR state did not match the bound target; merge not attempted"
         return execution_result
     merge_policy, merge_policy_query, merge_policy_errors = _captain_repository_merge_policy(

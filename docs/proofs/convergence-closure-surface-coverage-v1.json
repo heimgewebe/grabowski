@@ -124,7 +124,7 @@
       "surface_id": "grabowski_merge_delivery_record",
       "classification": "preflight_or_evidence",
       "convergence_requirement": "not_a_closeout",
-      "reason": "Diff delivery is pre-merge evidence."
+      "reason": "Optional diff delivery supplies artifact-handoff evidence and is neither a merge prerequisite nor a closeout."
     },
     {
       "surface_kind": "tool",
