@@ -1268,7 +1268,11 @@ TOOL_PROFILES.update(
         },
         "grabowski_bureau_candidate_assess": {
             "category": "bureau",
-            "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+            "purpose": (
+                "Assess one explicitly typed operator-intake candidate or event "
+                "against current Registry and Live Register truth; task and "
+                "initiative values are binding checks, never selectors."
+            ),
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

@@ -40,6 +40,7 @@ MAX_RECORD_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 2_048
 MAX_PAGE_LIMIT = 100
 MAX_CURRENT_SCAN_ROWS = 5 * MAX_PAGE_LIMIT
+MAX_CURRENT_CONVERGENCE_ROWS = 50_000
 LOCK_TIMEOUT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
 ARCHIVE_EFFECT_LEASE_TTL_SECONDS = 120
@@ -818,7 +819,11 @@ def record_decision(parameters: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _classify_record(record: dict[str, Any]) -> dict[str, Any]:
+def _classify_record(
+    record: dict[str, Any],
+    *,
+    include_decisions: bool = True,
+) -> dict[str, Any]:
     binding = _task_binding(record)
     base: dict[str, Any] = {
         "task_id": binding["task_id"],
@@ -836,6 +841,10 @@ def _classify_record(record: dict[str, Any]) -> dict[str, Any]:
         "evidence_error": None,
     }
     if record["state"] in {"outcome_unknown", "interrupted"}:
+        if not include_decisions:
+            if record["state"] == "outcome_unknown":
+                base["classification"] = "outcome_unknown"
+            return base
         target = _decision_path(binding)
         try:
             _ensure_private_directory(_state_root(), create=False)
@@ -860,6 +869,8 @@ def _classify_record(record: dict[str, Any]) -> dict[str, Any]:
     except (FileNotFoundError, OSError, TaskAttentionError, TaskAttentionInputError) as exc:
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = type(exc).__name__
+        return base
+    if not include_decisions:
         return base
     target = _decision_path(binding)
     try:
@@ -1695,12 +1706,17 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
-def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any]:
+def current_attention_projection(
+    records: list[dict[str, Any]],
+    *,
+    include_decisions: bool = True,
+    retry_successor_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Project operational attention without rewriting retained task history.
 
-    Raw attention remains the state-derived set. Only valid create-only decisions
-    bound to the current task attempt may remove ``closed`` or ``superseded``
-    records from the operational attention projection. Missing, stale or invalid
+    Raw attention remains the state-derived set. Only a validated persisted
+    retry edge or a valid create-only decision bound to the current task attempt
+    may remove a record from the operational projection. Missing, stale or invalid
     evidence therefore fails open into current attention rather than hiding work.
     """
     validated_records: list[dict[str, Any]] = []
@@ -1712,49 +1728,111 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
             raise TaskAttentionInputError("current attention record has a non-attention state")
         _task_binding(record)
         validated_records.append(record)
+    attention_task_ids = {str(record["task_id"]) for record in validated_records}
+    convergence_records = list(validated_records)
+    support_task_ids: set[str] = set()
+    if retry_successor_records is not None and not isinstance(
+        retry_successor_records, list
+    ):
+        raise TaskAttentionInputError(
+            "retry_successor_records must be a list when provided"
+        )
+    for value in list(retry_successor_records or []):
+        if not isinstance(value, dict):
+            raise TaskAttentionInputError(
+                "retry successor records must be objects"
+            )
+        record = dict(value)
+        if (
+            record.get("state")
+            not in terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES
+        ):
+            raise TaskAttentionInputError(
+                "retry successor record state is not support-eligible"
+            )
+        binding = _task_binding(record)
+        try:
+            persisted_binding = terminal_convergence.persisted_retry_binding(record)
+        except terminal_convergence.TerminalConvergenceError as exc:
+            raise TaskAttentionIntegrityError(str(exc)) from exc
+        if persisted_binding is None:
+            raise TaskAttentionInputError(
+                "retry successor record lacks persisted retry evidence"
+            )
+        task_id = str(binding["task_id"])
+        if task_id in attention_task_ids:
+            raise TaskAttentionIntegrityError(
+                "retry successor record overlaps the attention scope"
+            )
+        if task_id in support_task_ids:
+            raise TaskAttentionIntegrityError(
+                "retry successor record is duplicated in the support snapshot"
+            )
+        support_task_ids.add(task_id)
+        convergence_records.append(record)
     try:
-        convergence = terminal_convergence.converge_attention_records(validated_records)
+        convergence = terminal_convergence.converge_attention_records(
+            convergence_records,
+            attention_task_ids=attention_task_ids,
+        )
     except terminal_convergence.TerminalConvergenceError as exc:
         raise TaskAttentionIntegrityError(str(exc)) from exc
     current_by_task = {
         str(record["task_id"]): record for record in convergence["current"]
     }
 
-    excluded_task_ids: set[str] = set()
+    convergence_excluded_task_ids = {
+        str(item["task_id"])
+        for item in convergence["historical"]
+        if item.get("convergence_classification")
+        == "superseded_by_verified_retry"
+    }
+    excluded_task_ids: set[str] = set(convergence_excluded_task_ids)
+    decision_excluded_task_ids: set[str] = set()
     decision_classification_counts: dict[str, int] = {}
     decision_candidate_count = 0
-    root = _state_root()
-    try:
-        _ensure_private_directory(root, create=False)
-    except FileNotFoundError:
-        pass
-    else:
+    if include_decisions:
+        root = _state_root()
         try:
-            entries = sorted(root.iterdir(), key=lambda path: path.name)
-        except OSError as exc:
-            raise TaskAttentionIntegrityError("task attention decisions cannot be listed safely") from exc
-        for path in entries:
-            match = DECISION_FILE_RE.fullmatch(path.name)
-            if match is None:
-                continue
-            record = current_by_task.get(match.group("task_id"))
-            if record is None or int(record["attempt"]) != int(match.group("attempt")):
-                continue
-            decision_candidate_count += 1
-            classified = _classify_record(record)
-            classification = str(classified["classification"])
-            decision_classification_counts[classification] = (
-                decision_classification_counts.get(classification, 0) + 1
-            )
-            if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
-                excluded_task_ids.add(str(record["task_id"]))
+            _ensure_private_directory(root, create=False)
+        except FileNotFoundError:
+            pass
+        else:
+            try:
+                entries = sorted(root.iterdir(), key=lambda path: path.name)
+            except OSError as exc:
+                raise TaskAttentionIntegrityError(
+                    "task attention decisions cannot be listed safely"
+                ) from exc
+            for path in entries:
+                match = DECISION_FILE_RE.fullmatch(path.name)
+                if match is None:
+                    continue
+                record = current_by_task.get(match.group("task_id"))
+                if record is None or int(record["attempt"]) != int(
+                    match.group("attempt")
+                ):
+                    continue
+                decision_candidate_count += 1
+                classified = _classify_record(record)
+                classification = str(classified["classification"])
+                decision_classification_counts[classification] = (
+                    decision_classification_counts.get(classification, 0) + 1
+                )
+                if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
+                    task_id = str(record["task_id"])
+                    decision_excluded_task_ids.add(task_id)
+                    excluded_task_ids.add(task_id)
 
     excluded_counts = {
         classification: decision_classification_counts.get(classification, 0)
         for classification in sorted(CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS)
     }
-    raw_attention_count = len(current_by_task)
-    current_attention_count = raw_attention_count - len(excluded_task_ids)
+    deduplicated_attention_count = len(current_by_task)
+    current_attention_count = (
+        deduplicated_attention_count - len(decision_excluded_task_ids)
+    )
+    excluded_attention_count = convergence["raw_count"] - current_attention_count
     projection_material = {
         "schema_version": 1,
         "task_bindings": [
@@ -1762,6 +1840,7 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
             for _task_id, record in sorted(current_by_task.items())
         ],
         "excluded_task_ids": sorted(excluded_task_ids),
+        "convergence_excluded_task_ids": sorted(convergence_excluded_task_ids),
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
         "attention_convergence_counts": convergence["classification_counts"],
         "attention_converged_bindings": [
@@ -1770,6 +1849,8 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
                 "attempt": item["attempt"],
                 "lifecycle_receipt_sha256": item.get("lifecycle_receipt_sha256"),
                 "classification": item["convergence_classification"],
+                "success_claimed": bool(item.get("success_claimed", False)),
+                "successor_task_id": item.get("successor_task_id"),
             }
             for item in convergence["historical"]
         ],
@@ -1779,15 +1860,21 @@ def current_attention_projection(records: list[dict[str, Any]]) -> dict[str, Any
         "evidence_error": None,
         "projection_sha256": _sha256_json(projection_material),
         "raw_attention_count": convergence["raw_count"],
-        "deduplicated_attention_count": raw_attention_count,
+        "deduplicated_attention_count": deduplicated_attention_count,
         "current_attention_count": current_attention_count,
-        "excluded_attention_count": len(excluded_task_ids),
+        "excluded_attention_count": excluded_attention_count,
+        "convergence_excluded_attention_count": len(
+            convergence_excluded_task_ids
+        ),
         "excluded_classification_counts": excluded_counts,
         "decision_candidate_count": decision_candidate_count,
         "decision_classification_counts": dict(sorted(decision_classification_counts.items())),
         "attention_convergence_counts": convergence["classification_counts"],
         "converged_attention_count": convergence["converged_count"],
+        "retry_successor_record_count": convergence["support_record_count"],
         "excluded_task_ids": excluded_task_ids,
+        "convergence_excluded_task_ids": convergence_excluded_task_ids,
+        "decision_excluded_task_ids": decision_excluded_task_ids,
         "scope": "current_task_projection_after_valid_attention_decisions",
         "raw_scope": "current_task_projection_before_attention_decisions",
     }
@@ -1856,12 +1943,25 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
     filtered_counts = {
         "decision_closed": 0,
         "decision_superseded": 0,
+        "superseded_by_verified_retry": 0,
     }
+    convergence_status = "not_applicable"
+    convergence_error: str | None = None
+    convergence_counts = {
+        "duplicate": 0,
+        "superseded": 0,
+        "already_satisfied": 0,
+        "superseded_by_verified_retry": 0,
+    }
+    converged_attention_count = 0
+    retry_successor_record_count = 0
+    convergence_excluded_task_ids: set[str] = set()
+    decision_excluded_task_ids: set[str] = set()
     page_records: list[dict[str, Any]] = []
     has_more = False
     next_cursor = None
 
-    with tasks._task_read_snapshot() as connection:
+    with tasks._task_read_snapshot() as connection, decision_snapshot_guard() as decision_snapshot:
         raw_total_attention = int(
             connection.execute(
                 f"SELECT COUNT(*) FROM tasks WHERE state IN ({placeholders})",
@@ -1889,6 +1989,68 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                     },
                 )
         else:
+            snapshot_status = str(decision_snapshot.get("status") or "degraded")
+            if raw_total_attention > MAX_CURRENT_CONVERGENCE_ROWS:
+                convergence_status = "degraded"
+                convergence_error = "attention_convergence_scan_limit_exceeded"
+            else:
+                convergence_rows = connection.execute(
+                    f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+                    "ORDER BY created_at_unix DESC, task_id DESC LIMIT ?",
+                    (*ATTENTION_STATES, MAX_CURRENT_CONVERGENCE_ROWS + 1),
+                ).fetchall()
+                if len(convergence_rows) != raw_total_attention:
+                    convergence_status = "degraded"
+                    convergence_error = "attention_convergence_snapshot_count_mismatch"
+                else:
+                    try:
+                        retry_successors = tasks._task_retry_successor_records(
+                            connection,
+                            source_task_ids={
+                                str(row["task_id"]) for row in convergence_rows
+                            },
+                            limit=(
+                                MAX_CURRENT_CONVERGENCE_ROWS
+                                - len(convergence_rows)
+                            ),
+                        )
+                        projection = current_attention_projection(
+                            [dict(row) for row in convergence_rows],
+                            include_decisions=snapshot_status == "locked",
+                            retry_successor_records=retry_successors,
+                        )
+                    except terminal_convergence.TerminalConvergenceError:
+                        convergence_status = "degraded"
+                        convergence_error = "TaskAttentionIntegrityError"
+                    except (
+                        TaskAttentionError,
+                        TaskAttentionInputError,
+                        RuntimeError,
+                        OSError,
+                    ) as exc:
+                        convergence_status = "degraded"
+                        convergence_error = (
+                            str(exc) or type(exc).__name__
+                            if type(exc) is RuntimeError
+                            else type(exc).__name__
+                        )
+                    else:
+                        convergence_status = "verified"
+                        convergence_counts = dict(
+                            projection["attention_convergence_counts"]
+                        )
+                        converged_attention_count = int(
+                            projection["converged_attention_count"]
+                        )
+                        retry_successor_record_count = int(
+                            projection["retry_successor_record_count"]
+                        )
+                        convergence_excluded_task_ids = set(
+                            projection["convergence_excluded_task_ids"]
+                        )
+                        decision_excluded_task_ids = set(
+                            projection["decision_excluded_task_ids"]
+                        )
             scan_created_at = cursor_created_at
             scan_task_id = cursor_task_id
             visible: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1916,14 +2078,41 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                     raw = dict(row)
                     scanned_raw += 1
                     last_scanned_raw = raw
-                    classified = _classify_record(raw)
-                    classification = classified["classification"]
-                    if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
-                        filtered_counts[classification] += 1
+                    task_id_value = str(raw["task_id"])
+                    if task_id_value in convergence_excluded_task_ids:
+                        filtered_counts["superseded_by_verified_retry"] += 1
                     else:
-                        visible.append((raw, classified))
-                        if len(visible) > limit:
-                            break
+                        classified = _classify_record(
+                            raw,
+                            include_decisions=snapshot_status == "locked",
+                        )
+                        if snapshot_status == "degraded":
+                            classified["classification"] = "invalid_evidence"
+                            evidence_error = str(
+                                decision_snapshot.get("evidence_error")
+                                or "TaskAttentionDecisionSnapshotError"
+                            )
+                            if raw["state"] in {"outcome_unknown", "interrupted"}:
+                                try:
+                                    _decision_path(_task_binding(raw)).lstat()
+                                except FileNotFoundError:
+                                    pass
+                                except OSError as exc:
+                                    evidence_error = type(exc).__name__
+                                else:
+                                    evidence_error = "decision_without_eligible_outcome"
+                            classified["evidence_error"] = evidence_error
+                        classification = classified["classification"]
+                        if task_id_value in decision_excluded_task_ids:
+                            if classification not in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
+                                raise TaskAttentionIntegrityError(
+                                    "decision exclusion classification changed during snapshot"
+                                )
+                            filtered_counts[classification] += 1
+                        else:
+                            visible.append((raw, classified))
+                            if len(visible) > limit:
+                                break
                     scan_created_at = int(raw["created_at_unix"])
                     scan_task_id = str(raw["task_id"])
                 if len(visible) > limit:
@@ -1991,6 +2180,19 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
         ),
         "filtered_classification_counts": filtered_counts,
         "filtered_classification_counts_scope": "scanned_raw_window",
+        "attention_convergence_status": convergence_status,
+        "attention_convergence_error": convergence_error,
+        "attention_convergence_counts": convergence_counts,
+        "converged_attention_count": converged_attention_count,
+        "retry_successor_record_count": retry_successor_record_count,
+        "convergence_excluded_attention_count": len(
+            convergence_excluded_task_ids
+        ),
+        "decision_snapshot_status": (
+            str(decision_snapshot.get("status"))
+            if view == "current"
+            else "not_applicable"
+        ),
         "pagination": {
             "limit": limit,
             "returned": len(page_records),

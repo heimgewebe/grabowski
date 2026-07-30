@@ -25,6 +25,7 @@ TRUSTED_CODEX_ACTORS = frozenset(
     {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 )
 TRUSTED_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+TRUSTED_REQUEST_ACTORS = frozenset({"github-actions", "github-actions[bot]"})
 ACCEPTED_REVIEW_STATES = frozenset({"APPROVED", "COMMENTED"})
 BLOCKING_REVIEW_STATES = frozenset({"CHANGES_REQUESTED", "PENDING"})
 REQUEST_RE = re.compile(
@@ -74,6 +75,7 @@ query($owner: String!, $name: String!, $number: Int!) {
           databaseId
           body
           createdAt
+          updatedAt
           url
           authorAssociation
           author { login }
@@ -128,6 +130,7 @@ query($owner: String!, $name: String!, $number: Int!, $before: String!) {
           databaseId
           body
           createdAt
+          updatedAt
           url
           authorAssociation
           author { login }
@@ -230,11 +233,7 @@ def _run_json(repo: Path, argv: list[str]) -> Any:
 
 
 def _collect_comments(
-    repo: Path,
-    owner: str,
-    name: str,
-    pr_number: int,
-    initial: Any,
+    repo: Path, owner: str, name: str, pr_number: int, initial: Any
 ) -> dict[str, Any]:
     if not isinstance(initial, dict):
         raise SettlementError("comments connection is missing")
@@ -258,31 +257,12 @@ def _collect_comments(
     remember(nodes)
     while page.get("hasPreviousPage") is True:
         if pages >= MAX_COMMENT_PAGES:
-            raise SettlementError(
-                f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history"
-            )
+            raise SettlementError(f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history")
         before = page.get("startCursor")
         if not isinstance(before, str) or not before or before in cursors:
             raise SettlementError("comments pagination cursor is missing or repeated")
         cursors.add(before)
-        payload = _run_json(
-            repo,
-            [
-                "gh",
-                "api",
-                "graphql",
-                "-f",
-                f"query={COMMENTS_QUERY}",
-                "-F",
-                f"owner={owner}",
-                "-F",
-                f"name={name}",
-                "-F",
-                f"number={pr_number}",
-                "-f",
-                f"before={before}",
-            ],
-        )
+        payload = _run_json(repo, ["gh","api","graphql","-f",f"query={COMMENTS_QUERY}","-F",f"owner={owner}","-F",f"name={name}","-F",f"number={pr_number}","-f",f"before={before}"])
         try:
             connection = payload["data"]["repository"]["pullRequest"]["comments"]
         except (KeyError, TypeError) as exc:
@@ -293,19 +273,14 @@ def _collect_comments(
         remember(older)
         nodes = [*older, *nodes]
         if len(nodes) > MAX_COMMENT_ITEMS:
-            raise SettlementError(
-                f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history"
-            )
+            raise SettlementError(f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history")
         page = connection.get("pageInfo")
         if not isinstance(page, dict):
             raise SettlementError("comments pageInfo is missing")
         pages += 1
     if page.get("hasPreviousPage") is not False:
         raise SettlementError("comments pagination state is invalid")
-    return {
-        "nodes": nodes,
-        "pageInfo": {"hasPreviousPage": False, "pages_loaded": pages},
-    }
+    return {"nodes": nodes, "pageInfo": {"hasPreviousPage": False, "pages_loaded": pages}}
 
 
 def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
@@ -333,9 +308,7 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
     if not isinstance(pull_request, dict):
         raise SettlementError("pull request does not exist")
     pull_request = dict(pull_request)
-    pull_request["comments"] = _collect_comments(
-        repo, owner, name, pr_number, pull_request.get("comments")
-    )
+    pull_request["comments"] = _collect_comments(repo, owner, name, pr_number, pull_request.get("comments"))
     diff_bytes = subprocess.run(
         ["gh", "pr", "diff", str(pr_number), "--repo", repository],
         cwd=repo,
@@ -431,9 +404,7 @@ def _parse_request(comment: dict[str, Any]) -> dict[str, Any] | None:
 def _request_actor_allowed(comment: dict[str, Any]) -> bool:
     association = comment.get("authorAssociation")
     actor = _actor_login(comment.get("author"))
-    if not actor or actor == "github-actions" or actor.endswith("[bot]"):
-        return False
-    return association in TRUSTED_REQUEST_ASSOCIATIONS
+    return association in TRUSTED_REQUEST_ASSOCIATIONS or actor in TRUSTED_REQUEST_ACTORS
 
 
 def _canonical_request_payload(
@@ -494,15 +465,25 @@ def _canonical_requests(
             pr_number=pr_number,
         )
         created = _parse_time(comment.get("createdAt"))
+        effective = _parse_time(comment.get("updatedAt"))
         comment_id = comment.get("databaseId")
         if (
             parsed is None
             or created is None
+            or effective is None
+            or effective < created
             or isinstance(comment_id, bool)
             or not isinstance(comment_id, int)
         ):
             continue
-        result.append({**comment, "_created": created, "_request": parsed})
+        result.append(
+            {
+                **comment,
+                "_created": effective,
+                "_original_created": created,
+                "_request": parsed,
+            }
+        )
     return sorted(result, key=lambda item: (item["_created"], item["databaseId"]))
 
 
@@ -622,8 +603,9 @@ def _review_completion(
     requests: list[dict[str, Any]],
     head_sha: str,
 ) -> dict[str, Any] | None:
-    request = requests[0]
-    request_time = request["_created"]
+    if not requests:
+        raise SettlementError("review completion requires at least one request")
+    request_time = max(item["_created"] for item in requests)
     candidates: list[dict[str, Any]] = []
     for review in _list_nodes(pr.get("reviews"), label="reviews"):
         actor = _actor_login(review.get("author"))
@@ -720,7 +702,6 @@ def _review_completion(
     reaction_candidates: list[dict[str, Any]] = []
     for reacted_request in requests:
         request_comment_id = reacted_request["databaseId"]
-        reacted_request_time = reacted_request["_created"]
         reactions = reacted_request.get("reactions")
         for reaction in _list_nodes(
             reactions,
@@ -732,7 +713,7 @@ def _review_completion(
                 actor in TRUSTED_CODEX_ACTORS
                 and reaction.get("content") == "THUMBS_UP"
                 and created is not None
-                and created >= reacted_request_time
+                and created >= request_time
             ):
                 reaction_candidates.append(
                     {
@@ -870,6 +851,7 @@ def evaluate(
             "comment_id": request["databaseId"],
             "request_id": expected_request["request_id"],
             "created_at": request["createdAt"],
+            "effective_at": request["updatedAt"],
             "actor": _actor_login(request.get("author")),
             "author_association": request.get("authorAssociation"),
             "body_sha256": _sha256_text(str(request.get("body") or "")),
@@ -955,18 +937,45 @@ def ensure_request(
     payload = _request_payload(repository, pr_number, head_sha, diff_sha256)
     existing = _matching_requests(pr, payload)
     if existing:
-        comment = existing[0]
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "github_codex_review_request_result",
-            "requested": False,
-            "required": policy["required"],
-            "reason": "current-head request already exists",
-            "request_id": payload["request_id"],
-            "comment_id": comment["databaseId"],
-            "head_sha": head_sha,
-            "diff_sha256": diff_sha256,
-        }
+        adequate = existing[0]
+        edited_cutoffs = [
+            item["_created"]
+            for item in existing
+            if item["_created"] > item["_original_created"]
+        ]
+        needs_fresh_request = False
+        if edited_cutoffs:
+            latest_edit = max(edited_cutoffs)
+            completion = _review_completion(
+                pr,
+                requests=existing,
+                head_sha=head_sha,
+            )
+            fresh = [
+                item
+                for item in existing
+                if item["_created"] == item["_original_created"]
+                and item["_created"] >= latest_edit
+            ]
+            if completion is None and not fresh:
+                needs_fresh_request = True
+            elif fresh:
+                adequate = min(
+                    fresh,
+                    key=lambda item: (item["_created"], item["databaseId"]),
+                )
+        if not needs_fresh_request:
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "github_codex_review_request_result",
+                "requested": False,
+                "required": policy["required"],
+                "reason": "current-head request already exists",
+                "request_id": payload["request_id"],
+                "comment_id": adequate["databaseId"],
+                "head_sha": head_sha,
+                "diff_sha256": diff_sha256,
+            }
     response = _run_json(
         repo,
         [
