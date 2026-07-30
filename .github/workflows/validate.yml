@@ -86,8 +86,8 @@ jobs:
           git show b4862fac45184bac2e6ad1cf1fa5b2d3035a58ea:.github/workflows/validate.yml > .github/workflows/validate.yml
           git rm .github/workflows/pr514-review-fix.yml
           git rm .github/workflows/pr514-review-fix-v2.yml
-          git rm tools/pr514_review_fix.py
-          git rm tools/pr514_relax_anchor.py
+          git rm -f tools/pr514_review_fix.py
+          git rm -f tools/pr514_relax_anchor.py
           git rm .pr514-review-fix-trigger
           git add .github/workflows/validate.yml config/runtime-entrypoint.json contracts/capability-catalog.v1.json contracts/publication-profiles.v1.json docs/generated/operator-context.v1.json docs/generated/operator-context.md docs/text-artifact-export.md pyproject.toml src/grabowski_text_artifact_reconcile.py tests/test_text_artifact_reconcile.py
           git config user.name "github-actions[bot]"
