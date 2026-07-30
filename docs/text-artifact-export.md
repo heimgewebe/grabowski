@@ -13,7 +13,7 @@ UTF-8-Textdatei mit der Endung `.txt` und ein SHA-256-gebundenes Receipt nach
 3. Hochkonfidente Zugangsdaten und Private-Key-Marker blockieren die Ausgabe.
 4. Diff und Receipt werden privat und atomar unter
    `~/.local/state/grabowski/text-artifacts/<artifact_id>/` veröffentlicht.
-   Ein hartes Budget von 128 Artefakten und insgesamt 512 MiB verhindert
+   Ein hartes Budget von 4096 Artefakten und insgesamt 512 MiB verhindert
    unbegrenztes Wachstum; bei ausgeschöpfter Kapazität schlägt die Publikation
    fehl, statt vorhandene Evidenz still zu löschen.
    Ein nicht blockierender Store-Lock serialisiert Inventarprüfung und atomare
@@ -44,6 +44,43 @@ Der kanonische Nutzername lautet beispielsweise
 `grabowski-pr-439-0123456789ab-diff.txt`; das Receipt, nicht der Dateiname, ist
 autoritativ. Vorhandene Receipts aus der kurzen Vorhärtungsphase mit einem
 einzelnen Repository-Namen bleiben lesbar; der Publisher erzeugt sie nicht mehr.
+
+## Unverwaltete Transportreste
+
+Der Publisher bleibt fail-closed, wenn ein Artefaktverzeichnis außer dem
+kanonischen Diff und `receipt.json` weitere Einträge enthält. Solche Einträge
+werden nicht ignoriert und nicht anhand eines Dateinamens blind gelöscht.
+
+`grabowski-text-artifact-reconcile inspect-store` prüft den begrenzten
+Gesamtbestand und nennt ausschließlich Artefakt-IDs mit Zusatzdateien.
+`inspect --artifact-id <id>` erzeugt anschließend das digestgebundene
+Einzelinventar. Es bindet das verwaltete Artefakt und Receipt sowie jede
+Zusatzdatei an relativen Pfad, Dateityp, Dateiname, Eigentümer, Modus,
+Linkzahl, Größe, Inode, Zeitstempel und SHA-256. Unbekannte Wurzeleinträge,
+Symlinks, Hardlinks oder nicht erlaubte Modi blockieren geschlossen.
+
+Eine Wirkung erfordert anschließend alle vier exakten Vorbedingungen:
+
+```text
+--artifact-id
+--expected-inventory-sha256
+--expected-artifact-sha256
+--expected-receipt-sha256
+```
+
+`apply` kopiert nur die unverändert passenden Zusatzdateien in ein privates,
+create-only Quarantäneverzeichnis unter
+`~/.local/state/grabowski/text-artifact-quarantine/<inventory_sha256>/`.
+Die abschließende Verzeichnisveröffentlichung verwendet unter Linux
+`RENAME_NOREPLACE`; ein inzwischen vorhandenes Ziel wird niemals überschrieben.
+Erst nach vollständigem Kopier- und Receipt-Readback werden die gebundenen
+Quelldateien entfernt. Symlinks, Hardlinks, Hashdrift, unbekannte Modi,
+Kapazitätsüberschreitung und konkurrierende Store-Nutzung blockieren.
+Das verwaltete Receipt und der kanonische Diff werden niemals verschoben.
+
+Nach eindeutig erfolgreicher Reconciliation darf der Publisher erneut
+aufgerufen werden. Ein Quarantäne-Receipt begründet weder Reviewkorrektheit,
+Mergeautorität noch die Urheberschaft der Transportdateien.
 
 Altersbasierte Löschung ist eine eigene, explizit autorisierte Retention-Operation
 und gehört nicht zur Publikationsberechtigung.
