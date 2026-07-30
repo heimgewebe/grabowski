@@ -1815,7 +1815,10 @@ def _reconcile_stopped_record(
         if record["last_observation_json"]
         else {"state": "stopped"}
     )
-    if not _terminalization_action_required(observation):
+    terminalization = observation.get("terminalization")
+    if isinstance(terminalization, dict) and not _terminalization_action_required(
+        observation
+    ):
         return record, observation
     observation = {
         **observation,

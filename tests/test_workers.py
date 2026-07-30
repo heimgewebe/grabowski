@@ -1455,6 +1455,25 @@ globalThis.fetch = async () => ({
         self.assertEqual(history["count"], 1)
         self.assertEqual(history["workers"][0]["state"], "stopped")
 
+    def test_stopped_status_terminalizes_legacy_record_without_observation(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9353, runtime_seconds=60)
+        worker = started["worker"]
+        workers._update(worker["worker_id"], "stopped")
+
+        with patch.object(
+            workers, "_observe", side_effect=AssertionError("legacy stopped status must not probe systemd")
+        ):
+            reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
+        self.assertEqual(reconciled["state"], "stopped")
+        terminalization = reconciled["last_observation"]["terminalization"]
+        self.assertEqual(terminalization["release"]["status"], "released")
+        self.assertEqual(terminalization["cleanup"]["status"], "completed")
+        self.assertIsNone(workers.resources.inspect_resource("port:9353"))
+        self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
     def test_stopped_status_retries_incomplete_terminalization_without_probe(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
