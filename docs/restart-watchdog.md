@@ -138,8 +138,10 @@ Admission-Vertrag wie das Runtime-Deployment:
    `polled == enqueued == final_responses` melden. Nach dem abschließenden
    Liveness-Readback wird diese Bilanz unmittelbar vor der Mutation nochmals
    bestätigt.
-4. Hat sich die Live-Liveness während des Drains erholt, wird der Neustart
-   vollständig verworfen und der Marker entfernt.
+4. Hat sich die Live-Liveness während des Drains erholt, wird zusätzlich
+   MainPID, Startidentität, exakte Runtime-Kommandozeile und Listenerbindung
+   erneut geprüft. Nur ein vollständig identitätsgültiger Operator darf den
+   Neustart verwerfen; reine HTTP-Erreichbarkeit genügt nicht.
 5. Andernfalls stoppt der Watchdog zuerst den Tunnel. Ein neuer Operator muss
    als neue Prozessidentität antworten und den exakten Marker mit null aktiven
    Aufrufen bestätigen. Erst dann startet der Tunnel. Nach dessen Health- und
@@ -269,7 +271,10 @@ Der Wächter hält während Prüfung und möglichem Neustart einen Shared-Lock a
 `~/.local/state/grabowski/deploy.lock`. Das Deployment benötigt denselben Lock
 exklusiv. Ein laufendes Deployment führt deshalb zu einem übersprungenen
 Watchdog-Lauf; umgekehrt beginnt kein Deployment mitten in einer Watchdog-
-Entscheidung.
+Entscheidung. Zusätzlich nehmen Operator- und Tunnel-Watchdog denselben
+exklusiven `component-recovery.lock`. Damit kann kein Tunnel-Lauf eine
+Markerprüfung abschließen und anschließend parallel in einen bereits begonnenen
+Operator-Recovery eingreifen.
 
 ## Installation
 

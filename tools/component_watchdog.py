@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 import fcntl
 import hashlib
@@ -545,6 +545,21 @@ def _restore_service_pair_after_failed_recovery(
     return None
 
 
+def _operator_recovered_without_replacement(
+    args: argparse.Namespace,
+) -> ProbeResult:
+    return _operator_process_is_live(
+        None,
+        service=args.service,
+        runtime_root=args.runtime_root,
+        module=args.module,
+        host=args.host,
+        port=args.port,
+        mcp_url=args.mcp_url,
+        timeout=args.http_timeout,
+    )
+
+
 def safe_operator_restart(
     args: argparse.Namespace,
     previous_probe: ProbeResult,
@@ -575,9 +590,16 @@ def safe_operator_restart(
             metrics_url=args.metrics_url,
             timeout=args.restart_drain_timeout,
         )
-        if mcp_http_probe(args.mcp_url, args.http_timeout) is None:
+        recovered_without_restart = _operator_recovered_without_replacement(args)
+        proof["operator_recheck"] = {
+            "status": recovered_without_restart.status,
+            "reasons": list(recovered_without_restart.reasons),
+            "pid": recovered_without_restart.pid,
+            "start_ticks": recovered_without_restart.start_ticks,
+        }
+        if recovered_without_restart.status == "healthy":
             release_watchdog_admission(state_dir=args.state_dir, marker=marker)
-            return "recovered-without-restart", None, proof
+            return "recovered-without-restart", recovered_without_restart, proof
 
         # The first tunnel proof can become stale while liveness is rechecked.
         # Admission is already closed, so a second stable balance proof directly
@@ -587,9 +609,16 @@ def safe_operator_restart(
             metrics_url=args.metrics_url,
             timeout=args.restart_drain_timeout,
         )
-        if mcp_http_probe(args.mcp_url, args.http_timeout) is None:
+        recovered_without_restart = _operator_recovered_without_replacement(args)
+        proof["operator_recheck"] = {
+            "status": recovered_without_restart.status,
+            "reasons": list(recovered_without_restart.reasons),
+            "pid": recovered_without_restart.pid,
+            "start_ticks": recovered_without_restart.start_ticks,
+        }
+        if recovered_without_restart.status == "healthy":
             release_watchdog_admission(state_dir=args.state_dir, marker=marker)
-            return "recovered-without-restart", None, proof
+            return "recovered-without-restart", recovered_without_restart, proof
         emit(
             "grabowski.component_watchdog.restart_drained",
             component=args.component,
@@ -2143,9 +2172,12 @@ def run_watchdog(args: argparse.Namespace) -> int:
     args.state_dir = state_dir
     state_path = state_dir / f"{args.component}-watchdog-state.json"
     lock_path = state_dir / f"{args.component}-watchdog.lock"
+    recovery_lock_path = state_dir / "component-recovery.lock"
     deploy_lock = state_dir / "deploy.lock"
 
-    with exclusive_lock(lock_path):
+    with ExitStack() as locks:
+        locks.enter_context(exclusive_lock(lock_path))
+        locks.enter_context(exclusive_lock(recovery_lock_path))
         with deployment_shared_lock(deploy_lock) as deployment_clear:
             if not deployment_clear:
                 emit(

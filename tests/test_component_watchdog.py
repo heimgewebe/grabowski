@@ -1681,7 +1681,13 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
                 "wait_for_watchdog_tunnel_idle",
                 return_value={"bounded": True},
             ),
-            patch.object(watchdog, "mcp_http_probe", return_value=None),
+            patch.object(
+                watchdog,
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "healthy", pid=123, age_seconds=61, start_ticks=10
+                ),
+            ),
             patch.object(watchdog, "release_watchdog_admission") as release,
             patch.object(watchdog, "service_action") as service_action,
             patch.object(watchdog, "restart_service") as restart,
@@ -1693,12 +1699,17 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
                 ),
             )
         self.assertEqual("recovered-without-restart", outcome)
-        self.assertIsNone(probe)
+        self.assertEqual(
+            watchdog.ProbeResult(
+                "healthy", pid=123, age_seconds=61, start_ticks=10
+            ),
+            probe,
+        )
         release.assert_called_once()
         service_action.assert_not_called()
         restart.assert_not_called()
 
-    def test_safe_restart_orders_tunnel_after_replacement_readiness(self) -> None:
+    def test_identity_mismatch_remains_restartable_after_http_recovers(self) -> None:
         args = watchdog.normalize_args(
             watchdog.parser().parse_args(
                 [
@@ -1744,8 +1755,10 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             ) as tunnel_drain,
             patch.object(
                 watchdog,
-                "mcp_http_probe",
-                return_value="mcp-http-request-failed",
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
             ),
             patch.object(
                 watchdog,
@@ -1777,7 +1790,7 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             outcome, probe, _proof = watchdog.safe_operator_restart(
                 args,
                 watchdog.ProbeResult(
-                    "unhealthy", ("mcp-http-request-failed",), 123, 60, 10
+                    "unhealthy", ("operator-identity-mismatch",), 123, 60, 10
                 ),
             )
         self.assertEqual("restarted", outcome)
@@ -1823,8 +1836,10 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             ),
             patch.object(
                 watchdog,
-                "mcp_http_probe",
-                return_value="mcp-http-request-failed",
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
             ),
             patch.object(watchdog, "release_watchdog_admission") as release,
             patch.object(watchdog, "service_action") as service_action,
@@ -1996,8 +2011,10 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             ),
             patch.object(
                 watchdog,
-                "mcp_http_probe",
-                return_value="mcp-http-request-failed",
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
             ),
             patch.object(watchdog, "service_action"),
             patch.object(
@@ -2062,8 +2079,10 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             ),
             patch.object(
                 watchdog,
-                "mcp_http_probe",
-                return_value="mcp-http-request-failed",
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
             ),
             patch.object(watchdog, "service_action"),
             patch.object(
@@ -2190,8 +2209,10 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             ),
             patch.object(
                 watchdog,
-                "mcp_http_probe",
-                return_value="mcp-http-request-failed",
+                "_operator_recovered_without_replacement",
+                return_value=watchdog.ProbeResult(
+                    "unhealthy", ("operator-identity-mismatch",), 123, 61, 10
+                ),
             ),
             patch.object(
                 watchdog,
@@ -2303,6 +2324,22 @@ class WatchdogAdmissionRecoveryTests(unittest.TestCase):
             "grabowski.component_watchdog.restart_rolled_back",
             emit.call_args.args[0],
         )
+
+    def test_shared_recovery_lock_serializes_both_component_watchdogs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = watchdog.normalize_args(
+                watchdog.parser().parse_args(
+                    ["--component", "tunnel", "--state-dir", temp_dir]
+                )
+            )
+            with (
+                watchdog.exclusive_lock(root / "component-recovery.lock"),
+                patch.object(watchdog, "probe_component") as probe,
+            ):
+                with self.assertRaises(watchdog.LockBusy):
+                    watchdog.run_watchdog(args)
+            probe.assert_not_called()
 
     def test_run_watchdog_defers_when_safe_drain_cannot_be_proven(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
