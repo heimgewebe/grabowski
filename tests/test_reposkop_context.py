@@ -1532,5 +1532,31 @@ class ReposkopContextTests(unittest.TestCase):
 
 
 
+    @unittest.skipUnless(
+        hasattr(context.os, "memfd_create")
+        and isinstance(getattr(context.os, "MFD_ALLOW_SEALING", None), int)
+        and isinstance(getattr(context.fcntl, "F_ADD_SEALS", None), int)
+        and isinstance(getattr(context.fcntl, "F_GET_SEALS", None), int),
+        "Linux memfd seals are unavailable",
+    )
+    def test_sealed_executable_memfd_is_created_with_write_seal(self) -> None:
+        descriptor = context._seal_executable_bytes(b"#!/bin/sh\nexit 0\n")
+        try:
+            observed = context.fcntl.fcntl(
+                descriptor, context.fcntl.F_GET_SEALS
+            )
+            required = (
+                context.fcntl.F_SEAL_WRITE
+                | context.fcntl.F_SEAL_SHRINK
+                | context.fcntl.F_SEAL_GROW
+            )
+            self.assertEqual(observed & required, required)
+            with self.assertRaises(PermissionError):
+                context.os.write(descriptor, b"x")
+        finally:
+            context.os.close(descriptor)
+
+
+
 if __name__ == "__main__":
     unittest.main()

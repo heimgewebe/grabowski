@@ -114,11 +114,16 @@ def _seal_executable_bytes(payload: bytes) -> int:
     # Prefer memfd+seals when the platform exposes them; otherwise use an
     # immediately-unlinked private temporary file that only our fd can open.
     create = getattr(os, "memfd_create", None)
-    if create is not None:
-        memfd_flags = getattr(os, "MFD_CLOEXEC", 0) | getattr(
-            os, "MFD_ALLOW_SEALING", 0
-        )
-        sealed = create("grabowski-reposkop-exec", memfd_flags)
+    allow_sealing = getattr(os, "MFD_ALLOW_SEALING", None)
+    add_seals = getattr(fcntl, "F_ADD_SEALS", None)
+    if (
+        create is not None
+        and isinstance(allow_sealing, int)
+        and allow_sealing > 0
+        and isinstance(add_seals, int)
+    ):
+        flags = getattr(os, "MFD_CLOEXEC", 0) | allow_sealing
+        sealed = create("grabowski-reposkop-exec", flags)
         try:
             view = memoryview(payload)
             written = 0
@@ -128,15 +133,19 @@ def _seal_executable_bytes(payload: bytes) -> int:
                     raise OSError("short write")
                 written += count
             os.lseek(sealed, 0, os.SEEK_SET)
-            add_seals = getattr(fcntl, "F_ADD_SEALS", None)
-            if add_seals is not None:
-                seal_mask = 0
-                for name in ("F_SEAL_WRITE", "F_SEAL_SHRINK", "F_SEAL_GROW"):
-                    value = getattr(fcntl, name, 0)
-                    if isinstance(value, int):
-                        seal_mask |= value
-                if seal_mask:
-                    fcntl.fcntl(sealed, add_seals, seal_mask)
+            seal_mask = 0
+            for name in (
+                "F_SEAL_WRITE",
+                "F_SEAL_SHRINK",
+                "F_SEAL_GROW",
+                "F_SEAL_SEAL",
+            ):
+                value = getattr(fcntl, name, 0)
+                if isinstance(value, int):
+                    seal_mask |= value
+            if not seal_mask:
+                raise ReposkopContextError("memfd sealing constants are unavailable")
+            fcntl.fcntl(sealed, add_seals, seal_mask)
             os.fchmod(sealed, 0o700)
             return sealed
         except BaseException:

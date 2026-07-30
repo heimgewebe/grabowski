@@ -19,6 +19,8 @@ EVIDENCE_KIND = "github_codex_review_settlement"
 REQUEST_KIND = "grabowski_codex_review_request"
 STATUS_CONTEXT = "Codex review settled"
 MAX_ITEMS = 100
+MAX_COMMENT_PAGES = 10
+MAX_COMMENT_ITEMS = MAX_ITEMS * MAX_COMMENT_PAGES
 TRUSTED_CODEX_ACTORS = frozenset(
     {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
 )
@@ -80,7 +82,7 @@ query($owner: String!, $name: String!, $number: Int!) {
             pageInfo { hasNextPage }
           }
         }
-        pageInfo { hasPreviousPage }
+        pageInfo { hasPreviousPage startCursor }
       }
       reviews(last: 100) {
         nodes {
@@ -110,6 +112,31 @@ query($owner: String!, $name: String!, $number: Int!) {
           }
         }
         pageInfo { hasNextPage }
+      }
+    }
+  }
+}
+""".strip()
+
+
+COMMENTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $before: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(last: 100, before: $before) {
+        nodes {
+          databaseId
+          body
+          createdAt
+          url
+          authorAssociation
+          author { login }
+          reactions(first: 100) {
+            nodes { content createdAt user { login } }
+            pageInfo { hasNextPage }
+          }
+        }
+        pageInfo { hasPreviousPage startCursor }
       }
     }
   }
@@ -202,6 +229,85 @@ def _run_json(repo: Path, argv: list[str]) -> Any:
         raise SettlementError("command returned invalid JSON") from exc
 
 
+def _collect_comments(
+    repo: Path,
+    owner: str,
+    name: str,
+    pr_number: int,
+    initial: Any,
+) -> dict[str, Any]:
+    if not isinstance(initial, dict):
+        raise SettlementError("comments connection is missing")
+    nodes = _list_nodes(initial, label="comments")
+    page = initial.get("pageInfo")
+    if not isinstance(page, dict):
+        raise SettlementError("comments pageInfo is missing")
+    pages = 1
+    cursors: set[str] = set()
+    seen_ids: set[int] = set()
+
+    def remember(items: list[dict[str, Any]]) -> None:
+        for item in items:
+            comment_id = item.get("databaseId")
+            if isinstance(comment_id, bool) or not isinstance(comment_id, int):
+                raise SettlementError("comment databaseId is missing or invalid")
+            if comment_id in seen_ids:
+                raise SettlementError("comment pagination returned duplicate identities")
+            seen_ids.add(comment_id)
+
+    remember(nodes)
+    while page.get("hasPreviousPage") is True:
+        if pages >= MAX_COMMENT_PAGES:
+            raise SettlementError(
+                f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history"
+            )
+        before = page.get("startCursor")
+        if not isinstance(before, str) or not before or before in cursors:
+            raise SettlementError("comments pagination cursor is missing or repeated")
+        cursors.add(before)
+        payload = _run_json(
+            repo,
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-f",
+                f"query={COMMENTS_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+                "-f",
+                f"before={before}",
+            ],
+        )
+        try:
+            connection = payload["data"]["repository"]["pullRequest"]["comments"]
+        except (KeyError, TypeError) as exc:
+            raise SettlementError("GitHub GraphQL response lacks comment history") from exc
+        if not isinstance(connection, dict):
+            raise SettlementError("pull-request comments do not exist")
+        older = _list_nodes(connection, label="comments")
+        remember(older)
+        nodes = [*older, *nodes]
+        if len(nodes) > MAX_COMMENT_ITEMS:
+            raise SettlementError(
+                f"comments exceed the bounded {MAX_COMMENT_ITEMS}-item history"
+            )
+        page = connection.get("pageInfo")
+        if not isinstance(page, dict):
+            raise SettlementError("comments pageInfo is missing")
+        pages += 1
+    if page.get("hasPreviousPage") is not False:
+        raise SettlementError("comments pagination state is invalid")
+    return {
+        "nodes": nodes,
+        "pageInfo": {"hasPreviousPage": False, "pages_loaded": pages},
+    }
+
+
 def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
     _, owner, name = _normalize_repo(repository)
     payload = _run_json(
@@ -226,6 +332,10 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         raise SettlementError("GitHub GraphQL response lacks pull-request state") from exc
     if not isinstance(pull_request, dict):
         raise SettlementError("pull request does not exist")
+    pull_request = dict(pull_request)
+    pull_request["comments"] = _collect_comments(
+        repo, owner, name, pr_number, pull_request.get("comments")
+    )
     diff_bytes = subprocess.run(
         ["gh", "pr", "diff", str(pr_number), "--repo", repository],
         cwd=repo,
@@ -241,7 +351,6 @@ def _live_state(repo: Path, repository: str, pr_number: int) -> dict[str, Any]:
         raise SettlementError("cannot read current PR diff: " + " ".join(detail.split())[:400])
     if not diff_bytes.stdout:
         raise SettlementError("current PR diff is empty")
-    pull_request = dict(pull_request)
     pull_request["diff_sha256"] = hashlib.sha256(diff_bytes.stdout).hexdigest()
     return pull_request
 
