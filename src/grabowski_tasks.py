@@ -4856,12 +4856,19 @@ def grabowski_task_resume(
         )
         raise RuntimeError("Task outcome is unknown; verify the authoritative unit before retry")
     interrupted_recovery_binding = None
+    recovery_launcher_bindings: dict[str, Any] = {}
     if _interrupted_recovery_context is not None:
         interrupted_recovery_binding = _validate_interrupted_recovery_context(
             _interrupted_recovery_context,
             record=record,
             observation=observation,
         )
+        recovery_launcher_bindings["interrupted_recovery_binding"] = (
+            interrupted_recovery_binding
+        )
+        retained_retry_binding = _persisted_retry_binding_or_raise(record)
+        if retained_retry_binding is not None:
+            recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     attempt = int(record["attempt"]) + 1
     unit = _task_unit(task_id, attempt)
     candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
@@ -4873,7 +4880,7 @@ def grabowski_task_resume(
             "launching",
             launcher={
                 "pending": True,
-                "interrupted_recovery_binding": interrupted_recovery_binding,
+                **recovery_launcher_bindings,
             },
             observation=observation,
             unit=unit,
@@ -4900,7 +4907,7 @@ def grabowski_task_resume(
     if interrupted_recovery_binding is not None:
         launcher = {
             **launcher,
-            "interrupted_recovery_binding": interrupted_recovery_binding,
+            **recovery_launcher_bindings,
         }
     state = _launch_state(launcher)
     stored = _set_state(
