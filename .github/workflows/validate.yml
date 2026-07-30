@@ -7,7 +7,7 @@ on:
       - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -34,63 +34,3 @@ jobs:
 
       - name: Prove reproducible deployment staging
         run: make deploy-check
-
-  apply-pr514-review-fixes:
-    if: github.event_name == 'pull_request' && github.event.pull_request.number == 516 && github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout exact follow-up branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: fix/pr514-review-followup-v1
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.10"
-
-      - name: Install locked runtime dependencies
-        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements/runtime.lock.txt
-
-      - name: Relax receipt insertion anchor
-        run: python tools/pr514_relax_anchor.py
-
-      - name: Apply deterministic review patch
-        run: python tools/pr514_review_fix.py
-
-      - name: Regenerate contracts
-        run: make context-refresh PYTHON=python3
-
-      - name: Check patch formatting
-        run: git diff --check
-
-      - name: Run reconciliation regressions
-        shell: bash
-        run: |
-          set -euo pipefail
-          test_home="$(mktemp -d)"
-          trap 'rm -rf "$test_home"' EXIT
-          install -d -m 700 "$test_home/.config/grabowski"
-          install -m 600 config/access.home-wide-operator.example.json "$test_home/.config/grabowski/access.json"
-          HOME="$test_home" PYTHONPATH=src python -m unittest -v tests.test_text_artifact_reconcile
-
-      - name: Validate exact candidate
-        run: make validate PYTHON=python3
-
-      - name: Commit validated review fixes
-        shell: bash
-        run: |
-          set -euo pipefail
-          git show b4862fac45184bac2e6ad1cf1fa5b2d3035a58ea:.github/workflows/validate.yml > .github/workflows/validate.yml
-          git rm .github/workflows/pr514-review-fix.yml
-          git rm .github/workflows/pr514-review-fix-v2.yml
-          git rm -f tools/pr514_review_fix.py
-          git rm -f tools/pr514_relax_anchor.py
-          git rm .pr514-review-fix-trigger
-          git add .github/workflows/validate.yml config/runtime-entrypoint.json contracts/capability-catalog.v1.json contracts/publication-profiles.v1.json docs/generated/operator-context.v1.json docs/generated/operator-context.md docs/text-artifact-export.md pyproject.toml src/grabowski_text_artifact_reconcile.py tests/test_text_artifact_reconcile.py
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "fix: harden text artifact reconciliation"
-          git push origin HEAD:fix/pr514-review-followup-v1

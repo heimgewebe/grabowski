@@ -28,7 +28,11 @@ TEXT_ARTIFACT_QUARANTINE_ROOT = (
 _ALLOWED_LEGACY_MODES = {0o600, 0o640, 0o644}
 _MAX_UNMANAGED_ENTRIES = 256
 _MAX_UNMANAGED_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_QUARANTINE_DIRECTORIES = 4096
+_MAX_QUARANTINE_TOTAL_BYTES = 512 * 1024 * 1024
 _COPY_CHUNK_BYTES = 1024 * 1024
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
 _INVENTORY_NONCLAIMS = [
     "safe deletion authority",
     "transport-file authorship",
@@ -658,16 +662,156 @@ def _load_quarantine_locked(
         os.close(descriptor)
 
 
-def _rename_directory_noreplace(
-    parent_descriptor: int,
+def _build_quarantine_receipt(
+    inventory: dict[str, Any],
+    *,
+    created_at_unix: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": RECEIPT_KIND,
+        "inventory_sha256": inventory["inventory_sha256"],
+        "artifact_id": inventory["artifact_id"],
+        "managed": inventory["managed"],
+        "quarantined_entries": inventory["unmanaged_entries"],
+        "created_at_unix": created_at_unix,
+        "does_not_establish": [
+            "safe deletion beyond the reviewed inventory",
+            "transport-file authorship",
+            "review correctness",
+            "merge authority",
+        ],
+    }
+
+
+def _quarantine_directory_usage_locked(
+    quarantine_root_descriptor: int,
+    name: str,
+) -> int:
+    descriptor, identity = artifacts._open_private_directory_at(
+        quarantine_root_descriptor,
+        name,
+    )
+    try:
+        entries = sorted(os.listdir(descriptor))
+        if len(entries) > _MAX_UNMANAGED_ENTRIES + 1:
+            raise TextArtifactReconciliationError(
+                "Text artifact quarantine directory exceeds the bounded entry count"
+            )
+        total_bytes = 0
+        for entry_name in entries:
+            file_descriptor, before = _open_legacy_regular_file_at(
+                descriptor,
+                entry_name,
+            )
+            try:
+                after = os.fstat(file_descriptor)
+                linked = os.stat(
+                    entry_name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    _entry_identity(before) != _entry_identity(after)
+                    or _entry_identity(before) != _entry_identity(linked)
+                    or stat.S_IMODE(before.st_mode) != 0o600
+                ):
+                    raise TextArtifactReconciliationError(
+                        "Text artifact quarantine usage changed while reading"
+                    )
+                total_bytes += before.st_size
+            finally:
+                os.close(file_descriptor)
+        artifacts._verify_private_directory_at(
+            quarantine_root_descriptor,
+            name,
+            descriptor,
+            identity,
+        )
+        return total_bytes
+    finally:
+        os.close(descriptor)
+
+
+def _quarantine_usage_locked(
+    quarantine_root_descriptor: int,
+) -> dict[str, Any]:
+    names = sorted(os.listdir(quarantine_root_descriptor))
+    if len(names) > _MAX_QUARANTINE_DIRECTORIES:
+        raise TextArtifactReconciliationError(
+            "Text artifact quarantine directory count exceeds the retention limit"
+        )
+    total_bytes = 0
+    for name in names:
+        if artifacts.SHA256_RE.fullmatch(name) is None:
+            raise TextArtifactReconciliationError(
+                "Text artifact quarantine root contains an unmanaged entry"
+            )
+        total_bytes += _quarantine_directory_usage_locked(
+            quarantine_root_descriptor,
+            name,
+        )
+        if total_bytes > _MAX_QUARANTINE_TOTAL_BYTES:
+            raise TextArtifactReconciliationError(
+                "Text artifact quarantine bytes exceed the retention limit"
+            )
+    return {
+        "names": names,
+        "directory_count": len(names),
+        "byte_size": total_bytes,
+    }
+
+
+def _require_quarantine_capacity(
+    usage: dict[str, Any],
+    *,
+    additional_bytes: int,
+) -> None:
+    if usage["directory_count"] + 1 > _MAX_QUARANTINE_DIRECTORIES:
+        raise TextArtifactReconciliationError(
+            "Text artifact quarantine directory capacity is exhausted"
+        )
+    if usage["byte_size"] + additional_bytes > _MAX_QUARANTINE_TOTAL_BYTES:
+        raise TextArtifactReconciliationError(
+            "Text artifact quarantine byte capacity is exhausted"
+        )
+
+
+def _entry_matches_bound_source(
+    observed: dict[str, Any],
+    expected: dict[str, Any],
+) -> bool:
+    fields = {
+        "path",
+        "file_type",
+        "name",
+        "device",
+        "inode",
+        "mode",
+        "link_count",
+        "uid",
+        "gid",
+        "byte_size",
+        "mtime_ns",
+        "sha256",
+    }
+    return all(observed.get(field) == expected.get(field) for field in fields)
+
+
+def _renameat2(
+    source_descriptor: int,
     source_name: str,
+    destination_descriptor: int,
     destination_name: str,
+    *,
+    flags: int,
+    operation: str,
 ) -> None:
     try:
         renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
     except AttributeError as exc:
         raise TextArtifactReconciliationError(
-            "Text artifact create-only quarantine rename is unavailable"
+            f"Text artifact {operation} rename is unavailable"
         ) from exc
     renameat2.argtypes = [
         ctypes.c_int,
@@ -678,32 +822,80 @@ def _rename_directory_noreplace(
     ]
     renameat2.restype = ctypes.c_int
     result = renameat2(
-        parent_descriptor,
-        os.fsencode(source_name),
-        parent_descriptor,
-        os.fsencode(destination_name),
-        1,  # RENAME_NOREPLACE
+        source_descriptor,
+        os.fsencode(_safe_entry_name(source_name)),
+        destination_descriptor,
+        os.fsencode(_safe_entry_name(destination_name)),
+        flags,
     )
     if result == 0:
         return
     error = ctypes.get_errno()
-    if error == errno.EEXIST:
+    if flags == _RENAME_NOREPLACE and error == errno.EEXIST:
         raise TextArtifactReconciliationError(
-            "Text artifact quarantine destination already exists"
+            f"Text artifact {operation} destination already exists"
         )
     if error in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
         raise TextArtifactReconciliationError(
-            "Text artifact create-only quarantine rename is unavailable"
+            f"Text artifact {operation} rename is unavailable"
         )
     raise TextArtifactReconciliationError(
-        "Text artifact create-only quarantine rename failed"
+        f"Text artifact {operation} rename failed"
     ) from OSError(error, os.strerror(error))
+
+
+def _rename_directory_noreplace(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    _renameat2(
+        parent_descriptor,
+        source_name,
+        parent_descriptor,
+        destination_name,
+        flags=_RENAME_NOREPLACE,
+        operation="quarantine",
+    )
+
+
+def _rename_entry_noreplace(
+    source_descriptor: int,
+    source_name: str,
+    destination_descriptor: int,
+    destination_name: str,
+) -> None:
+    _renameat2(
+        source_descriptor,
+        source_name,
+        destination_descriptor,
+        destination_name,
+        flags=_RENAME_NOREPLACE,
+        operation="source isolation",
+    )
+
+
+def _rename_entry_exchange(
+    source_descriptor: int,
+    source_name: str,
+    destination_descriptor: int,
+    destination_name: str,
+) -> None:
+    _renameat2(
+        source_descriptor,
+        source_name,
+        destination_descriptor,
+        destination_name,
+        flags=_RENAME_EXCHANGE,
+        operation="verified source exchange",
+    )
 
 
 def _create_quarantine_locked(
     quarantine_root_descriptor: int,
     *,
     inventory: dict[str, Any],
+    receipt: dict[str, Any],
     source_descriptor: int,
 ) -> tuple[dict[str, Any], str, Path]:
     inventory_sha256 = str(inventory["inventory_sha256"])
@@ -723,21 +915,6 @@ def _create_quarantine_locked(
                 entry,
                 artifact_id=str(inventory["artifact_id"]),
             )
-        receipt = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": RECEIPT_KIND,
-            "inventory_sha256": inventory_sha256,
-            "artifact_id": inventory["artifact_id"],
-            "managed": inventory["managed"],
-            "quarantined_entries": inventory["unmanaged_entries"],
-            "created_at_unix": int(time.time()),
-            "does_not_establish": [
-                "safe deletion beyond the reviewed inventory",
-                "transport-file authorship",
-                "review correctness",
-                "merge authority",
-            ],
-        }
         receipt_path = temporary_path / "receipt.json"
         artifacts._atomic_write(receipt_path, _canonical_bytes(receipt))
         quarantine_receipt_sha256 = hashlib.sha256(
@@ -769,14 +946,20 @@ def _create_quarantine_locked(
 
 def _clean_source_locked(
     root_descriptor: int,
+    quarantine_root_descriptor: int,
     *,
     artifact_id: str,
+    inventory_sha256: str,
     quarantine_receipt: dict[str, Any],
 ) -> int:
     artifact_descriptor, _ = artifacts._open_private_directory_at(
         root_descriptor,
         artifact_id,
     )
+    cleanup_name = f".{inventory_sha256}.{uuid.uuid4().hex}.source-cleanup"
+    cleanup_descriptor: int | None = None
+    quarantine_descriptor: int | None = None
+    preserve_cleanup = False
     try:
         receipt, receipt_sha256, artifact_sha256, artifact_size = (
             _validate_managed_artifact(
@@ -806,26 +989,116 @@ def _clean_source_locked(
             raise TextArtifactReconciliationError(
                 "Text artifact source contains entries outside the reviewed quarantine"
             )
-        for name in remaining_names:
-            _verify_source_entry(
+        if not remaining_names:
+            _verify_current_private_directory_at(
+                root_descriptor,
+                artifact_id,
                 artifact_descriptor,
-                expected_entries[name],
-                artifact_id=artifact_id,
             )
-        for name in remaining_names:
-            os.unlink(name, dir_fd=artifact_descriptor)
-        os.fsync(artifact_descriptor)
-        if set(os.listdir(artifact_descriptor)) != managed_names:
-            raise TextArtifactReconciliationError(
-                "Text artifact source cleanup did not restore the managed entry set"
-            )
-        _verify_current_private_directory_at(
-            root_descriptor,
-            artifact_id,
-            artifact_descriptor,
+            return 0
+
+        os.mkdir(cleanup_name, 0o700, dir_fd=quarantine_root_descriptor)
+        cleanup_descriptor, _ = artifacts._open_private_directory_at(
+            quarantine_root_descriptor,
+            cleanup_name,
         )
+        quarantine_descriptor, _ = artifacts._open_private_directory_at(
+            quarantine_root_descriptor,
+            inventory_sha256,
+        )
+        try:
+            for name in remaining_names:
+                expected = expected_entries[name]
+                _verify_source_entry(
+                    artifact_descriptor,
+                    expected,
+                    artifact_id=artifact_id,
+                )
+                _rename_entry_noreplace(
+                    artifact_descriptor,
+                    name,
+                    cleanup_descriptor,
+                    name,
+                )
+                isolated = _inventory_entry(
+                    artifact_id,
+                    _inspect_entry(cleanup_descriptor, name),
+                )
+                if not _entry_matches_bound_source(isolated, expected):
+                    preserve_cleanup = True
+                    raise TextArtifactReconciliationError(
+                        "Text artifact source entry changed before atomic isolation"
+                    )
+                _rename_entry_exchange(
+                    cleanup_descriptor,
+                    name,
+                    quarantine_descriptor,
+                    name,
+                )
+                quarantined = _inventory_entry(
+                    artifact_id,
+                    _inspect_entry(quarantine_descriptor, name),
+                )
+                if not _entry_matches_bound_source(quarantined, expected):
+                    preserve_cleanup = True
+                    raise TextArtifactReconciliationError(
+                        "Text artifact isolated source entry changed during exchange"
+                    )
+                os.chmod(
+                    name,
+                    0o600,
+                    dir_fd=quarantine_descriptor,
+                    follow_symlinks=False,
+                )
+                stored = _inspect_entry(quarantine_descriptor, name)
+                if (
+                    stored["sha256"] != expected["sha256"]
+                    or stored["byte_size"] != expected["byte_size"]
+                    or stored["mode"] != 0o600
+                ):
+                    preserve_cleanup = True
+                    raise TextArtifactReconciliationError(
+                        "Text artifact exchanged quarantine payload failed verification"
+                    )
+                os.unlink(name, dir_fd=cleanup_descriptor)
+            os.fsync(artifact_descriptor)
+            os.fsync(quarantine_descriptor)
+            os.fsync(cleanup_descriptor)
+            if set(os.listdir(artifact_descriptor)) != managed_names:
+                raise TextArtifactReconciliationError(
+                    "Text artifact source cleanup did not restore the managed entry set"
+                )
+            if os.listdir(cleanup_descriptor):
+                preserve_cleanup = True
+                raise TextArtifactReconciliationError(
+                    "Text artifact source cleanup staging is not empty"
+                )
+            _verify_current_private_directory_at(
+                root_descriptor,
+                artifact_id,
+                artifact_descriptor,
+            )
+            _verify_current_private_directory_at(
+                quarantine_root_descriptor,
+                inventory_sha256,
+                quarantine_descriptor,
+            )
+        except Exception:
+            if cleanup_descriptor is not None and os.listdir(cleanup_descriptor):
+                preserve_cleanup = True
+            raise
         return len(remaining_names)
     finally:
+        if quarantine_descriptor is not None:
+            os.close(quarantine_descriptor)
+        if cleanup_descriptor is not None:
+            os.close(cleanup_descriptor)
+            if not preserve_cleanup:
+                try:
+                    os.rmdir(cleanup_name, dir_fd=quarantine_root_descriptor)
+                    os.fsync(quarantine_root_descriptor)
+                except FileNotFoundError:
+                    pass
         os.close(artifact_descriptor)
 
 
@@ -899,7 +1172,10 @@ def reconcile_text_artifact_store(
                 raise TextArtifactReconciliationError(
                     "Text artifact quarantine store is busy"
                 ) from exc
-            quarantine_names = set(os.listdir(quarantine_root_descriptor))
+            quarantine_usage = _quarantine_usage_locked(
+                quarantine_root_descriptor
+            )
+            quarantine_names = set(quarantine_usage["names"])
             quarantine_reused = inventory_sha256 in quarantine_names
             if quarantine_reused:
                 artifact_descriptor, _ = artifacts._open_private_directory_at(
@@ -956,6 +1232,18 @@ def reconcile_text_artifact_store(
                     raise TextArtifactReconciliationError(
                         "Text artifact has no unmanaged entries to reconcile"
                     )
+                quarantine_receipt = _build_quarantine_receipt(
+                    inventory,
+                    created_at_unix=int(time.time()),
+                )
+                additional_bytes = sum(
+                    int(entry["byte_size"])
+                    for entry in inventory["unmanaged_entries"]
+                ) + len(_canonical_bytes(quarantine_receipt))
+                _require_quarantine_capacity(
+                    quarantine_usage,
+                    additional_bytes=additional_bytes,
+                )
                 artifact_descriptor, _ = artifacts._open_private_directory_at(
                     root_descriptor,
                     identity,
@@ -965,6 +1253,7 @@ def reconcile_text_artifact_store(
                         _create_quarantine_locked(
                             quarantine_root_descriptor,
                             inventory=inventory,
+                            receipt=quarantine_receipt,
                             source_descriptor=artifact_descriptor,
                         )
                     )
@@ -985,7 +1274,9 @@ def reconcile_text_artifact_store(
                 )
             cleaned_count = _clean_source_locked(
                 root_descriptor,
+                quarantine_root_descriptor,
                 artifact_id=identity,
+                inventory_sha256=inventory_sha256,
                 quarantine_receipt=quarantine_receipt,
             )
             artifacts.base._append_audit(

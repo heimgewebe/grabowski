@@ -2803,6 +2803,10 @@
         "source": "src/grabowski_artifacts.py"
       },
       {
+        "module": "grabowski_text_artifact_reconcile",
+        "source": "src/grabowski_text_artifact_reconcile.py"
+      },
+      {
         "module": "grabowski_workers",
         "source": "src/grabowski_workers.py"
       },
@@ -2924,7 +2928,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "b0d032e607e5c537de0e203bd19fb5210ab654d24509a34355cda2a3fe5d9d54"
+      "sha256": "47fddfc5433e8abf72b1e82c862b46b05e79b55319757b153c60d6cf129e55c9"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -3002,6 +3006,7 @@
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
       "src/grabowski_tasks.py": "694c6c27820f19e95448a01ffcf5df008efcb947a047ab6af68e6396b063e05e",
       "src/grabowski_terminal_convergence.py": "5383579e275a9d07c2930faaada6d1a616b2dbdf442cc111d8e8dd1525aa6f9b",
+      "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
