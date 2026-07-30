@@ -1450,6 +1450,11 @@ globalThis.fetch = async () => ({
             readback["last_observation"]["prior_observation"]["properties"]["Result"],
             "timeout",
         )
+        with patch.object(workers.operator, "_run", return_value=result()):
+            repeated = workers.worker_stop(worker_id, expected_kind="browser")
+        repeated_prior = repeated["worker"]["last_observation"]["prior_observation"]
+        self.assertEqual(repeated_prior["state"], "failed")
+        self.assertEqual(repeated_prior["properties"]["Result"], "timeout")
         self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
         history = workers.worker_list("browser", limit=10, view="history")
         self.assertEqual(history["count"], 1)

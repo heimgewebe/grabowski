@@ -1799,6 +1799,9 @@ def _prior_observation_summary(record: dict[str, Any]) -> dict[str, Any] | None:
     if not raw:
         return None
     previous = json.loads(raw)
+    preserved = previous.get("prior_observation")
+    if isinstance(preserved, dict):
+        previous = preserved
     summary = {
         key: previous[key]
         for key in ("state", "properties", "observed_at_unix")
