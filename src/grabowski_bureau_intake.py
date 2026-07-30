@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 
 import grabowski_bureau_leases as bureau_runtime
 import grabowski_mcp as base
@@ -698,24 +698,45 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
 
 @mcp.tool(name="grabowski_bureau_candidate_assess", annotations=READ_ONLY)
 def grabowski_bureau_candidate_assess(
-    candidate_id: str = "",
-    event_id: int = 0,
-    initiative: str = "",
-    task_id: str = "",
+    selector_kind: Literal["candidate_id", "event_id"],
+    selector_value: str | int,
+    expected_initiative: str = "",
+    expected_task_id: str = "",
 ) -> dict[str, Any]:
-    """Assess one Bureau candidate read-only against current canonical Registry truth."""
-    if bool(candidate_id) == bool(event_id):
-        raise ValueError("provide exactly one of candidate_id or event_id")
+    """Assess one explicitly selected operator-intake candidate read-only.
+
+    ``expected_initiative`` and ``expected_task_id`` are optional binding checks;
+    they are never candidate selectors and cannot make an otherwise incomplete call valid.
+    """
+    if selector_kind not in {"candidate_id", "event_id"}:
+        raise ValueError("selector_kind must be candidate_id or event_id")
     arguments = ["--json", "--json-envelope", "operator-candidate-assess"]
-    arguments.extend(
-        ["--candidate-id", candidate_id]
-        if candidate_id
-        else ["--event-id", str(event_id)]
-    )
-    if initiative:
-        arguments.extend(["--initiative", initiative])
-    if task_id:
-        arguments.extend(["--task-id", task_id])
+    if selector_kind == "candidate_id":
+        if not isinstance(selector_value, str):
+            raise ValueError("candidate_id selector_value must be text")
+        candidate_id = selector_value.strip()
+        if not candidate_id or "\x00" in candidate_id:
+            raise ValueError("candidate_id selector_value is empty or contains NUL")
+        arguments.extend(["--candidate-id", candidate_id])
+    else:
+        if (
+            not isinstance(selector_value, int)
+            or isinstance(selector_value, bool)
+            or selector_value <= 0
+        ):
+            raise ValueError("event_id selector_value must be a positive integer")
+        arguments.extend(["--event-id", str(selector_value)])
+    for label, value, option in (
+        ("expected_initiative", expected_initiative, "--initiative"),
+        ("expected_task_id", expected_task_id, "--task-id"),
+    ):
+        if not isinstance(value, str):
+            raise ValueError(f"{label} must be text")
+        normalized = value.strip()
+        if "\x00" in normalized:
+            raise ValueError(f"{label} contains NUL")
+        if normalized:
+            arguments.extend([option, normalized])
     return _invoke_bureau(arguments)
 
 

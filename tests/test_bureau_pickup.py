@@ -359,6 +359,27 @@ class BureauPickupTests(unittest.TestCase):
             "reclaimed_from_owner": None,
         }
 
+    @staticmethod
+    def coordinated_status(intent, state="assigned", blocking=False):
+        keys = intent["required_resource_keys"]
+        return {
+            "status": "coordinated",
+            "run": {
+                "run_id": intent["run_id"],
+                "task_id": intent["task_id"],
+                "worker_id": intent["worker_id"],
+                "state": state,
+            },
+            "claim_intent_sha256": intent["intent_sha256"],
+            "release": {
+                "required": bool(keys),
+                "owner_id": intent["lease_owner_id"],
+                "resource_keys": keys,
+                "claim_intent_sha256": intent["intent_sha256"],
+            },
+            "blocking": blocking,
+        }
+
     def test_execute_claims_after_exact_lease_acquisition(self) -> None:
         intent = self.intent()
         lease = self.lease(
@@ -371,6 +392,7 @@ class BureauPickupTests(unittest.TestCase):
                 side_effect=[
                     {"status": "claim-intent", "intent": intent},
                     {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    self.coordinated_status(intent),
                 ],
             ) as invoke,
             mock.patch.object(
@@ -389,8 +411,9 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(metadata["claim_intent_sha256"], intent["intent_sha256"])
         intent_argv = invoke.call_args_list[0].args[0]
         commit_argv = invoke.call_args_list[1].args[0]
+        readback_argv = invoke.call_args_list[2].args[0]
         expected_coordination = str(pickup.COORDINATION_ROOT)
-        for argv in (intent_argv, commit_argv):
+        for argv in (intent_argv, commit_argv, readback_argv):
             root_index = argv.index("--root")
             self.assertEqual(argv[root_index + 1], str(self.registry_root))
             state_index = argv.index("--state-root")
@@ -401,6 +424,11 @@ class BureauPickupTests(unittest.TestCase):
         self.assertTrue((run_dir / "intent.json").is_file())
         self.assertTrue((run_dir / "acquisition.json").is_file())
         self.assertTrue((run_dir / "commit-result.json").is_file())
+        self.assertTrue((run_dir / "commit-readback.json").is_file())
+        self.assertEqual(
+            pickup._sha256(self.coordinated_status(intent)),
+            result["run_readback_sha256"],
+        )
         stored_request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
         self.assertEqual(expected_coordination, stored_request["coordination_root"])
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
@@ -555,11 +583,7 @@ class BureauPickupTests(unittest.TestCase):
         intent = self.intent()
         key = intent["required_resource_keys"][0]
         lease = self.lease(key, intent["lease_owner_id"])
-        coordinated = {
-            "status": "coordinated",
-            "run": {"run_id": intent["run_id"], "state": "assigned"},
-            "release": {"required": True},
-        }
+        coordinated = self.coordinated_status(intent)
         with (
             mock.patch.object(
                 pickup.bureau,
@@ -674,16 +698,7 @@ class BureauPickupTests(unittest.TestCase):
         return run_dir, value
 
     def terminal_status(self, intent, state="failed"):
-        return {
-            "status": "coordinated",
-            "run": {"run_id": intent["run_id"], "state": state},
-            "release": {
-                "required": True,
-                "owner_id": intent["lease_owner_id"],
-                "resource_keys": intent["required_resource_keys"],
-                "claim_intent_sha256": intent["intent_sha256"],
-            },
-        }
+        return self.coordinated_status(intent, state=state)
 
     def test_release_uses_journal_bound_coordination_root(self) -> None:
         intent = self.intent()
@@ -864,6 +879,7 @@ class BureauPickupTests(unittest.TestCase):
             side_effect=[
                 {"status": "claim-intent", "intent": intent},
                 {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                self.coordinated_status(intent),
             ],
         ) as invoke:
             result = pickup.grabowski_bureau_pickup_execute(self.request())
@@ -882,6 +898,7 @@ class BureauPickupTests(unittest.TestCase):
                 side_effect=[
                     {"status": "claim-intent", "intent": intent},
                     {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    self.coordinated_status(intent),
                 ],
             ),
             mock.patch.object(
@@ -899,11 +916,7 @@ class BureauPickupTests(unittest.TestCase):
         intent = self.intent()
         key = intent["required_resource_keys"][0]
         lease = self.lease(key, intent["lease_owner_id"])
-        coordinated = {
-            "status": "coordinated",
-            "run": {"run_id": intent["run_id"], "state": "assigned"},
-            "release": {"required": True},
-        }
+        coordinated = self.coordinated_status(intent)
         with (
             mock.patch.object(
                 pickup.bureau,
@@ -923,6 +936,71 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_execute(self.request())
         self.assertEqual(result["status"], "recovered")
+        release.assert_not_called()
+
+    def test_successful_commit_without_authoritative_readback_retains_leases(
+        self,
+    ) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    RuntimeError("readback unavailable"),
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-recovery-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            "recovery-required", raised.exception.details["result"]["status"]
+        )
+        release.assert_not_called()
+
+    def test_successful_commit_rejects_mismatched_run_readback(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        mismatched = self.coordinated_status(intent)
+        mismatched["run"] = {**mismatched["run"], "task_id": "OTHER-TASK"}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    mismatched,
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-recovery-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            "claim-readback-run-binding-mismatch",
+            raised.exception.details["result"]["recovery"]["readback_error_code"],
+        )
         release.assert_not_called()
 
     def test_commit_and_readback_failure_retains_leases_as_recovery_required(self) -> None:
@@ -992,10 +1070,7 @@ class BureauPickupTests(unittest.TestCase):
             "run": {"run_id": intent["run_id"], "state": "assigned"},
             "envelope": {"claim_intent": intent},
         }
-        coordinated = {
-            "status": "coordinated",
-            "run": {"run_id": intent["run_id"], "state": "assigned"},
-        }
+        coordinated = self.coordinated_status(intent)
         with (
             mock.patch.object(
                 pickup.bureau,
@@ -1044,10 +1119,7 @@ class BureauPickupTests(unittest.TestCase):
             "run": {"run_id": intent["run_id"], "state": "assigned"},
             "envelope": {"claim_intent": intent},
         }
-        coordinated = {
-            "status": "coordinated",
-            "run": {"run_id": intent["run_id"], "state": "assigned"},
-        }
+        coordinated = self.coordinated_status(intent)
         with mock.patch.object(
             pickup.bureau, "_invoke_bureau", side_effect=[existing, coordinated]
         ):

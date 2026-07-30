@@ -1039,6 +1039,63 @@ def _definitive_missing_run(payload: dict[str, Any]) -> bool:
     }
 
 
+def _validate_claim_readback(
+    payload: dict[str, Any],
+    intent: dict[str, Any],
+    acquisition: dict[str, Any],
+) -> dict[str, Any]:
+    if payload.get("status") != "coordinated":
+        raise BureauPickupError(
+            "claim-readback-not-coordinated",
+            details={"status": payload.get("status")},
+        )
+    run = payload.get("run")
+    if not isinstance(run, dict):
+        raise BureauPickupError("claim-readback-run-missing")
+    expected_run = {
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "worker_id": intent["worker_id"],
+    }
+    mismatches = {
+        key: {"expected": expected, "observed": run.get(key)}
+        for key, expected in expected_run.items()
+        if run.get(key) != expected
+    }
+    if mismatches:
+        raise BureauPickupError(
+            "claim-readback-run-binding-mismatch", details={"mismatches": mismatches}
+        )
+    if payload.get("claim_intent_sha256") != intent["intent_sha256"]:
+        raise BureauPickupError("claim-readback-intent-mismatch")
+    expected_keys = acquisition["resource_keys"]
+    release = payload.get("release")
+    if not isinstance(release, dict):
+        raise BureauPickupError("claim-readback-release-missing")
+    expected_release = {
+        "required": bool(expected_keys),
+        "owner_id": intent["lease_owner_id"],
+        "resource_keys": expected_keys,
+        "claim_intent_sha256": intent["intent_sha256"],
+    }
+    release_mismatches = {
+        key: {"expected": expected, "observed": release.get(key)}
+        for key, expected in expected_release.items()
+        if release.get(key) != expected
+    }
+    if release_mismatches:
+        raise BureauPickupError(
+            "claim-readback-release-binding-mismatch",
+            details={"mismatches": release_mismatches},
+        )
+    if payload.get("blocking") is not False:
+        raise BureauPickupError(
+            "claim-readback-blocking-or-incomplete",
+            details={"blocking": payload.get("blocking")},
+        )
+    return run
+
+
 def _recover_after_commit(
     intent: dict[str, Any],
     acquisition: dict[str, Any],
@@ -1058,10 +1115,13 @@ def _recover_after_commit(
         failure = {
             "status": "recovery-required",
             "readback_error_type": type(exc).__name__,
+            "readback_error_code": (
+                exc.code if isinstance(exc, BureauPickupError) else None
+            ),
             "lease_owner_id": intent["lease_owner_id"],
             "resource_keys": intent["required_resource_keys"],
             "does_not_establish": [
-                "absence of a Bureau run",
+                "a bound Bureau run",
                 "permission to release leases",
                 "safe retry without another readback",
             ],
@@ -1071,32 +1131,37 @@ def _recover_after_commit(
         except Exception:
             pass
         return failure
-    if status.get("status") == "coordinated":
-        return {
-            "status": "recovered",
-            "run": status.get("run"),
-            "coordination": status,
-            "acquisition": acquisition,
-        }
     if _definitive_missing_run(status):
-        compensation = _compensate_acquisitions(
-            intent["lease_owner_id"], acquisition["groups"], run_dir
-        )
         return {
             "status": "commit-not-applied",
             "coordination": status,
-            "compensation": compensation,
+            "compensation": _compensate_acquisitions(
+                intent["lease_owner_id"], acquisition["groups"], run_dir
+            ),
         }
+    try:
+        run = _validate_claim_readback(status, intent, acquisition)
+    except BureauPickupError as exc:
+        failure = {
+            "status": "recovery-required",
+            "readback_error_type": type(exc).__name__,
+            "readback_error_code": exc.code,
+            "lease_owner_id": intent["lease_owner_id"],
+            "resource_keys": intent["required_resource_keys"],
+            "does_not_establish": [
+                "a bound Bureau run",
+                "permission to release leases",
+                "safe retry without another readback",
+            ],
+        }
+        _write_bound_json(run_dir / "commit-readback-failure.json", failure)
+        return failure
     return {
-        "status": "recovery-required",
+        "status": "recovered",
+        "run": run,
         "coordination": status,
-        "lease_owner_id": intent["lease_owner_id"],
-        "resource_keys": intent["required_resource_keys"],
-        "does_not_establish": [
-            "absence of a Bureau run",
-            "permission to release leases",
-            "safe retry without another readback",
-        ],
+        "coordination_sha256": _sha256(status),
+        "acquisition": acquisition,
     }
 
 
@@ -1155,6 +1220,7 @@ def grabowski_bureau_pickup_execute(
             registry_root=normalized["registry_root"],
             coordination_root=normalized["coordination_root"],
         )
+        _validate_claim_readback(coordination, intent, acquisition)
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup",
@@ -1168,6 +1234,7 @@ def grabowski_bureau_pickup_execute(
             "acquisition_sha256": acquisition["acquisition_sha256"],
             "commit": intent_payload,
             "recovery": coordination,
+            "run_readback_sha256": _sha256(coordination),
             "journal": str(run_dir),
             "does_not_establish": [
                 "ownership of an unjournaled assignment",
@@ -1202,35 +1269,20 @@ def grabowski_bureau_pickup_execute(
             ],
         }
     _write_bound_json(run_dir / "commit-result.json", commit)
-    if commit.get("status") in {"claimed", "existing-assignment", "existing-terminal"}:
-        result = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "grabowski_bureau_pickup",
-            "status": commit["status"],
-            "request_sha256": request_sha256,
-            "run_id": intent["run_id"],
-            "task_id": intent["task_id"],
-            "lease_owner_id": intent["lease_owner_id"],
-            "resource_keys": intent["required_resource_keys"],
-            "claim_intent_sha256": intent["intent_sha256"],
-            "acquisition_sha256": acquisition["acquisition_sha256"],
-            "commit": commit,
-            "journal": str(run_dir),
-            "does_not_establish": [
-                "task completion",
-                "merge readiness",
-                "deployment authority",
-                "automatic lease release",
-            ],
-        }
-        bureau._audit(
-            "bureau-pickup-execute",
-            result,
-            run_id=intent["run_id"],
-            task_id=intent["task_id"],
+    successful_commit = commit.get("status") in {
+        "claimed",
+        "existing-assignment",
+        "existing-terminal",
+    }
+    if successful_commit:
+        recovered = _recover_after_commit(
+            intent,
+            acquisition,
+            run_dir,
+            registry_root=normalized["registry_root"],
+            coordination_root=normalized["coordination_root"],
         )
-        return result
-    if (
+    elif (
         commit.get("effect_started") is False
         and commit.get("ambiguity") is not True
     ) or commit.get("status") == "explicit-registry-root-required":
@@ -1249,10 +1301,15 @@ def grabowski_bureau_pickup_execute(
             registry_root=normalized["registry_root"],
             coordination_root=normalized["coordination_root"],
         )
+    result_status = (
+        commit["status"]
+        if successful_commit and recovered["status"] == "recovered"
+        else recovered["status"]
+    )
     result = {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup",
-        "status": recovered["status"],
+        "status": result_status,
         "request_sha256": request_sha256,
         "run_id": intent["run_id"],
         "task_id": intent["task_id"],
@@ -1260,6 +1317,22 @@ def grabowski_bureau_pickup_execute(
         "recovery": recovered,
         "journal": str(run_dir),
     }
+    if recovered["status"] == "recovered":
+        result.update(
+            {
+                "lease_owner_id": intent["lease_owner_id"],
+                "resource_keys": intent["required_resource_keys"],
+                "claim_intent_sha256": intent["intent_sha256"],
+                "acquisition_sha256": acquisition["acquisition_sha256"],
+                "run_readback_sha256": recovered["coordination_sha256"],
+                "does_not_establish": [
+                    "task completion",
+                    "merge readiness",
+                    "deployment authority",
+                    "automatic lease release",
+                ],
+            }
+        )
     bureau._audit(
         "bureau-pickup-execute",
         result,
