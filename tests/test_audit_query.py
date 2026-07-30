@@ -971,10 +971,7 @@ class AuditQueryTests(unittest.TestCase):
                 raise AssertionError("lease rows must not be read without a contract")
 
         fake_resources = types.ModuleType("grabowski_resources")
-        fake_resources.RESOURCE_DB = Path("/tmp/resources.sqlite3")
-        fake_resources._preflight_resource_store = (
-            lambda: "3:lease-contract-missing"
-        )
+        fake_resources.RESOURCE_DB = Path(__file__)
         fake_resources.normalize_resource_key = lambda value: value
 
         def reject_missing_contract(_connection):
@@ -1034,8 +1031,7 @@ class AuditQueryTests(unittest.TestCase):
                 return row
 
         fake_resources = types.ModuleType("grabowski_resources")
-        fake_resources.RESOURCE_DB = Path("/tmp/resources.sqlite3")
-        fake_resources._preflight_resource_store = lambda: "2"
+        fake_resources.RESOURCE_DB = Path(__file__)
         fake_resources._validate_resource_lease_contract = lambda _connection: "1"
         fake_resources.normalize_resource_key = lambda value: value
         fake_resources._public = lambda value: {key: item for key, item in dict(value).items() if key != "metadata_json"}

@@ -1127,6 +1127,7 @@ def _read_resource_leases() -> list[dict[str, Any]]:
     if connection is None:
         return []
     try:
+        resources._validate_resource_lease_contract(connection)
         rows = connection.execute(
             "SELECT * FROM leases WHERE expires_at_unix>? ORDER BY resource_key",
             (_now(),),

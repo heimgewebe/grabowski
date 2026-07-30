@@ -284,6 +284,8 @@ def _validate_resource_lease_contract(connection: sqlite3.Connection) -> str:
         raise RuntimeError(
             "Unsupported resource lease contract version; use a compatible runtime"
         )
+    if _resource_table_shape(connection, "leases") != RESOURCE_LEASE_SHAPE:
+        raise RuntimeError("Resource lease projection table is malformed")
     return version
 
 
