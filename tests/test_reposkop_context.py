@@ -481,6 +481,43 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertEqual(list(moved_root.glob("*.json")), [])
         self.assertEqual(list(moved_root.glob("*.pending")), [])
 
+    def test_link_renames_outside_write_roots_are_rolled_back(self) -> None:
+        """Rename between dirfd open and os.link must not leave authorized debris."""
+        patches = self.patches(self.report())
+        outside = self.root / "outside-link-race"
+        outside.mkdir(mode=0o700)
+        moved_root = outside / "receipts-moved"
+        real_link = os.link
+        renamed = {"done": False}
+
+        def link_after_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+            if (
+                not renamed["done"]
+                and src_dir_fd is not None
+                and dst_dir_fd is not None
+                and self.receipts.exists()
+            ):
+                self.receipts.rename(moved_root)
+                renamed["done"] = True
+            return real_link(
+                src,
+                dst,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+        with (
+            self.patch_context(patches),
+            patch.object(context.os, "link", side_effect=link_after_rename),
+        ):
+            with self.assertRaises(ValueError):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertTrue(renamed["done"])
+        self.assertEqual(list(moved_root.glob("*.json")), [])
+        self.assertEqual(list(moved_root.glob("*.pending")), [])
+
     def test_recovers_linked_pending_after_interruption(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):

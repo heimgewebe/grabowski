@@ -908,24 +908,40 @@ def _open_receipt_root_under_write_root() -> tuple[int, int]:
 
 
 @contextmanager
-def _publication_receipt_root() -> Iterator[int]:
-    """Re-anchor the receipt root for each mutating publication step."""
-    write_root_descriptor, receipt_descriptor = _open_receipt_root_under_write_root()
-    try:
-        yield receipt_descriptor
-    finally:
-        os.close(receipt_descriptor)
-        os.close(write_root_descriptor)
-
-
-@contextmanager
 def _receipt_root_descriptor() -> Iterator[int]:
+    """Open the receipt root via an authorized write-root walk for one critical section."""
     write_root_descriptor, receipt_descriptor = _open_receipt_root_under_write_root()
     try:
         yield receipt_descriptor
     finally:
         os.close(receipt_descriptor)
         os.close(write_root_descriptor)
+
+
+# Alias kept for call sites that emphasize publication re-anchoring.
+_publication_receipt_root = _receipt_root_descriptor
+
+
+def _rollback_leaf_names(root_descriptor: int, *names: str) -> None:
+    """Best-effort unlink of leaf names relative to a bound receipt-root descriptor."""
+    for name in names:
+        if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+            continue
+        try:
+            os.unlink(name, dir_fd=root_descriptor)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    try:
+        os.fsync(root_descriptor)
+    except OSError:
+        pass
+
+
+def _assert_live_root_still_authorized(root_descriptor: int) -> None:
+    """Fail closed if the bound receipt-root inode is no longer the authorized path."""
+    _validate_receipt_root_descriptor(root_descriptor)
 
 
 def _entry_exists(root_descriptor: int, path: Path) -> bool:
@@ -1398,12 +1414,17 @@ def _create_pending_on_descriptor(
         raise
     else:
         os.close(descriptor)
-    _read_exact_regular(
-        pending_path,
-        binding["data"],
-        label="Reposkop pending receipt",
-        root_descriptor=root_descriptor,
-    )
+    try:
+        _assert_live_root_still_authorized(root_descriptor)
+        _read_exact_regular(
+            pending_path,
+            binding["data"],
+            label="Reposkop pending receipt",
+            root_descriptor=root_descriptor,
+        )
+    except ReposkopContextError:
+        _rollback_leaf_names(root_descriptor, pending_path.name)
+        raise
 
 
 def _recover_linked_pending(
@@ -1489,7 +1510,36 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
             return
         except OSError as exc:
             raise ReposkopContextError("Reposkop receipt publication failed") from exc
-        _recover_linked_pending(binding, root_descriptor=live_root)
+        # Close the residual same-UID TOCTOU window: if the receipt root was
+        # renamed out of authorized write roots between open and link, remove
+        # debris via the still-valid dir_fd and fail closed.
+        try:
+            _assert_live_root_still_authorized(live_root)
+        except ReposkopContextError:
+            _rollback_leaf_names(
+                live_root,
+                receipt_path.name,
+                pending_path.name,
+            )
+            raise
+        try:
+            _recover_linked_pending(binding, root_descriptor=live_root)
+        except ReposkopContextError:
+            _rollback_leaf_names(
+                live_root,
+                receipt_path.name,
+                pending_path.name,
+            )
+            raise
+        try:
+            _assert_live_root_still_authorized(live_root)
+        except ReposkopContextError:
+            _rollback_leaf_names(
+                live_root,
+                receipt_path.name,
+                pending_path.name,
+            )
+            raise
 
 
 def _record_usage(
@@ -1521,12 +1571,9 @@ def _record_usage(
                     else AUDIT_PUBLICATION_CONTRACT
                 ),
             )
-        # Re-open receipt root from the authorized write root immediately before
-        # mutation so a same-UID rename out of write roots cannot publish via a
-        # stale dir_fd that still points at the moved inode.
-        write_root_descriptor, live_root = _open_receipt_root_under_write_root()
-        try:
-            _publish_receipt(binding, root_descriptor=live_root)
+        # Publication re-anchors and rolls back debris on write-root escape.
+        _publish_receipt(binding, root_descriptor=root_descriptor)
+        with _receipt_root_descriptor() as live_root:
             _validate_receipt_root_descriptor(live_root)
             _read_exact_regular(
                 binding["receipt_path"],
@@ -1534,9 +1581,6 @@ def _record_usage(
                 label="Reposkop usage receipt",
                 root_descriptor=live_root,
             )
-        finally:
-            os.close(live_root)
-            os.close(write_root_descriptor)
         verified_audit = _find_audit_binding(binding)
         if verified_audit is None:
             raise ReposkopContextError(
