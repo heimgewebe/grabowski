@@ -12,6 +12,11 @@ import stat
 import subprocess
 from typing import Any, Iterator, Literal
 
+try:
+    from typing_extensions import TypedDict
+except ModuleNotFoundError:
+    from typing import TypedDict
+
 import grabowski_bureau_leases as bureau_runtime
 import grabowski_mcp as base
 import grabowski_resources as resources
@@ -41,6 +46,20 @@ MANAGED_LAUNCHER_MARKER = b"# managed-by: heimgewebe-bureau-runtime-v1\n"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
+
+
+class BureauCandidateIdSelector(TypedDict):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    kind: Literal["candidate_id"]
+    candidate_id: str
+
+
+class BureauEventIdSelector(TypedDict):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    kind: Literal["event_id"]
+    event_id: int
 
 
 @dataclass(frozen=True)
@@ -698,8 +717,7 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
 
 @mcp.tool(name="grabowski_bureau_candidate_assess", annotations=READ_ONLY)
 def grabowski_bureau_candidate_assess(
-    selector_kind: Literal["candidate_id", "event_id"],
-    selector_value: str | int,
+    selector: BureauCandidateIdSelector | BureauEventIdSelector,
     expected_initiative: str = "",
     expected_task_id: str = "",
 ) -> dict[str, Any]:
@@ -708,24 +726,33 @@ def grabowski_bureau_candidate_assess(
     ``expected_initiative`` and ``expected_task_id`` are optional binding checks;
     they are never candidate selectors and cannot make an otherwise incomplete call valid.
     """
-    if selector_kind not in {"candidate_id", "event_id"}:
-        raise ValueError("selector_kind must be candidate_id or event_id")
+    if not isinstance(selector, dict):
+        raise ValueError("selector must be an object")
+    selector_kind = selector.get("kind")
     arguments = ["--json", "--json-envelope", "operator-candidate-assess"]
     if selector_kind == "candidate_id":
+        if set(selector) != {"kind", "candidate_id"}:
+            raise ValueError("candidate_id selector fields are invalid")
+        selector_value = selector["candidate_id"]
         if not isinstance(selector_value, str):
-            raise ValueError("candidate_id selector_value must be text")
+            raise ValueError("candidate_id must be text")
         candidate_id = selector_value.strip()
         if not candidate_id or "\x00" in candidate_id:
-            raise ValueError("candidate_id selector_value is empty or contains NUL")
+            raise ValueError("candidate_id is empty or contains NUL")
         arguments.extend(["--candidate-id", candidate_id])
-    else:
+    elif selector_kind == "event_id":
+        if set(selector) != {"kind", "event_id"}:
+            raise ValueError("event_id selector fields are invalid")
+        selector_value = selector["event_id"]
         if (
             not isinstance(selector_value, int)
             or isinstance(selector_value, bool)
             or selector_value <= 0
         ):
-            raise ValueError("event_id selector_value must be a positive integer")
+            raise ValueError("event_id must be a positive integer")
         arguments.extend(["--event-id", str(selector_value)])
+    else:
+        raise ValueError("selector kind must be candidate_id or event_id")
     for label, value, option in (
         ("expected_initiative", expected_initiative, "--initiative"),
         ("expected_task_id", expected_task_id, "--task-id"),

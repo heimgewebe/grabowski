@@ -715,6 +715,41 @@ class BureauPickupTests(unittest.TestCase):
         )
         release.assert_called_once_with(intent["lease_owner_id"], [key])
 
+    def test_unknown_run_code_with_run_evidence_retains_leases(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        contradictory = {
+            "status": "error",
+            "code": "unknown-run",
+            "run": {"run_id": intent["run_id"]},
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "unknown", "code": "bureau-runtime-timeout"},
+                    contradictory,
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-recovery-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            "recovery-required", raised.exception.details["result"]["status"]
+        )
+        release.assert_not_called()
+
     def create_acquisition_journal(self, intent, lease):
         run_dir = pickup._run_directory(intent["run_id"])
         value = {
@@ -1037,6 +1072,102 @@ class BureauPickupTests(unittest.TestCase):
         )
         release.assert_not_called()
 
+    def test_claim_readback_rejects_each_authoritative_binding_drift(self) -> None:
+        intent = self.intent()
+        acquisition = {
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "owner_id": intent["lease_owner_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+        }
+        cases = [
+            (
+                "run",
+                {"run": {"run_id": "BUR-RUN-20260724T000000Z-ffffffffff"}},
+                "claim-readback-run-binding-mismatch",
+            ),
+            (
+                "task",
+                {"run": {"task_id": "OTHER-TASK"}},
+                "claim-readback-run-binding-mismatch",
+            ),
+            (
+                "worker",
+                {"run": {"worker_id": "other-worker"}},
+                "claim-readback-run-binding-mismatch",
+            ),
+            (
+                "intent",
+                {"claim_intent_sha256": "9" * 64},
+                "claim-readback-intent-mismatch",
+            ),
+            (
+                "release-owner",
+                {"release": {"owner_id": "bureau-run:other"}},
+                "claim-readback-release-binding-mismatch",
+            ),
+            (
+                "release-resources",
+                {"release": {"resource_keys": []}},
+                "claim-readback-release-binding-mismatch",
+            ),
+            (
+                "release-intent",
+                {"release": {"claim_intent_sha256": "9" * 64}},
+                "claim-readback-release-binding-mismatch",
+            ),
+            (
+                "blocking",
+                {"blocking": True},
+                "claim-readback-blocking-or-incomplete",
+            ),
+        ]
+        for label, changes, expected in cases:
+            with self.subTest(binding=label):
+                status = self.coordinated_status(intent)
+                for key, value in changes.items():
+                    status[key] = (
+                        {**status[key], **value}
+                        if isinstance(value, dict) and isinstance(status.get(key), dict)
+                        else value
+                    )
+                with self.assertRaisesRegex(pickup.BureauPickupError, expected):
+                    pickup._validate_claim_readback(status, intent, acquisition)
+
+    def test_successful_commit_rejects_non_boolean_release_requirement(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        malformed = self.coordinated_status(intent)
+        malformed["release"] = {**malformed["release"], "required": 1}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    malformed,
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={"leases": [lease], "owner_id": intent["lease_owner_id"]},
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-commit-recovery-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        self.assertEqual(
+            "claim-readback-release-binding-mismatch",
+            raised.exception.details["result"]["recovery"]["readback_error_code"],
+        )
+        release.assert_not_called()
+
     def test_commit_and_readback_failure_retains_leases_as_recovery_required(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
@@ -1119,6 +1250,110 @@ class BureauPickupTests(unittest.TestCase):
             result["acquisition_sha256"], acquisition["acquisition_sha256"]
         )
         acquire.assert_not_called()
+
+    def test_existing_assignment_rejects_self_consistent_misbound_acquisition(
+        self,
+    ) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        acquisition["task_id"] = "OTHER-TASK"
+        acquisition.pop("acquisition_sha256")
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        (run_dir / "acquisition.json").write_text(
+            json.dumps(acquisition), encoding="utf-8"
+        )
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[existing, self.coordinated_status(intent)],
+            ),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "claim-readback-acquisition-binding-mismatch",
+            ):
+                pickup.grabowski_bureau_pickup_execute(request)
+        acquire.assert_not_called()
+        release.assert_not_called()
+
+    def test_existing_terminal_assignment_accepts_bound_terminal_readback(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        existing = {
+            "status": "existing-terminal",
+            "run": {"run_id": intent["run_id"], "state": "failed"},
+            "envelope": {"claim_intent": intent},
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[existing, self.coordinated_status(intent, state="failed")],
+            ),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-terminal", result["status"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
+        acquire.assert_not_called()
+        release.assert_not_called()
+
+    def test_existing_assignment_with_blocking_drift_retains_leases(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    existing,
+                    self.coordinated_status(intent, blocking=True),
+                ],
+            ),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "claim-readback-blocking-or-incomplete",
+            ):
+                pickup.grabowski_bureau_pickup_execute(request)
+        acquire.assert_not_called()
+        release.assert_not_called()
 
     def test_existing_assignment_without_own_journal_fails_closed(self) -> None:
         intent = self.intent()

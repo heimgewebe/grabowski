@@ -1032,10 +1032,15 @@ def _coordination_status(
 
 
 def _definitive_missing_run(payload: dict[str, Any]) -> bool:
-    return payload.get("status") != "coordinated" and payload.get("code") in {
-        "unknown-run",
-        "state-error-unknown-run",
-    }
+    return (
+        payload.get("status") != "coordinated"
+        and payload.get("run") is None
+        and payload.get("code")
+        in {
+            "unknown-run",
+            "state-error-unknown-run",
+        }
+    )
 
 
 def _validate_claim_readback(
@@ -1067,21 +1072,46 @@ def _validate_claim_readback(
         )
     if payload.get("claim_intent_sha256") != intent["intent_sha256"]:
         raise BureauPickupError("claim-readback-intent-mismatch")
-    expected_keys = acquisition["resource_keys"]
+    expected_acquisition = {
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "owner_id": intent["lease_owner_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "resource_keys": intent["required_resource_keys"],
+    }
+    acquisition_mismatches = {
+        key: {"expected": expected, "observed": acquisition.get(key)}
+        for key, expected in expected_acquisition.items()
+        if acquisition.get(key) != expected
+    }
+    if acquisition_mismatches:
+        raise BureauPickupError(
+            "claim-readback-acquisition-binding-mismatch",
+            details={"mismatches": acquisition_mismatches},
+        )
+    expected_keys = intent["required_resource_keys"]
     release = payload.get("release")
     if not isinstance(release, dict):
         raise BureauPickupError("claim-readback-release-missing")
+    release_mismatches = {}
+    expected_required = bool(expected_keys)
+    if release.get("required") is not expected_required:
+        release_mismatches["required"] = {
+            "expected": expected_required,
+            "observed": release.get("required"),
+        }
     expected_release = {
-        "required": bool(expected_keys),
         "owner_id": intent["lease_owner_id"],
         "resource_keys": expected_keys,
         "claim_intent_sha256": intent["intent_sha256"],
     }
-    release_mismatches = {
-        key: {"expected": expected, "observed": release.get(key)}
-        for key, expected in expected_release.items()
-        if release.get(key) != expected
-    }
+    release_mismatches.update(
+        {
+            key: {"expected": expected, "observed": release.get(key)}
+            for key, expected in expected_release.items()
+            if release.get(key) != expected
+        }
+    )
     if release_mismatches:
         raise BureauPickupError(
             "claim-readback-release-binding-mismatch",

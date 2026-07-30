@@ -423,35 +423,34 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         signature = inspect.signature(intake.grabowski_bureau_candidate_assess)
         self.assertEqual(
             [
-                "selector_kind",
-                "selector_value",
+                "selector",
                 "expected_initiative",
                 "expected_task_id",
             ],
             list(signature.parameters),
         )
         self.assertIs(
-            inspect.Parameter.empty, signature.parameters["selector_kind"].default
-        )
-        self.assertIs(
-            inspect.Parameter.empty, signature.parameters["selector_value"].default
+            inspect.Parameter.empty, signature.parameters["selector"].default
         )
         self.assertNotIn("task_id", signature.parameters)
         self.assertNotIn("initiative", signature.parameters)
         with self.assertRaises(TypeError):
             intake.grabowski_bureau_candidate_assess()
         with self.assertRaises(ValueError):
-            intake.grabowski_bureau_candidate_assess("candidate_id", 1)
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "candidate_id", "candidate_id": 1}
+            )
         with self.assertRaises(ValueError):
-            intake.grabowski_bureau_candidate_assess("event_id", 0)
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "event_id", "event_id": 0}
+            )
         with mock.patch.object(
             intake,
             "_invoke_bureau",
             return_value={"kind": "bureau_candidate_assessment"},
         ) as invoke:
             result = intake.grabowski_bureau_candidate_assess(
-                "candidate_id",
-                "candidate-a",
+                {"kind": "candidate_id", "candidate_id": "candidate-a"},
                 expected_initiative="INIT",
                 expected_task_id="INIT-T001",
             )
@@ -482,24 +481,65 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         schema = tool.inputSchema
         self.assertEqual(
             {
-                "selector_kind",
-                "selector_value",
+                "selector",
                 "expected_initiative",
                 "expected_task_id",
             },
             set(schema["properties"]),
         )
+        self.assertEqual({"selector"}, set(schema["required"]))
         self.assertEqual(
-            {"selector_kind", "selector_value"}, set(schema["required"])
+            {
+                "#/$defs/BureauCandidateIdSelector",
+                "#/$defs/BureauEventIdSelector",
+            },
+            {
+                variant["$ref"]
+                for variant in schema["properties"]["selector"]["anyOf"]
+            },
         )
-        self.assertEqual(
-            ["candidate_id", "event_id"],
-            schema["properties"]["selector_kind"]["enum"],
-        )
+        candidate = schema["$defs"]["BureauCandidateIdSelector"]
+        event = schema["$defs"]["BureauEventIdSelector"]
+        self.assertFalse(candidate["additionalProperties"])
+        self.assertFalse(event["additionalProperties"])
+        self.assertEqual({"kind", "candidate_id"}, set(candidate["required"]))
+        self.assertEqual({"kind", "event_id"}, set(event["required"]))
+        self.assertEqual("candidate_id", candidate["properties"]["kind"]["const"])
+        self.assertEqual("event_id", event["properties"]["kind"]["const"])
+        self.assertEqual("string", candidate["properties"]["candidate_id"]["type"])
+        self.assertEqual("integer", event["properties"]["event_id"]["type"])
         self.assertNotIn("candidate_id", schema["properties"])
         self.assertNotIn("event_id", schema["properties"])
         self.assertNotIn("task_id", schema["properties"])
         self.assertNotIn("initiative", schema["properties"])
+
+    def test_candidate_assess_rejects_malformed_selector_objects(self) -> None:
+        invalid = [
+            "candidate-a",
+            {},
+            {"kind": "other", "candidate_id": "candidate-a"},
+            {"kind": "candidate_id"},
+            {"kind": "candidate_id", "candidate_id": ""},
+            {"kind": "candidate_id", "candidate_id": "candidate\x00a"},
+            {
+                "kind": "candidate_id",
+                "candidate_id": "candidate-a",
+                "event_id": 31,
+            },
+            {"kind": "event_id"},
+            {"kind": "event_id", "event_id": True},
+            {"kind": "event_id", "event_id": "31"},
+            {"kind": "event_id", "event_id": -1},
+            {
+                "kind": "event_id",
+                "event_id": 31,
+                "candidate_id": "candidate-a",
+            },
+        ]
+        for selector in invalid:
+            with self.subTest(selector=selector):
+                with self.assertRaises(ValueError):
+                    intake.grabowski_bureau_candidate_assess(selector)
 
     def test_candidate_assess_routes_event_selector_without_task_guessing(self) -> None:
         with mock.patch.object(
@@ -507,7 +547,9 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             "_invoke_bureau",
             return_value={"kind": "bureau_candidate_assessment"},
         ) as invoke:
-            intake.grabowski_bureau_candidate_assess("event_id", 31)
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "event_id", "event_id": 31}
+            )
         self.assertEqual(
             [
                 "--json",
