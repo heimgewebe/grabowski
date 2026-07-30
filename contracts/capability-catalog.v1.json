@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "bfe3317e21fed21d2d6e647fd10a620cb0b5a6bc6aee4feea2ea2eedbbfb8ffc",
+  "capability_source_sha256": "091d00cbc5aa2419e39c346d737fc188756aad03a9aeb9c51e4b95a9bceed65a",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "cfc439b302d70c151b03ceb8db7f8eaf68ede81b6d452af42ceb6989dbb688f5",
   "integrity": {
@@ -1819,13 +1819,13 @@
     },
     {
       "category": "artifact",
-      "description": "Record one durable, exact user-visible diff delivery before merge.",
+      "description": "Optionally record one durable, exact user-visible diff artifact handoff.",
       "effects": [
         "local-file-create",
         "receipt-create"
       ],
       "id": "grabowski_merge_delivery_record",
-      "purpose": "Record one durable, exact user-visible diff delivery before a possible PR merge.",
+      "purpose": "Optionally record one durable, exact user-visible diff artifact handoff.",
       "read_only": null,
       "reversibility": "receipt-retention-dependent",
       "risk_class": "high",

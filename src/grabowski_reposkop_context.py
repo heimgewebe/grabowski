@@ -222,9 +222,12 @@ def _validate_report(report: Any, *, target: Path, purpose: str) -> dict[str, An
     return report
 
 
-def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+def _kill_process_group(process: subprocess.Popen[bytes], *, pgid: int | None = None) -> None:
+    # With start_new_session=True the child pid is the session/process-group id.
+    # Descendants may outlive the leader, so always signal the recorded pgid.
+    target = pgid if pgid is not None else process.pid
     try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(target, signal.SIGKILL)
     except ProcessLookupError:
         pass
 
@@ -260,8 +263,9 @@ def _run_bounded_process(
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
+    process_group_id = process.pid
     if process.stdout is None or process.stderr is None:
-        _kill_process_group(process)
+        _kill_process_group(process, pgid=process_group_id)
         process.wait()
         raise ReposkopContextError("Reposkop bounded output pipes are unavailable")
     selector = selectors.DefaultSelector()
@@ -282,7 +286,7 @@ def _run_bounded_process(
             if remaining <= 0:
                 timed_out = True
                 if not killed:
-                    _kill_process_group(process)
+                    _kill_process_group(process, pgid=process_group_id)
                     killed = True
                 _close_selector_streams(selector)
                 break
@@ -306,7 +310,7 @@ def _run_bounded_process(
                     exceeded[name] = True
             if any(exceeded.values()):
                 if not killed:
-                    _kill_process_group(process)
+                    _kill_process_group(process, pgid=process_group_id)
                     killed = True
                 _close_selector_streams(selector)
                 break
@@ -330,7 +334,7 @@ def _run_bounded_process(
                     stream.close()
                 if any(exceeded.values()):
                     if not killed:
-                        _kill_process_group(process)
+                        _kill_process_group(process, pgid=process_group_id)
                         killed = True
                     _close_selector_streams(selector)
                     break
@@ -342,7 +346,7 @@ def _run_bounded_process(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
-                    _kill_process_group(process)
+                    _kill_process_group(process, pgid=process_group_id)
                     killed = True
                     returncode = process.wait()
                 else:
@@ -350,13 +354,16 @@ def _run_bounded_process(
                         returncode = process.wait(timeout=remaining)
                     except subprocess.TimeoutExpired:
                         timed_out = True
-                        _kill_process_group(process)
+                        _kill_process_group(process, pgid=process_group_id)
                         killed = True
                         returncode = process.wait()
     finally:
         selector.close()
+        # Always terminate the session process group. Background descendants may
+        # close/redirect inherited pipes and otherwise outlive a successful child
+        # exit past the documented command bound (no permanent process).
+        _kill_process_group(process, pgid=process_group_id)
         if process.poll() is None:
-            _kill_process_group(process)
             process.wait()
         for stream in streams.values():
             if not stream.closed:

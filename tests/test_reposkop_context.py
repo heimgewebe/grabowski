@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -680,6 +681,62 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertLess(result["duration_seconds"], 3)
         self.assertFalse(result["stdout_limit_exceeded"])
         self.assertFalse(result["stderr_limit_exceeded"])
+
+    def test_terminates_redirected_descendants_after_child_exit(self) -> None:
+        marker = self.root / "descendant-alive"
+        executable = self.root / "redirected-descendant-reposkop"
+        child = (
+            "import os, time; "
+            f"open({str(marker)!r}, 'w').write(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        executable.write_text(
+            "#!/usr/bin/python3\n"
+            "import subprocess, sys, time\n"
+            "subprocess.Popen(\n"
+            f"    [sys.executable, '-c', {child!r}],\n"
+            "    stdout=subprocess.DEVNULL,\n"
+            "    stderr=subprocess.DEVNULL,\n"
+            "    stdin=subprocess.DEVNULL,\n"
+            ")\n"
+            "time.sleep(0.2)\n"
+            "sys.stdout.write('{\"ok\":true}\\n')\n"
+            "sys.stdout.flush()\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+
+        result = context._run_bounded_process(
+            [str(executable)],
+            cwd=self.root,
+            timeout_seconds=5,
+            stdout_limit=4096,
+            stderr_limit=4096,
+        )
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertFalse(result["timed_out"])
+        self.assertLess(result["duration_seconds"], 3)
+        # Allow the SIGKILL to land, then ensure the redirected descendant is gone.
+        deadline = time.monotonic() + 2.0
+        while marker.exists() and time.monotonic() < deadline:
+            try:
+                pid = int(marker.read_text(encoding="utf-8").strip())
+            except ValueError:
+                break
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            if marker.exists():
+                try:
+                    pid = int(marker.read_text(encoding="utf-8").strip())
+                    os.kill(pid, 0)
+                    self.fail(f"descendant pid {pid} still alive after bounded process return")
+                except (ProcessLookupError, ValueError):
+                    pass
 
     def test_wait_after_closed_pipes_respects_remaining_deadline(self) -> None:
         executable = self.root / "closed-pipe-reposkop"

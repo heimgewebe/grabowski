@@ -102,7 +102,7 @@ def grabowski_merge_delivery_record(
     delivery_channel: str,
     delivery_reference: str,
 ) -> dict[str, object]:
-    """Record one durable, exact user-visible diff delivery before merge."""
+    """Optionally record one durable, exact user-visible diff artifact handoff."""
     grabowski_operator_core._require_operator_mutation(
         "artifact_transfer",
         path=str(grabowski_merge_delivery_surface.delivery.MERGE_DELIVERY_ROOT),

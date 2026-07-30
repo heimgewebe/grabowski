@@ -3853,82 +3853,6 @@ def captain_codex_review_exception(
     return {**core, "exception_sha256": grips.sha256_json(core)}
 
 
-def captain_delivery_receipt(
-    *,
-    repository: str = "heimgewebe/grabowski",
-    pull_request: int = 96,
-    base_sha: str = CAPTAIN_BASE_SHA,
-    head_sha: str = CAPTAIN_HEAD,
-    diff_sha256: str = CAPTAIN_DIFF,
-) -> tuple[dict[str, object], str]:
-    delivered_ns = time.time_ns()
-    binding = {
-        "repository": repository,
-        "pull_request": pull_request,
-        "base_sha": base_sha,
-        "head_sha": head_sha,
-        "diff_sha256": diff_sha256,
-    }
-    reference = "sandbox:/mnt/data/grabowski-pr-96-diff.txt"
-    receipt: dict[str, object] = {
-        "schema": grips.grabowski_merge_delivery.MERGE_DELIVERY_SCHEMA,
-        "kind": "user-visible-diff-delivery",
-        **binding,
-        "artifact_id": "c" * 32,
-        "artifact_sha256": diff_sha256,
-        "artifact_receipt_sha256": "d" * 64,
-        "artifact_repository_path_sha256": "e" * 64,
-        "artifact_filename": "grabowski-pr-96-diff.txt",
-        "artifact_byte_size": len(CAPTAIN_DIFF_TEXT.encode("utf-8")),
-        "artifact_created_at_unix_ns": delivered_ns - 1_000_000_000,
-        "delivery_channel": "chat-download",
-        "delivery_reference": reference,
-        "delivery_reference_sha256": hashlib.sha256(reference.encode("utf-8")).hexdigest(),
-        "delivery_confirmed_at_unix_ns": delivered_ns,
-        "expires_at_unix_ns": delivered_ns + grips.grabowski_merge_delivery.MAX_DELIVERY_AGE_SECONDS * 1_000_000_000,
-        "clock_domain": "unix-realtime",
-        "ordering_uncertainty_ns": grips.grabowski_merge_delivery.GITHUB_TIMESTAMP_UNCERTAINTY_NS,
-        "binding_sha256": grips.grabowski_merge_delivery.sha256_json(binding),
-        "does_not_establish": list(grips.grabowski_merge_delivery._DOES_NOT_ESTABLISH),
-    }
-    receipt_sha256 = hashlib.sha256(
-        grips.grabowski_merge_delivery.canonical_json_bytes(receipt)
-    ).hexdigest()
-    return receipt, receipt_sha256
-
-
-def rebind_captain_delivery(parameters: dict[str, object]) -> None:
-    actions = parameters.get("actions")
-    target = (
-        actions[0].get("target", {})
-        if isinstance(actions, list) and actions and isinstance(actions[0], dict)
-        else {}
-    )
-    receipt, receipt_sha256 = captain_delivery_receipt(
-        repository=str(target.get("repo", "heimgewebe/grabowski")),
-        pull_request=int(target.get("pr", 96)),
-        base_sha=str(parameters.get("expected_base_sha", CAPTAIN_BASE_SHA)),
-        head_sha=str(parameters.get("expected_head", CAPTAIN_HEAD)),
-        diff_sha256=str(parameters.get("diff_sha256", CAPTAIN_DIFF)),
-    )
-    parameters["merge_delivery_receipt"] = receipt
-    parameters["merge_delivery_receipt_sha256"] = receipt_sha256
-    if isinstance(parameters.get("codex_review_evidence"), dict):
-        review = parameters.get("review_evidence")
-        review_tier = (
-            str(review.get("review_tier"))
-            if isinstance(review, dict) and review.get("review_tier")
-            else "high_critical"
-        )
-        parameters["codex_review_evidence"] = captain_codex_review_evidence(
-            head=str(parameters.get("expected_head", CAPTAIN_HEAD)),
-            base_sha=str(parameters.get("expected_base_sha", CAPTAIN_BASE_SHA)),
-            diff_sha256=str(parameters.get("diff_sha256", CAPTAIN_DIFF)),
-            review_tier=review_tier,
-            repo=str(target.get("repo", "heimgewebe/grabowski")),
-            pr=int(target.get("pr", 96)),
-        )
-
 
 def captain_action(**overrides) -> dict[str, object]:
     action: dict[str, object] = {
@@ -3956,7 +3880,6 @@ def captain_action(**overrides) -> dict[str, object]:
 
 def captain_parameters(actions: list[dict[str, object]] | None = None, **overrides) -> dict[str, object]:
     source = str(overrides.get("status_projection_source", "bureau status-projection"))
-    delivery_receipt, delivery_receipt_sha256 = captain_delivery_receipt()
     projection = {
         "schema_version": grips.CAPTAIN_STATUS_PROJECTION_SCHEMA_VERSION,
         "source": source,
@@ -3973,8 +3896,6 @@ def captain_parameters(actions: list[dict[str, object]] | None = None, **overrid
         "expected_head": CAPTAIN_HEAD,
         "expected_base_sha": CAPTAIN_BASE_SHA,
         "diff_sha256": CAPTAIN_DIFF,
-        "merge_delivery_receipt": delivery_receipt,
-        "merge_delivery_receipt_sha256": delivery_receipt_sha256,
         "execution_authority": {"granted_by": "alex", "reference": "captain decision record 2026-07-07"},
         "review_evidence": {
             "schema_version": 1,
@@ -4033,7 +3954,6 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
             "actions_sha256": action["actions_sha256"],
             "status_projection_sha256": grips.sha256_json(parameters["status_projection"]),
             "diff_sha256": parameters.get("diff_sha256"),
-            "merge_delivery_receipt_sha256": parameters.get("merge_delivery_receipt_sha256"),
             "review_evidence_sha256": grips.sha256_json(parameters["review_evidence"]),
             "codex_review_evidence_sha256": grips.sha256_json(
                 parameters.get("codex_review_evidence")
@@ -4052,6 +3972,14 @@ def captain_execution_intent(parameters: dict[str, object], **overrides) -> dict
         },
         "issued_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
+    legacy_delivery_sha256 = parameters.get("merge_delivery_receipt_sha256")
+    if (
+        isinstance(legacy_delivery_sha256, str)
+        and grips._is_sha256_hex(legacy_delivery_sha256)
+    ):
+        evidence_sha256 = intent["evidence_sha256"]
+        assert isinstance(evidence_sha256, dict)
+        evidence_sha256["merge_delivery_receipt_sha256"] = legacy_delivery_sha256
     if action["action"] == "pr-merge":
         intent["expected_base_sha"] = parameters.get("expected_base_sha")
     intent.update(overrides)
@@ -4226,39 +4154,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self._resource_db_patch.start()
 
 
-        def verified_delivery(receipt, **kwargs):
-            accepted = {
-                key: value
-                for key, value in kwargs.items()
-                if key
-                in {
-                    "expected_repository",
-                    "expected_pull_request",
-                    "expected_base_sha",
-                    "expected_head_sha",
-                    "expected_diff_sha256",
-                    "expected_receipt_sha256",
-                    "now_ns",
-                }
-            }
-            info = grips.grabowski_merge_delivery.validate_delivery_receipt_snapshot(
-                receipt, **accepted
-            )
-            return {
-                **info,
-                "durable": True,
-                "receipt_path": "/test/merge-delivery.json",
-            }
-
-        self._delivery_verify_patch = patch.object(
-            grips.grabowski_merge_delivery,
-            "verify_merge_delivery",
-            side_effect=verified_delivery,
-        )
-        self._delivery_verify_patch.start()
-
     def tearDown(self) -> None:
-        self._delivery_verify_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 
@@ -8635,7 +8531,9 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         parameters = authorized_captain_run_parameters()
         parameters["diff_sha256"] = hashlib.sha256(raw_diff).hexdigest()
         parameters["review_evidence"]["diff_sha256"] = parameters["diff_sha256"]
-        rebind_captain_delivery(parameters)
+        parameters["codex_review_evidence"] = captain_codex_review_evidence(
+            diff_sha256=parameters["diff_sha256"]
+        )
         parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(view={
             "number": 96, "state": "OPEN", "baseRefName": "main",
@@ -8693,7 +8591,6 @@ class CaptainAuthorityPathTests(unittest.TestCase):
     def test_atomic_merge_guard_rejects_empty_live_diff(self) -> None:
         parameters = authorized_captain_run_parameters()
         parameters["diff_sha256"] = hashlib.sha256(b"").hexdigest()
-        rebind_captain_delivery(parameters)
         parameters["execution_intent"] = captain_execution_intent(parameters)
         gh = FakeGh(diff_text="")
         gh.view.update({
@@ -9152,11 +9049,10 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertFalse(guard["contract_satisfied"])
         self.assertFalse(guard["dispatch_called"])
         reconciliation = execution["external_merge_reconciliation"]
-        self.assertEqual("delivery_after_merge", reconciliation["ordering"])
-        self.assertFalse(
-            reconciliation["pre_merge_delivery_contract_satisfied"]
-        )
-        self.assertTrue(reconciliation["post_merge_exposure_is_not_equivalent"])
+        self.assertTrue(reconciliation["external_merge_observed"])
+        self.assertFalse(reconciliation["dispatch_called"])
+        self.assertTrue(reconciliation["duplicate_dispatch_prevented"])
+        self.assertNotIn("pre_merge_diff_delivery_required", reconciliation)
         self.assertEqual(
             "external_merge_observed_after_merge_guard_block",
             execution["verification_error"],
@@ -9164,168 +9060,17 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
 
-    def test_blocks_missing_user_visible_diff_delivery(self) -> None:
+    def test_user_visible_diff_delivery_is_not_a_merge_gate(self) -> None:
         parameters = captain_parameters()
-        parameters.pop("merge_delivery_receipt")
-        parameters.pop("merge_delivery_receipt_sha256")
+        self.assertNotIn("merge_delivery_receipt", parameters)
+        self.assertNotIn("merge_delivery_receipt_sha256", parameters)
 
         result = self.run_captain(parameters)
 
-        self.assert_blocked_gate_reason(
-            result,
-            "diff-delivery-recorded",
-            "merge_delivery_receipt_missing",
-        )
-
-    def test_blocks_stale_user_visible_diff_delivery(self) -> None:
-        parameters = captain_parameters()
-        receipt = dict(parameters["merge_delivery_receipt"])
-        receipt["artifact_created_at_unix_ns"] = 1_000_000_000
-        receipt["delivery_confirmed_at_unix_ns"] = 2_000_000_000
-        receipt["expires_at_unix_ns"] = (
-            2_000_000_000
-            + grips.grabowski_merge_delivery.MAX_DELIVERY_AGE_SECONDS
-            * 1_000_000_000
-        )
-        parameters["merge_delivery_receipt"] = receipt
-        parameters["merge_delivery_receipt_sha256"] = hashlib.sha256(
-            grips.grabowski_merge_delivery.canonical_json_bytes(receipt)
-        ).hexdigest()
-
-        result = self.run_captain(parameters)
-
-        self.assert_blocked_gate_reason(
-            result,
-            "diff-delivery-recorded",
-            "merge-delivery receipt is stale",
-        )
-
-    def test_blocks_delivery_bound_to_another_diff(self) -> None:
-        parameters = captain_parameters()
-        receipt = dict(parameters["merge_delivery_receipt"])
-        receipt["diff_sha256"] = "f" * 64
-        receipt["artifact_sha256"] = "f" * 64
-        receipt["binding_sha256"] = grips.grabowski_merge_delivery.sha256_json(
-            {
-                "repository": receipt["repository"],
-                "pull_request": receipt["pull_request"],
-                "base_sha": receipt["base_sha"],
-                "head_sha": receipt["head_sha"],
-                "diff_sha256": receipt["diff_sha256"],
-            }
-        )
-        parameters["merge_delivery_receipt"] = receipt
-        parameters["merge_delivery_receipt_sha256"] = hashlib.sha256(
-            grips.grabowski_merge_delivery.canonical_json_bytes(receipt)
-        ).hexdigest()
-
-        result = self.run_captain(parameters)
-
-        self.assert_blocked_gate_reason(
-            result,
-            "diff-delivery-recorded",
-            "merge-delivery receipt diff_sha256 mismatch",
-        )
-
-    def test_captain_run_blocks_when_durable_delivery_readback_fails(self) -> None:
-        parameters = authorized_captain_run_parameters()
-        gh = FakeGh()
-        with patch.object(
-            grips.grabowski_merge_delivery,
-            "verify_merge_delivery",
-            side_effect=grips.grabowski_merge_delivery.MergeDeliveryError(
-                "durable receipt unavailable"
-            ),
-        ):
-            result = grips.grip_run(
-                "captain-run",
-                parameters,
-                profile="captain",
-                allow_mutation=True,
-                command_runner=FakeGit(),
-                github_runner=gh,
-            )
-
-        execution = result["output"]["executions"][0]
-        self.assertIn(
-            "merge_delivery_receipt_durable_verification_failed",
-            execution["preflight_errors"],
-        )
-        self.assertFalse(execution["execution_invoked"])
-        self.assertEqual([], gh.calls)
-
-    def test_atomic_merge_guard_blocks_delivery_drift_before_dispatch(self) -> None:
-        parameters = authorized_captain_run_parameters()
-        gh = FakeGh(
-            view={
-                "number": 96,
-                "state": "OPEN",
-                "baseRefName": "main",
-                "baseRefOid": CAPTAIN_BASE_SHA,
-                "headRefName": "feat/captain",
-                "headRefOid": CAPTAIN_HEAD,
-                "isDraft": False,
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-            }
-        )
-        calls = 0
-
-        def drifting_delivery(receipt, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls >= 3:
-                raise grips.grabowski_merge_delivery.MergeDeliveryError(
-                    "delivery receipt changed before dispatch"
-                )
-            accepted = {
-                key: value
-                for key, value in kwargs.items()
-                if key
-                in {
-                    "expected_repository",
-                    "expected_pull_request",
-                    "expected_base_sha",
-                    "expected_head_sha",
-                    "expected_diff_sha256",
-                    "expected_receipt_sha256",
-                    "now_ns",
-                }
-            }
-            info = grips.grabowski_merge_delivery.validate_delivery_receipt_snapshot(
-                receipt, **accepted
-            )
-            return {
-                **info,
-                "durable": True,
-                "receipt_path": "/test/merge-delivery.json",
-            }
-
-        with patch.object(
-            grips.grabowski_merge_delivery,
-            "verify_merge_delivery",
-            side_effect=drifting_delivery,
-        ):
-            result = grips.grip_run(
-                "captain-run",
-                parameters,
-                profile="captain",
-                allow_mutation=True,
-                command_runner=FakeGit(),
-                github_runner=gh,
-            )
-
-        execution = result["output"]["executions"][0]
-        guard = execution["merge_lease_guard"]
-        self.assertEqual("blocked_after_guard_revalidation_released", guard["status"])
-        self.assertTrue(
-            any(
-                "merge_guard_dispatch_delivery_revalidation_failed" in error
-                for error in guard["errors"]
-            )
-        )
-        self.assertFalse(guard["dispatch_called"])
-        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+        gate_ids = [gate["id"] for gate in result["output"]["gates"]]
+        self.assertNotIn("diff-delivery-recorded", gate_ids)
+        self.assertEqual("pass", self.gate(result, "diff-bound")["status"])
+        self.assertTrue(result["output"]["manual_decision_candidate"])
 
 
 class CaptainExecutionIntentTests(unittest.TestCase):
@@ -9338,39 +9083,7 @@ class CaptainExecutionIntentTests(unittest.TestCase):
         )
         self._resource_db_patch.start()
 
-        def verified_delivery(receipt, **kwargs):
-            accepted = {
-                key: value
-                for key, value in kwargs.items()
-                if key
-                in {
-                    "expected_repository",
-                    "expected_pull_request",
-                    "expected_base_sha",
-                    "expected_head_sha",
-                    "expected_diff_sha256",
-                    "expected_receipt_sha256",
-                    "now_ns",
-                }
-            }
-            info = grips.grabowski_merge_delivery.validate_delivery_receipt_snapshot(
-                receipt, **accepted
-            )
-            return {
-                **info,
-                "durable": True,
-                "receipt_path": "/test/merge-delivery.json",
-            }
-
-        self._delivery_verify_patch = patch.object(
-            grips.grabowski_merge_delivery,
-            "verify_merge_delivery",
-            side_effect=verified_delivery,
-        )
-        self._delivery_verify_patch.start()
-
     def tearDown(self) -> None:
-        self._delivery_verify_patch.stop()
         self._resource_db_patch.stop()
         self._resource_tempdir.cleanup()
 
@@ -9426,6 +9139,46 @@ class CaptainExecutionIntentTests(unittest.TestCase):
         self.assertEqual([], gh.calls)
         intent_checks = [check for check in result["receipt"]["checks"] if check["id"] == "execution-intent-bound"]
         self.assertEqual("fail", intent_checks[-1]["status"])
+
+    def test_legacy_merge_delivery_digest_is_optional_and_compatible(self) -> None:
+        parameters = self.executable_parameters()
+        parameters["merge_delivery_receipt"] = {"schema": "legacy-advisory"}
+        parameters["merge_delivery_receipt_sha256"] = "a" * 64
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        actions = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )
+
+        info, errors = grips._captain_execution_intent_review(parameters, actions)
+
+        self.assertEqual([], errors)
+        self.assertTrue(info["valid"])
+        self.assertEqual(
+            "a" * 64,
+            info["evidence_sha256"]["merge_delivery_receipt_sha256"],
+        )
+        self.assertNotIn(
+            "diff-delivery-recorded",
+            grips.CAPTAIN_GATE_IDS,
+        )
+
+    def test_optional_legacy_merge_delivery_digest_must_be_canonical(self) -> None:
+        parameters = self.executable_parameters()
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        evidence = parameters["execution_intent"]["evidence_sha256"]
+        assert isinstance(evidence, dict)
+        evidence["merge_delivery_receipt_sha256"] = "A" * 64
+        actions = grips._captain_actions(
+            {"actions": parameters["actions"]}, gate_native_validation=True
+        )
+
+        info, errors = grips._captain_execution_intent_review(parameters, actions)
+
+        self.assertFalse(info["valid"])
+        self.assertIn(
+            "execution_intent_evidence_not_canonical:merge_delivery_receipt_sha256",
+            errors,
+        )
 
     def test_captain_run_blocks_missing_execution_intent_before_any_executor(self) -> None:
         parameters = self.executable_parameters()
