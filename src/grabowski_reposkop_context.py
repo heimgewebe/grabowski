@@ -464,6 +464,26 @@ def _directory_open_flags() -> int:
     )
 
 
+def _validate_directory_path_binding(
+    descriptor: int, path: Path, *, label: str
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    try:
+        linked = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ReposkopContextError(
+            f"{label} changed during descriptor binding"
+        ) from exc
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (linked.st_dev, linked.st_ino)
+    ):
+        raise ReposkopContextError(f"{label} identity is unsafe")
+    return metadata
+
+
 def _open_directory_descriptor(path: Path) -> int:
     if not path.is_absolute() or ".." in path.parts:
         raise ReposkopContextError(
@@ -508,31 +528,16 @@ def _open_directory_descriptor(path: Path) -> int:
             os.close(descriptor)
             descriptor = child_descriptor
 
-        metadata = os.fstat(descriptor)
-        try:
-            linked = path.stat(follow_symlinks=False)
-        except OSError as exc:
-            raise ReposkopContextError(
-                "Reposkop receipt directory path changed during descriptor binding"
-            ) from exc
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or stat.S_ISLNK(linked.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != (linked.st_dev, linked.st_ino)
-        ):
-            raise ReposkopContextError(
-                "Reposkop receipt directory identity is unsafe"
-            )
+        _validate_directory_path_binding(
+            descriptor, path, label="Reposkop receipt directory"
+        )
         return descriptor
     except BaseException:
         os.close(descriptor)
         raise
 
 
-def _open_relative_receipt_directory(
-    parent_descriptor: int, component: str
-) -> int:
+def _validate_directory_component_name(component: str) -> None:
     if (
         not component
         or component in {".", ".."}
@@ -542,12 +547,24 @@ def _open_relative_receipt_directory(
         raise ReposkopContextError(
             "Reposkop receipt directory component is invalid"
         )
-    flags = _directory_open_flags()
+
+
+def _open_relative_receipt_directory(
+    parent_descriptor: int,
+    component: str,
+    *,
+    require_private: bool = True,
+) -> int:
+    _validate_directory_component_name(component)
     try:
-        descriptor = os.open(component, flags, dir_fd=parent_descriptor)
+        descriptor = os.open(
+            component, _directory_open_flags(), dir_fd=parent_descriptor
+        )
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         raise ReposkopContextError(
-            "Reposkop receipt directory could not be opened relative to its bound parent"
+            "Reposkop receipt directory component could not be opened safely"
         ) from exc
     try:
         metadata = os.fstat(descriptor)
@@ -559,13 +576,18 @@ def _open_relative_receipt_directory(
         if (
             not stat.S_ISDIR(metadata.st_mode)
             or stat.S_ISLNK(linked.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o700
             or (metadata.st_dev, metadata.st_ino)
             != (linked.st_dev, linked.st_ino)
         ):
             raise ReposkopContextError(
-                "Reposkop receipt directory has unsafe ownership, mode or identity"
+                "Reposkop receipt directory component identity is unsafe"
+            )
+        if require_private and (
+            metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ReposkopContextError(
+                "Reposkop receipt directory has unsafe ownership or mode"
             )
     except BaseException:
         os.close(descriptor)
@@ -573,64 +595,223 @@ def _open_relative_receipt_directory(
     return descriptor
 
 
-def _ensure_receipt_root() -> None:
-    if RECEIPT_ROOT.is_symlink():
-        raise ReposkopContextError("Reposkop receipt root may not be a symlink")
-
-    missing_components: list[str] = []
-    cursor = RECEIPT_ROOT
-    while not cursor.exists():
-        if cursor.is_symlink():
-            raise ReposkopContextError(
-                "Reposkop receipt root path may not contain a symlink leaf"
-            )
-        component = cursor.name
-        if not component or component in {".", ".."}:
-            raise ReposkopContextError(
-                "Reposkop receipt root has an invalid missing component"
-            )
-        missing_components.append(component)
-        parent = cursor.parent
-        if parent == cursor:
-            raise ReposkopContextError(
-                "Reposkop receipt root has no existing directory ancestor"
-            )
-        cursor = parent
-
-    existing = cursor.stat(follow_symlinks=False)
-    if stat.S_ISLNK(existing.st_mode) or not stat.S_ISDIR(existing.st_mode):
+def _authorized_write_root(path: Path) -> Path:
+    candidates = [
+        root
+        for root in base._roots("write")
+        if path == root or root in path.parents
+    ]
+    if not candidates:
         raise ReposkopContextError(
-            "Reposkop receipt root ancestor is not a stable directory"
+            "Reposkop receipt root is outside configured write roots"
         )
+    return max(candidates, key=lambda root: len(root.parts))
 
-    descriptor = _open_directory_descriptor(cursor)
+
+def _open_from_write_root(
+    write_root_descriptor: int,
+    components: tuple[str, ...],
+    *,
+    private_from_index: int,
+) -> int:
+    descriptor = os.dup(write_root_descriptor)
     try:
-        for component in reversed(missing_components):
-            try:
-                os.mkdir(component, mode=0o700, dir_fd=descriptor)
-            except FileExistsError:
-                pass
-            except OSError as exc:
-                raise ReposkopContextError(
-                    "Reposkop receipt directory could not be created relative to its bound parent"
-                ) from exc
-
+        for index, component in enumerate(components):
             child_descriptor = _open_relative_receipt_directory(
-                descriptor, component
+                descriptor,
+                component,
+                require_private=index >= private_from_index,
             )
-            try:
-                os.fsync(child_descriptor)
-                os.fsync(descriptor)
-            except BaseException:
-                os.close(child_descriptor)
-                raise
             os.close(descriptor)
             descriptor = child_descriptor
-
-        _validate_receipt_root_descriptor(descriptor)
-        os.fsync(descriptor)
-    finally:
+        return descriptor
+    except BaseException:
         os.close(descriptor)
+        raise
+
+
+def _close_created_directory_records(
+    records: list[tuple[int, str]],
+) -> None:
+    while records:
+        parent_descriptor, _component = records.pop()
+        os.close(parent_descriptor)
+
+
+def _rollback_created_directories(
+    records: list[tuple[int, str]],
+) -> None:
+    first_error: OSError | None = None
+    while records:
+        parent_descriptor, component = records.pop()
+        try:
+            os.rmdir(component, dir_fd=parent_descriptor)
+            os.fsync(parent_descriptor)
+        except OSError as exc:
+            if first_error is None:
+                first_error = exc
+        finally:
+            os.close(parent_descriptor)
+    if first_error is not None:
+        raise ReposkopContextError(
+            "Reposkop could not roll back directories created outside the authorized path"
+        ) from first_error
+
+
+def _ensure_receipt_root() -> None:
+    root_path, _root_exists = _resolve_exact_write_target(
+        RECEIPT_ROOT, allow_missing_parents=True
+    )
+    write_root = _authorized_write_root(root_path)
+    try:
+        components = root_path.relative_to(write_root).parts
+    except ValueError as exc:
+        raise ReposkopContextError(
+            "Reposkop receipt root could not be made relative to its write root"
+        ) from exc
+
+    private_from_index = len(components)
+    cursor = write_root
+    for index, component in enumerate(components):
+        cursor /= component
+        if cursor.is_symlink():
+            raise ReposkopContextError(
+                "Reposkop receipt root path may not contain symlinks"
+            )
+        if not cursor.exists():
+            private_from_index = index
+            break
+
+    write_root_descriptor = _open_directory_descriptor(write_root)
+    created_directories: list[tuple[int, str]] = []
+    try:
+        try:
+            _validate_directory_path_binding(
+                write_root_descriptor,
+                write_root,
+                label="Reposkop authorized write root",
+            )
+            for index, component in enumerate(components):
+                parent_descriptor = _open_from_write_root(
+                    write_root_descriptor,
+                    components[:index],
+                    private_from_index=private_from_index,
+                )
+                child_descriptor: int | None = None
+                verification_descriptor: int | None = None
+                try:
+                    try:
+                        child_descriptor = _open_relative_receipt_directory(
+                            parent_descriptor,
+                            component,
+                            require_private=(
+                                index >= private_from_index
+                                or index == len(components) - 1
+                            ),
+                        )
+                    except FileNotFoundError:
+                        if index < private_from_index:
+                            raise ReposkopContextError(
+                                "Reposkop existing receipt ancestor disappeared before creation"
+                            )
+                        _validate_directory_path_binding(
+                            write_root_descriptor,
+                            write_root,
+                            label="Reposkop authorized write root",
+                        )
+                        rollback_descriptor = os.dup(parent_descriptor)
+                        try:
+                            os.mkdir(
+                                component, mode=0o700, dir_fd=parent_descriptor
+                            )
+                        except FileExistsError:
+                            os.close(rollback_descriptor)
+                        except OSError as exc:
+                            os.close(rollback_descriptor)
+                            raise ReposkopContextError(
+                                "Reposkop receipt directory could not be created relative to its authorized root"
+                            ) from exc
+                        except BaseException:
+                            os.close(rollback_descriptor)
+                            raise
+                        else:
+                            created_directories.append(
+                                (rollback_descriptor, component)
+                            )
+                        child_descriptor = _open_relative_receipt_directory(
+                            parent_descriptor,
+                            component,
+                            require_private=True,
+                        )
+                        os.fsync(child_descriptor)
+                        os.fsync(parent_descriptor)
+
+                    if child_descriptor is None:
+                        raise ReposkopContextError(
+                            "Reposkop receipt directory descriptor is unavailable"
+                        )
+                    try:
+                        verification_descriptor = _open_from_write_root(
+                            write_root_descriptor,
+                            components[: index + 1],
+                            private_from_index=private_from_index,
+                        )
+                    except Exception as exc:
+                        raise ReposkopContextError(
+                            "Reposkop receipt directory left its authorized write-root path during creation"
+                        ) from exc
+                    observed = os.fstat(child_descriptor)
+                    verified = os.fstat(verification_descriptor)
+                    if (observed.st_dev, observed.st_ino) != (
+                        verified.st_dev,
+                        verified.st_ino,
+                    ):
+                        raise ReposkopContextError(
+                            "Reposkop receipt directory left its authorized write-root path during creation"
+                        )
+                finally:
+                    if verification_descriptor is not None:
+                        os.close(verification_descriptor)
+                    if child_descriptor is not None:
+                        os.close(child_descriptor)
+                    os.close(parent_descriptor)
+
+            try:
+                root_descriptor = _open_from_write_root(
+                    write_root_descriptor,
+                    components,
+                    private_from_index=private_from_index,
+                )
+            except Exception as exc:
+                raise ReposkopContextError(
+                    "Reposkop receipt root left its authorized write-root path during creation"
+                ) from exc
+            try:
+                _validate_receipt_root_descriptor(root_descriptor)
+                os.fsync(root_descriptor)
+                _validate_directory_path_binding(
+                    write_root_descriptor,
+                    write_root,
+                    label="Reposkop authorized write root",
+                )
+            finally:
+                os.close(root_descriptor)
+        except BaseException as exc:
+            try:
+                _rollback_created_directories(created_directories)
+            except ReposkopContextError as rollback_exc:
+                raise rollback_exc from exc
+            if isinstance(exc, ReposkopContextError):
+                raise
+            if isinstance(exc, Exception):
+                raise ReposkopContextError(
+                    "Reposkop receipt-root creation failed safely and was rolled back"
+                ) from exc
+            raise
+        else:
+            _close_created_directory_records(created_directories)
+    finally:
+        os.close(write_root_descriptor)
 
 
 def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:

@@ -141,6 +141,11 @@ class ReposkopContextTests(unittest.TestCase):
             patch.object(
                 context.base, "_resolve_write_target", side_effect=fake_write_target
             ),
+            patch.object(
+                context.base,
+                "_roots",
+                side_effect=lambda kind: [self.root] if kind == "write" else [],
+            ),
             patch.object(context.base, "_require_mutations_enabled"),
             patch.object(context, "_find_audit_binding", side_effect=fake_find),
             patch.object(context, "_append_audit_binding", side_effect=fake_append),
@@ -924,6 +929,12 @@ class ReposkopContextTests(unittest.TestCase):
 
         with (
             patch.object(context, "RECEIPT_ROOT", self.receipts),
+            patch.object(
+                context.base,
+                "_resolve_write_target",
+                side_effect=lambda value, **_kwargs: (Path(value), Path(value).exists()),
+            ),
+            patch.object(context.base, "_roots", return_value=[self.root]),
             patch.object(context.os, "open", side_effect=swap_before_component_open),
         ):
             with self.assertRaisesRegex(
@@ -936,39 +947,121 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertEqual(list(moved_anchor.iterdir()), [])
         self.assertEqual(list(outside.iterdir()), [])
 
-    def test_missing_root_creation_uses_bound_ancestor_descriptor(self) -> None:
+    def test_missing_root_creation_reanchors_and_removes_moved_child(self) -> None:
         anchor = self.root / "receipt-anchor"
         anchor.mkdir(mode=0o700)
         moved_anchor = self.root / "receipt-anchor-moved"
         self.receipts = anchor / "nested" / "receipts"
-        real_open_directory = context._open_directory_descriptor
+        real_mkdir = context.os.mkdir
         replaced = False
 
-        def bind_then_replace(path: Path) -> int:
+        def move_parent_before_create(
+            path, mode=0o777, *, dir_fd=None
+        ):
             nonlocal replaced
-            descriptor = real_open_directory(path)
-            if Path(path) == anchor and not replaced:
+            if path == "nested" and dir_fd is not None and not replaced:
                 anchor.rename(moved_anchor)
                 anchor.mkdir(mode=0o700)
                 replaced = True
-            return descriptor
+            return real_mkdir(path, mode, dir_fd=dir_fd)
 
         with (
             patch.object(context, "RECEIPT_ROOT", self.receipts),
             patch.object(
-                context,
-                "_open_directory_descriptor",
-                side_effect=bind_then_replace,
+                context.base, "_resolve_write_target",
+                side_effect=lambda value, **_kwargs: (Path(value), Path(value).exists()),
+            ),
+            patch.object(context.base, "_roots", return_value=[self.root]),
+            patch.object(context.os, "mkdir", side_effect=move_parent_before_create),
+        ):
+            with self.assertRaisesRegex(
+                context.ReposkopContextError,
+                "authorized write-root path",
+            ):
+                context._ensure_receipt_root()
+
+        self.assertTrue(replaced)
+        self.assertEqual(list(anchor.iterdir()), [])
+        self.assertEqual(list(moved_anchor.iterdir()), [])
+
+    def test_missing_root_creation_rolls_back_entire_created_chain(self) -> None:
+        anchor = self.root / "receipt-chain"
+        anchor.mkdir(mode=0o700)
+        moved_anchor = self.root / "receipt-chain-moved"
+        self.receipts = anchor / "nested" / "deeper" / "receipts"
+        real_mkdir = context.os.mkdir
+        moved = False
+
+        def move_after_first_created_component(
+            path, mode=0o777, *, dir_fd=None
+        ):
+            nonlocal moved
+            if path == "deeper" and dir_fd is not None and not moved:
+                anchor.rename(moved_anchor)
+                anchor.mkdir(mode=0o700)
+                moved = True
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+
+        with (
+            patch.object(context, "RECEIPT_ROOT", self.receipts),
+            patch.object(
+                context.base,
+                "_resolve_write_target",
+                side_effect=lambda value, **_kwargs: (Path(value), Path(value).exists()),
+            ),
+            patch.object(context.base, "_roots", return_value=[self.root]),
+            patch.object(
+                context.os, "mkdir", side_effect=move_after_first_created_component
             ),
         ):
             with self.assertRaisesRegex(
                 context.ReposkopContextError,
-                "disappeared after descriptor binding",
+                "authorized write-root path",
             ):
                 context._ensure_receipt_root()
 
+        self.assertTrue(moved)
         self.assertEqual(list(anchor.iterdir()), [])
-        self.assertTrue((moved_anchor / "nested" / "receipts").is_dir())
+        self.assertEqual(list(moved_anchor.iterdir()), [])
+
+    def test_missing_root_creation_rolls_back_after_child_fsync_failure(self) -> None:
+        created = self.root / "fsync-failure"
+        self.receipts = created / "receipts"
+        real_fsync = context.os.fsync
+        failed = False
+
+        def fail_created_directory_fsync(descriptor: int) -> None:
+            nonlocal failed
+            if created.exists() and not failed:
+                observed = context.os.fstat(descriptor)
+                linked = created.stat()
+                if (observed.st_dev, observed.st_ino) == (
+                    linked.st_dev,
+                    linked.st_ino,
+                ):
+                    failed = True
+                    raise OSError("injected child fsync failure")
+            real_fsync(descriptor)
+
+        with (
+            patch.object(context, "RECEIPT_ROOT", self.receipts),
+            patch.object(
+                context.base,
+                "_resolve_write_target",
+                side_effect=lambda value, **_kwargs: (Path(value), Path(value).exists()),
+            ),
+            patch.object(context.base, "_roots", return_value=[self.root]),
+            patch.object(context.os, "fsync", side_effect=fail_created_directory_fsync),
+        ):
+            with self.assertRaisesRegex(
+                context.ReposkopContextError,
+                "failed safely and was rolled back",
+            ):
+                context._ensure_receipt_root()
+
+        self.assertTrue(failed)
+        self.assertFalse(created.exists())
+
 
     def test_rejects_boolean_schema_versions(self) -> None:
         cases = (
