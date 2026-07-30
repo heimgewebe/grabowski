@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - fix/text-artifact-store-reconcile-v1
 
 permissions:
   contents: write
@@ -36,7 +37,7 @@ jobs:
         run: make deploy-check
 
   converge-pr514-main:
-    if: github.event_name == 'pull_request' && github.event.pull_request.number == 514 && github.actor != 'github-actions[bot]'
+    if: github.actor != 'github-actions[bot]' && ((github.event_name == 'push' && github.ref == 'refs/heads/fix/text-artifact-store-reconcile-v1') || (github.event_name == 'pull_request' && github.event.pull_request.number == 514))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
