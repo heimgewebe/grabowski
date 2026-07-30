@@ -85,6 +85,14 @@ TUNNEL_OPERATOR_DEPENDENCY_EFFECTIVE_PROPERTIES = (
 WATCHDOG_HOST_ASSET_MAX_BYTES = 1_048_576
 WATCHDOG_HOST_ASSETS = (
     WatchdogHostAsset(
+        source=Path("tools/watchdog_admission_recovery.py"),
+        target=(
+            core.HOME
+            / ".local/libexec/grabowski/watchdog_admission_recovery.py"
+        ),
+        mode=0o600,
+    ),
+    WatchdogHostAsset(
         source=Path("tools/component_watchdog.py"),
         target=core.HOME / ".local/libexec/grabowski/component_watchdog.py",
         mode=0o700,

@@ -484,7 +484,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Project bounded current operator work without creating a second lifecycle truth.",
+      "description": "Project bounded current operator work without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_current_work",
       "purpose": "Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth.",
@@ -495,7 +495,7 @@
     },
     {
       "category": "operations-observability",
-      "description": "Audit bounded operator friction and optimization potential on manual request.",
+      "description": "Audit bounded operator friction without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_operator_optimization_report",
       "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
@@ -739,7 +739,7 @@
     },
     {
       "category": "checkout-lifecycle",
-      "description": "Compare durable checkout bindings with current Git state, strictly read-only.",
+      "description": "Compare checkout bindings without blocking the MCP event loop.",
       "effects": [],
       "id": "grabowski_checkout_binding_reconciliation",
       "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
@@ -2997,7 +2997,7 @@
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_resources.py": "f8dc6069df3fa23a4cf8a9fcddc426855af794d1a5c5639b50bbdd3ae202d764",
-      "src/grabowski_runtime.py": "0ce1db3a063a81b685ff54a7d6371e9fed2dee6fc765407fe78903fa22042545",
+      "src/grabowski_runtime.py": "fc361cdd2b8d7e084df6b7746fc96e5e329eee286ca444796a3542bfdc5dc1cc",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
