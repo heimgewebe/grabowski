@@ -873,7 +873,11 @@ def _validate_receipt_root_descriptor(descriptor: int) -> os.stat_result:
 
 
 def _open_receipt_root_under_write_root() -> tuple[int, int]:
-    """Open receipt root only by walking from an authorized write-root descriptor."""
+    """Open receipt root only by walking from an authorized write-root descriptor.
+
+    Existing intermediate ancestors may use normal shared modes (e.g. 0755 under
+    ${HOME}). Only the final receipt-root component must be owner-private 0700.
+    """
     root_path, write_root, components = _receipt_root_components()
     write_root_descriptor = _open_directory_descriptor(write_root)
     try:
@@ -883,10 +887,12 @@ def _open_receipt_root_under_write_root() -> tuple[int, int]:
             label="Reposkop authorized write root",
         )
         if components:
+            # Only the leaf receipt directory is required to be private 0700.
+            private_from_index = max(0, len(components) - 1)
             receipt_descriptor = _open_from_write_root(
                 write_root_descriptor,
                 components,
-                private_from_index=0,
+                private_from_index=private_from_index,
             )
         else:
             receipt_descriptor = os.dup(write_root_descriptor)
@@ -899,6 +905,17 @@ def _open_receipt_root_under_write_root() -> tuple[int, int]:
     except BaseException:
         os.close(write_root_descriptor)
         raise
+
+
+@contextmanager
+def _publication_receipt_root() -> Iterator[int]:
+    """Re-anchor the receipt root for each mutating publication step."""
+    write_root_descriptor, receipt_descriptor = _open_receipt_root_under_write_root()
+    try:
+        yield receipt_descriptor
+    finally:
+        os.close(receipt_descriptor)
+        os.close(write_root_descriptor)
 
 
 @contextmanager
@@ -1304,6 +1321,14 @@ def _discard_recoverable_pending(
 
 
 def _create_pending(binding: dict[str, Any], *, root_descriptor: int) -> None:
+    del root_descriptor  # re-anchor immediately before the leaf create
+    with _publication_receipt_root() as live_root:
+        _create_pending_on_descriptor(binding, root_descriptor=live_root)
+
+
+def _create_pending_on_descriptor(
+    binding: dict[str, Any], *, root_descriptor: int
+) -> None:
     pending_path = binding["pending_path"]
     flags = (
         os.O_WRONLY
@@ -1424,10 +1449,9 @@ def _recover_linked_pending(
 
 def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
     del root_descriptor  # callers may pass a prior fd; publication always re-anchors
-    write_root_descriptor, live_root = _open_receipt_root_under_write_root()
-    try:
-        receipt_path = binding["receipt_path"]
-        pending_path = binding["pending_path"]
+    receipt_path = binding["receipt_path"]
+    pending_path = binding["pending_path"]
+    with _publication_receipt_root() as live_root:
         if _recover_linked_pending(binding, root_descriptor=live_root):
             return
         if _entry_exists(live_root, receipt_path):
@@ -1445,7 +1469,9 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
                 root_descriptor=live_root,
             )
             return
-        _create_pending(binding, root_descriptor=live_root)
+    # Leaf create re-anchors independently so a rename cannot use a stale dir_fd.
+    _create_pending(binding, root_descriptor=-1)
+    with _publication_receipt_root() as live_root:
         try:
             os.link(
                 pending_path.name,
@@ -1464,9 +1490,6 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
         except OSError as exc:
             raise ReposkopContextError("Reposkop receipt publication failed") from exc
         _recover_linked_pending(binding, root_descriptor=live_root)
-    finally:
-        os.close(live_root)
-        os.close(write_root_descriptor)
 
 
 def _record_usage(
