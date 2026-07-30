@@ -58,6 +58,9 @@ MAX_RETENTION_RECEIPT_BYTES = 16 * 1024 * 1024
 MAX_LEGACY_ARCHIVE_COLLECTIONS = 64
 MAX_LEGACY_ARCHIVE_ROOT_ENTRIES = 4_000
 MAX_LEGACY_ARCHIVE_ENTRIES = 512
+MAX_WORKTREE_HYGIENE_REPOSITORIES = 8
+MAX_WORKTREE_HYGIENE_ACTIONS_PER_CYCLE = 8
+MAX_WORKTREE_HYGIENE_ROOTS = 16
 MAX_LEGACY_COLLECTION_BYTES = 256 * 1024 * 1024
 LEGACY_SELF_DEPLOY_REASON = (
     "legacy self-deploy completed and superseded, but lacks finalization receipt"
@@ -1678,10 +1681,146 @@ def apply_plan(plan: dict[str, Any], *, expected_plan_sha256: str) -> dict[str, 
     return result
 
 
+def _normalize_periodic_paths(
+    values: list[str] | tuple[str, ...] | None,
+    *,
+    label: str,
+    maximum: int,
+) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple)) or len(values) > maximum:
+        raise ValueError(f"{label} must contain at most {maximum} paths")
+    normalized: list[str] = []
+    for raw in values:
+        if not isinstance(raw, str) or not raw or "\x00" in raw:
+            raise ValueError(f"{label} entries must be non-empty paths")
+        path = Path(raw).expanduser().resolve(strict=True)
+        if not path.is_dir():
+            raise ValueError(f"{label} entries must be directories")
+        value = str(path)
+        if value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _apply_periodic_worktree_hygiene(
+    *,
+    repositories: list[str] | tuple[str, ...] | None,
+    owner_id: str,
+    allowed_checkout_roots: list[str] | tuple[str, ...] | None,
+    max_actions: int,
+    grip_runner: Any | None = None,
+) -> dict[str, Any]:
+    repos = _normalize_periodic_paths(
+        repositories,
+        label="worktree_hygiene_repositories",
+        maximum=MAX_WORKTREE_HYGIENE_REPOSITORIES,
+    )
+    roots = _normalize_periodic_paths(
+        allowed_checkout_roots,
+        label="worktree_hygiene_allowed_roots",
+        maximum=MAX_WORKTREE_HYGIENE_ROOTS,
+    )
+    if not repos:
+        return {
+            "schema_version": 1,
+            "operation": "grabowski-worktree-hygiene-periodic-noop",
+            "completed": True,
+            "mutated": False,
+            "actions": 0,
+            "receipts": [],
+        }
+    if not roots:
+        raise ValueError(
+            "periodic worktree hygiene requires at least one allowed checkout root"
+        )
+    if (
+        isinstance(max_actions, bool)
+        or not isinstance(max_actions, int)
+        or not 1 <= max_actions <= MAX_WORKTREE_HYGIENE_ACTIONS_PER_CYCLE
+    ):
+        raise ValueError(
+            "max_worktree_hygiene_actions must be between 1 and "
+            f"{MAX_WORKTREE_HYGIENE_ACTIONS_PER_CYCLE}"
+        )
+    if not isinstance(owner_id, str) or not owner_id:
+        raise ValueError("worktree_hygiene_owner must be a non-empty string")
+
+    source = str(SRC)
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    if grip_runner is None:
+        import grabowski_grips
+
+        grip_runner = grabowski_grips.run_grip
+
+    remaining = max_actions
+    receipts: list[dict[str, Any]] = []
+    action_count = 0
+    for repo in repos:
+        if remaining <= 0:
+            break
+        receipt = grip_runner(
+            "worktree-hygiene-reconcile",
+            {
+                "repo": repo,
+                "owner_id": owner_id,
+                "apply_cleanup": True,
+                "archive_new_candidates": True,
+                "allowed_checkout_roots": roots,
+                "max_actions": remaining,
+                "confirmation": "reconcile-terminal-worktrees",
+            },
+            allow_mutation=True,
+        )
+        if not isinstance(receipt, dict):
+            raise RuntimeError("worktree hygiene returned no structured receipt")
+        status = receipt.get("status")
+        if status == "failed":
+            raise RuntimeError(
+                f"periodic worktree hygiene failed for {repo}: "
+                f"{receipt.get('output', {}).get('error', 'unknown error')}"
+            )
+        if status not in {"passed", "blocked"}:
+            raise RuntimeError(
+                f"periodic worktree hygiene returned invalid status for {repo}: {status}"
+            )
+        output = receipt.get("output")
+        actions = output.get("actions", 0) if isinstance(output, dict) else 0
+        if isinstance(actions, bool) or not isinstance(actions, int) or actions < 0:
+            raise RuntimeError("worktree hygiene receipt has invalid action count")
+        if actions > remaining:
+            raise RuntimeError("worktree hygiene exceeded the cycle action bound")
+        action_count += actions
+        remaining -= actions
+        receipts.append(receipt)
+
+    return {
+        "schema_version": 1,
+        "operation": "grabowski-worktree-hygiene-periodic",
+        "completed": True,
+        "mutated": action_count > 0,
+        "actions": action_count,
+        "maximum_actions": max_actions,
+        "repositories": repos,
+        "allowed_checkout_roots": roots,
+        "owner_id": owner_id,
+        "receipts": receipts,
+        "bounded": True,
+        "single_producer": "grabowski-runtime-retention.timer",
+    }
+
+
 def apply_periodic_plan(
     *,
     minimum_job_age_seconds: int = 86_400,
     max_archive_jobs: int = MAX_ARCHIVE_JOBS_PER_PLAN,
+    worktree_hygiene_repositories: list[str] | tuple[str, ...] | None = None,
+    worktree_hygiene_owner: str = "operator:runtime-retention",
+    worktree_hygiene_allowed_roots: list[str] | tuple[str, ...] | None = None,
+    max_worktree_hygiene_actions: int = 2,
+    worktree_hygiene_runner: Any | None = None,
 ) -> dict[str, Any]:
     """Apply one bounded live retention cycle after two identical snapshots.
 
@@ -1703,14 +1842,38 @@ def apply_periodic_plan(
     if current["plan_sha256"] != preview["plan_sha256"]:
         raise RuntimeError("retention plan drifted between periodic snapshots")
     if not current["reset_failed_units"] and not current["archive_jobs"]:
-        return {
+        runtime_result = {
             "schema_version": 1,
             "operation": "grabowski-runtime-state-retention-periodic-noop",
             "plan_sha256": current["plan_sha256"],
             "completed": True,
             "mutated": False,
         }
-    return apply_plan(current, expected_plan_sha256=preview["plan_sha256"])
+    else:
+        runtime_result = apply_plan(
+            current, expected_plan_sha256=preview["plan_sha256"]
+        )
+    hygiene_result = _apply_periodic_worktree_hygiene(
+        repositories=worktree_hygiene_repositories,
+        owner_id=worktree_hygiene_owner,
+        allowed_checkout_roots=worktree_hygiene_allowed_roots,
+        max_actions=max_worktree_hygiene_actions,
+        grip_runner=worktree_hygiene_runner,
+    )
+    if not worktree_hygiene_repositories:
+        return runtime_result
+    return {
+        "schema_version": 1,
+        "operation": "grabowski-runtime-retention-convergence-periodic",
+        "plan_sha256": current["plan_sha256"],
+        "completed": bool(runtime_result.get("completed"))
+        and bool(hygiene_result.get("completed")),
+        "mutated": bool(runtime_result.get("mutated"))
+        or bool(hygiene_result.get("mutated")),
+        "runtime_retention": runtime_result,
+        "worktree_hygiene": hygiene_result,
+        "single_producer": "grabowski-runtime-retention.timer",
+    }
 
 
 def main() -> int:
@@ -1724,6 +1887,17 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-plan-sha256")
     parser.add_argument("--periodic-apply", action="store_true")
+    parser.add_argument("--worktree-hygiene-repo", action="append", default=[])
+    parser.add_argument(
+        "--worktree-hygiene-owner",
+        default="operator:runtime-retention",
+    )
+    parser.add_argument("--worktree-hygiene-allowed-root", action="append", default=[])
+    parser.add_argument(
+        "--max-worktree-hygiene-actions",
+        type=int,
+        default=2,
+    )
     parser.add_argument("--legacy-archive-status", action="store_true")
     args = parser.parse_args()
     try:
@@ -1749,6 +1923,10 @@ def main() -> int:
             receipt = apply_periodic_plan(
                 minimum_job_age_seconds=args.minimum_job_age_seconds,
                 max_archive_jobs=args.max_archive_jobs,
+                worktree_hygiene_repositories=args.worktree_hygiene_repo,
+                worktree_hygiene_owner=args.worktree_hygiene_owner,
+                worktree_hygiene_allowed_roots=args.worktree_hygiene_allowed_root,
+                max_worktree_hygiene_actions=args.max_worktree_hygiene_actions,
             )
             print(
                 json.dumps(
@@ -1756,6 +1934,10 @@ def main() -> int:
                 )
             )
             return 0
+        if args.worktree_hygiene_repo or args.worktree_hygiene_allowed_root:
+            raise ValueError(
+                "worktree hygiene arguments require --periodic-apply"
+            )
         plan = build_plan(
             minimum_job_age_seconds=args.minimum_job_age_seconds,
             max_archive_jobs=args.max_archive_jobs,

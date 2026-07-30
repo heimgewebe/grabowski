@@ -49,8 +49,8 @@ CHECKOUT_LOCK = Path(
 DRY_RUN_TTL_SECONDS = 15 * 60
 OPERATION_LEASE_TTL_SECONDS = 10 * 60
 MAX_RETENTION_SECONDS = 365 * 24 * 60 * 60
-# Compatibility telemetry remains in schema 2; cleanup itself is immediately eligible.
-CHECKOUT_CLEANUP_GRACE_SECONDS = 0
+# Cleanup is deliberately delayed so recovery evidence has one full day to surface.
+CHECKOUT_CLEANUP_GRACE_SECONDS = 24 * 60 * 60
 CLEANUP_PLAN_SCHEMA_VERSION = 2
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
 MAX_ACTIVE_CHECKOUTS_PER_REPO = 8
@@ -1455,9 +1455,10 @@ def _checkout_lifecycle_decision(
         if archive_present and isinstance(archive.get("created_at_unix"), int)
         else None
     )
-    # Kept as a compatibility projection for existing consumers. The time-based
-    # gate is retired; recovery and live coordination checks remain authoritative.
-    archive_grace_elapsed = archive_age_seconds is not None
+    archive_grace_elapsed = bool(
+        archive_age_seconds is not None
+        and archive_age_seconds >= CHECKOUT_CLEANUP_GRACE_SECONDS
+    )
     blocking = bool(coordination.get("blocking"))
     reasons: list[str] = []
     cleanup_candidate = False
@@ -1523,13 +1524,23 @@ def _checkout_lifecycle_decision(
             hygiene_mark = "archived"
             next_step = "resolve_coordination_blockers_before_cleanup_dry_run"
             reasons.append("checkout is archived but active coordination blocks cleanup")
+        elif retention_is_active:
+            state = "archived_retained"
+            hygiene_mark = "archived"
+            next_step = "wait_for_retention_before_cleanup_dry_run"
+            reasons.append("archived checkout remains protected by active retention")
+        elif not archive_grace_elapsed:
+            state = "archived_grace"
+            hygiene_mark = "archived"
+            next_step = "wait_for_archive_grace_before_cleanup_dry_run"
+            reasons.append("archived checkout is still inside the recovery grace period")
         else:
             state = "cleanup_candidate"
             hygiene_mark = "obsolete"
             cleanup_candidate = True
             requires_cleanup_dry_run = True
             next_step = "run_checkout_cleanup_dry_run_before_apply"
-            reasons.append("clean managed checkout has matching open recovery archive")
+            reasons.append("clean managed checkout has a mature matching recovery archive")
     elif archive_present and not archive_open:
         state = "archive_closed"
         hygiene_mark = "unknown"
@@ -1545,13 +1556,23 @@ def _checkout_lifecycle_decision(
         hygiene_mark = "archived"
         next_step = "resolve_coordination_blockers_before_cleanup_dry_run"
         reasons.append("checkout is archived but active coordination blocks cleanup")
+    elif archive_present and retention_is_active:
+        state = "archived_retained"
+        hygiene_mark = "archived"
+        next_step = "wait_for_retention_before_cleanup_dry_run"
+        reasons.append("archived checkout remains protected by active retention")
+    elif archive_present and not archive_grace_elapsed:
+        state = "archived_grace"
+        hygiene_mark = "archived"
+        next_step = "wait_for_archive_grace_before_cleanup_dry_run"
+        reasons.append("archived checkout is still inside the recovery grace period")
     elif archive_present:
         state = "cleanup_candidate"
         hygiene_mark = "obsolete"
         cleanup_candidate = True
         requires_cleanup_dry_run = True
         next_step = "run_checkout_cleanup_dry_run_before_apply"
-        reasons.append("clean linked checkout has matching open recovery archive")
+        reasons.append("clean linked checkout has a mature matching recovery archive")
     elif retention_is_active:
         state = "retained"
         hygiene_mark = "retained"
@@ -2114,8 +2135,8 @@ def _cleanup_plan(
     owner = _owner(owner_id)
     retention = _retention_records([record["checkout_key"]]).get(record["checkout_key"])
     retention_active = bool(retention and retention["retention_until_unix"] > now)
-    if retention_active and retention["owner_id"] != owner:
-        raise PermissionError("Active checkout retention is owned by another owner")
+    retention_owner_matches = bool(retention and retention.get("owner_id") == owner)
+    archive_grace_elapsed = archive_age_seconds >= CHECKOUT_CLEANUP_GRACE_SECONDS
     verified_refs = _verify_recovery_refs(top_level, archive["recovery_refs"])
     if not all(item["present"] for item in verified_refs):
         raise RuntimeError("Checkout recovery refs are missing or mismatched")
@@ -2144,14 +2165,29 @@ def _cleanup_plan(
         "status": status,
         "retention": retention,
         "retention_active": retention_active,
+        "retention_owner_matches": retention_owner_matches,
         "archive_created_at_unix": archive_created_at_unix,
         "archive_age_seconds": archive_age_seconds,
         "archive_grace_seconds": CHECKOUT_CLEANUP_GRACE_SECONDS,
+        "archive_grace_elapsed": archive_grace_elapsed,
+        "cleanup_blockers": [
+            reason
+            for reason, blocked in (
+                ("active_retention_not_elapsed", retention_active),
+                ("archive_grace_not_elapsed", not archive_grace_elapsed),
+                ("active_coordination", coordination["blocking"]),
+            )
+            if blocked
+        ],
         "plan_hash_excludes": list(CLEANUP_PLAN_HASH_EXCLUDED_FIELDS),
         "recovery_refs": verified_refs,
         "coordination": coordination,
         "command": command,
-        "safe_to_apply": not coordination["blocking"],
+        "safe_to_apply": bool(
+            not retention_active
+            and archive_grace_elapsed
+            and not coordination["blocking"]
+        ),
         "rollback": {
             "available": True,
             "command": ["git", "-C", str(top_level), "worktree", "add", str(checkout), archive["recovery_refs"][0]["ref"]],
@@ -2274,6 +2310,10 @@ def grabowski_checkout_cleanup(
     )
     if current_plan["plan_sha256"] != expected_hash:
         raise RuntimeError("Cleanup dry-run is stale; rerun dry_run first")
+    if current_plan["retention_active"]:
+        raise RuntimeError("Active checkout retention has not elapsed")
+    if not current_plan["archive_grace_elapsed"]:
+        raise RuntimeError("Checkout archive grace period has not elapsed")
     if not current_plan["safe_to_apply"]:
         _require_no_blockers(current_plan["coordination"])
     retention_until_unix = _now() + DRY_RUN_TTL_SECONDS

@@ -1671,5 +1671,100 @@ class RuntimeRetentionTests(unittest.TestCase):
         )
 
 
+    def test_periodic_worktree_hygiene_reuses_retention_producer_and_bound(self) -> None:
+        plan = {
+            "plan_sha256": "e" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo_one = root / "repo-one"
+            repo_two = root / "repo-two"
+            allowed = root / "worktrees"
+            repo_one.mkdir()
+            repo_two.mkdir()
+            allowed.mkdir()
+            runner = Mock(
+                return_value={
+                    "status": "passed",
+                    "output": {"actions": 2, "archived": [], "cleaned": []},
+                }
+            )
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ), patch.object(RETENTION, "apply_plan") as apply:
+                result = RETENTION.apply_periodic_plan(
+                    worktree_hygiene_repositories=[str(repo_one), str(repo_two)],
+                    worktree_hygiene_allowed_roots=[str(allowed)],
+                    max_worktree_hygiene_actions=2,
+                    worktree_hygiene_runner=runner,
+                )
+
+        apply.assert_not_called()
+        runner.assert_called_once()
+        args, kwargs = runner.call_args
+        self.assertEqual(args[0], "worktree-hygiene-reconcile")
+        self.assertTrue(kwargs["allow_mutation"])
+        self.assertEqual(args[1]["max_actions"], 2)
+        self.assertEqual(args[1]["allowed_checkout_roots"], [str(allowed.resolve())])
+        self.assertEqual(result["operation"], "grabowski-runtime-retention-convergence-periodic")
+        self.assertEqual(result["worktree_hygiene"]["actions"], 2)
+        self.assertTrue(result["worktree_hygiene"]["bounded"])
+        self.assertTrue(result["mutated"])
+
+    def test_periodic_worktree_hygiene_accepts_blocked_fail_closed_receipt(self) -> None:
+        plan = {
+            "plan_sha256": "f" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            allowed = root / "worktrees"
+            repo.mkdir()
+            allowed.mkdir()
+            runner = Mock(
+                return_value={
+                    "status": "blocked",
+                    "output": {
+                        "actions": 0,
+                        "error": "dirty or foreign worktree remains protected",
+                    },
+                }
+            )
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ):
+                result = RETENTION.apply_periodic_plan(
+                    worktree_hygiene_repositories=[str(repo)],
+                    worktree_hygiene_allowed_roots=[str(allowed)],
+                    worktree_hygiene_runner=runner,
+                )
+        self.assertTrue(result["completed"])
+        self.assertFalse(result["mutated"])
+        self.assertEqual(
+            result["worktree_hygiene"]["receipts"][0]["status"],
+            "blocked",
+        )
+
+    def test_periodic_worktree_hygiene_rejects_missing_allowed_root(self) -> None:
+        plan = {
+            "plan_sha256": "1" * 64,
+            "reset_failed_units": [],
+            "archive_jobs": [],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            with patch.object(
+                RETENTION, "build_plan", side_effect=[plan, plan]
+            ):
+                with self.assertRaisesRegex(ValueError, "allowed checkout root"):
+                    RETENTION.apply_periodic_plan(
+                        worktree_hygiene_repositories=[str(repo)],
+                    )
+
 if __name__ == "__main__":
     unittest.main()

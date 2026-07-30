@@ -9,10 +9,38 @@ import json
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+
+class _FakeFastMCP:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    def tool(self, *args: object, **kwargs: object):
+        del args, kwargs
+        return lambda function: function
+
+
+class _FakeToolAnnotations:
+    def __init__(self, **kwargs: object) -> None:
+        self.values = kwargs
+
+
+if "mcp" not in sys.modules:
+    fake_mcp = types.ModuleType("mcp")
+    fake_server = types.ModuleType("mcp.server")
+    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fake_types = types.ModuleType("mcp.types")
+    fake_fastmcp.FastMCP = _FakeFastMCP
+    fake_types.ToolAnnotations = _FakeToolAnnotations
+    sys.modules["mcp"] = fake_mcp
+    sys.modules["mcp.server"] = fake_server
+    sys.modules["mcp.server.fastmcp"] = fake_fastmcp
+    sys.modules["mcp.types"] = fake_types
 
 import grabowski_grips as grips
 import grabowski_grip_orchestration as grip_orchestration
@@ -10312,6 +10340,72 @@ class WorktreeHygieneReconcileTests(unittest.TestCase):
         self.assertEqual(0, result["output"]["actions"])
         self.assertEqual(1, result["output"]["foreign_owned_count"])
         self.assertEqual(0, result["output"]["adopted_unowned_count"])
+
+    def test_allowed_checkout_roots_skip_outside_candidates_before_github(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allowed = root / "allowed"
+            outside = root / "outside"
+            allowed.mkdir()
+            outside.mkdir()
+            inventory = {
+                "inventory_sha256": "c" * 64,
+                "worktrees": [self._owned_item(str(outside))],
+            }
+            parameters = self._parameters(tmp)
+            parameters["allowed_checkout_roots"] = [str(allowed)]
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch("grabowski_checkouts.grabowski_checkout_archive") as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    parameters,
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=lambda _repo, _argv: (_ for _ in ()).throw(
+                        AssertionError("outside candidates must not query GitHub")
+                    ),
+                )
+
+        archive.assert_not_called()
+        self.assertEqual(0, result["output"]["actions"])
+        self.assertEqual(
+            "outside_allowed_checkout_roots",
+            result["output"]["skipped"][0]["reason"],
+        )
+
+    def test_archive_new_candidates_false_preserves_clean_terminal_checkout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / "worktree"
+            checkout.mkdir()
+            inventory = {
+                "inventory_sha256": "d" * 64,
+                "worktrees": [self._owned_item(str(checkout))],
+            }
+            parameters = self._parameters(tmp)
+            parameters["archive_new_candidates"] = False
+            parameters["allowed_checkout_roots"] = [tmp]
+            with (
+                patch("grabowski_checkouts.checkout_inventory", return_value=inventory),
+                patch("grabowski_checkouts.grabowski_checkout_archive") as archive,
+            ):
+                result = grips.run_grip(
+                    "worktree-hygiene-reconcile",
+                    parameters,
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=lambda _repo, _argv: (_ for _ in ()).throw(
+                        AssertionError("disabled archive must not query GitHub")
+                    ),
+                )
+
+        archive.assert_not_called()
+        self.assertEqual(0, result["output"]["actions"])
+        self.assertEqual(
+            "new_archive_disabled",
+            result["output"]["skipped"][0]["reason"],
+        )
 
     def test_surface_marks_worktree_hygiene_as_high_risk_and_not_mechanic_normal(self) -> None:
         spec = next(

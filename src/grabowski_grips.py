@@ -3364,6 +3364,27 @@ def _run_worktree_hygiene_reconcile(
             f"confirmation must be exactly {WORKTREE_HYGIENE_CONFIRMATION!r}"
         )
     max_actions = parameters.get("max_actions", WORKTREE_HYGIENE_MAX_ACTIONS)
+    archive_new_candidates = parameters.get("archive_new_candidates", True)
+    if not isinstance(archive_new_candidates, bool):
+        raise GripPreflightError("archive_new_candidates must be boolean")
+    allowed_checkout_roots_raw = parameters.get("allowed_checkout_roots")
+    allowed_checkout_roots: tuple[Path, ...] = ()
+    if allowed_checkout_roots_raw is not None:
+        if (
+            not isinstance(allowed_checkout_roots_raw, list)
+            or not 1 <= len(allowed_checkout_roots_raw) <= 16
+            or not all(isinstance(item, str) and item for item in allowed_checkout_roots_raw)
+        ):
+            raise GripPreflightError(
+                "allowed_checkout_roots must contain between 1 and 16 paths"
+            )
+        roots: list[Path] = []
+        for raw in allowed_checkout_roots_raw:
+            root = Path(raw).expanduser().resolve(strict=True)
+            if not root.is_dir():
+                raise GripPreflightError("allowed checkout root must be a directory")
+            roots.append(root)
+        allowed_checkout_roots = tuple(roots)
     if (
         isinstance(max_actions, bool)
         or not isinstance(max_actions, int)
@@ -3419,6 +3440,13 @@ def _run_worktree_hygiene_reconcile(
 
         if actions >= max_actions:
             skipped.append({"path": path, "reason": "max_actions_reached", "state": state})
+            continue
+        checkout_path = Path(path).expanduser().resolve(strict=False)
+        if allowed_checkout_roots and not any(
+            checkout_path == root or checkout_path.is_relative_to(root)
+            for root in allowed_checkout_roots
+        ):
+            skipped.append({"path": path, "reason": "outside_allowed_checkout_roots", "state": state})
             continue
         if item.get("is_main"):
             skipped.append({"path": path, "reason": "main_worktree", "state": state})
@@ -3499,6 +3527,13 @@ def _run_worktree_hygiene_reconcile(
         if state not in {"retained", "unclassified_clean"}:
             skipped.append({"path": path, "reason": "state_not_archive_candidate", "state": state})
             continue
+        if not archive_new_candidates:
+            skipped.append({
+                "path": path,
+                "reason": "new_archive_disabled",
+                "state": state,
+            })
+            continue
         if not isinstance(branch, str) or not branch or not isinstance(head, str):
             skipped.append({"path": path, "reason": "branch_or_head_unavailable", "state": state})
             continue
@@ -3568,8 +3603,14 @@ def _run_worktree_hygiene_reconcile(
             "branch": branch,
             "merged_pr": terminal,
             "ownership_mode": owner_mode,
-            "cleanup_not_before_unix": result["archive"]["created_at_unix"],
-            "cleanup_available_at_unix": result["archive"]["created_at_unix"],
+            "cleanup_not_before_unix": (
+                result["archive"]["created_at_unix"]
+                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            ),
+            "cleanup_available_at_unix": (
+                result["archive"]["created_at_unix"]
+                + grabowski_checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            ),
         })
         actions += 1
 
@@ -3593,6 +3634,8 @@ def _run_worktree_hygiene_reconcile(
         "owner_id": owner_id,
         "repository": str(repo),
         "apply_cleanup": apply_cleanup,
+        "archive_new_candidates": archive_new_candidates,
+        "allowed_checkout_roots": [str(path) for path in allowed_checkout_roots],
         "actions": actions,
         "github_queries": github_queries,
         "candidate_pr_queries": candidate_pr_queries,

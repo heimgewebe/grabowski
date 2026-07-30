@@ -5055,6 +5055,30 @@ class AgentWorkspaceTests(unittest.TestCase):
         workspace._write_manifest(manifest)
         return manifest
 
+    def _mature_checkout_archive(self, archive_id: str) -> None:
+        archive = workspace.checkouts._load_archive(archive_id)
+        mature_at = (
+            int(time.time())
+            - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            - 1
+        )
+        with workspace.checkouts._database() as connection:
+            connection.execute(
+                "UPDATE archives SET created_at_unix=?, retention_until_unix=? "
+                "WHERE archive_id=?",
+                (mature_at, mature_at, archive_id),
+            )
+            connection.execute(
+                "UPDATE retention SET retention_until_unix=? WHERE checkout_key=?",
+                (mature_at, archive["checkout_key"]),
+            )
+            connection.execute(
+                "UPDATE lifecycle_bindings SET retention_until_unix=? "
+                "WHERE checkout_key=?",
+                (mature_at, archive["checkout_key"]),
+            )
+            connection.commit()
+
     def test_cleanup_plan_marks_closed_clean_linked_worktree_eligible(self) -> None:
         manifest = self._closed_cleanup_manifest()
         with (
@@ -5297,9 +5321,21 @@ class AgentWorkspaceTests(unittest.TestCase):
                 plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
-            self.assertEqual(archived["state"], "archived_ready_for_cleanup")
+            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
             self.assertTrue(archived["requires_fresh_cleanup_plan"])
             self.assertTrue(self.git.writer.exists())
+            waiting_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                [manifest["workspace_id"]]
+            )["plans"][0]
+            waiting = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                waiting_plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            self.assertEqual(waiting["state"], "archived_waiting_for_cleanup")
+            self.assertTrue(waiting["idempotent"])
+            self.assertTrue(self.git.writer.exists())
+            self._mature_checkout_archive(str(archived["archive_id"]))
             refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
@@ -5395,7 +5431,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 )
 
             self.assertEqual(archive_calls, 1)
-            self.assertEqual(archived["state"], "archived_ready_for_cleanup")
+            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
+            self._mature_checkout_archive(str(archived["archive_id"]))
             self.assertTrue(self.git.writer.exists())
             effect = archived["lifecycle_effect"]
             self.assertEqual(effect["status"], "succeeded")
@@ -5459,7 +5496,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
-            self.assertEqual(archived["state"], "archived_ready_for_cleanup")
+            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
+            self._mature_checkout_archive(str(archived["archive_id"]))
             refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
@@ -5537,7 +5575,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                 plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
-            self.assertEqual(archived["state"], "archived_ready_for_cleanup")
+            self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
+            self._mature_checkout_archive(str(archived["archive_id"]))
             refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
@@ -6947,16 +6986,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 expected_branch=plan["checkout"]["branch"],
             )
             archive = archived["archive"]
-            with workspace.checkouts._database() as connection:
-                connection.execute(
-                    "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
-                    (
-                        workspace._now()
-                        - workspace.checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
-                        archive["archive_id"],
-                    ),
-                )
-                connection.commit()
+            self._mature_checkout_archive(str(archive["archive_id"]))
             dry_run = workspace.checkouts.grabowski_checkout_cleanup(
                 repo=plan["repository"],
                 checkout_path=plan["writer_worktree"],

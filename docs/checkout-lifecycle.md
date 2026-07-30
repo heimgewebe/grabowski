@@ -61,8 +61,10 @@ Die Phasen werden read-only wie folgt projiziert:
   nicht auf `unclassified_clean` zurück.
 - `completed_retained` bleibt als terminal-retained und
   archivierungspflichtig sichtbar.
-- `archived` gelangt mit passendem offenem Recovery-Archiv unmittelbar in
-  `archived_blocked` oder `cleanup_candidate`; eine zeitbasierte Grace existiert nicht.
+- `archived` gelangt mit passendem offenem Recovery-Archiv in
+  `archived_blocked` oder `cleanup_candidate`; Apply bleibt jedoch für mindestens
+  24 Stunden nach der Archivierung gesperrt. Auch Retention desselben Owners muss
+  vollständig abgelaufen sein.
 - Agent-Workspace-Cleanup archiviert und entfernt nie im selben Top-Level-Aufruf:
   Nach `archived_ready_for_cleanup` folgt ohne Wartezeit ein frischer Plan und ein zweiter Aufruf.
 - Unbekannte Phase oder widersprüchliche Path-, Repository-, Branch-, Owner-,

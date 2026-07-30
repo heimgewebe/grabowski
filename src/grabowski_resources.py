@@ -18,6 +18,7 @@ import grabowski_mcp as base
 import grabowski_bureau_leases as bureau_leases
 import grabowski_nonconflict as nonconflict
 import grabowski_sqlite_store as sqlite_store
+import grabowski_work_admission as work_admission
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -3559,6 +3560,7 @@ def acquire_resources(
     ttl_seconds: int = 3600,
     metadata: dict[str, Any] | None = None,
     nonconflict_proof: dict[str, Any] | None = None,
+    admission_assessor: Any | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
@@ -3583,6 +3585,53 @@ def acquire_resources(
         keys, ttl_seconds=ttl, metadata=normalized_metadata
     )
     now = _now()
+    admission_evidence: list[dict[str, Any]] = []
+    admission_mode = normalized_metadata.get("work_admission_mode", "normal")
+    if admission_mode not in {"normal", "convergence"}:
+        raise ValueError("metadata.work_admission_mode must be normal or convergence")
+    scope = normalized_metadata.get("scope_manifest")
+    if lease_mode != "emergency-recovery" and isinstance(scope, dict):
+        repository = str(scope.get("repository") or "")
+        broad_key = f"repo:{repository}"
+        if broad_key in keys and os.path.lexists(os.path.join(repository, ".git")):
+            existing = inspect_resource(broad_key)
+            if (
+                isinstance(existing, dict)
+                and existing.get("owner_id") == owner
+                and isinstance(existing.get("expires_at_unix"), int)
+                and existing["expires_at_unix"] > now
+            ):
+                admission_evidence.append(
+                    {
+                        "repository": repository,
+                        "decision": "allow",
+                        "reason": "same-owner-live-lease-reentry",
+                        "read_only": True,
+                    }
+                )
+            elif not (
+                isinstance(existing, dict)
+                and isinstance(existing.get("expires_at_unix"), int)
+                and existing["expires_at_unix"] > now
+                and existing.get("owner_id") != owner
+            ):
+                assessor = admission_assessor or work_admission.require_repository_admission
+                assessment = assessor(
+                    mode=admission_mode,
+                    repo=repository,
+                    owner_id=owner,
+                    operation="broad_repository_lease",
+                    requested_scope=scope,
+                )
+                admission_evidence.append(assessment)
+    if admission_evidence:
+        sanitized_metadata["work_admission"] = {
+            "schema_version": 1,
+            "assessments": admission_evidence,
+            "assessment_sha256": hashlib.sha256(
+                _canonical_json(admission_evidence).encode("utf-8")
+            ).hexdigest(),
+        }
     expires = now + ttl
     reclaimed: list[dict[str, Any]] = []
     with _database() as connection:
@@ -3694,6 +3743,7 @@ def acquire_resources(
         "reclaimed": reclaimed,
         "bureau_contract": bureau_contract,
         "nonconflict_exception": nonconflict_exception,
+        "work_admission": admission_evidence,
     }
 
 

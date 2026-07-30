@@ -131,6 +131,16 @@ class TaskTests(unittest.TestCase):
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
         )
+        self.admission_patch = patch.object(
+            tasks.resources.work_admission,
+            "require_repository_admission",
+            return_value={
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            },
+        )
         self.task_archive_root = self.root / "state" / "task-archives"
         self.task_projection_root = self.root / "state" / "task-projection"
         (self.root / "state").mkdir(parents=True, exist_ok=True)
@@ -141,9 +151,11 @@ class TaskTests(unittest.TestCase):
         self.db_patch.start()
         self.outcomes_patch.start()
         self.resource_patch.start()
+        self.admission_patch.start()
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.admission_patch.stop()
         self.resource_patch.stop()
         self.outcomes_patch.stop()
         self.db_patch.stop()
