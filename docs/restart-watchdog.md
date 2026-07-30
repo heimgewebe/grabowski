@@ -239,6 +239,9 @@ wieder zu starten. Ohne Drain- und Readiness-Beleg bleibt jede Mutation aus.
 ### Installation der Komponenten-Watchdogs
 
 ```bash
+install -m 0600 \
+  tools/watchdog_admission_recovery.py \
+  "$HOME/.local/libexec/grabowski/watchdog_admission_recovery.py"
 install -m 0700 \
   tools/component_watchdog.py \
   "$HOME/.local/libexec/grabowski/component_watchdog.py"

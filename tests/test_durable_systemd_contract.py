@@ -18,6 +18,30 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("KillMode=mixed", text)
         self.assertNotIn("tunnel-client", text)
 
+    def test_component_watchdogs_require_both_installed_python_assets(self) -> None:
+        helper_condition = (
+            "ConditionPathExists=%h/.local/libexec/grabowski/"
+            "watchdog_admission_recovery.py"
+        )
+        script_condition = (
+            "ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py"
+        )
+        for unit_name in (
+            "grabowski-operator-watchdog.service.example",
+            "grabowski-tunnel-watchdog.service.example",
+        ):
+            unit = (ROOT / "systemd" / unit_name).read_text(encoding="utf-8")
+            self.assertIn(script_condition, unit)
+            self.assertIn(helper_condition, unit)
+        docs = (ROOT / "docs" / "restart-watchdog.md").read_text(
+            encoding="utf-8"
+        )
+        helper_position = docs.index("tools/watchdog_admission_recovery.py")
+        watchdog_position = docs.index(
+            "tools/component_watchdog.py", helper_position
+        )
+        self.assertLess(helper_position, watchdog_position)
+
     def test_component_watchdogs_keep_explicit_recovery_scope(self) -> None:
         operator = (
             ROOT / "systemd" / "grabowski-operator-watchdog.service.example"

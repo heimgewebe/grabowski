@@ -7,6 +7,7 @@
 Description=Grabowski operator semantic watchdog
 After=grabowski-operator.service
 ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py
+ConditionPathExists=%h/.local/libexec/grabowski/watchdog_admission_recovery.py
 
 [Service]
 Type=oneshot

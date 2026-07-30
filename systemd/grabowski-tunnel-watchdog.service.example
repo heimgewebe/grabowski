@@ -2,6 +2,7 @@
 Description=Grabowski tunnel semantic watchdog
 After=tunnel-client-grabowski.service
 ConditionPathExists=%h/.local/libexec/grabowski/component_watchdog.py
+ConditionPathExists=%h/.local/libexec/grabowski/watchdog_admission_recovery.py
 
 [Service]
 Type=oneshot
