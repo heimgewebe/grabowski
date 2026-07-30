@@ -17,6 +17,7 @@ CONVERGENCE_STATES = frozenset(
     {
         "cleanup_candidate",
         "completed_retained",
+        "completed_retained_blocked",
         "archived_blocked",
         "archived_grace",
         "archived_retained",

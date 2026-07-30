@@ -22,6 +22,7 @@ import grabowski_resources as resources
 import grabowski_tasks as tasks
 import grabowski_command_identity as command_identity
 import grabowski_checkouts as checkouts
+import grabowski_work_admission as work_admission
 import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 from grabowski_agent_sandbox import safe_git_environment
@@ -5198,6 +5199,26 @@ def _capture_routing_shadow_prospective_best_effort(
     return result
 
 
+def _assess_new_agent_workspace(
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    return work_admission.require_repository_admission(
+        mode="normal",
+        repo=str(plan["repository"]),
+        owner_id=str(plan["resources"]["owner_id"]),
+        operation="agent_workspace_create",
+        requested_scope={
+            "allowed_paths": list(plan["scope"]["allowed_paths"]),
+            "forbidden_paths": list(plan["scope"]["forbidden_paths"]),
+            "branch": str(plan["writer_branch"]),
+        },
+        target_path=str(plan["writer_worktree"]),
+        branch=str(plan["writer_branch"]),
+        source_kind=str(plan["binding"]["kind"]),
+        source_id=str(plan["binding"]["id"]),
+    )
+
+
 @mcp.tool(name="grabowski_agent_workspace_create", annotations=MUTATING)
 def grabowski_agent_workspace_create(
     binding_kind: str,
@@ -5326,6 +5347,39 @@ def grabowski_agent_workspace_create(
         )
         repo = Path(str(plan["repository"]))
         worktree = Path(str(plan["writer_worktree"]))
+        try:
+            admission = _assess_new_agent_workspace(plan)
+        except work_admission.WorkAdmissionBlocked as exc:
+            manifest["work_admission"] = exc.assessment
+            _append_workspace_event(
+                manifest,
+                "repository_work_admission",
+                role="writer",
+                outcome="blocked",
+                evidence={
+                    "decision": exc.assessment.get("decision"),
+                    "assessment_sha256": exc.assessment.get(
+                        "assessment_sha256"
+                    ),
+                    "blocker_codes": list(
+                        exc.assessment.get("blocker_codes", [])
+                    ),
+                },
+            )
+            _write_manifest(manifest)
+            raise AgentWorkspaceActionError(str(exc)) from exc
+        manifest["work_admission"] = admission
+        _append_workspace_event(
+            manifest,
+            "repository_work_admission",
+            role="writer",
+            outcome="allowed",
+            evidence={
+                "decision": admission.get("decision"),
+                "assessment_sha256": admission.get("assessment_sha256"),
+            },
+        )
+        _write_manifest(manifest)
         lifecycle_reservation = _reserve_writer_checkout_lifecycle(manifest)
         _append_workspace_event(
             manifest,
@@ -5570,6 +5624,19 @@ def grabowski_agent_workspace_create(
             "lease_retained": lease is not None and not lease_released,
             "lease_release_error": lease_release_error,
             "worktree_preserved": Path(str(plan["writer_worktree"])).exists(),
+            "work_admission": (
+                {
+                    "decision": manifest["work_admission"].get("decision"),
+                    "assessment_sha256": manifest["work_admission"].get(
+                        "assessment_sha256"
+                    ),
+                    "blocker_codes": list(
+                        manifest["work_admission"].get("blocker_codes", [])
+                    ),
+                }
+                if isinstance(manifest.get("work_admission"), dict)
+                else None
+            ),
         }
         try:
             _atomic_json(directory / "create-failure.json", failure)

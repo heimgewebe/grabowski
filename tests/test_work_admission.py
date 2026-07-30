@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import ast
 import sys
 import tempfile
 import unittest
@@ -117,6 +118,37 @@ class WorkAdmissionTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_every_checkout_lifecycle_state_has_an_admission_policy(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "grabowski_checkouts.py"
+        ).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        classifier = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_checkout_lifecycle_decision"
+        )
+        emitted_states = {
+            node.value.value
+            for node in ast.walk(classifier)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "state"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        }
+        explicitly_handled = set(admission.CONVERGENCE_STATES) | {
+            "main",
+            "dirty",
+            "retained",
+        }
+        self.assertEqual(emitted_states, explicitly_handled)
+
     def test_clean_primary_only_allows_new_broad_lane(self) -> None:
         result = self._assess([self._main()])
         self.assertEqual(result["decision"], "allow")
@@ -143,6 +175,23 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertEqual(foreign["decision"], "blocked")
         self.assertIn("foreign-live-coordination", foreign["blocker_codes"])
         self.assertIn("foreign-retained-worktree", foreign["blocker_codes"])
+
+    def test_completed_retained_blocked_requires_convergence_for_same_owner(self) -> None:
+        linked = self._linked(
+            state="completed_retained_blocked",
+            owner="owner-a",
+        )
+        linked["coordination"]["resource_leases"] = [
+            {
+                "blocking": True,
+                "resource_key": "path:/tmp/same-owner",
+                "owner_id": "owner-a",
+            }
+        ]
+        result = self._assess([self._main(), linked])
+        self.assertEqual(result["decision"], "converge_first")
+        self.assertIn("worktree-convergence-required", result["blocker_codes"])
+        self.assertNotIn("foreign-live-coordination", result["blocker_codes"])
 
     def test_clean_terminal_or_orphaned_state_requires_convergence_first(self) -> None:
         terminal = self._assess(

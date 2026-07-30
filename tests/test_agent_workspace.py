@@ -1617,6 +1617,94 @@ class AgentWorkspaceTests(unittest.TestCase):
                     "1" * 64,
                 )
 
+    def test_create_admission_blocks_before_lifecycle_or_git_mutation(self) -> None:
+        binding_id = "thread-admission-block"
+        target = self.root / "admission-block-writer"
+        assessment = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_admission",
+            "decision": "blocked",
+            "assessment_sha256": "a" * 64,
+            "blocker_codes": ["dirty-worktree"],
+            "blockers": [
+                {
+                    "code": "dirty-worktree",
+                    "path": str(self.root / "foreign-dirty"),
+                }
+            ],
+            "read_only": True,
+        }
+        release = mock.Mock(return_value={"released": []})
+        with (
+            mock.patch.object(workspace.operator, "_require_operator_mutation"),
+            mock.patch.object(
+                workspace, "_verify_bureau_binding", side_effect=binding_evidence
+            ),
+            mock.patch.object(
+                workspace.resources,
+                "acquire_resources",
+                return_value={"leases": []},
+            ),
+            mock.patch.object(
+                workspace.resources, "release_resources", release
+            ),
+            mock.patch.object(
+                workspace.work_admission,
+                "require_repository_admission",
+                side_effect=workspace.work_admission.WorkAdmissionBlocked(
+                    assessment
+                ),
+            ) as admission,
+            mock.patch.object(
+                workspace, "_reserve_writer_checkout_lifecycle"
+            ) as reserve,
+            mock.patch.object(workspace.tasks, "grabowski_task_start") as start,
+        ):
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceActionError,
+                "repository work admission blocked: dirty-worktree",
+            ):
+                workspace.grabowski_agent_workspace_create(
+                    route_evidence=complete_route_evidence(),
+                    binding_kind="thread_focus",
+                    binding_id=binding_id,
+                    repository=str(self.git.repo),
+                    expected_base_head=self.git.base,
+                    writer_branch="feat/admission-block",
+                    writer_worktree=str(target),
+                    allowed_paths=["src"],
+                    writer_argv=["true"],
+                    test_argv=["true"],
+                    review_argv=["true"],
+                    runtime_seconds=600,
+                )
+
+        admission.assert_called_once()
+        reserve.assert_not_called()
+        start.assert_not_called()
+        release.assert_called_once()
+        self.assertFalse(target.exists())
+        workspace_id, _session = workspace._workspace_identity(
+            "thread_focus", binding_id, self.git.repo, self.git.base
+        )
+        manifest = workspace._manifest(workspace_id)
+        self.assertEqual(manifest["work_admission"], assessment)
+        failure = json.loads(
+            (self.state / workspace_id / "create-failure.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(failure["worktree_create_attempted"])
+        self.assertTrue(failure["lease_released"])
+        self.assertEqual(
+            failure["work_admission"],
+            {
+                "decision": "blocked",
+                "assessment_sha256": "a" * 64,
+                "blocker_codes": ["dirty-worktree"],
+            },
+        )
+
     def test_create_blocks_writer_when_exact_sandbox_preflight_fails(self) -> None:
         with (
             mock.patch.object(workspace.operator, "_require_operator_mutation"),
