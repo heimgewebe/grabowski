@@ -177,6 +177,9 @@ RESOURCE_SCHEMA_V3_REQUIRED_INDEXES = {
 }
 RESOURCE_CURRENT_SCHEMA_VERSION = "3"
 RESOURCE_SUPPORTED_SCHEMA_VERSIONS = ("1", "2", "3")
+RESOURCE_LEASE_CONTRACT_METADATA_KEY = "resource_lease_contract_version"
+RESOURCE_LEASE_CONTRACT_CURRENT_VERSION = "1"
+RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS = ("1",)
 RESOURCE_SCHEMA_MIGRATION_PATHS = {
     "1": ("1", RESOURCE_CURRENT_SCHEMA_VERSION),
     "2": ("2", RESOURCE_CURRENT_SCHEMA_VERSION),
@@ -251,6 +254,56 @@ def _resource_schema_version(connection: sqlite3.Connection) -> str | None:
     return str(rows[0][0])
 
 
+def _resource_lease_contract_version(
+    connection: sqlite3.Connection, *, required: bool = True
+) -> str | None:
+    if _resource_table_shape(connection, "metadata") != RESOURCE_METADATA_SHAPE:
+        raise RuntimeError("Resource database metadata table is malformed")
+    rows = connection.execute(
+        "SELECT value FROM metadata WHERE key=?",
+        (RESOURCE_LEASE_CONTRACT_METADATA_KEY,),
+    ).fetchall()
+    if not rows:
+        if required:
+            raise RuntimeError(
+                "Resource lease contract metadata is missing; open the store with a "
+                "compatible Grabowski runtime before retrying"
+            )
+        return None
+    if len(rows) != 1:
+        raise RuntimeError("Resource lease contract metadata is ambiguous")
+    version = str(rows[0][0])
+    if not version or len(version.encode("utf-8")) > 32 or not version.isdecimal():
+        raise RuntimeError("Resource lease contract version is malformed")
+    return version
+
+
+def _validate_resource_lease_contract(connection: sqlite3.Connection) -> str:
+    version = _resource_lease_contract_version(connection)
+    if version not in RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS:
+        raise RuntimeError(
+            "Unsupported resource lease contract version; use a compatible runtime"
+        )
+    return version
+
+
+def _publish_resource_lease_contract(connection: sqlite3.Connection) -> None:
+    observed = _resource_lease_contract_version(connection, required=False)
+    if observed is None:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?)",
+            (
+                RESOURCE_LEASE_CONTRACT_METADATA_KEY,
+                RESOURCE_LEASE_CONTRACT_CURRENT_VERSION,
+            ),
+        )
+        return
+    if observed != RESOURCE_LEASE_CONTRACT_CURRENT_VERSION:
+        raise RuntimeError(
+            "Resource lease contract changed while opening; use a compatible runtime"
+        )
+
+
 def _validate_resource_schema_legacy(connection: sqlite3.Connection) -> None:
     if _resource_database_tables(connection) != {"metadata", "leases"}:
         raise RuntimeError("Resource database schema 1 is incomplete or unsupported")
@@ -296,7 +349,9 @@ def _validate_resource_schema_v2(connection: sqlite3.Connection) -> None:
     _validate_additive_schema_v2(connection)
 
 
-def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
+def _validate_resource_schema_current(
+    connection: sqlite3.Connection, *, require_lease_contract: bool = True
+) -> None:
     if _resource_database_tables(connection) != RESOURCE_SCHEMA_V3_TABLES:
         raise RuntimeError("Unsupported resource database schema")
     _validate_resource_schema_v2(connection)
@@ -313,6 +368,8 @@ def _validate_resource_schema_current(connection: sqlite3.Connection) -> None:
             "Resource database schema 3 indexes are incomplete: "
             + ", ".join(sorted(missing))
         )
+    if require_lease_contract:
+        _validate_resource_lease_contract(connection)
 
 
 def _resource_schema_inventory() -> dict[str, Any]:
@@ -323,6 +380,12 @@ def _resource_schema_inventory() -> dict[str, Any]:
         "observed_version": None,
         "current_version": RESOURCE_CURRENT_SCHEMA_VERSION,
         "supported_versions": list(RESOURCE_SUPPORTED_SCHEMA_VERSIONS),
+        "lease_contract_observed_version": None,
+        "lease_contract_current_version": RESOURCE_LEASE_CONTRACT_CURRENT_VERSION,
+        "lease_contract_supported_versions": list(
+            RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS
+        ),
+        "lease_contract_status": "uninitialized",
         "status": "uninitialized",
         "migration_required": False,
         "migration_path": [],
@@ -349,6 +412,30 @@ def _resource_schema_inventory() -> dict[str, Any]:
             _resource_sqlite_integrity(connection, "Resource database", quick=True)
             observed = _resource_schema_version(connection)
             result["observed_version"] = observed
+            lease_contract = _resource_lease_contract_version(
+                connection, required=False
+            )
+            result["lease_contract_observed_version"] = lease_contract
+            if (
+                lease_contract is not None
+                and lease_contract not in RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS
+            ):
+                future_contract = (
+                    lease_contract.isdecimal()
+                    and int(lease_contract)
+                    > int(RESOURCE_LEASE_CONTRACT_CURRENT_VERSION)
+                )
+                result.update(
+                    status=(
+                        "unsupported_future_lease_contract"
+                        if future_contract
+                        else "unsupported_lease_contract"
+                    ),
+                    lease_contract_status="unsupported",
+                    required_action="upgrade_runtime_or_restore_verified_backup",
+                    recovery_instruction=RESOURCE_SCHEMA_RECOVERY_INSTRUCTION,
+                )
+                return result
             if observed not in RESOURCE_SUPPORTED_SCHEMA_VERSIONS:
                 future = (
                     observed is not None
@@ -362,7 +449,11 @@ def _resource_schema_inventory() -> dict[str, Any]:
                 )
                 return result
             if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
-                _validate_resource_schema_current(connection)
+                _validate_resource_schema_current(
+                    connection, require_lease_contract=False
+                )
+            elif observed == "2":
+                _validate_resource_schema_v2(connection)
             else:
                 _validate_resource_schema_legacy(connection)
     except ResourceSchemaInventoryChanged as exc:
@@ -385,11 +476,36 @@ def _resource_schema_inventory() -> dict[str, Any]:
         )
         return result
     if observed == RESOURCE_CURRENT_SCHEMA_VERSION:
-        result.update(status="current", write_compatible=True, required_action="none")
+        if lease_contract is None:
+            result.update(
+                status="lease_contract_metadata_required",
+                lease_contract_status="missing",
+                migration_required=True,
+                required_action="open_with_current_runtime_to_publish_lease_contract",
+                migration_path=[
+                    {
+                        "from": RESOURCE_CURRENT_SCHEMA_VERSION,
+                        "to": RESOURCE_CURRENT_SCHEMA_VERSION,
+                        "lease_contract_from": None,
+                        "lease_contract_to": RESOURCE_LEASE_CONTRACT_CURRENT_VERSION,
+                        "lock": "exclusive_store_directory",
+                        "transaction": "immediate",
+                        "verified_backup_required": True,
+                    }
+                ],
+            )
+            return result
+        result.update(
+            status="current",
+            lease_contract_status="current",
+            write_compatible=True,
+            required_action="none",
+        )
         return result
     path = RESOURCE_SCHEMA_MIGRATION_PATHS[observed]
     result.update(
         status="migration_required",
+        lease_contract_status=("missing" if lease_contract is None else "current"),
         migration_required=True,
         migration_path=[
             {
@@ -428,6 +544,10 @@ def _validate_resource_backup(
             _validate_resource_schema_legacy(backup)
         elif version == "2":
             _validate_resource_schema_v2(backup)
+        elif version == "3":
+            _validate_resource_schema_current(
+                backup, require_lease_contract=False
+            )
         else:
             raise RuntimeError("Resource migration backup schema version is unsupported")
         if _resource_sqlite_fingerprint(backup) != fingerprint:
@@ -508,7 +628,21 @@ def _preflight_resource_store() -> str | None:
         elif version == "2":
             _validate_resource_schema_v2(connection)
         else:
-            _validate_resource_schema_current(connection)
+            _validate_resource_schema_current(
+                connection, require_lease_contract=False
+            )
+        lease_contract = _resource_lease_contract_version(
+            connection, required=False
+        )
+        if (
+            lease_contract is not None
+            and lease_contract not in RESOURCE_LEASE_CONTRACT_SUPPORTED_VERSIONS
+        ):
+            raise RuntimeError(
+                "Unsupported resource lease contract version; use a compatible runtime"
+            )
+        if version == RESOURCE_CURRENT_SCHEMA_VERSION and lease_contract is None:
+            return f"{version}:lease-contract-missing"
         return version
 
 
@@ -584,6 +718,7 @@ def _create_resource_schema_v3(connection: sqlite3.Connection) -> None:
     connection.execute(
         "INSERT INTO metadata(key, value) VALUES('schema_version', '3')"
     )
+    _publish_resource_lease_contract(connection)
 
 
 def _migrate_resource_schema_v1(connection: sqlite3.Connection) -> None:
@@ -591,6 +726,7 @@ def _migrate_resource_schema_v1(connection: sqlite3.Connection) -> None:
     connection.execute(
         "UPDATE metadata SET value='3' WHERE key='schema_version'"
     )
+    _publish_resource_lease_contract(connection)
 
 
 def _migrate_resource_schema_v2(connection: sqlite3.Connection) -> None:
@@ -605,6 +741,7 @@ def _migrate_resource_schema_v2(connection: sqlite3.Connection) -> None:
     connection.execute(
         "UPDATE metadata SET value='3' WHERE key='schema_version'"
     )
+    _publish_resource_lease_contract(connection)
 
 
 def _connect_existing_resource_database() -> sqlite3.Connection:
@@ -690,7 +827,18 @@ def _database() -> sqlite3.Connection:
                 _verified_resource_migration_backup(version, fingerprint)
                 _migrate_resource_schema_v2(connection)
             else:
-                _validate_resource_schema_current(connection)
+                _validate_resource_schema_current(
+                    connection, require_lease_contract=False
+                )
+                if _resource_lease_contract_version(
+                    connection, required=False
+                ) is None:
+                    _resource_sqlite_integrity(connection, "Resource database")
+                    fingerprint = _resource_sqlite_fingerprint(connection)
+                    _verified_resource_migration_backup(version, fingerprint)
+                    _publish_resource_lease_contract(connection)
+                else:
+                    _validate_resource_lease_contract(connection)
             if _resource_schema_version(connection) != "3":
                 raise RuntimeError("Resource database migration did not reach schema 3")
             _validate_resource_schema_current(connection)

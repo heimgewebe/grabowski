@@ -204,6 +204,13 @@ class ResourceTests(unittest.TestCase):
                 ).fetchone()[0],
             )
             self.assertEqual(
+                "1",
+                connection.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='resource_lease_contract_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
                 ("task-v2", "guard-v2", "lease-v2", 1, 2, "a" * 64),
                 connection.execute(
                     """
@@ -232,6 +239,108 @@ class ResourceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "Unsupported resource database schema"):
             resources.count_resources()
+
+    def test_schema_v3_missing_lease_contract_is_promoted_without_schema_bump(self) -> None:
+        resources.acquire_resources(
+            "owner-before-contract",
+            ["component:lease-contract-fixture"],
+            purpose="preserve lease across contract metadata promotion",
+            ttl_seconds=120,
+        )
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "DELETE FROM metadata WHERE key='resource_lease_contract_version'"
+            )
+            connection.commit()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+
+        inventory = resources.grabowski_resource_list(schema_only=True)
+
+        self.assertEqual("3", inventory["observed_version"])
+        self.assertIsNone(inventory["lease_contract_observed_version"])
+        self.assertEqual("1", inventory["lease_contract_current_version"])
+        self.assertEqual("missing", inventory["lease_contract_status"])
+        self.assertEqual("lease_contract_metadata_required", inventory["status"])
+        self.assertTrue(inventory["migration_required"])
+        self.assertFalse(inventory["write_compatible"])
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+
+        self.assertEqual(1, resources.count_resources())
+
+        with sqlite3.connect(self.database) as connection:
+            metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+            self.assertEqual("3", metadata["schema_version"])
+            self.assertEqual("1", metadata["resource_lease_contract_version"])
+            self.assertEqual(
+                1,
+                connection.execute(
+                    "SELECT COUNT(*) FROM leases "
+                    "WHERE owner_id='owner-before-contract'"
+                ).fetchone()[0],
+            )
+        backups = self._resource_migration_backups()
+        self.assertEqual(1, len(backups))
+        with sqlite3.connect(backups[0]) as backup:
+            self.assertEqual(
+                "3",
+                backup.execute(
+                    "SELECT value FROM metadata WHERE key='schema_version'"
+                ).fetchone()[0],
+            )
+            self.assertIsNone(
+                backup.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='resource_lease_contract_version'"
+                ).fetchone()
+            )
+
+    def test_future_lease_contract_fails_closed_without_side_effects(self) -> None:
+        resources.count_resources()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='2' "
+                "WHERE key='resource_lease_contract_version'"
+            )
+            connection.commit()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+        before_sidecars = sorted(
+            item.name for item in self.database.parent.glob(self.database.name + "-*")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "lease contract version"):
+            resources.count_resources()
+
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
+        self.assertEqual(
+            before_sidecars,
+            sorted(
+                item.name for item in self.database.parent.glob(self.database.name + "-*")
+            ),
+        )
+        inventory = resources.grabowski_resource_list(schema_only=True)
+        self.assertEqual("unsupported_future_lease_contract", inventory["status"])
+        self.assertEqual("unsupported", inventory["lease_contract_status"])
+
+    def test_malformed_lease_contract_fails_closed_without_side_effects(self) -> None:
+        resources.count_resources()
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE metadata SET value='not-a-version' "
+                "WHERE key='resource_lease_contract_version'"
+            )
+            connection.commit()
+        before = self.database.read_bytes()
+        before_stat = self.database.stat()
+
+        with self.assertRaisesRegex(RuntimeError, "lease contract version is malformed"):
+            resources.count_resources()
+
+        self.assertEqual(before, self.database.read_bytes())
+        self.assertEqual(before_stat.st_mtime_ns, self.database.stat().st_mtime_ns)
 
     def test_raced_away_current_resource_store_is_not_recreated(self) -> None:
         with resources._database():
@@ -1595,6 +1704,10 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual("1", inventory["observed_version"])
         self.assertEqual("3", inventory["current_version"])
         self.assertEqual(["1", "2", "3"], inventory["supported_versions"])
+        self.assertIsNone(inventory["lease_contract_observed_version"])
+        self.assertEqual("1", inventory["lease_contract_current_version"])
+        self.assertEqual(["1"], inventory["lease_contract_supported_versions"])
+        self.assertEqual("missing", inventory["lease_contract_status"])
         self.assertEqual("migration_required", inventory["status"])
         self.assertTrue(inventory["migration_required"])
         self.assertFalse(inventory["write_compatible"])
@@ -1647,6 +1760,8 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(1, integrity.call_count)
         inventory = resources.grabowski_resource_list(schema_only=True)
         self.assertEqual("3", inventory["observed_version"])
+        self.assertEqual("1", inventory["lease_contract_observed_version"])
+        self.assertEqual("current", inventory["lease_contract_status"])
         self.assertEqual("current", inventory["status"])
         self.assertTrue(inventory["write_compatible"])
         self.assertFalse(inventory["migration_required"])
