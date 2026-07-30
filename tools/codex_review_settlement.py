@@ -603,8 +603,9 @@ def _review_completion(
     requests: list[dict[str, Any]],
     head_sha: str,
 ) -> dict[str, Any] | None:
-    request = requests[0]
-    request_time = request["_created"]
+    if not requests:
+        raise SettlementError("review completion requires at least one request")
+    request_time = max(item["_created"] for item in requests)
     candidates: list[dict[str, Any]] = []
     for review in _list_nodes(pr.get("reviews"), label="reviews"):
         actor = _actor_login(review.get("author"))
@@ -701,7 +702,6 @@ def _review_completion(
     reaction_candidates: list[dict[str, Any]] = []
     for reacted_request in requests:
         request_comment_id = reacted_request["databaseId"]
-        reacted_request_time = reacted_request["_created"]
         reactions = reacted_request.get("reactions")
         for reaction in _list_nodes(
             reactions,
@@ -713,7 +713,7 @@ def _review_completion(
                 actor in TRUSTED_CODEX_ACTORS
                 and reaction.get("content") == "THUMBS_UP"
                 and created is not None
-                and created >= reacted_request_time
+                and created >= request_time
             ):
                 reaction_candidates.append(
                     {

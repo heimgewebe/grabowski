@@ -714,6 +714,101 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("reaction", result["evidence"]["completion"]["mode"])
         self.assertEqual(1002, result["evidence"]["completion"]["comment_id"])
 
+    def test_latest_edited_request_controls_review_cutoff(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(
+                    comment_id=1001,
+                    created_at="2026-07-26T08:00:00Z",
+                    updated_at="2026-07-26T08:02:00Z",
+                ),
+                request_comment(
+                    comment_id=1002,
+                    created_at="2026-07-26T08:01:00Z",
+                    updated_at="2026-07-26T08:04:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection(
+            [codex_review(submitted_at="2026-07-26T08:03:00Z")],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertTrue(result["request_present"])
+        self.assertFalse(result["review_performed"])
+        self.assertFalse(result["settled"])
+
+    def test_latest_edited_request_controls_reaction_cutoff(self) -> None:
+        state = base_state()
+        earliest = request_comment(
+            comment_id=1001,
+            created_at="2026-07-26T08:00:00Z",
+            updated_at="2026-07-26T08:02:00Z",
+        )
+        latest = request_comment(
+            comment_id=1002,
+            created_at="2026-07-26T08:01:00Z",
+            updated_at="2026-07-26T08:04:00Z",
+        )
+        earliest["reactions"] = connection(
+            [
+                {
+                    "content": "THUMBS_UP",
+                    "createdAt": "2026-07-26T08:03:00Z",
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                }
+            ],
+            hasNextPage=False,
+        )
+        state["comments"] = connection(
+            [earliest, latest],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("pending", result["status"])
+        self.assertFalse(result["settled"])
+
+    def test_request_posts_after_latest_edited_cutoff(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [
+                request_comment(
+                    comment_id=1001,
+                    created_at="2026-07-26T08:00:00Z",
+                    updated_at="2026-07-26T08:02:00Z",
+                ),
+                request_comment(
+                    comment_id=1002,
+                    created_at="2026-07-26T08:01:00Z",
+                    updated_at="2026-07-26T08:04:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection(
+            [codex_review(submitted_at="2026-07-26T08:03:00Z")],
+            hasPreviousPage=False,
+        )
+        with mock.patch.object(
+            settlement, "_live_state", return_value=state
+        ), mock.patch.object(
+            settlement, "_run_json", return_value={"id": 4003}
+        ) as run_json:
+            result = settlement.ensure_request(
+                ROOT, REPOSITORY, PR, force=True
+            )
+
+        self.assertTrue(result["requested"])
+        self.assertEqual(4003, result["comment_id"])
+        run_json.assert_called_once()
+
     def test_graphql_actions_actor_without_bot_suffix_is_trusted(self) -> None:
         state = base_state()
         state["comments"] = connection(
