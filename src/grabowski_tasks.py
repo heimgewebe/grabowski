@@ -82,6 +82,7 @@ CARGO_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])cargo(?:$|[^A-Za-z0-9_])")
 JUST_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])just(?:$|[^A-Za-z0-9_])")
 MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
+MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
 # One re-entrant in-process lock plus one shared file lock serializes every
 # persistent-task mutation across the MCP runtime and the timer-driven
@@ -291,6 +292,28 @@ TASK_SCHEMA_V5_ADDITIVE_COLUMNS = {
 }
 LEASE_MAINTENANCE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
+TASK_RETRY_CONTEXT_SCHEMA_VERSION = 1
+TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION = 1
+TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "source_task_id",
+        "source_attempt",
+        "source_state",
+        "source_resume_policy",
+        "source_unit",
+        "source_authoritative_unit",
+        "source_updated_at_unix",
+        "source_execution_identity_sha256",
+        "source_recovery_evidence_sha256",
+        "named_state_change",
+        "admitted_at_unix",
+        "does_not_establish",
+        "context_sha256",
+    }
+)
+UNCHANGED_RETRY_STATES = frozenset(TASK_STATE_PROJECTIONS["attention"])
 
 
 def _now() -> int:
@@ -1416,13 +1439,13 @@ def _managed_cargo_profile(command: list[str]) -> str:
     return "dev"
 
 
-def _resolve_managed_cargo_target_dir(
+def _managed_cargo_request_root(
     command: list[str],
     *,
     target: dict[str, Any],
     cwd: str,
     execution_backend: str,
-) -> str | None:
+) -> Path | None:
     if target["transport"] != "local" or execution_backend != "systemd-user":
         return None
     if _explicit_cargo_target_dir(command):
@@ -1431,6 +1454,24 @@ def _resolve_managed_cargo_target_dir(
     if root is None or not _regular_cargo_lock(root):
         return None
     if not _command_may_invoke_cargo(command, cwd=cwd, root=root):
+        return None
+    return root
+
+
+def _resolve_managed_cargo_target_dir(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+) -> str | None:
+    root = _managed_cargo_request_root(
+        command,
+        target=target,
+        cwd=cwd,
+        execution_backend=execution_backend,
+    )
+    if root is None:
         return None
     try:
         resolver_info = MANAGED_BUILD_RESOLVER.lstat()
@@ -1522,7 +1563,7 @@ def _resolve_managed_cargo_target_dir(
     return str(target_dir)
 
 
-def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
+def _managed_cargo_lifecycle_lock_path(cargo_target_dir: str) -> Path:
     target_dir = Path(cargo_target_dir)
     cache_path = target_dir.parent
     try:
@@ -1534,6 +1575,11 @@ def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
     cache_key = relative.parts[0]
     if SHA256.fullmatch(cache_key) is None:
         raise RuntimeError("managed Cargo cache key is invalid for lifecycle lock")
+    return MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+
+
+def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
+    lifecycle_lock = _managed_cargo_lifecycle_lock_path(cargo_target_dir)
     try:
         MANAGED_CARGO_LOCK_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         resolved_lock_root = MANAGED_CARGO_LOCK_ROOT.resolve(strict=True)
@@ -1547,7 +1593,7 @@ def _managed_cargo_lifecycle_lock(cargo_target_dir: str) -> Path:
         raise RuntimeError("managed Cargo lifecycle lock root is unsafe")
     if not Path(FLOCK_EXECUTABLE).is_file() or not os.access(FLOCK_EXECUTABLE, os.X_OK):
         raise RuntimeError("managed Cargo lifecycle lock executable is unavailable")
-    return MANAGED_CARGO_LOCK_ROOT / f"{cache_key}.lock"
+    return lifecycle_lock
 
 
 def _bind_managed_cargo_environment(
@@ -1953,10 +1999,921 @@ def _lease_owner(task_id: str) -> str:
 
 def _record_resource_keys(record: dict[str, Any]) -> list[str]:
     raw = record.get("resource_keys_json") or "[]"
-    values = json.loads(raw)
+    try:
+        values = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise RuntimeError("stored task resource keys are invalid") from exc
     if not isinstance(values, list):
-        raise RuntimeError("Stored task resource keys are invalid")
-    return [resources.normalize_resource_key(value) for value in values]
+        raise RuntimeError("stored task resource keys are invalid")
+    try:
+        return [resources.normalize_resource_key(value) for value in values]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("stored task resource keys are invalid") from exc
+
+
+def _task_execution_identity(
+    *,
+    host: str,
+    argv_sha256: str,
+    cwd: str,
+    resource_keys: list[str],
+    runtime_seconds: int,
+    cpu_weight: int,
+    io_weight: int,
+    memory_max_bytes: int | None,
+    chronik_outbox_enabled: bool,
+    chronik_outbox_state_root: str | None,
+    chronik_context_json: str | None,
+    execution_backend: str,
+    systemd_scope: str,
+) -> dict[str, Any]:
+    chronik_context: dict[str, Any] | None = None
+    if chronik_context_json is not None:
+        try:
+            decoded_chronik_context = json.loads(chronik_context_json)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("stored task Chronik context is invalid") from exc
+        if not isinstance(decoded_chronik_context, dict):
+            raise RuntimeError("stored task Chronik context is invalid")
+        chronik_context = decoded_chronik_context
+    return terminal_convergence.task_execution_identity(
+        host=host,
+        argv_sha256=argv_sha256,
+        cwd=cwd,
+        resource_keys=[
+            resources.normalize_resource_key(value) for value in resource_keys
+        ],
+        runtime_seconds=runtime_seconds,
+        cpu_weight=cpu_weight,
+        io_weight=io_weight,
+        memory_max_bytes=memory_max_bytes,
+        chronik_outbox_enabled=chronik_outbox_enabled,
+        chronik_outbox_state_root=chronik_outbox_state_root,
+        chronik_context=chronik_context,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+
+
+def _record_execution_identity(record: dict[str, Any]) -> dict[str, Any]:
+    return _task_execution_identity(
+        host=str(record["host"]),
+        argv_sha256=str(record["argv_sha256"]),
+        cwd=str(record["cwd"]),
+        resource_keys=_record_resource_keys(record),
+        runtime_seconds=int(record["runtime_seconds"]),
+        cpu_weight=int(record["cpu_weight"]),
+        io_weight=int(record["io_weight"]),
+        memory_max_bytes=(
+            None
+            if record.get("memory_max_bytes") is None
+            else int(record["memory_max_bytes"])
+        ),
+        chronik_outbox_enabled=bool(record.get("chronik_outbox_enabled")),
+        chronik_outbox_state_root=record.get("chronik_outbox_state_root"),
+        chronik_context_json=record.get("chronik_context_json"),
+        execution_backend=_execution_backend(record),
+        systemd_scope=_systemd_scope(record),
+    )
+
+
+def _latest_matching_execution_record(
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    with _database_connection() as connection:
+        row = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 1",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+            ),
+        ).fetchone()
+    if row is None:
+        return None
+    record = dict(row)
+    if (
+        _record_execution_identity(record)["identity_sha256"]
+        != identity["identity_sha256"]
+    ):
+        raise RuntimeError("stored task execution identity is inconsistent")
+    return record
+
+
+def _matching_attention_execution_records(
+    identity: dict[str, Any],
+) -> list[dict[str, Any]]:
+    attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
+    placeholders = ",".join("?" for _ in attention_states)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND state IN ({placeholders}) "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+                *attention_states,
+            ),
+        ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("matching attention execution scan limit exceeded")
+    records = [dict(row) for row in rows]
+    if any(
+        _record_execution_identity(record)["identity_sha256"]
+        != identity["identity_sha256"]
+        for record in records
+    ):
+        raise RuntimeError("stored task execution identity is inconsistent")
+    return records
+
+
+def _build_terminal_retry_context(
+    record: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    normalized_reason = _redact_reason(reason.strip())
+    if not normalized_reason:
+        raise ValueError("named retry state change is required")
+    state = str(record["state"])
+    if state not in UNCHANGED_RETRY_STATES:
+        raise ValueError("retry source task is not an attention state")
+    lifecycle_receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    terminalization_sha256 = record.get("terminalization_sha256")
+    if not isinstance(lifecycle_receipt_sha256, str) or len(lifecycle_receipt_sha256) != 64:
+        raise ValueError("retry source lifecycle receipt is missing")
+    if not isinstance(terminalization_sha256, str) or len(terminalization_sha256) != 64:
+        raise ValueError("retry source terminalization receipt is missing")
+    material = {
+        "schema_version": TASK_RETRY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_terminal_retry",
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]),
+        "source_state": state,
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        "source_terminalization_sha256": terminalization_sha256,
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+        "named_state_change": normalized_reason,
+        "observed_at_unix": _now(),
+        "does_not_establish": [
+            "that_the_named_change_is_sufficient",
+            "that_the_retry_will_succeed",
+            "automatic_retry_authority",
+        ],
+    }
+    return {**material, "context_sha256": _sha256_json(material)}
+
+
+def _validate_terminal_retry_context(
+    context: dict[str, Any],
+    *,
+    predecessor: dict[str, Any],
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(context, dict):
+        raise ValueError("terminal retry context must be an object")
+    context_sha256 = context.get("context_sha256")
+    material = {key: value for key, value in context.items() if key != "context_sha256"}
+    if not isinstance(context_sha256, str) or context_sha256 != _sha256_json(material):
+        raise ValueError("terminal retry context integrity is invalid")
+    expected = {
+        "source_task_id": str(predecessor["task_id"]),
+        "source_attempt": int(predecessor["attempt"]),
+        "source_state": str(predecessor["state"]),
+        "source_resume_policy": str(predecessor["resume_policy"]),
+        "source_lifecycle_receipt_sha256": predecessor.get(
+            "lifecycle_receipt_sha256"
+        ),
+        "source_terminalization_sha256": predecessor.get(
+            "terminalization_sha256"
+        ),
+        "source_execution_identity_sha256": identity["identity_sha256"],
+    }
+    if context.get("schema_version") != TASK_RETRY_CONTEXT_SCHEMA_VERSION:
+        raise ValueError("terminal retry context schema is invalid")
+    if context.get("kind") != "grabowski_named_terminal_retry":
+        raise ValueError("terminal retry context kind is invalid")
+    for key, value in expected.items():
+        if context.get(key) != value:
+            raise ValueError(f"terminal retry context {key} binding is stale")
+    named_state_change = context.get("named_state_change")
+    if not isinstance(named_state_change, str) or not named_state_change.strip():
+        raise ValueError("terminal retry context requires a named state change")
+    observed_at_unix = context.get("observed_at_unix")
+    now = _now()
+    if (
+        isinstance(observed_at_unix, bool)
+        or not isinstance(observed_at_unix, int)
+        or observed_at_unix < 0
+        or observed_at_unix > now + 300
+    ):
+        raise ValueError("terminal retry context timestamp is invalid")
+    return {
+        "schema_version": TASK_RETRY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_terminal_retry",
+        "source_task_id": expected["source_task_id"],
+        "source_attempt": expected["source_attempt"],
+        "source_state": expected["source_state"],
+        "source_resume_policy": expected["source_resume_policy"],
+        "source_lifecycle_receipt_sha256": expected[
+            "source_lifecycle_receipt_sha256"
+        ],
+        "source_terminalization_sha256": expected[
+            "source_terminalization_sha256"
+        ],
+        "source_execution_identity_sha256": expected[
+            "source_execution_identity_sha256"
+        ],
+        "named_state_change": named_state_change,
+        "observed_at_unix": observed_at_unix,
+        "does_not_establish": list(context.get("does_not_establish") or []),
+        "context_sha256": context_sha256,
+    }
+
+
+def _interrupted_recovery_evidence_projection(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    if str(record.get("state")) != "interrupted":
+        raise ValueError("interrupted recovery source task is not interrupted")
+    if not isinstance(observation, dict):
+        raise ValueError("interrupted recovery observation is invalid")
+    properties = observation.get("properties")
+    probe = observation.get("probe")
+    observer = observation.get("observer")
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(probe, dict)
+        or not isinstance(observer, dict)
+    ):
+        raise ValueError("interrupted recovery observation evidence is incomplete")
+    if properties.get("LoadState") != "not-found":
+        raise ValueError("interrupted recovery old unit is not confirmed absent")
+    if properties.get("ActiveState") not in {None, "", "inactive"}:
+        raise ValueError("interrupted recovery old unit state is not safely absent")
+    if properties.get("SubState") not in {None, "", "dead"}:
+        raise ValueError("interrupted recovery old unit substate is not safely absent")
+    if properties.get("Result") not in {None, "", "success"}:
+        raise ValueError("interrupted recovery old unit retains a material result")
+    if properties.get("ExecMainCode") not in {None, "", "0"}:
+        raise ValueError("interrupted recovery old unit retains a material exit code")
+    if properties.get("ExecMainStatus") not in {None, "", "0"}:
+        raise ValueError("interrupted recovery old unit retains a material exit status")
+    returncode = probe.get("returncode")
+    if (
+        isinstance(returncode, bool)
+        or not isinstance(returncode, int)
+        or returncode not in {0, 1, 3, 4}
+        or bool(probe.get("timed_out"))
+        or bool(probe.get("outcome_unknown"))
+    ):
+        raise ValueError("interrupted recovery probe transport is not authoritative")
+    expected_backend = _execution_backend(record)
+    expected_scope = _systemd_scope(record)
+    if (
+        observer.get("execution_backend") != expected_backend
+        or observer.get("systemd_scope") != expected_scope
+        or not isinstance(observer.get("kind"), str)
+        or not str(observer.get("kind")).strip()
+    ):
+        raise ValueError("interrupted recovery observer binding is invalid")
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_interrupted_unit_absence_evidence",
+        "source_task_id": str(record["task_id"]),
+        "source_unit": str(record["unit"]),
+        "source_authoritative_unit": _authoritative_unit(record),
+        "execution_backend": expected_backend,
+        "systemd_scope": expected_scope,
+        "observer_kind": str(observer["kind"]),
+        "observation_state": str(observation.get("state") or ""),
+        "load_state": "not-found",
+        "active_state": str(properties.get("ActiveState") or ""),
+        "sub_state": str(properties.get("SubState") or ""),
+        "result": str(properties.get("Result") or ""),
+        "exec_main_code": str(properties.get("ExecMainCode") or ""),
+        "exec_main_status": str(properties.get("ExecMainStatus") or ""),
+        "probe_returncode": returncode,
+        "probe_timed_out": False,
+        "probe_outcome_unknown": False,
+    }
+
+
+def _build_interrupted_recovery_context(
+    record: dict[str, Any],
+    observation: dict[str, Any],
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    normalized_reason = _redact_reason(reason.strip())
+    if not normalized_reason:
+        raise ValueError("named interrupted recovery state change is required")
+    recovery_evidence = _interrupted_recovery_evidence_projection(record, observation)
+    material = {
+        "schema_version": TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_interrupted_recovery",
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]),
+        "source_state": "interrupted",
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_unit": str(record["unit"]),
+        "source_authoritative_unit": _authoritative_unit(record),
+        "source_updated_at_unix": int(record["updated_at_unix"]),
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+        "source_recovery_evidence_sha256": _sha256_json(recovery_evidence),
+        "named_state_change": normalized_reason,
+        "admitted_at_unix": _now(),
+        "does_not_establish": [
+            "that_the_interrupted_execution_failed",
+            "that_the_named_change_is_sufficient",
+            "that_the_recovery_will_succeed",
+            "automatic_retry_authority",
+        ],
+    }
+    return {**material, "context_sha256": _sha256_json(material)}
+
+
+def _validate_interrupted_recovery_context(
+    context: dict[str, Any],
+    *,
+    record: dict[str, Any],
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    required = TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS
+    if not isinstance(context, dict) or set(context) != required:
+        raise ValueError("interrupted recovery context shape is invalid")
+    material = {key: context[key] for key in required - {"context_sha256"}}
+    if context.get("context_sha256") != _sha256_json(material):
+        raise ValueError("interrupted recovery context integrity is invalid")
+    if (
+        context.get("schema_version")
+        != TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION
+        or context.get("kind") != "grabowski_named_interrupted_recovery"
+    ):
+        raise ValueError("interrupted recovery context contract is invalid")
+    recovery_evidence = _interrupted_recovery_evidence_projection(record, observation)
+    expected = {
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]),
+        "source_state": "interrupted",
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_unit": str(record["unit"]),
+        "source_authoritative_unit": _authoritative_unit(record),
+        "source_updated_at_unix": int(record["updated_at_unix"]),
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+        "source_recovery_evidence_sha256": _sha256_json(recovery_evidence),
+    }
+    for key, value in expected.items():
+        if context.get(key) != value:
+            raise ValueError(f"interrupted recovery context {key} binding is stale")
+    named_state_change = context.get("named_state_change")
+    if not isinstance(named_state_change, str) or not named_state_change.strip():
+        raise ValueError("interrupted recovery context requires a named state change")
+    admitted_at_unix = context.get("admitted_at_unix")
+    now = _now()
+    if (
+        isinstance(admitted_at_unix, bool)
+        or not isinstance(admitted_at_unix, int)
+        or admitted_at_unix < 0
+        or admitted_at_unix > now + 300
+    ):
+        raise ValueError("interrupted recovery context timestamp is invalid")
+    non_claims = context.get("does_not_establish")
+    if not isinstance(non_claims, list) or any(
+        not isinstance(item, str) or not item for item in non_claims
+    ):
+        raise ValueError("interrupted recovery context non-claims are invalid")
+    return dict(context)
+
+
+
+def _persisted_retry_binding_or_raise(record: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        return terminal_convergence.persisted_retry_binding(record)
+    except terminal_convergence.TerminalConvergenceError as exc:
+        raise RuntimeError("stored retry admission evidence is invalid") from exc
+
+
+def _persisted_interrupted_recovery_binding_or_raise(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw_launcher = record.get("launcher_json")
+    if raw_launcher in {None, ""}:
+        return None
+    try:
+        launcher = json.loads(str(raw_launcher))
+    except (json.JSONDecodeError, TypeError) as exc:
+        if "interrupted_recovery_binding" in str(raw_launcher):
+            raise RuntimeError(
+                "stored interrupted recovery admission evidence is invalid"
+            ) from exc
+        return None
+    if not isinstance(launcher, dict):
+        return None
+    binding = launcher.get("interrupted_recovery_binding")
+    if binding is None:
+        return None
+    if not isinstance(binding, dict) or set(binding) != set(
+        TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS
+    ):
+        raise RuntimeError("stored interrupted recovery admission evidence is invalid")
+    material = {
+        key: binding[key]
+        for key in TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS
+        if key != "context_sha256"
+    }
+    source_attempt = binding.get("source_attempt")
+    if (
+        isinstance(source_attempt, bool)
+        or not isinstance(source_attempt, int)
+        or source_attempt < 1
+    ):
+        raise RuntimeError("stored interrupted recovery admission evidence is invalid")
+    source_unit = _task_unit(str(record["task_id"]), source_attempt)
+    expected = {
+        "schema_version": TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION,
+        "kind": "grabowski_named_interrupted_recovery",
+        "source_task_id": str(record["task_id"]),
+        "source_attempt": int(record["attempt"]) - 1,
+        "source_state": "interrupted",
+        "source_resume_policy": str(record["resume_policy"]),
+        "source_unit": source_unit,
+        "source_authoritative_unit": source_unit,
+        "source_execution_identity_sha256": _record_execution_identity(record)[
+            "identity_sha256"
+        ],
+    }
+    source_updated_at_unix = binding.get("source_updated_at_unix")
+    admitted_at_unix = binding.get("admitted_at_unix")
+    named_state_change = binding.get("named_state_change")
+    source_recovery_evidence_sha256 = binding.get("source_recovery_evidence_sha256")
+    non_claims = binding.get("does_not_establish")
+    if (
+        binding.get("context_sha256") != _sha256_json(material)
+        or any(binding.get(key) != value for key, value in expected.items())
+        or isinstance(source_updated_at_unix, bool)
+        or not isinstance(source_updated_at_unix, int)
+        or source_updated_at_unix < 0
+        or isinstance(admitted_at_unix, bool)
+        or not isinstance(admitted_at_unix, int)
+        or admitted_at_unix < source_updated_at_unix
+        or not isinstance(named_state_change, str)
+        or not named_state_change.strip()
+        or not isinstance(source_recovery_evidence_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_recovery_evidence_sha256) is None
+        or not isinstance(non_claims, list)
+        or any(not isinstance(item, str) or not item for item in non_claims)
+    ):
+        raise RuntimeError("stored interrupted recovery admission evidence is invalid")
+    return dict(binding)
+
+
+def _retained_retry_successor_for_source(
+    source_task_id: str,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(source_task_id, str)
+        or terminal_convergence.TASK_ID_RE.fullmatch(source_task_id) is None
+    ):
+        raise ValueError("retry successor source task id is invalid")
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE task_id<>? AND state<>'cancelled' "
+            "AND launcher_json IS NOT NULL AND ("
+            "(json_valid(launcher_json) "
+            "AND json_type(launcher_json, '$.retry_binding.source_task_id') = 'text' "
+            "AND json_extract(launcher_json, '$.retry_binding.source_task_id')=?) "
+            "OR (NOT json_valid(launcher_json) AND instr(launcher_json, ?) > 0)"
+            ") ORDER BY created_at_unix DESC, rowid DESC LIMIT 2",
+            (source_task_id, source_task_id, '"retry_binding"'),
+        ).fetchall()
+    if not rows:
+        return None
+    records = [dict(row) for row in rows]
+    for record in records:
+        binding = _persisted_retry_binding_or_raise(record)
+        if binding is None or str(binding.get("source_task_id")) != source_task_id:
+            raise RuntimeError("stored retry admission evidence is invalid")
+    if len(records) > 1:
+        raise RuntimeError("named retry source has multiple retained successors")
+    return records[0]
+
+
+def _guard_linked_retry_successor(
+    latest: dict[str, Any] | None,
+    *,
+    source_task_id: str,
+) -> None:
+    if latest is not None and str(latest["task_id"]) != source_task_id:
+        binding = _persisted_retry_binding_or_raise(latest)
+        if binding is not None and str(latest["state"]) in {
+            "launching",
+            "running",
+            "outcome_unknown",
+        }:
+            raise RuntimeError(
+                "unchanged task start blocked by unresolved retry successor; "
+                f"reconcile task {latest['task_id']} before another start"
+            )
+    retained = _retained_retry_successor_for_source(source_task_id)
+    if retained is None:
+        return
+    retained_state = str(retained["state"])
+    if retained_state in {"launching", "running", "outcome_unknown"}:
+        raise RuntimeError(
+            "unchanged task start blocked by unresolved retry successor; "
+            f"reconcile task {retained['task_id']} before another start"
+        )
+    raise RuntimeError(
+        "named retry source already has a retained successor; "
+        f"reconcile task {retained['task_id']} instead"
+    )
+
+
+def _execution_identity_without_command(identity: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in identity.items()
+        if key not in {"argv_sha256", "identity_sha256"}
+    }
+
+
+def _record_matches_unprepared_managed_cargo_command(
+    record: dict[str, Any],
+    command: list[str],
+) -> bool:
+    try:
+        stored = json.loads(str(record["argv_json"]))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError("stored task argv is invalid") from exc
+    if not isinstance(stored, list) or any(not isinstance(item, str) for item in stored):
+        raise RuntimeError("stored task argv is invalid")
+    if stored == command:
+        return True
+
+    # An explicitly managed CARGO_TARGET_DIR is lifecycle-fenced by prefixing
+    # only the flock wrapper. Match that persisted form before the lock root is
+    # prepared again, so an unchanged terminal retry remains effect-free.
+    if len(stored) == len(command) + 3 and stored[3:] == command:
+        target_dir = _explicit_managed_cargo_target_dir(command)
+        if (
+            stored[0] != FLOCK_EXECUTABLE
+            or stored[1] != "--shared"
+            or target_dir is None
+        ):
+            raise RuntimeError("stored managed Cargo task wrapper is invalid")
+        expected_lock = _managed_cargo_lifecycle_lock_path(target_dir)
+        if stored[2] != str(expected_lock):
+            raise RuntimeError("stored managed Cargo task lock binding is invalid")
+        return True
+
+    # An unprepared Cargo request gains both the lifecycle flock and an env
+    # assignment produced by the managed-build resolver.
+    if len(stored) != len(command) + 5 or stored[5:] != command:
+        return False
+    if (
+        stored[0] != FLOCK_EXECUTABLE
+        or stored[1] != "--shared"
+        or Path(stored[3]).name != Path(SYSTEMD_ENV_EXECUTABLE).name
+        or not stored[4].startswith("CARGO_TARGET_DIR=")
+    ):
+        raise RuntimeError("stored managed Cargo task wrapper is invalid")
+    target_dir = stored[4].removeprefix("CARGO_TARGET_DIR=")
+    expected_lock = _managed_cargo_lifecycle_lock_path(target_dir)
+    if stored[2] != str(expected_lock):
+        raise RuntimeError("stored managed Cargo task lock binding is invalid")
+    return True
+
+
+def _managed_cargo_command_sql_predicate(
+    command: list[str],
+) -> tuple[str, tuple[Any, ...]]:
+    if not command or any(not isinstance(item, str) for item in command):
+        raise ValueError("managed Cargo command must contain only strings")
+
+    clauses = ["argv_json=?"]
+    parameters: list[Any] = [_canonical_json(command)]
+    explicit_target = _explicit_managed_cargo_target_dir(command)
+    if explicit_target is not None:
+        clauses.append("argv_json=?")
+        parameters.append(
+            _canonical_json(
+                [
+                    FLOCK_EXECUTABLE,
+                    "--shared",
+                    str(_managed_cargo_lifecycle_lock_path(explicit_target)),
+                    *command,
+                ]
+            )
+        )
+
+    target_prefix = "CARGO_TARGET_DIR="
+    wrapper_terms = [
+        "json_valid(argv_json)",
+        "json_type(argv_json)='array'",
+        "json_array_length(argv_json)=?",
+        "json_type(argv_json, '$[0]')='text'",
+        "json_extract(argv_json, '$[0]')=?",
+        "json_type(argv_json, '$[1]')='text'",
+        "json_extract(argv_json, '$[1]')=?",
+        "json_type(argv_json, '$[2]')='text'",
+        "json_type(argv_json, '$[3]')='text'",
+        "(json_extract(argv_json, '$[3]')=? "
+        "OR json_extract(argv_json, '$[3]') GLOB '*/env')",
+        "json_type(argv_json, '$[4]')='text'",
+        "substr(json_extract(argv_json, '$[4]'), 1, ?)=?",
+    ]
+    wrapper_parameters: list[Any] = [
+        len(command) + 5,
+        FLOCK_EXECUTABLE,
+        "--shared",
+        Path(SYSTEMD_ENV_EXECUTABLE).name,
+        len(target_prefix),
+        target_prefix,
+    ]
+    for index, item in enumerate(command, start=5):
+        wrapper_terms.extend(
+            [
+                f"json_type(argv_json, '$[{index}]')='text'",
+                f"json_extract(argv_json, '$[{index}]')=?",
+            ]
+        )
+        wrapper_parameters.append(item)
+    clauses.append("(" + " AND ".join(wrapper_terms) + ")")
+    parameters.extend(wrapper_parameters)
+
+    # Preserve the old fail-closed behavior for corrupt stored argv.
+    # CASE prevents JSON table functions from evaluating malformed JSON.
+    invalid_stored_argv = (
+        "CASE WHEN NOT json_valid(argv_json) THEN 1 "
+        "WHEN json_type(argv_json)<>'array' THEN 1 "
+        "WHEN EXISTS (SELECT 1 FROM json_each(argv_json) WHERE type<>'text') "
+        "THEN 1 ELSE 0 END=1"
+    )
+    clauses.append(invalid_stored_argv)
+    return (
+        "(" + " OR ".join(f"({clause})" for clause in clauses) + ")",
+        tuple(parameters),
+    )
+
+
+def _latest_matching_unprepared_managed_cargo_record(
+    identity: dict[str, Any],
+    command: list[str],
+) -> dict[str, Any] | None:
+    argv_predicate, argv_parameters = _managed_cargo_command_sql_predicate(command)
+    with _database_connection() as connection:
+        cursor = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {argv_predicate} "
+            "ORDER BY created_at_unix DESC, rowid DESC",
+            (
+                identity["host"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+                *argv_parameters,
+            ),
+        )
+        while True:
+            rows = cursor.fetchmany(256)
+            if not rows:
+                return None
+            for row in rows:
+                record = dict(row)
+                if _record_matches_unprepared_managed_cargo_command(
+                    record, command
+                ):
+                    return record
+
+def _matching_attention_unprepared_managed_cargo_records(
+    identity: dict[str, Any],
+    command: list[str],
+) -> list[dict[str, Any]]:
+    attention_states = tuple(TASK_STATE_PROJECTIONS["attention"])
+    placeholders = ",".join("?" for _ in attention_states)
+    argv_predicate, argv_parameters = _managed_cargo_command_sql_predicate(command)
+    scan_limit = MANAGED_CARGO_ATTENTION_MATCH_LIMIT
+    if (
+        isinstance(scan_limit, bool)
+        or not isinstance(scan_limit, int)
+        or scan_limit < 1
+    ):
+        raise RuntimeError("managed Cargo attention scan limit is invalid")
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND {argv_predicate} "
+            f"AND state IN ({placeholders}) "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
+            (
+                identity["host"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+                *argv_parameters,
+                *attention_states,
+                scan_limit + 1,
+            ),
+        ).fetchall()
+    if len(rows) > scan_limit:
+        raise RuntimeError("matching managed Cargo attention scan limit exceeded")
+    return [
+        record
+        for row in rows
+        if _record_matches_unprepared_managed_cargo_command(
+            record := dict(row), command
+        )
+    ]
+
+def _guard_direct_terminal_retry_record(record: dict[str, Any] | None) -> None:
+    if record is None:
+        return
+    state = str(record["state"])
+    if state in UNCHANGED_RETRY_STATES:
+        raise RuntimeError(
+            "unchanged terminal task retry blocked; use "
+            "grabowski_task_reconcile_resume for task "
+            f"{record['task_id']} with a named state change"
+        )
+    if state in {"launching", "running", "outcome_unknown"}:
+        pending_retry = _persisted_retry_binding_or_raise(record)
+        pending_interrupted_recovery = (
+            _persisted_interrupted_recovery_binding_or_raise(record)
+        )
+        if pending_retry is not None:
+            raise RuntimeError(
+                "unchanged task start blocked by unresolved retry successor; "
+                f"reconcile task {record['task_id']} before another start"
+            )
+        if pending_interrupted_recovery is not None:
+            raise RuntimeError(
+                "unchanged task start blocked by unresolved recovery attempt; "
+                f"reconcile task {record['task_id']} before another start"
+            )
+
+
+def _guard_unprepared_managed_cargo_retry(
+    command: list[str],
+    *,
+    target: dict[str, Any],
+    cwd: str,
+    execution_backend: str,
+    identity: dict[str, Any],
+    retry_context: dict[str, Any] | None,
+) -> None:
+    local_systemd = (
+        target["transport"] == "local" and execution_backend == "systemd-user"
+    )
+    request_root = _managed_cargo_request_root(
+        command,
+        target=target,
+        cwd=cwd,
+        execution_backend=execution_backend,
+    )
+    explicit_managed_target = (
+        _explicit_managed_cargo_target_dir(command) if local_systemd else None
+    )
+    if request_root is None and explicit_managed_target is None:
+        return
+    if retry_context is None:
+        latest = _latest_matching_unprepared_managed_cargo_record(identity, command)
+        _guard_direct_terminal_retry_record(latest)
+        latest_task_id = str(latest["task_id"]) if latest is not None else None
+        for source in _matching_attention_unprepared_managed_cargo_records(
+            identity, command
+        ):
+            if str(source["task_id"]) == latest_task_id:
+                continue
+            if _retained_retry_successor_for_source(str(source["task_id"])) is not None:
+                continue
+            _guard_direct_terminal_retry_record(source)
+        return
+    source_task_id = retry_context.get("source_task_id")
+    if not isinstance(source_task_id, str):
+        raise ValueError("terminal retry context source task is invalid")
+    source = _row_raw(source_task_id)
+    source_identity = _record_execution_identity(source)
+    if _execution_identity_without_command(source_identity) != _execution_identity_without_command(
+        identity
+    ):
+        raise ValueError("terminal retry context execution identity is stale")
+    if not _record_matches_unprepared_managed_cargo_command(source, command):
+        raise ValueError("terminal retry context command binding is stale")
+    _guard_unchanged_terminal_retry(source_identity, retry_context)
+
+
+def _guard_unchanged_terminal_retry(
+    identity: dict[str, Any],
+    retry_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    latest = _latest_matching_execution_record(identity)
+    if retry_context is not None:
+        source_task_id = retry_context.get("source_task_id")
+        if not isinstance(source_task_id, str):
+            raise ValueError("terminal retry context source task is invalid")
+        source = _row_raw(source_task_id)
+        source_identity = _record_execution_identity(source)
+        if source_identity["identity_sha256"] != identity["identity_sha256"]:
+            raise ValueError("terminal retry context execution identity is stale")
+        _guard_linked_retry_successor(
+            latest,
+            source_task_id=str(source["task_id"]),
+        )
+        return _validate_terminal_retry_context(
+            retry_context,
+            predecessor=source,
+            identity=identity,
+        )
+
+    _guard_direct_terminal_retry_record(latest)
+    latest_task_id = str(latest["task_id"]) if latest is not None else None
+    for source in _matching_attention_execution_records(identity):
+        if str(source["task_id"]) == latest_task_id:
+            continue
+        if _retained_retry_successor_for_source(str(source["task_id"])) is not None:
+            continue
+        _guard_direct_terminal_retry_record(source)
+    return None
 
 
 def _task_lease_ttl(record: dict[str, Any], state: str) -> int:
@@ -2864,6 +3821,54 @@ def _task_current_records_for_states(
     ]
 
 
+def _task_retry_successor_records(
+    connection: sqlite3.Connection,
+    *,
+    source_task_ids: set[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("retry successor limit must be a non-negative integer")
+    if not isinstance(source_task_ids, set) or any(
+        not isinstance(task_id, str)
+        or terminal_convergence.TASK_ID_RE.fullmatch(task_id) is None
+        for task_id in source_task_ids
+    ):
+        raise ValueError("retry successor source task ids must be a set of task ids")
+    if not source_task_ids:
+        return []
+    support_states = tuple(
+        sorted(terminal_convergence.RETRY_SUCCESSOR_SUPPORT_STATES)
+    )
+    placeholders = ",".join("?" for _ in support_states)
+    rows = connection.execute(
+        f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+        "AND ("
+        "(json_valid(launcher_json) "
+        "AND json_type(launcher_json, '$.retry_binding.source_task_id') = 'text' "
+        "AND json_extract(launcher_json, '$.retry_binding.source_task_id') "
+        "IN (SELECT value FROM json_each(?))) "
+        "OR (NOT json_valid(launcher_json) AND instr(launcher_json, ?) > 0)"
+        ") "
+        "ORDER BY created_at_unix DESC, rowid DESC LIMIT ?",
+        (
+            *support_states,
+            _canonical_json(sorted(source_task_ids)),
+            '"retry_binding"',
+            limit + 1,
+        ),
+    ).fetchall()
+    if len(rows) > limit:
+        raise RuntimeError("retry successor convergence scan limit exceeded")
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        binding = terminal_convergence.persisted_retry_binding(record)
+        if binding is not None:
+            records.append(record)
+    return records
+
+
 def _task_attention_projection(
     connection: sqlite3.Connection,
     projection: dict[str, Any],
@@ -2906,6 +3911,7 @@ def _task_attention_projection(
                 "excluded_classification_counts": {},
                 "decision_candidate_count": None,
                 "decision_classification_counts": {},
+                "retry_successor_record_count": 0,
                 "scope": "current_task_projection_after_valid_attention_decisions",
                 "raw_scope": "current_task_projection_before_attention_decisions",
             },
@@ -2916,63 +3922,45 @@ def _task_attention_projection(
     snapshot_error = (decision_snapshot or {}).get("evidence_error")
     if snapshot_status == "degraded":
         return degraded(str(snapshot_error or "TaskAttentionDecisionSnapshotError"))
-    if snapshot_status == "absent":
-        task_bindings = [
-            {
-                "task_id": str(record["task_id"]),
-                "attempt": int(record["attempt"]),
-                "unit": str(record["unit"]),
-                "authoritative_unit": str(record["authoritative_unit"]),
-                "argv_sha256": str(record["argv_sha256"]),
-                "execution_envelope_sha256": record["execution_envelope_sha256"],
-                "state": str(record["state"]),
-            }
-            for record in records
-        ]
-        return (
-            {
-                "status": "verified",
-                "evidence_error": None,
-                "projection_sha256": _sha256_json(
-                    {
-                        "schema_version": 1,
-                        "task_bindings": sorted(
-                            task_bindings,
-                            key=lambda item: str(item["task_id"]),
-                        ),
-                        "excluded_task_ids": [],
-                        "decision_classification_counts": {},
-                    }
-                ),
-                "raw_attention_count": len(records),
-                "current_attention_count": len(records),
-                "excluded_attention_count": 0,
-                "excluded_classification_counts": {
-                    classification: 0
-                    for classification in sorted(
-                        task_attention.CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
-                    )
-                },
-                "decision_candidate_count": 0,
-                "decision_classification_counts": {},
-                "scope": "current_task_projection_after_valid_attention_decisions",
-                "raw_scope": "current_task_projection_before_attention_decisions",
-            },
-            set(),
-        )
     try:
-        projected = task_attention.current_attention_projection(records)
+        if len(records) > task_attention.MAX_CURRENT_CONVERGENCE_ROWS:
+            return degraded("attention_convergence_scan_limit_exceeded")
+        retry_successors = _task_retry_successor_records(
+            connection,
+            source_task_ids={str(record["task_id"]) for record in records},
+            limit=(
+                task_attention.MAX_CURRENT_CONVERGENCE_ROWS - len(records)
+            ),
+        )
+        projected = task_attention.current_attention_projection(
+            records,
+            include_decisions=snapshot_status != "absent",
+            retry_successor_records=retry_successors,
+        )
+    except terminal_convergence.TerminalConvergenceError:
+        return degraded("TaskAttentionIntegrityError")
     except (
         task_attention.TaskAttentionError,
         task_attention.TaskAttentionInputError,
+        RuntimeError,
         OSError,
     ) as exc:
-        return degraded(type(exc).__name__)
+        error = (
+            str(exc) or type(exc).__name__
+            if type(exc) is RuntimeError
+            else type(exc).__name__
+        )
+        return degraded(error)
     excluded_task_ids = set(projected["excluded_task_ids"])
     public_projection = {
         key: value
         for key, value in projected.items()
-        if key != "excluded_task_ids"
+        if key
+        not in {
+            "excluded_task_ids",
+            "convergence_excluded_task_ids",
+            "decision_excluded_task_ids",
+        }
     }
     return public_projection, excluded_task_ids
 
@@ -3321,6 +4309,7 @@ def grabowski_task_start(
     chronik_pr_number: int | None = None,
     runtime_python: bool = False,
     route_evidence: dict[str, Any] | None = None,
+    _retry_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -3416,6 +4405,29 @@ def grabowski_task_start(
         host=host,
         opaque_command=True,
     )
+    unprepared_identity = _task_execution_identity(
+        host=host,
+        argv_sha256=command_identity.argv_sha256(command),
+        cwd=working_directory,
+        resource_keys=task_resources,
+        runtime_seconds=runtime,
+        cpu_weight=cpu,
+        io_weight=io,
+        memory_max_bytes=memory,
+        chronik_outbox_enabled=bool(chronik_enabled),
+        chronik_outbox_state_root=chronik_state_root,
+        chronik_context_json=chronik_context_json,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+    _guard_unprepared_managed_cargo_retry(
+        command,
+        target=target,
+        cwd=working_directory,
+        execution_backend=execution_backend,
+        identity=unprepared_identity,
+        retry_context=_retry_context,
+    )
     command = _bind_managed_cargo_environment(
         command,
         target=target,
@@ -3423,6 +4435,25 @@ def grabowski_task_start(
         execution_backend=execution_backend,
     )
     argv_sha256 = command_identity.argv_sha256(command)
+    execution_identity = _task_execution_identity(
+        host=host,
+        argv_sha256=argv_sha256,
+        cwd=working_directory,
+        resource_keys=task_resources,
+        runtime_seconds=runtime,
+        cpu_weight=cpu,
+        io_weight=io,
+        memory_max_bytes=memory,
+        chronik_outbox_enabled=bool(chronik_enabled),
+        chronik_outbox_state_root=chronik_state_root,
+        chronik_context_json=chronik_context_json,
+        execution_backend=execution_backend,
+        systemd_scope=systemd_scope,
+    )
+    retry_binding = _guard_unchanged_terminal_retry(
+        execution_identity,
+        _retry_context,
+    )
     routing_shadow_capture: dict[str, Any] | None = None
     if normalized_route_evidence is not None:
         import grabowski_operator_routing_shadow_capture as routing_shadow
@@ -3458,7 +4489,16 @@ def grabowski_task_start(
         "memory_max_bytes": memory,
         "created_at_unix": now,
         "updated_at_unix": now,
-        "launcher_json": _canonical_json({"pending": True}),
+        "launcher_json": _canonical_json(
+            {
+                "pending": True,
+                **(
+                    {"retry_binding": dict(retry_binding)}
+                    if retry_binding is not None
+                    else {}
+                ),
+            }
+        ),
         "last_observation_json": None,
         "resource_keys_json": _canonical_json(task_resources),
         "lease_owner_id": lease_owner,
@@ -3525,6 +4565,8 @@ def grabowski_task_start(
             resources.release_resources(lease_owner, task_resources)
         raise
     launcher = _launch(record)
+    if retry_binding is not None:
+        launcher = {**launcher, "retry_binding": dict(retry_binding)}
     state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
     lease_maintenance = _maintain_record_resources(stored, state)
@@ -3538,6 +4580,8 @@ def grabowski_task_start(
         "systemd_scope": systemd_scope,
         "authoritative_unit": unit,
         "argv_sha256": record["argv_sha256"],
+        "execution_identity_sha256": execution_identity["identity_sha256"],
+        "retry_binding": retry_binding,
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
@@ -3563,6 +4607,8 @@ def grabowski_task_start(
     return {
         "task": _public(stored),
         "audit": audit,
+        "execution_identity": execution_identity,
+        "retry_binding": retry_binding,
         "routing_shadow_capture": routing_shadow_capture,
     }
 
@@ -3755,7 +4801,11 @@ def grabowski_task_cancel(task_id: str) -> dict[str, Any]:
 
 
 @_serialize_task_mutation
-def grabowski_task_resume(task_id: str) -> dict[str, Any]:
+def grabowski_task_resume(
+    task_id: str,
+    *,
+    _interrupted_recovery_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Recreate a missing or stopped task unit from its persistent record."""
     record = _row(task_id)
     operator._require_operator_mutation(
@@ -3769,32 +4819,74 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
     )
     if _is_terminal_state(record["state"]):
         raise RuntimeError("Terminal task cannot be resumed")
-    if record["resume_policy"] in {"never", "manual"}:
+    if record["resume_policy"] == "never":
+        raise PermissionError("Task resume policy does not permit automatic retry")
+    if (
+        str(record["state"]) == "interrupted"
+        and _interrupted_recovery_context is None
+    ):
+        raise PermissionError(
+            "Interrupted task resume requires exact recovery evidence"
+        )
+    if record["resume_policy"] == "manual" and _interrupted_recovery_context is None:
         raise PermissionError("Task resume policy does not permit automatic retry")
     command = json.loads(record["argv_json"])
     recovery_gate = _require_recovery_gate(command)
     observation = _observe(record)
     if observation["state"] == "running":
         raise RuntimeError("Task is still running")
-    if observation["state"] == "completed":
+    if (
+        observation["state"] == "completed"
+        and _interrupted_recovery_context is None
+    ):
         stored = _set_state(
             task_id,
             "completed",
             observation=observation,
         )
         raise RuntimeError("Task already completed; refusing retry")
-    if observation["state"] == "outcome_unknown":
+    if (
+        observation["state"] == "outcome_unknown"
+        and _interrupted_recovery_context is None
+    ):
         _set_state(
             task_id,
             "outcome_unknown",
             observation=observation,
         )
         raise RuntimeError("Task outcome is unknown; verify the authoritative unit before retry")
+    interrupted_recovery_binding = None
+    recovery_launcher_bindings: dict[str, Any] = {}
+    if _interrupted_recovery_context is not None:
+        interrupted_recovery_binding = _validate_interrupted_recovery_context(
+            _interrupted_recovery_context,
+            record=record,
+            observation=observation,
+        )
+        recovery_launcher_bindings["interrupted_recovery_binding"] = (
+            interrupted_recovery_binding
+        )
+        retained_retry_binding = _persisted_retry_binding_or_raise(record)
+        if retained_retry_binding is not None:
+            recovery_launcher_bindings["retry_binding"] = retained_retry_binding
     attempt = int(record["attempt"]) + 1
     unit = _task_unit(task_id, attempt)
     candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
     task_resources = _record_resource_keys(record)
     lease_owner = record.get("lease_owner_id") or _lease_owner(task_id)
+    if interrupted_recovery_binding is not None:
+        _set_state(
+            task_id,
+            "launching",
+            launcher={
+                "pending": True,
+                **recovery_launcher_bindings,
+            },
+            observation=observation,
+            unit=unit,
+            authoritative_unit=unit,
+            attempt=attempt,
+        )
     lease_result = None
     if task_resources:
         lease_result = resources.acquire_resources(
@@ -3812,6 +4904,11 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
             },
         )
     launcher = _launch(candidate)
+    if interrupted_recovery_binding is not None:
+        launcher = {
+            **launcher,
+            **recovery_launcher_bindings,
+        }
     state = _launch_state(launcher)
     stored = _set_state(
         task_id,
@@ -3842,6 +4939,7 @@ def grabowski_task_resume(task_id: str) -> dict[str, Any]:
             lease_result["expires_at_unix"] if lease_result else None
         ),
         "resource_lease_maintenance": lease_maintenance,
+        "interrupted_recovery_binding": interrupted_recovery_binding,
     }
     base._append_audit(audit)
     return {"task": _public(stored), "audit": audit}
@@ -4394,19 +5492,51 @@ def _terminal_convergence_classification(
     )
 
 
+def _terminal_retry_command(record: dict[str, Any]) -> list[str]:
+    command = json.loads(record["argv_json"])
+    if (
+        not isinstance(command, list)
+        or any(not isinstance(item, str) for item in command)
+        or not command
+    ):
+        raise RuntimeError("stored task argv is invalid for retry")
+    if (
+        str(record["host"]) != "local"
+        or _execution_backend(record) != "systemd-user"
+        or len(command) < 6
+        or command[0] != FLOCK_EXECUTABLE
+        or command[1] != "--shared"
+        or Path(command[3]).name != Path(SYSTEMD_ENV_EXECUTABLE).name
+    ):
+        return command
+    replay = command[3:]
+    managed_target = _explicit_managed_cargo_target_dir(replay)
+    if managed_target is None:
+        return command
+    # Pure path validation only: do not prepare the lock root here. Named
+    # reconcile retries must remain effect-free until grabowski_task_start has
+    # run retained-successor admission.
+    expected_lock = _managed_cargo_lifecycle_lock_path(managed_target)
+    if command[2] != str(expected_lock):
+        raise RuntimeError("stored managed Cargo retry lock binding is invalid")
+    return replay
+
+
 def _terminal_retry_successor(
     record: dict[str, Any],
     *,
     reason: str,
+    explicit_policy_override: bool = False,
 ) -> dict[str, Any]:
     context = (
         json.loads(record["chronik_context_json"])
         if record.get("chronik_context_json")
         else {}
     )
+    retry_context = _build_terminal_retry_context(record, reason=reason)
     started = grabowski_task_start(
         str(record["host"]),
-        json.loads(record["argv_json"]),
+        _terminal_retry_command(record),
         cwd=str(record["cwd"]),
         runtime_seconds=int(record["runtime_seconds"]),
         resume_policy="manual",
@@ -4424,10 +5554,13 @@ def _terminal_retry_successor(
             if isinstance(context.get("pr_number"), int)
             else None
         ),
+        _retry_context=retry_context,
     )
     task = dict(started["task"])
     task["retry_of_task_id"] = record["task_id"]
     task["retry_reason"] = _redact_reason(reason)
+    task["retry_context_sha256"] = retry_context["context_sha256"]
+    task["explicit_policy_override"] = explicit_policy_override
     task["automatic_retry_budget_exhausted_after_start"] = True
     base._append_audit(
         {
@@ -4439,6 +5572,12 @@ def _terminal_retry_successor(
             ),
             "successor_task_id": task["task_id"],
             "successor_resume_policy": task["resume_policy"],
+            "source_execution_identity_sha256": retry_context[
+                "source_execution_identity_sha256"
+            ],
+            "retry_context_sha256": retry_context["context_sha256"],
+            "explicit_policy_override": explicit_policy_override,
+            "source_resume_policy": retry_context["source_resume_policy"],
             "reason": _redact_reason(reason),
         }
     )
@@ -4672,6 +5811,92 @@ def reconcile_tasks_resume(
                 raise
             blocked.append(_reconcile_unknown_host(record, exc))
             continue
+
+        if str(record["state"]) == "interrupted":
+            if not task_id:
+                blocked.append(
+                    {
+                        "task_id": record["task_id"],
+                        "resume_policy": record["resume_policy"],
+                        "reason": (
+                            "interrupted recovery requires an exact task target "
+                            "and named state change"
+                        ),
+                        "reason_class": "evidence_drift",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+                continue
+            try:
+                _interrupted_recovery_evidence_projection(record, observation)
+            except ValueError as exc:
+                blocked.append(
+                    {
+                        "task_id": record["task_id"],
+                        "resume_policy": record["resume_policy"],
+                        "reason": _redact_reason(str(exc)),
+                        "reason_class": "evidence_drift",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+                continue
+            if len(resumed) >= max_resumes:
+                blocked.append(
+                    {
+                        "task_id": record["task_id"],
+                        "resume_policy": record["resume_policy"],
+                        "reason": "max_resumes reached",
+                        "reason_class": "retry_exhausted",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+                continue
+            stored = _set_state(
+                record["task_id"],
+                "interrupted",
+                observation=observation,
+            )
+            public = _public(stored)
+            public["lease_maintenance"] = None
+            refreshed.append(public)
+            try:
+                interrupted_context = _build_interrupted_recovery_context(
+                    stored,
+                    observation,
+                    reason=reason,
+                )
+                resumed_task = dict(
+                    grabowski_task_resume(
+                        stored["task_id"],
+                        _interrupted_recovery_context=interrupted_context,
+                    )["task"]
+                )
+                resumed_task["explicit_interrupted_recovery"] = True
+                resumed_task["recovery_reason"] = _redact_reason(reason.strip())
+                resumed_task["interrupted_recovery_context_sha256"] = (
+                    interrupted_context["context_sha256"]
+                )
+                resumed.append(resumed_task)
+            except Exception as exc:
+                blocked.append(
+                    {
+                        "task_id": stored["task_id"],
+                        "resume_policy": stored["resume_policy"],
+                        "reason": _redact_reason(str(exc)),
+                        "reason_class": "evidence_drift",
+                        "retryable": False,
+                        "automatic_resume_allowed": False,
+                        "owner_decision_required": True,
+                    }
+                )
+            continue
+
         effective_state = _effective_observed_state(record, observation["state"])
         lease_maintenance = _maintain_record_resources(record, effective_state)
         if lease_maintenance is not None:
@@ -4689,7 +5914,23 @@ def reconcile_tasks_resume(
         if observation["state"] == "running":
             continue
         blocker = _reconcile_blocker(stored, observation)
-        if blocker is not None:
+        explicit_policy_override = bool(task_id) and bool(blocker) and (
+            _is_terminal_state(str(stored["state"]))
+            and (
+                (
+                    str(stored["resume_policy"])
+                    in {"manual", "verify-then-retry"}
+                    and blocker.get("reason_class") == "non_retryable_failure"
+                    and blocker.get("reason")
+                    == "task resume policy does not permit automatic retry"
+                )
+                or (
+                    str(stored["resume_policy"]) == "retry-safe"
+                    and blocker.get("reason_class") == "retry_exhausted"
+                )
+            )
+        )
+        if blocker is not None and not explicit_policy_override:
             blocked.append(blocker)
             continue
         if len(resumed) >= max_resumes:
@@ -4711,6 +5952,7 @@ def reconcile_tasks_resume(
                     _terminal_retry_successor(
                         stored,
                         reason=reason,
+                        explicit_policy_override=explicit_policy_override,
                     )
                 )
             else:

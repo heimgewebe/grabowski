@@ -201,6 +201,7 @@ class FakeWebSocket {
           response: {url: expectedOrigin + '/', remoteIPAddress},
         });
         if (scenario === 'response-then-close') {
+          setInterval(() => {}, 1000);
           this.readyState = 3;
           if (this.onclose) this.onclose();
           return;
@@ -1024,6 +1025,13 @@ globalThis.fetch = async () => ({
         self.assertIs(receipt["ok"], False)
         self.assertEqual(receipt["result_code"], "transport")
         self.assertIsNone(receipt["remote_address_sha256"])
+
+    def test_stored_form_helper_flushes_receipt_before_bounded_exit(self) -> None:
+        source = workers.BROWSER_FORM_NODE_SOURCE
+        self.assertIn("const EXIT_FLUSH_TIMEOUT_MS = 1000;", source)
+        self.assertIn("process.stdout.write(line, () => {", source)
+        self.assertIn("const forcedExit = setTimeout(finish, EXIT_FLUSH_TIMEOUT_MS);", source)
+        self.assertIn("process.exit(status);", source)
 
     def test_stored_form_helper_preserves_digest_after_verified_later_failure(self) -> None:
         execution, receipt = self._run_browser_form_node(

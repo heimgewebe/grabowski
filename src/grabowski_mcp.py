@@ -267,6 +267,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),
     "grabowski_current_work": (),
+    "grabowski_reposkop_context": ("file_read", "file_write", "terminal_execute"),
     "grabowski_operator_optimization_report": (),
     "grabowski_git_status": (),
     "grabowski_git_diff": (),
@@ -459,6 +460,7 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_agent_competition_status",
     "grabowski_agent_competition_compare",
     "grabowski_terminal_run",
+    "grabowski_reposkop_context",
     "grabowski_job_start",
     "grabowski_job_status",
     "grabowski_job_notification_list",
@@ -1744,16 +1746,41 @@ def _resolve_existing(raw_path: str, kind: str) -> Path:
     return resolved
 
 
-def _resolve_write_target(raw_path: str) -> tuple[Path, bool]:
+def _resolve_missing_write_target(candidate: Path) -> Path:
+    missing_parts: list[str] = []
+    ancestor = candidate
+    while not ancestor.exists() and not ancestor.is_symlink():
+        parent = ancestor.parent
+        if parent == ancestor:
+            raise FileNotFoundError(str(candidate))
+        missing_parts.append(ancestor.name)
+        ancestor = parent
+    if any(part == ".." for part in missing_parts):
+        raise PermissionError(
+            f"Parent traversal is forbidden for missing write targets: {candidate}"
+        )
+    _reject_symlink_components(ancestor)
+    resolved_ancestor = ancestor.resolve(strict=True)
+    if not resolved_ancestor.is_dir():
+        raise NotADirectoryError(str(resolved_ancestor))
+    return resolved_ancestor.joinpath(*reversed(missing_parts))
+
+
+def _resolve_write_target(
+    raw_path: str, *, allow_missing_parents: bool = False
+) -> tuple[Path, bool]:
     candidate = _absolute_candidate(raw_path)
     if candidate.exists() or candidate.is_symlink():
         _reject_symlink_components(candidate)
         resolved = candidate.resolve(strict=True)
         exists = True
     else:
-        _reject_symlink_components(candidate, allow_missing_leaf=True)
-        parent = candidate.parent.resolve(strict=True)
-        resolved = parent / candidate.name
+        if allow_missing_parents:
+            resolved = _resolve_missing_write_target(candidate)
+        else:
+            _reject_symlink_components(candidate, allow_missing_leaf=True)
+            parent = candidate.parent.resolve(strict=True)
+            resolved = parent / candidate.name
         exists = False
 
     if not _is_within(resolved, _roots("write")):

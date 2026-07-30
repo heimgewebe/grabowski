@@ -71,6 +71,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
 | `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
 | `grabowski_current_work` | operations-observability | yes | low | Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth. |
+| `grabowski_reposkop_context` | repository-observation | no | low | Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt. |
 | `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
 | `grabowski_git_status` | version-control | yes | low | Read fixed short Git status for one allowed repository. |
 | `grabowski_git_diff` | version-control | yes | low | Read a bounded staged or unstaged Git diff without external helpers. |
@@ -151,7 +152,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_connector_transport_diagnostics` | operations-observability | yes | low | Run bounded read-only diagnostics for connector transport failures. |
 | `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
-| `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one Bureau candidate read-only against current Registry and Live Register truth. |
+| `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
 | `grabowski_bureau_task_review` | bureau | no | medium | Review one exact Bureau proposal digest and create reviewed-plan approval evidence without Registry, Queue or publication mutation. |
 | `grabowski_bureau_task_publish_preview` | bureau | yes | low | Validate one Bureau task proposal and return exact publication resources without effects. |

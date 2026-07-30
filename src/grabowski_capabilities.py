@@ -331,6 +331,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_reposkop_context": {
+        "category": "repository-observation",
+        "purpose": "Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt.",
+        "risk_class": "low",
+        "effects": ["repository-read", "state-create"],
+        "reversibility": "idempotent-create-only",
+    },
     "grabowski_checkout_binding_reconciliation": {
         "category": "checkout-lifecycle",
         "purpose": "Classify durable checkout lifecycle bindings against current canonical Git worktree observations without creating mutation authority.",
@@ -1261,7 +1268,11 @@ TOOL_PROFILES.update(
         },
         "grabowski_bureau_candidate_assess": {
             "category": "bureau",
-            "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+            "purpose": (
+                "Assess one explicitly typed operator-intake candidate or event "
+                "against current Registry and Live Register truth; task and "
+                "initiative values are binding checks, never selectors."
+            ),
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

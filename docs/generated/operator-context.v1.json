@@ -494,6 +494,20 @@
       "tool": "grabowski_current_work"
     },
     {
+      "category": "repository-observation",
+      "description": "Run one target-bound Reposkop report and persist a deduplicated usage receipt.",
+      "effects": [
+        "repository-read",
+        "state-create"
+      ],
+      "id": "grabowski_reposkop_context",
+      "purpose": "Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt.",
+      "read_only": false,
+      "reversibility": "idempotent-create-only",
+      "risk_class": "low",
+      "tool": "grabowski_reposkop_context"
+    },
+    {
       "category": "operations-observability",
       "description": "Audit bounded operator friction without blocking the MCP event loop.",
       "effects": [],
@@ -1517,10 +1531,10 @@
     },
     {
       "category": "bureau",
-      "description": "Assess one Bureau candidate read-only against current canonical Registry truth.",
+      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors and cannot make an otherwise incomplete call valid.",
       "effects": [],
       "id": "grabowski_bureau_candidate_assess",
-      "purpose": "Assess one Bureau candidate read-only against current Registry and Live Register truth.",
+      "purpose": "Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",
@@ -2433,6 +2447,7 @@
       "grabowski_contract_drift",
       "grabowski_checkout_summary",
       "grabowski_current_work",
+      "grabowski_reposkop_context",
       "grabowski_operator_optimization_report",
       "grabowski_git_status",
       "grabowski_git_diff",
@@ -2727,6 +2742,10 @@
         "source": "src/grabowski_operations.py"
       },
       {
+        "module": "grabowski_reposkop_context",
+        "source": "src/grabowski_reposkop_context.py"
+      },
+      {
         "module": "grabowski_privileged",
         "source": "src/grabowski_privileged.py"
       },
@@ -2920,7 +2939,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "2b0d868d3da69f634586d543a98a7984dbafbd87ac32c020ee35fbe1a2dfa998"
+      "sha256": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2928,7 +2947,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "47fddfc5433e8abf72b1e82c862b46b05e79b55319757b153c60d6cf129e55c9"
+      "sha256": "fc79eae4e2a124f6d90b875bc0a233c1127f23f4f7deed6a94c48902746695a6"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
@@ -2945,10 +2964,10 @@
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
-      "src/grabowski_bureau_intake.py": "4eab97232ddee6fcebc83232209f37b2babb90d22d9fc809e71111e6d67a4c8b",
+      "src/grabowski_bureau_intake.py": "1ea3bd85f017d7a40e14051851584e4bc28a7afec477184b9bfda8b904f8e887",
       "src/grabowski_bureau_leases.py": "c22a6bc66330bcd8a39639a5e10d92f056cecc2cdbd67f1176a566ba9807184b",
-      "src/grabowski_bureau_pickup.py": "70d78e65f58dc353ccfd22f21a10ad7421b014d22d347173c952dde727d7fcac",
-      "src/grabowski_capabilities.py": "2b0d868d3da69f634586d543a98a7984dbafbd87ac32c020ee35fbe1a2dfa998",
+      "src/grabowski_bureau_pickup.py": "2f1f3d68c955061892d88152f25e88f21e6d956605f19dce45f43898cb10a06d",
+      "src/grabowski_capabilities.py": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19",
       "src/grabowski_checkout_binding_reconciler.py": "6198f9614b41f67412fec575410fa2b2fa63ff0fcc0db349cce55c4c29950733",
       "src/grabowski_checkouts.py": "6fb1b94b58f4b511954cdc18fe894f2ef5b14deeea443153e10a370f325fde11",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
@@ -2976,7 +2995,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "80bb4069234402f0edf6e44edf6410145958995166b90f67c79b685f480a36c0",
+      "src/grabowski_mcp.py": "abf6ba30e5c3bc5d80b42d2a78fd75701d681b07c6e460cc5688028871e8c275",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "2bdde504493d793c9db8c6830b6c30e70d173761023d17932ee03e019fce7321",
@@ -2996,19 +3015,20 @@
       "src/grabowski_recovery.py": "b3fdbb3d47cea1723dad00646cf93a6bbfd41cac856b115610fbf1872cb88777",
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
+      "src/grabowski_reposkop_context.py": "17992589456ac42e5fadaa32d6536f14dd73a7661cb1b2eb3ed214134991f973",
       "src/grabowski_resources.py": "f8dc6069df3fa23a4cf8a9fcddc426855af794d1a5c5639b50bbdd3ae202d764",
-      "src/grabowski_runtime.py": "fc361cdd2b8d7e084df6b7746fc96e5e329eee286ca444796a3542bfdc5dc1cc",
+      "src/grabowski_runtime.py": "5880d0912b7e51dafad9d29ae3c79f111a6572fb591533af19f09ce49c1c3c1e",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_system_map.py": "86eb6fe760aea800052d74b7c45ff3986adc130c6e3a78954cd65a472565a7de",
-      "src/grabowski_task_attention.py": "f75a87d3b05456472d298dd2fc9ee960057b31b2a6dd46d85f472706d956658a",
+      "src/grabowski_task_attention.py": "547a0223f50f7f11874f06d86ab89db1accf7d86d8fd52fea619457bf7e97732",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "694c6c27820f19e95448a01ffcf5df008efcb947a047ab6af68e6396b063e05e",
-      "src/grabowski_terminal_convergence.py": "5383579e275a9d07c2930faaada6d1a616b2dbdf442cc111d8e8dd1525aa6f9b",
+      "src/grabowski_tasks.py": "e34a04b1fcde2a4ad175cbe65bbf53e495298689406242425f6617e0dd41c346",
+      "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
-      "src/grabowski_workers.py": "9be067c783e69b810470d233d14dd09e3e214d23e4815235c09f533e901a0178",
+      "src/grabowski_workers.py": "e471c758224ce96e86cb00f5f959efd15b276b43c218ed17bb0d0a534e9ee00a",
       "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
     }
   }

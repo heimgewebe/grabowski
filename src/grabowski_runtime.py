@@ -32,6 +32,7 @@ import grabowski_tasks
 import grabowski_agent_competition
 import grabowski_coding_agent_router
 import grabowski_workers
+import grabowski_reposkop_context  # noqa: F401
 
 
 mcp = grabowski_operator_core.mcp
