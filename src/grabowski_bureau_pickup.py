@@ -756,7 +756,68 @@ def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
     if request["base_dir"]:
         arguments.extend(["--base-dir", request["base_dir"]])
     arguments.extend(["--approve", "--approval-source", request["approval_source"]])
-    return bureau._invoke_bureau(arguments)
+    return bureau._invoke_bureau(arguments, include_runtime_identity=True)
+
+
+def _claim_intent_rejection(payload: dict[str, Any]) -> BureauPickupError:
+    status = payload.get("status")
+    source_code = payload.get("code")
+    token = source_code if isinstance(source_code, str) else status
+    if not isinstance(token, str) or re.fullmatch(
+        r"[a-z0-9]+(?:-[a-z0-9]+)*", token
+    ) is None:
+        error_code = "claim-intent-not-ready"
+    elif token.startswith("claim-intent-"):
+        error_code = token
+    else:
+        error_code = f"claim-intent-{token}"
+
+    details: dict[str, Any] = {
+        "status": status,
+        "source_code": source_code,
+    }
+    detail = payload.get("detail")
+    if isinstance(detail, str):
+        try:
+            details["detail"] = json.loads(detail)
+        except json.JSONDecodeError:
+            details["detail"] = detail
+    elif detail is not None:
+        details["detail"] = detail
+
+    runtime_identity = payload.get("runtime_identity")
+    if isinstance(runtime_identity, dict):
+        summary: dict[str, Any] = {}
+        compatibility = runtime_identity.get("compatibility")
+        if isinstance(compatibility, dict):
+            summary["compatibility"] = compatibility
+        registry = runtime_identity.get("registry")
+        if isinstance(registry, dict):
+            summary["registry"] = {
+                key: registry.get(key)
+                for key in (
+                    "root",
+                    "head",
+                    "origin_main",
+                    "head_equals_origin_main",
+                    "dirty",
+                )
+                if key in registry
+            }
+        manifest = runtime_identity.get("manifest")
+        if isinstance(manifest, dict):
+            canonical_registry = manifest.get("canonical_registry")
+            summary["manifest"] = {
+                "source_commit": manifest.get("source_commit"),
+                "canonical_registry_source_commit": (
+                    canonical_registry.get("source_commit")
+                    if isinstance(canonical_registry, dict)
+                    else None
+                ),
+            }
+        if summary:
+            details["runtime_identity"] = summary
+    return BureauPickupError(error_code, details=details)
 
 
 def _validate_intent_result(
@@ -770,7 +831,7 @@ def _validate_intent_result(
         envelope = payload.get("envelope")
         intent = envelope.get("claim_intent") if isinstance(envelope, dict) else None
     else:
-        raise BureauPickupError("claim-intent-not-ready", details={"payload": payload})
+        raise _claim_intent_rejection(payload)
     if not isinstance(intent, dict):
         raise BureauPickupError("claim-intent-missing")
     if RUN_ID_RE.fullmatch(str(intent.get("run_id", ""))) is None:

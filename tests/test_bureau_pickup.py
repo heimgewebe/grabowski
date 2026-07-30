@@ -410,6 +410,7 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(metadata["run_id"], intent["run_id"])
         self.assertEqual(metadata["claim_intent_sha256"], intent["intent_sha256"])
         intent_argv = invoke.call_args_list[0].args[0]
+        self.assertTrue(invoke.call_args_list[0].kwargs["include_runtime_identity"])
         commit_argv = invoke.call_args_list[1].args[0]
         readback_argv = invoke.call_args_list[2].args[0]
         expected_coordination = str(pickup.COORDINATION_ROOT)
@@ -455,10 +456,64 @@ class BureauPickupTests(unittest.TestCase):
             mock.patch.object(pickup.resources, "acquire_resources") as acquire,
         ):
             with self.assertRaisesRegex(
-                pickup.BureauPickupError, "claim-intent-not-ready"
+                pickup.BureauPickupError,
+                "claim-intent-explicit-registry-root-required",
             ):
                 pickup.grabowski_bureau_pickup_execute(self.request())
         self.assertEqual(invoke.call_count, 1)
+        acquire.assert_not_called()
+
+    def test_claim_intent_rejection_exposes_structured_runtime_drift(self) -> None:
+        payload = {
+            "status": "no-eligible-task",
+            "detail": json.dumps(
+                {
+                    "rejected": [
+                        {
+                            "task_id": "TEST-T001",
+                            "reasons": ["state is verified"],
+                        }
+                    ]
+                }
+            ),
+            "runtime_identity": {
+                "compatibility": {
+                    "status": "stale",
+                    "reason_codes": ["release-registry-identity-mismatch"],
+                    "mutation_allowed": False,
+                },
+                "registry": {
+                    "root": "/tmp/bureau",
+                    "head": "a" * 40,
+                    "origin_main": "a" * 40,
+                    "head_equals_origin_main": True,
+                    "dirty": False,
+                },
+                "manifest": {
+                    "source_commit": "b" * 40,
+                    "canonical_registry": {"source_commit": "b" * 40},
+                },
+            },
+        }
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=payload),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        details = raised.exception.details
+        self.assertEqual(
+            details["detail"]["rejected"][0]["reasons"], ["state is verified"]
+        )
+        self.assertEqual(
+            details["runtime_identity"]["compatibility"]["reason_codes"],
+            ["release-registry-identity-mismatch"],
+        )
+        self.assertEqual(
+            details["runtime_identity"]["manifest"]["source_commit"], "b" * 40
+        )
         acquire.assert_not_called()
 
     def test_repository_scope_is_required_before_any_acquisition(self) -> None:

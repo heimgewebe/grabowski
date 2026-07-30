@@ -146,6 +146,9 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                         "kind": "bureau_candidate_assessment",
                         "status": "ready",
                     },
+                    "runtime_identity": {
+                        "compatibility": {"status": "current", "reason_codes": []}
+                    },
                 }
             ),
             "",
@@ -169,9 +172,13 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             mock.patch.object(intake.subprocess, "run", return_value=completed) as run,
         ):
             result = intake._invoke_bureau(
-                ["--json", "--json-envelope", "operator-candidate-assess"]
+                ["--json", "--json-envelope", "operator-candidate-assess"],
+                include_runtime_identity=True,
             )
         self.assertEqual(result["status"], "ready")
+        self.assertEqual(
+            result["runtime_identity"]["compatibility"]["status"], "current"
+        )
         self.assertEqual(
             run.call_args.args[0],
             [
