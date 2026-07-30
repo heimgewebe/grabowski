@@ -19,10 +19,13 @@ def _write_private(path: Path, payload: bytes, mode: int = 0o600) -> None:
     path.chmod(mode)
 
 
-def _artifact_fixture(root: Path) -> tuple[str, str, str, Path, bytes]:
-    root.mkdir(mode=0o700)
+def _artifact_fixture(
+    root: Path,
+    *,
+    artifact_id: str = "a" * 32,
+) -> tuple[str, str, str, Path, bytes]:
+    root.mkdir(mode=0o700, exist_ok=True)
     root.chmod(0o700)
-    artifact_id = "a" * 32
     directory = root / artifact_id
     directory.mkdir(mode=0o700)
     directory.chmod(0o700)
@@ -129,6 +132,7 @@ class TextArtifactReconciliationTests(unittest.TestCase):
         )
         sidecar = directory / "artifact.chunk.00"
         _write_private(sidecar, b"transport", 0o644)
+        source_inode = sidecar.stat().st_ino
 
         with (
             patch.object(artifacts, "TEXT_ARTIFACT_ROOT", store),
@@ -169,6 +173,10 @@ class TextArtifactReconciliationTests(unittest.TestCase):
             self.assertEqual(
                 (quarantined / "artifact.chunk.00").stat().st_mode & 0o777,
                 0o600,
+            )
+            self.assertEqual(
+                (quarantined / "artifact.chunk.00").stat().st_ino,
+                source_inode,
             )
             self.assertEqual(
                 json.loads((quarantined / "receipt.json").read_text())[
@@ -298,6 +306,126 @@ class TextArtifactReconciliationTests(unittest.TestCase):
         self.assertEqual(list(destination.iterdir()), [])
         self.assertFalse(any(path.name.startswith(".") for path in quarantine.iterdir()))
         self.assertEqual(sidecar.read_bytes(), b"transport")
+
+    def test_source_replacement_before_isolation_is_preserved_not_deleted(self) -> None:
+        store = self.root / "text-artifacts"
+        quarantine = self.root / "quarantine"
+        artifact_id, artifact_sha256, receipt_sha256, directory, _ = (
+            _artifact_fixture(store)
+        )
+        sidecar = directory / "artifact.chunk.00"
+        _write_private(sidecar, b"reviewed", 0o644)
+        displaced_original = self.root / "displaced-original"
+        original_rename = reconcile._rename_entry_noreplace
+        replaced = False
+
+        def replace_then_isolate(
+            source_descriptor: int,
+            source_name: str,
+            destination_descriptor: int,
+            destination_name: str,
+        ) -> None:
+            nonlocal replaced
+            if not replaced:
+                os.replace(sidecar, displaced_original)
+                _write_private(sidecar, b"unreviewed-replacement", 0o644)
+                replaced = True
+            original_rename(
+                source_descriptor,
+                source_name,
+                destination_descriptor,
+                destination_name,
+            )
+
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", store),
+            patch.object(reconcile, "TEXT_ARTIFACT_QUARANTINE_ROOT", quarantine),
+            patch.object(reconcile, "_rename_entry_noreplace", replace_then_isolate),
+            patch.object(artifacts.base, "_append_audit"),
+        ):
+            inventory = reconcile.inspect_text_artifact_store(artifact_id)
+            with self.assertRaisesRegex(
+                reconcile.TextArtifactReconciliationError,
+                "changed before atomic isolation",
+            ):
+                reconcile.reconcile_text_artifact_store(
+                    artifact_id,
+                    inventory["inventory_sha256"],
+                    artifact_sha256,
+                    receipt_sha256,
+                )
+
+        self.assertEqual(displaced_original.read_bytes(), b"reviewed")
+        staging = [
+            path for path in quarantine.iterdir() if path.name.startswith(".")
+        ]
+        self.assertEqual(len(staging), 1)
+        self.assertEqual(
+            (staging[0] / "artifact.chunk.00").read_bytes(),
+            b"unreviewed-replacement",
+        )
+
+    def test_quarantine_count_capacity_blocks_before_source_cleanup(self) -> None:
+        store = self.root / "text-artifacts"
+        quarantine = self.root / "quarantine"
+        first = _artifact_fixture(store, artifact_id="a" * 32)
+        second = _artifact_fixture(store, artifact_id="b" * 32)
+        _write_private(first[3] / "artifact.chunk.00", b"first", 0o644)
+        second_sidecar = second[3] / "artifact.chunk.00"
+        _write_private(second_sidecar, b"second", 0o644)
+
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", store),
+            patch.object(reconcile, "TEXT_ARTIFACT_QUARANTINE_ROOT", quarantine),
+            patch.object(artifacts.base, "_append_audit"),
+        ):
+            first_inventory = reconcile.inspect_text_artifact_store(first[0])
+            reconcile.reconcile_text_artifact_store(
+                first[0], first_inventory["inventory_sha256"], first[1], first[2]
+            )
+            second_inventory = reconcile.inspect_text_artifact_store(second[0])
+            with (
+                patch.object(reconcile, "_MAX_QUARANTINE_DIRECTORIES", 1),
+                self.assertRaisesRegex(
+                    reconcile.TextArtifactReconciliationError,
+                    "directory capacity is exhausted",
+                ),
+            ):
+                reconcile.reconcile_text_artifact_store(
+                    second[0],
+                    second_inventory["inventory_sha256"],
+                    second[1],
+                    second[2],
+                )
+        self.assertEqual(second_sidecar.read_bytes(), b"second")
+
+    def test_quarantine_byte_capacity_blocks_before_source_cleanup(self) -> None:
+        store = self.root / "text-artifacts"
+        quarantine = self.root / "quarantine"
+        artifact_id, artifact_sha256, receipt_sha256, directory, _ = (
+            _artifact_fixture(store)
+        )
+        sidecar = directory / "artifact.chunk.00"
+        _write_private(sidecar, b"transport", 0o644)
+
+        with (
+            patch.object(artifacts, "TEXT_ARTIFACT_ROOT", store),
+            patch.object(reconcile, "TEXT_ARTIFACT_QUARANTINE_ROOT", quarantine),
+            patch.object(reconcile, "_MAX_QUARANTINE_TOTAL_BYTES", 1),
+        ):
+            inventory = reconcile.inspect_text_artifact_store(artifact_id)
+            with self.assertRaisesRegex(
+                reconcile.TextArtifactReconciliationError,
+                "byte capacity is exhausted",
+            ):
+                reconcile.reconcile_text_artifact_store(
+                    artifact_id,
+                    inventory["inventory_sha256"],
+                    artifact_sha256,
+                    receipt_sha256,
+                )
+        self.assertEqual(sidecar.read_bytes(), b"transport")
+        self.assertEqual(list(quarantine.iterdir()), [])
 
     def test_reconcile_is_idempotent_but_rejects_new_unreviewed_entries(self) -> None:
         store = self.root / "text-artifacts"

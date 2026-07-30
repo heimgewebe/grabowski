@@ -387,6 +387,10 @@
       "source": "src/grabowski_artifacts.py"
     },
     {
+      "module": "grabowski_text_artifact_reconcile",
+      "source": "src/grabowski_text_artifact_reconcile.py"
+    },
+    {
       "module": "grabowski_workers",
       "source": "src/grabowski_workers.py"
     },
