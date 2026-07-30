@@ -1078,6 +1078,20 @@ class TaskAttentionTests(unittest.TestCase):
         )
         self.assertRegex(projection["projection_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_exact_failed_filter_does_not_claim_attention_without_evaluation(self) -> None:
+        closed = self._failed_task()
+        attention.record_decision(self._parameters(closed, decision="closed"))
+
+        listed = tasks.grabowski_task_list(state="failed")
+
+        self.assertEqual(1, listed["count"])
+        self.assertEqual(closed["task_id"], listed["tasks"][0]["task_id"])
+        self.assertEqual("not_evaluated", listed["attention_projection"]["status"])
+        self.assertNotIn(
+            "task_requires_attention",
+            {warning["code"] for warning in listed["warnings"]},
+        )
+
     def test_task_current_records_for_states_batches_lifecycle_projection(self) -> None:
         records = [self._failed_task() for _ in range(3)]
         projection = tasks._task_current_projection()

@@ -6376,16 +6376,17 @@ def grabowski_task_list(
             "evidence_error": attention_projection["evidence_error"],
             "raw_attention_count": attention_projection["raw_attention_count"],
         })
-    warnings.extend(
-        {
-            "code": "task_requires_attention",
-            "task_id": task["task_id"],
-            "state": task["state"],
-        }
-        for task in tasks
-        if task.get("state") in warning_states
-        and task.get("task_id") not in attention_excluded_task_ids
-    )
+    if attention_projection["status"] != "not_evaluated":
+        warnings.extend(
+            {
+                "code": "task_requires_attention",
+                "task_id": task["task_id"],
+                "state": task["state"],
+            }
+            for task in tasks
+            if task.get("state") in warning_states
+            and task.get("task_id") not in attention_excluded_task_ids
+        )
     payload: dict[str, Any] = {
         "schema_version": 2,
         "view": selected_view,
@@ -6435,8 +6436,12 @@ def grabowski_task_list(
             if unknown_state_count
             else "repair attention projection evidence before relying on closeout filtering"
             if attention_projection["status"] == "degraded"
-            else "inspect returned tasks before deciding the next action"
-            if attention_projection["status"] == "not_evaluated" and tasks
+            else (
+                "inspect returned tasks before deciding the next action"
+                if tasks
+                else "none"
+            )
+            if attention_projection["status"] == "not_evaluated"
             else "inspect current attention tasks before retry"
             if projection_counts["attention"]
             else "none"

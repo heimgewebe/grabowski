@@ -1141,6 +1141,17 @@ class TaskTests(unittest.TestCase):
             listed["does_not_establish"],
         )
 
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+        empty = tasks.grabowski_task_list(state="running")
+        self.assertEqual(0, empty["count"])
+        self.assertEqual(1, empty["raw_projection_counts"]["attention"])
+        self.assertEqual("none", empty["recommended_next_action"])
+
     def test_task_list_reads_rows_and_counts_from_one_snapshot(self) -> None:
         task = self._start()["task"]
         original_state_counts = tasks._task_state_counts
