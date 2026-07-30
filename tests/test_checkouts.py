@@ -313,7 +313,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             patch.object(checkouts, "_readonly_connection", return_value=Connection()),
             patch.object(
                 checkouts.resources,
-                "_validate_resource_lease_contract",
+                "_begin_resource_lease_projection_read",
                 side_effect=RuntimeError("Resource lease contract metadata is missing"),
             ),
         ):

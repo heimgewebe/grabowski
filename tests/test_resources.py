@@ -296,6 +296,70 @@ class ResourceTests(unittest.TestCase):
                 ).fetchone()
             )
 
+    def test_lease_projection_read_guard_pins_contract_and_rows_to_one_snapshot(self) -> None:
+        key = "component:lease-snapshot-proof"
+        resources.acquire_resources(
+            "snapshot-owner",
+            [key],
+            purpose="prove contract and lease rows share one read snapshot",
+            ttl_seconds=120,
+        )
+        with sqlite3.connect(self.database) as connection:
+            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        self.assertEqual("wal", str(mode).lower())
+
+        with resources._resource_readonly_sqlite(self.database) as reader:
+            self.assertEqual(
+                "1",
+                resources._begin_resource_lease_projection_read(
+                    reader, quick_integrity=True
+                ),
+            )
+            self.assertEqual(
+                "snapshot-owner",
+                reader.execute(
+                    "SELECT owner_id FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0],
+            )
+            with sqlite3.connect(self.database) as writer:
+                writer.execute(
+                    "UPDATE metadata SET value='2' "
+                    "WHERE key='resource_lease_contract_version'"
+                )
+                writer.execute(
+                    "UPDATE leases SET owner_id='future-owner' WHERE resource_key=?",
+                    (key,),
+                )
+                writer.commit()
+            self.assertEqual(
+                "1",
+                reader.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='resource_lease_contract_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                "snapshot-owner",
+                reader.execute(
+                    "SELECT owner_id FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0],
+            )
+
+        with sqlite3.connect(self.database) as current:
+            self.assertEqual(
+                "2",
+                current.execute(
+                    "SELECT value FROM metadata "
+                    "WHERE key='resource_lease_contract_version'"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                "future-owner",
+                current.execute(
+                    "SELECT owner_id FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()[0],
+            )
+
     def test_future_lease_contract_fails_closed_without_side_effects(self) -> None:
         resources.count_resources()
         with sqlite3.connect(self.database) as connection:

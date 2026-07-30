@@ -289,6 +289,15 @@ def _validate_resource_lease_contract(connection: sqlite3.Connection) -> str:
     return version
 
 
+def _begin_resource_lease_projection_read(
+    connection: sqlite3.Connection, *, quick_integrity: bool = False
+) -> str:
+    connection.execute("BEGIN")
+    if quick_integrity:
+        _resource_sqlite_integrity(connection, "Resource database", quick=True)
+    return _validate_resource_lease_contract(connection)
+
+
 def _publish_resource_lease_contract(connection: sqlite3.Connection) -> None:
     observed = _resource_lease_contract_version(connection, required=False)
     if observed is None:

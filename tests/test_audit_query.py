@@ -1017,10 +1017,11 @@ class AuditQueryTests(unittest.TestCase):
         fake_resources._resource_store_file_ready = lambda: True
         fake_resources.normalize_resource_key = lambda value: value
 
-        def reject_missing_contract(_connection):
+        def reject_missing_contract(_connection, *, quick_integrity=False):
+            self.assertTrue(quick_integrity)
             raise RuntimeError("Resource lease contract metadata is missing")
 
-        fake_resources._validate_resource_lease_contract = reject_missing_contract
+        fake_resources._begin_resource_lease_projection_read = reject_missing_contract
         fake_sqlite = types.ModuleType("grabowski_sqlite_store")
 
         @contextmanager
@@ -1076,7 +1077,12 @@ class AuditQueryTests(unittest.TestCase):
         fake_resources = types.ModuleType("grabowski_resources")
         fake_resources.RESOURCE_DB = Path(__file__)
         fake_resources._resource_store_file_ready = lambda: True
-        fake_resources._validate_resource_lease_contract = lambda _connection: "1"
+        projection_reads: list[bool] = []
+        fake_resources._begin_resource_lease_projection_read = (
+            lambda _connection, *, quick_integrity=False: (
+                projection_reads.append(quick_integrity) or "1"
+            )
+        )
         fake_resources.normalize_resource_key = lambda value: value
         fake_resources._public = lambda value: {key: item for key, item in dict(value).items() if key != "metadata_json"}
         fake_resources._row_metadata = lambda _value: {}
@@ -1108,6 +1114,7 @@ class AuditQueryTests(unittest.TestCase):
         self.assertEqual(evidence, [])
         self.assertEqual(gaps[0]["reason"], "lease_not_active")
         self.assertEqual(gaps[0]["context"]["expires_at_unix"], 10)
+        self.assertEqual(projection_reads, [True])
 
 
 if __name__ == "__main__":
