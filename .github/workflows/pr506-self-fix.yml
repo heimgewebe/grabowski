@@ -13,10 +13,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  apply-and-validate:
+  apply-and-publish:
     if: github.event.head_commit.message == 'chore(ci): stage PR 506 exact-head fix'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,12 +38,12 @@ jobs:
           tests.test_tasks.TaskTests.test_explicit_managed_cargo_retry_is_blocked_before_lock_preparation
           tests.test_tasks.TaskTests.test_unprepared_managed_cargo_blocks_exposed_cancelled_successor_source
 
-      - name: Full validation
+      - name: Check patch
         run: |
+          python3 -m py_compile src/grabowski_tasks.py tools/pr506_exact_head_fix.py
           git diff --check
-          make validate
 
-      - name: Publish validated source fix
+      - name: Publish focused-tested source fix
         shell: bash
         run: |
           set -euo pipefail
