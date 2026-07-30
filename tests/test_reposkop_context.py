@@ -567,6 +567,50 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertEqual(list(moved_root.glob("*.json")), [])
         self.assertEqual(list(moved_root.glob("*.pending")), [])
 
+    def test_create_descriptor_rolls_back_pending_on_raw_file_not_found(self) -> None:
+        """Raw FileNotFoundError during link re-anchor must still roll back .pending."""
+        patches = self.patches(self.report())
+        outside = self.root / "outside-fnf-reanchor"
+        outside.mkdir(mode=0o700)
+        moved_root = outside / "receipts-moved"
+        real_create = context._create_pending_on_descriptor
+        real_open = context._open_receipt_root_under_write_root
+        state = {"creates": 0, "opens": 0}
+
+        def create_and_count(binding, *, root_descriptor):
+            state["creates"] += 1
+            return real_create(binding, root_descriptor=root_descriptor)
+
+        def open_then_raise_file_not_found():
+            state["opens"] += 1
+            if state["opens"] == 4 and self.receipts.exists():
+                self.receipts.rename(moved_root)
+            if state["opens"] >= 4:
+                # Simulate component disappearing mid-walk before translation.
+                raise FileNotFoundError("receipt component vanished mid-walk")
+            return real_open()
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context,
+                "_create_pending_on_descriptor",
+                side_effect=create_and_count,
+            ),
+            patch.object(
+                context,
+                "_open_receipt_root_under_write_root",
+                side_effect=open_then_raise_file_not_found,
+            ),
+        ):
+            with self.assertRaises((ValueError, FileNotFoundError)):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertGreaterEqual(state["creates"], 1)
+        self.assertGreaterEqual(state["opens"], 4)
+        self.assertEqual(list(moved_root.glob("*.json")), [])
+        self.assertEqual(list(moved_root.glob("*.pending")), [])
+
     def test_recovers_linked_pending_after_interruption(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):

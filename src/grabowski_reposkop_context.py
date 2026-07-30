@@ -568,6 +568,8 @@ def _open_relative_receipt_directory(
             component, _directory_open_flags(), dir_fd=parent_descriptor
         )
     except FileNotFoundError:
+        # Propagate raw so _ensure_receipt_root can create missing private
+        # components. Publication re-anchor rolls this back via except Exception.
         raise
     except OSError as exc:
         raise ReposkopContextError(
@@ -1499,7 +1501,9 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
         _create_pending_on_descriptor(binding, root_descriptor=create_root)
         try:
             link_write_root, link_root = _open_receipt_root_under_write_root()
-        except ReposkopContextError:
+        except Exception:
+            # FileNotFoundError and other ordinary open failures must still
+            # roll back the pending created under create_root; only then raise.
             _rollback_leaf_names(create_root, pending_path.name)
             raise
         try:
