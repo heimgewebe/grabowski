@@ -51,6 +51,9 @@ jobs:
         with:
           python-version: "3.10"
 
+      - name: Install locked runtime dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements/runtime.lock.txt
+
       - name: Relax receipt insertion anchor
         run: python tools/pr514_relax_anchor.py
 
