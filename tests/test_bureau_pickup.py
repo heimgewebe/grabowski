@@ -557,6 +557,28 @@ class BureauPickupTests(unittest.TestCase):
                 )
                 acquire.assert_not_called()
 
+    def test_claim_intent_rejection_bounds_oversized_values(self) -> None:
+        oversized = "x" * (pickup.MAX_CLAIM_REJECTION_VALUE_BYTES + 1)
+        rejection = pickup._claim_intent_rejection(
+            {
+                "status": "no-eligible-task",
+                "code": oversized,
+                "detail": oversized,
+                "kind": "grabowski_bureau_intake_adapter_failure",
+                "details": {"message": oversized},
+            }
+        )
+
+        self.assertEqual(rejection.code, "claim-intent-not-ready")
+        for key in ("source_code", "detail", "adapter_failure"):
+            summary = rejection.details[key]
+            self.assertTrue(summary["raw_omitted"])
+            self.assertGreater(
+                summary["size_bytes"], pickup.MAX_CLAIM_REJECTION_VALUE_BYTES
+            )
+            self.assertRegex(summary["sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(oversized, json.dumps(rejection.details))
+
     def test_repository_scope_is_required_before_any_acquisition(self) -> None:
         key = "repo:/tmp/repository"
         intent = self.intent([key])
