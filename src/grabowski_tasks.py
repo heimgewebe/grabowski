@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import functools
@@ -3869,6 +3869,38 @@ def _task_retry_successor_records(
     return records
 
 
+def _task_attention_projection_not_evaluated(
+    raw_attention_count: int,
+) -> dict[str, Any]:
+    if (
+        isinstance(raw_attention_count, bool)
+        or not isinstance(raw_attention_count, int)
+        or raw_attention_count < 0
+    ):
+        raise ValueError("raw attention count must be a non-negative integer")
+    return {
+        "status": "not_evaluated",
+        "evidence_error": None,
+        "projection_sha256": _sha256_json(
+            {
+                "schema_version": 1,
+                "status": "not_evaluated",
+                "raw_attention_count": raw_attention_count,
+                "scope": "non_attention_filtered_task_list",
+            }
+        ),
+        "raw_attention_count": raw_attention_count,
+        "current_attention_count": None,
+        "excluded_attention_count": None,
+        "excluded_classification_counts": {},
+        "decision_candidate_count": None,
+        "decision_classification_counts": {},
+        "retry_successor_record_count": None,
+        "scope": "non_attention_filtered_task_list",
+        "raw_scope": "current_task_projection_before_attention_decisions",
+    }
+
+
 def _task_attention_projection(
     connection: sqlite3.Connection,
     projection: dict[str, Any],
@@ -6224,25 +6256,42 @@ def grabowski_task_list(
         )
         import grabowski_task_attention as task_attention
 
+        evaluate_attention_projection = state in {None, "attention"}
+        decision_guard = (
+            task_attention.decision_snapshot_guard()
+            if evaluate_attention_projection
+            else nullcontext(None)
+        )
         # Decision files live outside SQLite. Hold the shared decision lock from
-        # projection through cursor validation and row materialization so a
-        # create-only closeout write cannot split one attention read across two
-        # decision-store generations. Writers use the same lock exclusively.
-        with task_attention.decision_snapshot_guard() as decision_snapshot:
-            attention_projection, attention_excluded_task_ids = _task_attention_projection(
-                connection,
-                current_projection,
-                decision_snapshot=decision_snapshot,
-            )
-            if (
-                attention_projection["raw_attention_count"]
-                != raw_projection_counts["attention"]
-            ):
-                raise lifecycle_projection.LifecycleProjectionIntegrityError(
-                    "decision-aware attention projection does not match current raw attention count"
-                )
+        # projection through cursor validation and row materialization only when
+        # the caller requested the unfiltered or decision-aware attention view.
+        # Exact and non-attention projection filters must not scan unrelated
+        # attention history merely to return their bounded row page.
+        with decision_guard as decision_snapshot:
             projection_counts = dict(raw_projection_counts)
-            projection_counts["attention"] = attention_projection["current_attention_count"]
+            attention_excluded_task_ids: set[str] = set()
+            if evaluate_attention_projection:
+                attention_projection, attention_excluded_task_ids = (
+                    _task_attention_projection(
+                        connection,
+                        current_projection,
+                        decision_snapshot=decision_snapshot,
+                    )
+                )
+                if (
+                    attention_projection["raw_attention_count"]
+                    != raw_projection_counts["attention"]
+                ):
+                    raise lifecycle_projection.LifecycleProjectionIntegrityError(
+                        "decision-aware attention projection does not match current raw attention count"
+                    )
+                projection_counts["attention"] = attention_projection[
+                    "current_attention_count"
+                ]
+            else:
+                attention_projection = _task_attention_projection_not_evaluated(
+                    raw_projection_counts["attention"]
+                )
             list_snapshot_sha256 = projection_sha256
             if state == "attention":
                 list_snapshot_sha256 = _sha256_json(
@@ -6321,22 +6370,23 @@ def grabowski_task_list(
             "code": "unknown_task_states",
             "count": unknown_state_count,
         })
-    if attention_projection["status"] != "verified":
+    if attention_projection["status"] == "degraded":
         warnings.append({
             "code": "attention_projection_degraded",
             "evidence_error": attention_projection["evidence_error"],
             "raw_attention_count": attention_projection["raw_attention_count"],
         })
-    warnings.extend(
-        {
-            "code": "task_requires_attention",
-            "task_id": task["task_id"],
-            "state": task["state"],
-        }
-        for task in tasks
-        if task.get("state") in warning_states
-        and task.get("task_id") not in attention_excluded_task_ids
-    )
+    if attention_projection["status"] != "not_evaluated":
+        warnings.extend(
+            {
+                "code": "task_requires_attention",
+                "task_id": task["task_id"],
+                "state": task["state"],
+            }
+            for task in tasks
+            if task.get("state") in warning_states
+            and task.get("task_id") not in attention_excluded_task_ids
+        )
     payload: dict[str, Any] = {
         "schema_version": 2,
         "view": selected_view,
@@ -6356,7 +6406,11 @@ def grabowski_task_list(
         "projection_counts_scope": "current_projection",
         "projection_counts_semantics": {
             "active": "current_task_states",
-            "attention": "current_task_projection_after_valid_attention_decisions",
+            "attention": (
+                "current_task_projection_after_valid_attention_decisions"
+                if evaluate_attention_projection
+                else "raw_current_task_states_attention_not_decision_filtered"
+            ),
             "terminal": "current_task_states",
         },
         "projection_counts_overlap": True,
@@ -6381,7 +6435,13 @@ def grabowski_task_list(
             "inspect unknown task states before relying on projections"
             if unknown_state_count
             else "repair attention projection evidence before relying on closeout filtering"
-            if attention_projection["status"] != "verified"
+            if attention_projection["status"] == "degraded"
+            else (
+                "inspect returned tasks before deciding the next action"
+                if tasks
+                else "none"
+            )
+            if attention_projection["status"] == "not_evaluated"
             else "inspect current attention tasks before retry"
             if projection_counts["attention"]
             else "none"
@@ -6391,6 +6451,11 @@ def grabowski_task_list(
             "safe_unchanged_retry",
             "resource_release_complete",
             "physical_archive_pruning",
+            *(
+                ["decision-aware attention count for this non-attention filter"]
+                if attention_projection["status"] == "not_evaluated"
+                else []
+            ),
         ],
     }
     if selected_view == "evidence":

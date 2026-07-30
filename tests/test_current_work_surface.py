@@ -182,11 +182,43 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
         self.assertEqual(seen["task_ids"], ["terminal123"])
         self.assertFalse(seen["required_ids_truncated"])
 
-    def test_repository_scope_is_bounded_and_unique(self) -> None:
+    def test_repository_scope_is_bounded_absolute_and_canonical(self) -> None:
         with self.assertRaisesRegex(ValueError, "between 1 and"):
             surface.grabowski_current_work([])
-        with self.assertRaisesRegex(ValueError, "unique"):
-            surface.grabowski_current_work([REPOSITORY, REPOSITORY])
+        with self.assertRaisesRegex(ValueError, "must be absolute"):
+            surface.grabowski_current_work(["grabowski"])
+        self.assertEqual(
+            surface._require_repositories(["/home/alex/repos/../repos/grabowski"]),
+            [REPOSITORY],
+        )
+        self.assertEqual(
+            surface._require_repositories(["//home/alex/repos/grabowski"]),
+            [REPOSITORY],
+        )
+        with self.assertRaisesRegex(ValueError, "unique canonical paths"):
+            surface.grabowski_current_work(
+                [REPOSITORY, "/home/alex/repos/../repos/grabowski"]
+            )
+
+    def test_checkout_source_failure_is_isolated_per_repository(self) -> None:
+        missing = "/home/alex/repos/missing"
+
+        def inventory(repository: str, **_kwargs: object) -> dict:
+            if repository == missing:
+                raise ValueError("not a repository")
+            return {"repository": repository, "worktrees": [{"path": repository}]}
+
+        errors: list[dict] = []
+        checkouts = SimpleNamespace(checkout_inventory=inventory)
+        with patch.object(surface, "_module", return_value=checkouts):
+            payloads = surface._checkout_payloads([REPOSITORY, missing], errors)
+
+        self.assertEqual(payloads[0]["repository"], REPOSITORY)
+        self.assertEqual(payloads[1], {"repository": missing, "worktrees": [], "truncated": True})
+        self.assertEqual(
+            errors,
+            [{"source": "checkouts", "error": "ValueError", "repository": missing}],
+        )
 
 
 if __name__ == "__main__":
