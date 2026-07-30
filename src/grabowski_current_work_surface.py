@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 import time
 from typing import Any, Callable
 
@@ -30,9 +31,15 @@ def _require_repositories(repositories: list[str]) -> list[str]:
     for repository in repositories:
         if not isinstance(repository, str) or not repository or "\x00" in repository:
             raise ValueError("repository paths must be non-empty strings")
-        if repository in normalized:
-            raise ValueError("repositories must be unique")
-        normalized.append(repository)
+        candidate = Path(repository).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError(
+                "repository paths must be absolute; repository aliases are not accepted"
+            )
+        canonical = str(candidate.resolve(strict=False))
+        if canonical in normalized:
+            raise ValueError("repositories must resolve to unique canonical paths")
+        normalized.append(canonical)
     return normalized
 
 
@@ -161,18 +168,31 @@ def _resources_payload() -> dict[str, Any]:
     }
 
 
-def _checkout_payloads(repositories: list[str]) -> list[dict[str, Any]]:
+def _checkout_payloads(
+    repositories: list[str],
+    errors: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     checkouts = _module("grabowski_checkouts")
     payloads: list[dict[str, Any]] = []
     for repository in repositories:
-        payloads.append(
-            checkouts.checkout_inventory(
-                repository,
-                include_processes=True,
-                include_tasks=True,
-                include_resources=True,
+        try:
+            payloads.append(
+                checkouts.checkout_inventory(
+                    repository,
+                    include_processes=True,
+                    include_tasks=True,
+                    include_resources=True,
+                )
             )
-        )
+        except Exception as exc:
+            if errors is None:
+                raise
+            error = _source_error("checkouts", exc)
+            error["repository"] = repository
+            errors.append(error)
+            payloads.append(
+                {"repository": repository, "worktrees": [], "truncated": True}
+            )
     return payloads
 
 
@@ -238,7 +258,7 @@ def grabowski_current_work(
     checkout_payloads = _attempt_source(
         "checkouts",
         "git_cli",
-        lambda: _checkout_payloads(repository_filters),
+        lambda: _checkout_payloads(repository_filters, source_errors),
         source_errors,
         [
             {"repository": repository, "worktrees": [], "truncated": True}

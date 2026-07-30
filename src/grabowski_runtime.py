@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Annotated
+
+from pydantic import Field
 
 import grabowski_operator_core
 import grabowski_checkouts
@@ -41,12 +44,20 @@ READ_ONLY = grabowski_operator_core.READ_ONLY
 
 @mcp.tool(name="grabowski_current_work", annotations=READ_ONLY)
 async def grabowski_current_work(
-    repositories: list[str],
+    repositories: Annotated[
+        list[str],
+        Field(
+            description=(
+                "Absolute local repository paths; short aliases such as "
+                "'grabowski' are rejected."
+            )
+        ),
+    ],
     view: str = "current",
     limit: int = 20,
     cursor: str | None = None,
 ) -> dict[str, object]:
-    """Project bounded current operator work without blocking the MCP event loop."""
+    """Project work for absolute local repository paths without blocking the MCP event loop."""
     return await asyncio.to_thread(
         grabowski_current_work_surface.grabowski_current_work,
         repositories,
