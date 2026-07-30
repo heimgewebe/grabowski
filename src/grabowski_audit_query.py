@@ -864,6 +864,7 @@ def _lease_external_evidence(resource_key: str) -> tuple[list[dict[str, Any]], l
             return [], [_external_gap("lease", "lease_store_uninitialized", resource_key=resource_key)]
         key = resources.normalize_resource_key(resource_key)
         with sqlite_store.readonly_sqlite(resources.RESOURCE_DB) as connection:
+            resources._validate_resource_lease_contract(connection)
             row = connection.execute("SELECT * FROM leases WHERE resource_key=?", (key,)).fetchone()
     except Exception as exc:
         return [], [_external_gap("lease", "lease_store_unverifiable", resource_key=resource_key, error=type(exc).__name__)]
