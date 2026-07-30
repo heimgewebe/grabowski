@@ -649,12 +649,12 @@
         "tests:tests/test_grips.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only create-only confirmation that one already published exact Git diff was exposed through a user-visible delivery reference before merge.",
+        "claim": "The tool owns only optional create-only confirmation that one already published exact Git diff was exposed through a user-visible delivery reference. It is not pre-merge evidence and grants no merge authority.",
         "evidence": "The receipt revalidates the private git-diff.v1 artifact and payload, binds repository, PR, base, head and full diff SHA-256, records comparable timestamps, expires after one hour and grants no merge, review or CI authority."
       },
       "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "A typed generic file or merge operation was rejected because delivery confirmation must remain temporally and cryptographically separate from both artifact creation and irreversible merge dispatch; otherwise one actor could manufacture retrospective compliance.",
-      "rationale": "User-visible delivery is a distinct append-only evidence boundary. It must be created only after the concrete download reference has been exposed and independently revalidated by Captain and the atomic merge guard.",
+      "operation_alternative_considered": "A typed generic file or merge operation was rejected because optional artifact-handoff confirmation must remain cryptographically separate from artifact creation and irreversible merge dispatch; otherwise a handoff receipt could be mistaken for merge authority.",
+      "rationale": "User-visible delivery is an optional append-only artifact-handoff boundary. It is created only when the user explicitly requests the artifact or a documented special risk justifies it, and it is verified only by consumers that explicitly opt in; Captain and the atomic merge guard do not require or revalidate it.",
       "tool_contract": {
         "authority_class": "mutation",
         "category": "artifact",
