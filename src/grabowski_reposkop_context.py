@@ -109,29 +109,92 @@ def _validate_executable_ancestors(path: Path) -> None:
         _validate_executable_directory(current, trusted_uids=trusted_uids)
 
 
-def _validate_executable(path: Path) -> tuple[Path, str]:
+def _open_validated_executable(path: Path) -> tuple[int, str]:
+    """Open the executable O_NOFOLLOW, validate that inode, and hash its bytes.
+
+    The returned descriptor must be the one executed (e.g. via /proc/self/fd/N)
+    so a same-UID path replacement cannot swap the image after validation.
+    """
     if not path.is_absolute() or path.is_symlink():
         raise ReposkopContextError(
             "Reposkop executable must be an absolute non-symlink path"
         )
     _validate_executable_ancestors(path)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
-        metadata = path.stat()
+        descriptor = os.open(path, flags)
     except FileNotFoundError as exc:
         raise ReposkopContextError(f"Reposkop executable is missing: {path}") from exc
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.getuid()
-        or metadata.st_nlink != 1
-        or metadata.st_size <= 0
-        or metadata.st_size > MAX_EXECUTABLE_BYTES
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-        or not os.access(path, os.X_OK)
-    ):
+    except OSError as exc:
         raise ReposkopContextError(
-            "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
-        )
-    return path, _sha256_file(path)
+            "Reposkop executable could not be opened safely"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        try:
+            linked = path.lstat()
+        except FileNotFoundError as exc:
+            raise ReposkopContextError(
+                f"Reposkop executable is missing: {path}"
+            ) from exc
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(linked.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (linked.st_dev, linked.st_ino)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_EXECUTABLE_BYTES
+            or mode & 0o022
+            or not mode & 0o100
+        ):
+            raise ReposkopContextError(
+                "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
+            )
+        digest = hashlib.sha256()
+        total = 0
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_EXECUTABLE_BYTES:
+                raise ReposkopContextError(
+                    "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
+                )
+            digest.update(chunk)
+        if total != metadata.st_size or total <= 0:
+            raise ReposkopContextError(
+                "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
+            )
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        ):
+            raise ReposkopContextError(
+                "Reposkop executable changed while being validated"
+            )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor, digest.hexdigest()
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _validate_executable(path: Path) -> tuple[Path, str]:
+    descriptor, digest = _open_validated_executable(path)
+    os.close(descriptor)
+    return path, digest
 
 
 def _validate_target(value: str) -> Path:
@@ -250,6 +313,7 @@ def _run_bounded_process(
     timeout_seconds: int,
     stdout_limit: int,
     stderr_limit: int,
+    pass_fds: tuple[int, ...] = (),
 ) -> dict[str, Any]:
     if timeout_seconds <= 0 or stdout_limit <= 0 or stderr_limit <= 0:
         raise ValueError("Reposkop process limits must be positive")
@@ -262,6 +326,8 @@ def _run_bounded_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
+        pass_fds=pass_fds,
+        close_fds=True,
     )
     process_group_id = process.pid
     if process.stdout is None or process.stderr is None:
@@ -384,14 +450,29 @@ def _run_bounded_process(
 def _run_reposkop(
     target: Path, purpose: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    executable, executable_sha256 = _validate_executable(REPOSKOP_BIN)
-    result = _run_bounded_process(
-        [str(executable), "report", str(target), "--purpose", purpose, "--json"],
-        cwd=HOME,
-        timeout_seconds=20,
-        stdout_limit=MAX_REPORT_BYTES,
-        stderr_limit=MAX_STDERR_BYTES,
+    # Bind validation to the executed inode: open O_NOFOLLOW, hash that fd, and
+    # exec via /proc/self/fd/N so a same-UID path replace cannot swap the image.
+    executable_descriptor, executable_sha256 = _open_validated_executable(
+        REPOSKOP_BIN
     )
+    try:
+        result = _run_bounded_process(
+            [
+                f"/proc/self/fd/{executable_descriptor}",
+                "report",
+                str(target),
+                "--purpose",
+                purpose,
+                "--json",
+            ],
+            cwd=HOME,
+            timeout_seconds=20,
+            stdout_limit=MAX_REPORT_BYTES,
+            stderr_limit=MAX_STDERR_BYTES,
+            pass_fds=(executable_descriptor,),
+        )
+    finally:
+        os.close(executable_descriptor)
     if result["timed_out"]:
         raise ReposkopContextError("Reposkop report timed out")
     if result["stdout_limit_exceeded"]:
@@ -408,7 +489,10 @@ def _run_reposkop(
             f"{str(result['stderr'])[:1000]}"
         )
     post_executable, post_executable_sha256 = _validate_executable(REPOSKOP_BIN)
-    if post_executable != executable or post_executable_sha256 != executable_sha256:
+    if (
+        post_executable != REPOSKOP_BIN
+        or post_executable_sha256 != executable_sha256
+    ):
         raise ReposkopContextError(
             "Reposkop executable identity changed during report execution"
         )
@@ -430,7 +514,7 @@ def _run_reposkop(
             "Reposkop report output is not valid JSON"
         ) from exc
     return _validate_report(report, target=target, purpose=purpose), {
-        "path": str(executable),
+        "path": str(REPOSKOP_BIN),
         "sha256": executable_sha256,
     }
 
@@ -1527,6 +1611,7 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
     # create fd is the only handle that can still unlink the escaped .pending.
     write_root_descriptor, create_root = _open_receipt_root_under_write_root()
     try:
+        create_identity = os.fstat(create_root)
         _create_pending_on_descriptor(binding, root_descriptor=create_root)
         try:
             link_write_root, link_root = _open_receipt_root_under_write_root()
@@ -1540,6 +1625,20 @@ def _publish_receipt(binding: dict[str, Any], *, root_descriptor: int) -> None:
                 "Reposkop receipt root re-open failed after pending create"
             ) from exc
         try:
+            link_identity = os.fstat(link_root)
+            if (create_identity.st_dev, create_identity.st_ino) != (
+                link_identity.st_dev,
+                link_identity.st_ino,
+            ):
+                # Re-anchor selected a different authorized directory; remove
+                # debris via both bound roots before failing closed.
+                _rollback_leaf_names(create_root, pending_path.name)
+                _rollback_leaf_names(
+                    link_root, pending_path.name, receipt_path.name
+                )
+                raise ReposkopContextError(
+                    "Reposkop receipt root identity changed between create and link re-anchor"
+                )
             try:
                 os.link(
                     pending_path.name,

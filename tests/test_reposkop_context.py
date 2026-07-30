@@ -80,13 +80,22 @@ class ReposkopContextTests(unittest.TestCase):
         audit_error: BaseException | None = None,
     ):
         def fake_run(
-            argv, *, cwd, timeout_seconds, stdout_limit, stderr_limit
+            argv,
+            *,
+            cwd,
+            timeout_seconds,
+            stdout_limit,
+            stderr_limit,
+            pass_fds=(),
         ):
             with self.audit_lock:
                 self.run_calls.append((list(argv), Path(cwd)))
             self.assertEqual(timeout_seconds, 20)
             self.assertEqual(stdout_limit, context.MAX_REPORT_BYTES)
             self.assertEqual(stderr_limit, context.MAX_STDERR_BYTES)
+            self.assertIsInstance(pass_fds, tuple)
+            self.assertEqual(len(pass_fds), 1)
+            self.assertTrue(str(argv[0]).startswith("/proc/self/fd/"))
             stdout = json.dumps(report)
             return {
                 "returncode": 0,
@@ -290,10 +299,11 @@ class ReposkopContextTests(unittest.TestCase):
                 }
             )
         )
+        run_argv = self.run_calls[0][0]
+        self.assertTrue(run_argv[0].startswith("/proc/self/fd/"))
         self.assertEqual(
-            self.run_calls[0][0],
+            run_argv[1:],
             [
-                str(self.executable),
                 "report",
                 str(self.repo.resolve()),
                 "--purpose",
@@ -566,6 +576,107 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertGreaterEqual(state["opens"], 4)
         self.assertEqual(list(moved_root.glob("*.json")), [])
         self.assertEqual(list(moved_root.glob("*.pending")), [])
+
+    def test_link_reanchor_rejects_different_receipt_root_inode(self) -> None:
+        """Create and link roots must share one inode; else roll back via create_fd."""
+        patches = self.patches(self.report())
+        alt_root = self.root / "alt-receipts-inode"
+        alt_root.mkdir(mode=0o700)
+        real_create = context._create_pending_on_descriptor
+        real_open = context._open_receipt_root_under_write_root
+        state = {"creates": 0, "opens": 0}
+
+        def create_and_count(binding, *, root_descriptor):
+            state["creates"] += 1
+            return real_create(binding, root_descriptor=root_descriptor)
+
+        def open_then_alternate_root(*, expected_identity=None):
+            state["opens"] += 1
+            # opens 1-3 use the real receipt root; open 4 (link re-anchor) is foreign.
+            if state["opens"] >= 4:
+                flags = context._directory_open_flags()
+                write_fd = os.open(str(self.root), flags)
+                try:
+                    receipt_fd = os.open(str(alt_root), flags)
+                except BaseException:
+                    os.close(write_fd)
+                    raise
+                return write_fd, receipt_fd
+            return real_open(expected_identity=expected_identity)
+
+        with (
+            self.patch_context(patches),
+            patch.object(
+                context,
+                "_create_pending_on_descriptor",
+                side_effect=create_and_count,
+            ),
+            patch.object(
+                context,
+                "_open_receipt_root_under_write_root",
+                side_effect=open_then_alternate_root,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "identity changed between create and link re-anchor",
+            ):
+                context.grabowski_reposkop_context(str(self.repo))
+
+        self.assertGreaterEqual(state["creates"], 1)
+        self.assertGreaterEqual(state["opens"], 4)
+        if self.receipts.exists():
+            self.assertEqual(list(self.receipts.glob("*.json")), [])
+            self.assertEqual(list(self.receipts.glob("*.pending")), [])
+        self.assertEqual(list(alt_root.glob("*.json")), [])
+        self.assertEqual(list(alt_root.glob("*.pending")), [])
+
+    def test_run_reposkop_executes_opened_executable_descriptor(self) -> None:
+        """_run_reposkop must exec the validated inode via /proc/self/fd and pass_fds."""
+        script = self.root / "fd-exec-reposkop"
+        script.write_text(
+            "#!/usr/bin/python3\n"
+            "import json, sys\n"
+            "json.dump({'kind':'probe'}, sys.stdout)\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        captured: dict[str, object] = {}
+
+        def capture_run(argv, **kwargs):
+            captured["argv"] = list(argv)
+            captured["pass_fds"] = kwargs.get("pass_fds")
+            return {
+                "returncode": 0,
+                "timed_out": False,
+                "duration_seconds": 0.01,
+                "stdout_data": b"{}",
+                "stderr": "",
+                "stdout_bytes": 2,
+                "stderr_bytes": 0,
+                "stdout_limit_exceeded": False,
+                "stderr_limit_exceeded": False,
+            }
+
+        report = self.report()
+        with (
+            patch.object(context, "REPOSKOP_BIN", script),
+            patch.object(context, "_run_bounded_process", side_effect=capture_run),
+            patch.object(context, "_validate_report", return_value=report),
+        ):
+            _result, executable = context._run_reposkop(
+                self.repo.resolve(), "grabowski-repo-state-context"
+            )
+
+        argv = captured["argv"]
+        assert isinstance(argv, list)
+        self.assertTrue(str(argv[0]).startswith("/proc/self/fd/"))
+        self.assertEqual(argv[1:4], ["report", str(self.repo.resolve()), "--purpose"])
+        pass_fds = captured["pass_fds"]
+        self.assertIsInstance(pass_fds, tuple)
+        self.assertEqual(len(pass_fds), 1)
+        self.assertEqual(executable["path"], str(script))
+        self.assertEqual(executable["sha256"], context._sha256_file(script))
 
     def test_create_descriptor_rolls_back_pending_on_raw_file_not_found(self) -> None:
         """Raw FileNotFoundError during link re-anchor must still roll back .pending."""
