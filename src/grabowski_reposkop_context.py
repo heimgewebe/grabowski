@@ -110,85 +110,131 @@ def _validate_executable_ancestors(path: Path) -> None:
 
 
 def _open_validated_executable(path: Path) -> tuple[int, str]:
-    """Open the executable O_NOFOLLOW, validate that inode, and hash its bytes.
+    """Open the executable via an O_NOFOLLOW ancestor walk, hash that inode.
 
     The returned descriptor must be the one executed (e.g. via /proc/self/fd/N)
     so a same-UID path replacement cannot swap the image after validation.
+    Intermediate ancestors are opened component-wise so a rename of a middle
+    path segment to a symlink cannot redirect the open.
     """
     if not path.is_absolute() or path.is_symlink():
         raise ReposkopContextError(
             "Reposkop executable must be an absolute non-symlink path"
         )
-    _validate_executable_ancestors(path)
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    try:
-        descriptor = os.open(path, flags)
-    except FileNotFoundError as exc:
-        raise ReposkopContextError(f"Reposkop executable is missing: {path}") from exc
-    except OSError as exc:
+    if ".." in path.parts:
         raise ReposkopContextError(
-            "Reposkop executable could not be opened safely"
-        ) from exc
+            "Reposkop executable path may not contain parent traversal"
+        )
+    trusted_uids = {0, os.getuid()}
+    leaf = path.name
+    _validate_directory_component_name(leaf)
+    parent_descriptor = _open_directory_descriptor(Path(path.anchor))
     try:
-        metadata = os.fstat(descriptor)
+        cursor = Path(path.anchor)
+        _validate_executable_directory(cursor, trusted_uids=trusted_uids)
+        _validate_directory_path_binding(
+            parent_descriptor,
+            cursor,
+            label="Reposkop executable ancestor",
+        )
+        for component in path.parts[1:-1]:
+            cursor /= component
+            child = _open_relative_receipt_directory(
+                parent_descriptor,
+                component,
+                require_private=False,
+            )
+            try:
+                metadata = os.fstat(child)
+                mode = stat.S_IMODE(metadata.st_mode)
+                if (
+                    metadata.st_uid not in trusted_uids
+                    or (mode & 0o022 and not mode & stat.S_ISVTX)
+                ):
+                    raise ReposkopContextError(
+                        "Reposkop executable ancestor failed directory, ownership, "
+                        f"symlink or writable-mode checks: {cursor}"
+                    )
+                _validate_directory_path_binding(
+                    child,
+                    cursor,
+                    label="Reposkop executable ancestor",
+                )
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(parent_descriptor)
+            parent_descriptor = child
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
         try:
-            linked = path.lstat()
+            descriptor = os.open(leaf, flags, dir_fd=parent_descriptor)
         except FileNotFoundError as exc:
             raise ReposkopContextError(
                 f"Reposkop executable is missing: {path}"
             ) from exc
-        mode = stat.S_IMODE(metadata.st_mode)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(linked.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != (linked.st_dev, linked.st_ino)
-            or metadata.st_uid != os.getuid()
-            or metadata.st_nlink != 1
-            or metadata.st_size <= 0
-            or metadata.st_size > MAX_EXECUTABLE_BYTES
-            or mode & 0o022
-            or not mode & 0o100
-        ):
+        except OSError as exc:
             raise ReposkopContextError(
-                "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
+                "Reposkop executable could not be opened safely"
+            ) from exc
+        try:
+            metadata = os.fstat(descriptor)
+            linked = os.stat(
+                leaf, dir_fd=parent_descriptor, follow_symlinks=False
             )
-        digest = hashlib.sha256()
-        total = 0
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        while True:
-            chunk = os.read(descriptor, 64 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_EXECUTABLE_BYTES:
+            mode = stat.S_IMODE(metadata.st_mode)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(linked.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (linked.st_dev, linked.st_ino)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or metadata.st_size <= 0
+                or metadata.st_size > MAX_EXECUTABLE_BYTES
+                or mode & 0o022
+                or not mode & 0o100
+            ):
                 raise ReposkopContextError(
                     "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
                 )
-            digest.update(chunk)
-        if total != metadata.st_size or total <= 0:
-            raise ReposkopContextError(
-                "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
-            )
-        after = os.fstat(descriptor)
-        if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
-            metadata.st_dev,
-            metadata.st_ino,
-            metadata.st_size,
-            metadata.st_mtime_ns,
-        ):
-            raise ReposkopContextError(
-                "Reposkop executable changed while being validated"
-            )
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        return descriptor, digest.hexdigest()
-    except BaseException:
-        os.close(descriptor)
-        raise
+            digest = hashlib.sha256()
+            total = 0
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_EXECUTABLE_BYTES:
+                    raise ReposkopContextError(
+                        "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
+                    )
+                digest.update(chunk)
+            if total != metadata.st_size or total <= 0:
+                raise ReposkopContextError(
+                    "Reposkop executable failed ownership, type, link, size, execute or group/world-write checks"
+                )
+            after = os.fstat(descriptor)
+            if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ):
+                raise ReposkopContextError(
+                    "Reposkop executable changed while being validated"
+                )
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return descriptor, digest.hexdigest()
+        except BaseException:
+            os.close(descriptor)
+            raise
+    finally:
+        os.close(parent_descriptor)
 
 
 def _validate_executable(path: Path) -> tuple[Path, str]:

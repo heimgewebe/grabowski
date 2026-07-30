@@ -227,7 +227,8 @@ class ReposkopContextTests(unittest.TestCase):
         executable.chmod(0o700)
 
         with self.assertRaisesRegex(
-            context.ReposkopContextError, "executable ancestor failed"
+            context.ReposkopContextError,
+            r"executable ancestor failed|could not be opened safely|identity is unsafe",
         ):
             context._validate_executable(linked / "reposkop")
 
