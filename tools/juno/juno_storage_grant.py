@@ -27,13 +27,17 @@ from juno import dialogs
 from juno.objc import (
     ObjCClass,
     ObjCInstance,
-    ObjCProtocol,
     create_objc_class,
     ns,
     nsdata_to_bytes,
     on_main_thread,
     py_from_ns,
 )
+
+try:
+    from juno.objc import ObjCProtocol
+except ImportError:
+    ObjCProtocol = None
 
 
 SCHEMA_VERSION = 1
@@ -274,23 +278,20 @@ def _persist_grant(url: ObjCInstance) -> dict[str, Any]:
         url.stopAccessingSecurityScopedResource()
 
 
-def _release_picker(picker: ObjCInstance) -> None:
-    for token, retained in list(_RETAINED.items()):
+def _complete_picker(picker: ObjCInstance, status: str) -> None:
+    # UIDocumentPickerViewController.delegate is weak. Releasing the retained
+    # delegate while UIKit is still unwinding its callback can deallocate the
+    # receiver during the native message return and crash Juno. Keep the bounded
+    # delegate/picker pair until the next explicit picker run dismisses and
+    # clears it outside any delegate callback.
+    for retained in _RETAINED.values():
         try:
             if retained.get("picker") == picker:
-                _RETAINED.pop(token, None)
+                retained["completed_at"] = _utc_now()
+                retained["completion_status"] = status
                 return
         except Exception:
             continue
-    if len(_RETAINED) > 16:
-        _RETAINED.pop(next(iter(_RETAINED)), None)
-
-
-def _local_alert(title: str, message: str) -> None:
-    try:
-        dialogs.alert(title, message, ["OK"])
-    except Exception:
-        pass
 
 
 def documentPicker_didPickDocumentsAtURLs_(
@@ -305,16 +306,13 @@ def documentPicker_didPickDocumentsAtURLs_(
             f"{result['selected_name']} ({result['grant_id']}); "
             f"lesbar={result['readable']}, schreibbar={result['writable']}"
         )
-        _local_alert(
-            "Ordner aufgenommen",
-            f"{result['selected_name']}\nFreigabe: {result['grant_id']}",
-        )
+        completion_status = "granted"
     except Exception as exc:
         error = f"{type(exc).__name__}: {str(exc)[:500]}"
         print(f"Freigabe fehlgeschlagen: {error}")
-        _local_alert("Freigabe fehlgeschlagen", error)
+        completion_status = "failed"
     finally:
-        _release_picker(picker)
+        _complete_picker(picker, completion_status)
 
 
 def documentPickerWasCancelled_(
@@ -322,7 +320,7 @@ def documentPickerWasCancelled_(
     picker: ObjCInstance,
 ) -> None:
     print("Ordnerauswahl abgebrochen; es wurde keine Freigabe gespeichert.")
-    _release_picker(picker)
+    _complete_picker(picker, "cancelled")
 
 
 def _top_presenter() -> ObjCInstance:
@@ -374,6 +372,9 @@ def _dismiss_retained_pickers() -> None:
 @on_main_thread
 def _present_picker() -> str:
     delegate_class_name = f"{GRANT_CLASS_PREFIX}_{uuid.uuid4().hex}"
+    delegate_options: dict[str, Any] = {}
+    if ObjCProtocol is not None:
+        delegate_options["protocols"] = [ObjCProtocol("UIDocumentPickerDelegate")]
     Delegate = create_objc_class(
         delegate_class_name,
         superclass=ObjCClass("NSObject"),
@@ -381,7 +382,7 @@ def _present_picker() -> str:
             documentPicker_didPickDocumentsAtURLs_,
             documentPickerWasCancelled_,
         ],
-        protocols=[ObjCProtocol("UIDocumentPickerDelegate")],
+        **delegate_options,
     )
     delegate = Delegate.alloc().init()
     Picker = ObjCClass("UIDocumentPickerViewController")
@@ -421,9 +422,11 @@ def main() -> int:
         "Der iPadOS-Dialog ist geöffnet. Dieses Skript blockiert Junos "
         f"Hauptthread nicht (Vorgang {token[:12]})."
     )
-    print("Nach Auswahl oder Abbruch erscheint eine lokale Bestätigung.")
+    print("Nach Auswahl oder Abbruch wird das Ergebnis in Junos Konsole ausgegeben.")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    if exit_code:
+        raise RuntimeError(f"Juno storage grant picker failed with status {exit_code}")
