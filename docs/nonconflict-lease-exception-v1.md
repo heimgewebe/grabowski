@@ -39,7 +39,7 @@ The exception is denied when:
 - task, branch, worktree, path, component, runtime resource, process, deployment, migration, generated artifact or shared gate overlaps;
 - either manifest is missing, malformed, broad, unattested, based on another commit, incomplete or inconsistent with its resource keys;
 - the blocking lease lacks a scope manifest, belongs to the requester, changed, expired or has less than 30 seconds remaining;
-- the blocker is marked `lease_mode=emergency-recovery`;
+- the blocker is marked `lease_mode=emergency-recovery`; the marker is created only when a validated Bureau emergency-recovery contract corroborates the request, and caller metadata alone never grants recovery authority;
 - owner, purpose, exact resources or requested scope changed after assessment;
 - the proof is stale, future-dated, tampered with, carries non-canonical axis evidence, is ambiguous or shorter than the requested lease;
 - an exact resource key is already held by another owner;

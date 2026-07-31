@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import time
@@ -782,18 +784,32 @@ class NonConflictResourceTests(unittest.TestCase):
                     ttl_seconds=60,
                 )
 
-    def test_emergency_recovery_repository_lease_cannot_be_bypassed(self) -> None:
+    def test_persisted_emergency_recovery_repository_lease_cannot_be_bypassed(self) -> None:
+        resource_key = f"repo:{self.repo}"
         resources.acquire_resources(
             "owner-a",
-            [f"repo:{self.repo}"],
-            purpose="emergency recovery",
+            [resource_key],
+            purpose="validated recovery placeholder",
             ttl_seconds=180,
             metadata={
                 "scope_manifest": self.scope("a"),
                 "scope_manifest_complete": True,
-                "lease_mode": "emergency-recovery",
             },
         )
+        with sqlite3.connect(self.database) as connection:
+            stored = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?",
+                    (resource_key,),
+                ).fetchone()[0]
+            )
+            stored["lease_mode"] = "emergency-recovery"
+            metadata_json, metadata_sha256 = resources._metadata(stored)
+            connection.execute(
+                "UPDATE leases SET metadata_json=?, metadata_sha256=? "
+                "WHERE resource_key=?",
+                (metadata_json, metadata_sha256, resource_key),
+            )
         with self.assertRaisesRegex(
             nonconflict.NonConflictDenied, "cannot be bypassed"
         ):

@@ -3667,33 +3667,30 @@ def acquire_resources(
     if _preserve_live_same_owner and task_owner_match is None:
         raise PermissionError("live lease preservation requires a task owner")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    if "lease_mode" in normalized_metadata:
+        raise ValueError("metadata.lease_mode is not an authority surface")
     if "work_admission" in normalized_metadata:
         raise ValueError("metadata.work_admission is not a public authority surface")
     if "scope_manifest" in normalized_metadata:
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
         )
-    lease_mode_explicit = "lease_mode" in normalized_metadata
-    requested_lease_mode = normalized_metadata.get("lease_mode", "normal")
-    if requested_lease_mode not in {"normal", "emergency-recovery"}:
-        raise ValueError("metadata.lease_mode must be normal or emergency-recovery")
     bureau_contract = bureau_leases.enforce_bureau_lease_contract(
         keys, ttl_seconds=ttl, metadata=normalized_metadata
     )
-    bureau_emergency = (
+    contract_emergency = (
         isinstance(bureau_contract, dict)
         and bureau_contract.get("phase") == "emergency-recovery"
     )
-    if bureau_emergency:
-        if lease_mode_explicit and requested_lease_mode != "emergency-recovery":
-            raise ValueError(
-                "Bureau emergency-recovery conflicts with metadata.lease_mode"
-            )
-        lease_mode = "emergency-recovery"
-    else:
-        lease_mode = requested_lease_mode
-    if lease_mode == "emergency-recovery" and not any(key.startswith("repo:") for key in keys):
-        raise ValueError("emergency-recovery mode requires a repository lease")
+    bureau_emergency = (
+        contract_emergency
+        and keys == [bureau_leases.BROAD_BUREAU_REPOSITORY_KEY]
+    )
+    if contract_emergency and not bureau_emergency:
+        raise ValueError(
+            "emergency-recovery mode requires the exact broad Bureau repository key"
+        )
+    lease_mode = "emergency-recovery" if bureau_emergency else "normal"
     sanitized_value = bureau_leases.sanitize_bureau_metadata(keys, normalized_metadata)
     sanitized_metadata: dict[str, Any] = {} if sanitized_value is None else sanitized_value
     if bureau_emergency:
@@ -3982,7 +3979,13 @@ def renew_resources(
                     row
                 ) != expected_by_key[key]:
                     raise RuntimeError(f"Resource lease changed before renew: {key}")
-                if "nonconflict_exception" in _row_metadata(row):
+                row_metadata = _row_metadata(row)
+                if row_metadata.get("lease_mode") == "emergency-recovery":
+                    raise RuntimeError(
+                        "emergency-recovery leases are non-renewable; "
+                        "reacquire with a new validated contract"
+                    )
+                if "nonconflict_exception" in row_metadata:
                     raise RuntimeError(
                         "non-conflict exception leases are non-renewable; reassess and reacquire"
                     )
@@ -4243,7 +4246,12 @@ def _public_repository_scope_keys(
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
     normalized_metadata = {} if metadata is None else dict(metadata)
-    if normalized_metadata.get("lease_mode") == "emergency-recovery":
+    if "lease_mode" in normalized_metadata:
+        raise ValueError("metadata.lease_mode is not a public authority surface")
+    if (
+        normalized_metadata.get("bureau_phase") == "emergency-recovery"
+        and repository_keys == [bureau_leases.BROAD_BUREAU_REPOSITORY_KEY]
+    ):
         return keys
     scope = (
         nonconflict.normalize_scope_manifest(normalized_metadata["scope_manifest"])
@@ -4303,10 +4311,11 @@ def grabowski_resource_acquire(
 ) -> dict[str, Any]:
     """Atomically acquire typed resource leases for one owner.
 
-    Public broad repository resources require a complete exact scope manifest. An
-    explicit emergency-recovery lease remains a deliberately exclusive
-    fail-closed exception and cannot be used for non-conflict bypasses. Self-scoped
-    branch and operation keys are authoritative and reject scope manifests.
+    Public broad repository resources require a complete exact scope manifest.
+    Emergency-recovery mode is derived only from a validated Bureau recovery
+    contract; caller-supplied lease-mode metadata is not an authority surface.
+    Self-scoped branch and operation keys are authoritative and reject scope
+    manifests.
     """
     normalized_resource_keys = _public_repository_scope_keys(resource_keys, metadata)
     operator._require_operator_mutation("resource_lease")

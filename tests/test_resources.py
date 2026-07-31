@@ -2554,18 +2554,70 @@ class ResourceTests(unittest.TestCase):
                     },
                 )
 
-    def test_public_tool_preserves_explicit_emergency_repository_exclusion(self) -> None:
+    def test_public_tool_rejects_caller_selected_emergency_repository_mode(self) -> None:
         with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
             resources.base, "_append_audit"
         ):
-            result = resources.grabowski_resource_acquire(
+            with self.assertRaisesRegex(
+                ValueError, "metadata.lease_mode is not a public authority surface"
+            ):
+                resources.grabowski_resource_acquire(
+                    "owner-a",
+                    [f"repo:{self.root}"],
+                    "emergency recovery",
+                    60,
+                    {"lease_mode": "emergency-recovery"},
+                )
+
+    def test_core_rejects_non_bureau_emergency_repository_mode(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "metadata.lease_mode is not an authority surface"
+        ):
+            resources.acquire_resources(
                 "owner-a",
                 [f"repo:{self.root}"],
-                "emergency recovery",
-                60,
-                {"lease_mode": "emergency-recovery"},
+                purpose="emergency recovery",
+                ttl_seconds=60,
+                metadata={"lease_mode": "emergency-recovery"},
             )
-        self.assertEqual(result["leases"][0]["resource_key"], f"repo:{self.root}")
+        self.assertFalse(self.database.exists())
+
+    def test_public_tool_does_not_accept_bureau_phase_for_other_repository(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "metadata.scope_manifest_complete=true"
+        ):
+            resources.grabowski_resource_acquire(
+                "owner-a",
+                [f"repo:{self.root}"],
+                "claimed recovery",
+                60,
+                {
+                    "bureau_phase": "emergency-recovery",
+                    "bureau_justification": "not the Bureau repository",
+                    "bureau_expected_head": "a" * 40,
+                },
+            )
+
+    def test_public_bureau_emergency_pass_through_rejects_mixed_repositories(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "metadata.scope_manifest_complete=true"
+        ):
+            resources._public_repository_scope_keys(
+                [
+                    resources.bureau_leases.BROAD_BUREAU_REPOSITORY_KEY,
+                    f"repo:{self.root}",
+                ],
+                {"bureau_phase": "emergency-recovery"},
+            )
+
+    def test_public_broad_bureau_work_still_requires_complete_scope(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "metadata.scope_manifest_complete=true"
+        ):
+            resources._public_repository_scope_keys(
+                [resources.bureau_leases.BROAD_BUREAU_REPOSITORY_KEY],
+                {"bureau_phase": "work"},
+            )
 
     def test_tool_audits_hash_only_metadata(self) -> None:
         with patch.object(resources.operator, "_require_operator_mutation"), patch.object(

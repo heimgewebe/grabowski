@@ -37,6 +37,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
 
     def test_permissions_are_observer_only_except_status_publication(self) -> None:
         self.assertIn("  contents: read\n", self.text)
+        self.assertIn("  issues: read\n", self.text)
         self.assertIn("  pull-requests: read\n", self.text)
         self.assertNotIn("  pull-requests: write\n", self.text)
         self.assertNotIn("  issues: write\n", self.text)
