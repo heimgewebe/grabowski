@@ -13,6 +13,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -31,7 +32,24 @@ COMPETITION_ROOT = Path(
         str(operator.STATE_DIR / "agent-competitions"),
     )
 ).expanduser()
-RUNNER = Path(__file__).resolve().parent.parent / "tools" / "external_programming_candidate.py"
+def _resolve_runner_path(
+    *,
+    module_file: str | Path | None = None,
+    python_prefix: str | Path | None = None,
+) -> Path:
+    module_path = Path(__file__ if module_file is None else module_file).resolve()
+    prefix = Path(sys.prefix if python_prefix is None else python_prefix).resolve()
+    candidates = (
+        module_path.parent.parent / "tools" / "external_programming_candidate.py",
+        prefix.parent / "inputs" / "tools" / "external_programming_candidate.py",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+RUNNER = _resolve_runner_path()
 PROVIDERS = {"claude", "antigravity", "opencode", "openhands", "codex", "grok"}
 ROUTABLE_EXTERNAL_PROVIDERS = (
     "codex",
