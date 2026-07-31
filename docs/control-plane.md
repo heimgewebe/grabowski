@@ -15,6 +15,10 @@ Die Registry liegt unter `~/.config/grabowski/fleet.json`; das versionierte Beis
 
 Hosts sind ausschließlich registrierte lokale oder SSH-Ziele. SSH verwendet `BatchMode=yes`, deaktiviert Forwardings, begrenzt den Verbindungsaufbau und erzeugt den Remote-Befehl aus einer argv-Liste mit POSIX-Quoting. Pro Host gilt eine Executable-Allowlist; `*` ist die explizite Power-Policy.
 
+Normale persistente Tasks leiten stdout und stderr nicht in das gemeinsame User-Journal. Ein argv-only Capture-Prozess startet das unveränderte Nutzkommando, erzeugt pro Taskversuch ein privates `0700`-Verzeichnis unter dem Benutzer-Home und zwei create-only, `O_NOFOLLOW`-geöffnete `0600`-Dateien. Jeder Stream ist auf 8 MiB begrenzt; bei Überschreitung bleiben ein großer Anfangsbereich, die letzten 64 KiB und ein expliziter Kürzungsmarker erhalten. `grabowski_task_logs` liest beide Streams begrenzt und redigiert. Parent, Taskverzeichnis und Dateien werden descriptorgebunden mit Eigentümer-, Modus-, Link- und Inodeprüfungen vor und nach dem Zugriff validiert. User-Tasks ohne vorhandenes privates Outputverzeichnis — historische Tasks sowie Starts, die vor dessen Erzeugung scheitern — fallen lesend auf das Journal zurück; Root-Broker-Tasks behalten ihren getrennten Root-Journalvertrag. Der Vertrag beweist weder Authentizität gegenüber anderen Prozessen derselben UID noch vollständige Ausgabe jenseits des Streamlimits oder eine spätere Retention/Archivbereinigung.
+
+SSH-Hosts müssen `/usr/bin/python3` mit `O_NOFOLLOW` bereitstellen. Bei einer eingeschränkten `command_allowlist` muss mindestens `python3` oder `/usr/bin/python3` freigegeben sein, weil der Fleet-Reader denselben descriptorgebundenen Python-Vertrag direkt ausführt. Die Freigabe erteilt keine Shell- oder Mutationsautorität; sie erlaubt ausschließlich die vom aufrufenden Werkzeug weiterhin vollständig validierte argv-Liste.
+
 ## Operationsrezepte
 
 Die Registry liegt unter `~/.config/grabowski/operations.json`; das Beispiel ist `config/operations.example.json`.

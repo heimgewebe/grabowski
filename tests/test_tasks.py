@@ -8,6 +8,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 from pathlib import Path
 import subprocess
 import sys
@@ -127,6 +128,11 @@ class TaskTests(unittest.TestCase):
             "TASK_OUTCOMES_DIR",
             self.database.with_suffix(".outcomes"),
         )
+        self.output_root = self.root / "output-home"
+        self.output_root.mkdir(mode=0o700)
+        self.output_root_patch = patch.object(
+            tasks, "TASK_OUTPUT_ROOT", self.output_root
+        )
         self.resource_database = self.root / "state" / "resources.sqlite3"
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
@@ -150,6 +156,7 @@ class TaskTests(unittest.TestCase):
         self.audit_patch.start()
         self.db_patch.start()
         self.outcomes_patch.start()
+        self.output_root_patch.start()
         self.resource_patch.start()
         self.admission_patch.start()
         self.start_counter = 0
@@ -157,6 +164,7 @@ class TaskTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.admission_patch.stop()
         self.resource_patch.stop()
+        self.output_root_patch.stop()
         self.outcomes_patch.stop()
         self.db_patch.stop()
         self.audit_patch.stop()
@@ -274,21 +282,317 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=ProtectHome=no", launch)
         self.assertIn("--property=MemoryDenyWriteExecute=no", launch)
         self.assertIn("--property=UMask=0077", launch)
-        self.assertEqual(
-            launch.count(
-                f"--property=LogRateLimitIntervalSec="
-                f"{tasks.TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s"
-            ),
-            1,
+        self.assertEqual(launch.count("--property=StandardOutput=null"), 1)
+        self.assertEqual(launch.count("--property=StandardError=journal"), 1)
+        self.assertFalse(
+            any(item.startswith("--property=LogRateLimit") for item in launch)
         )
+        separator = launch.index("--")
+        capture = launch[separator + 1 :]
+        paths = tasks._task_output_paths(result["task"])
         self.assertEqual(
-            launch.count(
-                f"--property=LogRateLimitBurst={tasks.TASK_LOG_RATE_LIMIT_BURST}"
-            ),
-            1,
+            capture[:6],
+            [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_CAPTURE_CODE,
+                str(paths["directory"]),
+                str(tasks.TASK_OUTPUT_MAX_BYTES),
+                str(tasks.TASK_OUTPUT_TAIL_BYTES),
+            ],
         )
-        self.assertEqual(launch[-3:], ["--", "/bin/echo", command_argument])
+        self.assertEqual(capture[-2:], ["/bin/echo", command_argument])
         return result
+
+    def _write_task_output(
+        self,
+        task: dict[str, object],
+        *,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> dict[str, Path]:
+        paths = tasks._task_output_paths(task)
+        paths["directory"].mkdir(mode=0o700)
+        paths["stdout"].write_text(stdout, encoding="utf-8")
+        paths["stderr"].write_text(stderr, encoding="utf-8")
+        os.chmod(paths["stdout"], 0o600)
+        os.chmod(paths["stderr"], 0o600)
+        return paths
+
+    def test_task_output_paths_are_attempt_bound(self) -> None:
+        record = {"task_id": "a" * 24, "attempt": 1}
+        first = tasks._task_output_paths(record)
+        second = tasks._task_output_paths({**record, "attempt": 2})
+        self.assertNotEqual(first["directory"], second["directory"])
+        self.assertEqual(first["stdout"].name, "stdout.log")
+        self.assertEqual(first["stderr"].name, "stderr.log")
+        self.assertEqual(first["directory"].parent, self.output_root)
+
+    def test_capture_wrapper_bounds_streams_and_preserves_exit_status(self) -> None:
+        child = (
+            "import sys\n"
+            "for i in range(1000): print(f'out-{i:04d}', flush=True)\n"
+            "for i in range(1000): print(f'err-{i:04d}', file=sys.stderr, flush=True)\n"
+            "raise SystemExit(7)\n"
+        )
+        record = {
+            "task_id": "b" * 24,
+            "attempt": 1,
+            "argv_json": json.dumps(["/usr/bin/python3", "-c", child]),
+        }
+        with patch.object(tasks, "TASK_OUTPUT_MAX_BYTES", 4096), patch.object(
+            tasks, "TASK_OUTPUT_TAIL_BYTES", 512
+        ):
+            argv = tasks._task_output_capture_argv(record)
+            completed = subprocess.run(
+                argv,
+                cwd=self.root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(completed.returncode, 7)
+        self.assertEqual(completed.stdout, "")
+        self.assertEqual(completed.stderr, "")
+        paths = tasks._task_output_paths(record)
+        self.assertEqual(stat.S_IMODE(paths["directory"].stat().st_mode), 0o700)
+        for stream in ("stdout", "stderr"):
+            self.assertEqual(stat.S_IMODE(paths[stream].stat().st_mode), 0o600)
+            self.assertLessEqual(paths[stream].stat().st_size, 4096)
+        stdout = paths["stdout"].read_text(encoding="utf-8")
+        stderr = paths["stderr"].read_text(encoding="utf-8")
+        self.assertIn("out-0000", stdout)
+        self.assertIn("out-0999", stdout)
+        self.assertIn("GRABOWSKI_TASK_OUTPUT_TRUNCATED stdout", stdout)
+        self.assertIn("err-0000", stderr)
+        self.assertIn("err-0999", stderr)
+        self.assertIn("GRABOWSKI_TASK_OUTPUT_TRUNCATED stderr", stderr)
+
+    def test_capture_wrapper_refuses_existing_output_directory_before_child(self) -> None:
+        side_effect = self.root / "child-started"
+        record = {
+            "task_id": "c" * 24,
+            "attempt": 1,
+            "argv_json": json.dumps(
+                [
+                    "/usr/bin/python3",
+                    "-c",
+                    "from pathlib import Path; Path(" + repr(str(side_effect)) + ").write_text('yes')",
+                ]
+            ),
+        }
+        paths = tasks._task_output_paths(record)
+        paths["directory"].mkdir(mode=0o700)
+        completed = subprocess.run(
+            tasks._task_output_capture_argv(record),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(side_effect.exists())
+        self.assertFalse(paths["stdout"].exists())
+        self.assertFalse(paths["stderr"].exists())
+
+    def test_capture_wrapper_rejects_nonprivate_parent_before_child(self) -> None:
+        side_effect = self.root / "unsafe-parent-child-started"
+        record = {
+            "task_id": "d" * 24,
+            "attempt": 1,
+            "argv_json": json.dumps(
+                [
+                    "/usr/bin/python3",
+                    "-c",
+                    "from pathlib import Path; Path("
+                    + repr(str(side_effect))
+                    + ").write_text('yes')",
+                ]
+            ),
+        }
+        os.chmod(self.output_root, 0o755)
+        completed = subprocess.run(
+            tasks._task_output_capture_argv(record),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("task output parent identity is unsafe", completed.stderr)
+        self.assertFalse(side_effect.exists())
+        self.assertFalse(tasks._task_output_paths(record)["directory"].exists())
+
+    def test_task_logs_rejects_nonprivate_parent(self) -> None:
+        task = self._start()["task"]
+        self._write_task_output(task, stdout="private\n", stderr="")
+        os.chmod(self.output_root, 0o755)
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "parent identity is unsafe"):
+                tasks.grabowski_task_logs(str(task["task_id"]), max_lines=20)
+
+    def test_task_logs_reads_private_files_without_journal_dispatch(self) -> None:
+        task = self._start()["task"]
+        self._write_task_output(
+            task,
+            stdout="out-one\nout-two\nout-three\n",
+            stderr="err-one\nerr-two\n",
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            output = tasks.grabowski_task_logs(str(task["task_id"]), max_lines=2)
+        dispatch.assert_not_called()
+        self.assertEqual(output["output_source"], "private-task-files-v1")
+        self.assertEqual(output["result"]["output_reader"], "local-descriptor-v1")
+        self.assertEqual(output["result"]["stdout"], "out-two\nout-three\n")
+        self.assertEqual(output["result"]["stderr"], "err-one\nerr-two\n")
+        self.assertTrue(output["result"]["stdout_truncated"])
+        self.assertFalse(output["result"]["stderr_truncated"])
+        self.assertEqual(
+            output["result"]["does_not_establish"],
+            [
+                "same_uid_output_authenticity",
+                "complete_output_beyond_stream_cap",
+                "retention_or_archive_completion",
+            ],
+        )
+
+    def test_task_logs_falls_back_to_user_journal_when_directory_is_absent(self) -> None:
+        task = self._start()["task"]
+        legacy = _launcher()
+        legacy["stdout"] = "legacy journal\n"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch", return_value=legacy
+        ) as dispatch:
+            output = tasks.grabowski_task_logs(str(task["task_id"]), max_lines=20)
+        self.assertEqual(output["output_source"], "user-journal-fallback-v1")
+        self.assertEqual(output["result"]["stdout"], "legacy journal\n")
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(dispatch.call_args.args[1][0], "journalctl")
+
+    def test_task_logs_rejects_incomplete_private_output_contract(self) -> None:
+        task = self._start()["task"]
+        paths = tasks._task_output_paths(task)
+        paths["directory"].mkdir(mode=0o700)
+        paths["stdout"].write_text("partial\n", encoding="utf-8")
+        os.chmod(paths["stdout"], 0o600)
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_dispatch"
+        ) as dispatch:
+            with self.assertRaisesRegex(RuntimeError, "missing stderr"):
+                tasks.grabowski_task_logs(str(task["task_id"]), max_lines=20)
+        dispatch.assert_not_called()
+
+    def test_task_logs_rejects_symlink_broad_mode_and_hardlink(self) -> None:
+        symlink_task = self._start()["task"]
+        symlink_paths = tasks._task_output_paths(symlink_task)
+        symlink_paths["directory"].mkdir(mode=0o700)
+        target = self.output_root / "symlink-target"
+        target.write_text("secret\n", encoding="utf-8")
+        os.chmod(target, 0o600)
+        symlink_paths["stdout"].symlink_to(target)
+        symlink_paths["stderr"].write_text("", encoding="utf-8")
+        os.chmod(symlink_paths["stderr"], 0o600)
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "opened safely"):
+                tasks.grabowski_task_logs(str(symlink_task["task_id"]), max_lines=20)
+
+        broad_task = self._start()["task"]
+        broad_paths = self._write_task_output(broad_task, stdout="broad\n")
+        os.chmod(broad_paths["stdout"], 0o644)
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+                tasks.grabowski_task_logs(str(broad_task["task_id"]), max_lines=20)
+
+        hardlink_task = self._start()["task"]
+        hardlink_paths = self._write_task_output(hardlink_task, stdout="linked\n")
+        os.link(hardlink_paths["stdout"], self.output_root / "second-link")
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
+            with self.assertRaisesRegex(RuntimeError, "identity is unsafe"):
+                tasks.grabowski_task_logs(str(hardlink_task["task_id"]), max_lines=20)
+
+    def test_remote_task_logs_use_descriptor_bound_reader_for_each_stream(self) -> None:
+        task = self._start(host="remote")["task"]
+        stdout = _launcher()
+        stdout.update(
+            {
+                "stdout": "remote-out\n",
+                "stderr": (
+                    "GRABOWSKI_TASK_OUTPUT_READ_METADATA "
+                    "byte_truncated=0 line_truncated=0\n"
+                ),
+            }
+        )
+        stderr = _launcher()
+        stderr.update(
+            {
+                "stdout": "remote-err\n",
+                "stderr": (
+                    "GRABOWSKI_TASK_OUTPUT_READ_METADATA "
+                    "byte_truncated=0 line_truncated=1\n"
+                ),
+            }
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=REMOTE_HOST), patch.object(
+            tasks, "_dispatch", side_effect=[stdout, stderr]
+        ) as dispatch:
+            output = tasks.grabowski_task_logs(str(task["task_id"]), max_lines=25)
+        self.assertEqual(dispatch.call_count, 2)
+        for call in dispatch.call_args_list:
+            self.assertEqual(call.args[1][:3], [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE,
+            ])
+        self.assertEqual(output["output_source"], "private-task-files-v1")
+        self.assertEqual(output["result"]["output_reader"], "fleet-descriptor-v1")
+        self.assertEqual(output["result"]["stdout"], "remote-out\n")
+        self.assertEqual(output["result"]["stderr"], "remote-err\n")
+        self.assertFalse(output["result"]["stdout_truncated"])
+        self.assertTrue(output["result"]["stderr_truncated"])
+
+    def test_remote_task_logs_fail_closed_on_invalid_reader_metadata(self) -> None:
+        task = self._start(host="remote")["task"]
+        invalid = _launcher()
+        invalid.update({"stdout": "remote-out\n", "stderr": "not metadata\n"})
+        with patch.object(tasks.fleet, "fleet_host", return_value=REMOTE_HOST), patch.object(
+            tasks, "_dispatch", return_value=invalid
+        ):
+            with self.assertRaisesRegex(RuntimeError, "metadata is invalid"):
+                tasks.grabowski_task_logs(str(task["task_id"]), max_lines=25)
+
+    def test_remote_reader_code_executes_descriptor_bound_contract(self) -> None:
+        task = self._start()["task"]
+        paths = self._write_task_output(
+            task,
+            stdout="remote-one\nremote-two\nremote-three\n",
+            stderr="",
+        )
+        completed = subprocess.run(
+            [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE,
+                str(paths["directory"]),
+                "stdout.log",
+                "2",
+                "60000",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, "remote-two\nremote-three\n")
+        self.assertIn(
+            "GRABOWSKI_TASK_OUTPUT_READ_METADATA byte_truncated=0 line_truncated=1",
+            completed.stderr,
+        )
 
     def _prepare_pending_terminalization(
         self,
@@ -624,7 +928,21 @@ class TaskTests(unittest.TestCase):
         separator = launch.index("--")
         self.assertEqual(command, task["argv"])
         self.assertEqual(command_identity.argv_sha256(command), task["argv_sha256"])
-        self.assertEqual(command_identity.systemd_escape_argv(command), launch[separator + 1 :])
+        capture = tasks._task_output_capture_argv(
+            {
+                "task_id": task["task_id"],
+                "attempt": task["attempt"],
+                "argv_json": json.dumps(command),
+            }
+        )
+        self.assertEqual(
+            command_identity.systemd_escape_argv(capture),
+            launch[separator + 1 :],
+        )
+        self.assertEqual(
+            command_identity.systemd_escape_argv(command),
+            launch[-len(command) :],
+        )
         self.assertNotIn("--expand-environment=no", launch[:separator])
 
     def test_start_chronik_context_persists_target_component_bureau_and_pr_refs(self) -> None:
@@ -6850,6 +7168,9 @@ class TaskTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_task_output_root_is_fixed_to_operator_home(self) -> None:
+        self.assertEqual(tasks.TASK_OUTPUT_ROOT, tasks.operator.HOME)
+
     def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:
         source = (
             ROOT / "systemd" / "grabowski-reconcile-tasks.service.example"
