@@ -687,6 +687,7 @@ def _canonical_registry_binding() -> dict[str, Any]:
         "identity": identity,
         "managed_runtime": managed,
         "explicit": False,
+        "legacy": False,
     }
 
 
@@ -697,12 +698,19 @@ def _explicit_registry_binding(registry_root: str) -> dict[str, Any]:
         "registry_root": registry_root,
     }
     identity["binding_sha256"] = _sha256(identity)
-    return {"identity": identity, "managed_runtime": None, "explicit": True}
+    return {
+        "identity": identity,
+        "managed_runtime": None,
+        "explicit": True,
+        "legacy": False,
+    }
 
 
 def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(identity, dict):
         raise BureauPickupError("registry-binding-invalid")
+    if identity.get("schema_version") != SCHEMA_VERSION:
+        raise BureauPickupError("registry-binding-schema-version-invalid")
     claimed = identity.get("binding_sha256")
     if not isinstance(claimed, str) or SHA256_RE.fullmatch(claimed) is None:
         raise BureauPickupError("registry-binding-digest-invalid")
@@ -791,11 +799,24 @@ def _registry_binding_from_identity(identity: dict[str, Any]) -> dict[str, Any]:
         "identity": validated,
         "managed_runtime": None,
         "explicit": validated["kind"] == "explicit-registry-root",
+        "legacy": False,
     }
 
 
+def _normalize_registry_binding_marker(value: Any) -> str | None:
+    if value is None:
+        return None
+    marker = _text(value, label="registry_binding_sha256", maximum=64)
+    if SHA256_RE.fullmatch(marker) is None:
+        raise BureauPickupError("registry-binding-marker-invalid")
+    return marker
+
+
 def _read_journal_registry_binding(
-    run_dir: Path, registry_root: str
+    run_dir: Path,
+    registry_root: str,
+    *,
+    expected_sha256: str | None,
 ) -> dict[str, Any]:
     try:
         identity = _read_bound_json(
@@ -804,10 +825,19 @@ def _read_journal_registry_binding(
     except BureauPickupError as exc:
         if exc.code != "registry-binding-missing":
             raise
-        return _explicit_registry_binding(registry_root)
+        if expected_sha256 is not None:
+            raise
+        binding = _explicit_registry_binding(registry_root)
+        binding["legacy"] = True
+        return binding
     binding = _registry_binding_from_identity(identity)
     if binding["identity"]["registry_root"] != registry_root:
         raise BureauPickupError("journal-registry-root-mismatch")
+    if (
+        expected_sha256 is not None
+        and binding["identity"]["binding_sha256"] != expected_sha256
+    ):
+        raise BureauPickupError("journal-registry-binding-marker-mismatch")
     return binding
 
 
@@ -1511,6 +1541,10 @@ def grabowski_bureau_pickup_execute(
         stored_request_payload = _read_bound_json(
             run_dir / "request.json", label="request"
         )
+        stored_request_payload = dict(stored_request_payload)
+        stored_binding_sha256 = _normalize_registry_binding_marker(
+            stored_request_payload.pop("registry_binding_sha256", None)
+        )
         if "coordination_root" not in stored_request_payload:
             if Path(normalized["coordination_root"]) != _legacy_coordination_root():
                 raise BureauPickupError(
@@ -1525,7 +1559,9 @@ def grabowski_bureau_pickup_execute(
             stored_request_payload, allow_internal_bindings=True
         )
         stored_registry_binding = _read_journal_registry_binding(
-            run_dir, stored_request["registry_root"]
+            run_dir,
+            stored_request["registry_root"],
+            expected_sha256=stored_binding_sha256,
         )
         if registry_binding["explicit"]:
             if stored_registry_binding["identity"] != registry_binding["identity"]:
@@ -1565,6 +1601,12 @@ def grabowski_bureau_pickup_execute(
             "status": intent_payload["status"],
             "request_sha256": request_sha256,
             "registry_binding_sha256": registry_binding["identity"]["binding_sha256"],
+            "registry_binding_kind": registry_binding["identity"]["kind"],
+            "registry_binding_source": (
+                "legacy-journal-explicit-registry-root"
+                if registry_binding["legacy"]
+                else "journal-bound"
+            ),
             "run_id": intent["run_id"],
             "task_id": intent["task_id"],
             "lease_owner_id": intent["lease_owner_id"],
@@ -1591,7 +1633,15 @@ def grabowski_bureau_pickup_execute(
     _write_bound_json(
         run_dir / "registry-binding.json", registry_binding["identity"]
     )
-    _write_bound_json(run_dir / "request.json", normalized)
+    _write_bound_json(
+        run_dir / "request.json",
+        {
+            **normalized,
+            "registry_binding_sha256": registry_binding["identity"][
+                "binding_sha256"
+            ],
+        },
+    )
     _write_bound_json(run_dir / "intent-result.json", intent_payload)
     _write_bound_json(run_dir / "intent.json", intent)
     acquisition = _acquire_groups(intent, normalized, run_dir)
@@ -1658,6 +1708,8 @@ def grabowski_bureau_pickup_execute(
         "status": result_status,
         "request_sha256": request_sha256,
         "registry_binding_sha256": registry_binding["identity"]["binding_sha256"],
+        "registry_binding_kind": registry_binding["identity"]["kind"],
+        "registry_binding_source": "request-bound",
         "run_id": intent["run_id"],
         "task_id": intent["task_id"],
         "commit": commit,
@@ -1751,11 +1803,16 @@ def _root_binding_for_run(run_id: str) -> dict[str, Any]:
             _explicit_registry_binding(legacy_registry),
             source="legacy-missing-request-with-legacy-fallback",
         )
+    stored_binding_sha256 = _normalize_registry_binding_marker(
+        stored.get("registry_binding_sha256")
+    )
     legacy_registry = _normalize_registry_root(str(bureau.BUREAU_ROOT))
     registry_root = _normalize_registry_root(
         stored.get("registry_root", legacy_registry)
     )
-    registry_binding = _read_journal_registry_binding(run_dir, registry_root)
+    registry_binding = _read_journal_registry_binding(
+        run_dir, registry_root, expected_sha256=stored_binding_sha256
+    )
     if "coordination_root" not in stored:
         return {
             "registry_root": registry_root,
@@ -1773,7 +1830,11 @@ def _root_binding_for_run(run_id: str) -> dict[str, Any]:
         "registry_root": registry_root,
         "registry_binding": registry_binding,
         "coordination_root": coordination_root,
-        "source": "journal-bound",
+        "source": (
+            "legacy-journal-explicit-registry-root"
+            if registry_binding["legacy"]
+            else "journal-bound"
+        ),
         "legacy_fallback_allowed": False,
     }
 

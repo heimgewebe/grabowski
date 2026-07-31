@@ -454,6 +454,10 @@ class BureauPickupTests(unittest.TestCase):
         )
         stored_request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
         self.assertEqual(expected_coordination, stored_request["coordination_root"])
+        self.assertEqual(
+            self.default_registry_binding["identity"]["binding_sha256"],
+            stored_request["registry_binding_sha256"],
+        )
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
 
     def test_canonical_binding_uses_managed_manifest_identity(self) -> None:
@@ -533,8 +537,27 @@ class BureauPickupTests(unittest.TestCase):
             pickup.BureauPickupError, "registry-binding-digest-mismatch"
         ):
             pickup._read_journal_registry_binding(
-                run_dir, str(self.registry_root)
+                run_dir,
+                str(self.registry_root),
+                expected_sha256=None,
             )
+
+    def test_binding_marker_without_binding_fails_closed(self) -> None:
+        run_dir = pickup._run_directory(self.intent()["run_id"])
+        request = pickup._normalize_request(self.request())
+        pickup._write_bound_json(
+            run_dir / "request.json",
+            {
+                **request,
+                "registry_binding_sha256": self.default_registry_binding[
+                    "identity"
+                ]["binding_sha256"],
+            },
+        )
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "registry-binding-missing"
+        ):
+            pickup._root_binding_for_run(self.intent()["run_id"])
 
     def test_default_root_ignores_dirty_conventional_checkout(self) -> None:
         dirty_checkout = self.root / "dirty-conventional-checkout"
@@ -1066,6 +1089,20 @@ class BureauPickupTests(unittest.TestCase):
         pickup._write_bound_json(run_dir / "acquisition.json", value)
         return run_dir, value
 
+    def write_registry_bound_request(self, run_dir, request):
+        pickup._write_bound_json(
+            run_dir / "registry-binding.json",
+            self.default_registry_binding["identity"],
+        )
+        bound_request = {
+            **request,
+            "registry_binding_sha256": self.default_registry_binding[
+                "identity"
+            ]["binding_sha256"],
+        }
+        pickup._write_bound_json(run_dir / "request.json", bound_request)
+        return bound_request
+
     def terminal_status(self, intent, state="failed"):
         return self.coordinated_status(intent, state=state)
 
@@ -1075,7 +1112,7 @@ class BureauPickupTests(unittest.TestCase):
         lease = self.lease(key, intent["lease_owner_id"])
         run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
         request = pickup._normalize_request(self.request())
-        pickup._write_bound_json(run_dir / "request.json", request)
+        self.write_registry_bound_request(run_dir, request)
         with (
             mock.patch.object(
                 pickup.bureau,
@@ -1732,7 +1769,7 @@ class BureauPickupTests(unittest.TestCase):
         intent = self.intent()
         normalized = pickup._normalize_request(self.request())
         run_dir = pickup._run_directory(intent["run_id"])
-        pickup._write_bound_json(run_dir / "request.json", normalized)
+        self.write_registry_bound_request(run_dir, normalized)
         with mock.patch.object(
             pickup.bureau,
             "_invoke_bureau",
@@ -1750,7 +1787,7 @@ class BureauPickupTests(unittest.TestCase):
         intent = self.intent()
         request = pickup._normalize_request(self.request())
         run_dir = pickup._run_directory(intent["run_id"])
-        pickup._write_bound_json(run_dir / "request.json", request)
+        self.write_registry_bound_request(run_dir, request)
         with (
             mock.patch.object(
                 pickup, "COORDINATION_ROOT", self.root / "new-configured-state"
