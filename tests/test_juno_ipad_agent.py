@@ -69,16 +69,63 @@ class StateRootSelectionTests(unittest.TestCase):
                 with self.assertRaises(PermissionError):
                     agent.select_state_root(Path(directory) / "agent.py", explicit)
 
-    def test_secret_is_persisted_in_selected_state_root(self) -> None:
+    def test_unpaired_agent_targets_shared_identity_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = root / "readonly" / "agent.py"
             state_root = root / "writable"
+            identity_key = root / "identity" / "juno_ipad_agent.key"
             state_root.mkdir()
-            secret, source, key_path = agent.load_secret(script, state_root)
+            secret, source, key_path = agent.load_secret(
+                script,
+                state_root,
+                identity_key_path=identity_key,
+            )
             self.assertIsNone(secret)
             self.assertEqual(source, "unpaired")
-            self.assertEqual(key_path, state_root / "juno_ipad_agent.key")
+            self.assertEqual(key_path, identity_key)
+
+    def test_legacy_script_key_is_migrated_to_shared_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "provider" / "agent.py"
+            script.parent.mkdir()
+            legacy_key = script.with_name("juno_ipad_agent.key")
+            legacy_key.write_bytes(b"s" * agent.PAIRING_SECRET_BYTES)
+            state_root = root / "provider" / "grabowski_workspace"
+            identity_key = root / "identity" / "juno_ipad_agent.key"
+
+            secret, source, key_path = agent.load_secret(
+                script,
+                state_root,
+                identity_key_path=identity_key,
+            )
+
+            self.assertEqual(secret, b"s" * agent.PAIRING_SECRET_BYTES)
+            self.assertEqual(source, "shared_identity_migrated")
+            self.assertEqual(key_path, identity_key)
+            self.assertEqual(identity_key.read_bytes(), secret)
+            self.assertEqual(identity_key.stat().st_mode & 0o777, 0o600)
+
+    def test_shared_identity_is_reused_across_provider_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            identity_key = root / "identity" / "juno_ipad_agent.key"
+            identity_key.parent.mkdir()
+            identity_key.write_bytes(b"i" * agent.PAIRING_SECRET_BYTES)
+            identity_key.chmod(0o600)
+
+            for provider in ("icloud", "local", "external"):
+                script = root / provider / "agent.py"
+                state_root = root / provider / "grabowski_workspace"
+                secret, source, key_path = agent.load_secret(
+                    script,
+                    state_root,
+                    identity_key_path=identity_key,
+                )
+                self.assertEqual(secret, b"i" * agent.PAIRING_SECRET_BYTES)
+                self.assertEqual(source, "shared_identity")
+                self.assertEqual(key_path, identity_key)
 
     def test_cache_directories_are_not_reported_as_persistent(self) -> None:
         self.assertFalse(
@@ -396,7 +443,7 @@ class PairingIntegrationTests(unittest.TestCase):
     def test_unpaired_agent_pairs_once_and_accepts_authenticated_job(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            key_path = root / "juno_ipad_agent.key"
+            key_path = root / "identity" / "juno_ipad_agent.key"
             state = agent.AgentState(root / "state")
             server = agent.AgentHTTPServer(
                 ("127.0.0.1", 0),
@@ -429,6 +476,8 @@ class PairingIntegrationTests(unittest.TestCase):
                 paired = pairing_client.pair(secret, "123456")
                 self.assertEqual(paired["status"], "paired")
                 self.assertEqual(key_path.read_bytes(), secret)
+                self.assertEqual(key_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(key_path.parent.stat().st_mode & 0o777, 0o700)
                 self.assertTrue(pairing_client.health()["paired"])
                 replayed = pairing_client.pair(secret, "000000")
                 self.assertEqual(replayed["status"], "already_paired_same_secret")
