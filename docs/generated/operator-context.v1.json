@@ -1666,7 +1666,7 @@
     },
     {
       "category": "resource",
-      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest. An\nexplicit emergency-recovery lease remains a deliberately exclusive\nfail-closed exception and cannot be used for non-conflict bypasses. Self-scoped\nbranch and operation keys are authoritative and reject scope manifests.",
+      "description": "Atomically acquire typed resource leases for one owner.\n\nPublic broad repository resources require a complete exact scope manifest.\nEmergency-recovery mode is derived only from a validated Bureau recovery\ncontract; caller-supplied lease-mode metadata is not an authority surface.\nSelf-scoped branch and operation keys are authoritative and reject scope\nmanifests.",
       "effects": [
         "lease-create",
         "possible-expired-lease-reclaim"
@@ -3020,7 +3020,7 @@
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "17992589456ac42e5fadaa32d6536f14dd73a7661cb1b2eb3ed214134991f973",
-      "src/grabowski_resources.py": "70d0d822cd880a9c014aebeea92daf5b8b4cd2acdcf2909158abf91599abbee3",
+      "src/grabowski_resources.py": "f1e192f27cb5428fb540378d6340d7f41ad12de3e0ae2a899bdf6c2c50bcb0ab",
       "src/grabowski_runtime.py": "a8c3cbbea0f017e73a5123f077d07b8bd680aae9015097f2ec91b2d830b94be6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",

@@ -607,14 +607,56 @@ class CheckoutLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
 
-    def test_emergency_recovery_broad_repo_lease_still_blocks_archive(self) -> None:
+    def test_persisted_emergency_recovery_broad_repo_lease_still_blocks_archive(self) -> None:
+        resource_key = f"repo:{self.repo}"
+        scope = {
+            "schema_version": 1,
+            "repository": str(self.repo),
+            "task_id": "CHECKOUT-EMERGENCY-RECOVERY",
+            "base_head": self.head,
+            "head": self.head,
+            "branch": "topic",
+            "worktree": str(self.checkout),
+            "effects": ["write"],
+            "paths": [str(self.repo / "README.md")],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
         checkouts.resources.acquire_resources(
             "foreign-broad-owner",
-            [f"repo:{self.repo}"],
-            purpose="unknown broad repository mutation",
+            [resource_key],
+            purpose="validated recovery placeholder",
             ttl_seconds=3600,
-            metadata={"lease_mode": "emergency-recovery"},
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=lambda **kwargs: {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            },
         )
+        with sqlite3.connect(self.resource_db) as connection:
+            stored = json.loads(
+                connection.execute(
+                    "SELECT metadata_json FROM leases WHERE resource_key=?",
+                    (resource_key,),
+                ).fetchone()[0]
+            )
+            stored["lease_mode"] = "emergency-recovery"
+            metadata_json, metadata_sha256 = checkouts.resources._metadata(stored)
+            connection.execute(
+                "UPDATE leases SET metadata_json=?, metadata_sha256=? "
+                "WHERE resource_key=?",
+                (metadata_json, metadata_sha256, resource_key),
+            )
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
 
