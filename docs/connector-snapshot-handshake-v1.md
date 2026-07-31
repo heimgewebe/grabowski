@@ -47,7 +47,7 @@ The `standard` and `evidence` status views include `system_overview`. It is a re
 - task state and active/attention/terminal projection counts;
 - bounded active lease count;
 - bounded operator-obligation attention and integrity counts;
-- an explicit source registry for Bureau, GitHub/CI, RepoBrief, Systemkatalog, and Chronik.
+- an explicit source registry for Bureau, GitHub/CI, RepoGround, Systemkatalog, and Chronik. The stable legacy machine id for RepoGround remains `repobrief` during the compatibility window.
 
 Target-bound external sources are marked `target_required` until a repository, pull request, bundle, system, task, operation, or receipt identity is supplied. Their freshness is never inferred from the global status call.
 

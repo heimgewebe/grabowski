@@ -14,7 +14,11 @@ import grabowski_system_map as system_map  # noqa: E402
 
 SOURCE_REGISTRY = {
     "bureau": {"authority": "Bureau", "required_binding": ["task"]},
-    "repobrief": {"authority": "RepoGround", "required_binding": ["repo", "stem"]},
+    "repobrief": {
+        "display_name": "RepoGround",
+        "authority": "RepoGround",
+        "required_binding": ["repo", "stem"],
+    },
     "chronik": {"authority": "Chronik", "required_binding": ["operation"]},
     "systemkatalog": {"authority": "Systemkatalog", "required_binding": ["system"]},
     "github_ci": {"authority": "GitHub", "required_binding": ["repo", "pr"]},
@@ -63,6 +67,9 @@ def test_component_map_is_projection_only_and_target_bound() -> None:
     assert components["grabowski"]["signal"] == "green"
     assert components["bureau"]["signal"] == "target_required"
     assert components["bureau"]["observed"] is False
+    assert components["repobrief"]["id"] == "repobrief"
+    assert components["repobrief"]["name"] == "RepoGround"
+    assert components["repobrief"]["authority"] == "RepoGround"
     assert result["counts"] == {
         "red": 0,
         "unknown": 0,
