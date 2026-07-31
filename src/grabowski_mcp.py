@@ -4996,6 +4996,7 @@ def _operator_system_overview(
             "freshness": "must be read live for the selected target",
         },
         "repobrief": {
+            "display_name": "RepoGround",
             "authority": "RepoGround bundle receipts",
             "observation_state": "target_required",
             "required_binding": ["repository", "bundle stem"],

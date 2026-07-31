@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import grabowski_repoground_catalog as repoground_catalog
 
@@ -31,16 +32,26 @@ def safe_segment(value: str) -> str | None:
     return value if SEGMENT_RE.fullmatch(value) else None
 
 
+def _github_remote_path(remote: str) -> str | None:
+    text = remote.strip()
+    if not text:
+        return None
+    if "://" in text:
+        parsed = urlsplit(text)
+        return parsed.path if parsed.hostname == "github.com" else None
+    scp_prefix = "git@github.com:"
+    return text.removeprefix(scp_prefix) if text.startswith(scp_prefix) else None
+
+
 def repo_from_remote(remote: str | None, root: str) -> str | None:
     if remote:
-        cleaned = remote.strip().removesuffix(".git")
-        if "github.com" in cleaned:
-            candidate = cleaned.rsplit("/", 1)[-1]
-            if ":" in candidate:
-                candidate = candidate.rsplit(":", 1)[-1]
-            segment = safe_segment(candidate)
-            if segment:
-                return segment
+        remote_path = _github_remote_path(remote)
+        if remote_path:
+            parts = remote_path.removesuffix(".git").strip("/").split("/")
+            if len(parts) == 2:
+                segment = safe_segment(parts[1])
+                if segment:
+                    return segment
     return safe_segment(Path(root).name)
 
 

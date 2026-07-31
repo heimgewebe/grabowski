@@ -494,6 +494,10 @@ class ConsumerSurfaceTests(unittest.TestCase):
             "target_required",
             overview["source_registry"]["systemkatalog"]["observation_state"],
         )
+        self.assertEqual(
+            "RepoGround",
+            overview["source_registry"]["repobrief"]["display_name"],
+        )
 
     def test_operator_system_overview_prioritizes_invalid_coding_catalog(self) -> None:
         fake_tasks = SimpleNamespace(
