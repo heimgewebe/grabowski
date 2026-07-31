@@ -84,6 +84,8 @@ MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
+TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
+TASK_LOG_RATE_LIMIT_BURST = 200
 # One re-entrant in-process lock plus one shared file lock serializes every
 # persistent-task mutation across the MCP runtime and the timer-driven
 # reconciler process. Nested task operations reuse the outer file lock.
@@ -3097,6 +3099,8 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
         "--property=PrivateTmp=no",
         "--property=MemoryDenyWriteExecute=no",
         "--property=UMask=0077",
+        f"--property=LogRateLimitIntervalSec={TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s",
+        f"--property=LogRateLimitBurst={TASK_LOG_RATE_LIMIT_BURST}",
         f"--property=RuntimeMaxSec={record['runtime_seconds']}s",
         f"--property=WorkingDirectory={record['cwd']}",
         f"--property=CPUWeight={record['cpu_weight']}",

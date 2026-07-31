@@ -274,6 +274,19 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=ProtectHome=no", launch)
         self.assertIn("--property=MemoryDenyWriteExecute=no", launch)
         self.assertIn("--property=UMask=0077", launch)
+        self.assertEqual(
+            launch.count(
+                f"--property=LogRateLimitIntervalSec="
+                f"{tasks.TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s"
+            ),
+            1,
+        )
+        self.assertEqual(
+            launch.count(
+                f"--property=LogRateLimitBurst={tasks.TASK_LOG_RATE_LIMIT_BURST}"
+            ),
+            1,
+        )
         self.assertEqual(launch[-3:], ["--", "/bin/echo", command_argument])
         return result
 
