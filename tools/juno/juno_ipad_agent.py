@@ -212,34 +212,78 @@ def select_state_root(
     )
 
 
+def default_identity_key_path() -> Path:
+    return (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "GrabowskiJunoAgent"
+        / "identity"
+        / "juno_ipad_agent.key"
+    )
+
+
+def _read_secret_file(path: Path) -> bytes:
+    secret = path.read_bytes()
+    if len(secret) < PAIRING_SECRET_BYTES:
+        raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
+    return secret
+
+
+def _persist_identity_secret(path: Path, secret: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        os.chmod(path.parent, 0o700)
+    try:
+        atomic_create_bytes(path, secret)
+    except FileExistsError:
+        existing = _read_secret_file(path)
+        if not hmac.compare_digest(existing, secret):
+            raise RuntimeError("Konflikt mit bestehender gemeinsamer Agentidentität")
+    metadata = path.stat()
+    if metadata.st_mode & 0o777 != 0o600:
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+        metadata = path.stat()
+    if metadata.st_mode & 0o777 != 0o600:
+        raise RuntimeError("Gemeinsamer Agent-Schlüssel ist nicht privat gespeichert")
+
+
 def load_secret(
     script_path: Path,
     state_root: Path,
+    *,
+    identity_key_path: Path | None = None,
 ) -> tuple[bytes | None, str, Path]:
+    shared_key = identity_key_path or default_identity_key_path()
     environment_secret = os.environ.get("GRABOWSKI_JUNO_SECRET")
     if environment_secret is not None:
         secret = environment_secret.encode("utf-8")
         if len(secret) < PAIRING_SECRET_BYTES:
             raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
-        return secret, "environment", state_root / "juno_ipad_agent.key"
+        return secret, "environment", shared_key
+
     script_key = script_path.with_name("juno_ipad_agent.key")
     state_key = state_root / "juno_ipad_agent.key"
-    key_candidates = [script_key]
-    if state_key != script_key:
+    key_candidates = [shared_key, script_key]
+    if state_key not in key_candidates:
         key_candidates.append(state_key)
+
     for key_path in key_candidates:
         try:
-            secret = key_path.read_bytes()
+            secret = _read_secret_file(key_path)
         except FileNotFoundError:
             continue
         except OSError:
-            if key_path == script_key and state_key != script_key:
+            if key_path != shared_key:
                 continue
             raise
-        if len(secret) < PAIRING_SECRET_BYTES:
-            raise RuntimeError("Agent-Schlüssel muss mindestens 32 Byte lang sein")
-        return secret, str(key_path), key_path
-    return None, "unpaired", state_key
+        if key_path == shared_key:
+            return secret, "shared_identity", shared_key
+        _persist_identity_secret(shared_key, secret)
+        return secret, "shared_identity_migrated", shared_key
+
+    return None, "unpaired", shared_key
 
 
 class AuthenticationError(ValueError):
@@ -761,7 +805,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                     self.pairing_consent_expires_at_unix = None
                     raise PermissionError("pairing_consent_locked")
                 raise PermissionError("pairing_consent_mismatch")
-            atomic_create_bytes(self.key_path, secret)
+            _persist_identity_secret(self.key_path, secret)
             self.authenticator = RequestAuthenticator(secret)
             self.secret_source = self.key_path.name
             self.pairing_consent_code = None

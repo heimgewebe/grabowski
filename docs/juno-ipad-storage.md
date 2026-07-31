@@ -56,15 +56,16 @@ Vertrag:
 
 Die Aufnahme erfolgt einzeln, damit Zustimmung und Beleg eindeutig bleiben:
 
-1. Juno-Agent stoppen, falls er die interaktive Ausführung blockiert.
-2. `juno_storage_grant.py` in Juno öffnen und starten.
-3. Im Systemdialog genau einen Ordner auswählen.
-4. Die iPadOS-Freigabe bestätigen.
-5. Das Skript darf bereits beendet erscheinen; den Systemdialog dennoch
+1. Juno in den Vordergrund bringen; ein gesunder Hintergrund-Agent besitzt noch kein aktives UIKit-Fenster und kann deshalb keinen Systemdialog präsentieren.
+2. Juno-Agent stoppen, falls er die interaktive Ausführung blockiert.
+3. `juno_storage_grant.py` in Juno öffnen und starten. Der Helfer unterstützt sowohl Juno-Bridges mit als auch ohne exportiertes `ObjCProtocol`; Delegate und Picker bleiben bis zum nächsten expliziten Lauf gehalten, damit UIKit seinen schwachen Delegate nicht innerhalb des Rückrufs verliert. Fehlt ein aktives Juno-Fenster oder scheitert die native Präsentation, wird kein Picker als scheinbar aktiv zurückbehalten.
+4. Im Systemdialog genau einen Ordner auswählen.
+5. Die iPadOS-Freigabe bestätigen.
+6. Das Skript darf bereits beendet erscheinen; den Systemdialog dennoch
    abschließen und auf die lokale Meldung `Freigabe gespeichert` mit Grant-ID
    warten.
-6. Juno-Agent erneut starten.
-7. Grabowski führt anschließend Grant-, Lese-, Schreib- und Neustartprüfung aus.
+7. Juno-Agent erneut starten.
+8. Grabowski führt anschließend Grant-, Lese-, Schreib- und Neustartprüfung aus.
 
 Sinnvolle Reihenfolge:
 
@@ -219,3 +220,9 @@ Belegt wurden im damals laufenden Juno-Prozess:
 Dieser Ausgangsbefund belegt die technische Mechanik, aber noch keine externe
 Provider-Persistenz. Dafür ist mindestens eine sichtbare lokale Ordnerauswahl
 und der anschließende Neustart-Readback erforderlich.
+
+### Gemeinsame Agentidentität
+
+Der Agent speichert seine Kopplungsidentität unabhängig vom aktuell geöffneten Dokumentanbieter in Junos privatem Application-Support-Bereich. Bestehende, neben älteren Agentkopien liegende Schlüssel werden beim nächsten Start fail-closed in diese gemeinsame Identität migriert. Dadurch bleibt dieselbe Kopplung beim Wechsel zwischen iCloud Drive, „Auf meinem iPad“, externen Laufwerken und anderen bereits lokal freigegebenen Dokumentanbietern erhalten.
+
+Das verhindert erneutes Koppeln, hält den Prozess aber nicht gegen iPadOS-Suspendierung oder ein Beenden von Juno am Leben. Nach einem App-Neustart muss der Agent weiterhin einmal gestartet werden; die vorhandene Kopplung wird dabei ohne neuen Einmalcode wiederverwendet.

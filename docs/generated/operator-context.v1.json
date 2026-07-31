@@ -1680,7 +1680,7 @@
     },
     {
       "category": "resource",
-      "description": "Renew live resource leases owned by one owner.",
+      "description": "Renew owner leases without shortening them; optionally bind exact snapshots.",
       "effects": [
         "lease-update"
       ],
@@ -1693,7 +1693,7 @@
     },
     {
       "category": "resource",
-      "description": "Release owner-bound resource leases; force is an explicit high-risk override.",
+      "description": "Release owner leases; exact snapshots prevent stale same-owner release.",
       "effects": [
         "lease-remove",
         "possible-force-release"
@@ -3020,7 +3020,7 @@
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "17992589456ac42e5fadaa32d6536f14dd73a7661cb1b2eb3ed214134991f973",
-      "src/grabowski_resources.py": "4a2adad36552d4561da62132a4a14b9727b6f4848bb72bc46f0caa2143946bc7",
+      "src/grabowski_resources.py": "e629fc7a2a84e30ee286e2887ac67b1bd9ab1ed0bbdb582b0de579ec69dd12c4",
       "src/grabowski_runtime.py": "a8c3cbbea0f017e73a5123f077d07b8bd680aae9015097f2ec91b2d830b94be6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
@@ -3028,7 +3028,7 @@
       "src/grabowski_system_map.py": "16dda15f49bf6e0993510455313c24172625dcddba1123eaad096e393b78908c",
       "src/grabowski_task_attention.py": "547a0223f50f7f11874f06d86ab89db1accf7d86d8fd52fea619457bf7e97732",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "c566eeec06c743adcc011dae074e78a5383a60238a3b3d6b8f5e9a3dd78fc499",
+      "src/grabowski_tasks.py": "ce45a5b8d0153124952914cda17179fc38333a8649507da2451b8269e3a841dc",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_work_admission.py": "9ffb4c1169259168341d6e8282cb0d017f5adfdac6a380fed93fa2e98d04ea57",

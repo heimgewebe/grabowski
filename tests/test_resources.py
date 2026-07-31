@@ -1593,6 +1593,251 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             resources.renew_resources("owner-b", ["repo:/tmp/repo"])
 
+    def test_missing_renew_uses_typed_reacquisition_signal(self) -> None:
+        with self.assertRaisesRegex(
+            resources.ResourceLeaseMissing, "Unknown resource lease"
+        ):
+            resources.renew_resources(
+                "owner-a", ["component:typed-missing"], ttl_seconds=60
+            )
+
+    def test_expired_renew_uses_typed_reacquisition_signal(self) -> None:
+        key = "component:typed-expiry"
+        with patch.object(resources, "_now", return_value=100):
+            resources.acquire_resources(
+                "owner-a", [key], purpose="typed expiry", ttl_seconds=30
+            )
+        with patch.object(resources, "_now", return_value=130):
+            with self.assertRaisesRegex(
+                resources.ResourceLeaseExpired, "Resource lease has expired"
+            ):
+                resources.renew_resources("owner-a", [key], ttl_seconds=60)
+
+    def test_live_same_owner_reentry_is_identity_bound_and_never_shortens(self) -> None:
+        key = "component:same-owner-reentry"
+        with patch.object(resources, "_now", return_value=100):
+            first = resources.acquire_resources(
+                "owner-a",
+                [key],
+                purpose="stable purpose",
+                ttl_seconds=120,
+                metadata={"scope": "stable"},
+            )
+        with patch.object(resources, "_now", return_value=110):
+            second = resources.acquire_resources(
+                "owner-a",
+                [key],
+                purpose="stable purpose",
+                ttl_seconds=30,
+                metadata={"scope": "stable"},
+            )
+        self.assertEqual(first["leases"][0]["acquired_at_unix"], 100)
+        self.assertEqual(second["leases"][0]["acquired_at_unix"], 100)
+        self.assertEqual(second["leases"][0]["updated_at_unix"], 100)
+        self.assertEqual(second["leases"][0]["expires_at_unix"], 220)
+        self.assertEqual(second["reclaimed"], [])
+
+        with patch.object(resources, "_now", return_value=120):
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                resources.acquire_resources(
+                    "owner-a",
+                    [key],
+                    purpose="different purpose",
+                    ttl_seconds=60,
+                    metadata={"scope": "stable"},
+                )
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                resources.acquire_resources(
+                    "owner-a",
+                    [key],
+                    purpose="stable purpose",
+                    ttl_seconds=60,
+                    metadata={"scope": "different"},
+                )
+        self.assertEqual(resources.inspect_resource(key), second["leases"][0])
+
+    def test_task_reconciliation_preserves_live_generation_and_recreates_missing(self) -> None:
+        task_id = "a" * 24
+        owner = f"task:{task_id}"
+        live_key = "component:task-reconcile-live"
+        missing_key = "component:task-reconcile-missing"
+        keys = [live_key, missing_key]
+        initial_metadata = {
+            "task_id": task_id,
+            "host": "heim-pc",
+            "attempt": 1,
+            "implicit_workspace_resource_key": None,
+        }
+        with patch.object(resources, "_now", return_value=100):
+            initial = resources.acquire_resources(
+                owner,
+                keys,
+                purpose=f"persistent task {task_id}",
+                ttl_seconds=120,
+                metadata=initial_metadata,
+            )
+        before = {item["resource_key"]: item for item in initial["leases"]}
+        resources.release_resources(owner, [missing_key])
+
+        recovery_metadata = {
+            **initial_metadata,
+            "attempt": 2,
+            "recovered_after_expiry": True,
+        }
+        with patch.object(resources, "_now", return_value=110):
+            reconciled = resources.acquire_resources(
+                owner,
+                keys,
+                purpose=f"persistent task {task_id}",
+                ttl_seconds=120,
+                metadata=recovery_metadata,
+                _preserve_live_same_owner=True,
+            )
+
+        self.assertEqual(reconciled["preserved"], [live_key])
+        after = {item["resource_key"]: item for item in reconciled["leases"]}
+        self.assertEqual(
+            after[live_key]["acquired_at_unix"], before[live_key]["acquired_at_unix"]
+        )
+        self.assertEqual(
+            after[live_key]["metadata_sha256"], before[live_key]["metadata_sha256"]
+        )
+        self.assertEqual(after[missing_key]["acquired_at_unix"], 110)
+        self.assertNotEqual(
+            after[missing_key]["metadata_sha256"], before[missing_key]["metadata_sha256"]
+        )
+        with resources._database() as connection:
+            rows = {
+                row["resource_key"]: row
+                for row in connection.execute(
+                    "SELECT * FROM leases WHERE resource_key IN (?, ?)",
+                    (live_key, missing_key),
+                ).fetchall()
+            }
+        live_metadata = json.loads(rows[live_key]["metadata_json"])
+        missing_metadata = json.loads(rows[missing_key]["metadata_json"])
+        self.assertEqual(live_metadata["attempt"], 1)
+        self.assertNotIn("recovered_after_expiry", live_metadata)
+        self.assertEqual(missing_metadata["attempt"], 2)
+        self.assertIs(missing_metadata["recovered_after_expiry"], True)
+
+    def test_live_preservation_is_restricted_to_task_owners(self) -> None:
+        with self.assertRaisesRegex(PermissionError, "requires a task owner"):
+            resources.acquire_resources(
+                "owner-a",
+                ["component:forbidden-preservation"],
+                purpose="forbidden internal mode",
+                ttl_seconds=60,
+                _preserve_live_same_owner=True,
+            )
+
+    def test_snapshot_guarded_renew_is_atomic_and_never_shortens(self) -> None:
+        keys = ["component:renew-a", "component:renew-b"]
+        with patch.object(resources, "_now", return_value=100):
+            acquired = resources.acquire_resources(
+                "owner-a", keys, purpose="guarded renew", ttl_seconds=120
+            )
+        snapshots = [
+            {field: lease[field] for field in resources.LEASE_SNAPSHOT_KEYS}
+            for lease in acquired["leases"]
+        ]
+        with patch.object(resources, "_now", return_value=110):
+            renewed = resources.renew_resources(
+                "owner-a",
+                keys,
+                ttl_seconds=30,
+                expected_leases=snapshots,
+            )
+        self.assertTrue(renewed["snapshot_guarded"])
+        self.assertEqual(
+            [lease["expires_at_unix"] for lease in renewed["leases"]], [220, 220]
+        )
+
+        with patch.object(resources, "_now", return_value=120):
+            with self.assertRaisesRegex(RuntimeError, "changed before renew"):
+                resources.renew_resources(
+                    "owner-a",
+                    keys,
+                    ttl_seconds=200,
+                    expected_leases=snapshots,
+                )
+        with patch.object(resources, "_now", return_value=120):
+            self.assertEqual(
+                resources.list_resources(owner_id="owner-a"), renewed["leases"]
+            )
+
+    def test_live_same_owner_reentry_preserves_reclaim_provenance(self) -> None:
+        key = "component:reclaim-provenance"
+        with patch.object(resources, "_now", return_value=100):
+            resources.acquire_resources(
+                "owner-a", [key], purpose="first", ttl_seconds=30
+            )
+        with patch.object(resources, "_now", return_value=200):
+            reclaimed = resources.acquire_resources(
+                "owner-b",
+                [key],
+                purpose="stable",
+                ttl_seconds=120,
+                metadata={"scope": "stable"},
+            )
+        self.assertEqual(
+            reclaimed["leases"][0]["reclaimed_from_owner"], "owner-a"
+        )
+        with patch.object(resources, "_now", return_value=210):
+            renewed = resources.acquire_resources(
+                "owner-b",
+                [key],
+                purpose="stable",
+                ttl_seconds=30,
+                metadata={"scope": "stable"},
+            )
+        self.assertEqual(renewed["leases"][0]["reclaimed_from_owner"], "owner-a")
+
+    def test_snapshot_guarded_force_release_binds_foreign_snapshot(self) -> None:
+        key = "component:force-snapshot"
+        acquired = resources.acquire_resources(
+            "owner-a", [key], purpose="foreign owner", ttl_seconds=60
+        )
+        snapshot = [
+            {field: acquired["leases"][0][field] for field in resources.LEASE_SNAPSHOT_KEYS}
+        ]
+        released = resources.release_resources(
+            "operator", [key], force=True, expected_leases=snapshot
+        )
+        self.assertTrue(released["snapshot_guarded"])
+        self.assertEqual(released["released"][0]["owner_id"], "owner-a")
+        self.assertIsNone(resources.inspect_resource(key))
+
+    def test_snapshot_guarded_release_rejects_same_owner_aba(self) -> None:
+        key = "component:release-aba"
+        with patch.object(resources, "_now", return_value=100):
+            first = resources.acquire_resources(
+                "owner-a", [key], purpose="first identity", ttl_seconds=30
+            )
+        stale_snapshot = [
+            {field: first["leases"][0][field] for field in resources.LEASE_SNAPSHOT_KEYS}
+        ]
+        with patch.object(resources, "_now", return_value=200):
+            second = resources.acquire_resources(
+                "owner-a", [key], purpose="second identity", ttl_seconds=60
+            )
+        self.assertEqual(second["leases"][0]["acquired_at_unix"], 200)
+        self.assertEqual(second["reclaimed"][0]["previous_owner_id"], "owner-a")
+
+        with self.assertRaisesRegex(RuntimeError, "changed before release"):
+            resources.release_resources(
+                "owner-a", [key], expected_leases=stale_snapshot
+            )
+        self.assertEqual(resources.inspect_resource(key), second["leases"][0])
+        current_snapshot = [
+            {field: second["leases"][0][field] for field in resources.LEASE_SNAPSHOT_KEYS}
+        ]
+        released = resources.release_resources(
+            "owner-a", [key], expected_leases=current_snapshot
+        )
+        self.assertTrue(released["snapshot_guarded"])
+        self.assertIsNone(resources.inspect_resource(key))
+
     def _resource_migration_backups(self) -> list[Path]:
         return sorted(
             self.database.parent.glob(
@@ -2775,6 +3020,77 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(result["work_admission"][0]["decision"], "allow")
         stored = resources.inspect_resource(f"repo:{self.root}")
         self.assertIsNotNone(stored)
+
+    def test_broad_repository_same_owner_reentry_preserves_admission_generation(self) -> None:
+        (self.root / ".git").mkdir()
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(self.root, name="admission-reentry", path=self.root)
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            }
+
+        first = resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="stable admitted repository work",
+            ttl_seconds=120,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=assessor,
+        )
+        with resources._database() as connection:
+            original = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(original)
+
+        def unexpected_assessor(**_kwargs: object) -> dict[str, object]:
+            raise AssertionError("same-owner live reentry must not rerun admission")
+
+        second = resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="stable admitted repository work",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=unexpected_assessor,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(second["preserved"], [key])
+        self.assertEqual(
+            second["leases"][0]["metadata_sha256"], first["leases"][0]["metadata_sha256"]
+        )
+        self.assertEqual(
+            second["leases"][0]["acquired_at_unix"], first["leases"][0]["acquired_at_unix"]
+        )
+        with resources._database() as connection:
+            current = connection.execute(
+                "SELECT * FROM leases WHERE resource_key=?", (key,)
+            ).fetchone()
+        self.assertEqual(current["metadata_json"], original["metadata_json"])
+        self.assertEqual(current["metadata_sha256"], original["metadata_sha256"])
+
+    def test_work_admission_metadata_is_not_caller_controlled(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not a public authority surface"):
+            resources.acquire_resources(
+                "owner-a",
+                ["component:forbidden-work-admission"],
+                purpose="attempt caller admission evidence",
+                ttl_seconds=60,
+                metadata={"work_admission": {"decision": "allow"}},
+            )
 
     def test_broad_repository_lease_rejects_public_convergence_mode_override(self) -> None:
         (self.root / ".git").mkdir()

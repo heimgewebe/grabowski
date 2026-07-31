@@ -1692,7 +1692,7 @@
     },
     {
       "category": "resource",
-      "description": "Renew live resource leases owned by one owner.",
+      "description": "Renew owner leases without shortening them; optionally bind exact snapshots.",
       "effects": [
         "lease-update"
       ],
@@ -1705,7 +1705,7 @@
     },
     {
       "category": "resource",
-      "description": "Release owner-bound resource leases; force is an explicit high-risk override.",
+      "description": "Release owner leases; exact snapshots prevent stale same-owner release.",
       "effects": [
         "lease-remove",
         "possible-force-release"
