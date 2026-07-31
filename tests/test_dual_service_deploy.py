@@ -2504,6 +2504,88 @@ class DeploymentSequenceTests(unittest.TestCase):
             result["stability"],
         )
 
+    def test_tunnel_drain_wait_with_admission_accepts_stable_historical_response_gap(self) -> None:
+        metrics = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 0\n"
+            "commands_polled_total 10\n"
+            "commands_enqueued_total 10\n"
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response"} 7\n'
+            "process_start_time_seconds 1000\n"
+        )
+        with (
+            mock.patch.object(core, "http_text", return_value=metrics),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            result = dual.wait_for_tunnel_dispatcher_idle(
+                timeout_seconds=5, admission_active=True
+            )
+        self.assertEqual(3, result["attempts"])
+        self.assertEqual(3, result["consecutive_idle_samples"])
+        self.assertEqual(7.0, result["stability"]["commands_final_responses_total"])
+
+    def test_tunnel_drain_wait_with_admission_requires_stable_response_gap(self) -> None:
+        def metrics(responses: int) -> str:
+            return (
+                "commands_queue_length 0\n"
+                "dispatcher_worker_pool_occupancy 0\n"
+                "commands_polled_total 10\n"
+                "commands_enqueued_total 10\n"
+                f'command_end_to_end_latency_milliseconds_count{{latency_type="enqueue_to_response"}} {responses}\n'
+                "process_start_time_seconds 1000\n"
+            )
+
+        with (
+            mock.patch.object(
+                core,
+                "http_text",
+                side_effect=[metrics(7), metrics(8), metrics(8), metrics(8)],
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            result = dual.wait_for_tunnel_dispatcher_idle(
+                timeout_seconds=5, admission_active=True
+            )
+        self.assertEqual(4, result["attempts"])
+        self.assertEqual(3, result["consecutive_idle_samples"])
+        self.assertEqual(8.0, result["stability"]["commands_final_responses_total"])
+
+    def test_tunnel_drain_final_guard_with_admission_binds_historical_gap(self) -> None:
+        metrics = (
+            "commands_queue_length 0\n"
+            "dispatcher_worker_pool_occupancy 0\n"
+            "commands_polled_total 10\n"
+            "commands_enqueued_total 10\n"
+            'command_end_to_end_latency_milliseconds_count{latency_type="enqueue_to_response"} 7\n'
+            "process_start_time_seconds 1000\n"
+        )
+        expected = {
+            "commands_polled_total": 10.0,
+            "commands_enqueued_total": 10.0,
+            "commands_final_responses_total": 7.0,
+            "process_start_time_seconds": 1000.0,
+        }
+        with mock.patch.object(core, "http_text", return_value=metrics):
+            observed = dual.verify_tunnel_drain_final_guard(
+                expected, admission_active=True
+            )
+        self.assertEqual(7.0, observed["commands_final_responses_total"])
+
+        changed_gap = metrics.replace(
+            'latency_type="enqueue_to_response"} 7',
+            'latency_type="enqueue_to_response"} 8',
+        )
+        with mock.patch.object(core, "http_text", return_value=changed_gap):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.verify_tunnel_drain_final_guard(
+                    expected, admission_active=True
+                )
+        self.assertEqual("tunnel-drain-final-guard", raised.exception.phase)
+        self.assertIn(
+            "pending_final_responses",
+            raised.exception.details["changed_stability"],
+        )
+
     def test_tunnel_drain_wait_fails_closed_on_counter_regression(self) -> None:
         first = (
             "commands_queue_length 0\n"
