@@ -284,6 +284,65 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertEqual(archive["audit"]["coordination_checked"]["processes"], 0)
 
 
+    def test_archive_converges_managed_binding_to_terminal_identity(self) -> None:
+        self._managed_binding()
+        (self.checkout / "README.md").write_text("terminal head\n", encoding="utf-8")
+        self._git("add", "README.md", cwd=self.checkout)
+        self._git("commit", "-m", "terminal head", cwd=self.checkout)
+        terminal_head = self._git(
+            "rev-parse", "HEAD", cwd=self.checkout
+        ).stdout.strip()
+
+        result = checkouts.grabowski_checkout_archive(
+            str(self.repo),
+            str(self.checkout),
+            "owner-a",
+            "archive exact terminal identity",
+            int(time.time()) + 3600,
+            terminal_head,
+            "topic",
+        )
+
+        binding = result["lifecycle_binding"]
+        self.assertEqual(binding["phase"], "archived")
+        self.assertEqual(binding["expected_head"], terminal_head)
+        self.assertEqual(binding["expected_branch"], "topic")
+        self.assertIsNotNone(binding["terminal_at_unix"])
+        inventory = checkouts.checkout_inventory(
+            str(self.repo),
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        record = next(
+            item for item in inventory["worktrees"]
+            if item["path"] == str(self.checkout.resolve())
+        )
+        self.assertTrue(record["lifecycle_decision"]["binding_consistent"])
+        self.assertEqual(record["lifecycle_decision"]["binding_drift_reasons"], [])
+
+    def test_archive_rejects_managed_binding_branch_drift_before_effects(self) -> None:
+        binding = self._managed_binding()
+        checkout_key = str(binding["checkout_key"])
+        with checkouts._database() as connection:
+            connection.execute(
+                "UPDATE lifecycle_bindings SET expected_branch=? WHERE checkout_key=?",
+                ("other", checkout_key),
+            )
+            connection.commit()
+        retention_before = checkouts._retention_records([checkout_key])[checkout_key]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "lifecycle branch changed before archive"
+        ):
+            self._archive()
+
+        retention_after = checkouts._retention_records([checkout_key])[checkout_key]
+        self.assertEqual(retention_after, retention_before)
+        with checkouts._database() as connection:
+            count = connection.execute("SELECT count(*) FROM archives").fetchone()[0]
+        self.assertEqual(count, 0)
+
     def test_archive_uses_exact_checkout_common_dir_and_branch_operation_leases(self) -> None:
         result = self._archive()
         keys = {item["resource_key"] for item in result["lease"]["leases"]}
@@ -1288,7 +1347,11 @@ class CheckoutLifecycleTests(unittest.TestCase):
     def test_archived_binding_without_matching_archive_is_fail_closed(self) -> None:
         binding = self._managed_binding()
         checkouts._mark_checkout_archived(
-            str(binding["checkout_key"]), "owner-a", int(time.time())
+            str(binding["checkout_key"]),
+            "owner-a",
+            int(time.time()),
+            self.head,
+            "topic",
         )
         inventory = checkouts.checkout_inventory(
             self.repo,
