@@ -134,7 +134,7 @@ if (
     or parent_before.st_uid != os.geteuid()
     or parent_before.st_gid != os.getegid()
     or parent_before.st_nlink < 1
-    or stat.S_IMODE(parent_before.st_mode) != 0o700
+    or (stat.S_IMODE(parent_before.st_mode) & 0o022) != 0
 ):
     raise RuntimeError("task output parent identity is unsafe")
 os.mkdir(name, 0o700, dir_fd=parent_fd)
@@ -312,7 +312,7 @@ if (
     or parent_before.st_uid != os.geteuid()
     or parent_before.st_gid != os.getegid()
     or parent_before.st_nlink < 1
-    or stat.S_IMODE(parent_before.st_mode) != 0o700
+    or (stat.S_IMODE(parent_before.st_mode) & 0o022) != 0
 ):
     raise RuntimeError("task output parent identity is unsafe")
 try:
@@ -3557,7 +3557,7 @@ def _open_local_task_output_root() -> tuple[int, os.stat_result]:
         or opened.st_uid != os.geteuid()
         or opened.st_gid != os.getegid()
         or opened.st_nlink < 1
-        or stat.S_IMODE(opened.st_mode) != 0o700
+        or (stat.S_IMODE(opened.st_mode) & 0o022) != 0
     ):
         os.close(descriptor)
         raise RuntimeError("task output parent identity is unsafe")
