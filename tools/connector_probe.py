@@ -16,7 +16,18 @@ sys.path.insert(0, str(ROOT / "tools"))
 import deploy_runtime
 
 DEFAULT_RUNTIME = Path.home() / ".local" / "share" / "grabowski-mcp"
-REQUIRED_SCHEMA_SENTINELS = {"grabowski_secret_reveal"}
+REQUIRED_SCHEMA_PROPERTIES = {
+    "grabowski_task_start": {
+        "force_new_reason",
+        "operation_identity",
+        "supersedes_receipt_sha256",
+        "supersedes_task_id",
+    },
+}
+REQUIRED_SCHEMA_SENTINELS = {
+    "grabowski_secret_reveal",
+    *REQUIRED_SCHEMA_PROPERTIES,
+}
 SCHEMA_METADATA_KEYS = {"title", "description"}
 
 
@@ -183,6 +194,25 @@ def probe(
                 "observed_sha256": observed_hash,
                 "runtime_sha256": runtime_hash,
             })
+    required_schema_property_mismatches = []
+    for name, required_properties in sorted(REQUIRED_SCHEMA_PROPERTIES.items()):
+        for source, schema in (
+            ("connector", observed_schemas.get(name)),
+            ("runtime", runtime_by_name.get(name, {}).get("inputSchema")),
+        ):
+            properties = schema.get("properties") if isinstance(schema, dict) else None
+            missing = sorted(
+                required_properties - set(properties)
+                if isinstance(properties, dict)
+                else required_properties
+            )
+            if missing:
+                required_schema_property_mismatches.append({
+                    "tool": name,
+                    "source": source,
+                    "missing_properties": missing,
+                })
+
     missing_schema_sentinels = sorted(
         REQUIRED_SCHEMA_SENTINELS - set(observed_schemas)
     )
@@ -197,12 +227,17 @@ def probe(
         runtime_unexpected_from_contract,
         schema_mismatches,
         missing_schema_sentinels,
+        required_schema_property_mismatches,
     ))
     return {
         "matches": matches,
         "name_contract_matches": not missing_from_connector and not unexpected_in_connector,
         "runtime_contract_matches": not contract_missing_from_runtime and not runtime_unexpected_from_contract,
-        "schema_contract_matches": not schema_mismatches and not missing_schema_sentinels,
+        "schema_contract_matches": (
+            not schema_mismatches
+            and not missing_schema_sentinels
+            and not required_schema_property_mismatches
+        ),
         "runtime_count": len(runtime_names),
         "observed_count": len(observed_names),
         "runtime_names_sha256": fingerprint(runtime_names),
@@ -210,6 +245,11 @@ def probe(
         "schema_coverage_count": len(observed_schemas),
         "required_schema_sentinels": sorted(REQUIRED_SCHEMA_SENTINELS),
         "missing_schema_sentinels": missing_schema_sentinels,
+        "required_schema_properties": {
+            name: sorted(properties)
+            for name, properties in sorted(REQUIRED_SCHEMA_PROPERTIES.items())
+        },
+        "required_schema_property_mismatches": required_schema_property_mismatches,
         "schema_mismatches": schema_mismatches,
         "missing_from_connector": missing_from_connector,
         "unexpected_in_connector": unexpected_in_connector,
