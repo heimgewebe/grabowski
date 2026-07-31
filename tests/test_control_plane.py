@@ -1336,12 +1336,28 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             },
             "required": ["path", "expected_sha256"],
         }
+        task_start_schema = {
+            "type": "object",
+            "properties": {
+                "operation_identity": {
+                    "anyOf": [{"type": "object"}, {"type": "null"}],
+                    "default": None,
+                },
+                "supersedes_task_id": {"type": "string", "default": ""},
+                "supersedes_receipt_sha256": {"type": "string", "default": ""},
+                "force_new_reason": {"type": "string", "default": ""},
+            },
+        }
+        sentinel_schemas = {
+            "grabowski_secret_reveal": runtime_schema,
+            "grabowski_task_start": task_start_schema,
+        }
         runtime_tools = [
             {
                 "name": name,
                 **(
-                    {"inputSchema": runtime_schema}
-                    if name == "grabowski_secret_reveal"
+                    {"inputSchema": sentinel_schemas[name]}
+                    if name in sentinel_schemas
                     else {}
                 ),
             }
@@ -1349,7 +1365,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         ]
         current = module.probe(
             expected,
-            {"grabowski_secret_reveal": runtime_schema},
+            sentinel_schemas,
             runtime_tools,
         )
         self.assertTrue(current["matches"])
@@ -1360,7 +1376,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         del stale_schema["properties"]["acknowledge_context_exposure"]
         stale = module.probe(
             expected,
-            {"grabowski_secret_reveal": stale_schema},
+            {**sentinel_schemas, "grabowski_secret_reveal": stale_schema},
             runtime_tools,
         )
         self.assertFalse(stale["matches"])
@@ -1370,11 +1386,50 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             "grabowski_secret_reveal",
         )
 
+        stale_task_schema = json.loads(json.dumps(task_start_schema))
+        del stale_task_schema["properties"]["operation_identity"]
+        stale_task_runtime_tools = [
+            {
+                "name": name,
+                **(
+                    {
+                        "inputSchema": (
+                            stale_task_schema
+                            if name == "grabowski_task_start"
+                            else sentinel_schemas[name]
+                        )
+                    }
+                    if name in sentinel_schemas
+                    else {}
+                ),
+            }
+            for name in expected
+        ]
+        missing_retry_contract = module.probe(
+            expected,
+            {**sentinel_schemas, "grabowski_task_start": stale_task_schema},
+            stale_task_runtime_tools,
+        )
+        self.assertFalse(missing_retry_contract["matches"])
+        self.assertFalse(missing_retry_contract["schema_contract_matches"])
+        self.assertEqual(
+            [
+                (item["source"], item["missing_properties"])
+                for item in missing_retry_contract[
+                    "required_schema_property_mismatches"
+                ]
+            ],
+            [
+                ("connector", ["operation_identity"]),
+                ("runtime", ["operation_identity"]),
+            ],
+        )
+
         names_only = module.probe(expected, {}, runtime_tools)
         self.assertFalse(names_only["matches"])
         self.assertEqual(
             names_only["missing_schema_sentinels"],
-            ["grabowski_secret_reveal"],
+            ["grabowski_secret_reveal", "grabowski_task_start"],
         )
 
 
