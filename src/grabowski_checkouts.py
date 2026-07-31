@@ -733,8 +733,12 @@ def _mark_checkout_archived_in_connection(
     checkout_key: str,
     owner_id: str,
     archived_at: int,
+    expected_head: str,
+    expected_branch: str | None,
 ) -> dict[str, Any] | None:
     owner = _owner(owner_id)
+    head = _validate_git_object_id(expected_head, "expected_head")
+    branch = _expected_branch(expected_branch)
     row = connection.execute(
         "SELECT * FROM lifecycle_bindings WHERE checkout_key=?",
         (checkout_key,),
@@ -746,10 +750,12 @@ def _mark_checkout_archived_in_connection(
     updated = connection.execute(
         """
         UPDATE lifecycle_bindings
-        SET phase='archived', archived_at_unix=?, updated_at_unix=?
+        SET phase='archived', expected_head=?, expected_branch=?,
+            terminal_at_unix=COALESCE(terminal_at_unix, ?),
+            archived_at_unix=?, updated_at_unix=?
         WHERE checkout_key=? AND owner_id=?
         """,
-        (archived_at, archived_at, checkout_key, owner),
+        (head, branch, archived_at, archived_at, archived_at, checkout_key, owner),
     )
     if updated.rowcount != 1:
         raise RuntimeError("Checkout lifecycle archive transition was not applied exactly")
@@ -764,6 +770,8 @@ def _mark_checkout_archived(
     checkout_key: str,
     owner_id: str,
     archived_at: int,
+    expected_head: str,
+    expected_branch: str | None,
 ) -> dict[str, Any] | None:
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -772,6 +780,8 @@ def _mark_checkout_archived(
             checkout_key,
             owner_id,
             archived_at,
+            expected_head,
+            expected_branch,
         )
         connection.commit()
     return lifecycle
@@ -1985,10 +1995,15 @@ def grabowski_checkout_archive(
         lifecycle = _lifecycle_bindings([record["checkout_key"]]).get(
             record["checkout_key"]
         )
-        if lifecycle is not None and lifecycle["owner_id"] != owner:
-            raise PermissionError(
-                "Checkout lifecycle binding is owned by another owner"
-            )
+        if lifecycle is not None:
+            if lifecycle["owner_id"] != owner:
+                raise PermissionError(
+                    "Checkout lifecycle binding is owned by another owner"
+                )
+            if lifecycle["expected_branch"] != record.get("branch"):
+                raise RuntimeError(
+                    "Checkout lifecycle branch changed before archive"
+                )
 
         archive_id = _new_archive_id()
         path_hash = record["checkout_key"][:16]
@@ -2089,6 +2104,8 @@ def grabowski_checkout_archive(
                 record["checkout_key"],
                 owner,
                 created,
+                expected_head,
+                record.get("branch"),
             )
             connection.commit()
         archive = _load_archive(archive_id)
