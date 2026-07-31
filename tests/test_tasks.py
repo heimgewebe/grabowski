@@ -340,6 +340,7 @@ class TaskTests(unittest.TestCase):
             "attempt": 1,
             "argv_json": json.dumps(["/usr/bin/python3", "-c", child]),
         }
+        os.chmod(self.output_root, 0o755)
         with patch.object(tasks, "TASK_OUTPUT_MAX_BYTES", 4096), patch.object(
             tasks, "TASK_OUTPUT_TAIL_BYTES", 512
         ):
@@ -397,7 +398,7 @@ class TaskTests(unittest.TestCase):
         self.assertFalse(paths["stdout"].exists())
         self.assertFalse(paths["stderr"].exists())
 
-    def test_capture_wrapper_rejects_nonprivate_parent_before_child(self) -> None:
+    def test_capture_wrapper_rejects_group_writable_parent_before_child(self) -> None:
         side_effect = self.root / "unsafe-parent-child-started"
         record = {
             "task_id": "d" * 24,
@@ -412,7 +413,7 @@ class TaskTests(unittest.TestCase):
                 ]
             ),
         }
-        os.chmod(self.output_root, 0o755)
+        os.chmod(self.output_root, 0o775)
         completed = subprocess.run(
             tasks._task_output_capture_argv(record),
             cwd=self.root,
@@ -426,10 +427,10 @@ class TaskTests(unittest.TestCase):
         self.assertFalse(side_effect.exists())
         self.assertFalse(tasks._task_output_paths(record)["directory"].exists())
 
-    def test_task_logs_rejects_nonprivate_parent(self) -> None:
+    def test_task_logs_rejects_group_writable_parent(self) -> None:
         task = self._start()["task"]
         self._write_task_output(task, stdout="private\n", stderr="")
-        os.chmod(self.output_root, 0o755)
+        os.chmod(self.output_root, 0o775)
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST):
             with self.assertRaisesRegex(RuntimeError, "parent identity is unsafe"):
                 tasks.grabowski_task_logs(str(task["task_id"]), max_lines=20)
