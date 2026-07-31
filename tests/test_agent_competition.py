@@ -46,7 +46,7 @@ import grabowski_agent_competition as competition  # noqa: E402
 
 
 class AgentCompetitionTests(unittest.TestCase):
-    def test_runner_resolution_finds_packaged_release_input(self) -> None:
+    def test_runner_resolution_finds_manifest_bound_release_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             release = Path(temporary) / "release"
             module_file = (
@@ -59,7 +59,7 @@ class AgentCompetitionTests(unittest.TestCase):
             )
             module_file.parent.mkdir(parents=True)
             module_file.write_text("# installed module\n", encoding="utf-8")
-            runner = release / "inputs" / "tools" / "external_programming_candidate.py"
+            runner = release / "tools" / "external_programming_candidate.py"
             runner.parent.mkdir(parents=True)
             runner.write_text("# packaged runner\n", encoding="utf-8")
 
@@ -92,6 +92,29 @@ class AgentCompetitionTests(unittest.TestCase):
             )
 
         self.assertEqual(resolved, source_runner)
+
+    def test_runner_resolution_skips_symlinked_source_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            module_file = checkout / "src" / "grabowski_agent_competition.py"
+            module_file.parent.mkdir(parents=True)
+            module_file.write_text("# source module\n", encoding="utf-8")
+            source_runner = checkout / "tools" / "external_programming_candidate.py"
+            source_runner.parent.mkdir(parents=True)
+            symlink_target = checkout / "untrusted-runner.py"
+            symlink_target.write_text("# untrusted runner\n", encoding="utf-8")
+            source_runner.symlink_to(symlink_target)
+            release = Path(temporary) / "release"
+            packaged_runner = release / "tools" / "external_programming_candidate.py"
+            packaged_runner.parent.mkdir(parents=True)
+            packaged_runner.write_text("# packaged runner\n", encoding="utf-8")
+
+            resolved = competition._resolve_runner_path(
+                module_file=module_file,
+                python_prefix=release / ".venv",
+            )
+
+        self.assertEqual(resolved, packaged_runner)
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()

@@ -901,6 +901,25 @@ def enforce_bureau_lease_contract(
     expected_state = _bounded_text(
         metadata, "bureau_expected_state", maximum_bytes=512
     )
+    if phase in {"merge", "worktree-admin", "emergency-recovery"}:
+        if ttl_seconds > MAX_EFFECT_GATE_TTL_SECONDS:
+            raise BureauLeaseContractError(
+                "effect-gate-ttl-exceeds-maximum",
+                details={"maximum_ttl_seconds": MAX_EFFECT_GATE_TTL_SECONDS},
+            )
+    if phase == "emergency-recovery":
+        if keys != [BROAD_BUREAU_REPOSITORY_KEY]:
+            raise BureauLeaseContractError(
+                "emergency-recovery-requires-broad-repository-key"
+            )
+        if justification is None:
+            raise BureauLeaseContractError(
+                "emergency-recovery-justification-required"
+            )
+        if expected_head is None and expected_state is None:
+            raise BureauLeaseContractError(
+                "emergency-recovery-boundary-required"
+            )
     runtime = _contract_runtime()
     component_sha256 = {
         name: identity["sha256"]

@@ -3610,36 +3610,28 @@ def acquire_resources(
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    if "lease_mode" in normalized_metadata:
+        raise ValueError("metadata.lease_mode is not an authority surface")
     if "scope_manifest" in normalized_metadata:
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
         )
-    lease_mode_explicit = "lease_mode" in normalized_metadata
-    requested_lease_mode = normalized_metadata.get("lease_mode", "normal")
-    if requested_lease_mode not in {"normal", "emergency-recovery"}:
-        raise ValueError("metadata.lease_mode must be normal or emergency-recovery")
     bureau_contract = bureau_leases.enforce_bureau_lease_contract(
         keys, ttl_seconds=ttl, metadata=normalized_metadata
     )
-    bureau_emergency = (
+    contract_emergency = (
         isinstance(bureau_contract, dict)
         and bureau_contract.get("phase") == "emergency-recovery"
     )
-    if lease_mode_explicit and not bureau_emergency:
+    bureau_emergency = (
+        contract_emergency
+        and keys == [bureau_leases.BROAD_BUREAU_REPOSITORY_KEY]
+    )
+    if contract_emergency and not bureau_emergency:
         raise ValueError(
-            "metadata.lease_mode is not an authority surface; emergency recovery "
-            "requires a validated Bureau emergency-recovery contract"
+            "emergency-recovery mode requires the exact broad Bureau repository key"
         )
-    if bureau_emergency:
-        if lease_mode_explicit and requested_lease_mode != "emergency-recovery":
-            raise ValueError(
-                "Bureau emergency-recovery conflicts with metadata.lease_mode"
-            )
-        lease_mode = "emergency-recovery"
-    else:
-        lease_mode = "normal"
-    if lease_mode == "emergency-recovery" and not any(key.startswith("repo:") for key in keys):
-        raise ValueError("emergency-recovery mode requires a repository lease")
+    lease_mode = "emergency-recovery" if bureau_emergency else "normal"
     sanitized_value = bureau_leases.sanitize_bureau_metadata(keys, normalized_metadata)
     sanitized_metadata: dict[str, Any] = {} if sanitized_value is None else sanitized_value
     if bureau_emergency:
@@ -3860,7 +3852,13 @@ def renew_resources(
                     raise PermissionError(f"Resource lease is owned by another owner: {key}")
                 if row["expires_at_unix"] <= now:
                     raise RuntimeError(f"Resource lease has expired: {key}")
-                if "nonconflict_exception" in _row_metadata(row):
+                row_metadata = _row_metadata(row)
+                if row_metadata.get("lease_mode") == "emergency-recovery":
+                    raise RuntimeError(
+                        "emergency-recovery leases are non-renewable; "
+                        "reacquire with a new validated contract"
+                    )
+                if "nonconflict_exception" in row_metadata:
                     raise RuntimeError(
                         "non-conflict exception leases are non-renewable; reassess and reacquire"
                     )

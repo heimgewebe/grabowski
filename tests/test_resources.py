@@ -2326,7 +2326,7 @@ class ResourceTests(unittest.TestCase):
 
     def test_core_rejects_non_bureau_emergency_repository_mode(self) -> None:
         with self.assertRaisesRegex(
-            ValueError, "requires a validated Bureau emergency-recovery contract"
+            ValueError, "metadata.lease_mode is not an authority surface"
         ):
             resources.acquire_resources(
                 "owner-a",
@@ -2351,6 +2351,27 @@ class ResourceTests(unittest.TestCase):
                     "bureau_justification": "not the Bureau repository",
                     "bureau_expected_head": "a" * 40,
                 },
+            )
+
+    def test_public_bureau_emergency_pass_through_rejects_mixed_repositories(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "metadata.scope_manifest_complete=true"
+        ):
+            resources._public_repository_scope_keys(
+                [
+                    resources.bureau_leases.BROAD_BUREAU_REPOSITORY_KEY,
+                    f"repo:{self.root}",
+                ],
+                {"bureau_phase": "emergency-recovery"},
+            )
+
+    def test_public_broad_bureau_work_still_requires_complete_scope(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "metadata.scope_manifest_complete=true"
+        ):
+            resources._public_repository_scope_keys(
+                [resources.bureau_leases.BROAD_BUREAU_REPOSITORY_KEY],
+                {"bureau_phase": "work"},
             )
 
     def test_tool_audits_hash_only_metadata(self) -> None:

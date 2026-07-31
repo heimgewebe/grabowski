@@ -32,6 +32,8 @@ COMPETITION_ROOT = Path(
         str(operator.STATE_DIR / "agent-competitions"),
     )
 ).expanduser()
+
+
 def _resolve_runner_path(
     *,
     module_file: str | Path | None = None,
@@ -41,10 +43,14 @@ def _resolve_runner_path(
     prefix = Path(sys.prefix if python_prefix is None else python_prefix).resolve()
     candidates = (
         module_path.parent.parent / "tools" / "external_programming_candidate.py",
-        prefix.parent / "inputs" / "tools" / "external_programming_candidate.py",
+        prefix.parent / "tools" / "external_programming_candidate.py",
     )
     for candidate in candidates:
-        if candidate.is_file():
+        try:
+            candidate_status = candidate.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(candidate_status.st_mode):
             return candidate
     return candidates[0]
 

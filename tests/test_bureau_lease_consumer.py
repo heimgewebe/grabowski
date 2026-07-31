@@ -370,21 +370,17 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
             json.loads(stored)["lease_mode"], "emergency-recovery"
         )
 
-    def test_emergency_phase_rejects_conflicting_normal_lease_mode(self) -> None:
+    def test_explicit_lease_mode_is_rejected_before_contract_invocation(self) -> None:
         metadata = {
             "bureau_phase": "emergency-recovery",
             "bureau_justification": "private recovery reason",
             "bureau_expected_head": "a" * 40,
             "lease_mode": "normal",
         }
-        with patch.object(
-            bureau.subprocess,
-            "run",
-            side_effect=lambda argv, **kwargs: self._response(argv),
-        ):
+        with patch.object(bureau.subprocess, "run") as run:
             with self.assertRaisesRegex(
                 ValueError,
-                "Bureau emergency-recovery conflicts with metadata.lease_mode",
+                "metadata.lease_mode is not an authority surface",
             ):
                 resources.acquire_resources(
                     "owner-a",
@@ -393,7 +389,100 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
                     ttl_seconds=300,
                     metadata=metadata,
                 )
+        run.assert_not_called()
         self.assertFalse(self.database.exists())
+
+    def test_emergency_requires_exact_broad_repository_before_invocation(self) -> None:
+        key = "repo:/home/alex/repos/bureau/inner"
+        metadata = {
+            "bureau_phase": "emergency-recovery",
+            "bureau_justification": "private recovery reason",
+            "bureau_expected_head": "a" * 40,
+        }
+        with patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "emergency-recovery-requires-broad-repository-key",
+            ):
+                resources.acquire_resources(
+                    "owner-a",
+                    [key],
+                    purpose="recovery",
+                    ttl_seconds=300,
+                    metadata=metadata,
+                )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_emergency_requires_justification_before_invocation(self) -> None:
+        metadata = {
+            "bureau_phase": "emergency-recovery",
+            "bureau_expected_head": "a" * 40,
+        }
+        with patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "emergency-recovery-justification-required",
+            ):
+                resources.acquire_resources(
+                    "owner-a",
+                    [bureau.BROAD_BUREAU_REPOSITORY_KEY],
+                    purpose="recovery",
+                    ttl_seconds=300,
+                    metadata=metadata,
+                )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_emergency_requires_expected_boundary_before_invocation(self) -> None:
+        metadata = {
+            "bureau_phase": "emergency-recovery",
+            "bureau_justification": "private recovery reason",
+        }
+        with patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "emergency-recovery-boundary-required",
+            ):
+                resources.acquire_resources(
+                    "owner-a",
+                    [bureau.BROAD_BUREAU_REPOSITORY_KEY],
+                    purpose="recovery",
+                    ttl_seconds=300,
+                    metadata=metadata,
+                )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_effect_gate_ttl_is_capped_before_invocation(self) -> None:
+        cases = (
+            (
+                [bureau.BROAD_BUREAU_REPOSITORY_KEY],
+                {
+                    "bureau_phase": "emergency-recovery",
+                    "bureau_justification": "private recovery reason",
+                    "bureau_expected_head": "a" * 40,
+                },
+            ),
+            ([bureau.BUREAU_MERGE_GATE_KEY], None),
+            ([bureau.BUREAU_WORKTREE_ADMIN_KEY], None),
+        )
+        for keys, metadata in cases:
+            with self.subTest(keys=keys):
+                with patch.object(bureau.subprocess, "run") as run:
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        "effect-gate-ttl-exceeds-maximum",
+                    ):
+                        resources.acquire_resources(
+                            "owner-a",
+                            keys,
+                            purpose="effect",
+                            ttl_seconds=301,
+                            metadata=metadata,
+                        )
+                run.assert_not_called()
+                self.assertFalse(self.database.exists())
 
     def test_audit_contains_only_contract_summary(self) -> None:
         metadata = {
@@ -767,10 +856,14 @@ def _insert_lease_without_contract(
     *,
     resource_key: str,
     owner_id: str = "owner-a",
+    metadata: dict[str, object] | None = None,
 ) -> None:
     import time
 
     database.parent.mkdir(parents=True, exist_ok=True)
+    metadata_json, metadata_sha256 = resources._metadata(
+        {} if metadata is None else metadata
+    )
     with resources._database() as connection:
         now = int(time.time())
         connection.execute(
@@ -788,8 +881,8 @@ def _insert_lease_without_contract(
                 now,
                 now,
                 now + 3600,
-                hashlib.sha256(b"{}").hexdigest(),
-                "{}",
+                metadata_sha256,
+                metadata_json,
                 None,
             ),
         )
@@ -828,6 +921,27 @@ class BureauLeaseRenewalTests(_BureauLeaseTestCase):
         ):
             result = resources.renew_resources("owner-a", [key], ttl_seconds=60)
         self.assertEqual(result["bureau_contract"]["phase"], "work")
+
+    def test_persisted_emergency_marker_is_nonrenewable_on_any_bureau_key(self) -> None:
+        key = "repo:/home/alex/repos/bureau/inner"
+        _insert_lease_without_contract(
+            self.database,
+            resource_key=key,
+            metadata={"lease_mode": "emergency-recovery"},
+        )
+        with patch.object(
+            bureau.subprocess,
+            "run",
+            side_effect=lambda argv, **kwargs: self._response(argv),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "emergency-recovery leases are non-renewable",
+            ):
+                resources.renew_resources("owner-a", [key], ttl_seconds=60)
+        lease = resources.inspect_resource(key)
+        self.assertIsNotNone(lease)
+        self.assertEqual(lease["purpose"], "legacy")
 
     def test_effect_gates_cannot_be_renewed(self) -> None:
         for key in (bureau.BUREAU_MERGE_GATE_KEY, bureau.BUREAU_WORKTREE_ADMIN_KEY):
