@@ -1422,6 +1422,158 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(status["state"], "completed")
         self.assertEqual(status["last_observation"]["properties"]["Result"], "success")
 
+    def test_resume_renews_live_lease_without_rebinding_identity(self) -> None:
+        key = "component:task-resume-renew"
+        started = self._start(resource_keys=[key])
+        task_id = str(started["task"]["task_id"])
+        before = tasks.resources.inspect_resource(key)
+        self.assertIsNotNone(before)
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks, "_launch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+        after = tasks.resources.inspect_resource(key)
+        self.assertIsNotNone(after)
+        assert before is not None and after is not None
+        self.assertEqual(after["acquired_at_unix"], before["acquired_at_unix"])
+        self.assertEqual(after["purpose"], before["purpose"])
+        self.assertEqual(after["metadata_sha256"], before["metadata_sha256"])
+        self.assertEqual(
+            after["reclaimed_from_owner"], before["reclaimed_from_owner"]
+        )
+        self.assertGreaterEqual(after["expires_at_unix"], before["expires_at_unix"])
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        self.assertEqual(resumed["audit"]["resource_lease_mode"], "renewed")
+
+    def test_resume_reacquires_missing_lease_as_new_identity(self) -> None:
+        key = "component:task-resume-reacquire"
+        started = self._start(resource_keys=[key])
+        task_id = str(started["task"]["task_id"])
+        owner = str(started["task"]["lease_owner_id"])
+        tasks.resources.release_resources(owner, [key])
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks, "_launch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+        lease = tasks.resources.inspect_resource(key)
+        self.assertIsNotNone(lease)
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        self.assertEqual(resumed["audit"]["resource_lease_mode"], "reacquired")
+
+    def test_resume_reconciles_mixed_live_and_missing_leases(self) -> None:
+        live_key = "component:task-resume-mixed-live"
+        missing_key = "component:task-resume-mixed-missing"
+        started = self._start(resource_keys=[live_key, missing_key])
+        task_id = str(started["task"]["task_id"])
+        owner = str(started["task"]["lease_owner_id"])
+        live_before = tasks.resources.inspect_resource(live_key)
+        missing_before = tasks.resources.inspect_resource(missing_key)
+        self.assertIsNotNone(live_before)
+        self.assertIsNotNone(missing_before)
+        tasks.resources.release_resources(owner, [missing_key])
+        observation = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": int(time.time()),
+        }
+        with patch.object(tasks, "_observe", return_value=observation), patch.object(
+            tasks, "_launch", return_value=_launcher()
+        ), patch.object(tasks.base, "_append_audit"), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 126}
+        ):
+            resumed = tasks.grabowski_task_resume(task_id)
+
+        live_after = tasks.resources.inspect_resource(live_key)
+        missing_after = tasks.resources.inspect_resource(missing_key)
+        self.assertIsNotNone(live_after)
+        self.assertIsNotNone(missing_after)
+        assert live_before is not None and live_after is not None
+        assert missing_before is not None and missing_after is not None
+        self.assertEqual(
+            live_after["acquired_at_unix"], live_before["acquired_at_unix"]
+        )
+        self.assertEqual(
+            live_after["metadata_sha256"], live_before["metadata_sha256"]
+        )
+        self.assertNotEqual(
+            missing_after["metadata_sha256"], missing_before["metadata_sha256"]
+        )
+        self.assertEqual(resumed["task"]["attempt"], 2)
+        self.assertEqual(resumed["audit"]["resource_lease_mode"], "reconciled")
+        with sqlite3.connect(self.resource_database) as connection:
+            rows = {
+                row[0]: json.loads(row[1])
+                for row in connection.execute(
+                    "SELECT resource_key, metadata_json FROM leases "
+                    "WHERE resource_key IN (?, ?)",
+                    (live_key, missing_key),
+                ).fetchall()
+            }
+        self.assertEqual(rows[live_key]["attempt"], 1)
+        self.assertNotIn("recovered_after_expiry", rows[live_key])
+        self.assertEqual(rows[missing_key]["attempt"], 2)
+        self.assertIs(rows[missing_key]["recovered_after_expiry"], True)
+
+    def test_maintenance_reconciles_mixed_live_and_missing_leases(self) -> None:
+        live_key = "component:task-maintain-mixed-live"
+        missing_key = "component:task-maintain-mixed-missing"
+        started = self._start(resource_keys=[live_key, missing_key])
+        task_id = str(started["task"]["task_id"])
+        owner = str(started["task"]["lease_owner_id"])
+        live_before = tasks.resources.inspect_resource(live_key)
+        self.assertIsNotNone(live_before)
+        tasks.resources.release_resources(owner, [missing_key])
+
+        result = tasks._maintain_record_resources(
+            tasks._row_raw(task_id), "running"
+        )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result["maintained"])
+        self.assertEqual(result["mode"], "reconciled")
+        live_after = tasks.resources.inspect_resource(live_key)
+        missing_after = tasks.resources.inspect_resource(missing_key)
+        self.assertIsNotNone(live_after)
+        self.assertIsNotNone(missing_after)
+        assert live_before is not None and live_after is not None
+        self.assertEqual(
+            live_after["acquired_at_unix"], live_before["acquired_at_unix"]
+        )
+        self.assertEqual(
+            live_after["metadata_sha256"], live_before["metadata_sha256"]
+        )
+        with sqlite3.connect(self.resource_database) as connection:
+            rows = {
+                row[0]: json.loads(row[1])
+                for row in connection.execute(
+                    "SELECT resource_key, metadata_json FROM leases "
+                    "WHERE resource_key IN (?, ?)",
+                    (live_key, missing_key),
+                ).fetchall()
+            }
+        self.assertNotIn("recovered_after_expiry", rows[live_key])
+        self.assertIs(rows[missing_key]["recovered_after_expiry"], True)
+
     def test_completed_observation_blocks_direct_resume_before_launch(self) -> None:
         started = self._start()
         task_id = started["task"]["task_id"]
@@ -2765,16 +2917,16 @@ class TaskTests(unittest.TestCase):
             self.assertIn("interrupted_recovery_binding", launcher)
             with self.assertRaisesRegex(RuntimeError, "unresolved recovery attempt"):
                 tasks._guard_direct_terminal_retry_record(pending)
-            raise RuntimeError("synthetic lease acquisition failure")
+            raise RuntimeError("synthetic lease renewal failure")
 
         with (
             patch.object(tasks, "_reconcile_observation", return_value=admitted),
             patch.object(tasks, "_observe", return_value=revalidated),
             patch.object(
                 tasks.resources,
-                "acquire_resources",
+                "renew_resources",
                 side_effect=fail_after_binding,
-            ) as acquire,
+            ) as renew,
             patch.object(tasks, "_launch") as launch,
             patch.object(
                 tasks,
@@ -2789,8 +2941,8 @@ class TaskTests(unittest.TestCase):
             )
 
         self.assertEqual([], result["resumed"])
-        self.assertIn("lease acquisition failure", result["blocked"][0]["reason"])
-        acquire.assert_called_once()
+        self.assertIn("lease renewal failure", result["blocked"][0]["reason"])
+        renew.assert_called_once()
         launch.assert_not_called()
         persisted = tasks._row_raw(task_id)
         self.assertEqual("launching", persisted["state"])

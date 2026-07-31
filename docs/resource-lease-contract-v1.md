@@ -34,8 +34,38 @@ An existing valid schema-3 store from an older runtime may lack the lease-contra
 
 The aggregate schema version is not changed. Existing leases remain byte-for-byte represented by the same `leases` rows.
 
+## Mutation semantics
+
+A live lease is one identity, not merely one resource key and owner string. Its identity includes the normalized resource key, owner, purpose and semantic metadata.
+
+- Repeating `acquire` with the same live owner, purpose and semantic metadata is idempotent. It may extend expiry, but it never shortens expiry and does not advance `updated_at_unix` when no state changes.
+- Repeating `acquire` with the same live owner but a different purpose or semantic metadata fails closed. The caller must release the old identity and acquire a new one explicitly.
+- Server-generated admission evidence is not caller-controlled metadata. A caller cannot provide `work_admission`, and same-owner reentry preserves the original admission generation rather than rerunning or rewriting it.
+- Reclaiming an expired lease starts a new acquisition time and records the previous owner. A later idempotent call preserves that reclaim provenance.
+- `renew` never shortens expiry. It reports the requested expiry separately from the effective minimum expiry of the renewed set.
+- `renew` and `release` may be bound to exact public lease snapshots. A changed, replaced or disappeared lease aborts the complete atomic mutation.
+- A force release may bind a foreign-owner snapshot. Force authority does not disable snapshot comparison.
+- A lease carrying a non-conflict exception cannot be extended through either `renew` or same-owner `acquire`. The caller must reassess and acquire a fresh exception after the old generation expires or is explicitly released.
+
+Missing and expired renewals use distinct typed failures. Only these two states are eligible for an explicit reacquisition path; ownership, integrity, policy and snapshot failures are not downgraded to expiry.
+
+## Durable task reconciliation
+
+A persistent task resume or live-task maintenance first renews the complete lease set. If one or more leases are missing or expired, Grabowski reconciles the set in one resource-store transaction:
+
+- every still-live same-owner lease keeps its original acquisition time, raw metadata JSON, metadata hash, purpose and reclaim provenance;
+- only missing or expired leases receive a new generation with the current task attempt and `recovered_after_expiry=true`;
+- all reconciled leases receive an expiry that is at least as late as the requested expiry;
+- any foreign owner, metadata-integrity failure, semantic identity mismatch, policy failure or non-conflict exception aborts the entire transaction.
+
+The internal preservation mode is restricted to durable task owners. It is not exposed by the public resource-acquire tool. A mixed operation reports `reconciled`; a set containing no preserved live generation reports `reacquired`.
+
+A resume therefore does not rewrite a live lease with a new attempt number. This keeps the lease identity stable across execution attempts and prevents a task retry from silently changing ownership evidence.
+
 ## Fail-closed boundary
 
 Grabowski refuses to open a store carrying a malformed or unsupported lease-contract version. It does not rewrite, downgrade or infer compatibility from table shape. Schema inventory exposes the observed, current and supported contract versions without mutating the store.
+
+The v1 snapshot is a compare-and-swap binding over owner, acquisition time, update time, expiry and metadata hash. It is not a monotonic lease-generation counter. A future contract version may add an explicit generation field without changing the meaning of v1 rows.
 
 This contract does not grant lease ownership, deployment authority, migration authority or compatibility with future lease semantics.

@@ -575,6 +575,18 @@ class NonConflictResourceTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "non-renewable"):
             resources.renew_resources("owner-b", [exact_key], ttl_seconds=60)
+        with self.assertRaisesRegex(RuntimeError, "non-renewable"):
+            resources.acquire_resources(
+                "owner-b",
+                [exact_key],
+                purpose="secondary exact work",
+                ttl_seconds=60,
+                metadata={
+                    "scope_manifest": self.scope("b"),
+                    "scope_manifest_complete": True,
+                },
+                nonconflict_proof=assessment["proof"],
+            )
 
     def test_release_and_reacquire_race_invalidates_old_proof(self) -> None:
         self.acquire_blocker()

@@ -207,12 +207,10 @@ class ObsoletePathLeaseReconcileTests(unittest.TestCase):
         snapshots = self._acquire([self.path_a])
 
         def verify(*_args, **_kwargs):
-            resources.acquire_resources(
+            resources.renew_resources(
                 self.owner,
                 [self.path_a],
-                purpose="resumed terminal owner work",
                 ttl_seconds=600,
-                metadata={"attempt": 2},
             )
             return self._terminal_evidence(self.owner, [self.path_a])
 
