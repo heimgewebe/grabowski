@@ -46,6 +46,7 @@ COORDINATION_ROOT = Path(
 RUN_ID_RE = re.compile(r"^BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_REQUEST_BYTES = 1024 * 1024
+MAX_REGISTRY_TREE_BYTES = 16 * 1024 * 1024
 MAX_CLAIM_REJECTION_CODE_BYTES = 128
 MAX_CLAIM_REJECTION_VALUE_BYTES = 16 * 1024
 MIN_LEASE_TTL_SECONDS = 120
@@ -683,6 +684,7 @@ def _canonical_registry_binding() -> dict[str, Any]:
         "inventory_sha256": managed.inventory.sha256,
     }
     identity["binding_sha256"] = _sha256(identity)
+    _validate_registry_binding_identity(identity)
     return {
         "identity": identity,
         "managed_runtime": managed,
@@ -704,6 +706,38 @@ def _explicit_registry_binding(registry_root: str) -> dict[str, Any]:
         "explicit": True,
         "legacy": False,
     }
+
+
+def _observed_registry_tree_sha256(
+    registry_root: Path, paths: list[str]
+) -> str:
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for item in paths:
+        relative = Path(item)
+        try:
+            snapshot = bureau._read_regular_file_snapshot(
+                registry_root / relative,
+                label="canonical-registry-tree-entry",
+            )
+        except (OSError, RuntimeError) as exc:
+            raise BureauPickupError(
+                "canonical-registry-tree-read-failed",
+                details={
+                    "cause_code": getattr(exc, "code", None),
+                    "error_type": type(exc).__name__,
+                    "path": item,
+                },
+            ) from None
+        total_bytes += len(snapshot.raw)
+        if total_bytes > MAX_REGISTRY_TREE_BYTES:
+            raise BureauPickupError("canonical-registry-tree-too-large")
+        encoded = relative.as_posix().encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(snapshot.raw).to_bytes(8, "big"))
+        digest.update(snapshot.raw)
+    return digest.hexdigest()
 
 
 def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, Any]:
@@ -786,10 +820,37 @@ def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, A
         raise BureauPickupError("canonical-registry-inventory-invalid") from None
     if not isinstance(inventory_payload, dict):
         raise BureauPickupError("canonical-registry-inventory-invalid")
+    paths = inventory_payload.get("paths")
+    if (
+        inventory_payload.get("schema_version") != SCHEMA_VERSION
+        or inventory_payload.get("kind") != "bureau_registry_snapshot"
+        or not isinstance(paths, list)
+        or not paths
+        or any(
+            not isinstance(item, str)
+            or not item
+            or Path(item).is_absolute()
+            or ".." in Path(item).parts
+            for item in paths
+        )
+        or len(paths) != len(set(paths))
+    ):
+        raise BureauPickupError("canonical-registry-inventory-invalid")
     if inventory_payload.get("source_commit") != source_commit:
         raise BureauPickupError("canonical-registry-source-commit-drift")
     if inventory_payload.get("tree_sha256") != identity["registry_tree_sha256"]:
         raise BureauPickupError("canonical-registry-tree-drift")
+    observed_tree_sha256 = _observed_registry_tree_sha256(
+        Path(registry_root), paths
+    )
+    if observed_tree_sha256 != identity["registry_tree_sha256"]:
+        raise BureauPickupError(
+            "canonical-registry-tree-drift",
+            details={
+                "expected_tree_sha256": identity["registry_tree_sha256"],
+                "observed_tree_sha256": observed_tree_sha256,
+            },
+        )
     return identity
 
 
@@ -856,6 +917,7 @@ def _assert_registry_binding(binding: dict[str, Any]) -> None:
                 "error_type": type(exc).__name__,
             },
         ) from None
+    _validate_registry_binding_identity(binding["identity"])
 
 
 def _prepare_request(

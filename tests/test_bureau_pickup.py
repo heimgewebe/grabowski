@@ -460,15 +460,25 @@ class BureauPickupTests(unittest.TestCase):
         )
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
 
-    def test_canonical_binding_uses_managed_manifest_identity(self) -> None:
+    def managed_registry_fixture(self):
         source_commit = "a" * 40
-        tree_sha256 = "b" * 64
+        relative = "registry/queue.json"
+        tracked = self.registry_root / relative
+        tracked.parent.mkdir()
+        tracked.write_text('{"queue":[]}\n', encoding="utf-8")
+        paths = [relative]
+        tree_sha256 = pickup._observed_registry_tree_sha256(
+            self.registry_root, paths
+        )
         inventory_path = self.registry_root / ".bureau-runtime-snapshot.json"
         inventory_path.write_text(
             json.dumps(
                 {
+                    "schema_version": 1,
+                    "kind": "bureau_registry_snapshot",
                     "source_commit": source_commit,
                     "tree_sha256": tree_sha256,
+                    "paths": paths,
                 }
             ),
             encoding="utf-8",
@@ -483,6 +493,10 @@ class BureauPickupTests(unittest.TestCase):
         managed.launcher.sha256 = "c" * 64
         managed.manifest.sha256 = "d" * 64
         managed.inventory = inventory
+        return managed, tracked
+
+    def test_canonical_binding_uses_managed_manifest_identity(self) -> None:
+        managed, _tracked = self.managed_registry_fixture()
         with (
             mock.patch.object(
                 pickup.bureau, "_managed_runtime_binding", return_value=managed
@@ -494,10 +508,32 @@ class BureauPickupTests(unittest.TestCase):
             binding = REAL_CANONICAL_REGISTRY_BINDING()
         self.assertEqual("canonical-registry-binding", binding["identity"]["kind"])
         self.assertEqual(str(self.registry_root), binding["identity"]["registry_root"])
-        self.assertEqual(source_commit, binding["identity"]["source_commit"])
-        self.assertEqual(tree_sha256, binding["identity"]["registry_tree_sha256"])
-        self.assertEqual(inventory.sha256, binding["identity"]["inventory_sha256"])
+        self.assertEqual(managed.source_commit, binding["identity"]["source_commit"])
+        self.assertEqual(
+            managed.registry_tree_sha256,
+            binding["identity"]["registry_tree_sha256"],
+        )
+        self.assertEqual(
+            managed.inventory.sha256, binding["identity"]["inventory_sha256"]
+        )
         assert_unchanged.assert_called_once_with(managed)
+
+    def test_canonical_registry_tree_drift_fails_before_effect(self) -> None:
+        managed, tracked = self.managed_registry_fixture()
+        with (
+            mock.patch.object(
+                pickup.bureau, "_managed_runtime_binding", return_value=managed
+            ),
+            mock.patch.object(
+                pickup.bureau, "_assert_managed_runtime_unchanged"
+            ),
+        ):
+            binding = REAL_CANONICAL_REGISTRY_BINDING()
+            tracked.write_text('{"queue":["drift"]}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-tree-drift"
+            ):
+                REAL_ASSERT_REGISTRY_BINDING(binding)
 
     def test_canonical_manifest_failure_has_stable_fail_closed_code(self) -> None:
         with mock.patch.object(
