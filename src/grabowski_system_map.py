@@ -146,6 +146,7 @@ def build_component_map(
         components.append(
             {
                 "id": component_id,
+                "name": source.get("display_name", component_id),
                 "role": role,
                 "authority": source["authority"],
                 "signal": "target_required",

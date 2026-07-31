@@ -66,8 +66,8 @@ registrieren; es ersetzt aber nicht den Live-Zustand von GitHub, CI oder
 Runtime. Cabinet kann Übersicht und Projektionen liefern; es ist keine
 Wahrheitsquelle für Merge- oder Deploy-Sicherheit. Chronik und Plexer können
 Ereignisse und Zustellung sichtbar machen; sie sind keine Freigabeinstanzen.
-Lenskit und RepoBrief können Kontext bereitstellen; sie ersetzen keine
-aktuelle Diff-, Test- oder Review-Prüfung. Vibe-Lab kann Experimente und
+RepoGround kann commit-gebundenen Repository-Kontext bereitstellen; es ersetzt
+keine aktuelle Diff-, Test- oder Review-Prüfung. Vibe-Lab kann Experimente und
 Signale liefern; es macht daraus keine Produktionsautorität.
 
 Diese Organe sollen Entscheidungen besser beobachtbar machen, aber keinen
