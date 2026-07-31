@@ -1981,17 +1981,6 @@ def grabowski_checkout_archive(
     )
     result: dict[str, Any] | None = None
     try:
-        retention = _upsert_retention(
-            checkout_key=record["checkout_key"],
-            repo_common_dir=common_dir,
-            repo_path=top_level,
-            checkout_path=checkout,
-            owner_id=owner,
-            purpose=archive_purpose,
-            retention_until_unix=until,
-            expected_head=expected_head,
-            expected_branch=expected_branch,
-        )
         lifecycle = _lifecycle_bindings([record["checkout_key"]]).get(
             record["checkout_key"]
         )
@@ -2005,6 +1994,17 @@ def grabowski_checkout_archive(
                     "Checkout lifecycle branch changed before archive"
                 )
 
+        retention = _upsert_retention(
+            checkout_key=record["checkout_key"],
+            repo_common_dir=common_dir,
+            repo_path=top_level,
+            checkout_path=checkout,
+            owner_id=owner,
+            purpose=archive_purpose,
+            retention_until_unix=until,
+            expected_head=expected_head,
+            expected_branch=expected_branch,
+        )
         archive_id = _new_archive_id()
         path_hash = record["checkout_key"][:16]
         ref_base = f"{ARCHIVE_REF_ROOT}/{path_hash}/{archive_id}"

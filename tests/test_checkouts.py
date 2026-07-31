@@ -323,18 +323,22 @@ class CheckoutLifecycleTests(unittest.TestCase):
 
     def test_archive_rejects_managed_binding_branch_drift_before_effects(self) -> None:
         binding = self._managed_binding()
+        checkout_key = str(binding["checkout_key"])
         with checkouts._database() as connection:
             connection.execute(
                 "UPDATE lifecycle_bindings SET expected_branch=? WHERE checkout_key=?",
-                ("other", binding["checkout_key"]),
+                ("other", checkout_key),
             )
             connection.commit()
+        retention_before = checkouts._retention_records([checkout_key])[checkout_key]
 
         with self.assertRaisesRegex(
             RuntimeError, "lifecycle branch changed before archive"
         ):
             self._archive()
 
+        retention_after = checkouts._retention_records([checkout_key])[checkout_key]
+        self.assertEqual(retention_after, retention_before)
         with checkouts._database() as connection:
             count = connection.execute("SELECT count(*) FROM archives").fetchone()[0]
         self.assertEqual(count, 0)
