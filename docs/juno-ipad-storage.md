@@ -56,15 +56,16 @@ Vertrag:
 
 Die Aufnahme erfolgt einzeln, damit Zustimmung und Beleg eindeutig bleiben:
 
-1. Juno-Agent stoppen, falls er die interaktive Ausführung blockiert.
-2. `juno_storage_grant.py` in Juno öffnen und starten. Der Helfer unterstützt sowohl Juno-Bridges mit als auch ohne exportiertes `ObjCProtocol`; Delegate und Picker bleiben bis zum nächsten expliziten Lauf gehalten, damit UIKit seinen schwachen Delegate nicht innerhalb des Rückrufs verliert.
-3. Im Systemdialog genau einen Ordner auswählen.
-4. Die iPadOS-Freigabe bestätigen.
-5. Das Skript darf bereits beendet erscheinen; den Systemdialog dennoch
+1. Juno in den Vordergrund bringen; ein gesunder Hintergrund-Agent besitzt noch kein aktives UIKit-Fenster und kann deshalb keinen Systemdialog präsentieren.
+2. Juno-Agent stoppen, falls er die interaktive Ausführung blockiert.
+3. `juno_storage_grant.py` in Juno öffnen und starten. Der Helfer unterstützt sowohl Juno-Bridges mit als auch ohne exportiertes `ObjCProtocol`; Delegate und Picker bleiben bis zum nächsten expliziten Lauf gehalten, damit UIKit seinen schwachen Delegate nicht innerhalb des Rückrufs verliert. Fehlt ein aktives Juno-Fenster oder scheitert die native Präsentation, wird kein Picker als scheinbar aktiv zurückbehalten.
+4. Im Systemdialog genau einen Ordner auswählen.
+5. Die iPadOS-Freigabe bestätigen.
+6. Das Skript darf bereits beendet erscheinen; den Systemdialog dennoch
    abschließen und auf die lokale Meldung `Freigabe gespeichert` mit Grant-ID
    warten.
-6. Juno-Agent erneut starten.
-7. Grabowski führt anschließend Grant-, Lese-, Schreib- und Neustartprüfung aus.
+7. Juno-Agent erneut starten.
+8. Grabowski führt anschließend Grant-, Lese-, Schreib- und Neustartprüfung aus.
 
 Sinnvolle Reihenfolge:
 
