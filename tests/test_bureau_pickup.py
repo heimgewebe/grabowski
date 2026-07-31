@@ -13,12 +13,19 @@ from unittest import mock
 import grabowski_bureau_pickup as pickup
 
 
+REAL_CANONICAL_REGISTRY_BINDING = pickup._canonical_registry_binding
+REAL_ASSERT_REGISTRY_BINDING = pickup._assert_registry_binding
+
+
 class BureauPickupTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.registry_root = self.root / "bureau"
         self.registry_root.mkdir()
+        self.default_registry_binding = pickup._explicit_registry_binding(
+            str(self.registry_root)
+        )
         self.coordination_root = self.root / "bureau-state"
         self.patches = [
             mock.patch.object(pickup, "STATE_ROOT", self.root / "state"),
@@ -27,6 +34,11 @@ class BureauPickupTests(unittest.TestCase):
             ),
             mock.patch.object(pickup, "COORDINATION_ROOT", self.coordination_root),
             mock.patch.object(pickup.bureau, "BUREAU_ROOT", self.registry_root),
+            mock.patch.object(
+                pickup,
+                "_canonical_registry_binding",
+                return_value=self.default_registry_binding,
+            ),
             mock.patch.object(pickup.operator, "_require_operator_mutation"),
             mock.patch.object(pickup.bureau, "_audit"),
         ]
@@ -423,6 +435,16 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(0o700, Path(expected_coordination).stat().st_mode & 0o777)
         run_dir = Path(result["journal"])
         self.assertTrue((run_dir / "intent.json").is_file())
+        self.assertEqual(
+            self.default_registry_binding["identity"],
+            json.loads(
+                (run_dir / "registry-binding.json").read_text(encoding="utf-8")
+            ),
+        )
+        self.assertEqual(
+            self.default_registry_binding["identity"]["binding_sha256"],
+            result["registry_binding_sha256"],
+        )
         self.assertTrue((run_dir / "acquisition.json").is_file())
         self.assertTrue((run_dir / "commit-result.json").is_file())
         self.assertTrue((run_dir / "commit-readback.json").is_file())
@@ -432,7 +454,253 @@ class BureauPickupTests(unittest.TestCase):
         )
         stored_request = json.loads((run_dir / "request.json").read_text(encoding="utf-8"))
         self.assertEqual(expected_coordination, stored_request["coordination_root"])
+        self.assertEqual(
+            self.default_registry_binding["identity"]["binding_sha256"],
+            stored_request["registry_binding_sha256"],
+        )
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
+
+    def managed_registry_fixture(self):
+        source_commit = "a" * 40
+        relative = "registry/queue.json"
+        tracked = self.registry_root / relative
+        tracked.parent.mkdir()
+        tracked.write_text('{"queue":[]}\n', encoding="utf-8")
+        paths = [relative]
+        tree_sha256 = pickup._observed_registry_tree_sha256(
+            self.registry_root, paths
+        )
+        inventory_path = self.registry_root / ".bureau-runtime-snapshot.json"
+        inventory_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "kind": "bureau_registry_snapshot",
+                    "source_commit": source_commit,
+                    "tree_sha256": tree_sha256,
+                    "paths": paths,
+                }
+            ),
+            encoding="utf-8",
+        )
+        inventory = pickup.bureau._read_regular_file_snapshot(
+            inventory_path, label="test-inventory"
+        )
+        managed = mock.Mock()
+        managed.registry_root = self.registry_root
+        managed.source_commit = source_commit
+        managed.registry_tree_sha256 = tree_sha256
+        managed.launcher.sha256 = "c" * 64
+        managed.manifest.sha256 = "d" * 64
+        managed.inventory = inventory
+        return managed, tracked
+
+    def canonical_registry_binding_fixture(self):
+        managed, tracked = self.managed_registry_fixture()
+        with (
+            mock.patch.object(
+                pickup.bureau, "_managed_runtime_binding", return_value=managed
+            ),
+            mock.patch.object(pickup.bureau, "_assert_managed_runtime_unchanged"),
+        ):
+            binding = REAL_CANONICAL_REGISTRY_BINDING()
+        return binding, managed, tracked
+
+    def test_canonical_binding_uses_managed_manifest_identity(self) -> None:
+        managed, _tracked = self.managed_registry_fixture()
+        with (
+            mock.patch.object(
+                pickup.bureau, "_managed_runtime_binding", return_value=managed
+            ),
+            mock.patch.object(
+                pickup.bureau, "_assert_managed_runtime_unchanged"
+            ) as assert_unchanged,
+        ):
+            binding = REAL_CANONICAL_REGISTRY_BINDING()
+        self.assertEqual("canonical-registry-binding", binding["identity"]["kind"])
+        self.assertEqual(str(self.registry_root), binding["identity"]["registry_root"])
+        self.assertEqual(managed.source_commit, binding["identity"]["source_commit"])
+        self.assertEqual(
+            managed.registry_tree_sha256,
+            binding["identity"]["registry_tree_sha256"],
+        )
+        self.assertEqual(
+            managed.inventory.sha256, binding["identity"]["inventory_sha256"]
+        )
+        assert_unchanged.assert_called_once_with(managed)
+
+    def test_journal_binding_keeps_deployment_digests_as_provenance(self) -> None:
+        binding, managed, _tracked = self.canonical_registry_binding_fixture()
+        with mock.patch.object(
+            pickup.bureau,
+            "_managed_runtime_binding",
+            side_effect=AssertionError("journal replay must not read current deployment"),
+        ):
+            replayed = pickup._registry_binding_from_identity(binding["identity"])
+        self.assertIsNone(replayed["managed_runtime"])
+        self.assertEqual(
+            managed.launcher.sha256, replayed["identity"]["launcher_sha256"]
+        )
+        self.assertEqual(
+            managed.manifest.sha256, replayed["identity"]["manifest_sha256"]
+        )
+
+    def test_canonical_registry_tree_drift_fails_before_effect(self) -> None:
+        managed, tracked = self.managed_registry_fixture()
+        with (
+            mock.patch.object(
+                pickup.bureau, "_managed_runtime_binding", return_value=managed
+            ),
+            mock.patch.object(
+                pickup.bureau, "_assert_managed_runtime_unchanged"
+            ),
+        ):
+            binding = REAL_CANONICAL_REGISTRY_BINDING()
+            tracked.write_text('{"queue":["drift"]}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-tree-drift"
+            ):
+                REAL_ASSERT_REGISTRY_BINDING(binding)
+
+    def test_canonical_manifest_failure_has_stable_fail_closed_code(self) -> None:
+        with mock.patch.object(
+            pickup.bureau,
+            "_managed_runtime_binding",
+            side_effect=RuntimeError("deployment-manifest-invalid"),
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "canonical-registry-binding-unavailable",
+            ):
+                REAL_CANONICAL_REGISTRY_BINDING()
+
+    def test_canonical_manifest_drift_has_stable_fail_closed_code(self) -> None:
+        managed = object()
+        binding = {
+            "identity": self.default_registry_binding["identity"],
+            "managed_runtime": managed,
+            "explicit": False,
+        }
+        with mock.patch.object(
+            pickup.bureau,
+            "_assert_managed_runtime_unchanged",
+            side_effect=RuntimeError("deployment-manifest-changed-during-call"),
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-binding-drift"
+            ):
+                REAL_ASSERT_REGISTRY_BINDING(binding)
+
+    def test_journal_registry_binding_rejects_digest_tamper(self) -> None:
+        run_dir = pickup._run_directory(self.intent()["run_id"])
+        tampered = dict(self.default_registry_binding["identity"])
+        tampered["registry_root"] = str(self.root)
+        pickup._write_bound_json(run_dir / "registry-binding.json", tampered)
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "registry-binding-digest-mismatch"
+        ):
+            pickup._read_journal_registry_binding(
+                run_dir,
+                str(self.registry_root),
+                expected_sha256=None,
+            )
+
+    def test_binding_marker_without_binding_fails_closed(self) -> None:
+        run_dir = pickup._run_directory(self.intent()["run_id"])
+        request = pickup._normalize_request(self.request())
+        pickup._write_bound_json(
+            run_dir / "request.json",
+            {
+                **request,
+                "registry_binding_sha256": self.default_registry_binding[
+                    "identity"
+                ]["binding_sha256"],
+            },
+        )
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "registry-binding-missing"
+        ):
+            pickup._root_binding_for_run(self.intent()["run_id"])
+
+    def test_default_root_ignores_dirty_conventional_checkout(self) -> None:
+        dirty_checkout = self.root / "dirty-conventional-checkout"
+        dirty_checkout.mkdir()
+        intent = self.intent()
+        with (
+            mock.patch.object(pickup.bureau, "BUREAU_ROOT", dirty_checkout),
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                side_effect=RuntimeError("stop after root observation"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "lease-acquisition-failed"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        argv = invoke.call_args.args[0]
+        self.assertEqual(
+            str(self.registry_root), argv[argv.index("--root") + 1]
+        )
+
+    def test_explicit_registry_root_preserves_override(self) -> None:
+        explicit = self.root / "explicit-registry"
+        explicit.mkdir()
+        normalized, binding = pickup._prepare_request(
+            self.request(registry_root=str(explicit))
+        )
+        self.assertEqual(str(explicit), normalized["registry_root"])
+        self.assertEqual("explicit-registry-root", binding["identity"]["kind"])
+
+    def test_missing_canonical_manifest_fails_before_bureau_or_lease_effect(self) -> None:
+        with (
+            mock.patch.object(
+                pickup,
+                "_canonical_registry_binding",
+                side_effect=pickup.BureauPickupError(
+                    "canonical-registry-binding-unavailable"
+                ),
+            ),
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "canonical-registry-binding-unavailable",
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_not_called()
+        acquire.assert_not_called()
+
+    def test_canonical_snapshot_drift_after_intent_precedes_lease_effect(self) -> None:
+        intent = self.intent()
+        with (
+            mock.patch.object(
+                pickup,
+                "_assert_registry_binding",
+                side_effect=[
+                    None,
+                    pickup.BureauPickupError("canonical-registry-binding-drift"),
+                ],
+            ),
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-binding-drift"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_called_once()
+        acquire.assert_not_called()
 
     def test_relative_registry_root_is_rejected_before_any_effect(self) -> None:
         with (
@@ -884,8 +1152,43 @@ class BureauPickupTests(unittest.TestCase):
         pickup._write_bound_json(run_dir / "acquisition.json", value)
         return run_dir, value
 
+    def write_registry_bound_request(self, run_dir, request, binding=None):
+        selected = binding or self.default_registry_binding
+        pickup._write_bound_json(
+            run_dir / "registry-binding.json",
+            selected["identity"],
+        )
+        bound_request = {
+            **request,
+            "registry_binding_sha256": selected["identity"]["binding_sha256"],
+        }
+        pickup._write_bound_json(run_dir / "request.json", bound_request)
+        return bound_request
+
     def terminal_status(self, intent, state="failed"):
         return self.coordinated_status(intent, state=state)
+
+    def test_journal_bound_release_rejects_registry_tree_drift(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
+        binding, _managed, tracked = self.canonical_registry_binding_fixture()
+        request = pickup._normalize_request(
+            self.request(registry_root=str(self.registry_root))
+        )
+        self.write_registry_bound_request(run_dir, request, binding)
+        tracked.write_text('{"queue":["drift"]}\n', encoding="utf-8")
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-tree-drift"
+            ):
+                pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        invoke.assert_not_called()
+        release.assert_not_called()
 
     def test_release_uses_journal_bound_coordination_root(self) -> None:
         intent = self.intent()
@@ -893,7 +1196,7 @@ class BureauPickupTests(unittest.TestCase):
         lease = self.lease(key, intent["lease_owner_id"])
         run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
         request = pickup._normalize_request(self.request())
-        pickup._write_bound_json(run_dir / "request.json", request)
+        self.write_registry_bound_request(run_dir, request)
         with (
             mock.patch.object(
                 pickup.bureau,
@@ -1550,7 +1853,7 @@ class BureauPickupTests(unittest.TestCase):
         intent = self.intent()
         normalized = pickup._normalize_request(self.request())
         run_dir = pickup._run_directory(intent["run_id"])
-        pickup._write_bound_json(run_dir / "request.json", normalized)
+        self.write_registry_bound_request(run_dir, normalized)
         with mock.patch.object(
             pickup.bureau,
             "_invoke_bureau",
@@ -1564,11 +1867,34 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("journal-bound", result["root_binding_source"])
         self.assertEqual(normalized["coordination_root"], result["coordination_root"])
 
+    def test_journal_bound_status_rejects_registry_tree_drift(self) -> None:
+        intent = self.intent()
+        managed, tracked = self.managed_registry_fixture()
+        with (
+            mock.patch.object(
+                pickup.bureau, "_managed_runtime_binding", return_value=managed
+            ),
+            mock.patch.object(pickup.bureau, "_assert_managed_runtime_unchanged"),
+        ):
+            binding = REAL_CANONICAL_REGISTRY_BINDING()
+        request = pickup._normalize_request(
+            self.request(registry_root=str(self.registry_root))
+        )
+        run_dir = pickup._run_directory(intent["run_id"])
+        self.write_registry_bound_request(run_dir, request, binding)
+        tracked.write_text('{"queue":["drift"]}\n', encoding="utf-8")
+        with mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke:
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "canonical-registry-tree-drift"
+            ):
+                pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        invoke.assert_not_called()
+
     def test_journal_bound_status_survives_configured_root_change(self) -> None:
         intent = self.intent()
         request = pickup._normalize_request(self.request())
         run_dir = pickup._run_directory(intent["run_id"])
-        pickup._write_bound_json(run_dir / "request.json", request)
+        self.write_registry_bound_request(run_dir, request)
         with (
             mock.patch.object(
                 pickup, "COORDINATION_ROOT", self.root / "new-configured-state"
@@ -1648,7 +1974,7 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(1, invoke.call_count)
         self.assertEqual(failure, result["coordination"])
         self.assertEqual(
-            "current-default-with-legacy-fallback", result["root_binding_source"]
+            "current-canonical-with-legacy-fallback", result["root_binding_source"]
         )
 
     def test_status_does_not_create_private_state(self) -> None:
@@ -1664,7 +1990,7 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(
             str(pickup.COORDINATION_ROOT), result["coordination_root"]
         )
-        self.assertEqual("current-default", result["root_binding_source"])
+        self.assertEqual("current-canonical", result["root_binding_source"])
         self.assertFalse(pickup.STATE_ROOT.exists())
 
     def test_status_is_read_only_and_reports_journal_presence(self) -> None:
