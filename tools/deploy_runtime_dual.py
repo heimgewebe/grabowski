@@ -2387,17 +2387,20 @@ def _parse_tunnel_drain_metrics(text: str) -> dict[str, float]:
     return observed
 
 
-def _tunnel_drain_idle_mismatch(observed: dict[str, float]) -> dict[str, float]:
+def _tunnel_drain_idle_mismatch(
+    observed: dict[str, float], *, admission_active: bool = False
+) -> dict[str, float]:
     enqueued = observed["commands_enqueued_total"]
     polled = observed["commands_polled_total"]
     final_responses = observed[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]
+    response_gap = enqueued - final_responses
     mismatch: dict[str, float] = {}
     if observed[TUNNEL_DRAIN_QUEUE_GAUGE_NAME] != 0:
         mismatch[TUNNEL_DRAIN_QUEUE_GAUGE_NAME] = observed[TUNNEL_DRAIN_QUEUE_GAUGE_NAME]
     if polled != enqueued:
         mismatch["commands_polled_total"] = polled
         mismatch["commands_enqueued_total"] = enqueued
-    if final_responses != enqueued:
+    if response_gap < 0 or (response_gap != 0 and not admission_active):
         mismatch[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME] = final_responses
         mismatch["commands_enqueued_total"] = enqueued
     return mismatch
@@ -3003,9 +3006,17 @@ def wait_for_tunnel_dispatcher_idle(
                             "observed_process_start_time_seconds": process_start_time,
                         },
                     )
-                idle = not _tunnel_drain_idle_mismatch(observed)
+                idle = not _tunnel_drain_idle_mismatch(
+                    observed, admission_active=admission_active
+                )
                 comparable_stability = (
-                    {"process_start_time_seconds": process_start_time}
+                    {
+                        "process_start_time_seconds": process_start_time,
+                        "pending_final_responses": (
+                            counters["commands_enqueued_total"]
+                            - counters[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]
+                        ),
+                    }
                     if admission_active
                     else stability
                 )
@@ -3073,7 +3084,9 @@ def verify_tunnel_drain_final_guard(
             phase="tunnel-drain-final-guard",
             details={"metrics_error": _error_summary(exc)},
         )
-    busy = _tunnel_drain_idle_mismatch(observed)
+    busy = _tunnel_drain_idle_mismatch(
+        observed, admission_active=admission_active
+    )
     stability = _tunnel_drain_stability_snapshot(observed)
     if admission_active:
         changed_stability = {}
@@ -3083,6 +3096,31 @@ def verify_tunnel_drain_final_guard(
             changed_stability["process_start_time_seconds"] = {
                 "expected": expected_stability.get("process_start_time_seconds"),
                 "observed": stability["process_start_time_seconds"],
+            }
+        expected_enqueued = expected_stability.get("commands_enqueued_total")
+        expected_final_responses = expected_stability.get(
+            TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME
+        )
+        if (
+            isinstance(expected_enqueued, (int, float))
+            and not isinstance(expected_enqueued, bool)
+            and isinstance(expected_final_responses, (int, float))
+            and not isinstance(expected_final_responses, bool)
+        ):
+            expected_response_gap = expected_enqueued - expected_final_responses
+            observed_response_gap = (
+                stability["commands_enqueued_total"]
+                - stability[TUNNEL_DRAIN_FINAL_RESPONSE_COUNTER_NAME]
+            )
+            if observed_response_gap != expected_response_gap:
+                changed_stability["pending_final_responses"] = {
+                    "expected": expected_response_gap,
+                    "observed": observed_response_gap,
+                }
+        else:
+            changed_stability["pending_final_responses"] = {
+                "expected": "numeric-counter-pair",
+                "observed": None,
             }
         for name in TUNNEL_DRAIN_COUNTER_NAMES:
             expected = expected_stability.get(name)
