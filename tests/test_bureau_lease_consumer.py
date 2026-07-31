@@ -366,6 +366,34 @@ class BureauLeaseConsumerTests(_BureauLeaseTestCase):
             ).fetchone()[0]
         self.assertNotIn("private recovery reason", stored)
         self.assertIn("sha256:", stored)
+        self.assertEqual(
+            json.loads(stored)["lease_mode"], "emergency-recovery"
+        )
+
+    def test_emergency_phase_rejects_conflicting_normal_lease_mode(self) -> None:
+        metadata = {
+            "bureau_phase": "emergency-recovery",
+            "bureau_justification": "private recovery reason",
+            "bureau_expected_head": "a" * 40,
+            "lease_mode": "normal",
+        }
+        with patch.object(
+            bureau.subprocess,
+            "run",
+            side_effect=lambda argv, **kwargs: self._response(argv),
+        ):
+            with self.assertRaisesRegex(
+                ValueError,
+                "Bureau emergency-recovery conflicts with metadata.lease_mode",
+            ):
+                resources.acquire_resources(
+                    "owner-a",
+                    [bureau.BROAD_BUREAU_REPOSITORY_KEY],
+                    purpose="recovery",
+                    ttl_seconds=300,
+                    metadata=metadata,
+                )
+        self.assertFalse(self.database.exists())
 
     def test_audit_contains_only_contract_summary(self) -> None:
         metadata = {

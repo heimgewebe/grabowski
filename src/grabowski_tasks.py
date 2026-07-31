@@ -4874,6 +4874,23 @@ def grabowski_task_resume(
     candidate = {**record, "attempt": attempt, "unit": unit, "authoritative_unit": unit}
     task_resources = _record_resource_keys(record)
     lease_owner = record.get("lease_owner_id") or _lease_owner(task_id)
+    lease_metadata = None
+    if task_resources:
+        repository_resource = _task_repository_resource(task_resources)
+        implicit_workspace_resource = _record_implicit_workspace_resource(
+            record, repository_resource
+        )
+        repository_scope_manifest = _record_repository_scope_manifest(
+            record, repository_resource
+        )
+        lease_metadata = _task_lease_metadata(
+            task_id=task_id,
+            host=str(record["host"]),
+            attempt=attempt,
+            repository_resource=repository_resource,
+            implicit_workspace_resource=implicit_workspace_resource,
+            repository_scope_manifest=repository_scope_manifest,
+        )
     if interrupted_recovery_binding is not None:
         _set_state(
             task_id,
@@ -4897,11 +4914,7 @@ def grabowski_task_resume(
                 resources.MAX_TTL_SECONDS,
                 max(resources.MIN_TTL_SECONDS, int(record["runtime_seconds"]) + 300),
             ),
-            metadata={
-                "task_id": task_id,
-                "host": record["host"],
-                "attempt": attempt,
-            },
+            metadata=lease_metadata,
         )
     launcher = _launch(candidate)
     if interrupted_recovery_binding is not None:

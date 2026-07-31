@@ -1162,7 +1162,10 @@ def _resource_related(resource_key: str, paths: list[Path]) -> bool:
 
 
 def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
-    connection = _readonly_connection(tasks.TASK_DB)
+    try:
+        connection = _readonly_connection(tasks.TASK_DB)
+    except sqlite3.Error as exc:
+        raise RuntimeError("Task inventory projection is unavailable") from exc
     if connection is None:
         return []
     try:
@@ -1174,8 +1177,8 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
             ORDER BY task_id
             """
         ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    except sqlite3.Error as exc:
+        raise RuntimeError("Task inventory projection is unavailable") from exc
     finally:
         connection.close()
     results: list[dict[str, Any]] = []
@@ -1211,6 +1214,31 @@ def _task_records(paths: list[Path]) -> list[dict[str, Any]]:
             )
     return results
 
+
+def _process_systemd_units(entry: Path) -> list[str]:
+    try:
+        content = (entry / "cgroup").read_text(
+            encoding="utf-8", errors="strict"
+        )
+    except (OSError, UnicodeDecodeError):
+        return []
+    if len(content.encode("utf-8")) > 16 * 1024:
+        return []
+    units: set[str] = set()
+    for line in content.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            continue
+        for segment in fields[2].split("/"):
+            if (
+                len(segment.encode("utf-8")) <= 256
+                and re.fullmatch(r"[A-Za-z0-9_.@:-]+\.(?:service|scope)", segment)
+                is not None
+            ):
+                units.add(segment)
+    return sorted(units)
+
+
 def _processes_under(paths: list[Path]) -> list[dict[str, Any]]:
     proc = Path("/proc")
     if not proc.is_dir():
@@ -1234,7 +1262,15 @@ def _processes_under(paths: list[Path]) -> list[dict[str, Any]]:
             command = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip()
         except (OSError, UnicodeDecodeError):
             pass
-        records.append({"pid": int(entry.name), "cwd": str(cwd), "command": command})
+        record: dict[str, Any] = {
+            "pid": int(entry.name),
+            "cwd": str(cwd),
+            "command": command,
+        }
+        systemd_units = _process_systemd_units(entry)
+        if systemd_units:
+            record["systemd_units"] = systemd_units
+        records.append(record)
     return sorted(records, key=lambda item: item["pid"])
 
 

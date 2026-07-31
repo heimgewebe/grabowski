@@ -40,6 +40,7 @@ HARD_BLOCK_CODES = frozenset(
         "reconciliation-unobservable",
         "bounded-inventory-exceeded",
         "bounded-reconciliation-exceeded",
+        "lifecycle-owner-ambiguous",
     }
 )
 
@@ -93,17 +94,17 @@ def _default_reconciliation(repo: str) -> dict[str, Any]:
     )
 
 
-def _owner_from_lifecycle(item: dict[str, Any]) -> str | None:
+def _lifecycle_owners(item: dict[str, Any]) -> set[str]:
     lifecycle = item.get("lifecycle")
     if not isinstance(lifecycle, dict):
-        return None
+        return set()
     owners: set[str] = set()
     for key in ("retention", "binding", "latest_archive"):
         record = lifecycle.get(key)
         owner = record.get("owner_id") if isinstance(record, dict) else None
         if isinstance(owner, str) and owner:
             owners.add(owner)
-    return next(iter(owners)) if len(owners) == 1 else None
+    return owners
 
 
 def _source_binding(item: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -124,6 +125,8 @@ def _foreign_coordination(item: dict[str, Any], owner_id: str) -> list[dict[str,
     if not isinstance(coordination, dict):
         return []
     blockers: list[dict[str, Any]] = []
+    same_owner_units: set[str] = set()
+    same_owner_pids: set[int] = set()
     for lease in coordination.get("resource_leases", []):
         if not isinstance(lease, dict) or not lease.get("blocking"):
             continue
@@ -140,6 +143,27 @@ def _foreign_coordination(item: dict[str, Any], owner_id: str) -> list[dict[str,
         if not isinstance(task, dict):
             continue
         if task.get("lease_owner_id") == owner_id:
+            same_owner_units.update(
+                unit
+                for unit in (
+                    task.get("unit"),
+                    task.get("authoritative_unit"),
+                )
+                if isinstance(unit, str) and unit
+            )
+            for key in ("pid", "main_pid", "worker_pid"):
+                pid = task.get(key)
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    same_owner_pids.add(pid)
+            pids = task.get("pids")
+            if isinstance(pids, list):
+                same_owner_pids.update(
+                    pid
+                    for pid in pids
+                    if isinstance(pid, int)
+                    and not isinstance(pid, bool)
+                    and pid > 0
+                )
             continue
         blockers.append(
             {
@@ -150,9 +174,25 @@ def _foreign_coordination(item: dict[str, Any], owner_id: str) -> list[dict[str,
         )
     current_pid = os.getpid()
     for process in coordination.get("processes", []):
-        if not isinstance(process, dict) or process.get("pid") == current_pid:
+        if not isinstance(process, dict):
             continue
-        blockers.append({"kind": "process", "pid": process.get("pid")})
+        pid = process.get("pid")
+        if pid == current_pid or pid in same_owner_pids:
+            continue
+        process_units: set[str] = set()
+        systemd_unit = process.get("systemd_unit")
+        if isinstance(systemd_unit, str) and systemd_unit:
+            process_units.add(systemd_unit)
+        systemd_units = process.get("systemd_units")
+        if isinstance(systemd_units, list):
+            process_units.update(
+                unit
+                for unit in systemd_units
+                if isinstance(unit, str) and unit
+            )
+        if process_units & same_owner_units:
+            continue
+        blockers.append({"kind": "process", "pid": pid})
     return blockers
 
 
@@ -274,7 +314,19 @@ def assess_repository_admission(
         if item.get("is_main"):
             continue
         state = str(item.get("lifecycle_state") or "unobservable")
-        lifecycle_owner = _owner_from_lifecycle(item)
+        lifecycle_owners = _lifecycle_owners(item)
+        lifecycle_owner = (
+            next(iter(lifecycle_owners)) if len(lifecycle_owners) == 1 else None
+        )
+        if len(lifecycle_owners) > 1:
+            blockers.append(
+                {
+                    "code": "lifecycle-owner-ambiguous",
+                    "path": path,
+                    "state": state,
+                    "owner_ids": sorted(lifecycle_owners),
+                }
+            )
         if state == "retained":
             if lifecycle_owner != owner_id:
                 blockers.append(
@@ -285,6 +337,15 @@ def assess_repository_admission(
                     }
                 )
         elif state in CONVERGENCE_STATES:
+            if lifecycle_owner is not None and lifecycle_owner != owner_id:
+                blockers.append(
+                    {
+                        "code": "foreign-lifecycle-owner",
+                        "path": path,
+                        "state": state,
+                        "owner_id": lifecycle_owner,
+                    }
+                )
             blockers.append(
                 {
                     "code": "worktree-convergence-required",

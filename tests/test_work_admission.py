@@ -230,6 +230,72 @@ class WorkAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "converge_first")
 
+    def test_convergence_mode_never_treats_ambiguous_ownership_as_ownerless(self) -> None:
+        linked = self._linked(
+            state="managed_lifecycle_drift",
+            owner="owner-a",
+        )
+        linked["lifecycle"]["retention"] = {
+            "owner_id": "foreign-owner",
+        }
+        result = self._assess([self._main(), linked])
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("lifecycle-owner-ambiguous", result["blocker_codes"])
+        blocker = next(
+            item
+            for item in result["blockers"]
+            if item["code"] == "lifecycle-owner-ambiguous"
+        )
+        self.assertEqual(
+            blocker["owner_ids"], ["foreign-owner", "owner-a"]
+        )
+
+        with self.assertRaises(admission.WorkAdmissionBlocked):
+            admission.require_repository_admission(
+                mode="convergence",
+                repo=str(self.repo),
+                owner_id="owner-a",
+                operation="broad_repository_lease",
+                inventory_loader=lambda _repo: {
+                    "worktrees": [self._main(), linked],
+                    "inventory_sha256": "a" * 64,
+                },
+                reconciliation_loader=lambda _repo: self._reconciliation(),
+            )
+
+    def test_convergence_mode_never_overrides_foreign_lifecycle_owner(self) -> None:
+        worktrees = [
+            self._main(),
+            self._linked(
+                state="completed_retained",
+                owner="foreign-owner",
+            ),
+        ]
+        result = self._assess(worktrees)
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("foreign-lifecycle-owner", result["blocker_codes"])
+        self.assertIn("worktree-convergence-required", result["blocker_codes"])
+
+        inventory = lambda _repo: {
+            "worktrees": worktrees,
+            "inventory_sha256": "a" * 64,
+        }
+        reconciliation = lambda _repo: self._reconciliation()
+        with self.assertRaises(admission.WorkAdmissionBlocked) as raised:
+            admission.require_repository_admission(
+                mode="convergence",
+                repo=str(self.repo),
+                owner_id="owner-a",
+                operation="broad_repository_lease",
+                inventory_loader=inventory,
+                reconciliation_loader=reconciliation,
+            )
+        self.assertEqual(raised.exception.assessment["decision"], "blocked")
+        self.assertIn(
+            "foreign-lifecycle-owner",
+            raised.exception.assessment["blocker_codes"],
+        )
+
     def test_equivalent_source_binding_blocks_duplicate_lane(self) -> None:
         result = self._assess(
             [
@@ -247,7 +313,9 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertEqual(result["decision"], "converge_first")
         self.assertIn("similar-active-source-binding", result["blocker_codes"])
 
-    def test_same_owner_task_and_current_process_do_not_self_block(self) -> None:
+    def test_same_owner_task_unit_with_distinct_worker_pid_does_not_self_block(self) -> None:
+        unit = "grabowski-task-" + "a" * 24 + "-a2.service"
+        worker_pid = admission.os.getpid() + 100_000
         linked = self._linked(state="retained", owner="owner-a")
         linked["coordination"] = {
             "resource_leases": [],
@@ -255,9 +323,10 @@ class WorkAdmissionTests(unittest.TestCase):
                 {
                     "task_id": "task-a",
                     "lease_owner_id": "owner-a",
+                    "unit": unit,
                 }
             ],
-            "processes": [{"pid": admission.os.getpid()}],
+            "processes": [{"pid": worker_pid, "systemd_units": [unit]}],
         }
         result = self._assess([self._main(), linked])
         self.assertEqual(result["decision"], "allow")

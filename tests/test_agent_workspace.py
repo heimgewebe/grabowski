@@ -321,6 +321,16 @@ class AgentWorkspaceTests(unittest.TestCase):
                 "ARCHIVE_ROOT",
                 self.checkout_state / "archives",
             ),
+            mock.patch.object(
+                workspace.checkouts.resources,
+                "RESOURCE_DB",
+                self.checkout_state / "resources.sqlite3",
+            ),
+            mock.patch.object(
+                workspace.checkouts.tasks,
+                "TASK_DB",
+                self.checkout_state / "tasks.sqlite3",
+            ),
         ]
         for checkout_patch in self.checkout_patches:
             checkout_patch.start()

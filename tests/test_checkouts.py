@@ -46,6 +46,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_checkouts as checkouts
+import grabowski_work_admission as work_admission
 
 
 class CheckoutLifecycleTests(unittest.TestCase):
@@ -220,6 +221,55 @@ class CheckoutLifecycleTests(unittest.TestCase):
             checkouts._task_records([self.checkout, self.repo]),
             [],
         )
+
+    def test_task_inventory_schema_drift_is_unobservable(self) -> None:
+        self.task_db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.task_db) as connection:
+            connection.execute("CREATE TABLE tasks(task_id TEXT PRIMARY KEY)")
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Task inventory projection is unavailable"
+        ):
+            checkouts._task_records([self.checkout, self.repo])
+
+        assessment = work_admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            inventory_loader=lambda repo: checkouts.checkout_inventory(
+                repo,
+                include_processes=False,
+                include_tasks=True,
+                include_resources=False,
+            ),
+            reconciliation_loader=lambda _repo: {
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "source_snapshot": {"repository_errors": []},
+                "snapshot_sha256": "a" * 64,
+            },
+        )
+        self.assertEqual(assessment["decision"], "blocked")
+        self.assertIn("inventory-unobservable", assessment["blocker_codes"])
+        self.assertTrue(
+            any(
+                "Task inventory projection is unavailable"
+                in str(blocker.get("detail", ""))
+                for blocker in assessment["blockers"]
+            )
+        )
+
+    def test_process_cgroup_reports_exact_systemd_task_unit(self) -> None:
+        proc_entry = self.root / "proc" / "43210"
+        proc_entry.mkdir(parents=True)
+        unit = "grabowski-task-" + "a" * 24 + "-a2.service"
+        (proc_entry / "cgroup").write_text(
+            f"0::/user.slice/app.slice/{unit}\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(checkouts._process_systemd_units(proc_entry), [unit])
 
 
     def test_archive_ignores_processes_in_main_checkout(self) -> None:
@@ -557,12 +607,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
 
-    def test_broad_repo_lease_still_blocks_archive(self) -> None:
+    def test_emergency_recovery_broad_repo_lease_still_blocks_archive(self) -> None:
         checkouts.resources.acquire_resources(
             "foreign-broad-owner",
             [f"repo:{self.repo}"],
             purpose="unknown broad repository mutation",
             ttl_seconds=3600,
+            metadata={"lease_mode": "emergency-recovery"},
         )
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
@@ -1099,19 +1150,22 @@ class CheckoutLifecycleTests(unittest.TestCase):
             purpose="concurrent branch work",
             ttl_seconds=600,
         )
-        self.addCleanup(
-            checkouts.resources.release_resources,
-            lease["owner_id"],
-            [branch_key],
-        )
-        clear = checkouts._coordination_result([], [], [])
-        with (
-            patch.object(checkouts, "_linked_checkout_coordination", return_value=clear),
-            self.assertRaisesRegex(RuntimeError, "Resource is leased"),
-        ):
-            self._archive()
+        try:
+            clear = checkouts._coordination_result([], [], [])
+            with (
+                patch.object(
+                    checkouts, "_linked_checkout_coordination", return_value=clear
+                ),
+                self.assertRaisesRegex(RuntimeError, "Resource is leased"),
+            ):
+                self._archive()
 
-        self.assertTrue(self.checkout.exists())
+            self.assertTrue(self.checkout.exists())
+        finally:
+            checkouts.resources.release_resources(
+                lease["owner_id"],
+                [branch_key],
+            )
 
     def test_archive_rejects_symlinked_git_metadata(self) -> None:
         git_file = self.checkout / ".git"

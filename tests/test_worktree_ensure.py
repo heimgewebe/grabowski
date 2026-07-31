@@ -65,6 +65,16 @@ class WorktreeEnsureTests(unittest.TestCase):
             patch.object(checkouts, "CHECKOUT_DB", self.checkout_state / "checkouts.sqlite3"),
             patch.object(checkouts, "CHECKOUT_LOCK", self.checkout_state / "checkouts.lock"),
             patch.object(checkouts, "ARCHIVE_ROOT", self.checkout_state / "archives"),
+            patch.object(
+                checkouts.resources,
+                "RESOURCE_DB",
+                self.checkout_state / "resources.sqlite3",
+            ),
+            patch.object(
+                checkouts.tasks,
+                "TASK_DB",
+                self.checkout_state / "tasks.sqlite3",
+            ),
         ]
         for checkout_patch in self.checkout_patches:
             checkout_patch.start()

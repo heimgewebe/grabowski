@@ -8750,10 +8750,33 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                     head="feat/captain",
                 )
                 if mode == "legacy-repo":
-                    resources.acquire_resources(
-                        "foreign-legacy", [f"repo:{local_repo}"],
-                        purpose="legacy unscoped repository lease", ttl_seconds=60,
-                    )
+                    # Model a persisted pre-admission row. New broad leases must
+                    # pass admission and therefore cannot create this legacy
+                    # state while the repository is dirty.
+                    now = int(time.time())
+                    metadata_json, metadata_sha256 = resources._metadata({})
+                    with resources._database() as connection:
+                        connection.execute(
+                            """
+                            INSERT INTO leases(
+                                resource_key, owner_id, purpose,
+                                acquired_at_unix, updated_at_unix,
+                                expires_at_unix, metadata_sha256,
+                                metadata_json, reclaimed_from_owner
+                            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                            """,
+                            (
+                                f"repo:{local_repo}",
+                                "foreign-legacy",
+                                "legacy unscoped repository lease",
+                                now,
+                                now,
+                                now + 60,
+                                metadata_sha256,
+                                metadata_json,
+                            ),
+                        )
+                        connection.commit()
                 else:
                     gate = next(key for key in keys if key.startswith("gate:github-merge:"))
                     resources.acquire_resources(
@@ -10692,4 +10715,3 @@ class CaptainStructuredErrorTests(unittest.TestCase):
         self.assertEqual("fresh_status_projection_unavailable", errors[0]["code"])
         self.assertEqual("gate", errors[0]["phase"])
         self.assertEqual({"gate_id": "status-projection-fresh"}, errors[0]["context"])
-
