@@ -6591,6 +6591,251 @@ class TaskTests(unittest.TestCase):
                 )
 
 
+    def _operation_identity_fixture(self, *, source: str = "b") -> dict[str, str]:
+        return {
+            "repository_head": "a" * 40,
+            "source_fingerprint_sha256": source * 64,
+            "purpose": "validate exact source scope",
+            "scope_sha256": "c" * 64,
+        }
+
+    def test_operation_identity_reuses_recent_success_across_argv_changes(self) -> None:
+        operation_identity = self._operation_identity_fixture()
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as first_dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "syntax-a"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        self.assertTrue(first_dispatch.called)
+        source_task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            source_task_id,
+            "completed",
+            observation={"state": "completed", "observed_at_unix": tasks._now()},
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as second_dispatch,
+            patch.object(
+                tasks.operator, "_require_operator_mutation"
+            ) as mutation_gate,
+            patch.object(
+                tasks, "_bind_managed_cargo_environment"
+            ) as managed_cargo,
+            patch.object(tasks.base, "_append_audit") as audit,
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            second = tasks.grabowski_task_start(
+                "local",
+                ["env", "PYTHONPATH=src", "/bin/echo", "syntax-b"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        second_dispatch.assert_not_called()
+        mutation_gate.assert_not_called()
+        managed_cargo.assert_not_called()
+        self.assertEqual(source_task_id, second["task"]["task_id"])
+        self.assertEqual(
+            "recent_successful_operation_identity",
+            second["deduplicated_reuse"]["reason"],
+        )
+        self.assertEqual("task-start-deduplicated", audit.call_args.args[0]["operation"])
+
+    def test_operation_identity_stale_active_hit_is_reobserved_once(self) -> None:
+        operation_identity = self._operation_identity_fixture()
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "stale-a"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        task_id = str(first["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": tasks._now() - 121,
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+
+        def terminalize(observed_task_id: str) -> dict[str, object]:
+            self.assertEqual(task_id, observed_task_id)
+            return tasks._public(
+                tasks._set_state(
+                    task_id,
+                    "completed",
+                    observation={
+                        "state": "completed",
+                        "observed_at_unix": tasks._now(),
+                    },
+                )
+            )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(
+                tasks, "grabowski_task_status", side_effect=terminalize
+            ) as status,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            reused = tasks.grabowski_task_start(
+                "local",
+                ["env", "FIXED=1", "/bin/echo", "stale-b"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        status.assert_called_once_with(task_id)
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, reused["task"]["task_id"])
+        self.assertEqual(
+            "recent_successful_operation_identity",
+            reused["deduplicated_reuse"]["reason"],
+        )
+
+    def test_operation_identity_fresh_active_hit_is_not_reobserved(self) -> None:
+        operation_identity = self._operation_identity_fixture()
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "active-a"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        task_id = str(first["task"]["task_id"])
+        now = tasks._now()
+        tasks._set_state(
+            task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": now,
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks, "_observe") as observe,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            reused = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "active-b"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        observe.assert_not_called()
+        dispatch.assert_not_called()
+        self.assertEqual(task_id, reused["task"]["task_id"])
+        self.assertEqual("active_operation_identity", reused["deduplicated_reuse"]["reason"])
+
+    def test_operation_identity_attention_retry_requires_bound_supersession(self) -> None:
+        operation_identity = self._operation_identity_fixture()
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            first = tasks.grabowski_task_start(
+                "local",
+                ["/bin/false"],
+                cwd=str(self.root),
+                runtime_seconds=60,
+                operation_identity=operation_identity,
+            )
+        source_task_id = str(first["task"]["task_id"])
+        failed = tasks._set_state(
+            source_task_id,
+            "failed",
+            observation={"state": "failed", "observed_at_unix": tasks._now()},
+        )
+        receipt = str(failed["lifecycle_receipt_sha256"])
+        common = dict(
+            host="local",
+            argv=["env", "FIXED=1", "/bin/false"],
+            cwd=str(self.root),
+            runtime_seconds=60,
+            operation_identity=operation_identity,
+        )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as blocked_dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "attention predecessor"):
+                tasks.grabowski_task_start(**common)
+        blocked_dispatch.assert_not_called()
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as retry_dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+            ),
+        ):
+            retried = tasks.grabowski_task_start(
+                **common,
+                supersedes_task_id=source_task_id,
+                supersedes_receipt_sha256=receipt,
+                force_new_reason="launcher environment corrected",
+            )
+        self.assertTrue(retry_dispatch.called)
+        binding = retried["operation_retry_binding"]
+        self.assertEqual(source_task_id, binding["source_task_id"])
+        self.assertEqual(receipt, binding["source_lifecycle_receipt_sha256"])
+        self.assertEqual(
+            retried["operation_identity"]["operation_identity_sha256"],
+            binding["source_operation_identity_sha256"],
+        )
+
+
 class RuntimeContractTests(unittest.TestCase):
     def test_reconcile_service_example_uses_refresh_not_resume(self) -> None:
         source = (
@@ -7332,249 +7577,6 @@ else:
         )
 
 
-    def _operation_identity_fixture(self, *, source: str = "b") -> dict[str, str]:
-        return {
-            "repository_head": "a" * 40,
-            "source_fingerprint_sha256": source * 64,
-            "purpose": "validate exact source scope",
-            "scope_sha256": "c" * 64,
-        }
-
-    def test_operation_identity_reuses_recent_success_across_argv_changes(self) -> None:
-        operation_identity = self._operation_identity_fixture()
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as first_dispatch,
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
-            ),
-        ):
-            first = tasks.grabowski_task_start(
-                "local",
-                ["/bin/echo", "syntax-a"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        self.assertTrue(first_dispatch.called)
-        source_task_id = str(first["task"]["task_id"])
-        tasks._set_state(
-            source_task_id,
-            "completed",
-            observation={"state": "completed", "observed_at_unix": tasks._now()},
-        )
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as second_dispatch,
-            patch.object(
-                tasks.operator, "_require_operator_mutation"
-            ) as mutation_gate,
-            patch.object(
-                tasks, "_bind_managed_cargo_environment"
-            ) as managed_cargo,
-            patch.object(tasks.base, "_append_audit") as audit,
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
-            ),
-        ):
-            second = tasks.grabowski_task_start(
-                "local",
-                ["env", "PYTHONPATH=src", "/bin/echo", "syntax-b"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        second_dispatch.assert_not_called()
-        mutation_gate.assert_not_called()
-        managed_cargo.assert_not_called()
-        self.assertEqual(source_task_id, second["task"]["task_id"])
-        self.assertEqual(
-            "recent_successful_operation_identity",
-            second["deduplicated_reuse"]["reason"],
-        )
-        self.assertEqual("task-start-deduplicated", audit.call_args.args[0]["operation"])
-
-    def test_operation_identity_stale_active_hit_is_reobserved_once(self) -> None:
-        operation_identity = self._operation_identity_fixture()
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()),
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
-            ),
-        ):
-            first = tasks.grabowski_task_start(
-                "local",
-                ["/bin/echo", "stale-a"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        task_id = str(first["task"]["task_id"])
-        tasks._set_state(
-            task_id,
-            "running",
-            observation={
-                "state": "running",
-                "observed_at_unix": tasks._now() - 121,
-                "properties": {"ActiveState": "active", "SubState": "running"},
-            },
-        )
-
-        def terminalize(observed_task_id: str) -> dict[str, object]:
-            self.assertEqual(task_id, observed_task_id)
-            return tasks._public(
-                tasks._set_state(
-                    task_id,
-                    "completed",
-                    observation={
-                        "state": "completed",
-                        "observed_at_unix": tasks._now(),
-                    },
-                )
-            )
-
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
-            patch.object(
-                tasks, "grabowski_task_status", side_effect=terminalize
-            ) as status,
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
-            ),
-        ):
-            reused = tasks.grabowski_task_start(
-                "local",
-                ["env", "FIXED=1", "/bin/echo", "stale-b"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        status.assert_called_once_with(task_id)
-        dispatch.assert_not_called()
-        self.assertEqual(task_id, reused["task"]["task_id"])
-        self.assertEqual(
-            "recent_successful_operation_identity",
-            reused["deduplicated_reuse"]["reason"],
-        )
-
-    def test_operation_identity_fresh_active_hit_is_not_reobserved(self) -> None:
-        operation_identity = self._operation_identity_fixture()
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()),
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
-            ),
-        ):
-            first = tasks.grabowski_task_start(
-                "local",
-                ["/bin/echo", "active-a"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        task_id = str(first["task"]["task_id"])
-        now = tasks._now()
-        tasks._set_state(
-            task_id,
-            "running",
-            observation={
-                "state": "running",
-                "observed_at_unix": now,
-                "properties": {"ActiveState": "active", "SubState": "running"},
-            },
-        )
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
-            patch.object(tasks, "_observe") as observe,
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
-            ),
-        ):
-            reused = tasks.grabowski_task_start(
-                "local",
-                ["/bin/echo", "active-b"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        observe.assert_not_called()
-        dispatch.assert_not_called()
-        self.assertEqual(task_id, reused["task"]["task_id"])
-        self.assertEqual("active_operation_identity", reused["deduplicated_reuse"]["reason"])
-
-    def test_operation_identity_attention_retry_requires_bound_supersession(self) -> None:
-        operation_identity = self._operation_identity_fixture()
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()),
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
-            ),
-        ):
-            first = tasks.grabowski_task_start(
-                "local",
-                ["/bin/false"],
-                cwd=str(self.root),
-                runtime_seconds=60,
-                operation_identity=operation_identity,
-            )
-        source_task_id = str(first["task"]["task_id"])
-        failed = tasks._set_state(
-            source_task_id,
-            "failed",
-            observation={"state": "failed", "observed_at_unix": tasks._now()},
-        )
-        receipt = str(failed["lifecycle_receipt_sha256"])
-        common = dict(
-            host="local",
-            argv=["env", "FIXED=1", "/bin/false"],
-            cwd=str(self.root),
-            runtime_seconds=60,
-            operation_identity=operation_identity,
-        )
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as blocked_dispatch,
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 124}
-            ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "attention predecessor"):
-                tasks.grabowski_task_start(**common)
-        blocked_dispatch.assert_not_called()
-        with (
-            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
-            patch.object(tasks, "_dispatch", return_value=_launcher()) as retry_dispatch,
-            patch.object(tasks.base, "_append_audit"),
-            patch.object(
-                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
-            ),
-        ):
-            retried = tasks.grabowski_task_start(
-                **common,
-                supersedes_task_id=source_task_id,
-                supersedes_receipt_sha256=receipt,
-                force_new_reason="launcher environment corrected",
-            )
-        self.assertTrue(retry_dispatch.called)
-        binding = retried["operation_retry_binding"]
-        self.assertEqual(source_task_id, binding["source_task_id"])
-        self.assertEqual(receipt, binding["source_lifecycle_receipt_sha256"])
-        self.assertEqual(
-            retried["operation_identity"]["operation_identity_sha256"],
-            binding["source_operation_identity_sha256"],
-        )
 
 
 
