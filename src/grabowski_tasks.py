@@ -84,8 +84,353 @@ MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
-TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
-TASK_LOG_RATE_LIMIT_BURST = 200
+TASK_OUTPUT_ROOT = Path(operator.HOME)
+TASK_OUTPUT_CONTRACT_VERSION = 1
+TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
+TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
+TASK_OUTPUT_TAIL_BYTES = 64 * 1024
+TASK_OUTPUT_CAPTURE_PYTHON = "/usr/bin/python3"
+TASK_OUTPUT_CAPTURE_CODE = r"""
+import os
+import signal
+import stat
+import subprocess
+import sys
+import threading
+
+directory = sys.argv[1]
+limit = int(sys.argv[2])
+tail_limit = int(sys.argv[3])
+command = sys.argv[4:]
+parent = os.path.dirname(directory)
+name = os.path.basename(directory)
+if (
+    not command
+    or not os.path.isabs(directory)
+    or os.path.normpath(directory) != directory
+    or not name
+    or parent == directory
+    or limit < 4096
+    or tail_limit < 1
+    or tail_limit >= limit // 2
+):
+    raise SystemExit(125)
+marker_reserve = 256
+head_limit = limit - tail_limit - marker_reserve
+file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    file_flags |= os.O_NOFOLLOW
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+parent_fd = os.open(parent, directory_flags)
+parent_before = os.fstat(parent_fd)
+linked_parent = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_before.st_mode)
+    or stat.S_ISLNK(linked_parent.st_mode)
+    or parent_before.st_dev != linked_parent.st_dev
+    or parent_before.st_ino != linked_parent.st_ino
+    or parent_before.st_uid != os.geteuid()
+    or parent_before.st_gid != os.getegid()
+    or parent_before.st_nlink < 1
+    or stat.S_IMODE(parent_before.st_mode) != 0o700
+):
+    raise RuntimeError("task output parent identity is unsafe")
+os.mkdir(name, 0o700, dir_fd=parent_fd)
+directory_fd = os.open(name, directory_flags, dir_fd=parent_fd)
+opened_directory = os.fstat(directory_fd)
+linked_directory = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+if (
+    not stat.S_ISDIR(opened_directory.st_mode)
+    or opened_directory.st_dev != linked_directory.st_dev
+    or opened_directory.st_ino != linked_directory.st_ino
+    or opened_directory.st_mode != linked_directory.st_mode
+    or opened_directory.st_nlink != linked_directory.st_nlink
+    or opened_directory.st_uid != parent_before.st_uid
+    or opened_directory.st_gid != parent_before.st_gid
+    or opened_directory.st_nlink < 1
+    or stat.S_IMODE(opened_directory.st_mode) != 0o700
+):
+    raise RuntimeError("task output directory identity is unsafe")
+stdout_fd = os.open("stdout.log", file_flags, 0o600, dir_fd=directory_fd)
+try:
+    stderr_fd = os.open("stderr.log", file_flags, 0o600, dir_fd=directory_fd)
+except BaseException:
+    os.close(stdout_fd)
+    os.unlink("stdout.log", dir_fd=directory_fd)
+    os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    os.close(parent_fd)
+    raise
+errors = []
+
+def write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short task output write")
+        view = view[written:]
+
+def pump(pipe, descriptor, stream):
+    total = 0
+    head_written = 0
+    tail = bytearray()
+    writing = True
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if writing and head_written < head_limit:
+                selected = chunk[: head_limit - head_written]
+                try:
+                    write_all(descriptor, selected)
+                    head_written += len(selected)
+                except BaseException as exc:
+                    errors.append(exc)
+                    writing = False
+                overflow = chunk[len(selected):]
+            else:
+                overflow = chunk
+            if overflow:
+                tail.extend(overflow)
+                if len(tail) > tail_limit:
+                    del tail[: len(tail) - tail_limit]
+        if writing and total > head_written:
+            marker = (
+                "\n<GRABOWSKI_TASK_OUTPUT_TRUNCATED "
+                + stream
+                + " total_bytes="
+                + str(total)
+                + " retained_head_bytes="
+                + str(head_written)
+                + " retained_tail_bytes="
+                + str(len(tail))
+                + ">\n"
+            ).encode("utf-8")
+            write_all(descriptor, marker[:marker_reserve])
+            write_all(descriptor, tail)
+        if writing:
+            os.fsync(descriptor)
+    except BaseException as exc:
+        errors.append(exc)
+    finally:
+        pipe.close()
+
+try:
+    child = subprocess.Popen(
+        command,
+        stdin=None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        close_fds=True,
+    )
+    stdout_thread = threading.Thread(
+        target=pump, args=(child.stdout, stdout_fd, "stdout")
+    )
+    stderr_thread = threading.Thread(
+        target=pump, args=(child.stderr, stderr_fd, "stderr")
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    returncode = child.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    if errors:
+        raise errors[0]
+    directory_after = os.fstat(directory_fd)
+    linked_directory_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    parent_after = os.fstat(parent_fd)
+    linked_parent_after = os.lstat(parent)
+    if (
+        directory_after.st_dev != opened_directory.st_dev
+        or directory_after.st_ino != opened_directory.st_ino
+        or directory_after.st_mode != opened_directory.st_mode
+        or directory_after.st_nlink != opened_directory.st_nlink
+        or linked_directory_after.st_dev != opened_directory.st_dev
+        or linked_directory_after.st_ino != opened_directory.st_ino
+        or linked_directory_after.st_mode != opened_directory.st_mode
+        or linked_directory_after.st_nlink != opened_directory.st_nlink
+        or parent_after.st_dev != parent_before.st_dev
+        or parent_after.st_ino != parent_before.st_ino
+        or parent_after.st_mode != parent_before.st_mode
+        or linked_parent_after.st_dev != parent_before.st_dev
+        or linked_parent_after.st_ino != parent_before.st_ino
+        or linked_parent_after.st_mode != parent_before.st_mode
+    ):
+        raise RuntimeError("task output path identity changed during capture")
+    os.fsync(directory_fd)
+    os.fsync(parent_fd)
+finally:
+    os.close(stdout_fd)
+    os.close(stderr_fd)
+    os.close(directory_fd)
+    os.close(parent_fd)
+if returncode < 0:
+    signum = -returncode
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+raise SystemExit(returncode)
+""".strip()
+TASK_OUTPUT_REMOTE_READ_CODE = r"""
+import os
+import stat
+import sys
+
+directory = sys.argv[1]
+name = sys.argv[2]
+max_lines = int(sys.argv[3])
+byte_limit = int(sys.argv[4])
+parent = os.path.dirname(directory)
+directory_name = os.path.basename(directory)
+if (
+    not os.path.isabs(directory)
+    or os.path.normpath(directory) != directory
+    or not directory_name
+    or parent == directory
+    or name not in {"stdout.log", "stderr.log"}
+    or max_lines < 1
+    or max_lines > 2000
+    or byte_limit < 1024
+):
+    raise SystemExit(125)
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+parent_fd = os.open(parent, directory_flags)
+parent_before = os.fstat(parent_fd)
+linked_parent = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_before.st_mode)
+    or stat.S_ISLNK(linked_parent.st_mode)
+    or parent_before.st_dev != linked_parent.st_dev
+    or parent_before.st_ino != linked_parent.st_ino
+    or parent_before.st_uid != os.geteuid()
+    or parent_before.st_gid != os.getegid()
+    or parent_before.st_nlink < 1
+    or stat.S_IMODE(parent_before.st_mode) != 0o700
+):
+    raise RuntimeError("task output parent identity is unsafe")
+try:
+    directory_fd = os.open(directory_name, directory_flags, dir_fd=parent_fd)
+except FileNotFoundError:
+    print("GRABOWSKI_TASK_OUTPUT_DIRECTORY_MISSING", file=sys.stderr)
+    os.close(parent_fd)
+    raise SystemExit(44)
+try:
+    opened_directory = os.fstat(directory_fd)
+    linked_directory = os.stat(
+        directory_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    if (
+        not stat.S_ISDIR(opened_directory.st_mode)
+        or opened_directory.st_dev != linked_directory.st_dev
+        or opened_directory.st_ino != linked_directory.st_ino
+        or opened_directory.st_mode != linked_directory.st_mode
+        or opened_directory.st_nlink != linked_directory.st_nlink
+        or opened_directory.st_uid != parent_before.st_uid
+        or opened_directory.st_gid != parent_before.st_gid
+        or opened_directory.st_nlink < 1
+        or stat.S_IMODE(opened_directory.st_mode) != 0o700
+    ):
+        raise RuntimeError("task output directory identity is unsafe")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        print("GRABOWSKI_TASK_OUTPUT_FILE_MISSING", file=sys.stderr)
+        raise SystemExit(45)
+    try:
+        before = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_uid != opened_directory.st_uid
+            or before.st_gid != opened_directory.st_gid
+            or before.st_dev != linked.st_dev
+            or before.st_ino != linked.st_ino
+            or before.st_mode != linked.st_mode
+            or before.st_nlink != linked.st_nlink
+        ):
+            raise RuntimeError("task output file identity is unsafe")
+        end = int(before.st_size)
+        start = max(0, end - byte_limit)
+        os.lseek(descriptor, start, os.SEEK_SET)
+        data = bytearray()
+        remaining = end - start
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            data.extend(chunk)
+            remaining -= len(chunk)
+        lines = bytes(data).splitlines(keepends=True)
+        line_truncated = len(lines) > max_lines
+        if line_truncated:
+            data = bytearray(b"".join(lines[-max_lines:]))
+        after = os.fstat(descriptor)
+        linked_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        directory_after = os.fstat(directory_fd)
+        linked_directory_after = os.stat(
+            directory_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        parent_after = os.fstat(parent_fd)
+        linked_parent_after = os.lstat(parent)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_mode != before.st_mode
+            or after.st_nlink != before.st_nlink
+            or linked_after.st_dev != before.st_dev
+            or linked_after.st_ino != before.st_ino
+            or linked_after.st_mode != before.st_mode
+            or linked_after.st_nlink != before.st_nlink
+            or directory_after.st_dev != opened_directory.st_dev
+            or directory_after.st_ino != opened_directory.st_ino
+            or directory_after.st_mode != opened_directory.st_mode
+            or directory_after.st_nlink != opened_directory.st_nlink
+            or linked_directory_after.st_dev != opened_directory.st_dev
+            or linked_directory_after.st_ino != opened_directory.st_ino
+            or linked_directory_after.st_mode != opened_directory.st_mode
+            or linked_directory_after.st_nlink != opened_directory.st_nlink
+            or parent_after.st_dev != parent_before.st_dev
+            or parent_after.st_ino != parent_before.st_ino
+            or parent_after.st_mode != parent_before.st_mode
+            or parent_after.st_nlink != parent_before.st_nlink
+            or linked_parent_after.st_dev != parent_before.st_dev
+            or linked_parent_after.st_ino != parent_before.st_ino
+            or linked_parent_after.st_mode != parent_before.st_mode
+            or linked_parent_after.st_nlink != parent_before.st_nlink
+        ):
+            raise RuntimeError("task output path identity changed during read")
+        print(
+            "GRABOWSKI_TASK_OUTPUT_READ_METADATA "
+            + "byte_truncated="
+            + str(int(start > 0))
+            + " line_truncated="
+            + str(int(line_truncated)),
+            file=sys.stderr,
+        )
+        view = memoryview(data)
+        while view:
+            written = os.write(1, view)
+            if written <= 0:
+                raise OSError("short task output read write")
+            view = view[written:]
+    finally:
+        os.close(descriptor)
+finally:
+    os.close(directory_fd)
+    os.close(parent_fd)
+""".strip()
 # One re-entrant in-process lock plus one shared file lock serializes every
 # persistent-task mutation across the MCP runtime and the timer-driven
 # reconciler process. Nested task operations reuse the outer file lock.
@@ -3079,8 +3424,367 @@ def _dispatch(
     return result
 
 
-def _launch_argv(record: dict[str, Any]) -> list[str]:
+def _task_output_paths(record: dict[str, Any]) -> dict[str, Path]:
+    task_id = str(record.get("task_id", ""))
+    if TASK_ID.fullmatch(task_id) is None:
+        raise RuntimeError("task output identity has invalid task_id")
+    attempt = record.get("attempt")
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise RuntimeError("task output identity has invalid attempt")
+    root = Path(TASK_OUTPUT_ROOT)
+    if not root.is_absolute():
+        raise RuntimeError("task output root must be absolute")
+    directory = root / (
+        f"{TASK_OUTPUT_DIRECTORY_PREFIX}-{task_id}-a{attempt}"
+    )
+    return {
+        "directory": directory,
+        "stdout": directory / "stdout.log",
+        "stderr": directory / "stderr.log",
+    }
+
+
+def _task_output_capture_argv(record: dict[str, Any]) -> list[str]:
     command = json.loads(record["argv_json"])
+    paths = _task_output_paths(record)
+    return [
+        TASK_OUTPUT_CAPTURE_PYTHON,
+        "-c",
+        TASK_OUTPUT_CAPTURE_CODE,
+        str(paths["directory"]),
+        str(TASK_OUTPUT_MAX_BYTES),
+        str(TASK_OUTPUT_TAIL_BYTES),
+        *command,
+    ]
+
+
+def _task_output_public_result(
+    record: dict[str, Any],
+    *,
+    max_lines: int,
+    stdout: str,
+    stderr: str,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    duration_seconds: float,
+    reader: str,
+) -> dict[str, Any]:
+    synthetic_argv = ["grabowski-task-output-files-v1", "--lines", str(max_lines)]
+    paths = _task_output_paths(record)
+    return {
+        "argv": synthetic_argv,
+        "argv_sha256": hashlib.sha256(
+            _canonical_json(synthetic_argv).encode("utf-8")
+        ).hexdigest(),
+        "command": "grabowski-task-output-files-v1 --lines " + str(max_lines),
+        "cwd": str(TASK_OUTPUT_ROOT),
+        "returncode": 0,
+        "timed_out": False,
+        "duration_seconds": duration_seconds,
+        "stdout": operator._redact(stdout),
+        "stderr": operator._redact(stderr),
+        "stdout_truncated": bool(stdout_truncated),
+        "stderr_truncated": bool(stderr_truncated),
+        "output_source": "private-task-files-v1",
+        "output_reader": reader,
+        "output_contract_version": TASK_OUTPUT_CONTRACT_VERSION,
+        "output_directory_sha256": hashlib.sha256(
+            str(paths["directory"]).encode("utf-8")
+        ).hexdigest(),
+        "stdout_path_sha256": hashlib.sha256(
+            str(paths["stdout"]).encode("utf-8")
+        ).hexdigest(),
+        "stderr_path_sha256": hashlib.sha256(
+            str(paths["stderr"]).encode("utf-8")
+        ).hexdigest(),
+        "does_not_establish": [
+            "same_uid_output_authenticity",
+            "complete_output_beyond_stream_cap",
+            "retention_or_archive_completion",
+        ],
+    }
+
+
+def _task_output_tail_fd(descriptor: int, max_lines: int) -> tuple[str, bool]:
+    metadata = os.fstat(descriptor)
+    budget = int(operator.DEFAULT_OUTPUT_BYTES)
+    end = int(metadata.st_size)
+    start = max(0, end - budget)
+    os.lseek(descriptor, start, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = end - start
+    while remaining > 0:
+        chunk = os.read(descriptor, min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    data = b"".join(chunks)
+    lines = data.splitlines(keepends=True)
+    line_truncated = len(lines) > max_lines
+    if line_truncated:
+        data = b"".join(lines[-max_lines:])
+    return data.decode("utf-8", errors="replace"), bool(start > 0 or line_truncated)
+
+
+def _task_output_inode_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _open_local_task_output_root() -> tuple[int, os.stat_result]:
+    root = Path(TASK_OUTPUT_ROOT)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(root, flags)
+    except OSError as exc:
+        raise RuntimeError("task output parent could not be opened safely") from exc
+    opened = os.fstat(descriptor)
+    linked = root.lstat()
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(linked.st_mode)
+        or _task_output_inode_identity(opened)
+        != _task_output_inode_identity(linked)
+        or opened.st_uid != os.geteuid()
+        or opened.st_gid != os.getegid()
+        or opened.st_nlink < 1
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise RuntimeError("task output parent identity is unsafe")
+    return descriptor, opened
+
+
+def _revalidate_local_task_output_root(
+    descriptor: int, original: os.stat_result
+) -> None:
+    current = os.fstat(descriptor)
+    linked = Path(TASK_OUTPUT_ROOT).lstat()
+    if (
+        _task_output_inode_identity(current)
+        != _task_output_inode_identity(original)
+        or _task_output_inode_identity(linked)
+        != _task_output_inode_identity(original)
+    ):
+        raise RuntimeError("task output parent changed identity during read")
+
+
+def _read_local_task_output_files(
+    record: dict[str, Any], max_lines: int
+) -> dict[str, Any] | None:
+    started = time.monotonic()
+    paths = _task_output_paths(record)
+    root = Path(TASK_OUTPUT_ROOT)
+    directory = paths["directory"]
+    if directory.parent != root:
+        raise RuntimeError("task output directory escaped its parent")
+    root_fd, opened_root = _open_local_task_output_root()
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    try:
+        try:
+            directory_fd = os.open(
+                directory.name, directory_flags, dir_fd=root_fd
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise RuntimeError(
+                "task output directory could not be opened safely"
+            ) from exc
+        try:
+            opened_directory = os.fstat(directory_fd)
+            linked_directory = os.stat(
+                directory.name, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(opened_directory.st_mode)
+                or _task_output_inode_identity(opened_directory)
+                != _task_output_inode_identity(linked_directory)
+                or opened_directory.st_uid != opened_root.st_uid
+                or opened_directory.st_gid != opened_root.st_gid
+                or stat.S_IMODE(opened_directory.st_mode) != 0o700
+                or opened_directory.st_nlink < 1
+            ):
+                raise RuntimeError("task output directory identity is unsafe")
+            captured: dict[str, tuple[str, bool]] = {}
+            for stream in ("stdout", "stderr"):
+                path = paths[stream]
+                if path.parent != directory:
+                    raise RuntimeError("task output path escaped its directory")
+                flags = os.O_RDONLY | os.O_CLOEXEC
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                try:
+                    descriptor = os.open(path.name, flags, dir_fd=directory_fd)
+                except FileNotFoundError as exc:
+                    raise RuntimeError(
+                        f"task output contract is incomplete: missing {stream}"
+                    ) from exc
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"task {stream} output could not be opened safely"
+                    ) from exc
+                try:
+                    before = os.fstat(descriptor)
+                    linked = os.stat(
+                        path.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or stat.S_IMODE(before.st_mode) != 0o600
+                        or before.st_nlink != 1
+                        or before.st_uid != opened_directory.st_uid
+                        or before.st_gid != opened_directory.st_gid
+                        or _task_output_inode_identity(before)
+                        != _task_output_inode_identity(linked)
+                    ):
+                        raise RuntimeError(
+                            f"task {stream} output identity is unsafe"
+                        )
+                    value = _task_output_tail_fd(descriptor, max_lines)
+                    after = os.fstat(descriptor)
+                    linked_after = os.stat(
+                        path.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        _task_output_inode_identity(after)
+                        != _task_output_inode_identity(before)
+                        or _task_output_inode_identity(linked_after)
+                        != _task_output_inode_identity(before)
+                    ):
+                        raise RuntimeError(
+                            f"task {stream} output changed identity during read"
+                        )
+                    captured[stream] = value
+                finally:
+                    os.close(descriptor)
+            directory_after = os.fstat(directory_fd)
+            linked_directory_after = os.stat(
+                directory.name, dir_fd=root_fd, follow_symlinks=False
+            )
+            if (
+                _task_output_inode_identity(directory_after)
+                != _task_output_inode_identity(opened_directory)
+                or _task_output_inode_identity(linked_directory_after)
+                != _task_output_inode_identity(opened_directory)
+            ):
+                raise RuntimeError(
+                    "task output directory changed identity during read"
+                )
+            _revalidate_local_task_output_root(root_fd, opened_root)
+            return _task_output_public_result(
+                record,
+                max_lines=max_lines,
+                stdout=captured["stdout"][0],
+                stderr=captured["stderr"][0],
+                stdout_truncated=captured["stdout"][1],
+                stderr_truncated=captured["stderr"][1],
+                duration_seconds=time.monotonic() - started,
+                reader="local-descriptor-v1",
+            )
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _read_remote_task_output_stream(
+    record: dict[str, Any], stream: str, max_lines: int
+) -> tuple[str, bool] | None:
+    if stream not in {"stdout", "stderr"}:
+        raise ValueError("task output stream is invalid")
+    paths = _task_output_paths(record)
+    result = _dispatch(
+        str(record["host"]),
+        [
+            TASK_OUTPUT_CAPTURE_PYTHON,
+            "-c",
+            TASK_OUTPUT_REMOTE_READ_CODE,
+            str(paths["directory"]),
+            paths[stream].name,
+            str(max_lines),
+            str(min(int(operator.DEFAULT_OUTPUT_BYTES) - 1024, 60 * 1024)),
+        ],
+        timeout_seconds=30,
+    )
+    returncode = int(result.get("returncode", 1))
+    diagnostic = str(result.get("stderr", ""))
+    if returncode == 44 and "GRABOWSKI_TASK_OUTPUT_DIRECTORY_MISSING" in diagnostic:
+        return None
+    if returncode == 45 and "GRABOWSKI_TASK_OUTPUT_FILE_MISSING" in diagnostic:
+        raise RuntimeError(f"remote task output contract is incomplete: missing {stream}")
+    if returncode != 0:
+        raise RuntimeError(f"remote task {stream} output read failed")
+    marker = "GRABOWSKI_TASK_OUTPUT_READ_METADATA "
+    metadata_lines = [
+        line for line in diagnostic.splitlines() if line.startswith(marker)
+    ]
+    if len(metadata_lines) != 1:
+        raise RuntimeError("remote task output read metadata is invalid")
+    fields = {}
+    for item in metadata_lines[0][len(marker):].split():
+        if "=" not in item:
+            raise RuntimeError("remote task output read metadata field is invalid")
+        key, value = item.split("=", 1)
+        fields[key] = value
+    if set(fields) != {"byte_truncated", "line_truncated"}:
+        raise RuntimeError("remote task output read metadata shape is invalid")
+    if fields["byte_truncated"] not in {"0", "1"} or fields["line_truncated"] not in {"0", "1"}:
+        raise RuntimeError("remote task output read metadata value is invalid")
+    return (
+        str(result.get("stdout", "")),
+        bool(
+            result.get("stdout_truncated")
+            or fields["byte_truncated"] == "1"
+            or fields["line_truncated"] == "1"
+        ),
+    )
+
+
+def _read_remote_task_output_files(
+    record: dict[str, Any], max_lines: int
+) -> dict[str, Any] | None:
+    started = time.monotonic()
+    stdout = _read_remote_task_output_stream(record, "stdout", max_lines)
+    if stdout is None:
+        return None
+    stderr = _read_remote_task_output_stream(record, "stderr", max_lines)
+    if stderr is None:
+        raise RuntimeError("remote task output contract disappeared during read")
+    return _task_output_public_result(
+        record,
+        max_lines=max_lines,
+        stdout=stdout[0],
+        stderr=stderr[0],
+        stdout_truncated=stdout[1],
+        stderr_truncated=stderr[1],
+        duration_seconds=time.monotonic() - started,
+        reader="fleet-descriptor-v1",
+    )
+
+
+def _read_task_output_files(
+    record: dict[str, Any], max_lines: int
+) -> dict[str, Any] | None:
+    target = fleet.fleet_host(str(record["host"]))
+    if target["transport"] == "local":
+        return _read_local_task_output_files(record, max_lines)
+    return _read_remote_task_output_files(record, max_lines)
+
+
+def _launch_argv(record: dict[str, Any]) -> list[str]:
+    command = _task_output_capture_argv(record)
     unit = _authoritative_unit(record)
     argv = [
         "systemd-run",
@@ -3099,8 +3803,8 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
         "--property=PrivateTmp=no",
         "--property=MemoryDenyWriteExecute=no",
         "--property=UMask=0077",
-        f"--property=LogRateLimitIntervalSec={TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s",
-        f"--property=LogRateLimitBurst={TASK_LOG_RATE_LIMIT_BURST}",
+        "--property=StandardOutput=null",
+        "--property=StandardError=journal",
         f"--property=RuntimeMaxSec={record['runtime_seconds']}s",
         f"--property=WorkingDirectory={record['cwd']}",
         f"--property=CPUWeight={record['cpu_weight']}",
@@ -5100,11 +5804,12 @@ def grabowski_task_routing_shadow_seal(
     }
 
 def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
-    """Read redacted journal output for one local or fleet task."""
+    """Read bounded redacted stdout and stderr for one local or fleet task."""
     operator._require_operator_capability("durable_job")
     if not isinstance(max_lines, int) or not 1 <= max_lines <= 2000:
         raise ValueError("max_lines must be between 1 and 2000")
     record = _row(task_id)
+    output_source = "root-journal-v1"
     if _is_root_systemd_backend(record):
         result = privileged.root_task_systemd_request(
             _root_task_payload(record, "journal", max_lines=max_lines),
@@ -5112,20 +5817,25 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
             max_output_bytes=operator.DEFAULT_OUTPUT_BYTES,
         )
     else:
-        result = _dispatch(
-            record["host"],
-            [
-                "journalctl",
-                "--user",
-                "--unit",
-                _authoritative_unit(record),
-                "--no-pager",
-                "--output=cat",
-                "--lines",
-                str(max_lines),
-            ],
-            timeout_seconds=30,
-        )
+        result = _read_task_output_files(record, max_lines)
+        if result is None:
+            output_source = "user-journal-fallback-v1"
+            result = _dispatch(
+                record["host"],
+                [
+                    "journalctl",
+                    "--user",
+                    "--unit",
+                    _authoritative_unit(record),
+                    "--no-pager",
+                    "--output=cat",
+                    "--lines",
+                    str(max_lines),
+                ],
+                timeout_seconds=30,
+            )
+        else:
+            output_source = "private-task-files-v1"
     return {
         "task_id": task_id,
         "host": record["host"],
@@ -5133,6 +5843,7 @@ def grabowski_task_logs(task_id: str, max_lines: int = 200) -> dict[str, Any]:
         "authoritative_unit": _authoritative_unit(record),
         "execution_backend": _execution_backend(record),
         "systemd_scope": _systemd_scope(record),
+        "output_source": output_source,
         "result": result,
     }
 
