@@ -18,6 +18,7 @@ import grabowski_mcp as base
 import grabowski_bureau_leases as bureau_leases
 import grabowski_nonconflict as nonconflict
 import grabowski_sqlite_store as sqlite_store
+import grabowski_work_admission as work_admission
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -144,6 +145,46 @@ def _metadata(metadata: dict[str, Any] | None) -> tuple[str, str]:
     if len(encoded.encode("utf-8")) > 16 * 1024:
         raise ValueError("metadata is too large")
     return encoded, hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _work_admission_metadata(
+    assessments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    decisions = {"allow": 0, "blocked": 0, "converge_first": 0}
+    blocker_count = 0
+    blocker_codes: set[str] = set()
+    for assessment in assessments:
+        decision = assessment.get("decision")
+        if decision not in decisions:
+            raise RuntimeError("work admission assessment decision is invalid")
+        decisions[decision] += 1
+        blockers = assessment.get("blockers")
+        if isinstance(blockers, list):
+            blocker_count += len(blockers)
+        codes = assessment.get("blocker_codes")
+        if isinstance(codes, list):
+            blocker_codes.update(
+                code
+                for code in codes
+                if isinstance(code, str)
+                and re.fullmatch(r"[a-z0-9-]{1,64}", code) is not None
+            )
+    sorted_codes = sorted(blocker_codes)
+    return {
+        "schema_version": 1,
+        "assessment_count": len(assessments),
+        "assessment_sha256": hashlib.sha256(
+            _canonical_json(assessments).encode("utf-8")
+        ).hexdigest(),
+        "decision_counts": decisions,
+        "blocker_count": blocker_count,
+        "blocker_codes": sorted_codes[:8],
+        "blocker_codes_sha256": hashlib.sha256(
+            _canonical_json(sorted_codes).encode("utf-8")
+        ).hexdigest(),
+        "blocker_codes_truncated": len(sorted_codes) > 8,
+        "read_only": True,
+    }
 
 
 RESOURCE_METADATA_SHAPE = (
@@ -3559,6 +3600,7 @@ def acquire_resources(
     ttl_seconds: int = 3600,
     metadata: dict[str, Any] | None = None,
     nonconflict_proof: dict[str, Any] | None = None,
+    admission_assessor: Any | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
@@ -3572,17 +3614,97 @@ def acquire_resources(
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
         )
-    lease_mode = normalized_metadata.get("lease_mode", "normal")
-    if lease_mode not in {"normal", "emergency-recovery"}:
+    lease_mode_explicit = "lease_mode" in normalized_metadata
+    requested_lease_mode = normalized_metadata.get("lease_mode", "normal")
+    if requested_lease_mode not in {"normal", "emergency-recovery"}:
         raise ValueError("metadata.lease_mode must be normal or emergency-recovery")
+    bureau_contract = bureau_leases.enforce_bureau_lease_contract(
+        keys, ttl_seconds=ttl, metadata=normalized_metadata
+    )
+    bureau_emergency = (
+        isinstance(bureau_contract, dict)
+        and bureau_contract.get("phase") == "emergency-recovery"
+    )
+    if bureau_emergency:
+        if lease_mode_explicit and requested_lease_mode != "emergency-recovery":
+            raise ValueError(
+                "Bureau emergency-recovery conflicts with metadata.lease_mode"
+            )
+        lease_mode = "emergency-recovery"
+    else:
+        lease_mode = requested_lease_mode
     if lease_mode == "emergency-recovery" and not any(key.startswith("repo:") for key in keys):
         raise ValueError("emergency-recovery mode requires a repository lease")
     sanitized_value = bureau_leases.sanitize_bureau_metadata(keys, normalized_metadata)
     sanitized_metadata: dict[str, Any] = {} if sanitized_value is None else sanitized_value
-    bureau_contract = bureau_leases.enforce_bureau_lease_contract(
-        keys, ttl_seconds=ttl, metadata=normalized_metadata
-    )
+    if bureau_emergency:
+        sanitized_metadata["lease_mode"] = "emergency-recovery"
     now = _now()
+    admission_evidence: list[dict[str, Any]] = []
+    if "work_admission_mode" in normalized_metadata:
+        raise ValueError(
+            "metadata.work_admission_mode is not a public authority surface"
+        )
+    admission_mode = "normal"
+    scope = normalized_metadata.get("scope_manifest")
+    broad_repository_keys = [
+        key
+        for key in keys
+        if key.startswith("repo:")
+        and scoped_repository_resource_root(key) is None
+    ]
+    if lease_mode != "emergency-recovery":
+        for broad_key in broad_repository_keys:
+            repository = broad_key.removeprefix("repo:")
+            if not os.path.lexists(os.path.join(repository, ".git")):
+                continue
+            existing = inspect_resource(broad_key)
+            if (
+                isinstance(existing, dict)
+                and existing.get("owner_id") == owner
+                and isinstance(existing.get("expires_at_unix"), int)
+                and existing["expires_at_unix"] > now
+            ):
+                admission_evidence.append(
+                    {
+                        "repository": repository,
+                        "decision": "allow",
+                        "reason": "same-owner-live-lease-reentry",
+                        "read_only": True,
+                    }
+                )
+            elif not (
+                isinstance(existing, dict)
+                and isinstance(existing.get("expires_at_unix"), int)
+                and existing["expires_at_unix"] > now
+                and existing.get("owner_id") != owner
+            ):
+                assessor = admission_assessor or work_admission.require_repository_admission
+                assessment = assessor(
+                    mode=admission_mode,
+                    repo=repository,
+                    owner_id=owner,
+                    operation="broad_repository_lease",
+                    requested_scope=(
+                        scope
+                        if isinstance(scope, dict)
+                        and f"repo:{scope.get('repository')}" == broad_key
+                        else None
+                    ),
+                )
+                if not isinstance(assessment, dict):
+                    raise RuntimeError("work admission assessor returned invalid evidence")
+                if assessment.get("decision") != "allow":
+                    raise work_admission.WorkAdmissionBlocked(assessment)
+                if assessment.get("read_only") is not True:
+                    raise RuntimeError(
+                        "work admission assessor did not return read-only evidence"
+                    )
+                admission_evidence.append(assessment)
+    if admission_evidence:
+        sanitized_metadata["work_admission"] = _work_admission_metadata(
+            admission_evidence
+        )
     expires = now + ttl
     reclaimed: list[dict[str, Any]] = []
     with _database() as connection:
@@ -3694,6 +3816,7 @@ def acquire_resources(
         "reclaimed": reclaimed,
         "bureau_contract": bureau_contract,
         "nonconflict_exception": nonconflict_exception,
+        "work_admission": admission_evidence,
     }
 
 

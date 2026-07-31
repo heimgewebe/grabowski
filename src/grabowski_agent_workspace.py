@@ -22,6 +22,7 @@ import grabowski_resources as resources
 import grabowski_tasks as tasks
 import grabowski_command_identity as command_identity
 import grabowski_checkouts as checkouts
+import grabowski_work_admission as work_admission
 import grabowski_lifecycle_collectors as lifecycle_collectors
 import grabowski_lifecycle_effect_plan as lifecycle_effect_plan
 from grabowski_agent_sandbox import safe_git_environment
@@ -5198,6 +5199,26 @@ def _capture_routing_shadow_prospective_best_effort(
     return result
 
 
+def _assess_new_agent_workspace(
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    return work_admission.require_repository_admission(
+        mode="normal",
+        repo=str(plan["repository"]),
+        owner_id=str(plan["resources"]["owner_id"]),
+        operation="agent_workspace_create",
+        requested_scope={
+            "allowed_paths": list(plan["scope"]["allowed_paths"]),
+            "forbidden_paths": list(plan["scope"]["forbidden_paths"]),
+            "branch": str(plan["writer_branch"]),
+        },
+        target_path=str(plan["writer_worktree"]),
+        branch=str(plan["writer_branch"]),
+        source_kind=str(plan["binding"]["kind"]),
+        source_id=str(plan["binding"]["id"]),
+    )
+
+
 @mcp.tool(name="grabowski_agent_workspace_create", annotations=MUTATING)
 def grabowski_agent_workspace_create(
     binding_kind: str,
@@ -5326,6 +5347,39 @@ def grabowski_agent_workspace_create(
         )
         repo = Path(str(plan["repository"]))
         worktree = Path(str(plan["writer_worktree"]))
+        try:
+            admission = _assess_new_agent_workspace(plan)
+        except work_admission.WorkAdmissionBlocked as exc:
+            manifest["work_admission"] = exc.assessment
+            _append_workspace_event(
+                manifest,
+                "repository_work_admission",
+                role="writer",
+                outcome="blocked",
+                evidence={
+                    "decision": exc.assessment.get("decision"),
+                    "assessment_sha256": exc.assessment.get(
+                        "assessment_sha256"
+                    ),
+                    "blocker_codes": list(
+                        exc.assessment.get("blocker_codes", [])
+                    ),
+                },
+            )
+            _write_manifest(manifest)
+            raise AgentWorkspaceActionError(str(exc)) from exc
+        manifest["work_admission"] = admission
+        _append_workspace_event(
+            manifest,
+            "repository_work_admission",
+            role="writer",
+            outcome="allowed",
+            evidence={
+                "decision": admission.get("decision"),
+                "assessment_sha256": admission.get("assessment_sha256"),
+            },
+        )
+        _write_manifest(manifest)
         lifecycle_reservation = _reserve_writer_checkout_lifecycle(manifest)
         _append_workspace_event(
             manifest,
@@ -5570,6 +5624,19 @@ def grabowski_agent_workspace_create(
             "lease_retained": lease is not None and not lease_released,
             "lease_release_error": lease_release_error,
             "worktree_preserved": Path(str(plan["writer_worktree"])).exists(),
+            "work_admission": (
+                {
+                    "decision": manifest["work_admission"].get("decision"),
+                    "assessment_sha256": manifest["work_admission"].get(
+                        "assessment_sha256"
+                    ),
+                    "blocker_codes": list(
+                        manifest["work_admission"].get("blocker_codes", [])
+                    ),
+                }
+                if isinstance(manifest.get("work_admission"), dict)
+                else None
+            ),
         }
         try:
             _atomic_json(directory / "create-failure.json", failure)
@@ -9287,6 +9354,19 @@ def _publish_workspace_cleanup_receipt(
     return receipt
 
 
+def _workspace_cleanup_available_at(archive: dict[str, Any]) -> int:
+    created_at = archive.get("created_at_unix")
+    retention_until = archive.get("retention_until_unix")
+    if not isinstance(created_at, int) or not isinstance(retention_until, int):
+        raise AgentWorkspaceActionError(
+            "workspace archive lacks bounded cleanup timing evidence"
+        )
+    return max(
+        created_at + checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS,
+        retention_until,
+    )
+
+
 @mcp.tool(name="grabowski_agent_workspace_cleanup", annotations=MUTATING)
 def grabowski_agent_workspace_cleanup(
     workspace_id: str,
@@ -9383,6 +9463,38 @@ def grabowski_agent_workspace_cleanup(
                 and isinstance(prior_intent.get("archive_id"), str)
             ):
                 reusable_archive_id = prior_intent["archive_id"]
+            if reusable_archive_id is not None:
+                reusable_archive = checkouts._load_archive(reusable_archive_id)
+                cleanup_available_at_unix = _workspace_cleanup_available_at(
+                    reusable_archive
+                )
+                now_unix = int(time.time())
+                if now_unix < cleanup_available_at_unix:
+                    assert isinstance(prior_intent, dict)
+                    prior_intent.update(
+                        {
+                            "state": "waiting_grace",
+                            "cleanup_available_at_unix": cleanup_available_at_unix,
+                            "updated_at": _utc(),
+                        }
+                    )
+                    manifest["workspace_cleanup_intent"] = prior_intent
+                    _write_manifest(manifest)
+                    return {
+                        "workspace_id": identifier,
+                        "state": "archived_waiting_for_cleanup",
+                        "idempotent": True,
+                        "archive_id": reusable_archive_id,
+                        "archive_created_at_unix": reusable_archive[
+                            "created_at_unix"
+                        ],
+                        "cleanup_available_at_unix": cleanup_available_at_unix,
+                        "seconds_until_cleanup": (
+                            cleanup_available_at_unix - now_unix
+                        ),
+                        "requires_fresh_cleanup_plan": True,
+                        "worktree_preserved": True,
+                    }
             intent = {
                 "schema_version": 1,
                 "intent_id": hashlib.sha256(
@@ -9732,6 +9844,8 @@ def grabowski_agent_workspace_cleanup(
                 _workspace_lifecycle_effect_release(archive_effect)
 
         archive_record = checkouts._load_archive(str(archive_id))
+        cleanup_available_at_unix = _workspace_cleanup_available_at(archive_record)
+        cleanup_waiting = int(time.time()) < cleanup_available_at_unix
         if archive_attempted_this_invocation:
             with _lock(identifier):
                 current_manifest = _manifest(identifier)
@@ -9748,7 +9862,7 @@ def grabowski_agent_workspace_cleanup(
                         "state": "archived_ready",
                         "archive_id": archive_id,
                         "archive_created_at_unix": archive_record["created_at_unix"],
-                        "cleanup_available_at_unix": archive_record["created_at_unix"],
+                        "cleanup_available_at_unix": cleanup_available_at_unix,
                         "updated_at": _utc(),
                     }
                 )
@@ -9761,7 +9875,7 @@ def grabowski_agent_workspace_cleanup(
                         "intent_id": intent["intent_id"],
                         "archive_id": archive_id,
                         "archive_created_at_unix": archive_record["created_at_unix"],
-                        "cleanup_available_at_unix": archive_record["created_at_unix"],
+                        "cleanup_available_at_unix": cleanup_available_at_unix,
                         "requires_fresh_cleanup_plan": True,
                         "workspace_archive_effect_receipt_sha256": (
                             archive_effect_reference.get("receipt_sha256")
@@ -9773,14 +9887,36 @@ def grabowski_agent_workspace_cleanup(
                 _write_manifest(current_manifest)
             return {
                 "workspace_id": identifier,
-                "state": "archived_ready_for_cleanup",
+                "state": (
+                    "archived_waiting_for_cleanup"
+                    if cleanup_waiting
+                    else "archived_ready_for_cleanup"
+                ),
                 "idempotent": False,
                 "archive_id": archive_id,
                 "archive_created_at_unix": archive_record["created_at_unix"],
-                "cleanup_available_at_unix": archive_record["created_at_unix"],
+                "cleanup_available_at_unix": cleanup_available_at_unix,
+                "seconds_until_cleanup": max(
+                    0, cleanup_available_at_unix - int(time.time())
+                ),
                 "requires_fresh_cleanup_plan": True,
                 "worktree_preserved": True,
                 "lifecycle_effect": archive_effect_reference,
+            }
+
+        if cleanup_waiting:
+            return {
+                "workspace_id": identifier,
+                "state": "archived_waiting_for_cleanup",
+                "idempotent": True,
+                "archive_id": archive_id,
+                "archive_created_at_unix": archive_record["created_at_unix"],
+                "cleanup_available_at_unix": cleanup_available_at_unix,
+                "seconds_until_cleanup": max(
+                    0, cleanup_available_at_unix - int(time.time())
+                ),
+                "requires_fresh_cleanup_plan": True,
+                "worktree_preserved": True,
             }
 
         dry_run = checkouts.grabowski_checkout_cleanup(

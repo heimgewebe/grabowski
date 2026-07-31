@@ -46,6 +46,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_checkouts as checkouts
+import grabowski_work_admission as work_admission
 
 
 class CheckoutLifecycleTests(unittest.TestCase):
@@ -110,14 +111,25 @@ class CheckoutLifecycleTests(unittest.TestCase):
         if aged:
             archive = result["archive"]
             assert isinstance(archive, dict)
-            created_at = int(time.time()) - checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS
+            created_at = (
+                int(time.time()) - checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS - 1
+            )
             with checkouts._database() as connection:
                 connection.execute(
                     "UPDATE archives SET created_at_unix=? WHERE archive_id=?",
                     (created_at, archive["archive_id"]),
                 )
+                connection.execute(
+                    "UPDATE retention SET retention_until_unix=? WHERE checkout_key=?",
+                    (created_at, archive["checkout_key"]),
+                )
+                connection.execute(
+                    "UPDATE lifecycle_bindings SET retention_until_unix=? WHERE checkout_key=?",
+                    (created_at, archive["checkout_key"]),
+                )
                 connection.commit()
             archive["created_at_unix"] = created_at
+            archive["retention_until_unix"] = created_at
         return result
 
     def _common_dir(self) -> Path:
@@ -209,6 +221,55 @@ class CheckoutLifecycleTests(unittest.TestCase):
             checkouts._task_records([self.checkout, self.repo]),
             [],
         )
+
+    def test_task_inventory_schema_drift_is_unobservable(self) -> None:
+        self.task_db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.task_db) as connection:
+            connection.execute("CREATE TABLE tasks(task_id TEXT PRIMARY KEY)")
+            connection.commit()
+
+        with self.assertRaisesRegex(
+            RuntimeError, "Task inventory projection is unavailable"
+        ):
+            checkouts._task_records([self.checkout, self.repo])
+
+        assessment = work_admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            inventory_loader=lambda repo: checkouts.checkout_inventory(
+                repo,
+                include_processes=False,
+                include_tasks=True,
+                include_resources=False,
+            ),
+            reconciliation_loader=lambda _repo: {
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "source_snapshot": {"repository_errors": []},
+                "snapshot_sha256": "a" * 64,
+            },
+        )
+        self.assertEqual(assessment["decision"], "blocked")
+        self.assertIn("inventory-unobservable", assessment["blocker_codes"])
+        self.assertTrue(
+            any(
+                "Task inventory projection is unavailable"
+                in str(blocker.get("detail", ""))
+                for blocker in assessment["blockers"]
+            )
+        )
+
+    def test_process_cgroup_reports_exact_systemd_task_unit(self) -> None:
+        proc_entry = self.root / "proc" / "43210"
+        proc_entry.mkdir(parents=True)
+        unit = "grabowski-task-" + "a" * 24 + "-a2.service"
+        (proc_entry / "cgroup").write_text(
+            f"0::/user.slice/app.slice/{unit}\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(checkouts._process_systemd_units(proc_entry), [unit])
 
 
     def test_archive_ignores_processes_in_main_checkout(self) -> None:
@@ -546,12 +607,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
 
-    def test_broad_repo_lease_still_blocks_archive(self) -> None:
+    def test_emergency_recovery_broad_repo_lease_still_blocks_archive(self) -> None:
         checkouts.resources.acquire_resources(
             "foreign-broad-owner",
             [f"repo:{self.repo}"],
             purpose="unknown broad repository mutation",
             ttl_seconds=3600,
+            metadata={"lease_mode": "emergency-recovery"},
         )
         with self.assertRaisesRegex(RuntimeError, "resources=1"):
             self._archive()
@@ -673,13 +735,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
             include_resources=False,
         )
         linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
-        self.assertEqual(linked["lifecycle_state"], "cleanup_candidate")
-        self.assertEqual(linked["hygiene_mark"], "obsolete")
-        self.assertTrue(linked["cleanup_candidate"])
+        self.assertEqual(linked["lifecycle_state"], "archived_retained")
+        self.assertEqual(linked["hygiene_mark"], "archived")
+        self.assertFalse(linked["cleanup_candidate"])
         decision = linked["lifecycle_decision"]
-        self.assertEqual(decision["archive_grace_seconds"], 0)
-        self.assertTrue(decision["archive_grace_elapsed"])
-        self.assertTrue(decision["requires_cleanup_dry_run"])
+        self.assertEqual(decision["archive_grace_seconds"], 24 * 60 * 60)
+        self.assertFalse(decision["archive_grace_elapsed"])
+        self.assertFalse(decision["requires_cleanup_dry_run"])
         self.assertEqual(
             linked["lifecycle"]["latest_archive"]["archive_id"],
             archive_result["archive"]["archive_id"],
@@ -697,9 +759,14 @@ class CheckoutLifecycleTests(unittest.TestCase):
             expected_head=self.head,
             expected_branch="topic",
         )
-        self.assertTrue(dry_run["plan"]["safe_to_apply"])
-        self.assertEqual(dry_run["plan"]["archive_grace_seconds"], 0)
-        self.assertGreaterEqual(dry_run["plan"]["archive_age_seconds"], 0)
+        self.assertFalse(dry_run["plan"]["safe_to_apply"])
+        self.assertEqual(
+            dry_run["plan"]["archive_grace_seconds"],
+            24 * 60 * 60,
+        )
+        self.assertFalse(dry_run["plan"]["archive_grace_elapsed"])
+        self.assertIn("active_retention_not_elapsed", dry_run["plan"]["cleanup_blockers"])
+        self.assertIn("archive_grace_not_elapsed", dry_run["plan"]["cleanup_blockers"])
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         archive = self._archive()["archive"]
@@ -779,8 +846,14 @@ class CheckoutLifecycleTests(unittest.TestCase):
             dry_run["plan"]["plan_hash_excludes"],
             ["archive_age_seconds"],
         )
-        self.assertEqual(dry_run["plan"]["archive_age_seconds"], 100)
-        self.assertEqual(applied["plan"]["archive_age_seconds"], 101)
+        self.assertEqual(
+            dry_run["plan"]["archive_age_seconds"],
+            checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS + 100,
+        )
+        self.assertEqual(
+            applied["plan"]["archive_age_seconds"],
+            checkouts.CHECKOUT_CLEANUP_GRACE_SECONDS + 101,
+        )
         self.assertEqual(
             dry_run["plan"]["plan_sha256"],
             applied["plan"]["plan_sha256"],
@@ -1077,19 +1150,22 @@ class CheckoutLifecycleTests(unittest.TestCase):
             purpose="concurrent branch work",
             ttl_seconds=600,
         )
-        self.addCleanup(
-            checkouts.resources.release_resources,
-            lease["owner_id"],
-            [branch_key],
-        )
-        clear = checkouts._coordination_result([], [], [])
-        with (
-            patch.object(checkouts, "_linked_checkout_coordination", return_value=clear),
-            self.assertRaisesRegex(RuntimeError, "Resource is leased"),
-        ):
-            self._archive()
+        try:
+            clear = checkouts._coordination_result([], [], [])
+            with (
+                patch.object(
+                    checkouts, "_linked_checkout_coordination", return_value=clear
+                ),
+                self.assertRaisesRegex(RuntimeError, "Resource is leased"),
+            ):
+                self._archive()
 
-        self.assertTrue(self.checkout.exists())
+            self.assertTrue(self.checkout.exists())
+        finally:
+            checkouts.resources.release_resources(
+                lease["owner_id"],
+                [branch_key],
+            )
 
     def test_archive_rejects_symlinked_git_metadata(self) -> None:
         git_file = self.checkout / ".git"
@@ -1199,12 +1275,12 @@ class CheckoutLifecycleTests(unittest.TestCase):
         )
         linked = next(item for item in inventory["worktrees"] if item["path"] == str(self.checkout))
         decision = linked["lifecycle_decision"]
-        self.assertEqual(linked["lifecycle_state"], "cleanup_candidate")
+        self.assertEqual(linked["lifecycle_state"], "archived_retained")
         self.assertEqual(decision["binding_phase"], "archived")
         self.assertTrue(decision["binding_consistent"])
-        self.assertTrue(decision["archive_grace_elapsed"])
-        self.assertEqual(decision["archive_grace_seconds"], 0)
-        self.assertTrue(linked["cleanup_candidate"])
+        self.assertFalse(decision["archive_grace_elapsed"])
+        self.assertEqual(decision["archive_grace_seconds"], 24 * 60 * 60)
+        self.assertFalse(linked["cleanup_candidate"])
 
     def test_unknown_managed_phase_is_lifecycle_drift(self) -> None:
         binding = self._managed_binding()

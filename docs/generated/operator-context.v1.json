@@ -2928,6 +2928,10 @@
       {
         "module": "grabowski_coding_agent_router_cli",
         "source": "src/grabowski_coding_agent_router_cli.py"
+      },
+      {
+        "module": "grabowski_work_admission",
+        "source": "src/grabowski_work_admission.py"
       }
     ]
   },
@@ -2947,14 +2951,14 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "fc79eae4e2a124f6d90b875bc0a233c1127f23f4f7deed6a94c48902746695a6"
+      "sha256": "5d1484d0830242a7333d233476398db75bc57b8d3691b138a717cab11010abd4"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
       "src/grabowski_agent_competition.py": "304248121be13d1b0477a8e8f91792cc5680133ed17380e9e6881cd9645f6022",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
-      "src/grabowski_agent_workspace.py": "027e8ba0785291e4978679aa073bfba1544cbdf26cd83a9bbbe2e190dfa4411e",
+      "src/grabowski_agent_workspace.py": "4d744e17059040fbb7b234da5eca9bca605dc9d26a204d91d08af16d5b827cbe",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
       "src/grabowski_artifacts.py": "08925585075c7e77973d70ebf836537d612bc6b111b784cfce9f3025d93fe653",
@@ -2969,7 +2973,7 @@
       "src/grabowski_bureau_pickup.py": "a06e77e8a20e9f598c0f7a7be1b428cb3dbfeb1e1b4ed9654cf16e3f04ba5703",
       "src/grabowski_capabilities.py": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19",
       "src/grabowski_checkout_binding_reconciler.py": "6198f9614b41f67412fec575410fa2b2fa63ff0fcc0db349cce55c4c29950733",
-      "src/grabowski_checkouts.py": "42b1418868122dde8b3e68773e5da1662a59e7d2afe8da3f0291f7c54e139dec",
+      "src/grabowski_checkouts.py": "db4f3f179b65a7d02b966d61968f8e48760d83e43f75ea30146929a6f1b58529",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "769781a03136edce241925884d9dc396ed9b2e676dc32a4fa74dcd02a2da3152",
       "src/grabowski_coding_agent_catalog_data.py": "1e839a7f0e851e1ed7421fd5d4e859c3f22aa87ab00932dd2a48763b01e156bc",
@@ -2983,7 +2987,7 @@
       "src/grabowski_fleet.py": "0daf060517bde7b17caf7dd1f684e29521fb7b7457d1bfd79b32cf28a15c3beb",
       "src/grabowski_friction.py": "236ce1e84a01166bfcc0775a126f207202e179668921569c0c6b843884b6fbe1",
       "src/grabowski_grip_orchestration.py": "0f69fc3eeadc69609e49b3f3654c0a882380c9412d21592f24448a812fa4657e",
-      "src/grabowski_grips.py": "6c81418060521658546bf92333d89f2d05bc90c487ebfc48f7bf520db0d5beb4",
+      "src/grabowski_grips.py": "1566201a17effc1b43e6221b9f48d1f432f8df456fcd19f71497c2117ff26dff",
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
@@ -3016,7 +3020,7 @@
       "src/grabowski_repobrief.py": "cdec704a822293cf194db6f0dff6481b3f3c4679d4a5b58756a0ea235c052e0a",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "17992589456ac42e5fadaa32d6536f14dd73a7661cb1b2eb3ed214134991f973",
-      "src/grabowski_resources.py": "aa4919e4ed3fc4dc2489055a67dacb792415ba962f81b4a79a7736c70bdcee75",
+      "src/grabowski_resources.py": "70d0d822cd880a9c014aebeea92daf5b8b4cd2acdcf2909158abf91599abbee3",
       "src/grabowski_runtime.py": "a8c3cbbea0f017e73a5123f077d07b8bd680aae9015097f2ec91b2d830b94be6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
@@ -3024,12 +3028,13 @@
       "src/grabowski_system_map.py": "86eb6fe760aea800052d74b7c45ff3986adc130c6e3a78954cd65a472565a7de",
       "src/grabowski_task_attention.py": "547a0223f50f7f11874f06d86ab89db1accf7d86d8fd52fea619457bf7e97732",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "90975fd4a8a3076b4e9f1cbf5ae10d09b47338e3cbd9e2d827a3475c16725f6a",
+      "src/grabowski_tasks.py": "c566eeec06c743adcc011dae074e78a5383a60238a3b3d6b8f5e9a3dd78fc499",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
+      "src/grabowski_work_admission.py": "9ffb4c1169259168341d6e8282cb0d017f5adfdac6a380fed93fa2e98d04ea57",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "815914a20a0972210bdfd4ceb5774e2ca0d409c03858322a2fcdf8bf9219be3f",
-      "src/grabowski_worktree_ensure.py": "31c497ecea242690f452d3ec893754ac31a366ecf997e6bfd29150f77f965382"
+      "src/grabowski_worktree_ensure.py": "7a344edca97ef5342bed109f91f3e9a2778bb652217b104ff7b88f0cfabcb1e4"
     }
   }
 }

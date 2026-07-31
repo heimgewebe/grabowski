@@ -5,7 +5,7 @@ After=default.target
 [Service]
 Type=oneshot
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/share/grabowski-mcp/tools/maintain_runtime_state.py --periodic-apply --minimum-job-age-seconds 86400 --max-archive-jobs 128
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/share/grabowski-mcp/tools/maintain_runtime_state.py --periodic-apply --minimum-job-age-seconds 86400 --max-archive-jobs 128 --worktree-hygiene-repo %h/repos/grabowski --worktree-hygiene-owner operator:runtime-retention --worktree-hygiene-allowed-root %h/repos/.grabowski-standalone --worktree-hygiene-allowed-root %h/repos/.grabowski-worktrees --max-worktree-hygiene-actions 2
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -13,11 +13,11 @@ ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 # PrivateDevices requires capability operations unavailable to this unprivileged systemd --user manager.
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-ReadWritePaths=%h/.local/state/grabowski
+ReadWritePaths=%h/.local/state/grabowski %h/repos/grabowski -%h/repos/.grabowski-standalone -%h/repos/.grabowski-worktrees
 UMask=0077
 MemoryMax=512M
 TasksMax=50

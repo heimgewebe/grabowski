@@ -498,6 +498,10 @@
     {
       "module": "grabowski_coding_agent_router_cli",
       "source": "src/grabowski_coding_agent_router_cli.py"
+    },
+    {
+      "module": "grabowski_work_admission",
+      "source": "src/grabowski_work_admission.py"
     }
   ],
   "runtime_assets": [

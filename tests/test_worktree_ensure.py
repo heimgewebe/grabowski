@@ -65,6 +65,16 @@ class WorktreeEnsureTests(unittest.TestCase):
             patch.object(checkouts, "CHECKOUT_DB", self.checkout_state / "checkouts.sqlite3"),
             patch.object(checkouts, "CHECKOUT_LOCK", self.checkout_state / "checkouts.lock"),
             patch.object(checkouts, "ARCHIVE_ROOT", self.checkout_state / "archives"),
+            patch.object(
+                checkouts.resources,
+                "RESOURCE_DB",
+                self.checkout_state / "resources.sqlite3",
+            ),
+            patch.object(
+                checkouts.tasks,
+                "TASK_DB",
+                self.checkout_state / "tasks.sqlite3",
+            ),
         ]
         for checkout_patch in self.checkout_patches:
             checkout_patch.start()
@@ -616,6 +626,40 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertTrue(contract["availability"]["available"])
         self.assertTrue(contract["availability"]["requires_allow_mutation"])
 
+
+    def test_admission_block_creates_no_checkout_or_lifecycle_state(self) -> None:
+        parameters = self._parameters(key="admission-blocked")
+        target = Path(str(parameters["target_path"]))
+        assessment = {
+            "schema_version": 1,
+            "decision": "converge_first",
+            "blocker_codes": ["worktree-convergence-required"],
+            "assessment_sha256": "c" * 64,
+            "read_only": True,
+        }
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            raise worktree_ensure.work_admission.WorkAdmissionBlocked(assessment)
+
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root)},
+        ):
+            result = worktree_ensure.ensure_worktree(
+                parameters,
+                grips._default_command_runner,
+                self._lease,
+                record_friction=self._record_friction,
+                resolve_friction=self._resolve_friction,
+                assess_admission=assessor,
+            )
+
+        self.assertEqual(result["result_state"], "NOT_ACCEPTED")
+        self.assertEqual(result["error_class"], "WORK_ADMISSION_BLOCKED")
+        self.assertEqual(result["work_admission"], assessment)
+        self.assertFalse(target.exists())
+        self.assertEqual(checkouts._lifecycle_bindings([]), {})
+        self.assertEqual(len(self.friction_events), 1)
 
 if __name__ == "__main__":
     unittest.main()

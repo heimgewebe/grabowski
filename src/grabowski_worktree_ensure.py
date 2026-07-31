@@ -12,6 +12,8 @@ import time
 import uuid
 from typing import Any, Callable, Iterator
 
+import grabowski_work_admission as work_admission
+
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 LeaseInspector = Callable[[str], dict[str, Any] | None]
 FrictionRecorder = Callable[..., dict[str, Any]]
@@ -553,6 +555,7 @@ def _public_output(
         "post_state": record.get("post_state"),
         "lifecycle": lifecycle,
         "lifecycle_reservation": record.get("lifecycle_reservation"),
+        "work_admission": record.get("work_admission"),
         "lifecycle_integrity": {
             "sha256": _sha256_json(lifecycle) if isinstance(lifecycle, dict) else None,
             "source": (
@@ -671,6 +674,7 @@ def ensure_worktree(
     *,
     record_friction: FrictionRecorder | None = None,
     resolve_friction: FrictionResolver | None = None,
+    assess_admission: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     inputs = _normalize_inputs(parameters)
     parameters_sha256 = _sha256_json(inputs)
@@ -859,6 +863,49 @@ def ensure_worktree(
             written = _write_receipt(receipt_path, record)
             return _public_output(written, receipt_path, replayed=False, recovered=False)
 
+        admission: dict[str, Any] | None = None
+        try:
+            assessor = assess_admission or work_admission.require_repository_admission
+            admission = assessor(
+                mode="normal",
+                repo=inputs["repo"],
+                owner_id=inputs["lease_owner_id"],
+                operation="worktree_create",
+                requested_scope={
+                    "paths": [inputs["target_path"]],
+                    "branch": inputs["branch"],
+                },
+                target_path=inputs["target_path"],
+                branch=inputs["branch"],
+                source_kind=inputs["source_kind"],
+                source_id=inputs["source_id"],
+            )
+        except work_admission.WorkAdmissionBlocked as exc:
+            admission = exc.assessment
+            friction = recovery_friction or _record_friction(
+                record_friction,
+                result_state="NOT_ACCEPTED",
+                symptom="worktree creation rejected by convergence-first admission",
+                notes=list(admission.get("blocker_codes", [])),
+            )
+            record = _durable_record(
+                inputs=inputs,
+                parameters_sha256=parameters_sha256,
+                state="complete",
+                result_state="NOT_ACCEPTED",
+                post_state=observation,
+                error_class="WORK_ADMISSION_BLOCKED",
+                error=str(exc),
+                friction=friction,
+                created_at_unix=existing.get("created_at_unix") if existing else None,
+            )
+            record["lease"] = lease
+            record["work_admission"] = admission
+            written = _write_receipt(receipt_path, record)
+            return _public_output(
+                written, receipt_path, replayed=recovering_intent, recovered=False
+            )
+
         if not recovering_intent:
             intent = _durable_record(
                 inputs=inputs,
@@ -870,6 +917,7 @@ def ensure_worktree(
                 error="",
             )
             intent["lease"] = lease
+            intent["work_admission"] = admission
             existing = _write_receipt(receipt_path, intent)
 
         pre_mutation_lease = _lease_state(inputs, inspect_lease)
@@ -943,6 +991,7 @@ def ensure_worktree(
                 created_at_unix=existing.get("created_at_unix") if existing else None,
             )
             record["lease"] = lease
+            record["work_admission"] = admission
             record["lifecycle"] = _bind_checkout_lifecycle(inputs, post_state, lease)
             record["mutation"] = {
                 "returncode": _returncode(mutation),

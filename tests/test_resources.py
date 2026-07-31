@@ -41,6 +41,7 @@ if "mcp" not in sys.modules:
 
 import grabowski_merge_guard as merge_guard
 import grabowski_resources as resources
+import grabowski_work_admission as work_admission
 
 REPOSITORY_ID = merge_guard._merge_guard_identifier("repository", "heimgewebe/grabowski")
 MAIN_BRANCH_ID = merge_guard._merge_guard_identifier("branch", "main")
@@ -2689,6 +2690,224 @@ class ResourceTests(unittest.TestCase):
                 terminal_source=terminal,
             )
         self.assertIsNotNone(resources.inspect_resource(key))
+
+    def test_broad_repository_lease_runs_read_only_admission_before_write(self) -> None:
+        (self.root / ".git").mkdir()
+        scope = self.scope_manifest(self.root, name="admission", path=self.root)
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            }
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="admission-bound repository work",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=assessor,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["operation"], "broad_repository_lease")
+        self.assertEqual(calls[0]["repo"], str(self.root.resolve()))
+        self.assertEqual(result["work_admission"][0]["decision"], "allow")
+        stored = resources.inspect_resource(f"repo:{self.root}")
+        self.assertIsNotNone(stored)
+
+    def test_broad_repository_lease_rejects_public_convergence_mode_override(self) -> None:
+        (self.root / ".git").mkdir()
+        scope = self.scope_manifest(
+            self.root, name="convergence-override", path=self.root
+        )
+        assessor_calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            assessor_calls.append(dict(kwargs))
+            raise AssertionError("rejected convergence metadata must not reach admission")
+
+        with self.assertRaisesRegex(
+            ValueError, "not a public authority surface"
+        ):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="attempt public convergence override",
+                ttl_seconds=60,
+                metadata={
+                    "scope_manifest": scope,
+                    "scope_manifest_complete": True,
+                    "work_admission_mode": "convergence",
+                },
+                admission_assessor=assessor,
+            )
+
+        self.assertEqual(assessor_calls, [])
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_broad_repository_lease_without_scope_still_runs_admission(self) -> None:
+        (self.root / ".git").mkdir()
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "blocker_codes": [],
+                "blockers": [],
+                "read_only": True,
+            }
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="internal broad lease without scope",
+            ttl_seconds=60,
+            admission_assessor=assessor,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["requested_scope"])
+        self.assertEqual(result["work_admission"][0]["decision"], "allow")
+
+    def test_persisted_admission_evidence_is_bounded_for_large_inputs(self) -> None:
+        (self.root / ".git").mkdir()
+        scope = self.scope_manifest(
+            self.root, name="large-admission", path=self.root
+        )
+        scope["paths"] = [
+            str(self.root / f"bounded-admission-path-{index:03d}" / ("x" * 32))
+            for index in range(128)
+        ]
+        blockers = [
+            {
+                "code": f"bounded-code-{index:03d}",
+                "path": str(self.root / f"worktree-{index:03d}" / ("y" * 64)),
+            }
+            for index in range(512)
+        ]
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "c" * 64,
+                "requested_scope": scope,
+                "blocker_codes": [item["code"] for item in blockers],
+                "blockers": blockers,
+                "read_only": True,
+            }
+
+        resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="large bounded admission evidence",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=assessor,
+        )
+
+        with resources._database() as connection:
+            row = connection.execute(
+                "SELECT metadata_json FROM leases WHERE resource_key=?",
+                (f"repo:{self.root}",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        metadata_json = row["metadata_json"]
+        self.assertLessEqual(len(metadata_json.encode("utf-8")), 16 * 1024)
+        metadata = json.loads(metadata_json)
+        evidence = metadata["work_admission"]
+        self.assertNotIn("assessments", evidence)
+        self.assertEqual(evidence["assessment_count"], 1)
+        self.assertRegex(evidence["assessment_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(evidence["blocker_count"], len(blockers))
+        self.assertEqual(len(evidence["blocker_codes"]), 8)
+        self.assertTrue(evidence["blocker_codes_truncated"])
+        self.assertNotIn("requested_scope", evidence)
+        self.assertNotIn("blockers", evidence)
+        self.assertEqual(metadata["scope_manifest"]["paths"], scope["paths"])
+
+    def test_broad_repository_lease_rejects_any_public_admission_mode_metadata(self) -> None:
+        (self.root / ".git").mkdir()
+        scope = self.scope_manifest(
+            self.root, name="normal-mode-override", path=self.root
+        )
+        with self.assertRaisesRegex(
+            ValueError, "not a public authority surface"
+        ):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="attempt public normal mode metadata",
+                ttl_seconds=60,
+                metadata={
+                    "scope_manifest": scope,
+                    "scope_manifest_complete": True,
+                    "work_admission_mode": "normal",
+                },
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_broad_repository_admission_blocks_before_lease_creation(self) -> None:
+        (self.root / ".git").mkdir()
+        scope = self.scope_manifest(self.root, name="blocked-admission", path=self.root)
+        assessment = {
+            "schema_version": 1,
+            "decision": "blocked",
+            "blocker_codes": ["dirty-worktree"],
+            "assessment_sha256": "b" * 64,
+            "read_only": True,
+        }
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            raise work_admission.WorkAdmissionBlocked(assessment)
+
+        with self.assertRaises(work_admission.WorkAdmissionBlocked):
+            resources.acquire_resources(
+                "owner-a",
+                [f"repo:{self.root}"],
+                purpose="blocked repository work",
+                ttl_seconds=60,
+                metadata={
+                    "scope_manifest": scope,
+                    "scope_manifest_complete": True,
+                },
+                admission_assessor=assessor,
+            )
+        self.assertIsNone(resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_exact_repository_scope_does_not_trigger_global_admission(self) -> None:
+        (self.root / ".git").mkdir()
+        called = False
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            nonlocal called
+            called = True
+            raise AssertionError("exact branch work must stay on the non-conflict path")
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}:branch:feat/disjoint"],
+            purpose="exact disjoint branch work",
+            ttl_seconds=60,
+            admission_assessor=assessor,
+        )
+        self.assertFalse(called)
+        self.assertEqual(result["work_admission"], [])
 
 if __name__ == "__main__":
     unittest.main()

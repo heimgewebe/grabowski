@@ -131,6 +131,16 @@ class TaskTests(unittest.TestCase):
         self.resource_patch = patch.object(
             tasks.resources, "RESOURCE_DB", self.resource_database
         )
+        self.admission_patch = patch.object(
+            tasks.resources.work_admission,
+            "require_repository_admission",
+            return_value={
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            },
+        )
         self.task_archive_root = self.root / "state" / "task-archives"
         self.task_projection_root = self.root / "state" / "task-projection"
         (self.root / "state").mkdir(parents=True, exist_ok=True)
@@ -141,9 +151,11 @@ class TaskTests(unittest.TestCase):
         self.db_patch.start()
         self.outcomes_patch.start()
         self.resource_patch.start()
+        self.admission_patch.start()
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.admission_patch.stop()
         self.resource_patch.stop()
         self.outcomes_patch.stop()
         self.db_patch.stop()
@@ -1461,6 +1473,91 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(task["attempt"], 1)
         self.assertEqual(task["state"], "outcome_unknown")
         self.assertEqual(task["last_observation"]["state"], "outcome_unknown")
+
+    def test_resume_reacquisition_binds_scope_and_blocks_before_launch(self) -> None:
+        key = f"repo:{self.root}"
+        started = self._start(resource_keys=[key])
+        task_id = started["task"]["task_id"]
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=0 WHERE resource_key=?",
+                (key,),
+            )
+            connection.commit()
+        assessment = {
+            "schema_version": 1,
+            "decision": "blocked",
+            "blocker_codes": ["dirty-worktree"],
+            "blockers": [{"code": "dirty-worktree", "path": str(self.root)}],
+            "assessment_sha256": "d" * 64,
+            "read_only": True,
+        }
+        observed = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": 321,
+        }
+
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(tasks, "_observe", return_value=observed), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 321}
+        ), patch.object(
+            tasks.resources.work_admission,
+            "require_repository_admission",
+            side_effect=tasks.resources.work_admission.WorkAdmissionBlocked(
+                assessment
+            ),
+        ) as assessor, patch.object(tasks, "_launch") as launch:
+            with self.assertRaises(tasks.resources.work_admission.WorkAdmissionBlocked):
+                tasks.grabowski_task_resume(task_id)
+
+        launch.assert_not_called()
+        self.assertEqual(assessor.call_count, 1)
+        requested_scope = assessor.call_args.kwargs["requested_scope"]
+        self.assertEqual(requested_scope["repository"], str(self.root))
+        self.assertEqual(requested_scope["task_id"], task_id)
+        self.assertEqual(assessor.call_args.kwargs["mode"], "normal")
+
+    def test_resume_without_bound_repository_scope_fails_closed(self) -> None:
+        key = f"repo:{self.root}"
+        started = self._start(resource_keys=[key])
+        task_id = started["task"]["task_id"]
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET repository_scope_manifest_json=NULL "
+                "WHERE task_id=?",
+                (task_id,),
+            )
+            connection.commit()
+        with sqlite3.connect(self.resource_database) as connection:
+            connection.execute("DELETE FROM leases WHERE resource_key=?", (key,))
+            connection.commit()
+        observed = {
+            "state": "failed",
+            "properties": {"Result": "exit-code"},
+            "probe": _launcher(returncode=1),
+            "observer": {"kind": "test"},
+            "observed_at_unix": 322,
+        }
+
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(tasks, "_observe", return_value=observed), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 322}
+        ), patch.object(
+            tasks.resources.work_admission,
+            "require_repository_admission",
+        ) as assessor, patch.object(tasks, "_launch") as launch:
+            with self.assertRaisesRegex(
+                RuntimeError, "scope manifest evidence is required"
+            ):
+                tasks.grabowski_task_resume(task_id)
+
+        assessor.assert_not_called()
+        launch.assert_not_called()
 
     def test_reconcile_observer_falls_back_to_narrow_production_probe(self) -> None:
         probe = _launcher()

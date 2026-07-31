@@ -17,7 +17,7 @@ The call binds these normalized values into one immutable idempotency identity:
 - artifact class;
 - caller-supplied idempotency key.
 
-Both `repo:<repo>` and `path:<target>` leases must be live and owned by the declared owner before a new mutation. The grip never creates, renews, steals or force-releases leases. Before `git worktree add`, it also reserves an owner-bound lifecycle record. Missing source/purpose/retention/artifact fields, a conflicting existing binding, or the per-repository active-checkout limit reject the request before Git mutation. Existing foreign or legacy checkouts are never removed to make room.
+Both `repo:<repo>` and `path:<target>` leases must be live and owned by the declared owner before a new mutation. The grip never creates, renews, steals or force-releases leases. Immediately before it writes an intent, reserves lifecycle state, or calls `git worktree add`, one read-only repository admission snapshot checks dirty or unobservable worktrees, foreign live coordination, unresolved lifecycle convergence, orphaned bindings and equivalent source/branch bindings. A blocked snapshot creates no checkout or lifecycle state. Before `git worktree add`, the grip also reserves an owner-bound lifecycle record. Missing source/purpose/retention/artifact fields, a conflicting existing binding, or the per-repository active-checkout limit reject the request before Git mutation. Existing foreign or legacy checkouts are never removed to make room. Exact disjoint path/component leases remain governed by the separate non-conflict proof path and are not globally serialized by this broad-lane gate.
 
 ## Result states
 
