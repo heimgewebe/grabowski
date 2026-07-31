@@ -46,6 +46,8 @@ COORDINATION_ROOT = Path(
 RUN_ID_RE = re.compile(r"^BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 MAX_REQUEST_BYTES = 1024 * 1024
+MAX_CLAIM_REJECTION_CODE_BYTES = 128
+MAX_CLAIM_REJECTION_VALUE_BYTES = 16 * 1024
 MIN_LEASE_TTL_SECONDS = 120
 MAX_LEASE_TTL_SECONDS = 3600
 
@@ -756,7 +758,98 @@ def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
     if request["base_dir"]:
         arguments.extend(["--base-dir", request["base_dir"]])
     arguments.extend(["--approve", "--approval-source", request["approval_source"]])
-    return bureau._invoke_bureau(arguments)
+    return bureau._invoke_bureau(arguments, include_runtime_identity=True)
+
+
+def _bounded_claim_rejection_value(value: Any) -> Any:
+    raw = _canonical_json(value)
+    if len(raw) <= MAX_CLAIM_REJECTION_VALUE_BYTES:
+        return value
+    return {
+        "raw_omitted": True,
+        "original_type": type(value).__name__,
+        "size_bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def _claim_intent_rejection(payload: dict[str, Any]) -> BureauPickupError:
+    status = payload.get("status")
+    source_code = payload.get("code")
+    token = source_code if isinstance(source_code, str) else status
+    if not isinstance(token, str) or re.fullmatch(
+        r"[a-z0-9]+(?:-[a-z0-9]+)*", token
+    ) is None:
+        error_code = "claim-intent-not-ready"
+    else:
+        candidate = token if token.startswith("claim-intent-") else f"claim-intent-{token}"
+        error_code = (
+            candidate
+            if len(candidate) <= MAX_CLAIM_REJECTION_CODE_BYTES
+            else "claim-intent-not-ready"
+        )
+
+    details: dict[str, Any] = {
+        "status": _bounded_claim_rejection_value(status),
+        "source_code": _bounded_claim_rejection_value(source_code),
+    }
+    if payload.get("kind") == "grabowski_bureau_intake_adapter_failure":
+        details["adapter_failure"] = _bounded_claim_rejection_value(
+            {
+                key: payload[key]
+                for key in (
+                    "schema_version",
+                    "effect_started",
+                    "retryable",
+                    "ambiguity",
+                    "required_readback",
+                    "details",
+                )
+                if key in payload
+            }
+        )
+    detail = payload.get("detail")
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except json.JSONDecodeError:
+            pass
+    if detail is not None:
+        details["detail"] = _bounded_claim_rejection_value(detail)
+
+    runtime_identity = payload.get("runtime_identity")
+    if isinstance(runtime_identity, dict):
+        summary: dict[str, Any] = {}
+        compatibility = runtime_identity.get("compatibility")
+        if isinstance(compatibility, dict):
+            summary["compatibility"] = compatibility
+        registry = runtime_identity.get("registry")
+        if isinstance(registry, dict):
+            summary["registry"] = {
+                key: registry.get(key)
+                for key in (
+                    "root",
+                    "head",
+                    "origin_main",
+                    "head_equals_origin_main",
+                    "dirty",
+                )
+                if key in registry
+            }
+        manifest = runtime_identity.get("manifest")
+        if isinstance(manifest, dict):
+            canonical_registry = manifest.get("canonical_registry")
+            summary["manifest"] = {
+                "source_commit": manifest.get("source_commit"),
+                "canonical_registry_source_commit": (
+                    canonical_registry.get("source_commit")
+                    if isinstance(canonical_registry, dict)
+                    else None
+                ),
+            }
+        if summary:
+            details["runtime_identity"] = _bounded_claim_rejection_value(summary)
+    return BureauPickupError(error_code, details=details)
 
 
 def _validate_intent_result(
@@ -770,7 +863,7 @@ def _validate_intent_result(
         envelope = payload.get("envelope")
         intent = envelope.get("claim_intent") if isinstance(envelope, dict) else None
     else:
-        raise BureauPickupError("claim-intent-not-ready", details={"payload": payload})
+        raise _claim_intent_rejection(payload)
     if not isinstance(intent, dict):
         raise BureauPickupError("claim-intent-missing")
     if RUN_ID_RE.fullmatch(str(intent.get("run_id", ""))) is None:
