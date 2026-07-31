@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
@@ -219,12 +220,16 @@ def assess_repository_admission(
     reconciliation_error: str | None = None
     try:
         inventory = (inventory_loader or _default_inventory)(repository)
-    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+    except (
+        ImportError, OSError, RuntimeError, ValueError, sqlite3.Error
+    ) as exc:
         inventory = {}
         inventory_error = f"{type(exc).__name__}: {exc}"
     try:
         reconciliation = (reconciliation_loader or _default_reconciliation)(repository)
-    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+    except (
+        ImportError, OSError, RuntimeError, ValueError, sqlite3.Error
+    ) as exc:
         reconciliation = {}
         reconciliation_error = f"{type(exc).__name__}: {exc}"
     worktrees = inventory.get("worktrees") if isinstance(inventory, dict) else None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import ast
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -358,6 +359,53 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertTrue(
             any(
                 "inventory unavailable" in str(item.get("detail", ""))
+                for item in result["blockers"]
+            )
+        )
+
+    def test_inventory_sqlite_failure_becomes_typed_unobservable_block(
+        self,
+    ) -> None:
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            inventory_loader=lambda _repo: (_ for _ in ()).throw(
+                sqlite3.OperationalError("task schema drift")
+            ),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("inventory-unobservable", result["blocker_codes"])
+        self.assertTrue(
+            any(
+                "OperationalError: task schema drift"
+                in str(item.get("detail", ""))
+                for item in result["blockers"]
+            )
+        )
+
+    def test_reconciliation_sqlite_failure_becomes_typed_unobservable_block(
+        self,
+    ) -> None:
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            inventory_loader=lambda _repo: {
+                "worktrees": [self._main()],
+                "inventory_sha256": "a" * 64,
+            },
+            reconciliation_loader=lambda _repo: (_ for _ in ()).throw(
+                sqlite3.OperationalError("binding schema drift")
+            ),
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("reconciliation-unobservable", result["blocker_codes"])
+        self.assertTrue(
+            any(
+                "OperationalError: binding schema drift"
+                in str(item.get("detail", ""))
                 for item in result["blockers"]
             )
         )
