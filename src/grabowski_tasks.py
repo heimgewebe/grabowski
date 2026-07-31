@@ -84,6 +84,8 @@ MAKE_TOKEN = re.compile(r"(?:^|[^A-Za-z0-9_])make(?:$|[^A-Za-z0-9_])")
 MAX_BUILD_SCRIPT_INSPECTION_BYTES = 256 * 1024
 MANAGED_CARGO_ATTENTION_MATCH_LIMIT = 50_000
 DEFAULT_TASK_LIST_LIMIT = 20
+TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
+TASK_LOG_RATE_LIMIT_BURST = 200
 # One re-entrant in-process lock plus one shared file lock serializes every
 # persistent-task mutation across the MCP runtime and the timer-driven
 # reconciler process. Nested task operations reuse the outer file lock.
@@ -293,6 +295,9 @@ TASK_SCHEMA_V5_ADDITIVE_COLUMNS = {
 LEASE_MAINTENANCE_TASK_STATES = {"running", "outcome_unknown"}
 TASK_LEASE_DELEGATION_STATES = frozenset({"running"})
 TASK_RETRY_CONTEXT_SCHEMA_VERSION = 1
+TASK_OPERATION_IDENTITY_SCHEMA_VERSION = 1
+TASK_OPERATION_REUSE_WINDOW_SECONDS = 600
+TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS = 120
 TASK_INTERRUPTED_RECOVERY_CONTEXT_SCHEMA_VERSION = 1
 TASK_INTERRUPTED_RECOVERY_CONTEXT_KEYS = frozenset(
     {
@@ -3094,6 +3099,8 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
         "--property=PrivateTmp=no",
         "--property=MemoryDenyWriteExecute=no",
         "--property=UMask=0077",
+        f"--property=LogRateLimitIntervalSec={TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s",
+        f"--property=LogRateLimitBurst={TASK_LOG_RATE_LIMIT_BURST}",
         f"--property=RuntimeMaxSec={record['runtime_seconds']}s",
         f"--property=WorkingDirectory={record['cwd']}",
         f"--property=CPUWeight={record['cpu_weight']}",
@@ -4281,6 +4288,276 @@ def _observe(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _normalize_task_operation_identity(
+    value: dict[str, Any] | None,
+    *,
+    cwd: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    required = {
+        "repository_head",
+        "source_fingerprint_sha256",
+        "purpose",
+        "scope_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError(
+            "operation_identity must contain repository_head, "
+            "source_fingerprint_sha256, purpose and scope_sha256"
+        )
+    repository_head = value.get("repository_head")
+    if (
+        not isinstance(repository_head, str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", repository_head) is None
+    ):
+        raise ValueError("operation_identity.repository_head is invalid")
+    source_fingerprint = value.get("source_fingerprint_sha256")
+    scope_sha256 = value.get("scope_sha256")
+    if not isinstance(source_fingerprint, str) or SHA256.fullmatch(source_fingerprint) is None:
+        raise ValueError(
+            "operation_identity.source_fingerprint_sha256 is invalid"
+        )
+    if not isinstance(scope_sha256, str) or SHA256.fullmatch(scope_sha256) is None:
+        raise ValueError("operation_identity.scope_sha256 is invalid")
+    raw_purpose = value.get("purpose")
+    if not isinstance(raw_purpose, str):
+        raise ValueError("operation_identity.purpose must be text")
+    purpose = " ".join(raw_purpose.split())
+    if not purpose or len(purpose) > 512:
+        raise ValueError("operation_identity.purpose is empty or too long")
+    material = {
+        "schema_version": TASK_OPERATION_IDENTITY_SCHEMA_VERSION,
+        "canonical_cwd": cwd,
+        "repository_head": repository_head,
+        "source_fingerprint_sha256": source_fingerprint,
+        "purpose": purpose,
+        "scope_sha256": scope_sha256,
+    }
+    return {
+        **material,
+        "operation_identity_sha256": _sha256_json(material),
+    }
+
+
+def _persisted_task_operation_identity(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw_launcher = record.get("launcher_json")
+    if raw_launcher in {None, ""}:
+        return None
+    try:
+        launcher = json.loads(str(raw_launcher))
+    except (json.JSONDecodeError, TypeError) as exc:
+        if "operation_identity" in str(raw_launcher):
+            raise RuntimeError("stored task operation identity is invalid") from exc
+        return None
+    if not isinstance(launcher, dict):
+        return None
+    identity = launcher.get("operation_identity")
+    if identity is None:
+        return None
+    if not isinstance(identity, dict):
+        raise RuntimeError("stored task operation identity is invalid")
+    required = {
+        "schema_version",
+        "canonical_cwd",
+        "repository_head",
+        "source_fingerprint_sha256",
+        "purpose",
+        "scope_sha256",
+        "operation_identity_sha256",
+    }
+    if set(identity) != required:
+        raise RuntimeError("stored task operation identity is invalid")
+    material = {
+        key: identity[key]
+        for key in required
+        if key != "operation_identity_sha256"
+    }
+    if (
+        identity.get("schema_version") != TASK_OPERATION_IDENTITY_SCHEMA_VERSION
+        or identity.get("canonical_cwd") != str(record["cwd"])
+        or not isinstance(identity.get("repository_head"), str)
+        or re.fullmatch(r"[0-9a-f]{40,64}", identity["repository_head"]) is None
+        or not isinstance(identity.get("source_fingerprint_sha256"), str)
+        or SHA256.fullmatch(identity["source_fingerprint_sha256"]) is None
+        or not isinstance(identity.get("scope_sha256"), str)
+        or SHA256.fullmatch(identity["scope_sha256"]) is None
+        or not isinstance(identity.get("purpose"), str)
+        or not identity["purpose"]
+        or identity.get("operation_identity_sha256") != _sha256_json(material)
+    ):
+        raise RuntimeError("stored task operation identity is invalid")
+    return dict(identity)
+
+
+def _latest_task_for_operation_identity(
+    operation_identity_sha256: str,
+) -> dict[str, Any] | None:
+    if SHA256.fullmatch(operation_identity_sha256) is None:
+        raise ValueError("operation identity sha256 is invalid")
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE launcher_json IS NOT NULL "
+            "AND json_valid(launcher_json) "
+            "AND json_type(launcher_json, '$.operation_identity.operation_identity_sha256')='text' "
+            "AND json_extract(launcher_json, '$.operation_identity.operation_identity_sha256')=? "
+            "AND state<>'cancelled' "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 2",
+            (operation_identity_sha256,),
+        ).fetchall()
+    if not rows:
+        return None
+    records = [dict(row) for row in rows]
+    for record in records:
+        identity = _persisted_task_operation_identity(record)
+        if (
+            identity is None
+            or identity["operation_identity_sha256"]
+            != operation_identity_sha256
+        ):
+            raise RuntimeError("stored task operation identity is inconsistent")
+    return records[0]
+
+
+def _task_has_fresh_active_observation(
+    record: dict[str, Any],
+    *,
+    now: int,
+) -> bool:
+    if str(record.get("state")) not in TASK_STATE_PROJECTIONS["active"]:
+        return False
+    raw = record.get("last_observation_json")
+    if raw in {None, ""}:
+        return False
+    try:
+        observation = json.loads(str(raw))
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(observation, dict):
+        return False
+    observed_at = observation.get("observed_at_unix")
+    properties = observation.get("properties")
+    return bool(
+        isinstance(observed_at, int)
+        and not isinstance(observed_at, bool)
+        and 0 <= now - observed_at <= TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS
+        and observation.get("state") in TASK_STATE_PROJECTIONS["active"]
+        and isinstance(properties, dict)
+        and properties.get("ActiveState") == "active"
+        and properties.get("SubState") == "running"
+    )
+
+
+def _operation_retry_binding(
+    record: dict[str, Any],
+    operation_identity: dict[str, Any],
+    *,
+    supersedes_task_id: str,
+    supersedes_receipt_sha256: str,
+    force_new_reason: str,
+) -> dict[str, Any]:
+    if supersedes_task_id != str(record["task_id"]):
+        raise ValueError("operation retry supersedes_task_id is stale")
+    receipt = record.get("lifecycle_receipt_sha256")
+    if (
+        not isinstance(receipt, str)
+        or SHA256.fullmatch(receipt) is None
+        or supersedes_receipt_sha256 != receipt
+    ):
+        raise ValueError("operation retry predecessor receipt is missing or stale")
+    reason = " ".join(force_new_reason.split())
+    if not reason or len(reason) > 512:
+        raise ValueError("operation retry force-new reason is missing or too long")
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_operation_identity_retry",
+        "source_task_id": str(record["task_id"]),
+        "source_state": str(record["state"]),
+        "source_lifecycle_receipt_sha256": receipt,
+        "source_operation_identity_sha256": operation_identity[
+            "operation_identity_sha256"
+        ],
+        "force_new_reason": reason,
+        "admitted_at_unix": _now(),
+    }
+    return {**material, "binding_sha256": _sha256_json(material)}
+
+
+def _resolve_task_operation_identity(
+    operation_identity: dict[str, Any] | None,
+    *,
+    supersedes_task_id: str,
+    supersedes_receipt_sha256: str,
+    force_new_reason: str,
+) -> dict[str, Any]:
+    retry_fields = (
+        supersedes_task_id,
+        supersedes_receipt_sha256,
+        force_new_reason,
+    )
+    if operation_identity is None:
+        if any(retry_fields):
+            raise ValueError(
+                "operation retry fields require operation_identity"
+            )
+        return {"reuse": None, "reuse_reason": None, "retry_binding": None}
+    latest = _latest_task_for_operation_identity(
+        operation_identity["operation_identity_sha256"]
+    )
+    if latest is None:
+        if any(retry_fields):
+            raise ValueError("operation retry predecessor was not found")
+        return {"reuse": None, "reuse_reason": None, "retry_binding": None}
+    now = _now()
+    if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+        if not _task_has_fresh_active_observation(latest, now=now):
+            grabowski_task_status(str(latest["task_id"]))
+            latest = _row_raw(str(latest["task_id"]))
+        if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+            if any(retry_fields):
+                raise ValueError("active operation identity cannot be superseded")
+            return {
+                "reuse": latest,
+                "reuse_reason": "active_operation_identity",
+                "retry_binding": None,
+            }
+    if (
+        str(latest["state"]) == "completed"
+        and isinstance(latest.get("lifecycle_receipt_sha256"), str)
+        and int(latest.get("terminalized_at_unix") or latest["updated_at_unix"])
+        >= now - TASK_OPERATION_REUSE_WINDOW_SECONDS
+    ):
+        if any(retry_fields):
+            raise ValueError("successful operation identity cannot be superseded")
+        return {
+            "reuse": latest,
+            "reuse_reason": "recent_successful_operation_identity",
+            "retry_binding": None,
+        }
+    if str(latest["state"]) in TASK_STATE_PROJECTIONS["attention"]:
+        if not all(retry_fields):
+            raise RuntimeError(
+                "operation identity has an attention predecessor; bind "
+                "supersedes_task_id, predecessor receipt and force-new reason"
+            )
+        return {
+            "reuse": None,
+            "reuse_reason": None,
+            "retry_binding": _operation_retry_binding(
+                latest,
+                operation_identity,
+                supersedes_task_id=supersedes_task_id,
+                supersedes_receipt_sha256=supersedes_receipt_sha256,
+                force_new_reason=force_new_reason,
+            ),
+        }
+    if any(retry_fields):
+        raise ValueError("operation retry fields do not match an attention predecessor")
+    return {"reuse": None, "reuse_reason": None, "retry_binding": None}
+
 def server_task_lease_delegation_evidence(lease_owner_id: str) -> dict[str, Any]:
     """Validate one live task and its complete current lease set for server delegation."""
     if not isinstance(lease_owner_id, str):
@@ -4343,6 +4620,10 @@ def grabowski_task_start(
     chronik_pr_number: int | None = None,
     runtime_python: bool = False,
     route_evidence: dict[str, Any] | None = None,
+    operation_identity: dict[str, Any] | None = None,
+    supersedes_task_id: str = "",
+    supersedes_receipt_sha256: str = "",
+    force_new_reason: str = "",
     _retry_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
@@ -4380,6 +4661,46 @@ def grabowski_task_start(
             enabled=bool(chronik_enabled),
         )
     )
+    normalized_operation_identity = _normalize_task_operation_identity(
+        operation_identity,
+        cwd=working_directory,
+    )
+    task_id = uuid.uuid4().hex[:24]
+    operation_resolution = _resolve_task_operation_identity(
+        normalized_operation_identity,
+        supersedes_task_id=supersedes_task_id,
+        supersedes_receipt_sha256=supersedes_receipt_sha256,
+        force_new_reason=force_new_reason,
+    )
+    reused_record = operation_resolution["reuse"]
+    if reused_record is not None:
+        reuse_audit = {
+            "timestamp_unix": _now(),
+            "operation": "task-start-deduplicated",
+            "requested_task_id": task_id,
+            "reused_task_id": str(reused_record["task_id"]),
+            "reuse_reason": operation_resolution["reuse_reason"],
+            "operation_identity_sha256": normalized_operation_identity[
+                "operation_identity_sha256"
+            ],
+            "no_process_started": True,
+        }
+        base._append_audit(reuse_audit)
+        return {
+            "task": _public(reused_record),
+            "audit": reuse_audit,
+            "execution_identity": _record_execution_identity(reused_record),
+            "retry_binding": _persisted_retry_binding_or_raise(reused_record),
+            "routing_shadow_capture": None,
+            "operation_identity": normalized_operation_identity,
+            "operation_retry_binding": None,
+            "deduplicated_reuse": {
+                "reused": True,
+                "task_id": str(reused_record["task_id"]),
+                "reason": operation_resolution["reuse_reason"],
+            },
+        }
+    operation_retry_binding = operation_resolution["retry_binding"]
     requested_resources = _resource_keys(resource_keys)
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
@@ -4399,7 +4720,6 @@ def grabowski_task_start(
         if chronik_enabled
         else None
     )
-    task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
     repository_resource = _task_repository_resource(task_resources)
     repository_scope_manifest = (
@@ -4484,9 +4804,13 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
-    retry_binding = _guard_unchanged_terminal_retry(
-        execution_identity,
-        _retry_context,
+    retry_binding = (
+        None
+        if operation_retry_binding is not None
+        else _guard_unchanged_terminal_retry(
+            execution_identity,
+            _retry_context,
+        )
     )
     routing_shadow_capture: dict[str, Any] | None = None
     if normalized_route_evidence is not None:
@@ -4529,6 +4853,16 @@ def grabowski_task_start(
                 **(
                     {"retry_binding": dict(retry_binding)}
                     if retry_binding is not None
+                    else {}
+                ),
+                **(
+                    {"operation_identity": dict(normalized_operation_identity)}
+                    if normalized_operation_identity is not None
+                    else {}
+                ),
+                **(
+                    {"operation_retry_binding": dict(operation_retry_binding)}
+                    if operation_retry_binding is not None
                     else {}
                 ),
             }
@@ -4601,6 +4935,16 @@ def grabowski_task_start(
     launcher = _launch(record)
     if retry_binding is not None:
         launcher = {**launcher, "retry_binding": dict(retry_binding)}
+    if normalized_operation_identity is not None:
+        launcher = {
+            **launcher,
+            "operation_identity": dict(normalized_operation_identity),
+        }
+    if operation_retry_binding is not None:
+        launcher = {
+            **launcher,
+            "operation_retry_binding": dict(operation_retry_binding),
+        }
     state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
     lease_maintenance = _maintain_record_resources(stored, state)
@@ -4616,6 +4960,12 @@ def grabowski_task_start(
         "argv_sha256": record["argv_sha256"],
         "execution_identity_sha256": execution_identity["identity_sha256"],
         "retry_binding": retry_binding,
+        "operation_identity_sha256": (
+            normalized_operation_identity["operation_identity_sha256"]
+            if normalized_operation_identity is not None
+            else None
+        ),
+        "operation_retry_binding": operation_retry_binding,
         "unit": unit,
         "launcher_returncode": launcher["returncode"],
         "launcher_outcome_unknown": bool(launcher.get("outcome_unknown")),
@@ -4644,6 +4994,9 @@ def grabowski_task_start(
         "execution_identity": execution_identity,
         "retry_binding": retry_binding,
         "routing_shadow_capture": routing_shadow_capture,
+        "operation_identity": normalized_operation_identity,
+        "operation_retry_binding": operation_retry_binding,
+        "deduplicated_reuse": None,
     }
 
 
@@ -6536,6 +6889,10 @@ async def _grabowski_task_start_tool(
     chronik_pr_number: int | None = None,
     runtime_python: bool = False,
     route_evidence: dict[str, Any] | None = None,
+    operation_identity: dict[str, Any] | None = None,
+    supersedes_task_id: str = "",
+    supersedes_receipt_sha256: str = "",
+    force_new_reason: str = "",
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -6563,6 +6920,10 @@ async def _grabowski_task_start_tool(
         chronik_pr_number,
         runtime_python,
         route_evidence,
+        operation_identity,
+        supersedes_task_id,
+        supersedes_receipt_sha256,
+        force_new_reason,
     )
 
 
