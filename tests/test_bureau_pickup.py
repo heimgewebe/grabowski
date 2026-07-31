@@ -410,6 +410,7 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(metadata["run_id"], intent["run_id"])
         self.assertEqual(metadata["claim_intent_sha256"], intent["intent_sha256"])
         intent_argv = invoke.call_args_list[0].args[0]
+        self.assertTrue(invoke.call_args_list[0].kwargs["include_runtime_identity"])
         commit_argv = invoke.call_args_list[1].args[0]
         readback_argv = invoke.call_args_list[2].args[0]
         expected_coordination = str(pickup.COORDINATION_ROOT)
@@ -455,11 +456,128 @@ class BureauPickupTests(unittest.TestCase):
             mock.patch.object(pickup.resources, "acquire_resources") as acquire,
         ):
             with self.assertRaisesRegex(
-                pickup.BureauPickupError, "claim-intent-not-ready"
+                pickup.BureauPickupError,
+                "claim-intent-explicit-registry-root-required",
             ):
                 pickup.grabowski_bureau_pickup_execute(self.request())
         self.assertEqual(invoke.call_count, 1)
         acquire.assert_not_called()
+
+    def test_claim_intent_rejection_exposes_structured_runtime_drift(self) -> None:
+        payload = {
+            "status": "no-eligible-task",
+            "detail": json.dumps(
+                {
+                    "rejected": [
+                        {
+                            "task_id": "TEST-T001",
+                            "reasons": ["state is verified"],
+                        }
+                    ]
+                }
+            ),
+            "runtime_identity": {
+                "compatibility": {
+                    "status": "stale",
+                    "reason_codes": ["release-registry-identity-mismatch"],
+                    "mutation_allowed": False,
+                },
+                "registry": {
+                    "root": "/tmp/bureau",
+                    "head": "a" * 40,
+                    "origin_main": "a" * 40,
+                    "head_equals_origin_main": True,
+                    "dirty": False,
+                },
+                "manifest": {
+                    "source_commit": "b" * 40,
+                    "canonical_registry": {"source_commit": "b" * 40},
+                },
+            },
+        }
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=payload),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        details = raised.exception.details
+        self.assertEqual(
+            details["detail"]["rejected"][0]["reasons"], ["state is verified"]
+        )
+        self.assertEqual(
+            details["runtime_identity"]["compatibility"]["reason_codes"],
+            ["release-registry-identity-mismatch"],
+        )
+        self.assertEqual(
+            details["runtime_identity"]["manifest"]["source_commit"], "b" * 40
+        )
+        acquire.assert_not_called()
+
+    def test_claim_intent_adapter_failure_preserves_retry_contract(self) -> None:
+        for code, retryable in (
+            ("bureau-runtime-timeout", True),
+            ("bureau-runtime-drift", False),
+        ):
+            with self.subTest(code=code):
+                payload = {
+                    "schema_version": 1,
+                    "kind": "grabowski_bureau_intake_adapter_failure",
+                    "code": code,
+                    "effect_started": False,
+                    "retryable": retryable,
+                    "ambiguity": False,
+                    "required_readback": [],
+                    "details": {"error_type": "RuntimeError"},
+                }
+                with (
+                    mock.patch.object(
+                        pickup.bureau, "_invoke_bureau", return_value=payload
+                    ),
+                    mock.patch.object(
+                        pickup.resources, "acquire_resources"
+                    ) as acquire,
+                ):
+                    with self.assertRaisesRegex(
+                        pickup.BureauPickupError, f"claim-intent-{code}"
+                    ) as raised:
+                        pickup.grabowski_bureau_pickup_execute(self.request())
+                self.assertEqual(
+                    raised.exception.details["adapter_failure"],
+                    {
+                        "schema_version": 1,
+                        "effect_started": False,
+                        "retryable": retryable,
+                        "ambiguity": False,
+                        "required_readback": [],
+                        "details": {"error_type": "RuntimeError"},
+                    },
+                )
+                acquire.assert_not_called()
+
+    def test_claim_intent_rejection_bounds_oversized_values(self) -> None:
+        oversized = "x" * (pickup.MAX_CLAIM_REJECTION_VALUE_BYTES + 1)
+        rejection = pickup._claim_intent_rejection(
+            {
+                "status": "no-eligible-task",
+                "code": oversized,
+                "detail": oversized,
+                "kind": "grabowski_bureau_intake_adapter_failure",
+                "details": {"message": oversized},
+            }
+        )
+
+        self.assertEqual(rejection.code, "claim-intent-not-ready")
+        for key in ("source_code", "detail", "adapter_failure"):
+            summary = rejection.details[key]
+            self.assertTrue(summary["raw_omitted"])
+            self.assertGreater(
+                summary["size_bytes"], pickup.MAX_CLAIM_REJECTION_VALUE_BYTES
+            )
+            self.assertRegex(summary["sha256"], r"^[0-9a-f]{64}$")
+        self.assertNotIn(oversized, json.dumps(rejection.details))
 
     def test_repository_scope_is_required_before_any_acquisition(self) -> None:
         key = "repo:/tmp/repository"

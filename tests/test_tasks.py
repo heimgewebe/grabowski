@@ -1109,6 +1109,61 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(listed["state_counts"]["running"], 1)
         self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
 
+    def test_task_list_exact_filter_skips_unrelated_attention_projection(self) -> None:
+        task = self._start()["task"]
+        import grabowski_task_attention as task_attention
+
+        with patch.object(
+            tasks,
+            "_task_attention_projection",
+            side_effect=AssertionError("attention projection must not run"),
+        ) as projection, patch.object(
+            task_attention,
+            "decision_snapshot_guard",
+            side_effect=AssertionError("decision lock must not be acquired"),
+        ) as decision_guard:
+            listed = tasks.grabowski_task_list(state="running")
+
+        projection.assert_not_called()
+        decision_guard.assert_not_called()
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["tasks"][0]["task_id"], task["task_id"])
+        self.assertEqual(listed["attention_projection"]["status"], "not_evaluated")
+        self.assertIsNone(
+            listed["attention_projection"]["current_attention_count"]
+        )
+        self.assertEqual(
+            listed["projection_counts"]["attention"],
+            listed["raw_projection_counts"]["attention"],
+        )
+        self.assertEqual(
+            listed["projection_counts_semantics"]["attention"],
+            "raw_current_task_states_attention_not_decision_filtered",
+        )
+        self.assertNotIn(
+            "attention_projection_degraded",
+            {warning["code"] for warning in listed["warnings"]},
+        )
+        self.assertEqual(
+            listed["recommended_next_action"],
+            "inspect returned tasks before deciding the next action",
+        )
+        self.assertIn(
+            "decision-aware attention count for this non-attention filter",
+            listed["does_not_establish"],
+        )
+
+        with sqlite3.connect(self.database) as connection:
+            connection.execute(
+                "UPDATE tasks SET state='failed' WHERE task_id=?",
+                (task["task_id"],),
+            )
+            connection.commit()
+        empty = tasks.grabowski_task_list(state="running")
+        self.assertEqual(0, empty["count"])
+        self.assertEqual(1, empty["raw_projection_counts"]["attention"])
+        self.assertEqual("none", empty["recommended_next_action"])
+
     def test_task_list_reads_rows_and_counts_from_one_snapshot(self) -> None:
         task = self._start()["task"]
         original_state_counts = tasks._task_state_counts

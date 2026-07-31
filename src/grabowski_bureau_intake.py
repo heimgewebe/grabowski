@@ -558,6 +558,7 @@ def _invoke_bureau(
     timeout_seconds: int = COMMAND_TIMEOUT_SECONDS,
     mutation: bool = False,
     required_readback: list[str] | None = None,
+    include_runtime_identity: bool = False,
 ) -> dict[str, Any]:
     readback = sorted(set(required_readback or []))
     try:
@@ -667,6 +668,10 @@ def _invoke_bureau(
             required_readback=readback,
             retryable=False,
         )
+    if include_runtime_identity:
+        runtime_identity = value.get("runtime_identity")
+        if isinstance(runtime_identity, dict) and "runtime_identity" not in payload:
+            payload = {**payload, "runtime_identity": runtime_identity}
     return payload
 
 

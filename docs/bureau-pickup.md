@@ -63,3 +63,7 @@ The adapter does not establish:
 - safety of retrying an ambiguous commit without a fresh readback;
 - absence of resource conflicts outside the live Grabowski lease database;
 - validity or mutability of a caller-selected Registry root beyond the separate Bureau and operator gates.
+
+## Claim refusal diagnostics
+
+The pickup adapter preserves the Bureau envelope runtime identity for the claim-intent read and converts refusals into stable, specific error codes such as `claim-intent-no-eligible-task`. Structured rejection detail, adapter retry metadata and a bounded runtime-identity summary remain attached to the error. Any individual refusal value above 16 KiB is replaced by its type, byte size and SHA-256 digest, so oversized upstream diagnostics cannot inflate MCP error metadata. This distinguishes task-state rejection from stale release/Registry identity without acquiring any lease or starting a workspace.
