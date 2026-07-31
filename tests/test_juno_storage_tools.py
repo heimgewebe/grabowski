@@ -1061,6 +1061,72 @@ class JunoStorageGrantScriptTests(unittest.TestCase):
         self.assertNotIn("protocols", observed["delegate_kwargs"])
         self.assertEqual(observed["mode"], module.PICKER_MODE_OPEN)
 
+    def test_missing_active_window_allocates_and_retains_nothing(self) -> None:
+        module = self.load_script()
+        module._RETAINED.clear()
+        with (
+            patch.object(
+                module,
+                "_top_presenter",
+                side_effect=RuntimeError(
+                    "Juno has no active iPadOS window for the folder picker"
+                ),
+            ),
+            patch.object(module, "create_objc_class") as create_class,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no active iPadOS window"):
+                module._present_picker()
+
+        create_class.assert_not_called()
+        self.assertEqual(module._RETAINED, {})
+
+    def test_failed_native_presentation_releases_new_picker(self) -> None:
+        module = self.load_script(include_objc_protocol=False)
+
+        class DelegateType:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+        class PickerInstance:
+            def setDelegate_(self, delegate):
+                self.delegate = delegate
+
+            def setAllowsMultipleSelection_(self, enabled):
+                self.multiple = enabled
+
+        class PickerType:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initWithDocumentTypes_inMode_(self, document_types, mode):
+                return PickerInstance()
+
+        class Presenter:
+            def presentViewController_animated_completion_(self, picker, animated, completion):
+                raise RuntimeError("native presentation failed")
+
+        module._RETAINED.clear()
+        with (
+            patch.object(module, "create_objc_class", return_value=DelegateType),
+            patch.object(
+                module,
+                "ObjCClass",
+                side_effect=lambda name: (
+                    PickerType if name == "UIDocumentPickerViewController" else object
+                ),
+            ),
+            patch.object(module, "_top_presenter", return_value=Presenter()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "native presentation failed"):
+                module._present_picker()
+
+        self.assertEqual(module._RETAINED, {})
+
     def test_atomic_create_is_private_single_link_and_create_only(self) -> None:
         module = self.load_script()
         with tempfile.TemporaryDirectory() as directory:
