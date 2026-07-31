@@ -73,6 +73,34 @@ class BureauPickupRequest(_RequiredBureauPickupRequest, total=False):
     registry_root: str
 
 
+class ExplicitRegistryBindingIdentity(TypedDict):
+    schema_version: int
+    kind: str
+    registry_root: str
+    binding_sha256: str
+
+
+class CanonicalRegistryBindingIdentity(ExplicitRegistryBindingIdentity):
+    source_commit: str
+    registry_tree_sha256: str
+    launcher_sha256: str
+    manifest_sha256: str
+    inventory_path: str
+    inventory_sha256: str
+
+
+RegistryBindingIdentity = (
+    ExplicitRegistryBindingIdentity | CanonicalRegistryBindingIdentity
+)
+
+
+class RegistryBinding(TypedDict):
+    identity: RegistryBindingIdentity
+    managed_runtime: Any | None
+    explicit: bool
+    legacy: bool
+
+
 class BureauPickupError(RuntimeError):
     def __init__(self, code: str, *, details: dict[str, Any] | None = None) -> None:
         super().__init__(code)
@@ -91,6 +119,16 @@ def _canonical_json(value: Any) -> bytes:
 
 def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _runtime_error_details(
+    exc: BaseException, **details: Any
+) -> dict[str, Any]:
+    return {
+        "cause_code": getattr(exc, "code", None),
+        "error_type": type(exc).__name__,
+        **details,
+    }
 
 
 def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -660,17 +698,14 @@ def _normalize_registry_root(value: Any) -> str:
     return str(resolved)
 
 
-def _canonical_registry_binding() -> dict[str, Any]:
+def _canonical_registry_binding() -> RegistryBinding:
     try:
         managed = bureau._managed_runtime_binding()
         bureau._assert_managed_runtime_unchanged(managed)
     except (OSError, RuntimeError) as exc:
         raise BureauPickupError(
             "canonical-registry-binding-unavailable",
-            details={
-                "cause_code": getattr(exc, "code", None),
-                "error_type": type(exc).__name__,
-            },
+            details=_runtime_error_details(exc),
         ) from None
     identity = {
         "schema_version": SCHEMA_VERSION,
@@ -693,7 +728,7 @@ def _canonical_registry_binding() -> dict[str, Any]:
     }
 
 
-def _explicit_registry_binding(registry_root: str) -> dict[str, Any]:
+def _explicit_registry_binding(registry_root: str) -> RegistryBinding:
     identity = {
         "schema_version": SCHEMA_VERSION,
         "kind": "explicit-registry-root",
@@ -723,15 +758,18 @@ def _observed_registry_tree_sha256(
         except (OSError, RuntimeError) as exc:
             raise BureauPickupError(
                 "canonical-registry-tree-read-failed",
-                details={
-                    "cause_code": getattr(exc, "code", None),
-                    "error_type": type(exc).__name__,
-                    "path": item,
-                },
+                details=_runtime_error_details(exc, path=item),
             ) from None
         total_bytes += len(snapshot.raw)
         if total_bytes > MAX_REGISTRY_TREE_BYTES:
-            raise BureauPickupError("canonical-registry-tree-too-large")
+            raise BureauPickupError(
+                "canonical-registry-tree-too-large",
+                details={
+                    "limit_bytes": MAX_REGISTRY_TREE_BYTES,
+                    "observed_bytes": total_bytes,
+                    "path": item,
+                },
+            )
         encoded = relative.as_posix().encode("utf-8")
         digest.update(len(encoded).to_bytes(4, "big"))
         digest.update(encoded)
@@ -785,6 +823,9 @@ def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, A
     source_commit = identity.get("source_commit")
     if not isinstance(source_commit, str) or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise BureauPickupError("canonical-registry-source-commit-invalid")
+    # Launcher and manifest digests preserve deployment provenance only.
+    # Journal replay must survive a later deployment rotation; the inventory
+    # and Registry tree below remain the operative content-bound authority.
     for field in (
         "registry_tree_sha256",
         "launcher_sha256",
@@ -807,10 +848,7 @@ def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, A
     except (OSError, RuntimeError) as exc:
         raise BureauPickupError(
             "canonical-registry-inventory-unavailable",
-            details={
-                "cause_code": getattr(exc, "code", None),
-                "error_type": type(exc).__name__,
-            },
+            details=_runtime_error_details(exc),
         ) from None
     if inventory.sha256 != identity["inventory_sha256"]:
         raise BureauPickupError("canonical-registry-inventory-drift")
@@ -854,7 +892,9 @@ def _validate_registry_binding_identity(identity: dict[str, Any]) -> dict[str, A
     return identity
 
 
-def _registry_binding_from_identity(identity: dict[str, Any]) -> dict[str, Any]:
+def _registry_binding_from_identity(
+    identity: dict[str, Any],
+) -> RegistryBinding:
     validated = _validate_registry_binding_identity(identity)
     return {
         "identity": validated,
@@ -902,7 +942,7 @@ def _read_journal_registry_binding(
     return binding
 
 
-def _assert_registry_binding(binding: dict[str, Any]) -> None:
+def _assert_registry_binding(binding: RegistryBinding) -> None:
     managed = binding.get("managed_runtime")
     if managed is None:
         _validate_registry_binding_identity(binding["identity"])
@@ -912,17 +952,14 @@ def _assert_registry_binding(binding: dict[str, Any]) -> None:
     except (OSError, RuntimeError) as exc:
         raise BureauPickupError(
             "canonical-registry-binding-drift",
-            details={
-                "cause_code": getattr(exc, "code", None),
-                "error_type": type(exc).__name__,
-            },
+            details=_runtime_error_details(exc),
         ) from None
     _validate_registry_binding_identity(binding["identity"])
 
 
 def _prepare_request(
     request: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], RegistryBinding]:
     if not isinstance(request, dict):
         raise ValueError("request must be an object")
     prepared = dict(request)
@@ -936,7 +973,7 @@ def _prepare_request(
     return _normalize_request(prepared), binding
 
 
-def _bound_bureau_call(binding: dict[str, Any], callback):
+def _bound_bureau_call(binding: RegistryBinding, callback):
     _assert_registry_binding(binding)
     result = callback()
     _assert_registry_binding(binding)
