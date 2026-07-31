@@ -94,6 +94,32 @@ class RBLookupTests(unittest.TestCase):
         for value in ["", ".", "..", ".hidden", "repo/", "repo\\evil", "repo."]:
             self.assertIsNone(rb.safe_segment(value))
 
+    def test_repo_from_remote_accepts_exact_github_hosts(self) -> None:
+        remotes = [
+            "git@github.com:heimgewebe/grabowski.git",
+            "ssh://git@github.com/heimgewebe/grabowski.git",
+            "https://github.com/heimgewebe/grabowski.git",
+            "http://github.com/heimgewebe/grabowski/",
+        ]
+        for remote in remotes:
+            with self.subTest(remote=remote):
+                self.assertEqual("grabowski", rb.repo_from_remote(remote, "/tmp/local"))
+
+    def test_repo_from_remote_rejects_embedded_or_lookalike_github_hosts(self) -> None:
+        remotes = [
+            "https://evil.invalid/github.com/heimgewebe/attacker.git",
+            "https://github.com.evil.invalid/heimgewebe/attacker.git",
+            "git@evil.invalid:github.com/heimgewebe/attacker.git",
+            "ssh://git@github.com.evil.invalid/heimgewebe/attacker.git",
+            "https://github.com/heimgewebe/nested/attacker.git",
+        ]
+        for remote in remotes:
+            with self.subTest(remote=remote):
+                self.assertEqual(
+                    "local-fallback",
+                    rb.repo_from_remote(remote, "/tmp/local-fallback"),
+                )
+
     def test_missing_publication_root(self) -> None:
         got = rb.context(
             Path("/tmp/demo"),
