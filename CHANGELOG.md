@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Hardened Juno picker presentation so a healthy background agent is no longer mistaken for an active UIKit surface: presenter readiness is resolved before picker allocation, and failed native presentation leaves no retained false-arm state.
 - Added one shared, private Juno agent identity in application support, with fail-closed migration of legacy provider-local keys, so switching among user-consented iCloud, on-device, external-drive, and document-provider roots no longer requires re-pairing.
 - Fixed the live Juno folder picker for the installed bridge: `ObjCProtocol` is optional, delegate retention is deferred until the next picker run to avoid releasing UIKit's weak delegate inside its callback, callback-time alerts are removed, and successful interactive runs no longer surface as `SystemExit` failures.
 - Repaired Bureau task intake so candidate assessment exposes one explicit typed candidate/event selector while task and initiative values remain binding checks, and hardened pickup execution so even an apparently successful claim is accepted only after an authoritative run, claim-intent, lease-release and nonblocking readback; missing or drifted readback retains leases and fails closed.

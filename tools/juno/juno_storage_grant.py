@@ -371,6 +371,10 @@ def _dismiss_retained_pickers() -> None:
 
 @on_main_thread
 def _present_picker() -> str:
+    # A healthy background agent is not sufficient for UIKit presentation.
+    # Resolve one active foreground presenter before allocating or retaining
+    # picker objects so a background invocation leaves no false armed state.
+    presenter = _top_presenter()
     delegate_class_name = f"{GRANT_CLASS_PREFIX}_{uuid.uuid4().hex}"
     delegate_options: dict[str, Any] = {}
     if ObjCProtocol is not None:
@@ -400,8 +404,11 @@ def _present_picker() -> str:
         "picker": picker,
         "created_at": _utc_now(),
     }
-    presenter = _top_presenter()
-    presenter.presentViewController_animated_completion_(picker, True, None)
+    try:
+        presenter.presentViewController_animated_completion_(picker, True, None)
+    except Exception:
+        _RETAINED.pop(token, None)
+        raise
     return token
 
 
