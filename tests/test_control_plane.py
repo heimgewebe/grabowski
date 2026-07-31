@@ -1386,44 +1386,51 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
             "grabowski_secret_reveal",
         )
 
-        stale_task_schema = json.loads(json.dumps(task_start_schema))
-        del stale_task_schema["properties"]["operation_identity"]
-        stale_task_runtime_tools = [
-            {
-                "name": name,
-                **(
+        for missing_property in sorted(task_start_schema["properties"]):
+            with self.subTest(missing_property=missing_property):
+                stale_task_schema = json.loads(json.dumps(task_start_schema))
+                del stale_task_schema["properties"][missing_property]
+                stale_task_runtime_tools = [
                     {
-                        "inputSchema": (
-                            stale_task_schema
-                            if name == "grabowski_task_start"
-                            else sentinel_schemas[name]
-                        )
+                        "name": name,
+                        **(
+                            {
+                                "inputSchema": (
+                                    stale_task_schema
+                                    if name == "grabowski_task_start"
+                                    else sentinel_schemas[name]
+                                )
+                            }
+                            if name in sentinel_schemas
+                            else {}
+                        ),
                     }
-                    if name in sentinel_schemas
-                    else {}
-                ),
-            }
-            for name in expected
-        ]
-        missing_retry_contract = module.probe(
-            expected,
-            {**sentinel_schemas, "grabowski_task_start": stale_task_schema},
-            stale_task_runtime_tools,
-        )
-        self.assertFalse(missing_retry_contract["matches"])
-        self.assertFalse(missing_retry_contract["schema_contract_matches"])
-        self.assertEqual(
-            [
-                (item["source"], item["missing_properties"])
-                for item in missing_retry_contract[
-                    "required_schema_property_mismatches"
+                    for name in expected
                 ]
-            ],
-            [
-                ("connector", ["operation_identity"]),
-                ("runtime", ["operation_identity"]),
-            ],
-        )
+                missing_retry_contract = module.probe(
+                    expected,
+                    {
+                        **sentinel_schemas,
+                        "grabowski_task_start": stale_task_schema,
+                    },
+                    stale_task_runtime_tools,
+                )
+                self.assertFalse(missing_retry_contract["matches"])
+                self.assertFalse(
+                    missing_retry_contract["schema_contract_matches"]
+                )
+                self.assertEqual(
+                    [
+                        (item["source"], item["missing_properties"])
+                        for item in missing_retry_contract[
+                            "required_schema_property_mismatches"
+                        ]
+                    ],
+                    [
+                        ("connector", [missing_property]),
+                        ("runtime", [missing_property]),
+                    ],
+                )
 
         names_only = module.probe(expected, {}, runtime_tools)
         self.assertFalse(names_only["matches"])
