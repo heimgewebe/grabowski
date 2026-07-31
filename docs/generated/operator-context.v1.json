@@ -3031,7 +3031,7 @@
       "src/grabowski_tasks.py": "c566eeec06c743adcc011dae074e78a5383a60238a3b3d6b8f5e9a3dd78fc499",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
-      "src/grabowski_work_admission.py": "58798a3172cb18af75847fffda0b61a1e8ddba50098296ee160b97b17ad656fb",
+      "src/grabowski_work_admission.py": "9ffb4c1169259168341d6e8282cb0d017f5adfdac6a380fed93fa2e98d04ea57",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "815914a20a0972210bdfd4ceb5774e2ca0d409c03858322a2fcdf8bf9219be3f",
       "src/grabowski_worktree_ensure.py": "7a344edca97ef5342bed109f91f3e9a2778bb652217b104ff7b88f0cfabcb1e4"
