@@ -2960,9 +2960,10 @@ def _maintain_record_resources(
                 else None
             ),
         }
-    except (ValueError, RuntimeError):
-        # A lease may have expired between observations. Reacquire only when the
-        # resource is still free; a foreign owner remains a hard conflict.
+    except (resources.ResourceLeaseMissing, resources.ResourceLeaseExpired):
+        # A lease may be missing or have expired between observations. Reacquire
+        # only when the resource is still free; a foreign owner remains a hard
+        # conflict.
         try:
             repository_resource = _task_repository_resource(keys)
             implicit_workspace_resource = _record_implicit_workspace_resource(
@@ -2974,7 +2975,7 @@ def _maintain_record_resources(
             acquired = resources.acquire_resources(
                 owner,
                 keys,
-                purpose=f"persistent task {record['task_id']} lease recovery",
+                purpose=f"persistent task {record['task_id']}",
                 ttl_seconds=ttl,
                 metadata=_task_lease_metadata(
                     task_id=str(record["task_id"]),
@@ -2985,6 +2986,7 @@ def _maintain_record_resources(
                     repository_scope_manifest=repository_scope_manifest,
                     recovered_after_expiry=True,
                 ),
+                _preserve_live_same_owner=True,
             )
         except Exception as exc:
             return {
@@ -2994,7 +2996,7 @@ def _maintain_record_resources(
             }
         return {
             "maintained": True,
-            "mode": "reacquired",
+            "mode": "reconciled" if acquired.get("preserved") else "reacquired",
             "expires_at_unix": acquired.get("expires_at_unix"),
         }
     except Exception as exc:
@@ -4937,17 +4939,38 @@ def grabowski_task_resume(
             attempt=attempt,
         )
     lease_result = None
+    lease_mode = None
     if task_resources:
-        lease_result = resources.acquire_resources(
-            lease_owner,
-            task_resources,
-            purpose=f"persistent task {task_id}",
-            ttl_seconds=min(
-                resources.MAX_TTL_SECONDS,
-                max(resources.MIN_TTL_SECONDS, int(record["runtime_seconds"]) + 300),
-            ),
-            metadata=lease_metadata,
+        lease_ttl = min(
+            resources.MAX_TTL_SECONDS,
+            max(resources.MIN_TTL_SECONDS, int(record["runtime_seconds"]) + 300),
         )
+        try:
+            lease_result = resources.renew_resources(
+                lease_owner,
+                task_resources,
+                ttl_seconds=lease_ttl,
+            )
+            lease_mode = "renewed"
+        except (
+            resources.ResourceLeaseMissing,
+            resources.ResourceLeaseExpired,
+        ):
+            if lease_metadata is None:
+                raise RuntimeError("task lease metadata missing for reacquisition")
+            recovery_lease_metadata = dict(lease_metadata)
+            recovery_lease_metadata["recovered_after_expiry"] = True
+            lease_result = resources.acquire_resources(
+                lease_owner,
+                task_resources,
+                purpose=f"persistent task {task_id}",
+                ttl_seconds=lease_ttl,
+                metadata=recovery_lease_metadata,
+                _preserve_live_same_owner=True,
+            )
+            lease_mode = (
+                "reconciled" if lease_result.get("preserved") else "reacquired"
+            )
     launcher = _launch(candidate)
     if interrupted_recovery_binding is not None:
         launcher = {
@@ -4983,6 +5006,7 @@ def grabowski_task_resume(
         "resource_lease_expires_at_unix": (
             lease_result["expires_at_unix"] if lease_result else None
         ),
+        "resource_lease_mode": lease_mode,
         "resource_lease_maintenance": lease_maintenance,
         "interrupted_recovery_binding": interrupted_recovery_binding,
     }

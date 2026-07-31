@@ -250,6 +250,18 @@ class ResourceSchemaInventoryChanged(RuntimeError):
     pass
 
 
+class ResourceLeaseMissing(ValueError):
+    """No lease exists for a requested resource key."""
+
+    pass
+
+
+class ResourceLeaseExpired(RuntimeError):
+    """The observed lease generation is no longer live and may be reacquired."""
+
+    pass
+
+
 @contextmanager
 def _resource_inventory_readonly_sqlite(path: Path) -> Iterator[sqlite3.Connection]:
     with sqlite_store.inventory_readonly_sqlite(
@@ -1014,6 +1026,15 @@ def _row_metadata(row: sqlite3.Row) -> dict[str, Any]:
     return value
 
 
+def _lease_identity_metadata(
+    metadata: dict[str, Any], *, preserve_task_attempt: bool
+) -> dict[str, Any]:
+    ignored = {"work_admission"}
+    if preserve_task_attempt:
+        ignored.update({"attempt", "recovered_after_expiry"})
+    return {key: value for key, value in metadata.items() if key not in ignored}
+
+
 def _scope_manifest_from_metadata(metadata: dict[str, Any], *, required: bool) -> dict[str, Any] | None:
     value = metadata.get("scope_manifest")
     if value is None and not required:
@@ -1220,6 +1241,37 @@ def _normalize_expected_lease_snapshots(
         if not key.startswith("path:"):
             raise ValueError("obsolete lease reconciliation accepts exact path leases only")
         if item["owner_id"] != owner_id:
+            raise PermissionError("expected lease snapshot is owned by another owner")
+        for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+            if type(item[field]) is not int:
+                raise ValueError(f"expected lease {field} is invalid")
+        if not (
+            item["acquired_at_unix"] <= item["updated_at_unix"]
+            < item["expires_at_unix"]
+        ):
+            raise ValueError("expected lease timestamps are inconsistent")
+        if not isinstance(item["metadata_sha256"], str) or SHA256_RE.fullmatch(
+            item["metadata_sha256"]
+        ) is None:
+            raise ValueError("expected lease metadata SHA-256 is invalid")
+        snapshots.append({**item, "resource_key": key})
+    snapshots.sort(key=lambda item: item["resource_key"])
+    if [item["resource_key"] for item in snapshots] != resource_keys:
+        raise ValueError("expected lease snapshots do not match resource_keys")
+    return snapshots
+
+
+def _normalize_mutation_lease_snapshots(
+    value: Any, *, expected_owner_id: str | None, resource_keys: list[str]
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) != len(resource_keys):
+        raise ValueError("expected_leases must contain one snapshot per resource key")
+    snapshots: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != LEASE_SNAPSHOT_KEYS:
+            raise ValueError("expected lease snapshot is malformed")
+        key = normalize_resource_key(item["resource_key"])
+        if expected_owner_id is not None and item["owner_id"] != expected_owner_id:
             raise PermissionError("expected lease snapshot is owned by another owner")
         for field in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
             if type(item[field]) is not int:
@@ -3601,6 +3653,7 @@ def acquire_resources(
     metadata: dict[str, Any] | None = None,
     nonconflict_proof: dict[str, Any] | None = None,
     admission_assessor: Any | None = None,
+    _preserve_live_same_owner: bool = False,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     task_owner_match = re.fullmatch(r"task:([0-9a-f]{24})", owner)
@@ -3609,7 +3662,13 @@ def acquire_resources(
     ttl = _ttl(ttl_seconds)
     if metadata is not None and not isinstance(metadata, dict):
         raise ValueError("metadata must be an object")
+    if not isinstance(_preserve_live_same_owner, bool):
+        raise ValueError("_preserve_live_same_owner must be boolean")
+    if _preserve_live_same_owner and task_owner_match is None:
+        raise PermissionError("live lease preservation requires a task owner")
     normalized_metadata: dict[str, Any] = {} if metadata is None else dict(metadata)
+    if "work_admission" in normalized_metadata:
+        raise ValueError("metadata.work_admission is not a public authority surface")
     if "scope_manifest" in normalized_metadata:
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
@@ -3707,6 +3766,7 @@ def acquire_resources(
         )
     expires = now + ttl
     reclaimed: list[dict[str, Any]] = []
+    preserved: list[str] = []
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -3757,19 +3817,72 @@ def acquire_resources(
             if nonconflict_exception is not None:
                 persisted_metadata["nonconflict_exception"] = nonconflict_exception
             metadata_json, metadata_sha256 = _metadata(persisted_metadata)
+            requested_identity_metadata = _lease_identity_metadata(
+                persisted_metadata,
+                preserve_task_attempt=_preserve_live_same_owner,
+            )
             for key in keys:
                 row = existing.get(key)
-                acquired = now if row is None or row["owner_id"] != owner else row["acquired_at_unix"]
+                live_same_owner = (
+                    row is not None
+                    and row["owner_id"] == owner
+                    and int(row["expires_at_unix"]) > now
+                )
                 previous_owner = None
-                if row is not None and row["owner_id"] != owner:
-                    previous_owner = row["owner_id"]
-                    reclaimed.append(
-                        {
-                            "resource_key": key,
-                            "previous_owner_id": previous_owner,
-                            "previous_expires_at_unix": row["expires_at_unix"],
-                        }
+                reclaimed_from_owner = None
+                stored_purpose = lease_purpose
+                stored_metadata_json = metadata_json
+                stored_metadata_sha256 = metadata_sha256
+                if live_same_owner:
+                    observed_metadata = _row_metadata(row)
+                    _, observed_metadata_sha256 = _metadata(observed_metadata)
+                    if row["metadata_sha256"] != observed_metadata_sha256:
+                        raise RuntimeError(
+                            f"Resource lease metadata integrity mismatch: {key}"
+                        )
+                    if "nonconflict_exception" in observed_metadata:
+                        raise RuntimeError(
+                            "non-conflict exception leases are non-renewable; reassess and reacquire"
+                        )
+                    observed_identity_metadata = _lease_identity_metadata(
+                        observed_metadata,
+                        preserve_task_attempt=_preserve_live_same_owner,
                     )
+                    if (
+                        row["purpose"] != lease_purpose
+                        or observed_identity_metadata != requested_identity_metadata
+                    ):
+                        raise RuntimeError(
+                            "Live same-owner lease identity changed; release and "
+                            f"reacquire: {key}"
+                        )
+                    acquired = int(row["acquired_at_unix"])
+                    current_expires = int(row["expires_at_unix"])
+                    lease_expires = max(current_expires, expires)
+                    updated = (
+                        now
+                        if lease_expires > current_expires
+                        else int(row["updated_at_unix"])
+                    )
+                    reclaimed_from_owner = row["reclaimed_from_owner"]
+                    stored_purpose = str(row["purpose"])
+                    stored_metadata_json = str(row["metadata_json"])
+                    stored_metadata_sha256 = observed_metadata_sha256
+                    preserved.append(key)
+                else:
+                    acquired = now
+                    updated = now
+                    lease_expires = expires
+                    if row is not None:
+                        previous_owner = row["owner_id"]
+                        reclaimed_from_owner = previous_owner
+                        reclaimed.append(
+                            {
+                                "resource_key": key,
+                                "previous_owner_id": previous_owner,
+                                "previous_expires_at_unix": row["expires_at_unix"],
+                            }
+                        )
                 connection.execute(
                     """
                     INSERT INTO leases(
@@ -3790,13 +3903,13 @@ def acquire_resources(
                     (
                         key,
                         owner,
-                        lease_purpose,
+                        stored_purpose,
                         acquired,
-                        now,
-                        expires,
-                        metadata_sha256,
-                        metadata_json,
-                        previous_owner,
+                        updated,
+                        lease_expires,
+                        stored_metadata_sha256,
+                        stored_metadata_json,
+                        reclaimed_from_owner,
                     ),
                 )
             rows = connection.execute(
@@ -3811,9 +3924,11 @@ def acquire_resources(
     return {
         "owner_id": owner,
         "acquired_at_unix": now,
-        "expires_at_unix": expires,
+        "requested_expires_at_unix": expires,
+        "expires_at_unix": min(int(row["expires_at_unix"]) for row in rows),
         "leases": [_public(row) for row in rows],
         "reclaimed": reclaimed,
+        "preserved": preserved,
         "bureau_contract": bureau_contract,
         "nonconflict_exception": nonconflict_exception,
         "work_admission": admission_evidence,
@@ -3825,15 +3940,23 @@ def renew_resources(
     resource_keys: Iterable[str],
     *,
     ttl_seconds: int = 3600,
+    expected_leases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     keys = normalize_resource_keys(resource_keys)
     ttl = _ttl(ttl_seconds)
+    expected_by_key: dict[str, dict[str, Any]] | None = None
+    if expected_leases is not None:
+        snapshots = _normalize_mutation_lease_snapshots(
+            expected_leases, expected_owner_id=owner, resource_keys=keys
+        )
+        expected_by_key = {item["resource_key"]: item for item in snapshots}
     bureau_contract = bureau_leases.enforce_bureau_lease_renewal(
         keys, ttl_seconds=ttl
     )
     now = _now()
-    expires = now + ttl
+    requested_expires = now + ttl
+    updates: list[tuple[int, int, str, str]] = []
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
         try:
@@ -3850,19 +3973,31 @@ def renew_resources(
                     (key,),
                 ).fetchone()
                 if row is None:
-                    raise ValueError(f"Unknown resource lease: {key}")
+                    raise ResourceLeaseMissing(f"Unknown resource lease: {key}")
                 if row["owner_id"] != owner:
                     raise PermissionError(f"Resource lease is owned by another owner: {key}")
                 if row["expires_at_unix"] <= now:
-                    raise RuntimeError(f"Resource lease has expired: {key}")
+                    raise ResourceLeaseExpired(f"Resource lease has expired: {key}")
+                if expected_by_key is not None and _release_lease_snapshot(
+                    row
+                ) != expected_by_key[key]:
+                    raise RuntimeError(f"Resource lease changed before renew: {key}")
                 if "nonconflict_exception" in _row_metadata(row):
                     raise RuntimeError(
                         "non-conflict exception leases are non-renewable; reassess and reacquire"
                     )
+                updates.append(
+                    (
+                        now,
+                        max(int(row["expires_at_unix"]), requested_expires),
+                        key,
+                        owner,
+                    )
+                )
             connection.executemany(
                 "UPDATE leases SET updated_at_unix=?, expires_at_unix=? "
                 "WHERE resource_key=? AND owner_id=?",
-                [(now, expires, key, owner) for key in keys],
+                updates,
             )
             rows = connection.execute(
                 f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)}) "
@@ -3875,6 +4010,9 @@ def renew_resources(
             raise
     return {
         "owner_id": owner,
+        "requested_expires_at_unix": requested_expires,
+        "expires_at_unix": min(int(row["expires_at_unix"]) for row in rows),
+        "snapshot_guarded": expected_by_key is not None,
         "leases": [_public(row) for row in rows],
         "bureau_contract": bureau_contract,
     }
@@ -3885,9 +4023,18 @@ def release_resources(
     resource_keys: Iterable[str],
     *,
     force: bool = False,
+    expected_leases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     owner = _owner(owner_id)
     keys = normalize_resource_keys(resource_keys)
+    expected_by_key: dict[str, dict[str, Any]] | None = None
+    if expected_leases is not None:
+        snapshots = _normalize_mutation_lease_snapshots(
+            expected_leases,
+            expected_owner_id=None if force else owner,
+            resource_keys=keys,
+        )
+        expected_by_key = {item["resource_key"]: item for item in snapshots}
     released: list[dict[str, Any]] = []
     with _database() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -3897,9 +4044,17 @@ def release_resources(
                     "SELECT * FROM leases WHERE resource_key=?", (key,)
                 ).fetchone()
                 if row is None:
+                    if expected_by_key is not None:
+                        raise RuntimeError(
+                            f"Resource lease disappeared before release: {key}"
+                        )
                     continue
                 if not force and row["owner_id"] != owner:
                     raise PermissionError(f"Resource lease is owned by another owner: {key}")
+                if expected_by_key is not None and _release_lease_snapshot(
+                    row
+                ) != expected_by_key[key]:
+                    raise RuntimeError(f"Resource lease changed before release: {key}")
                 released.append(_public(row))
             if released:
                 connection.executemany(
@@ -3910,7 +4065,12 @@ def release_resources(
         except Exception:
             connection.rollback()
             raise
-    return {"owner_id": owner, "force": force, "released": released}
+    return {
+        "owner_id": owner,
+        "force": force,
+        "snapshot_guarded": expected_by_key is not None,
+        "released": released,
+    }
 
 
 def inspect_resource(resource_key: str) -> dict[str, Any] | None:
@@ -4178,10 +4338,16 @@ def grabowski_resource_renew(
     owner_id: str,
     resource_keys: list[str],
     ttl_seconds: int = 3600,
+    expected_leases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Renew live resource leases owned by one owner."""
+    """Renew owner leases without shortening them; optionally bind exact snapshots."""
     operator._require_operator_mutation("resource_lease")
-    result = renew_resources(owner_id, resource_keys, ttl_seconds=ttl_seconds)
+    result = renew_resources(
+        owner_id,
+        resource_keys,
+        ttl_seconds=ttl_seconds,
+        expected_leases=expected_leases,
+    )
     base._append_audit(
         {
             "timestamp_unix": _now(),
@@ -4189,6 +4355,7 @@ def grabowski_resource_renew(
             "owner_id": result["owner_id"],
             "resource_keys": [item["resource_key"] for item in result["leases"]],
             "bureau_contract": result.get("bureau_contract"),
+            "snapshot_guarded": result["snapshot_guarded"],
         }
     )
     return result
@@ -4199,12 +4366,18 @@ def grabowski_resource_release(
     owner_id: str,
     resource_keys: list[str],
     force: bool = False,
+    expected_leases: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Release owner-bound resource leases; force is an explicit high-risk override."""
+    """Release owner leases; exact snapshots prevent stale same-owner release."""
     operator._require_operator_mutation("resource_lease")
     if not isinstance(force, bool):
         raise ValueError("force must be boolean")
-    result = release_resources(owner_id, resource_keys, force=force)
+    result = release_resources(
+        owner_id,
+        resource_keys,
+        force=force,
+        expected_leases=expected_leases,
+    )
     base._append_audit(
         {
             "timestamp_unix": _now(),
@@ -4212,6 +4385,7 @@ def grabowski_resource_release(
             "owner_id": result["owner_id"],
             "resource_keys": [item["resource_key"] for item in result["released"]],
             "force": force,
+            "snapshot_guarded": result["snapshot_guarded"],
         }
     )
     return result
