@@ -4661,6 +4661,42 @@ def grabowski_task_start(
         operation_identity,
         cwd=working_directory,
     )
+    task_id = uuid.uuid4().hex[:24]
+    operation_resolution = _resolve_task_operation_identity(
+        normalized_operation_identity,
+        supersedes_task_id=supersedes_task_id,
+        supersedes_receipt_sha256=supersedes_receipt_sha256,
+        force_new_reason=force_new_reason,
+    )
+    reused_record = operation_resolution["reuse"]
+    if reused_record is not None:
+        reuse_audit = {
+            "timestamp_unix": _now(),
+            "operation": "task-start-deduplicated",
+            "requested_task_id": task_id,
+            "reused_task_id": str(reused_record["task_id"]),
+            "reuse_reason": operation_resolution["reuse_reason"],
+            "operation_identity_sha256": normalized_operation_identity[
+                "operation_identity_sha256"
+            ],
+            "no_process_started": True,
+        }
+        base._append_audit(reuse_audit)
+        return {
+            "task": _public(reused_record),
+            "audit": reuse_audit,
+            "execution_identity": _record_execution_identity(reused_record),
+            "retry_binding": _persisted_retry_binding_or_raise(reused_record),
+            "routing_shadow_capture": None,
+            "operation_identity": normalized_operation_identity,
+            "operation_retry_binding": None,
+            "deduplicated_reuse": {
+                "reused": True,
+                "task_id": str(reused_record["task_id"]),
+                "reason": operation_resolution["reuse_reason"],
+            },
+        }
+    operation_retry_binding = operation_resolution["retry_binding"]
     requested_resources = _resource_keys(resource_keys)
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
@@ -4680,7 +4716,6 @@ def grabowski_task_start(
         if chronik_enabled
         else None
     )
-    task_id = uuid.uuid4().hex[:24]
     lease_owner = _lease_owner(task_id)
     repository_resource = _task_repository_resource(task_resources)
     repository_scope_manifest = (
@@ -4765,41 +4800,6 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
-    operation_resolution = _resolve_task_operation_identity(
-        normalized_operation_identity,
-        supersedes_task_id=supersedes_task_id,
-        supersedes_receipt_sha256=supersedes_receipt_sha256,
-        force_new_reason=force_new_reason,
-    )
-    reused_record = operation_resolution["reuse"]
-    if reused_record is not None:
-        reuse_audit = {
-            "timestamp_unix": _now(),
-            "operation": "task-start-deduplicated",
-            "requested_task_id": task_id,
-            "reused_task_id": str(reused_record["task_id"]),
-            "reuse_reason": operation_resolution["reuse_reason"],
-            "operation_identity_sha256": normalized_operation_identity[
-                "operation_identity_sha256"
-            ],
-            "no_process_started": True,
-        }
-        base._append_audit(reuse_audit)
-        return {
-            "task": _public(reused_record),
-            "audit": reuse_audit,
-            "execution_identity": _record_execution_identity(reused_record),
-            "retry_binding": _persisted_retry_binding_or_raise(reused_record),
-            "routing_shadow_capture": None,
-            "operation_identity": normalized_operation_identity,
-            "operation_retry_binding": None,
-            "deduplicated_reuse": {
-                "reused": True,
-                "task_id": str(reused_record["task_id"]),
-                "reason": operation_resolution["reuse_reason"],
-            },
-        }
-    operation_retry_binding = operation_resolution["retry_binding"]
     retry_binding = (
         None
         if operation_retry_binding is not None
