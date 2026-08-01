@@ -285,8 +285,15 @@ class TaskTests(unittest.TestCase):
         self.assertIn("--property=UMask=0077", launch)
         self.assertEqual(launch.count("--property=StandardOutput=null"), 1)
         self.assertEqual(launch.count("--property=StandardError=journal"), 1)
-        self.assertFalse(
-            any(item.startswith("--property=LogRateLimit") for item in launch)
+        self.assertEqual(tasks.TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS, 30)
+        self.assertEqual(tasks.TASK_LOG_RATE_LIMIT_BURST, 200)
+        self.assertEqual(
+            launch.count("--property=LogRateLimitIntervalSec=30s"),
+            1,
+        )
+        self.assertEqual(
+            launch.count("--property=LogRateLimitBurst=200"),
+            1,
         )
         separator = launch.index("--")
         capture = launch[separator + 1 :]

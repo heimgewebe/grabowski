@@ -90,6 +90,8 @@ TASK_OUTPUT_DIRECTORY_PREFIX = ".grabowski-task-output"
 TASK_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
 TASK_OUTPUT_TAIL_BYTES = 64 * 1024
 TASK_OUTPUT_CAPTURE_PYTHON = "/usr/bin/python3"
+TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS = 30
+TASK_LOG_RATE_LIMIT_BURST = 200
 TASK_OUTPUT_CAPTURE_CODE = r"""
 import os
 import signal
@@ -4248,6 +4250,8 @@ def _launch_argv(record: dict[str, Any]) -> list[str]:
         "--property=UMask=0077",
         "--property=StandardOutput=null",
         "--property=StandardError=journal",
+        f"--property=LogRateLimitIntervalSec={TASK_LOG_RATE_LIMIT_INTERVAL_SECONDS}s",
+        f"--property=LogRateLimitBurst={TASK_LOG_RATE_LIMIT_BURST}",
         f"--property=RuntimeMaxSec={record['runtime_seconds']}s",
         f"--property=WorkingDirectory={record['cwd']}",
         f"--property=CPUWeight={record['cpu_weight']}",
