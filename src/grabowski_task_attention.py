@@ -2857,6 +2857,15 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             raise TaskAttentionIntegrityError(
                 "task archive projection readback did not contain the archived task"
             )
+        resource_release = _release_owned_archive_resources(
+            owner,
+            resources_to_hold,
+        )
+        if resource_release.get("status") not in {"released", "not_required"}:
+            raise TaskAttentionConflictError(
+                "task archive resources could not be released before output cleanup"
+            )
+        lease_result = None
         cleanup_archive_binding = _task_output_cleanup_archive_binding(
             manifest,
             record_sha256=record_sha256,

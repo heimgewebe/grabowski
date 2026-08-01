@@ -3026,7 +3026,7 @@
       "src/grabowski_self_deploy.py": "0f9cfa2259314438c345f22f5eba131332d71b72f759952f315fed1fef5111b8",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_system_map.py": "16dda15f49bf6e0993510455313c24172625dcddba1123eaad096e393b78908c",
-      "src/grabowski_task_attention.py": "0d7b323ff6fe67d1acb678fdc538eeb9b28473503a1c38a13a91310a8e157ad1",
+      "src/grabowski_task_attention.py": "c369a09ca1cdccc41ba221abd2a7c597fe95cd0a508fba203fcdfed78f23648e",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
       "src/grabowski_tasks.py": "0ecef71184aca2bf8cda608a901e008fb59e2867e8c5a73dec5e2b910e1c18aa",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
