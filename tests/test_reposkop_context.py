@@ -45,33 +45,61 @@ class ReposkopContextTests(unittest.TestCase):
         self,
         *,
         effect_authorized: bool = False,
-        schema_version: object = 1,
+        schema_version: object = 2,
         observation_kind: str = "reposkop_checkout_observation",
-        observation_schema_version: int = 1,
+        observation_schema_version: int = 2,
         projection_kind: str = "reposkop_coherence_projection",
         projection_schema_version: int = 1,
     ) -> dict[str, object]:
         target = str(self.repo.resolve())
         purpose = "grabowski-repo-state-context"
-        return {
+        observation: dict[str, object] = {
+            "kind": observation_kind,
+            "schema_version": observation_schema_version,
+            "observed_at": "2026-07-29T08:00:00Z",
+            "authority": {
+                "producer": "reposkop",
+                "domain": "local_checkout_identity",
+                "claim": "canonical",
+            },
+            "observation_complete": True,
+            "identities": {
+                "path": target,
+                "purpose": purpose,
+                "repository_identity_sha256": "d" * 64,
+                "checkout_identity_sha256": "e" * 64,
+            },
+        }
+        observation["observation_sha256"] = context._reposkop_artifact_sha256(
+            observation
+        )
+        projection: dict[str, object] = {
+            "kind": projection_kind,
+            "schema_version": projection_schema_version,
+            "observation_sha256": observation["observation_sha256"],
+            "effect_authorized": False,
+        }
+        projection["projection_sha256"] = context._reposkop_artifact_sha256(
+            projection
+        )
+        report: dict[str, object] = {
             "kind": "reposkop_coherence_report",
             "schema_version": schema_version,
             "generated_at": "2026-07-29T08:00:00Z",
+            "authority_boundary": {
+                "checkout_identity_truth": "reposkop",
+                "checkout_transition_truth": "reposkop",
+                "effect_executor": "grabowski",
+                "task_truth": "bureau",
+                "pull_request_truth": "github",
+                "display": "leitstand",
+            },
             "effect_authorized": effect_authorized,
-            "report_sha256": "a" * 64,
-            "observation": {
-                "kind": observation_kind,
-                "schema_version": observation_schema_version,
-                "observation_sha256": "b" * 64,
-                "identities": {"path": target, "purpose": purpose},
-            },
-            "projection": {
-                "kind": projection_kind,
-                "schema_version": projection_schema_version,
-                "projection_sha256": "c" * 64,
-                "effect_authorized": False,
-            },
+            "observation": observation,
+            "projection": projection,
         }
+        report["report_sha256"] = context._reposkop_artifact_sha256(report)
+        return report
 
     def patches(
         self,
@@ -232,6 +260,44 @@ class ReposkopContextTests(unittest.TestCase):
         ):
             context._validate_executable(linked / "reposkop")
 
+    def test_capture_timestamps_do_not_change_semantic_receipt_key(self) -> None:
+        first = self.report()
+        second = json.loads(json.dumps(first))
+        second["generated_at"] = "2026-07-29T08:01:00Z"
+        second["observation"]["observed_at"] = "2026-07-29T08:01:00Z"
+        observation = second["observation"]
+        observation.pop("observation_sha256", None)
+        observation["observation_sha256"] = context._reposkop_artifact_sha256(
+            observation
+        )
+        projection = second["projection"]
+        projection["observation_sha256"] = observation["observation_sha256"]
+        projection.pop("projection_sha256", None)
+        projection["projection_sha256"] = context._reposkop_artifact_sha256(
+            projection
+        )
+        second.pop("report_sha256", None)
+        second["report_sha256"] = context._reposkop_artifact_sha256(second)
+
+        executable = {"sha256": "f" * 64}
+        first_binding = context._usage_binding(
+            first,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+            executable=executable,
+        )
+        second_binding = context._usage_binding(
+            second,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+            executable=executable,
+        )
+        self.assertNotEqual(first["report_sha256"], second["report_sha256"])
+        self.assertEqual(
+            first_binding["usage_key_sha256"], second_binding["usage_key_sha256"]
+        )
+        self.assertEqual(first_binding["data"], second_binding["data"])
+
     def test_records_one_receipt_and_replays_unchanged_semantic_state(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):
@@ -279,6 +345,36 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertFalse(receipt["effect_authorized"])
         self.assertNotIn("recorded_at", receipt)
         self.assertNotIn("report_sha256", receipt)
+        self.assertNotIn("observation_sha256", receipt)
+        self.assertNotIn("projection_sha256", receipt)
+        self.assertEqual(
+            receipt["repository_identity_sha256"],
+            first["report"]["observation"]["identities"][
+                "repository_identity_sha256"
+            ],
+        )
+        self.assertEqual(
+            receipt["checkout_identity_sha256"],
+            first["report"]["observation"]["identities"][
+                "checkout_identity_sha256"
+            ],
+        )
+        self.assertRegex(receipt["semantic_observation_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(receipt["semantic_projection_sha256"], r"^[0-9a-f]{64}$")
+        audit_record = self.audit_records[0]
+        self.assertEqual(
+            audit_record["receipt_schema_version"], receipt["schema_version"]
+        )
+        for field in (
+            "reposkop_executable_sha256",
+            "repository_identity_sha256",
+            "checkout_identity_sha256",
+            "semantic_observation_sha256",
+            "semantic_projection_sha256",
+        ):
+            self.assertEqual(audit_record[field], receipt[field])
+        self.assertNotIn("observation_sha256", audit_record)
+        self.assertNotIn("projection_sha256", audit_record)
         self.assertEqual(first["report"]["effect_authorized"], False)
         self.assertEqual(len(self.run_calls), 2)
         self.assertTrue(
@@ -1210,7 +1306,7 @@ class ReposkopContextTests(unittest.TestCase):
                 "observation kind or schema",
             ),
             (
-                self.report(observation_schema_version=2),
+                self.report(observation_schema_version=3),
                 "observation kind or schema",
             ),
             (
