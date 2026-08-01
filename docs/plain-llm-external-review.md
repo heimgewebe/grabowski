@@ -79,10 +79,12 @@ requested model label, source identifier, transport, tool policy, verdict,
 finding count, and response hashes. It also recomputes a canonical digest over
 `verdict`, `finding_count`, and `findings`, so retained structured review data
 cannot be edited independently of the digest checked by the gate. The gate also
-opens the retained raw response beneath the explicitly supplied repository root
-without following symlinks, bounds and identity-checks the private file while
-reading it, verifies its stdout hash, parses it with the adapter's strict parser,
-and requires the parsed raw response to equal those structured evidence fields.
+opens the retained raw response beneath the evidence artifact directory without
+following symlinks, bounds and identity-checks the private file while reading
+it, verifies its stdout hash, parses it with the adapter's strict parser, and
+requires the parsed raw response to equal those structured evidence fields. The
+adapter requires custom raw-review and transmitted-prompt outputs to stay below
+that same directory before it invokes the provider.
 
 Any path escape, stale digest, malformed identity, oversized prompt or provider
 output, colliding or existing output artifact, provider failure, empty response,

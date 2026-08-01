@@ -703,6 +703,38 @@ class PlainExternalReviewTests(unittest.TestCase):
                 )
             run.assert_not_called()
 
+    def test_rejects_artifacts_outside_evidence_directory_before_provider_invocation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            artifact_directory = root / "artifacts"
+            output = artifact_directory / "evidence.json"
+            raw_review = root / "escaped-review.txt"
+            with (
+                mock.patch.object(plain, "run_provider") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "raw review output must stay inside the evidence "
+                    "artifact directory",
+                ),
+            ):
+                plain.run_from_manifest(
+                    manifest_path=manifest,
+                    output_path=output,
+                    raw_review_path=raw_review,
+                    transmitted_prompt_path=None,
+                    provider="grok",
+                    executable="grok",
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=100_000,
+                )
+            run.assert_not_called()
+            self.assertFalse(artifact_directory.exists())
+            self.assertFalse(raw_review.exists())
+
     def test_rejects_oversized_provider_output_without_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1995,6 +2027,42 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(
                 output.with_suffix(".prompt.txt").exists()
             )
+
+    def test_main_rejects_surrogate_model_before_provider_invocation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(plain, "run_provider") as run,
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "grok",
+                        "--executable",
+                        "grok",
+                        "--model",
+                        "grok-\ud800",
+                    ]
+                )
+
+            self.assertEqual(rc, 2)
+            self.assertIn(
+                "provider model label is missing or invalid",
+                stderr.getvalue(),
+            )
+            self.assertNotIn("Traceback", stderr.getvalue())
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
 
 if __name__ == "__main__":

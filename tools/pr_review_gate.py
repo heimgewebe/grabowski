@@ -2920,7 +2920,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         self_review = load_self_review(resolve_inside_repo(repo, args.self_review, label="self-review"))
         claude_evidence = load_claude_evidence(resolve_inside_repo(repo, args.claude_evidence, label="Claude evidence"))
-        external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
+        external_review_evidence_path = resolve_inside_repo(
+            repo,
+            args.external_review_evidence,
+            label="external review evidence",
+        )
+        external_review_evidence = load_external_review_evidence(
+            external_review_evidence_path
+        )
         policy_waiver = load_policy_waiver(resolve_inside_repo(repo, args.policy_waiver, label="Claude policy waiver"))
         state = load_pr_state(repo, args.pr)
         packet = None
@@ -2940,7 +2947,11 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
-            external_review_artifact_root=repo,
+            external_review_artifact_root=(
+                external_review_evidence_path.parent
+                if external_review_evidence_path is not None
+                else repo
+            ),
             policy_waiver=policy_waiver,
             expected_check_names=expected_check_names_for_repo(
                 repo,

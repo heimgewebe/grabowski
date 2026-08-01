@@ -1707,6 +1707,35 @@ def ensure_distinct_output_paths(paths: list[Path]) -> None:
         )
 
 
+def validate_output_artifact_paths(
+    output_path: Path,
+    raw_review_path: Path,
+    transmitted_prompt_path: Path,
+) -> None:
+    labelled_paths = (
+        ("evidence output", output_path),
+        ("raw review output", raw_review_path),
+        ("transmitted prompt output", transmitted_prompt_path),
+    )
+    for label, path in labelled_paths:
+        path_text = os.fspath(path)
+        if "\x00" in path_text or _contains_unicode_surrogate(path_text):
+            raise PlainReviewError(f"{label} contains invalid path text")
+    try:
+        artifact_root = output_path.parent.resolve(strict=False)
+        resolved_paths = {
+            label: path.resolve(strict=False)
+            for label, path in labelled_paths[1:]
+        }
+    except (OSError, RuntimeError) as exc:
+        raise PlainReviewError(f"cannot resolve output artifact path: {exc}") from exc
+    for label, resolved in resolved_paths.items():
+        if resolved == artifact_root or artifact_root not in resolved.parents:
+            raise PlainReviewError(
+                f"{label} must stay inside the evidence artifact directory"
+            )
+
+
 def build_evidence(
     *,
     manifest: dict[str, Any],
@@ -1852,6 +1881,28 @@ def run_from_manifest(
 ) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
+    if (
+        not isinstance(executable, str)
+        or not executable
+        or "\x00" in executable
+        or _contains_unicode_surrogate(executable)
+    ):
+        raise PlainReviewError("provider executable is missing or invalid")
+    if model is not None and (
+        not isinstance(model, str)
+        or not model.strip()
+        or "\x00" in model
+        or _contains_unicode_surrogate(model)
+    ):
+        raise PlainReviewError("provider model label is missing or invalid")
+    raw_path = raw_review_path or output_path.with_suffix(".review.txt")
+    sent_prompt_path = (
+        transmitted_prompt_path or output_path.with_suffix(".prompt.txt")
+    )
+    validate_output_artifact_paths(output_path, raw_path, sent_prompt_path)
+    ensure_distinct_output_paths(
+        [output_path, raw_path, sent_prompt_path]
+    )
     try:
         manifest_path = manifest_path.resolve(strict=True)
         manifest_expected = manifest_path.lstat()
@@ -1905,13 +1956,6 @@ def run_from_manifest(
             f"{len(prompt_bytes)} bytes > {max_prompt_bytes}"
         )
     _validate_provider_prompt_transport(provider, prompt_bytes)
-    raw_path = raw_review_path or output_path.with_suffix(".review.txt")
-    sent_prompt_path = (
-        transmitted_prompt_path or output_path.with_suffix(".prompt.txt")
-    )
-    ensure_distinct_output_paths(
-        [output_path, raw_path, sent_prompt_path]
-    )
     if output_path.exists():
         raise PlainReviewError(f"evidence output already exists: {output_path}")
     if raw_path.exists():
