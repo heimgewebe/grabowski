@@ -383,6 +383,19 @@ class PlainExternalReviewTests(unittest.TestCase):
                 evidence["reviews"][0]["findings"][0]["file"],
                 "x.py",
             )
+            review = evidence["reviews"][0]
+            self.assertEqual(
+                review["parsed_review_sha256"],
+                plain.plain_llm_review_payload_sha256(
+                    verdict=review["verdict"],
+                    finding_count=review["finding_count"],
+                    findings=review["findings"],
+                ),
+            )
+            self.assertNotEqual(
+                review["parsed_review_sha256"],
+                review["stdout_sha256"],
+            )
             self.assertEqual(
                 schemas.EXTERNAL_REVIEW_SCHEMA.validate(evidence),
                 (),

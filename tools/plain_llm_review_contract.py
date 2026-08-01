@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from typing import Any
 
 PLAIN_LLM_REVIEW_INPUT_MODE = "plain_llm_single_turn_v1"
 PLAIN_LLM_REVIEW_SOURCE_PREFIX = "plain-llm:"
@@ -42,6 +45,27 @@ PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS = frozenset(
         "PATH",
     }
 )
+
+
+def plain_llm_review_payload_sha256(
+    *,
+    verdict: Any,
+    finding_count: Any,
+    findings: Any,
+) -> str:
+    """Hash the exact structured plain-LLM review fields the gate consumes."""
+    payload = {
+        "verdict": verdict,
+        "finding_count": finding_count,
+        "findings": findings,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def build_plain_llm_review_prompt(

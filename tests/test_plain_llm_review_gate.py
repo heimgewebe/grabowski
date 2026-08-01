@@ -108,6 +108,11 @@ def _plain_external_evidence(
     prompt_sha256 = gate._sha256_text(prompt)
     packet_prompt_sha256 = gate._sha256_text(packet_prompt)
     response_sha256 = "2" * 64
+    parsed_review_sha256 = gate.plain_llm_review_payload_sha256(
+        verdict="PASS",
+        finding_count=0,
+        findings=[],
+    )
     return {
         "schema_version": 1,
         "kind": "external_review",
@@ -191,6 +196,7 @@ def _plain_external_evidence(
                 "stdout_sha256": response_sha256,
                 "stderr_sha256": "4" * 64,
                 "review_sha256": response_sha256,
+                "parsed_review_sha256": parsed_review_sha256,
                 "verdict": "PASS",
                 "finding_count": 0,
                 "findings": [],
@@ -356,6 +362,41 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         )
         self.assertIn(
             "tool_policy does not match provider contract", warnings
+        )
+
+    def test_parsed_review_fields_are_bound_to_canonical_digest(self) -> None:
+        evidence = _plain_external_evidence(_state())
+        review = evidence["reviews"][0]
+        review.update(
+            verdict="BLOCK",
+            finding_count=1,
+            findings=[
+                {
+                    "severity": "high",
+                    "summary": "Original concrete issue",
+                    "file": "tools/example.py",
+                    "line": 7,
+                    "fix": "Repair the issue",
+                }
+            ],
+        )
+        review["parsed_review_sha256"] = (
+            gate.plain_llm_review_payload_sha256(
+                verdict=review["verdict"],
+                finding_count=review["finding_count"],
+                findings=review["findings"],
+            )
+        )
+        review["findings"][0]["summary"] = "Edited after retention"
+        self.assertEqual(
+            gate._plain_llm_external_review_failures(
+                review,
+                evidence["review_input"],
+            ),
+            [
+                "parsed_review_sha256 does not match canonical verdict, "
+                "finding_count, and findings payload"
+            ],
         )
 
     def test_reserved_source_cannot_downgrade_to_legacy_input_mode(

@@ -26,6 +26,7 @@ try:
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
         build_plain_llm_review_prompt,
+        plain_llm_review_payload_sha256,
     )
 except ModuleNotFoundError:  # importlib-based tests load from the repo root
     from tools.plain_llm_review_contract import (
@@ -35,6 +36,7 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
         build_plain_llm_review_prompt,
+        plain_llm_review_payload_sha256,
     )
 
 VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
@@ -1816,6 +1818,11 @@ def build_evidence(
                 "stdout_sha256": sha256_text(completed.stdout),
                 "stderr_sha256": sha256_text(completed.stderr),
                 "review_sha256": sha256_text(completed.stdout),
+                "parsed_review_sha256": plain_llm_review_payload_sha256(
+                    verdict=verdict,
+                    finding_count=finding_count,
+                    findings=review["findings"],
+                ),
                 "verdict": verdict,
                 "finding_count": finding_count,
                 "findings": review["findings"],

@@ -30,6 +30,7 @@ try:
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
         build_plain_llm_review_prompt,
+        plain_llm_review_payload_sha256,
     )
 except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
     from tools.plain_llm_review_contract import (
@@ -42,6 +43,7 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
         build_plain_llm_review_prompt,
+        plain_llm_review_payload_sha256,
     )
 
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
@@ -1532,6 +1534,7 @@ def _plain_llm_external_review_failures(
         "stdout_sha256",
         "stderr_sha256",
         "review_sha256",
+        "parsed_review_sha256",
     ):
         if not _valid_sha256(review.get(key)):
             failures.append(f"{key} is missing or invalid")
@@ -1559,6 +1562,25 @@ def _plain_llm_external_review_failures(
         failures.append("findings is not a list")
     elif valid_count and len(findings) != finding_count:
         failures.append("finding_count does not match findings length")
+    try:
+        expected_parsed_review_sha256 = plain_llm_review_payload_sha256(
+            verdict=verdict,
+            finding_count=finding_count,
+            findings=findings,
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        failures.append("structured review payload is not canonical JSON")
+    else:
+        parsed_review_sha256 = review.get("parsed_review_sha256")
+        if (
+            _valid_sha256(parsed_review_sha256)
+            and _normalize_sha256(parsed_review_sha256)
+            != expected_parsed_review_sha256
+        ):
+            failures.append(
+                "parsed_review_sha256 does not match canonical verdict, "
+                "finding_count, and findings payload"
+            )
     if verdict == "PASS" and valid_count and finding_count != 0:
         failures.append("PASS plain-LLM review must have finding_count 0")
     if (

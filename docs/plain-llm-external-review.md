@@ -76,7 +76,9 @@ prompt independently from the current PR identity and diff. A copied or stale
 prompt hash therefore cannot become valid merely because the adapter asserts it.
 The gate also binds the reconstructed prompt's exact UTF-8 byte count, provider,
 requested model label, source identifier, transport, tool policy, verdict,
-finding count, and response hashes.
+finding count, and response hashes. It also recomputes a canonical digest over
+`verdict`, `finding_count`, and `findings`, so retained structured review data
+cannot be edited independently of the digest checked by the gate.
 
 Any path escape, stale digest, malformed identity, oversized prompt or provider
 output, colliding or existing output artifact, provider failure, empty response,
@@ -155,7 +157,7 @@ The evidence records:
 - packet prompt, transmitted prompt, and nonce;
 - exact diff hash and pull-request head;
 - transmitted prompt and raw response paths;
-- argv, stdout, stderr, and review hashes;
+- argv, stdout, stderr, raw-review, and canonical parsed-review hashes;
 - removed billable API-key and inherited Git-context variable names;
 - the exact passed environment-key names (never values), removed session-variable
   names, Null-stdin, process-group and output-limit policy, and workspace
