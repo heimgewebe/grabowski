@@ -1066,6 +1066,87 @@ class PlainExternalReviewTests(unittest.TestCase):
                 [stat.S_IFREG, stat.S_IFDIR],
             )
 
+    def test_create_only_syncs_every_new_parent_entry_before_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "new" / "nested" / "artifact.txt"
+            real_fsync = plain.os.fsync
+            synced_identities: list[tuple[int, int]] = []
+
+            def tracking_fsync(descriptor: int) -> None:
+                metadata = os.fstat(descriptor)
+                synced_identities.append((metadata.st_dev, metadata.st_ino))
+                real_fsync(descriptor)
+
+            with mock.patch.object(
+                plain.os,
+                "fsync",
+                side_effect=tracking_fsync,
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "durable nested artifact",
+                    label="test artifact",
+                )
+
+            def identity(path: Path) -> tuple[int, int]:
+                metadata = path.stat()
+                return metadata.st_dev, metadata.st_ino
+
+            self.assertEqual(
+                synced_identities,
+                [
+                    identity(root),
+                    identity(root / "new"),
+                    identity(target),
+                    identity(root / "new" / "nested"),
+                ],
+            )
+
+    def test_new_parent_sync_failure_rolls_back_and_allows_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "new" / "nested" / "artifact.txt"
+            real_fsync = plain.os.fsync
+            directory_syncs = 0
+
+            def fail_first_directory_fsync(descriptor: int) -> None:
+                nonlocal directory_syncs
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    directory_syncs += 1
+                    if directory_syncs == 1:
+                        raise OSError("simulated new parent sync failure")
+                real_fsync(descriptor)
+
+            with (
+                mock.patch.object(
+                    plain.os,
+                    "fsync",
+                    side_effect=fail_first_directory_fsync,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "simulated new parent sync failure",
+                ),
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "not durable",
+                    label="test artifact",
+                )
+
+            self.assertEqual(directory_syncs, 2)
+            self.assertFalse((root / "new").exists())
+            plain.write_text_create_only(
+                target,
+                "retry succeeded",
+                label="test artifact",
+            )
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "retry succeeded",
+            )
+
     def test_parent_sync_failure_rolls_back_create_and_allows_retry(
         self,
     ) -> None:
@@ -1453,6 +1534,71 @@ class PlainExternalReviewTests(unittest.TestCase):
                 '{"verdict":"BLOCK","finding_count":1,"findings":['
                 '{"severity":"high","summary":"issue","extra":"x"}]}'
             )
+
+    def test_rejects_surrogate_escapes_in_finding_strings(self) -> None:
+        for field in ("summary", "file", "fix"):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                plain.PlainReviewError,
+                rf"{field} contains an invalid Unicode surrogate",
+            ):
+                finding = {
+                    "severity": "high",
+                    "summary": "issue",
+                    field: "\ud800",
+                }
+                plain.parse_review_json(
+                    json.dumps(
+                        {
+                            "verdict": "BLOCK",
+                            "finding_count": 1,
+                            "findings": [finding],
+                        }
+                    )
+                )
+
+        valid_pair = plain.parse_review_json(
+            '{"verdict":"BLOCK","finding_count":1,"findings":['
+            '{"severity":"high","summary":"\\ud83d\\ude00"}]}'
+        )
+        self.assertEqual(valid_pair["findings"][0]["summary"], "😀")
+
+    def test_surrogate_finding_removes_unpublished_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+
+            def fake_run(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"BLOCK","finding_count":1,"findings":['
+                    '{"severity":"high","summary":"\\ud800"}]}',
+                    "",
+                )
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "summary contains an invalid Unicode surrogate",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="grok",
+                    executable="grok",
+                    model=None,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
     def test_main_reports_provider_failure_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

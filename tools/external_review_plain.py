@@ -205,6 +205,10 @@ def strip_ansi(value: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", value)
 
 
+def _contains_unicode_surrogate(value: str) -> bool:
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
 def _validate_finding(value: Any, index: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise PlainReviewError(f"plain review finding {index} is not an object")
@@ -225,6 +229,11 @@ def _validate_finding(value: Any, index: int) -> dict[str, Any]:
         raise PlainReviewError(
             f"plain review finding {index} summary is missing"
         )
+    if _contains_unicode_surrogate(summary):
+        raise PlainReviewError(
+            f"plain review finding {index} summary contains an invalid "
+            "Unicode surrogate"
+        )
     for key in ("file", "fix"):
         field = value.get(key)
         if field is not None and (
@@ -232,6 +241,11 @@ def _validate_finding(value: Any, index: int) -> dict[str, Any]:
         ):
             raise PlainReviewError(
                 f"plain review finding {index} {key} is not a nonempty string"
+            )
+        if field is not None and _contains_unicode_surrogate(field):
+            raise PlainReviewError(
+                f"plain review finding {index} {key} contains an invalid "
+                "Unicode surrogate"
             )
     line = value.get("line")
     if line is not None and (
@@ -1165,6 +1179,50 @@ def _discard_created_directories(
                     pass
 
 
+def _sync_created_directory_entry(
+    directory: Path,
+    created: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    """Persist one mkdir entry through its verified containing directory."""
+    parent_descriptor = -1
+    try:
+        parent_descriptor = os.open(
+            directory.parent,
+            _parent_directory_open_flags(),
+        )
+        parent_linked = directory.parent.lstat()
+        parent_opened = os.fstat(parent_descriptor)
+        linked_from_parent = os.stat(
+            directory.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        _validate_path_ancestry(
+            directory.parent,
+            label=f"{label} created parent",
+        )
+        if (
+            stat.S_ISLNK(parent_linked.st_mode)
+            or not _is_trusted_ancestry_directory(parent_linked)
+            or not _is_trusted_ancestry_directory(parent_opened)
+            or not _same_file_identity(parent_opened, parent_linked)
+            or not _is_owner_controlled_directory(linked_from_parent)
+            or not _same_file_identity(created, linked_from_parent)
+        ):
+            raise PlainReviewError(
+                f"cannot write {label}: created parent identity drifted"
+            )
+        os.fsync(parent_descriptor)
+    finally:
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+
+
 def _ensure_private_parent_directories(
     path: Path,
     *,
@@ -1223,6 +1281,12 @@ def _ensure_private_parent_directories(
             ):
                 raise PlainReviewError(
                     f"cannot write {label}: unsafe created parent identity"
+                )
+            if created:
+                _sync_created_directory_entry(
+                    directory,
+                    metadata,
+                    label=label,
                 )
         _validate_path_ancestry(parent, label=f"{label} parent")
         return created_directories
