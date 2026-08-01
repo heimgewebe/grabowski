@@ -837,9 +837,17 @@ def run_bounded_process(
                 if len(chunk) > remaining_capacity and failure is None:
                     failure = f"provider {name} exceeds byte limit"
                     _kill_process_group(process)
-        try:
-            returncode = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
+        returncode = process.poll()
+        if returncode is None and failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "provider timed out"
+            else:
+                try:
+                    returncode = process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    failure = "provider timed out"
+        if returncode is None:
             _kill_process_group(process)
             returncode = process.wait(timeout=5)
     finally:

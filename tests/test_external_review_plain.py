@@ -837,6 +837,47 @@ class PlainExternalReviewTests(unittest.TestCase):
                     environment=plain.sanitized_environment()[0],
                 )
 
+    def test_process_timeout_still_applies_after_early_pipe_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            started = plain.time.monotonic()
+            with self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "provider timed out",
+            ):
+                plain.run_bounded_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import os, time; os.close(1); os.close(2); "
+                        "time.sleep(10)",
+                    ],
+                    executable=sys.executable,
+                    cwd=Path(directory),
+                    timeout_seconds=1,
+                    max_output_bytes=1_000,
+                    environment=plain.sanitized_environment()[0],
+                )
+            self.assertLess(plain.time.monotonic() - started, 3)
+
+    def test_process_can_exit_after_five_seconds_within_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            completed = plain.run_bounded_process(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os, time; os.close(1); os.close(2); "
+                    "time.sleep(5.5)",
+                ],
+                executable=sys.executable,
+                cwd=Path(directory),
+                timeout_seconds=8,
+                max_output_bytes=1_000,
+                environment=plain.sanitized_environment()[0],
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "")
+            self.assertEqual(completed.stderr, "")
+
     def test_process_rejects_non_utf8_output_without_rewriting_it(self) -> None:
         json_bytes = (
             "b'{\"verdict\":\"PASS\",\"finding_count\":0,"
