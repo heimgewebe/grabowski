@@ -24,6 +24,8 @@ try:
     from plain_llm_review_contract import (
         PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
         PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_MAX_EVIDENCE_BYTES,
+        PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -37,6 +39,8 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
     from tools.plain_llm_review_contract import (
         PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
         PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_MAX_EVIDENCE_BYTES,
+        PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -73,7 +77,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 }
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
-MAX_PLAIN_LLM_RAW_REVIEW_BYTES = 1_000_000
+MAX_PLAIN_LLM_RAW_REVIEW_BYTES = PLAIN_LLM_MAX_RAW_REVIEW_BYTES
 PASS_CHECK_BUCKETS = {"pass"}
 DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate",
@@ -269,7 +273,7 @@ PR_FIELDS = (
     "files",
 )
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
-MAX_JSON_EVIDENCE_BYTES = 1_000_000
+MAX_JSON_EVIDENCE_BYTES = PLAIN_LLM_MAX_EVIDENCE_BYTES
 
 
 class GateInputError(RuntimeError):

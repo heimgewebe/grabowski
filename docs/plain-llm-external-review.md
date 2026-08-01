@@ -40,9 +40,9 @@ This path is deliberately distinct from coding-agent review:
 - the executable resolves to an owner-controlled, executable regular file that
   is not group- or world-writable; every resolved ancestor must be owned by the
   current user or root and may be group- or world-writable only with sticky-bit
-  replacement protection; Grok additionally requires the canonical native
-  binary under the private `~/.grok/bin` directory rather than an npm or Node
-  trampoline;
+  replacement protection, and the resolved pathname must be valid Unicode;
+  Grok additionally requires the canonical native binary under the private
+  `~/.grok/bin` directory rather than an npm or Node trampoline;
 - the selected temporary base is validated before workspace creation; the
   private workspace has mode `0700`, a trusted full ancestry, and a stable inode
   identity checked immediately before and after the provider turn; readback
@@ -87,6 +87,11 @@ it, verifies its stdout hash, parses it with the adapter's strict parser, and
 requires the parsed raw response to equal those structured evidence fields. The
 adapter requires custom raw-review and transmitted-prompt outputs to stay below
 that same directory before it invokes the provider.
+
+Provider stdout and retained raw review are capped at 1,000,000 bytes. The
+adapter also measures the final pretty-printed UTF-8 evidence and refuses to
+publish it above the gate's shared 1,000,000-byte JSON limit, so every evidence
+file it successfully publishes remains loadable by the gate.
 
 Any path escape, stale digest, malformed identity, oversized prompt or provider
 output, colliding or existing output artifact, provider failure, empty response,

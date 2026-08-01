@@ -167,6 +167,18 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
             self.assertNotIn(
                 "Optional external review evidence invalid", warnings
             )
+            self.assertEqual(
+                plain.PLAIN_LLM_MAX_EVIDENCE_BYTES,
+                gate.MAX_JSON_EVIDENCE_BYTES,
+            )
+            self.assertEqual(
+                plain.PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+                gate.MAX_PLAIN_LLM_RAW_REVIEW_BYTES,
+            )
+            self.assertLessEqual(
+                output.stat().st_size,
+                gate.MAX_JSON_EVIDENCE_BYTES,
+            )
 
 
 if __name__ == "__main__":

@@ -22,6 +22,8 @@ try:
     from plain_llm_review_contract import (
         PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
         PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_MAX_EVIDENCE_BYTES,
+        PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
@@ -32,6 +34,8 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
     from tools.plain_llm_review_contract import (
         PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
         PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_MAX_EVIDENCE_BYTES,
+        PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
@@ -43,7 +47,7 @@ VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 PROVIDERS = {"gemini", "grok"}
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_PROMPT_BYTES = 500_000
-DEFAULT_MAX_REVIEW_BYTES = 1_000_000
+DEFAULT_MAX_REVIEW_BYTES = PLAIN_LLM_MAX_RAW_REVIEW_BYTES
 MAX_PACKET_MANIFEST_BYTES = 64_000
 # Linux rejects a single exec argument at 128 KiB including its terminator.
 # Keep enough headroom for platform and encoding details while Gemini still
@@ -647,8 +651,14 @@ def _validate_account_configuration_roots(
 def _validated_executable(path: Path, *, label: str) -> Path:
     try:
         resolved = path.resolve(strict=True)
+        if _contains_unicode_surrogate(os.fspath(resolved)):
+            raise PlainReviewError(
+                f"{label} resolved path contains invalid Unicode text"
+            )
         metadata = resolved.stat()
         linked = resolved.lstat()
+    except PlainReviewError:
+        raise
     except OSError as exc:
         raise PlainReviewError(f"{label} is unavailable: {exc}") from exc
     if (
@@ -1899,6 +1909,17 @@ def run_from_manifest(
 ) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
+    if (
+        isinstance(max_review_bytes, bool)
+        or not isinstance(max_review_bytes, int)
+        or max_review_bytes <= 0
+    ):
+        raise PlainReviewError("max review bytes must be a positive integer")
+    if max_review_bytes > PLAIN_LLM_MAX_RAW_REVIEW_BYTES:
+        raise PlainReviewError(
+            "max review bytes exceeds the retained raw review gate limit of "
+            f"{PLAIN_LLM_MAX_RAW_REVIEW_BYTES} bytes"
+        )
     _validate_inherited_environment_text(dict(os.environ))
     if (
         not isinstance(executable, str)
@@ -2062,15 +2083,29 @@ def run_from_manifest(
         review=review,
         prompt_nonce=prompt_nonce,
     )
-    write_text_create_only(
-        output_path,
+    evidence_text = (
         json.dumps(
             evidence,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
         )
-        + "\n",
+        + "\n"
+    )
+    try:
+        evidence_bytes = evidence_text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise PlainReviewError(
+            "external review evidence contains invalid Unicode text"
+        ) from exc
+    if len(evidence_bytes) > PLAIN_LLM_MAX_EVIDENCE_BYTES:
+        raise PlainReviewError(
+            "serialized external review evidence exceeds the gate limit of "
+            f"{PLAIN_LLM_MAX_EVIDENCE_BYTES} bytes"
+        )
+    write_text_create_only(
+        output_path,
+        evidence_text,
         label="evidence output",
     )
     return evidence
@@ -2083,6 +2118,16 @@ def positive_int(value: str) -> int:
         raise argparse.ArgumentTypeError("must be an integer") from exc
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def review_byte_limit(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed > PLAIN_LLM_MAX_RAW_REVIEW_BYTES:
+        raise argparse.ArgumentTypeError(
+            "must not exceed the retained raw review gate limit of "
+            f"{PLAIN_LLM_MAX_RAW_REVIEW_BYTES} bytes"
+        )
     return parsed
 
 
@@ -2114,7 +2159,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--max-review-bytes",
-        type=positive_int,
+        type=review_byte_limit,
         default=DEFAULT_MAX_REVIEW_BYTES,
     )
     args = parser.parse_args(argv)

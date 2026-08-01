@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -776,6 +777,47 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.with_suffix(".review.txt").exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_rejects_review_limit_above_retained_raw_gate_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            with (
+                mock.patch.object(plain, "run_provider") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "exceeds the retained raw review gate limit",
+                ),
+            ):
+                plain.run_from_manifest(
+                    manifest_path=manifest,
+                    output_path=output,
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=100_000,
+                    max_review_bytes=(
+                        plain.PLAIN_LLM_MAX_RAW_REVIEW_BYTES + 1
+                    ),
+                )
+
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
+
+    def test_cli_review_limit_rejects_value_above_gate_limit(self) -> None:
+        with self.assertRaisesRegex(
+            argparse.ArgumentTypeError,
+            "must not exceed the retained raw review gate limit",
+        ):
+            plain.review_byte_limit(
+                str(plain.PLAIN_LLM_MAX_RAW_REVIEW_BYTES + 1)
+            )
+
     def test_process_output_limit_is_enforced_while_reading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(
@@ -878,6 +920,43 @@ class PlainExternalReviewTests(unittest.TestCase):
                             executable,
                             label="test provider",
                         )
+
+    def test_resolved_executable_rejects_surrogate_path_before_launch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            target = root / "provider-\udcff"
+            target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            target.chmod(0o700)
+            alias = root / "provider"
+            alias.symlink_to(target.name)
+
+            with (
+                mock.patch.object(plain, "run_bounded_process") as runner,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "resolved path contains invalid Unicode text",
+                ),
+            ):
+                plain.run_from_manifest(
+                    manifest_path=manifest,
+                    output_path=output,
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
+                    provider="gemini",
+                    executable=str(alias),
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=100_000,
+                )
+
+            runner.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
     def test_provider_rejects_unsafe_account_configuration_ancestry(
         self,
@@ -1890,6 +1969,48 @@ class PlainExternalReviewTests(unittest.TestCase):
                     executable="grok",
                     model=None,
                 )
+            self.assertFalse(output.exists())
+            self.assertTrue(output.with_suffix(".review.txt").is_file())
+            self.assertTrue(output.with_suffix(".prompt.txt").is_file())
+
+    def test_oversized_serialized_evidence_is_not_published(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+
+            def fake_run(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                mock.patch.object(
+                    plain,
+                    "PLAIN_LLM_MAX_EVIDENCE_BYTES",
+                    100,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "serialized external review evidence exceeds the gate limit",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="grok",
+                    executable="grok",
+                    model=None,
+                )
+
             self.assertFalse(output.exists())
             self.assertTrue(output.with_suffix(".review.txt").is_file())
             self.assertTrue(output.with_suffix(".prompt.txt").is_file())
