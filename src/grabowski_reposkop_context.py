@@ -530,6 +530,7 @@ def _validate_report(
     )
     return report
 
+
 def _kill_process_group(process: subprocess.Popen[bytes], *, pgid: int | None = None) -> None:
     # With start_new_session=True the child pid is the session/process-group id.
     # Descendants may outlive the leader, so always signal the recorded pgid.
@@ -1442,6 +1443,7 @@ def _receipt_identity(
         ),
     }
 
+
 def _receipt_payload(
     identity: dict[str, Any], *, usage_key_sha256: str
 ) -> dict[str, Any]:
@@ -1628,9 +1630,12 @@ def _audit_record(
         "transaction_id": binding["usage_key_sha256"],
         "after_sha256": binding["receipt_sha256"],
         "bytes": len(binding["data"]),
+        "receipt_schema_version": identity["schema_version"],
         "reposkop_executable_sha256": identity["reposkop_executable_sha256"],
-        "observation_sha256": identity["observation_sha256"],
-        "projection_sha256": identity["projection_sha256"],
+        "repository_identity_sha256": identity["repository_identity_sha256"],
+        "checkout_identity_sha256": identity["checkout_identity_sha256"],
+        "semantic_observation_sha256": identity["semantic_observation_sha256"],
+        "semantic_projection_sha256": identity["semantic_projection_sha256"],
         "effect_authorized": False,
         "publication_contract": publication_contract,
     }
@@ -1665,10 +1670,17 @@ def _audit_record_matches(record: dict[str, Any], binding: dict[str, Any]) -> bo
         and record.get("transaction_id") == binding["usage_key_sha256"]
         and record.get("after_sha256") == binding["receipt_sha256"]
         and record.get("bytes") == len(binding["data"])
+        and record.get("receipt_schema_version") == identity["schema_version"]
         and record.get("reposkop_executable_sha256")
         == identity["reposkop_executable_sha256"]
-        and record.get("observation_sha256") == identity["observation_sha256"]
-        and record.get("projection_sha256") == identity["projection_sha256"]
+        and record.get("repository_identity_sha256")
+        == identity["repository_identity_sha256"]
+        and record.get("checkout_identity_sha256")
+        == identity["checkout_identity_sha256"]
+        and record.get("semantic_observation_sha256")
+        == identity["semantic_observation_sha256"]
+        and record.get("semantic_projection_sha256")
+        == identity["semantic_projection_sha256"]
         and record.get("effect_authorized") is False
         and _audit_contract_matches(record)
     )

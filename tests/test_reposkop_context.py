@@ -361,6 +361,20 @@ class ReposkopContextTests(unittest.TestCase):
         )
         self.assertRegex(receipt["semantic_observation_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(receipt["semantic_projection_sha256"], r"^[0-9a-f]{64}$")
+        audit_record = self.audit_records[0]
+        self.assertEqual(
+            audit_record["receipt_schema_version"], receipt["schema_version"]
+        )
+        for field in (
+            "reposkop_executable_sha256",
+            "repository_identity_sha256",
+            "checkout_identity_sha256",
+            "semantic_observation_sha256",
+            "semantic_projection_sha256",
+        ):
+            self.assertEqual(audit_record[field], receipt[field])
+        self.assertNotIn("observation_sha256", audit_record)
+        self.assertNotIn("projection_sha256", audit_record)
         self.assertEqual(first["report"]["effect_authorized"], False)
         self.assertEqual(len(self.run_calls), 2)
         self.assertTrue(

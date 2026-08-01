@@ -11,13 +11,15 @@ The adapter accepts only:
 - `effect_authorized: false` on report and projection;
 - canonically reproducible observation, projection and report digests.
 
-The private usage receipt binds:
+The live tool result retains the exact capture digests. The private usage receipt deliberately excludes those volatile digests and binds:
 
 - the Reposkop executable digest;
-- report and observation digests;
+- canonical target path and purpose;
 - repository and checkout identity digests;
-- projection digest;
-- target path and purpose.
+- a semantic observation digest without `observed_at` and `observation_sha256`;
+- a semantic projection digest without capture-bound observation validation and projection digests.
+
+The matching audit record binds the receipt schema version, exact receipt bytes and the same stable identity fields. An unchanged semantic checkout therefore replays one receipt and one audit binding even when capture timestamps and exact artifact digests change.
 
 ## Rollout order
 
