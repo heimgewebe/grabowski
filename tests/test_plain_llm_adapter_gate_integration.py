@@ -175,6 +175,10 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                 plain.PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
                 gate.MAX_PLAIN_LLM_RAW_REVIEW_BYTES,
             )
+            self.assertEqual(
+                plain.PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+                gate.MAX_PLAIN_LLM_TRANSMITTED_PROMPT_BYTES,
+            )
             self.assertLessEqual(
                 output.stat().st_size,
                 gate.MAX_JSON_EVIDENCE_BYTES,

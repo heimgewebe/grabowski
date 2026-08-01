@@ -26,6 +26,7 @@ try:
         PLAIN_LLM_ENVIRONMENT_POLICY,
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+        PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -41,6 +42,7 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
         PLAIN_LLM_ENVIRONMENT_POLICY,
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+        PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
         PLAIN_LLM_PROMPT_NONCE_RE,
         PLAIN_LLM_PROVIDERS,
         PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
@@ -78,6 +80,9 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
 MAX_PLAIN_LLM_RAW_REVIEW_BYTES = PLAIN_LLM_MAX_RAW_REVIEW_BYTES
+MAX_PLAIN_LLM_TRANSMITTED_PROMPT_BYTES = (
+    PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES
+)
 PASS_CHECK_BUCKETS = {"pass"}
 DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate",
@@ -884,6 +889,52 @@ def _retained_plain_llm_review(
     except (GateInputError, UnicodeDecodeError, PlainReviewError) as exc:
         return None, None, str(exc)
     return _sha256_bytes(raw), parsed, None
+
+
+def _retained_plain_llm_prompt_failures(
+    review_input: dict[str, Any],
+    artifact_root: Path | None,
+    *,
+    expected_prompt: str | None,
+) -> list[str]:
+    try:
+        prompt = _read_private_artifact_inside_root(
+            artifact_root,
+            review_input.get("transmitted_prompt_path"),
+            label="retained transmitted prompt artifact",
+            max_bytes=MAX_PLAIN_LLM_TRANSMITTED_PROMPT_BYTES,
+        )
+    except GateInputError as exc:
+        return [str(exc)]
+
+    failures: list[str] = []
+    prompt_sha256 = review_input.get("prompt_sha256")
+    if (
+        _valid_sha256(prompt_sha256)
+        and _normalize_sha256(prompt_sha256) != _sha256_bytes(prompt)
+    ):
+        failures.append(
+            "review_input.prompt_sha256 does not match retained transmitted "
+            "prompt artifact"
+        )
+    prompt_bytes = review_input.get("transmitted_prompt_bytes")
+    if (
+        isinstance(prompt_bytes, int)
+        and not isinstance(prompt_bytes, bool)
+        and prompt_bytes != len(prompt)
+    ):
+        failures.append(
+            "review_input.transmitted_prompt_bytes does not match retained "
+            "transmitted prompt artifact"
+        )
+    if expected_prompt is None:
+        failures.append("expected transmitted prompt is unavailable")
+    elif prompt != expected_prompt.encode("utf-8"):
+        failures.append(
+            "retained transmitted prompt artifact does not match "
+            "independently reconstructed plain-LLM prompt"
+        )
+    return failures
 
 
 def load_policy_waiver(path: Path | None) -> dict[str, Any] | None:
@@ -1931,6 +1982,7 @@ def _external_review_failures(
         )
     expected_packet_prompt_sha256: str | None = None
     expected_claude_prompt_sha256: str | None = None
+    expected_plain_llm_prompt: str | None = None
     expected_plain_llm_prompt_sha256: str | None = None
     expected_plain_llm_prompt_bytes: int | None = None
     normalized_diff_sha256 = _normalize_sha256(diff_sha256)
@@ -1994,6 +2046,15 @@ def _external_review_failures(
                     expected_plain_llm_prompt_sha256
                 ),
                 expected_prompt_bytes=expected_plain_llm_prompt_bytes,
+            )
+        )
+        failures.extend(
+            _retained_plain_llm_prompt_failures(
+                raw_review_input
+                if isinstance(raw_review_input, dict)
+                else {},
+                external_review_artifact_root,
+                expected_prompt=expected_plain_llm_prompt,
             )
         )
     if (

@@ -24,6 +24,7 @@ try:
         PLAIN_LLM_ENVIRONMENT_POLICY,
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+        PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
@@ -36,6 +37,7 @@ except ModuleNotFoundError:  # importlib-based tests load from the repo root
         PLAIN_LLM_ENVIRONMENT_POLICY,
         PLAIN_LLM_MAX_EVIDENCE_BYTES,
         PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+        PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
         PLAIN_LLM_REVIEW_GATE_AUTHORITY,
         PLAIN_LLM_REVIEW_INPUT_MODE,
         PLAIN_LLM_REVIEW_SOURCE_PREFIX,
@@ -1918,6 +1920,17 @@ def run_from_manifest(
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
     if (
+        isinstance(max_prompt_bytes, bool)
+        or not isinstance(max_prompt_bytes, int)
+        or max_prompt_bytes <= 0
+    ):
+        raise PlainReviewError("max prompt bytes must be a positive integer")
+    if max_prompt_bytes > PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES:
+        raise PlainReviewError(
+            "max prompt bytes exceeds the retained transmitted prompt gate "
+            f"limit of {PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES} bytes"
+        )
+    if (
         isinstance(max_review_bytes, bool)
         or not isinstance(max_review_bytes, int)
         or max_review_bytes <= 0
@@ -2139,6 +2152,16 @@ def review_byte_limit(value: str) -> int:
     return parsed
 
 
+def prompt_byte_limit(value: str) -> int:
+    parsed = positive_int(value)
+    if parsed > PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES:
+        raise argparse.ArgumentTypeError(
+            "must not exceed the retained transmitted prompt gate limit of "
+            f"{PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES} bytes"
+        )
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -2162,7 +2185,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--max-prompt-bytes",
-        type=positive_int,
+        type=prompt_byte_limit,
         default=DEFAULT_MAX_PROMPT_BYTES,
     )
     parser.add_argument(

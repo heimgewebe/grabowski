@@ -809,6 +809,37 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.with_suffix(".review.txt").exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_rejects_prompt_limit_above_retained_prompt_gate_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            with (
+                mock.patch.object(plain, "run_provider") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "exceeds the retained transmitted prompt gate limit",
+                ),
+            ):
+                plain.run_from_manifest(
+                    manifest_path=manifest,
+                    output_path=output,
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=(
+                        plain.PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES + 1
+                    ),
+                )
+
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
+
     def test_cli_review_limit_rejects_value_above_gate_limit(self) -> None:
         with self.assertRaisesRegex(
             argparse.ArgumentTypeError,
@@ -816,6 +847,15 @@ class PlainExternalReviewTests(unittest.TestCase):
         ):
             plain.review_byte_limit(
                 str(plain.PLAIN_LLM_MAX_RAW_REVIEW_BYTES + 1)
+            )
+
+    def test_cli_prompt_limit_rejects_value_above_gate_limit(self) -> None:
+        with self.assertRaisesRegex(
+            argparse.ArgumentTypeError,
+            "must not exceed the retained transmitted prompt gate limit",
+        ):
+            plain.prompt_byte_limit(
+                str(plain.PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES + 1)
             )
 
     def test_process_output_limit_is_enforced_while_reading(self) -> None:

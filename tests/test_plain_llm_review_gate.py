@@ -137,6 +137,9 @@ def _plain_external_evidence(
     prompt_sha256 = gate._sha256_text(prompt)
     packet_prompt_sha256 = gate._sha256_text(packet_prompt)
     response_sha256 = gate._sha256_text(PLAIN_REVIEW_TEXT)
+    prompt_path = PLAIN_ARTIFACT_ROOT / "prompt.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    prompt_path.chmod(0o600)
     parsed_review_sha256 = gate.plain_llm_review_payload_sha256(
         verdict="PASS",
         finding_count=0,
@@ -180,7 +183,7 @@ def _plain_external_evidence(
             "prompt_argument_exposure": provider == "gemini",
             "ephemeral_prompt_file": provider == "grok",
             "transmitted_prompt_bytes": len(prompt.encode("utf-8")),
-            "transmitted_prompt_path": "prompt.txt",
+            "transmitted_prompt_path": str(prompt_path),
             "raw_review_path": str(PLAIN_RAW_REVIEW_PATH),
             "isolated_working_directory": True,
             "local_repository_context_provided": False,
@@ -371,6 +374,69 @@ class PlainLlmReviewGateTests(unittest.TestCase):
             "transmitted_prompt_bytes does not match independently "
             "reconstructed plain-LLM prompt",
             _warnings(result),
+        )
+
+    def test_retained_transmitted_prompt_must_exist(self) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(state)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            raw_review = artifact_root / "review.txt"
+            raw_review.write_text(PLAIN_REVIEW_TEXT, encoding="utf-8")
+            raw_review.chmod(0o600)
+            evidence["review_input"]["raw_review_path"] = str(raw_review)
+            evidence["review_input"]["transmitted_prompt_path"] = str(
+                artifact_root / "missing-prompt.txt"
+            )
+            result = _evaluate_review_gate(
+                state,
+                self_review=_self_review(),
+                external_review_evidence=evidence,
+                external_review_artifact_root=artifact_root,
+            )
+        self.assertIn(
+            "cannot read retained transmitted prompt artifact",
+            _warnings(result),
+        )
+
+    def test_retained_transmitted_prompt_is_reconstructed_and_bound(
+        self,
+    ) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(state)
+        expected_prompt = (PLAIN_ARTIFACT_ROOT / "prompt.txt").read_text(
+            encoding="utf-8"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            raw_review = artifact_root / "review.txt"
+            raw_review.write_text(PLAIN_REVIEW_TEXT, encoding="utf-8")
+            raw_review.chmod(0o600)
+            prompt = artifact_root / "prompt.txt"
+            prompt.write_text(expected_prompt + "tampered", encoding="utf-8")
+            prompt.chmod(0o600)
+            evidence["review_input"]["raw_review_path"] = str(raw_review)
+            evidence["review_input"]["transmitted_prompt_path"] = str(prompt)
+            result = _evaluate_review_gate(
+                state,
+                self_review=_self_review(),
+                external_review_evidence=evidence,
+                external_review_artifact_root=artifact_root,
+            )
+        warnings = _warnings(result)
+        self.assertIn(
+            "prompt_sha256 does not match retained transmitted prompt artifact",
+            warnings,
+        )
+        self.assertIn(
+            "transmitted_prompt_bytes does not match retained transmitted "
+            "prompt artifact",
+            warnings,
+        )
+        self.assertIn(
+            "retained transmitted prompt artifact does not match "
+            "independently reconstructed plain-LLM prompt",
+            warnings,
         )
 
     def test_source_and_tool_policy_are_provider_bound(self) -> None:

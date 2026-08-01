@@ -81,17 +81,20 @@ requested model label, source identifier, transport, tool policy, verdict,
 finding count, and response hashes. It also recomputes a canonical digest over
 `verdict`, `finding_count`, and `findings`, so retained structured review data
 cannot be edited independently of the digest checked by the gate. The gate also
-opens the retained raw response beneath the evidence artifact directory without
-following symlinks, bounds and identity-checks the private file while reading
-it, verifies its stdout hash, parses it with the adapter's strict parser, and
-requires the parsed raw response to equal those structured evidence fields. The
-adapter requires custom raw-review and transmitted-prompt outputs to stay below
-that same directory before it invokes the provider.
+opens both retained prompt and raw response beneath the evidence artifact
+directory without following symlinks, bounds and identity-checks the private
+files while reading them, requires the prompt bytes, hash, and length to match
+its independent reconstruction, verifies the raw response's stdout hash, parses
+it with the adapter's strict parser, and requires the parsed response to equal
+those structured evidence fields. The adapter requires custom raw-review and
+transmitted-prompt outputs to stay below that same directory before it invokes
+the provider.
 
-Provider stdout and retained raw review are capped at 1,000,000 bytes. The
-adapter also measures the final pretty-printed UTF-8 evidence and refuses to
-publish it above the gate's shared 1,000,000-byte JSON limit, so every evidence
-file it successfully publishes remains loadable by the gate.
+Provider stdout, retained raw review, and retained transmitted prompt are capped
+at 1,000,000 bytes. The adapter also measures the final pretty-printed UTF-8
+evidence and refuses to publish it above the gate's shared 1,000,000-byte JSON
+limit, so every artifact set it successfully publishes remains loadable by the
+gate.
 
 Any path escape, stale digest, malformed identity, oversized prompt or provider
 output, colliding or existing output artifact, provider failure, empty response,
