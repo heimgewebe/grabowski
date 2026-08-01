@@ -1240,7 +1240,11 @@ def run_provider(
                     argv,
                     executable=resolved_executable,
                     cwd=isolated_root,
-                    timeout_seconds=timeout_seconds + 15,
+                    timeout_seconds=(
+                        timeout_seconds + 15
+                        if provider == "gemini"
+                        else timeout_seconds
+                    ),
                     max_output_bytes=max_review_bytes,
                     environment=environment,
                 )
@@ -1284,6 +1288,64 @@ def _is_private_created_file(metadata: os.stat_result) -> bool:
         and metadata.st_nlink == 1
         and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
     )
+
+
+def _validate_private_packet_input(
+    path: Path,
+    expected: os.stat_result,
+    *,
+    label: str,
+) -> os.stat_result:
+    """Bind one provider input to a private packet directory and file."""
+    parent_descriptor = -1
+    try:
+        parent_descriptor = os.open(
+            path.parent,
+            _parent_directory_open_flags(),
+        )
+        parent_opened = os.fstat(parent_descriptor)
+        parent_linked = path.parent.lstat()
+        linked = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not _same_file_identity(parent_opened, parent_linked)
+            or stat.S_ISLNK(parent_linked.st_mode)
+            or not stat.S_ISDIR(parent_linked.st_mode)
+            or parent_linked.st_uid != os.getuid()
+            or stat.S_IMODE(parent_linked.st_mode) != 0o700
+            or not stat.S_ISDIR(parent_opened.st_mode)
+            or parent_opened.st_uid != os.getuid()
+            or parent_opened.st_nlink < 1
+            or stat.S_IMODE(parent_opened.st_mode) != 0o700
+        ):
+            raise PlainReviewError(
+                f"{label} directory is not private and owner-controlled"
+            )
+        if (
+            not _is_private_created_file(expected)
+            or stat.S_IMODE(expected.st_mode) != 0o600
+            or not _is_private_created_file(linked)
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or not _same_completed_file(expected, linked)
+        ):
+            raise PlainReviewError(
+                f"{label} is not a private single-link regular file"
+            )
+        _validate_path_ancestry(path, label=label)
+        return linked
+    except PlainReviewError:
+        raise
+    except OSError as exc:
+        raise PlainReviewError(f"cannot validate {label}: {exc}") from exc
+    finally:
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
 
 
 def _discard_failed_create(
@@ -1920,6 +1982,12 @@ def run_from_manifest(
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
     if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds <= 0
+    ):
+        raise PlainReviewError("timeout seconds must be a positive integer")
+    if (
         isinstance(max_prompt_bytes, bool)
         or not isinstance(max_prompt_bytes, int)
         or max_prompt_bytes <= 0
@@ -1971,6 +2039,11 @@ def run_from_manifest(
         raise PlainReviewError(
             f"cannot resolve external review manifest: {exc}"
         ) from exc
+    manifest_expected = _validate_private_packet_input(
+        manifest_path,
+        manifest_expected,
+        label="external review manifest",
+    )
     manifest = load_json(
         manifest_path,
         label="external review manifest",
@@ -1983,6 +2056,16 @@ def run_from_manifest(
     )
     packet_prompt_path, prompt_expected = resolve_packet_file(
         manifest_path, manifest["prompt_path"], label="prompt_path"
+    )
+    diff_expected = _validate_private_packet_input(
+        diff_path,
+        diff_expected,
+        label="diff file",
+    )
+    prompt_expected = _validate_private_packet_input(
+        packet_prompt_path,
+        prompt_expected,
+        label="prompt file",
     )
     diff_bytes = read_bytes(
         diff_path,

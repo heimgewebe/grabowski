@@ -31,12 +31,16 @@ This path is deliberately distinct from coding-agent review:
 - stdin is `/dev/null`, each provider has a new process group, and stdout and
   stderr are byte-bounded while they are read and decoded as strict UTF-8;
   malformed output is rejected, while timeout or overflow terminates the whole
-  process group;
+  process group; Grok's only watchdog uses the configured timeout exactly,
+  while Gemini receives that timeout internally and the outer watchdog adds a
+  15-second client-shutdown allowance;
 - the packet manifest, diff, and packet prompt are opened nonblocking and
   without following a final symlink, must remain the same single-link regular
-  inode throughout a bounded read, and retain their manifest-directory
-  containment; a raced FIFO, replacement, mutation, or oversized input fails
-  before provider launch;
+  inode at exact mode `0600` throughout a bounded read, reside in an
+  owner-controlled `0700` packet directory with trusted full ancestry, and
+  retain their manifest-directory containment; the canonical packet writer
+  enforces those modes independently of umask, and a raced FIFO, replacement,
+  mutation, writable input, or oversized input fails before provider launch;
 - the executable resolves to an owner-controlled, executable regular file that
   is not group- or world-writable; every resolved ancestor must be owned by the
   current user or root and may be group- or world-writable only with sticky-bit

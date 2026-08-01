@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -114,9 +115,29 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
         state = _state(diff)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            packet = gate.write_external_review_packet(
-                root / "packet", state, diff
-            )
+            packet_root = root / "packets" / "packet"
+            previous_umask = os.umask(0o002)
+            try:
+                packet = gate.write_external_review_packet(
+                    packet_root, state, diff
+                )
+            finally:
+                os.umask(previous_umask)
+            for private_directory in (root / "packets", packet_root):
+                self.assertEqual(
+                    stat.S_IMODE(private_directory.stat().st_mode),
+                    0o700,
+                )
+            for key in (
+                "diff_path",
+                "prompt_path",
+                "evidence_template_path",
+                "manifest_path",
+            ):
+                self.assertEqual(
+                    stat.S_IMODE(Path(packet[key]).stat().st_mode),
+                    0o600,
+                )
             output = root / "grok-evidence.json"
 
             def fake_run(argv, **kwargs):
@@ -183,6 +204,21 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                 output.stat().st_size,
                 gate.MAX_JSON_EVIDENCE_BYTES,
             )
+
+    def test_packet_writer_rejects_unsafe_ancestry_before_creation(self) -> None:
+        diff = b"diff --git a/x b/x\n+changed\n"
+        state = _state(diff)
+        with tempfile.TemporaryDirectory() as directory:
+            unsafe = Path(directory) / "shared"
+            unsafe.mkdir(mode=0o700)
+            unsafe.chmod(0o770)
+            packet_root = unsafe / "private" / "packet"
+            with self.assertRaisesRegex(
+                gate.GateInputError,
+                "packet path ancestry is unsafe",
+            ):
+                gate.write_external_review_packet(packet_root, state, diff)
+            self.assertFalse(packet_root.exists())
 
 
 if __name__ == "__main__":

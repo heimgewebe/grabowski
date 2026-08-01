@@ -2202,11 +2202,235 @@ def build_external_review_prompt(state: dict[str, Any], diff_filename: str, diff
     )
 
 
+def _validate_packet_directory_ancestry(path: Path) -> None:
+    """Reject packet directories another local user could replace."""
+    trusted_owners = {0, os.getuid(), Path("/").stat().st_uid}
+    try:
+        child_metadata = path.lstat()
+        if (
+            not stat.S_ISDIR(child_metadata.st_mode)
+            or stat.S_ISLNK(child_metadata.st_mode)
+            or child_metadata.st_nlink < 1
+            or child_metadata.st_uid not in trusted_owners
+            or (
+                child_metadata.st_mode & 0o022
+                and not child_metadata.st_mode & stat.S_ISVTX
+            )
+        ):
+            raise GateInputError(
+                f"external review packet path ancestry is unsafe: {path}"
+            )
+        directory = path.parent
+        while True:
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_nlink < 1
+                or metadata.st_uid not in trusted_owners
+                or (
+                    metadata.st_mode & 0o022
+                    and not metadata.st_mode & stat.S_ISVTX
+                )
+                or (
+                    metadata.st_mode & stat.S_ISVTX
+                    and child_metadata.st_uid not in trusted_owners
+                )
+            ):
+                raise GateInputError(
+                    f"external review packet path ancestry is unsafe: {directory}"
+                )
+            if directory.parent == directory:
+                return
+            child_metadata = metadata
+            directory = directory.parent
+    except GateInputError:
+        raise
+    except OSError as exc:
+        raise GateInputError(
+            f"external review packet path ancestry is unavailable: {exc}"
+        ) from exc
+
+
+def _open_private_packet_directory(output_dir: Path) -> tuple[Path, int]:
+    """Create/open the packet directory and pin it at exact mode 0700."""
+    output_dir = Path(os.path.abspath(output_dir))
+    descriptor = -1
+    try:
+        missing: list[Path] = []
+        cursor = output_dir
+        while True:
+            try:
+                cursor.lstat()
+                break
+            except FileNotFoundError:
+                missing.append(cursor)
+                if cursor.parent == cursor:
+                    raise GateInputError(
+                        "external review packet parent root is unavailable"
+                    )
+                cursor = cursor.parent
+        _validate_packet_directory_ancestry(cursor)
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+            created = directory.lstat()
+            if (
+                stat.S_ISLNK(created.st_mode)
+                or not stat.S_ISDIR(created.st_mode)
+                or created.st_uid != os.getuid()
+            ):
+                raise GateInputError(
+                    "external review packet directory is not owner-controlled"
+                )
+            os.chmod(directory, 0o700, follow_symlinks=False)
+        linked = output_dir.lstat()
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or linked.st_uid != os.getuid()
+        ):
+            raise GateInputError(
+                "external review packet directory is not owner-controlled"
+            )
+        os.chmod(output_dir, 0o700, follow_symlinks=False)
+        _validate_packet_directory_ancestry(output_dir)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(output_dir, flags)
+        opened = os.fstat(descriptor)
+        linked_after = output_dir.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or (opened.st_dev, opened.st_ino)
+            != (linked_after.st_dev, linked_after.st_ino)
+            or stat.S_IMODE(linked_after.st_mode) != 0o700
+        ):
+            raise GateInputError(
+                "external review packet directory identity is unsafe"
+            )
+        return output_dir, descriptor
+    except GateInputError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise GateInputError(
+            f"cannot prepare private external review packet directory: {exc}"
+        ) from exc
+
+
+def _write_private_packet_file(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    """Atomically replace one packet file with an exact private 0600 inode."""
+    temporary_name = ""
+    descriptor = -1
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for _ in range(8):
+            temporary_name = f".{name}.tmp-{os.urandom(12).hex()}"
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0:
+            raise GateInputError(
+                f"cannot allocate private temporary packet file for {name}"
+            )
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            chunk_size = os.write(descriptor, view[written:])
+            if chunk_size <= 0:
+                raise GateInputError(
+                    f"private packet file write made no progress: {name}"
+                )
+            written += chunk_size
+        os.fsync(descriptor)
+        completed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(completed.st_mode)
+            or completed.st_uid != os.getuid()
+            or completed.st_nlink != 1
+            or stat.S_IMODE(completed.st_mode) != 0o600
+            or completed.st_size != len(payload)
+        ):
+            raise GateInputError(f"private packet file identity is unsafe: {name}")
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        linked = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or linked.st_nlink != 1
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or (linked.st_dev, linked.st_ino)
+            != (completed.st_dev, completed.st_ino)
+            or linked.st_size != len(payload)
+        ):
+            raise GateInputError(f"private packet file publish drifted: {name}")
+        os.fsync(directory_descriptor)
+        temporary_name = ""
+    except GateInputError:
+        raise
+    except OSError as exc:
+        raise GateInputError(f"cannot write private packet file {name}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+
+
 def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_diff: bytes) -> dict[str, Any]:
     repo_name = _canonical_repo_slug(state.get("repoName"))
     if repo_name is None:
         raise GateInputError("cannot write external review packet without valid repo name")
-    output_dir = output_dir.resolve()
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     pr_number = pr.get("number")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int):
@@ -2214,8 +2438,8 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     head = pr.get("headRefOid")
     if not isinstance(head, str) or not head:
         raise GateInputError("cannot write external review packet without PR head SHA")
+    output_dir = Path(os.path.abspath(output_dir))
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     diff_sha256 = _sha256_bytes(pr_diff)
     diff_filename = f"pr-{pr_number}-{head[:12]}.diff"
     prompt_filename = f"pr-{pr_number}-{head[:12]}-external-review-prompt.md"
@@ -2227,9 +2451,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     evidence_path = output_dir / evidence_filename
     manifest_path = output_dir / manifest_filename
 
-    diff_path.write_bytes(pr_diff)
     prompt = build_external_review_prompt(state, diff_filename, diff_sha256)
-    prompt_path.write_text(prompt, encoding="utf-8")
     prompt_sha256 = _sha256_text(prompt)
     evidence_template = {
         "schema_version": 1,
@@ -2251,7 +2473,6 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
         "external_reviews_triaged": False,
         "findings": [],
     }
-    evidence_path.write_text(json.dumps(evidence_template, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     manifest = {
         "schema_version": 1,
         "kind": "external_review_packet",
@@ -2264,8 +2485,35 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
         "prompt_sha256": prompt_sha256,
         "evidence_template_path": str(evidence_path),
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {**manifest, "manifest_path": str(manifest_path)}
+    output_dir, directory_descriptor = _open_private_packet_directory(output_dir)
+    try:
+        _write_private_packet_file(
+            directory_descriptor,
+            diff_filename,
+            pr_diff,
+        )
+        _write_private_packet_file(
+            directory_descriptor,
+            prompt_filename,
+            prompt.encode("utf-8"),
+        )
+        _write_private_packet_file(
+            directory_descriptor,
+            evidence_filename,
+            (
+                json.dumps(evidence_template, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8"),
+        )
+        _write_private_packet_file(
+            directory_descriptor,
+            manifest_filename,
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+        )
+        return {**manifest, "manifest_path": str(manifest_path)}
+    finally:
+        os.close(directory_descriptor)
 
 
 def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict[str, Any]:

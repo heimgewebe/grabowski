@@ -52,13 +52,15 @@ class PlainExternalReviewTests(unittest.TestCase):
 
     def _packet(self, root: Path) -> Path:
         packet = root / "packet"
-        packet.mkdir()
+        packet.mkdir(mode=0o700)
+        packet.chmod(0o700)
         diff = packet / "pr-7-aaaaaaaaaaaa.diff"
         prompt = packet / "pr-7-aaaaaaaaaaaa-external-review-prompt.md"
         diff.write_text(
             "diff --git a/x.py b/x.py\n+print('x')\n",
             encoding="utf-8",
         )
+        diff.chmod(0o600)
         prompt_text = (
             "Review this exact pull request diff.\n"
             "Repo: heimgewebe/grabowski\n"
@@ -66,6 +68,7 @@ class PlainExternalReviewTests(unittest.TestCase):
             "Head SHA: " + "a" * 40 + "\n"
         )
         prompt.write_text(prompt_text, encoding="utf-8")
+        prompt.chmod(0o600)
         manifest = {
             "schema_version": 1,
             "kind": "external_review_packet",
@@ -82,6 +85,7 @@ class PlainExternalReviewTests(unittest.TestCase):
             json.dumps(manifest),
             encoding="utf-8",
         )
+        manifest_path.chmod(0o600)
         return manifest_path
 
     def _run(
@@ -119,6 +123,7 @@ class PlainExternalReviewTests(unittest.TestCase):
 
             def fake_run(argv, **kwargs):
                 calls.append((argv, kwargs))
+                self.assertEqual(kwargs["timeout_seconds"], 315)
                 self.assertEqual(argv[0], "/private/gemini")
                 self.assertIn("--mode", argv)
                 self.assertIn("plan", argv)
@@ -240,6 +245,7 @@ class PlainExternalReviewTests(unittest.TestCase):
             output = root / "grok-evidence.json"
 
             def fake_run(argv, **kwargs):
+                self.assertEqual(kwargs["timeout_seconds"], 300)
                 self.assertEqual(argv[0], "/private/grok")
                 expected = {
                     "--disable-web-search",
@@ -406,11 +412,13 @@ class PlainExternalReviewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             packet = root / "packet"
-            packet.mkdir()
+            packet.mkdir(mode=0o700)
+            packet.chmod(0o700)
             outside = root / "outside.diff"
             outside.write_text("diff", encoding="utf-8")
             prompt = packet / "prompt.md"
             prompt.write_text("prompt", encoding="utf-8")
+            prompt.chmod(0o600)
             manifest = {
                 "schema_version": 1,
                 "kind": "external_review_packet",
@@ -427,6 +435,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                 json.dumps(manifest),
                 encoding="utf-8",
             )
+            manifest_path.chmod(0o600)
             with self.assertRaisesRegex(
                 plain.PlainReviewError,
                 "escapes",
@@ -438,6 +447,41 @@ class PlainExternalReviewTests(unittest.TestCase):
                     executable="gemini",
                     model=None,
                 )
+
+    def test_rejects_nonprivate_packet_inputs_before_provider_launch(self) -> None:
+        cases = (
+            ("manifest", "external review manifest"),
+            ("diff", "diff file"),
+            ("prompt", "prompt file"),
+            ("directory", "directory is not private"),
+        )
+        for target, message in cases:
+            with (
+                self.subTest(target=target),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                manifest_path = self._packet(root)
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                paths = {
+                    "manifest": manifest_path,
+                    "diff": Path(manifest["diff_path"]),
+                    "prompt": Path(manifest["prompt_path"]),
+                    "directory": manifest_path.parent,
+                }
+                paths[target].chmod(0o770 if target == "directory" else 0o660)
+                with (
+                    mock.patch.object(plain, "run_bounded_process") as run,
+                    self.assertRaisesRegex(plain.PlainReviewError, message),
+                ):
+                    self._run(
+                        manifest_path,
+                        root / "out.json",
+                        provider="grok",
+                        executable="grok",
+                        model="grok-4.5",
+                    )
+                run.assert_not_called()
 
     def test_rejects_packet_fifo_replaced_after_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -857,6 +901,36 @@ class PlainExternalReviewTests(unittest.TestCase):
             plain.prompt_byte_limit(
                 str(plain.PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES + 1)
             )
+
+    def test_programmatic_timeout_requires_a_positive_integer(self) -> None:
+        for timeout_seconds in (0, True):
+            with (
+                self.subTest(timeout_seconds=timeout_seconds),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                manifest = self._packet(root)
+                output = root / "out.json"
+                with (
+                    mock.patch.object(plain, "run_bounded_process") as run,
+                    self.assertRaisesRegex(
+                        plain.PlainReviewError,
+                        "timeout seconds must be a positive integer",
+                    ),
+                ):
+                    plain.run_from_manifest(
+                        manifest_path=manifest,
+                        output_path=output,
+                        raw_review_path=None,
+                        transmitted_prompt_path=None,
+                        provider="grok",
+                        executable="grok",
+                        model="grok-4.5",
+                        timeout_seconds=timeout_seconds,
+                        max_prompt_bytes=100_000,
+                    )
+                run.assert_not_called()
+                self.assertFalse(output.exists())
 
     def test_process_output_limit_is_enforced_while_reading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

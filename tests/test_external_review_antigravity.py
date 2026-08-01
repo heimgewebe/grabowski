@@ -42,14 +42,17 @@ class ExternalReviewAntigravityCompatibilityTests(unittest.TestCase):
 
     def _packet(self, root: Path) -> Path:
         packet = root / "packet"
-        packet.mkdir()
+        packet.mkdir(mode=0o700)
+        packet.chmod(0o700)
         diff = packet / "diff.txt"
         prompt = packet / "prompt.md"
         diff.write_text(
             "diff --git a/x.py b/x.py\n+print('x')\n",
             encoding="utf-8",
         )
+        diff.chmod(0o600)
         prompt.write_text("Review the diff.\n", encoding="utf-8")
+        prompt.chmod(0o600)
         manifest = {
             "schema_version": 1,
             "kind": "external_review_packet",
@@ -65,6 +68,7 @@ class ExternalReviewAntigravityCompatibilityTests(unittest.TestCase):
         }
         path = packet / "manifest.json"
         path.write_text(json.dumps(manifest), encoding="utf-8")
+        path.chmod(0o600)
         return path
 
     def test_legacy_entry_point_routes_to_plain_gemini(self) -> None:
@@ -73,6 +77,7 @@ class ExternalReviewAntigravityCompatibilityTests(unittest.TestCase):
             output = root / "evidence.json"
 
             def fake_run(argv, **kwargs):
+                self.assertEqual(kwargs["timeout_seconds"], 315)
                 self.assertEqual(argv[0], "/private/gemini")
                 self.assertIn("--sandbox", argv)
                 self.assertIn("--print", argv)
