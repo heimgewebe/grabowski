@@ -17,6 +17,15 @@ import deploy_runtime
 
 DEFAULT_RUNTIME = Path.home() / ".local" / "share" / "grabowski-mcp"
 REQUIRED_SCHEMA_PROPERTIES = {
+    "grabowski_bureau_candidate_assess": {
+        "candidate_id",
+        "event_id",
+        "expected_initiative",
+        "expected_task_id",
+        "initiative",
+        "selector",
+        "task_id",
+    },
     "grabowski_task_start": {
         "force_new_reason",
         "operation_identity",

@@ -426,22 +426,22 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertFalse(result["effect_started"])
         self.assertFalse(result["ambiguity"])
 
-    def test_candidate_assess_exposes_one_required_typed_selector(self) -> None:
+    def test_candidate_assess_exposes_typed_and_legacy_compatible_selectors(self) -> None:
         signature = inspect.signature(intake.grabowski_bureau_candidate_assess)
         self.assertEqual(
             [
                 "selector",
                 "expected_initiative",
                 "expected_task_id",
+                "candidate_id",
+                "event_id",
+                "initiative",
+                "task_id",
             ],
             list(signature.parameters),
         )
-        self.assertIs(
-            inspect.Parameter.empty, signature.parameters["selector"].default
-        )
-        self.assertNotIn("task_id", signature.parameters)
-        self.assertNotIn("initiative", signature.parameters)
-        with self.assertRaises(TypeError):
+        self.assertIsNone(signature.parameters["selector"].default)
+        with self.assertRaises(ValueError):
             intake.grabowski_bureau_candidate_assess()
         with self.assertRaises(ValueError):
             intake.grabowski_bureau_candidate_assess(
@@ -477,7 +477,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
-    def test_candidate_assess_registered_schema_requires_typed_selector(self) -> None:
+    def test_candidate_assess_registered_schema_is_additive_and_cache_safe(self) -> None:
         if not hasattr(intake.mcp, "list_tools"):
             self.skipTest("real FastMCP unavailable in dependency-free validation")
         tool = next(
@@ -491,10 +491,14 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                 "selector",
                 "expected_initiative",
                 "expected_task_id",
+                "candidate_id",
+                "event_id",
+                "initiative",
+                "task_id",
             },
             set(schema["properties"]),
         )
-        self.assertEqual({"selector"}, set(schema["required"]))
+        self.assertEqual(set(), set(schema.get("required", [])))
         self.assertEqual(
             {
                 "#/$defs/BureauCandidateIdSelector",
@@ -503,6 +507,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             {
                 variant["$ref"]
                 for variant in schema["properties"]["selector"]["anyOf"]
+                if "$ref" in variant
             },
         )
         candidate = schema["$defs"]["BureauCandidateIdSelector"]
@@ -515,10 +520,73 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual("event_id", event["properties"]["kind"]["const"])
         self.assertEqual("string", candidate["properties"]["candidate_id"]["type"])
         self.assertEqual("integer", event["properties"]["event_id"]["type"])
-        self.assertNotIn("candidate_id", schema["properties"])
-        self.assertNotIn("event_id", schema["properties"])
-        self.assertNotIn("task_id", schema["properties"])
-        self.assertNotIn("initiative", schema["properties"])
+
+    def test_candidate_assess_accepts_stale_published_connector_shape(self) -> None:
+        if not hasattr(intake.mcp, "_tool_manager"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={"kind": "bureau_candidate_assessment"},
+        ) as invoke:
+            result = asyncio.run(
+                intake.mcp._tool_manager.call_tool(
+                    "grabowski_bureau_candidate_assess",
+                    {
+                        "candidate_id": "candidate-a",
+                        "event_id": 0,
+                        "initiative": "INIT",
+                        "task_id": "INIT-T001",
+                    },
+                )
+            )
+        self.assertEqual("bureau_candidate_assessment", result["kind"])
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--candidate-id",
+                "candidate-a",
+                "--initiative",
+                "INIT",
+                "--task-id",
+                "INIT-T001",
+            ],
+            invoke.call_args.args[0],
+        )
+
+    def test_candidate_assess_legacy_event_id_is_strict_before_dispatch(self) -> None:
+        if not hasattr(intake.mcp, "_tool_manager"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with mock.patch.object(intake, "_invoke_bureau") as invoke:
+            with self.assertRaisesRegex(ToolError, "valid integer"):
+                asyncio.run(
+                    intake.mcp._tool_manager.call_tool(
+                        "grabowski_bureau_candidate_assess",
+                        {
+                            "candidate_id": "",
+                            "event_id": True,
+                            "initiative": "",
+                            "task_id": "",
+                        },
+                    )
+                )
+        invoke.assert_not_called()
+
+    def test_candidate_assess_rejects_mixed_or_conflicting_contracts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not both"):
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "event_id", "event_id": 31}, candidate_id="candidate-a"
+            )
+        with self.assertRaisesRegex(ValueError, "conflicting initiative binding"):
+            intake.grabowski_bureau_candidate_assess(
+                {"kind": "event_id", "event_id": 31},
+                expected_initiative="INIT-A",
+                initiative="INIT-B",
+            )
 
     def test_candidate_assess_rejects_malformed_selector_objects(self) -> None:
         invalid = [
