@@ -306,7 +306,23 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertEqual(receipt["kind"], context.RECEIPT_KIND)
         self.assertFalse(receipt["effect_authorized"])
         self.assertNotIn("recorded_at", receipt)
-        self.assertNotIn("report_sha256", receipt)
+        self.assertEqual(receipt["report_sha256"], first["report"]["report_sha256"])
+        self.assertEqual(
+            receipt["observation_sha256"],
+            first["report"]["observation"]["observation_sha256"],
+        )
+        self.assertEqual(
+            receipt["repository_identity_sha256"],
+            first["report"]["observation"]["identities"][
+                "repository_identity_sha256"
+            ],
+        )
+        self.assertEqual(
+            receipt["checkout_identity_sha256"],
+            first["report"]["observation"]["identities"][
+                "checkout_identity_sha256"
+            ],
+        )
         self.assertEqual(first["report"]["effect_authorized"], False)
         self.assertEqual(len(self.run_calls), 2)
         self.assertTrue(
@@ -1238,7 +1254,7 @@ class ReposkopContextTests(unittest.TestCase):
                 "observation kind or schema",
             ),
             (
-                self.report(observation_schema_version=2),
+                self.report(observation_schema_version=3),
                 "observation kind or schema",
             ),
             (
