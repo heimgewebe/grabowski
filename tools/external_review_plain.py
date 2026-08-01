@@ -781,7 +781,6 @@ def verify_provider_workspace(
         return
     try:
         metadata = prompt_path.lstat()
-        observed = prompt_path.read_bytes()
     except OSError as exc:
         raise PlainReviewError(f"cannot verify ephemeral Grok prompt: {exc}") from exc
     if (
@@ -789,8 +788,15 @@ def verify_provider_workspace(
         or metadata.st_uid != os.getuid()
         or metadata.st_nlink != 1
         or stat.S_IMODE(metadata.st_mode) != 0o600
-        or observed != expected_prompt
     ):
+        raise PlainReviewError("provider changed the ephemeral Grok prompt")
+    observed = read_bytes(
+        prompt_path,
+        label="ephemeral Grok prompt",
+        max_bytes=len(expected_prompt),
+        expected=metadata,
+    )
+    if observed != expected_prompt:
         raise PlainReviewError("provider changed the ephemeral Grok prompt")
 
 

@@ -926,6 +926,115 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_workspace_prompt_fifo_is_rejected_and_cleaned_without_reading(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            workspaces: list[Path] = []
+
+            def fake_run(argv, **kwargs):
+                workspace = kwargs["cwd"]
+                prompt = workspace / "plain-review-prompt.txt"
+                prompt.unlink()
+                os.mkfifo(prompt)
+                workspaces.append(workspace)
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                mock.patch.object(
+                    Path,
+                    "read_bytes",
+                    side_effect=AssertionError("must not read a workspace FIFO"),
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "changed the ephemeral Grok prompt",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="grok",
+                    executable="grok",
+                    model="grok-4.5",
+                )
+
+            self.assertEqual(len(workspaces), 1)
+            self.assertFalse(workspaces[0].exists())
+            self.assertFalse(output.exists())
+
+    def test_workspace_prompt_oversize_is_rejected_before_descriptor_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            workspace_prompt_identity: tuple[int, int] | None = None
+            workspace_prompt_reads = 0
+            real_read = plain.os.read
+
+            def fake_run(argv, **kwargs):
+                nonlocal workspace_prompt_identity
+                prompt = kwargs["cwd"] / "plain-review-prompt.txt"
+                prompt.write_bytes(b"x" * 100_001)
+                metadata = prompt.stat()
+                workspace_prompt_identity = (metadata.st_dev, metadata.st_ino)
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            def tracking_read(descriptor: int, size: int) -> bytes:
+                nonlocal workspace_prompt_reads
+                metadata = os.fstat(descriptor)
+                if workspace_prompt_identity == (metadata.st_dev, metadata.st_ino):
+                    workspace_prompt_reads += 1
+                return real_read(descriptor, size)
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                mock.patch.object(
+                    plain.os,
+                    "read",
+                    side_effect=tracking_read,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "ephemeral Grok prompt: file exceeds",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="grok",
+                    executable="grok",
+                    model="grok-4.5",
+                )
+
+            self.assertIsNotNone(workspace_prompt_identity)
+            self.assertEqual(workspace_prompt_reads, 0)
+            self.assertFalse(output.exists())
+
     def test_workspace_rejects_unsafe_inherited_temp_ancestry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
