@@ -43,6 +43,7 @@ ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
 PROCESS_OBSERVER_BIND_PATHS = (
     "/home/alex/repos/.weltgewebe-worktrees",
+    "/home/alex/repos/.weltgewebe-standalone",
     "/home/alex/worktrees",
     "/home/alex/repos/.semantah-worktrees",
     "/home/alex/repos/.heimlern-worktrees",

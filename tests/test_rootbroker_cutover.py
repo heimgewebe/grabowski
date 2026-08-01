@@ -460,6 +460,25 @@ class RootbrokerCutoverTests(unittest.TestCase):
                     running_path=running,
                 )
 
+    def test_versioned_recovery_dropin_matches_generated_contract(self) -> None:
+        publisher = _publisher()
+        source = (
+            ROOT
+            / "systemd"
+            / "grabowski-privileged-broker@.service.d"
+            / "recovery-source.conf"
+        )
+        self.assertEqual(
+            source.read_bytes(),
+            cutover._expected_recovery_source_dropin(publisher),
+        )
+
+    def test_process_observer_bind_paths_include_weltgewebe_standalone(self) -> None:
+        self.assertIn(
+            "/home/alex/repos/.weltgewebe-standalone",
+            cutover.PROCESS_OBSERVER_BIND_PATHS,
+        )
+
     def test_recovery_source_dropin_is_exact_and_narrow(self) -> None:
         publisher = _publisher()
         expected_lines = [
