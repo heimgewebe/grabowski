@@ -5144,8 +5144,20 @@ def _task_has_fresh_active_observation(
         return False
     observed_at = observation.get("observed_at_unix")
     properties = observation.get("properties")
+    created_at = record.get("created_at_unix")
+    runtime_seconds = record.get("runtime_seconds")
+    within_runtime_budget = bool(
+        isinstance(created_at, int)
+        and not isinstance(created_at, bool)
+        and isinstance(runtime_seconds, int)
+        and not isinstance(runtime_seconds, bool)
+        and created_at >= 0
+        and runtime_seconds > 0
+        and 0 <= now - created_at <= runtime_seconds
+    )
     return bool(
-        isinstance(observed_at, int)
+        within_runtime_budget
+        and isinstance(observed_at, int)
         and not isinstance(observed_at, bool)
         and 0 <= now - observed_at <= TASK_ACTIVE_OBSERVATION_MAX_AGE_SECONDS
         and observation.get("state") in TASK_STATE_PROJECTIONS["active"]
