@@ -166,6 +166,10 @@ class ReadSurfaceTests(unittest.TestCase):
         resolver.assert_not_called()
         self.assertEqual(cwd, read_surface.operator.HOME)
         self.assertEqual(argv, ["--repo", "heimgewebe/grabowski"])
+        _, dot_repository_argv = read_surface._resolve_github_repository(
+            "heimgewebe/.github"
+        )
+        self.assertEqual(dot_repository_argv, ["--repo", "heimgewebe/.github"])
 
     def test_github_repository_rejects_relative_paths_and_option_like_names(
         self,
@@ -173,7 +177,8 @@ class ReadSurfaceTests(unittest.TestCase):
         for repo in (
             "../grabowski",
             "heimgewebe/grabowski/extra",
-            "heimgewebe/-grabowski",
+            "heimgewebe/..",
+            "heimgewebe-/grabowski",
             "--repo/heimgewebe",
         ):
             with self.subTest(repo=repo):

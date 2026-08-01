@@ -69,9 +69,10 @@ AUDIT_BUREAU_FAILURE_STATUSES = frozenset(
     }
 )
 REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]+")
-GITHUB_REPOSITORY_RE = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})"
+GITHUB_OWNER_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
 )
+GITHUB_REPOSITORY_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 DEPLOYMENT_IDENTITY_FIELDS = (
     "schema_version",
@@ -278,7 +279,14 @@ def _resolve_github_repository(raw: str) -> tuple[Path, list[str]]:
     candidate = Path(raw)
     if candidate.is_absolute():
         return _resolve_repository(raw), []
-    if not GITHUB_REPOSITORY_RE.fullmatch(raw):
+    parts = raw.split("/")
+    valid_identifier = (
+        len(parts) == 2
+        and GITHUB_OWNER_RE.fullmatch(parts[0]) is not None
+        and GITHUB_REPOSITORY_NAME_RE.fullmatch(parts[1]) is not None
+        and parts[1] not in {".", ".."}
+    )
+    if not valid_identifier:
         raise ValueError(
             "repo must be an absolute local Git worktree path or a canonical "
             "GitHub owner/repository identifier"
