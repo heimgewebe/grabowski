@@ -747,6 +747,94 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_workspace_rejects_unsafe_inherited_temp_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            unsafe = root / "unsafe"
+            unsafe.mkdir(mode=0o700)
+            temp_parent = unsafe / "private-temp"
+            temp_parent.mkdir(mode=0o700)
+            unsafe.chmod(0o770)
+
+            with (
+                mock.patch.dict(os.environ, {"TMPDIR": str(temp_parent)}),
+                mock.patch.object(plain.tempfile, "tempdir", None),
+                mock.patch.object(plain, "run_bounded_process") as runner,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "provider temporary base has unsafe path ancestry",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                )
+
+            runner.assert_not_called()
+            self.assertEqual(list(temp_parent.iterdir()), [])
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
+
+    def test_workspace_identity_rejects_replaced_leaf(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir(mode=0o700)
+            expected = plain._verify_private_workspace_identity(workspace)
+            workspace.rename(root / "displaced-workspace")
+            workspace.mkdir(mode=0o700)
+
+            with self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "provider workspace identity drifted",
+            ):
+                plain._verify_private_workspace_identity(
+                    workspace,
+                    expected_identity=expected,
+                )
+
+    def test_workspace_identity_is_rechecked_around_provider_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            real_verify = plain._verify_private_workspace_identity
+
+            with mock.patch.object(
+                plain,
+                "_verify_private_workspace_identity",
+                wraps=real_verify,
+            ) as identity_check:
+
+                def fake_run(argv, **kwargs):
+                    self.assertEqual(identity_check.call_count, 2)
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                        "",
+                    )
+
+                with mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ):
+                    self._run(
+                        manifest,
+                        output,
+                        provider="gemini",
+                        executable="gemini",
+                        model=None,
+                    )
+
+            self.assertEqual(identity_check.call_count, 3)
+
     def test_create_only_failure_removes_partial_file_and_allows_retry(self) -> None:
         class FaultingHandle:
             def __init__(

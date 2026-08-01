@@ -34,8 +34,10 @@ This path is deliberately distinct from coding-agent review:
   replacement protection; Grok additionally requires the canonical native
   binary under the private `~/.grok/bin` directory rather than an npm or Node
   trampoline;
-- the private temporary workspace is checked before and after the provider
-  turn, including the contents and mode of Grok's prompt file;
+- the selected temporary base is validated before workspace creation; the
+  private workspace has mode `0700`, a trusted full ancestry, and a stable inode
+  identity checked immediately before and after the provider turn; readback
+  also covers the contents and mode of Grok's prompt file;
 - the exact transmitted prompt, raw stdout, argv digest, and evidence are
   create-only artifacts; missing artifact directories are created with mode
   `0700`, their full ancestry is validated against replacement by another local

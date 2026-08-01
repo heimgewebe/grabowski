@@ -651,6 +651,82 @@ def verify_provider_workspace(
         raise PlainReviewError("provider changed the ephemeral Grok prompt")
 
 
+def _validated_provider_temporary_base() -> Path:
+    """Resolve a base where another local user cannot replace our workspace."""
+    descriptor = -1
+    try:
+        root = Path(os.path.abspath(tempfile.gettempdir()))
+        descriptor = os.open(root, _parent_directory_open_flags())
+        linked = root.lstat()
+        opened = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not _is_trusted_ancestry_directory(linked)
+            or not _is_trusted_ancestry_directory(opened)
+            or not _same_file_identity(linked, opened)
+        ):
+            raise PlainReviewError("provider temporary base is unsafe")
+        _validate_path_ancestry(root, label="provider temporary base")
+        return root
+    except PlainReviewError:
+        raise
+    except OSError as exc:
+        raise PlainReviewError(
+            f"provider temporary base is unavailable: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _verify_private_workspace_identity(
+    root: Path,
+    *,
+    expected_identity: os.stat_result | None = None,
+) -> os.stat_result:
+    """Bind the private provider workspace to a trusted path and inode."""
+    root = Path(os.path.abspath(root))
+    descriptor = -1
+    try:
+        descriptor = os.open(root, _parent_directory_open_flags())
+        linked = root.lstat()
+        opened = os.fstat(descriptor)
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not _same_file_identity(linked, opened)
+            or linked.st_uid != os.getuid()
+            or linked.st_nlink < 1
+            or stat.S_IMODE(linked.st_mode) != 0o700
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink < 1
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
+            raise PlainReviewError("provider workspace identity is unsafe")
+        if expected_identity is not None and not _same_file_identity(
+            expected_identity,
+            opened,
+        ):
+            raise PlainReviewError("provider workspace identity drifted")
+        _validate_path_ancestry(root, label="provider workspace")
+        return opened
+    except PlainReviewError:
+        raise
+    except OSError as exc:
+        raise PlainReviewError(
+            f"provider workspace identity is unavailable: {exc}"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
 def run_provider(
     prompt: str,
     *,
@@ -679,16 +755,13 @@ def run_provider(
         executable=executable,
         environment=environment,
     )
+    temporary_base = _validated_provider_temporary_base()
     with tempfile.TemporaryDirectory(
-        prefix="grabowski-plain-review-"
+        prefix="grabowski-plain-review-",
+        dir=temporary_base,
     ) as isolated_directory:
         isolated_root = Path(isolated_directory)
-        isolated_metadata = isolated_root.stat()
-        if (
-            isolated_metadata.st_uid != os.getuid()
-            or stat.S_IMODE(isolated_metadata.st_mode) != 0o700
-        ):
-            raise PlainReviewError("provider workspace is not private")
+        isolated_identity = _verify_private_workspace_identity(isolated_root)
         provider_prompt_path: Path | None = None
         provider_prompt: str | None = prompt
         if provider == "grok":
@@ -713,6 +786,10 @@ def run_provider(
             prompt_path=provider_prompt_path,
             expected_prompt=expected_prompt,
         )
+        _verify_private_workspace_identity(
+            isolated_root,
+            expected_identity=isolated_identity,
+        )
         try:
             completed = run_bounded_process(
                 argv,
@@ -723,6 +800,10 @@ def run_provider(
                 environment=environment,
             )
         finally:
+            _verify_private_workspace_identity(
+                isolated_root,
+                expected_identity=isolated_identity,
+            )
             verify_provider_workspace(
                 isolated_root,
                 prompt_path=provider_prompt_path,
