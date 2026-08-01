@@ -42,6 +42,8 @@ PROVIDERS = {"gemini", "grok"}
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_PROMPT_BYTES = 500_000
 DEFAULT_MAX_REVIEW_BYTES = 1_000_000
+MAX_WORKSPACE_CLEANUP_ENTRIES = 1_024
+MAX_WORKSPACE_CLEANUP_DEPTH = 32
 # Any inherited credential can silently move an account-backed CLI onto a
 # metered API route, so the sweep is by suffix as well as by exact name.
 BILLABLE_API_ENV_SUFFIXES = ("_API_KEY", "_API_TOKEN", "_AUTH_TOKEN")
@@ -727,6 +729,172 @@ def _verify_private_workspace_identity(
                 pass
 
 
+def _clear_workspace_descriptor(
+    descriptor: int,
+    *,
+    remaining_entries: list[int],
+    depth: int = 0,
+) -> None:
+    """Remove workspace contents without following links or reopening the root."""
+    if depth > MAX_WORKSPACE_CLEANUP_DEPTH:
+        raise PlainReviewError("provider workspace cleanup is too deep")
+    try:
+        try:
+            prompt_metadata = os.stat(
+                "plain-review-prompt.txt",
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            prompt_metadata = None
+        if prompt_metadata is not None and not stat.S_ISDIR(
+            prompt_metadata.st_mode
+        ):
+            if remaining_entries[0] <= 0:
+                raise PlainReviewError(
+                    "provider workspace cleanup is too large"
+                )
+            remaining_entries[0] -= 1
+            os.unlink("plain-review-prompt.txt", dir_fd=descriptor)
+        with os.scandir(descriptor) as entries:
+            names: list[str] = []
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > remaining_entries[0]:
+                    raise PlainReviewError(
+                        "provider workspace cleanup is too large"
+                    )
+    except OSError as exc:
+        raise PlainReviewError(
+            f"cannot inspect original provider workspace: {exc}"
+        ) from exc
+    for name in names:
+        if remaining_entries[0] <= 0:
+            raise PlainReviewError("provider workspace cleanup is too large")
+        remaining_entries[0] -= 1
+        child_descriptor = -1
+        try:
+            linked = os.stat(
+                name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if stat.S_ISDIR(linked.st_mode):
+                child_descriptor = os.open(
+                    name,
+                    _parent_directory_open_flags(),
+                    dir_fd=descriptor,
+                )
+                opened = os.fstat(child_descriptor)
+                if not _same_file_identity(linked, opened):
+                    raise PlainReviewError(
+                        "provider workspace cleanup identity drifted"
+                    )
+                _clear_workspace_descriptor(
+                    child_descriptor,
+                    remaining_entries=remaining_entries,
+                    depth=depth + 1,
+                )
+                os.close(child_descriptor)
+                child_descriptor = -1
+                current = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if not _same_file_identity(linked, current):
+                    raise PlainReviewError(
+                        "provider workspace cleanup identity drifted"
+                    )
+                os.rmdir(name, dir_fd=descriptor)
+            else:
+                os.unlink(name, dir_fd=descriptor)
+        except PlainReviewError:
+            raise
+        except OSError as exc:
+            raise PlainReviewError(
+                f"cannot clear original provider workspace: {exc}"
+            ) from exc
+        finally:
+            if child_descriptor >= 0:
+                try:
+                    os.close(child_descriptor)
+                except OSError:
+                    pass
+
+
+def _discard_open_provider_workspace(
+    descriptor: int,
+    *,
+    expected_identity: os.stat_result,
+) -> None:
+    """Clear and remove the exact workspace inode, even after a rename."""
+    opened = os.fstat(descriptor)
+    if not _same_file_identity(expected_identity, opened):
+        raise PlainReviewError("provider workspace descriptor identity drifted")
+    _clear_workspace_descriptor(
+        descriptor,
+        remaining_entries=[MAX_WORKSPACE_CLEANUP_ENTRIES],
+    )
+    if os.fstat(descriptor).st_nlink == 0:
+        return
+    try:
+        linked_path = os.readlink(f"/proc/self/fd/{descriptor}")
+    except OSError as exc:
+        raise PlainReviewError(
+            f"cannot locate original provider workspace: {exc}"
+        ) from exc
+    current_path = Path(linked_path)
+    if not current_path.is_absolute():
+        raise PlainReviewError("original provider workspace path is invalid")
+    _validate_path_ancestry(
+        current_path,
+        label="original provider workspace cleanup",
+    )
+    parent_descriptor = -1
+    try:
+        parent_descriptor = os.open(
+            current_path.parent,
+            _parent_directory_open_flags(),
+        )
+        parent_linked = current_path.parent.lstat()
+        parent_opened = os.fstat(parent_descriptor)
+        linked = os.stat(
+            current_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            stat.S_ISLNK(parent_linked.st_mode)
+            or not _is_trusted_ancestry_directory(parent_linked)
+            or not _is_trusted_ancestry_directory(parent_opened)
+            or not _same_file_identity(parent_linked, parent_opened)
+            or not stat.S_ISDIR(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or not _same_file_identity(expected_identity, linked)
+        ):
+            raise PlainReviewError(
+                "original provider workspace cleanup identity drifted"
+            )
+        os.rmdir(current_path.name, dir_fd=parent_descriptor)
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+    except PlainReviewError:
+        raise
+    except OSError as exc:
+        raise PlainReviewError(
+            f"cannot remove original provider workspace: {exc}"
+        ) from exc
+    finally:
+        if parent_descriptor >= 0:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
+
+
 def run_provider(
     prompt: str,
     *,
@@ -762,53 +930,73 @@ def run_provider(
     ) as isolated_directory:
         isolated_root = Path(isolated_directory)
         isolated_identity = _verify_private_workspace_identity(isolated_root)
-        provider_prompt_path: Path | None = None
-        provider_prompt: str | None = prompt
-        if provider == "grok":
-            provider_prompt_path = isolated_root / "plain-review-prompt.txt"
-            write_text_create_only(
-                provider_prompt_path,
-                prompt,
-                label="ephemeral Grok prompt",
-            )
-            provider_prompt = None
-        argv = build_provider_argv(
-            provider=provider,
-            executable=resolved_executable,
-            model=model,
-            prompt=provider_prompt,
-            prompt_path=provider_prompt_path,
-            timeout_seconds=timeout_seconds,
-        )
-        expected_prompt = prompt.encode("utf-8")
-        verify_provider_workspace(
+        workspace_descriptor = os.open(
             isolated_root,
-            prompt_path=provider_prompt_path,
-            expected_prompt=expected_prompt,
-        )
-        _verify_private_workspace_identity(
-            isolated_root,
-            expected_identity=isolated_identity,
+            _parent_directory_open_flags(),
         )
         try:
-            completed = run_bounded_process(
-                argv,
+            if not _same_file_identity(
+                isolated_identity,
+                os.fstat(workspace_descriptor),
+            ):
+                raise PlainReviewError(
+                    "provider workspace descriptor identity drifted"
+                )
+            provider_prompt_path: Path | None = None
+            provider_prompt: str | None = prompt
+            if provider == "grok":
+                provider_prompt_path = isolated_root / "plain-review-prompt.txt"
+                write_text_create_only(
+                    provider_prompt_path,
+                    prompt,
+                    label="ephemeral Grok prompt",
+                )
+                provider_prompt = None
+            argv = build_provider_argv(
+                provider=provider,
                 executable=resolved_executable,
-                cwd=isolated_root,
-                timeout_seconds=timeout_seconds + 15,
-                max_output_bytes=max_review_bytes,
-                environment=environment,
+                model=model,
+                prompt=provider_prompt,
+                prompt_path=provider_prompt_path,
+                timeout_seconds=timeout_seconds,
             )
-        finally:
-            _verify_private_workspace_identity(
-                isolated_root,
-                expected_identity=isolated_identity,
-            )
+            expected_prompt = prompt.encode("utf-8")
             verify_provider_workspace(
                 isolated_root,
                 prompt_path=provider_prompt_path,
                 expected_prompt=expected_prompt,
             )
+            _verify_private_workspace_identity(
+                isolated_root,
+                expected_identity=isolated_identity,
+            )
+            try:
+                completed = run_bounded_process(
+                    argv,
+                    executable=resolved_executable,
+                    cwd=isolated_root,
+                    timeout_seconds=timeout_seconds + 15,
+                    max_output_bytes=max_review_bytes,
+                    environment=environment,
+                )
+            finally:
+                _verify_private_workspace_identity(
+                    isolated_root,
+                    expected_identity=isolated_identity,
+                )
+                verify_provider_workspace(
+                    isolated_root,
+                    prompt_path=provider_prompt_path,
+                    expected_prompt=expected_prompt,
+                )
+        finally:
+            try:
+                _discard_open_provider_workspace(
+                    workspace_descriptor,
+                    expected_identity=isolated_identity,
+                )
+            finally:
+                os.close(workspace_descriptor)
     return (
         completed,
         argv,

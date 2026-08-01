@@ -798,6 +798,55 @@ class PlainExternalReviewTests(unittest.TestCase):
                     expected_identity=expected,
                 )
 
+    def test_renamed_workspace_cleanup_removes_original_prompt_inode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            renamed_workspaces: list[Path] = []
+
+            def fake_run(argv, **kwargs):
+                workspace = kwargs["cwd"]
+                renamed = workspace.with_name(f"{workspace.name}-renamed")
+                workspace.rename(renamed)
+                workspace.mkdir(mode=0o700)
+                renamed_workspaces.append(renamed)
+                self.assertTrue(
+                    (renamed / "plain-review-prompt.txt").is_file()
+                )
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "provider workspace identity drifted",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="grok",
+                    executable="grok",
+                    model=None,
+                )
+
+            self.assertEqual(len(renamed_workspaces), 1)
+            self.assertFalse(renamed_workspaces[0].exists())
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
+
     def test_workspace_identity_is_rechecked_around_provider_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
