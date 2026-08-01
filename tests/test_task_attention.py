@@ -1347,7 +1347,7 @@ class TaskAttentionTests(unittest.TestCase):
         with patch.object(
             attention,
             "_task_output_cleanup_now_unix",
-            side_effect=[100, 101, 200, 202],
+            side_effect=[101, 202],
         ), patch.object(
             attention,
             "_canonical_task_output_cleanup_retention_boundary",
@@ -1386,6 +1386,69 @@ class TaskAttentionTests(unittest.TestCase):
             [1, 2],
         )
         self.assertEqual(second["status"], "not_present")
+
+    def test_task_output_cleanup_canonicalizes_retention_per_attempt(self) -> None:
+        record = self._completed_task()
+        task_id = str(record["task_id"])
+        final_attempt = 2
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record = {
+            **record,
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        }
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        def cleanup_attempt(
+            current: dict[str, object], **kwargs: object
+        ) -> dict[str, object]:
+            return {
+                "status": "not_present",
+                "task_binding": attention._task_binding(current),
+                "retention_boundary_unix": kwargs["retention_boundary_unix"],
+            }
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            side_effect=[24, 48],
+        ) as canonical, patch.object(
+            attention, "_task_output_cleanup_now_unix", side_effect=[100, 100],
+        ), patch.object(
+            attention, "_assert_no_live_task_resource_leases",
+            return_value={"active_lease": False},
+        ), patch.object(
+            attention, "_assert_no_live_task_process",
+            return_value={"active_process": False},
+        ), patch.object(
+            attention, "_task_output_cleanup_after_archive",
+            side_effect=cleanup_attempt,
+        ) as cleanup:
+            first = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=48,
+            )
+            second = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=48,
+            )
+
+        self.assertEqual([24, 48], [
+            call.kwargs["retention_boundary_unix"]
+            for call in cleanup.call_args_list
+        ])
+        self.assertEqual([1, 2], [
+            int(call.args[0]["attempt"]) for call in canonical.call_args_list
+        ])
+        self.assertEqual("deferred", first["status"])
+        self.assertEqual("not_present", second["status"])
 
     def _automatic_cleanup_fixture(
         self, count: int, *, projection_sha256: str = "9" * 64

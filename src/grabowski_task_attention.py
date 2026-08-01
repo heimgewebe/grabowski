@@ -1607,7 +1607,6 @@ def _canonical_task_output_cleanup_retention_boundary(
     if (
         isinstance(persisted_boundary_unix, bool)
         or not isinstance(persisted_boundary_unix, int)
-        or persisted_boundary_unix < proposed_boundary_unix
     ):
         raise TaskAttentionIntegrityError(
             "task output cleanup intent retention boundary is invalid"
@@ -2040,31 +2039,6 @@ def _task_output_cleanup_all_attempts_after_archive(
 ) -> dict[str, Any]:
     archived_binding = _task_binding(record)
     final_attempt = int(archived_binding["attempt"])
-    canonical_boundary_unix = (
-        _canonical_task_output_cleanup_retention_boundary(
-            record,
-            archive_binding=archive_binding,
-            projection=projection,
-            proposed_boundary_unix=retention_boundary_unix,
-        )
-    )
-    initial_now_unix = _task_output_cleanup_now_unix()
-    if initial_now_unix < canonical_boundary_unix:
-        return {
-            "status": "deferred",
-            "reason": "retention_boundary_not_reached",
-            "task_binding": archived_binding,
-            "attempt_count": final_attempt,
-            "attempt_results": [],
-            "retention_boundary_unix": canonical_boundary_unix,
-            "eligible_at_unix": canonical_boundary_unix,
-            "remaining_seconds": canonical_boundary_unix - initial_now_unix,
-            "minimum_retention_seconds": TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
-            "does_not_establish": [
-                "task_output_deleted",
-                "retention_or_archive_completion",
-            ],
-        }
     task_id = str(archived_binding["task_id"])
     resource_key = "component:grabowski-task-output-cleanup-task:" + task_id
     owner = tasks.resources._owner(
@@ -2104,15 +2078,25 @@ def _task_output_cleanup_all_attempts_after_archive(
         counts = {"deleted": 0, "deferred": 0, "not_present": 0, "errors": 0}
         for attempt in selected_attempts:
             attempt_record = _task_output_attempt_record(record, attempt)
+            canonical_boundary_unix = (
+                _canonical_task_output_cleanup_retention_boundary(
+                    attempt_record,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    proposed_boundary_unix=retention_boundary_unix,
+                )
+            )
             observed_at_unix = _task_output_cleanup_now_unix()
             if observed_at_unix < canonical_boundary_unix:
                 attempt_results.append({
                     "attempt": attempt,
-                    "status": "error",
-                    "error_type": "TaskAttentionIntegrityError",
-                    "error": "task output cleanup clock moved behind the retention boundary",
+                    "status": "deferred",
+                    "reason": "retention_boundary_not_reached",
+                    "retention_boundary_unix": retention_boundary_unix,
+                    "eligible_at_unix": canonical_boundary_unix,
+                    "remaining_seconds": canonical_boundary_unix - observed_at_unix,
                 })
-                counts["errors"] += 1
+                counts["deferred"] += 1
                 continue
             try:
                 lease_observation = _assert_no_live_task_resource_leases(
@@ -2178,7 +2162,7 @@ def _task_output_cleanup_all_attempts_after_archive(
             reason = "attempt_cycle_completed"
         eligible_at_unix: int | None = None
         if status == "deferred":
-            eligible_at_unix = canonical_boundary_unix
+            eligible_at_unix = retention_boundary_unix
             if reason == "attempt_batch_remaining" and attempt_results:
                 observed_at = attempt_results[-1].get(
                     "eligibility_observed_at_unix"
