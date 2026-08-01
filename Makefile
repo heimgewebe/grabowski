@@ -12,7 +12,7 @@ RETENTION_MAX_ARCHIVE_JOBS ?= 128
 .PHONY: validate syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
 
 validate:
->set -uo pipefail; targets='catalog-data-check syntax test policy tool-surface-budget context-check profiles-check runtime-lock deploy-tooling-check secrets'; for target in $$targets; do echo "=== $$target ==="; log="/tmp/grabowski-$$target.log"; if $(MAKE) "$$target" >"$$log" 2>&1; then echo "PASS $$target"; else rc=$$?; echo "FAIL $$target rc=$$rc"; tail -n 160 "$$log"; exit $$rc; fi; done
+>set -u; targets='catalog-data-check syntax test policy tool-surface-budget context-check profiles-check runtime-lock deploy-tooling-check secrets'; for target in $$targets; do echo "=== $$target ==="; log="/tmp/grabowski-$$target.log"; if $(MAKE) "$$target" >"$$log" 2>&1; then echo "PASS $$target"; else rc=$$?; echo "FAIL $$target rc=$$rc"; tail -n 160 "$$log"; exit $$rc; fi; done
 
 syntax:
 >$(PYTHON) -m py_compile tools/operator_patch_relay.py
