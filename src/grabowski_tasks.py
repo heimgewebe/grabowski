@@ -7270,8 +7270,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     }
 
 
-@_serialize_task_mutation
-def reconcile_tasks_refresh(
+def _reconcile_tasks_refresh_locked(
     *,
     task_id: str = "",
     batch_size: int | None = None,
@@ -7362,29 +7361,51 @@ def reconcile_tasks_refresh(
         result["batch"]["terminalization_recovery"] = batch[
             "terminalization_recovery"
         ]
-        try:
-            import grabowski_task_attention as task_attention
-
-            result["task_output_cleanup"] = (
-                task_attention.reconcile_archived_task_outputs(
-                    limit=task_attention.DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE
-                )
-            )
-        except Exception as exc:
-            result["task_output_cleanup"] = {
-                "schema_version": 1,
-                "kind": "grabowski_task_output_cleanup_reconcile",
-                "status": "degraded",
-                "error_type": type(exc).__name__,
-                "error": operator._redact(str(exc))[:512],
-                "checked_at_unix": _now(),
-                "does_not_establish": [
-                    "task_output_cleanup_completed",
-                    "absence_of_archived_output",
-                    "safe_blind_retry",
-                ],
-            }
     return result
+
+
+def _attach_task_output_cleanup(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if "batch" not in result:
+        return result
+    output = dict(result)
+    try:
+        import grabowski_task_attention as task_attention
+
+        output["task_output_cleanup"] = (
+            task_attention.reconcile_archived_task_outputs(
+                limit=task_attention.DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE
+            )
+        )
+    except Exception as exc:
+        output["task_output_cleanup"] = {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_reconcile",
+            "status": "degraded",
+            "error_type": type(exc).__name__,
+            "error": operator._redact(str(exc))[:512],
+            "checked_at_unix": _now(),
+            "does_not_establish": [
+                "task_output_cleanup_completed",
+                "absence_of_archived_output",
+                "safe_blind_retry",
+            ],
+        }
+    return output
+
+
+def reconcile_tasks_refresh(
+    *,
+    task_id: str = "",
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    with _task_mutation_lock():
+        result = _reconcile_tasks_refresh_locked(
+            task_id=task_id,
+            batch_size=batch_size,
+        )
+    return _attach_task_output_cleanup(result)
 
 
 @_serialize_task_mutation
@@ -7589,13 +7610,15 @@ def reconcile_tasks_resume(
     }
 
 
-@_serialize_task_mutation
-def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
+def _reconcile_tasks_locked(
+    *,
+    auto_resume: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(auto_resume, bool):
         raise ValueError("auto_resume must be boolean")
     if auto_resume:
         preview = reconcile_tasks_check()
-        result = reconcile_tasks_refresh()
+        refresh = _reconcile_tasks_refresh_locked()
         disabled = [
             {
                 "task_id": item["task_id"],
@@ -7604,24 +7627,35 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
             }
             for item in preview["would_resume"]
         ]
-        return {
+        result = {
             "auto_resume": auto_resume,
             "legacy_auto_resume_disabled": True,
-            "scanned": result["scanned"],
-            "refreshed": result["refreshed"],
+            "scanned": refresh["scanned"],
+            "refreshed": refresh["refreshed"],
             "resumed": [],
             "blocked": [*preview["blocked"], *disabled],
-            "checked_at_unix": result["checked_at_unix"],
+            "checked_at_unix": refresh["checked_at_unix"],
         }
-    result = reconcile_tasks_refresh()
-    return {
+        return result, refresh
+    refresh = _reconcile_tasks_refresh_locked()
+    result = {
         "auto_resume": auto_resume,
-        "scanned": result["scanned"],
-        "refreshed": result["refreshed"],
-        "resumed": result["resumed"],
-        "blocked": result["blocked"],
-        "checked_at_unix": result["checked_at_unix"],
+        "scanned": refresh["scanned"],
+        "refreshed": refresh["refreshed"],
+        "resumed": refresh["resumed"],
+        "blocked": refresh["blocked"],
+        "checked_at_unix": refresh["checked_at_unix"],
     }
+    return result, refresh
+
+
+def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
+    with _task_mutation_lock():
+        result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
+    cleanup = _attach_task_output_cleanup(refresh)
+    if "task_output_cleanup" in cleanup:
+        result["task_output_cleanup"] = cleanup["task_output_cleanup"]
+    return result
 
 
 def _task_reconcile_check_after_guard(task_id: str) -> dict[str, Any]:
@@ -7646,7 +7680,7 @@ async def _grabowski_task_reconcile_check_tool(task_id: str = "") -> dict[str, A
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
-        result = reconcile_tasks_refresh(task_id=task_id)
+        result = _reconcile_tasks_refresh_locked(task_id=task_id)
         base._append_audit(
             {
                 "timestamp_unix": _now(),
@@ -7656,7 +7690,7 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
                 "released_count": len(result["released"]),
             }
         )
-        return result
+    return _attach_task_output_cleanup(result)
 
 
 def grabowski_task_reconcile_refresh(task_id: str = "") -> dict[str, Any]:
@@ -7728,7 +7762,7 @@ async def _grabowski_task_reconcile_resume_tool(
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
-        result = reconcile_tasks(auto_resume=auto_resume)
+        result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
         base._append_audit(
             {
                 "timestamp_unix": _now(),
@@ -7739,7 +7773,10 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
                 "blocked_count": len(result["blocked"]),
             }
         )
-        return result
+    cleanup = _attach_task_output_cleanup(refresh)
+    if "task_output_cleanup" in cleanup:
+        result["task_output_cleanup"] = cleanup["task_output_cleanup"]
+    return result
 
 
 def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:

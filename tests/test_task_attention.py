@@ -897,6 +897,81 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(intent_path.is_file())
         self.assertTrue(completion_path.is_file())
 
+    def test_task_output_cleanup_intent_survives_global_projection_digest_change(self) -> None:
+        record = self._completed_task()
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        first_projection = self._cleanup_projection(record, record_sha256)
+        second_projection = dict(first_projection)
+        second_projection["projection_sha256"] = "9" * 64
+        calls = 0
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if mode == "inspect":
+                return {
+                    "status": "present",
+                    "inventory": self._cleanup_inventory(current),
+                }
+            if calls == 2:
+                raise RuntimeError("simulated interruption after intent")
+            result = {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_delete_result",
+                "task_id": current["task_id"],
+                "attempt": current["attempt"],
+                "directory": self._cleanup_inventory(current)["directory"],
+                "token": token,
+                "resumed_from_staging": False,
+                "removed": ["stdout.log", "stderr.log"],
+                "streams": self._cleanup_inventory(current)["streams"],
+                "post_state": "absent",
+            }
+            return {"status": "deleted", "delete_result": result}
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention,
+            "_existing_task_projection_binding",
+            return_value=second_projection,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                attention._task_output_cleanup_after_archive(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=first_projection,
+                    retention_boundary_unix=123,
+                )
+            recovered = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=second_projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(recovered["status"], "deleted")
+        self.assertEqual(recovered["mutation_state"], "performed")
+        intent_path, _completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        intent, _file_sha = attention._task_output_cleanup_read_receipt(
+            intent_path, kind=attention.TASK_OUTPUT_CLEANUP_INTENT_KIND
+        )
+        stable_projection = intent["material"]["projection"]
+        self.assertEqual(
+            set(stable_projection),
+            {"task_id", "record_sha256", "segment_id", "switch_sha256"},
+        )
+        self.assertNotIn("projection_sha256", stable_projection)
+
     def test_task_output_cleanup_defers_before_fixed_retention_without_effect(self) -> None:
         record = self._completed_task()
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
@@ -1086,6 +1161,25 @@ class TaskAttentionTests(unittest.TestCase):
             "switches": [],
         }
         return records, projection, manifest
+
+    def test_archived_output_reconcile_component_lease_blocks_parallel_run(self) -> None:
+        foreign_owner = "operator:test-parallel-output-reconcile"
+        tasks.resources.acquire_resources(
+            foreign_owner,
+            [attention.TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
+            purpose="simulate parallel archived output reconcile",
+            ttl_seconds=60,
+        )
+        try:
+            with patch.object(tasks, "_task_current_projection") as projection:
+                with self.assertRaises(attention.TaskAttentionConflictError):
+                    attention.reconcile_archived_task_outputs(limit=1)
+            projection.assert_not_called()
+        finally:
+            tasks.resources.release_resources(
+                foreign_owner,
+                [attention.TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
+            )
 
     def test_archived_output_reconcile_cursor_is_fair_and_bounded(self) -> None:
         records, projection, manifest = self._automatic_cleanup_fixture(3)

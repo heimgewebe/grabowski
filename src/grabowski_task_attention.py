@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import stat
 import time
+import uuid
 from typing import Any, Iterator
 
 import grabowski_consumer_surface as consumer_surface
@@ -50,6 +51,10 @@ TASK_OUTPUT_CLEANUP_CURSOR_METADATA_KEY = (
 )
 DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE = 10
 MAX_TASK_OUTPUT_CLEANUP_BATCH_SIZE = 100
+TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE = (
+    "component:grabowski-task-output-cleanup-reconcile"
+)
+TASK_OUTPUT_CLEANUP_RECONCILE_LEASE_TTL_SECONDS = 15 * 60
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
 DECISION_FILE_RE = re.compile(r"(?P<task_id>[0-9a-f]{24})\.a(?P<attempt>[1-9][0-9]*)\.json\Z")
@@ -1456,7 +1461,7 @@ def _task_output_cleanup_archive_binding(
 def _task_output_cleanup_projection_binding(
     projection: dict[str, Any],
 ) -> dict[str, Any]:
-    required = ("task_id", "record_sha256", "segment_id", "switch_sha256", "projection_sha256")
+    required = ("task_id", "record_sha256", "segment_id", "switch_sha256")
     if not isinstance(projection, dict) or any(key not in projection for key in required):
         raise TaskAttentionIntegrityError("task output cleanup projection is incomplete")
     return {key: projection[key] for key in required}
@@ -1868,9 +1873,9 @@ def _save_task_output_cleanup_cursor(
         )
 
 
-def reconcile_archived_task_outputs(
+def _reconcile_archived_task_outputs_owned(
     *,
-    limit: int = DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE,
+    limit: int,
 ) -> dict[str, Any]:
     if (
         not isinstance(limit, int)
@@ -2026,6 +2031,39 @@ def reconcile_archived_task_outputs(
             "cleanup_of_unarchived_tasks",
         ],
     }
+
+
+def reconcile_archived_task_outputs(
+    *,
+    limit: int = DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE,
+) -> dict[str, Any]:
+    owner = tasks.resources._owner(
+        "operator:task-output-cleanup-reconcile:" + uuid.uuid4().hex[:24]
+    )
+    try:
+        tasks.resources.acquire_resources(
+            owner,
+            [TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
+            purpose="bounded archived task output cleanup reconcile",
+            ttl_seconds=TASK_OUTPUT_CLEANUP_RECONCILE_LEASE_TTL_SECONDS,
+            metadata={
+                "schema_version": 1,
+                "operation": "task-output-cleanup-reconcile",
+                "limit": limit,
+            },
+        )
+    except tasks.resources.ResourceConflict as exc:
+        raise TaskAttentionConflictError(str(exc)) from exc
+    try:
+        return _reconcile_archived_task_outputs_owned(limit=limit)
+    finally:
+        release = _release_owned_archive_resources(
+            owner, [TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE]
+        )
+        if release.get("status") not in {"released", "not_required"}:
+            raise TaskAttentionError(
+                "task output cleanup reconcile resource release failed"
+            )
 
 
 def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:

@@ -3723,6 +3723,113 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(result["task_output_cleanup"], cleanup)
 
+    def test_reconcile_refresh_runs_output_cleanup_after_mutation_lock_release(self) -> None:
+        lock_active = False
+        order: list[str] = []
+        core = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+            "batch": {"limit": 1},
+        }
+        cleanup = {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_reconcile",
+            "status": "ok",
+            "scanned": 0,
+        }
+
+        @contextmanager
+        def mutation_lock():
+            nonlocal lock_active
+            self.assertFalse(lock_active)
+            lock_active = True
+            order.append("lock-enter")
+            try:
+                yield
+            finally:
+                lock_active = False
+                order.append("lock-exit")
+
+        def run_cleanup(*, limit: int) -> dict[str, object]:
+            self.assertFalse(lock_active)
+            self.assertEqual(
+                limit, task_attention.DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE
+            )
+            order.append("cleanup")
+            return cleanup
+
+        with patch.object(
+            tasks, "_task_mutation_lock", side_effect=mutation_lock
+        ), patch.object(
+            tasks, "_reconcile_tasks_refresh_locked", return_value=core
+        ), patch.object(
+            task_attention,
+            "reconcile_archived_task_outputs",
+            side_effect=run_cleanup,
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+
+        self.assertEqual(order, ["lock-enter", "lock-exit", "cleanup"])
+        self.assertEqual(result["task_output_cleanup"], cleanup)
+
+    def test_mcp_refresh_guard_releases_mutation_lock_before_output_cleanup(self) -> None:
+        lock_active = False
+        order: list[str] = []
+        core = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+            "batch": {"limit": 1},
+        }
+
+        @contextmanager
+        def mutation_lock():
+            nonlocal lock_active
+            lock_active = True
+            order.append("lock-enter")
+            try:
+                yield
+            finally:
+                lock_active = False
+                order.append("lock-exit")
+
+        def run_cleanup(*, limit: int) -> dict[str, object]:
+            self.assertFalse(lock_active)
+            order.append("cleanup")
+            return {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_reconcile",
+                "status": "ok",
+                "scanned": 0,
+            }
+
+        with patch.object(
+            tasks, "_task_mutation_lock", side_effect=mutation_lock
+        ), patch.object(
+            tasks.operator, "_require_operator_mutation"
+        ), patch.object(
+            tasks, "_reconcile_tasks_refresh_locked", return_value=core
+        ), patch.object(
+            task_attention,
+            "reconcile_archived_task_outputs",
+            side_effect=run_cleanup,
+        ), patch.object(tasks.base, "_append_audit"):
+            result = tasks._task_reconcile_refresh_after_guard("")
+
+        self.assertEqual(order, ["lock-enter", "lock-exit", "cleanup"])
+        self.assertEqual(result["task_output_cleanup"]["status"], "ok")
+
     def test_reconcile_refresh_isolates_archived_output_cleanup_failure(self) -> None:
         with patch.object(
             task_attention,
@@ -4044,7 +4151,9 @@ class TaskTests(unittest.TestCase):
 
         with (
             patch.object(tasks.operator, "_require_operator_mutation"),
-            patch.object(tasks, "reconcile_tasks_refresh", side_effect=refresh),
+            patch.object(
+                tasks, "_reconcile_tasks_refresh_locked", side_effect=refresh
+            ),
             patch.object(tasks.base, "_append_audit"),
         ):
             asyncio.run(run_both())
@@ -4122,7 +4231,7 @@ class TaskTests(unittest.TestCase):
                 "_require_operator_mutation",
                 side_effect=PermissionError("blocked after wait"),
             ) as mutation,
-            patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+            patch.object(tasks, "_reconcile_tasks_refresh_locked") as refresh,
         ):
             with self.assertRaisesRegex(PermissionError, "blocked after wait"):
                 asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
@@ -4136,7 +4245,7 @@ class TaskTests(unittest.TestCase):
             (
                 "refresh",
                 lambda: tasks._task_reconcile_refresh_after_guard(""),
-                "reconcile_tasks_refresh",
+                "_reconcile_tasks_refresh_locked",
             ),
             (
                 "resume",
@@ -4146,7 +4255,7 @@ class TaskTests(unittest.TestCase):
             (
                 "reconcile",
                 lambda: tasks._task_reconcile_after_guard(False),
-                "reconcile_tasks",
+                "_reconcile_tasks_locked",
             ),
         )
 
@@ -4236,7 +4345,7 @@ class TaskTests(unittest.TestCase):
                     "_require_operator_mutation",
                     side_effect=deny_after_wait,
                 ),
-                patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+                patch.object(tasks, "_reconcile_tasks_refresh_locked") as refresh,
             ):
                 thread.start()
                 self.assertFalse(mutation_checked.wait(timeout=0.15))
@@ -4288,7 +4397,9 @@ class TaskTests(unittest.TestCase):
         with (
             patch.object(tasks.operator, "_require_operator_capability"),
             patch.object(tasks.operator, "_require_operator_mutation", side_effect=mutation),
-            patch.object(tasks, "reconcile_tasks_refresh", return_value=payload),
+            patch.object(
+                tasks, "_reconcile_tasks_refresh_locked", return_value=payload
+            ),
             patch.object(tasks.base, "_append_audit"),
         ):
             result = asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
