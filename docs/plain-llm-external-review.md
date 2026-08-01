@@ -28,6 +28,11 @@ This path is deliberately distinct from coding-agent review:
   stderr are byte-bounded while they are read and decoded as strict UTF-8;
   malformed output is rejected, while timeout or overflow terminates the whole
   process group;
+- the packet manifest, diff, and packet prompt are opened nonblocking and
+  without following a final symlink, must remain the same single-link regular
+  inode throughout a bounded read, and retain their manifest-directory
+  containment; a raced FIFO, replacement, mutation, or oversized input fails
+  before provider launch;
 - the executable resolves to an owner-controlled, executable regular file that
   is not group- or world-writable; every resolved ancestor must be owned by the
   current user or root and may be group- or world-writable only with sticky-bit
@@ -43,9 +48,10 @@ This path is deliberately distinct from coding-agent review:
 - the exact transmitted prompt, raw stdout, argv digest, and evidence are
   create-only artifacts; missing artifact directories are created with mode
   `0700`, their full ancestry is validated against replacement by another local
-  user, and local text artifacts are created with mode `0600`; directories
-  created by an attempt are removed again if that attempt fails before a valid
-  review is retained.
+  user, and every newly created directory entry is synced through its verified
+  containing directory before local text artifacts are durably created with
+  mode `0600`; directories created by an attempt are removed again if that
+  attempt fails before a valid review is retained.
 
 The external result remains diagnostic. It never replaces, satisfies, or
 shortens the head/diff-bound Grabowski self-review loop.

@@ -413,6 +413,118 @@ class PlainExternalReviewTests(unittest.TestCase):
                     model=None,
                 )
 
+    def test_rejects_packet_fifo_replaced_after_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            packet = json.loads(manifest.read_text(encoding="utf-8"))
+            diff = Path(packet["diff_path"])
+            real_open = plain.os.open
+            replaced = False
+
+            def replacing_open(path, flags, *args, **kwargs):
+                nonlocal replaced
+                if not replaced and Path(path) == diff:
+                    diff.unlink()
+                    os.mkfifo(diff)
+                    replaced = True
+                return real_open(path, flags, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    plain.os,
+                    "open",
+                    side_effect=replacing_open,
+                ),
+                mock.patch.object(plain, "run_bounded_process") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "not the same stable regular file",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    root / "out.json",
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                )
+
+            self.assertTrue(replaced)
+            run.assert_not_called()
+
+    def test_rejects_oversized_packet_file_before_reading_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = self._packet(root)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            diff = Path(manifest["diff_path"])
+            diff.write_bytes(b"x" * 65)
+            manifest["diff_sha256"] = plain.sha256_bytes(diff.read_bytes())
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            diff_identity = (diff.stat().st_dev, diff.stat().st_ino)
+            real_read = plain.os.read
+            diff_reads = 0
+
+            def tracking_read(descriptor: int, size: int) -> bytes:
+                nonlocal diff_reads
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino) == diff_identity:
+                    diff_reads += 1
+                return real_read(descriptor, size)
+
+            with (
+                mock.patch.object(
+                    plain.os,
+                    "read",
+                    side_effect=tracking_read,
+                ),
+                mock.patch.object(
+                    plain,
+                    "resolve_provider_executable",
+                    return_value="/private/gemini",
+                ),
+                mock.patch.object(plain, "run_bounded_process") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "diff file: file exceeds 64 bytes",
+                ),
+            ):
+                plain.run_from_manifest(
+                    manifest_path=manifest_path,
+                    output_path=root / "out.json",
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=64,
+                )
+
+            self.assertEqual(diff_reads, 0)
+            run.assert_not_called()
+
+    def test_rejects_unencodable_manifest_path_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = self._packet(root)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["diff_path"] = "\ud800"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "diff_path contains invalid path text",
+            ):
+                self._run(
+                    manifest_path,
+                    root / "out.json",
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                )
+
     def test_existing_output_blocks_before_provider_invocation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

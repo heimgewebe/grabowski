@@ -42,6 +42,7 @@ PROVIDERS = {"gemini", "grok"}
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_PROMPT_BYTES = 500_000
 DEFAULT_MAX_REVIEW_BYTES = 1_000_000
+MAX_PACKET_MANIFEST_BYTES = 64_000
 # Linux rejects a single exec argument at 128 KiB including its terminator.
 # Keep enough headroom for platform and encoding details while Gemini still
 # requires the complete prompt in one --print argument.
@@ -102,25 +103,114 @@ def canonical_sha256(value: Any) -> str:
     )
 
 
-def read_bytes(path: Path, *, label: str) -> bytes:
+def read_bytes(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+    expected: os.stat_result | None = None,
+) -> bytes:
+    if max_bytes < 0:
+        raise PlainReviewError(f"cannot read {label}: byte limit is negative")
+    descriptor = -1
     try:
-        return path.read_bytes()
-    except OSError as exc:
+        expected = expected or path.lstat()
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        linked = path.lstat()
+        if (
+            not stat.S_ISREG(expected.st_mode)
+            or expected.st_nlink != 1
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not stat.S_ISREG(linked.st_mode)
+            or linked.st_nlink != 1
+            or not _same_completed_file(expected, opened)
+            or not _same_completed_file(opened, linked)
+        ):
+            raise PlainReviewError(
+                f"cannot read {label}: input is not the same stable regular file"
+            )
+        if opened.st_size > max_bytes:
+            raise PlainReviewError(
+                f"cannot read {label}: file exceeds {max_bytes} bytes"
+            )
+        chunks: list[bytes] = []
+        observed_bytes = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, max_bytes + 1 - observed_bytes),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed_bytes += len(chunk)
+            if observed_bytes > max_bytes:
+                raise PlainReviewError(
+                    f"cannot read {label}: file exceeds {max_bytes} bytes"
+                )
+        completed = os.fstat(descriptor)
+        linked_after = path.lstat()
+        if (
+            not _same_completed_file(opened, completed)
+            or not _same_completed_file(opened, linked_after)
+        ):
+            raise PlainReviewError(
+                f"cannot read {label}: input changed while it was read"
+            )
+        return b"".join(chunks)
+    except (OSError, ValueError) as exc:
         raise PlainReviewError(f"cannot read {label}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
-def read_text(path: Path, *, label: str) -> str:
+def read_text(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+    expected: os.stat_result | None = None,
+) -> str:
     try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
+        return read_bytes(
+            path,
+            label=label,
+            max_bytes=max_bytes,
+            expected=expected,
+        ).decode("utf-8")
+    except UnicodeError as exc:
         raise PlainReviewError(f"cannot read {label} as UTF-8: {exc}") from exc
 
 
-def load_json(path: Path, *, label: str) -> dict[str, Any]:
+def load_json(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+    expected: os.stat_result | None = None,
+) -> dict[str, Any]:
     try:
-        data = json.loads(read_text(path, label=label))
-    except OSError as exc:
-        raise PlainReviewError(f"cannot read {label}: {exc}") from exc
+        data = json.loads(
+            read_text(
+                path,
+                label=label,
+                max_bytes=max_bytes,
+                expected=expected,
+            )
+        )
     except json.JSONDecodeError as exc:
         raise PlainReviewError(f"cannot parse {label} as JSON: {exc}") from exc
     if not isinstance(data, dict):
@@ -136,7 +226,12 @@ def is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def resolve_packet_file(manifest_path: Path, value: Any, *, label: str) -> Path:
+def resolve_packet_file(
+    manifest_path: Path,
+    value: Any,
+    *,
+    label: str,
+) -> tuple[Path, os.stat_result]:
     if not isinstance(value, str) or not value.strip():
         raise PlainReviewError(f"manifest {label} is missing or not a string")
     raw = Path(value)
@@ -150,9 +245,13 @@ def resolve_packet_file(manifest_path: Path, value: Any, *, label: str) -> Path:
         raise PlainReviewError(
             f"manifest {label} escapes external review packet directory"
         )
-    if not resolved.is_file():
+    try:
+        metadata = resolved.lstat()
+    except OSError as exc:
+        raise PlainReviewError(f"cannot resolve manifest {label}: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         raise PlainReviewError(f"manifest {label} is not a regular file")
-    return resolved
+    return resolved, metadata
 
 
 def _is_hex(value: Any, length: int) -> bool:
@@ -173,6 +272,8 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     repo = manifest.get("repo")
     if not isinstance(repo, str) or not repo.strip():
         raise PlainReviewError("manifest repo is missing")
+    if _contains_unicode_surrogate(repo):
+        raise PlainReviewError("manifest repo contains an invalid Unicode surrogate")
     pr = manifest.get("pr")
     if isinstance(pr, bool) or not isinstance(pr, int) or pr <= 0:
         raise PlainReviewError("manifest pr is not a positive integer")
@@ -184,8 +285,11 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 f"manifest {key} is not a 64-character hex digest"
             )
     for key in ("diff_path", "prompt_path"):
-        if not isinstance(manifest.get(key), str) or not manifest[key].strip():
+        value = manifest.get(key)
+        if not isinstance(value, str) or not value.strip():
             raise PlainReviewError(f"manifest {key} is missing")
+        if "\x00" in value or _contains_unicode_surrogate(value):
+            raise PlainReviewError(f"manifest {key} contains invalid path text")
 
 
 def build_plain_prompt(
@@ -1655,24 +1759,38 @@ def run_from_manifest(
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
     try:
         manifest_path = manifest_path.resolve(strict=True)
+        manifest_expected = manifest_path.lstat()
     except OSError as exc:
         raise PlainReviewError(
             f"cannot resolve external review manifest: {exc}"
         ) from exc
     manifest = load_json(
-        manifest_path, label="external review manifest"
+        manifest_path,
+        label="external review manifest",
+        max_bytes=MAX_PACKET_MANIFEST_BYTES,
+        expected=manifest_expected,
     )
     validate_manifest(manifest)
-    diff_path = resolve_packet_file(
+    diff_path, diff_expected = resolve_packet_file(
         manifest_path, manifest["diff_path"], label="diff_path"
     )
-    packet_prompt_path = resolve_packet_file(
+    packet_prompt_path, prompt_expected = resolve_packet_file(
         manifest_path, manifest["prompt_path"], label="prompt_path"
     )
-    diff_bytes = read_bytes(diff_path, label="diff file")
+    diff_bytes = read_bytes(
+        diff_path,
+        label="diff file",
+        max_bytes=max_prompt_bytes,
+        expected=diff_expected,
+    )
     if sha256_bytes(diff_bytes) != manifest["diff_sha256"]:
         raise PlainReviewError("diff file sha256 does not match manifest")
-    packet_prompt = read_text(packet_prompt_path, label="prompt file")
+    packet_prompt = read_text(
+        packet_prompt_path,
+        label="prompt file",
+        max_bytes=max_prompt_bytes,
+        expected=prompt_expected,
+    )
     if sha256_text(packet_prompt) != manifest["prompt_sha256"]:
         raise PlainReviewError("prompt file sha256 does not match manifest")
     try:
