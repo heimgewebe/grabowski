@@ -1439,6 +1439,59 @@ class TaskAttentionTests(unittest.TestCase):
                 [attention.TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
             )
 
+    def test_archived_output_reconcile_renews_component_lease_per_task(self) -> None:
+        records, projection, manifest = self._automatic_cleanup_fixture(2)
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            return_value={"status": "not_present"},
+        ), patch.object(
+            attention,
+            "_renew_task_output_cleanup_reconcile_lease",
+            return_value={"status": "renewed"},
+        ) as renew:
+            result = attention.reconcile_archived_task_outputs(limit=2)
+
+        self.assertEqual(result["scanned"], 2)
+        self.assertEqual(renew.call_count, 2)
+        owners = {str(call.args[0]) for call in renew.call_args_list}
+        self.assertEqual(len(owners), 1)
+
+    def test_archived_output_reconcile_stops_after_component_lease_loss(self) -> None:
+        _records, projection, manifest = self._automatic_cleanup_fixture(2)
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            return_value={"status": "not_present"},
+        ) as cleanup, patch.object(
+            attention,
+            "_renew_task_output_cleanup_reconcile_lease",
+            side_effect=[
+                {"status": "renewed"},
+                attention.TaskAttentionConflictError("lost component lease"),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "lost component lease"
+            ):
+                attention.reconcile_archived_task_outputs(limit=2)
+
+        self.assertEqual(cleanup.call_count, 1)
+
     def test_archived_output_reconcile_canonicalizes_boundary_before_live_checks(self) -> None:
         records, projection, manifest = self._automatic_cleanup_fixture(1)
         record = records[0]

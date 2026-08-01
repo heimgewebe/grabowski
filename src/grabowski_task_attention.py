@@ -2312,9 +2312,29 @@ def _save_task_output_cleanup_cursor(
         )
 
 
+def _renew_task_output_cleanup_reconcile_lease(owner: str) -> dict[str, Any]:
+    try:
+        return tasks.resources.renew_resources(
+            owner,
+            [TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
+            ttl_seconds=TASK_OUTPUT_CLEANUP_RECONCILE_LEASE_TTL_SECONDS,
+        )
+    except (
+        tasks.resources.ResourceConflict,
+        tasks.resources.ResourceLeaseMissing,
+        tasks.resources.ResourceLeaseExpired,
+        PermissionError,
+        RuntimeError,
+    ) as exc:
+        raise TaskAttentionConflictError(
+            "task output cleanup reconcile lease could not be renewed"
+        ) from exc
+
+
 def _reconcile_archived_task_outputs_owned(
     *,
     limit: int,
+    lease_owner: str | None = None,
 ) -> dict[str, Any]:
     if (
         not isinstance(limit, int)
@@ -2366,6 +2386,8 @@ def _reconcile_archived_task_outputs_owned(
     archive_root = tasks._task_archive_root()
     lifecycle = importlib.import_module("grabowski_lifecycle_archive")
     for task_id in selected:
+        if lease_owner is not None:
+            _renew_task_output_cleanup_reconcile_lease(lease_owner)
         try:
             binding = bindings.get(task_id)
             if not isinstance(binding, dict):
@@ -2508,7 +2530,10 @@ def reconcile_archived_task_outputs(
     except tasks.resources.ResourceConflict as exc:
         raise TaskAttentionConflictError(str(exc)) from exc
     try:
-        return _reconcile_archived_task_outputs_owned(limit=limit)
+        return _reconcile_archived_task_outputs_owned(
+            limit=limit,
+            lease_owner=owner,
+        )
     finally:
         release = _release_owned_archive_resources(
             owner, [TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE]
