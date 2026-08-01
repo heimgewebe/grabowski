@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -148,7 +149,13 @@ CONSUMER_VIEWS = consumer_surface.CONSUMER_VIEWS
 CONSUMER_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
-HTTP_SESSION_IDLE_TIMEOUT_SECONDS = 1_800
+HTTP_STATELESS_MODE = True
+HTTP_LOG_LEVEL = "WARNING"
+HTTP_TRANSPORT_VERBOSE_LOGGERS = (
+    "mcp.server.lowlevel.server",
+    "mcp.server.streamable_http",
+    "mcp.server.streamable_http_manager",
+)
 MCP_SESSION_LOCK_PROBE_TIMEOUT_SECONDS = 1.0
 MCP_LIVENESS_PATH = "/_grabowski/mcp-liveness"
 STACK_DUMP_MEMFD_NAME = "grabowski-operator-stackdump"
@@ -546,12 +553,19 @@ async def deployment_admission_status(_request: Any) -> Any:
 def _configure_http_runtime() -> None:
     if not callable(getattr(mcp, "custom_route", None)):
         raise RuntimeError("FastMCP custom_route support is required")
+    mcp.settings.stateless_http = HTTP_STATELESS_MODE
+    mcp.settings.log_level = HTTP_LOG_LEVEL
+    for logger_name in HTTP_TRANSPORT_VERBOSE_LOGGERS:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
     mcp.streamable_http_app()
     manager = mcp.session_manager
     if getattr(manager, "_session_creation_lock", None) is None:
         raise RuntimeError("FastMCP session creation lock is unavailable")
+    if getattr(manager, "stateless", None) is not HTTP_STATELESS_MODE:
+        raise RuntimeError("FastMCP stateless HTTP mode is unavailable")
     _install_deployment_admission_gate()
-    manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+    if manager.session_idle_timeout is not None:
+        raise RuntimeError("FastMCP stateless HTTP mode retained an idle timeout")
 
 
 
