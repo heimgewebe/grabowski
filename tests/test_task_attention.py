@@ -1790,6 +1790,88 @@ class TaskAttentionTests(unittest.TestCase):
         for resource_key in resource_keys:
             self.assertIsNone(tasks.resources.inspect_resource(resource_key))
 
+    def test_closeout_archive_replay_releases_archive_resources_before_output_cleanup(self) -> None:
+        import grabowski_lifecycle_archive as lifecycle
+        import grabowski_lifecycle_projection as lifecycle_projection
+
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+
+        owner = (
+            "operator:task-closeout-archive:"
+            + first["execution_id_sha256"][:24]
+        )
+        resource_keys = sorted(
+            {
+                lifecycle._task_archive_effect_resource_key(self.archive_root),
+                lifecycle._task_archive_effect_resource_key(self.archive_effect_root),
+                lifecycle_projection._projection_resource_key(self.projection_root),
+            }
+        )
+        tasks.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="simulate ambiguous release after successful projection",
+            ttl_seconds=60,
+        )
+        original_cleanup = attention._task_output_cleanup_all_attempts_after_archive
+        observed: list[object] = []
+
+        def cleanup(*args: object, **kwargs: object) -> dict[str, object]:
+            observed.extend(
+                tasks.resources.inspect_resource(resource_key)
+                for resource_key in resource_keys
+            )
+            return original_cleanup(*args, **kwargs)
+
+        with patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            side_effect=cleanup,
+        ):
+            replay = attention.execute_closeout_archive(parameters)
+
+        self.assertTrue(replay["already_archived"])
+        self.assertEqual("released", replay["resource_release"]["status"])
+        self.assertEqual([None, None, None], observed)
+
+    def test_closeout_archive_replay_blocks_cleanup_when_archive_release_fails(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            attention.execute_closeout_archive(parameters)
+
+        with patch.object(
+            attention,
+            "_release_owned_archive_resources",
+            return_value={
+                "status": "release_failed",
+                "released": [],
+                "foreign_preserved": [],
+                "error_type": "OSError",
+            },
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "could not be released before output cleanup",
+            ):
+                attention.execute_closeout_archive(parameters)
+
+        cleanup.assert_not_called()
+
     def test_closeout_archive_failed_task_requires_attention_decision(self) -> None:
         record = self._failed_task()
 

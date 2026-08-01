@@ -2609,6 +2609,14 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             verified_segment["manifest"],
             record_sha256=record_sha256,
         )
+        resource_release = _release_owned_archive_resources(
+            owner,
+            resources_to_hold,
+        )
+        if resource_release.get("status") not in {"released", "not_required"}:
+            raise TaskAttentionConflictError(
+                "task archive resources could not be released before output cleanup"
+            )
         task_output_cleanup = _task_output_cleanup_all_attempts_after_archive(
             record,
             archive_binding=archive_binding,
@@ -2619,10 +2627,6 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
         )
         task_output_retention_boundary_unix = int(
             task_output_cleanup["retention_boundary_unix"]
-        )
-        resource_release = _release_owned_archive_resources(
-            owner,
-            resources_to_hold,
         )
         return {
             "schema_version": 1,
