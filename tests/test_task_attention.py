@@ -897,6 +897,76 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(intent_path.is_file())
         self.assertTrue(completion_path.is_file())
 
+    def test_task_output_cleanup_replay_uses_persisted_higher_retention_boundary(self) -> None:
+        record = self._completed_task()
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        persisted_boundary_unix = 456
+        calls = 0
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if mode == "inspect":
+                return {
+                    "status": "present",
+                    "inventory": self._cleanup_inventory(current),
+                }
+            if calls == 2:
+                raise RuntimeError("simulated interruption after durable intent")
+            result = {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_delete_result",
+                "task_id": current["task_id"],
+                "attempt": current["attempt"],
+                "directory": self._cleanup_inventory(current)["directory"],
+                "token": token,
+                "resumed_from_staging": True,
+                "removed": ["stdout.log", "stderr.log"],
+                "streams": self._cleanup_inventory(current)["streams"],
+                "post_state": "absent",
+            }
+            return {"status": "deleted", "delete_result": result}
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention, "_existing_task_projection_binding", return_value=projection
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                attention._task_output_cleanup_after_archive(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=persisted_boundary_unix,
+                )
+            recovered = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(recovered["status"], "deleted")
+        self.assertEqual(recovered["mutation_state"], "performed")
+        intent_path, _completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        intent, _file_sha256 = attention._task_output_cleanup_read_receipt(
+            intent_path, kind=attention.TASK_OUTPUT_CLEANUP_INTENT_KIND
+        )
+        self.assertEqual(
+            intent["material"]["retention_boundary_unix"],
+            persisted_boundary_unix,
+        )
+
     def test_task_output_cleanup_intent_survives_global_projection_digest_change(self) -> None:
         record = self._completed_task()
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
@@ -1230,6 +1300,45 @@ class TaskAttentionTests(unittest.TestCase):
                 [attention.TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
             )
 
+    def test_archived_output_reconcile_canonicalizes_boundary_before_live_checks(self) -> None:
+        records, projection, manifest = self._automatic_cleanup_fixture(1)
+        future_boundary_unix = int(attention.time.time()) + 3600
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            return_value=future_boundary_unix,
+        ) as canonicalize, patch.object(
+            attention, "_assert_no_live_task_resource_leases"
+        ) as leases, patch.object(
+            attention, "_assert_no_live_task_process"
+        ) as process, patch.object(
+            attention,
+            "_task_output_cleanup_after_archive",
+            return_value={
+                "status": "deferred",
+                "eligible_at_unix": future_boundary_unix,
+            },
+        ) as cleanup:
+            result = attention.reconcile_archived_task_outputs(limit=1)
+
+        canonicalize.assert_called_once()
+        leases.assert_not_called()
+        process.assert_not_called()
+        cleanup.assert_called_once()
+        self.assertEqual(
+            cleanup.call_args.kwargs["retention_boundary_unix"],
+            future_boundary_unix,
+        )
+        self.assertEqual(result["counts"]["deferred"], 1)
+        self.assertEqual(result["results"][0]["task_id"], records[0]["task_id"])
+
     def test_archived_output_reconcile_cursor_is_fair_and_bounded(self) -> None:
         records, projection, manifest = self._automatic_cleanup_fixture(3)
         ordered = sorted(str(record["task_id"]) for record in records)
@@ -1261,14 +1370,19 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(first["counts"]["not_present"], 2)
         self.assertEqual(second["counts"]["not_present"], 1)
 
-    def test_archived_output_reconcile_projection_drift_resets_cursor(self) -> None:
-        records, first_projection, manifest = self._automatic_cleanup_fixture(3)
+    def test_archived_output_reconcile_additive_projection_drift_preserves_cursor(self) -> None:
+        records, full_projection, manifest = self._automatic_cleanup_fixture(4)
         ordered = sorted(str(record["task_id"]) for record in records)
+        first_projection = dict(full_projection)
+        first_projection["archived_task_bindings"] = {
+            task_id: full_projection["archived_task_bindings"][task_id]
+            for task_id in ordered[:3]
+        }
         attention._save_task_output_cleanup_cursor(
             projection_sha256=str(first_projection["projection_sha256"]),
             cursor=ordered[1],
         )
-        second_projection = dict(first_projection)
+        second_projection = dict(full_projection)
         second_projection["projection_sha256"] = "8" * 64
         observed: list[str] = []
 
@@ -1287,9 +1401,10 @@ class TaskAttentionTests(unittest.TestCase):
         ):
             result = attention.reconcile_archived_task_outputs(limit=1)
 
-        self.assertIsNone(result["cursor_before"])
-        self.assertEqual(observed, [ordered[0]])
-        self.assertEqual(result["cursor_after"], ordered[0])
+        self.assertEqual(result["cursor_before"], ordered[1])
+        self.assertEqual(observed, [ordered[2]])
+        self.assertEqual(result["cursor_after"], ordered[2])
+        self.assertFalse(result["cycle_completed"])
 
     def test_archived_output_reconcile_isolates_errors_and_advances(self) -> None:
         records, projection, manifest = self._automatic_cleanup_fixture(2)

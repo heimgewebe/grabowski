@@ -1526,6 +1526,63 @@ def _task_output_cleanup_validate_intent(
     return inventory
 
 
+def _canonical_task_output_cleanup_retention_boundary(
+    record: dict[str, Any],
+    *,
+    archive_binding: dict[str, Any],
+    projection: dict[str, Any],
+    proposed_boundary_unix: int,
+) -> int:
+    if (
+        isinstance(proposed_boundary_unix, bool)
+        or not isinstance(proposed_boundary_unix, int)
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup retention boundary is invalid"
+        )
+    binding = _task_binding(record)
+    lifecycle_receipt = record.get("lifecycle_receipt_sha256")
+    if (
+        not isinstance(lifecycle_receipt, str)
+        or SHA256_RE.fullmatch(lifecycle_receipt) is None
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup lifecycle receipt is unavailable"
+        )
+    projection_binding = _task_output_cleanup_projection_binding(projection)
+    intent_path, _completion_path = _task_output_cleanup_paths(binding)
+    if not intent_path.exists():
+        return proposed_boundary_unix
+    intent, _intent_file_sha256 = _task_output_cleanup_read_receipt(
+        intent_path, kind=TASK_OUTPUT_CLEANUP_INTENT_KIND
+    )
+    _task_output_cleanup_validate_intent(
+        intent,
+        expected_prefix={
+            "schema_version": 1,
+            "task_binding": binding,
+            "lifecycle_receipt_sha256": lifecycle_receipt,
+            "archive": archive_binding,
+            "projection": projection_binding,
+        },
+    )
+    material = intent.get("material")
+    if not isinstance(material, dict):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup intent material is invalid"
+        )
+    persisted_boundary_unix = material.get("retention_boundary_unix")
+    if (
+        isinstance(persisted_boundary_unix, bool)
+        or not isinstance(persisted_boundary_unix, int)
+        or persisted_boundary_unix < proposed_boundary_unix
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup intent retention boundary is invalid"
+        )
+    return persisted_boundary_unix
+
+
 def _task_output_cleanup_validate_completion(
     completion: dict[str, Any],
     *,
@@ -1736,6 +1793,14 @@ def _task_output_cleanup_after_archive(
     retention_boundary_unix: int,
 ) -> dict[str, Any]:
     binding = _task_binding(record)
+    retention_boundary_unix = (
+        _canonical_task_output_cleanup_retention_boundary(
+            record,
+            archive_binding=archive_binding,
+            projection=projection,
+            proposed_boundary_unix=retention_boundary_unix,
+        )
+    )
     now_unix = int(time.time())
     if now_unix < retention_boundary_unix:
         return {
@@ -1806,6 +1871,13 @@ def _load_task_output_cleanup_cursor(
     *,
     projection_sha256: str,
 ) -> str | None:
+    if (
+        not isinstance(projection_sha256, str)
+        or SHA256_RE.fullmatch(projection_sha256) is None
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup projection digest is invalid"
+        )
     with tasks._database_connection() as connection:
         row = connection.execute(
             "SELECT value FROM metadata WHERE key=?",
@@ -1831,8 +1903,14 @@ def _load_task_output_cleanup_cursor(
         raise TaskAttentionIntegrityError(
             "task output cleanup cursor schema is invalid"
         )
-    if value.get("projection_sha256") != projection_sha256:
-        return None
+    stored_projection_sha256 = value.get("projection_sha256")
+    if (
+        not isinstance(stored_projection_sha256, str)
+        or SHA256_RE.fullmatch(stored_projection_sha256) is None
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup cursor projection digest is invalid"
+        )
     cursor = value.get("cursor")
     if cursor is not None and (
         not isinstance(cursor, str) or tasks.TASK_ID.fullmatch(cursor) is None
@@ -1963,9 +2041,17 @@ def _reconcile_archived_task_outputs_owned(
                 verified_segment["manifest"],
                 record_sha256=record_sha256,
             )
-            retention_boundary_unix = _task_retention_boundary(
+            proposed_retention_boundary_unix = _task_retention_boundary(
                 record,
                 minimum_age_seconds=TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+            )
+            retention_boundary_unix = (
+                _canonical_task_output_cleanup_retention_boundary(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=projection_binding,
+                    proposed_boundary_unix=proposed_retention_boundary_unix,
+                )
             )
             if now_unix >= retention_boundary_unix:
                 _assert_no_live_task_resource_leases(
@@ -2112,16 +2198,15 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             minimum_age_seconds=int(value["minimum_age_seconds"]),
             now_unix=now_unix,
         )
-        task_output_retention_boundary_unix = _task_retention_boundary(
-            record,
-            minimum_age_seconds=max(
-                int(value["minimum_age_seconds"]),
-                TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
-            ),
+        proposed_task_output_retention_boundary_unix = (
+            _task_retention_boundary(
+                record,
+                minimum_age_seconds=max(
+                    int(value["minimum_age_seconds"]),
+                    TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+                ),
+            )
         )
-        if now_unix >= task_output_retention_boundary_unix:
-            _assert_no_live_task_resource_leases(record, now_unix=now_unix)
-            _assert_no_live_task_process(record)
         segment_id = existing_projection.get("segment_id")
         if not isinstance(segment_id, str) or not segment_id:
             raise TaskAttentionIntegrityError(
@@ -2134,6 +2219,19 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             verified_segment["manifest"],
             record_sha256=record_sha256,
         )
+        task_output_retention_boundary_unix = (
+            _canonical_task_output_cleanup_retention_boundary(
+                record,
+                archive_binding=archive_binding,
+                projection=existing_projection,
+                proposed_boundary_unix=(
+                    proposed_task_output_retention_boundary_unix
+                ),
+            )
+        )
+        if now_unix >= task_output_retention_boundary_unix:
+            _assert_no_live_task_resource_leases(record, now_unix=now_unix)
+            _assert_no_live_task_process(record)
         task_output_cleanup = _task_output_cleanup_after_archive(
             record,
             archive_binding=archive_binding,
