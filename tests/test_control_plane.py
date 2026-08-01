@@ -1348,7 +1348,23 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 "force_new_reason": {"type": "string", "default": ""},
             },
         }
+        candidate_assess_schema = {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "anyOf": [{"type": "object"}, {"type": "null"}],
+                    "default": None,
+                },
+                "expected_initiative": {"type": "string", "default": ""},
+                "expected_task_id": {"type": "string", "default": ""},
+                "candidate_id": {"type": "string", "default": ""},
+                "event_id": {"type": "integer", "default": 0},
+                "initiative": {"type": "string", "default": ""},
+                "task_id": {"type": "string", "default": ""},
+            },
+        }
         sentinel_schemas = {
+            "grabowski_bureau_candidate_assess": candidate_assess_schema,
             "grabowski_secret_reveal": runtime_schema,
             "grabowski_task_start": task_start_schema,
         }
@@ -1384,6 +1400,48 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertEqual(
             stale["schema_mismatches"][0]["tool"],
             "grabowski_secret_reveal",
+        )
+
+        stale_candidate_schema = json.loads(json.dumps(candidate_assess_schema))
+        del stale_candidate_schema["properties"]["selector"]
+        stale_candidate_runtime_tools = [
+            {
+                "name": name,
+                **(
+                    {
+                        "inputSchema": (
+                            stale_candidate_schema
+                            if name == "grabowski_bureau_candidate_assess"
+                            else sentinel_schemas[name]
+                        )
+                    }
+                    if name in sentinel_schemas
+                    else {}
+                ),
+            }
+            for name in expected
+        ]
+        missing_candidate_contract = module.probe(
+            expected,
+            {
+                **sentinel_schemas,
+                "grabowski_bureau_candidate_assess": stale_candidate_schema,
+            },
+            stale_candidate_runtime_tools,
+        )
+        self.assertFalse(missing_candidate_contract["matches"])
+        self.assertFalse(missing_candidate_contract["schema_contract_matches"])
+        self.assertEqual(
+            [
+                (item["source"], item["missing_properties"])
+                for item in missing_candidate_contract[
+                    "required_schema_property_mismatches"
+                ]
+            ],
+            [
+                ("connector", ["selector"]),
+                ("runtime", ["selector"]),
+            ],
         )
 
         for missing_property in sorted(task_start_schema["properties"]):
@@ -1436,7 +1494,11 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertFalse(names_only["matches"])
         self.assertEqual(
             names_only["missing_schema_sentinels"],
-            ["grabowski_secret_reveal", "grabowski_task_start"],
+            [
+                "grabowski_bureau_candidate_assess",
+                "grabowski_secret_reveal",
+                "grabowski_task_start",
+            ],
         )
 
 
