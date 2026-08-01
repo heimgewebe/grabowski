@@ -2471,6 +2471,88 @@ def _latest_matching_execution_record(
     return record
 
 
+def _latest_matching_active_execution_record(
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    active_states = tuple(TASK_STATE_PROJECTIONS["active"])
+    placeholders = ",".join("?" for _ in active_states)
+    with _database_connection() as connection:
+        rows = connection.execute(
+            "SELECT * FROM tasks WHERE host=? AND argv_sha256=? AND cwd=? "
+            "AND resource_keys_json=? AND runtime_seconds=? AND cpu_weight=? "
+            "AND io_weight=? AND memory_max_bytes IS ? "
+            "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
+            "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
+            f"AND state IN ({placeholders}) "
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
+            (
+                identity["host"],
+                identity["argv_sha256"],
+                identity["cwd"],
+                _canonical_json(identity["resource_keys"]),
+                identity["runtime_seconds"],
+                identity["cpu_weight"],
+                identity["io_weight"],
+                identity["memory_max_bytes"],
+                int(identity["chronik_outbox_enabled"]),
+                identity["chronik_outbox_state_root"],
+                (
+                    _canonical_json(identity["chronik_context"])
+                    if identity["chronik_context"] is not None
+                    else None
+                ),
+                identity["execution_backend"],
+                identity["systemd_scope"],
+                *active_states,
+            ),
+        ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("active execution identity scan limit exceeded")
+    matching: list[dict[str, Any]] = []
+    for row in rows:
+        record = dict(row)
+        if _persisted_task_operation_identity(record) is not None:
+            continue
+        if (
+            _record_execution_identity(record)["identity_sha256"]
+            != identity["identity_sha256"]
+        ):
+            raise RuntimeError("stored active task execution identity is inconsistent")
+        matching.append(record)
+    if len(matching) > 1:
+        raise RuntimeError(
+            "multiple active tasks share one execution identity; reconcile before retry"
+        )
+    return matching[0] if matching else None
+
+
+def _resolve_active_execution_reuse(
+    identity: dict[str, Any],
+    *,
+    resume_policy: str,
+) -> dict[str, Any] | None:
+    latest = _latest_matching_active_execution_record(identity)
+    if latest is None:
+        return None
+    if (
+        _persisted_retry_binding_or_raise(latest) is not None
+        or _persisted_interrupted_recovery_binding_or_raise(latest) is not None
+    ):
+        return None
+    if str(latest["resume_policy"]) != resume_policy:
+        raise RuntimeError(
+            "active execution identity has a different resume policy; "
+            f"reconcile task {latest['task_id']} before another start"
+        )
+    now = _now()
+    if not _task_has_fresh_active_observation(latest, now=now):
+        grabowski_task_status(str(latest["task_id"]))
+        latest = _row_raw(str(latest["task_id"]))
+    if str(latest["state"]) in TASK_STATE_PROJECTIONS["active"]:
+        return latest
+    return None
+
+
 def _matching_attention_execution_records(
     identity: dict[str, Any],
 ) -> list[dict[str, Any]]:
@@ -5351,6 +5433,8 @@ def grabowski_task_start(
     Direct local write-capable agent CLIs receive an implicit repository lease
     unless the caller supplies an explicit path or repository scope. Every
     task-owned broad repository lease carries a complete whole-repository scope manifest.
+    An exact already-active execution identity is reused instead of launching
+    another process, even when no explicit operation identity was supplied.
     """
     target = fleet.fleet_host(host)
     command = _validate_command(argv)
@@ -5524,6 +5608,44 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
+    active_execution_reuse = None
+    if (
+        normalized_operation_identity is None
+        and operation_retry_binding is None
+        and _retry_context is None
+        and not task_resources
+    ):
+        active_execution_reuse = _resolve_active_execution_reuse(
+            execution_identity,
+            resume_policy=policy,
+        )
+    if active_execution_reuse is not None:
+        reuse_audit = {
+            "timestamp_unix": _now(),
+            "operation": "task-start-execution-deduplicated",
+            "requested_task_id": task_id,
+            "reused_task_id": str(active_execution_reuse["task_id"]),
+            "reuse_reason": "active_execution_identity",
+            "execution_identity_sha256": execution_identity["identity_sha256"],
+            "no_process_started": True,
+        }
+        base._append_audit(reuse_audit)
+        return {
+            "task": _public(active_execution_reuse),
+            "audit": reuse_audit,
+            "execution_identity": execution_identity,
+            "retry_binding": _persisted_retry_binding_or_raise(
+                active_execution_reuse
+            ),
+            "routing_shadow_capture": None,
+            "operation_identity": None,
+            "operation_retry_binding": None,
+            "deduplicated_reuse": {
+                "reused": True,
+                "task_id": str(active_execution_reuse["task_id"]),
+                "reason": "active_execution_identity",
+            },
+        }
     retry_binding = (
         None
         if operation_retry_binding is not None
