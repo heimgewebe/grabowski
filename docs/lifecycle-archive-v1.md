@@ -94,6 +94,18 @@ Die Mutation wird innerhalb eines exklusiven Directory-Locks serialisiert. Ein v
 
 Der erfolgreiche Switch liefert verifizierte Post-State-Digests für Archivmanifest, Switch und Gesamtprojektion. Diese Digests können unmittelbar in ein create-only Execution-Receipt übernommen werden. Scheitert ein späterer Schritt, bleibt der deterministische Switch als Recovery-Readback erhalten.
 
+## Lifecyclegebundene Retention privater Taskausgaben
+
+Die privaten `.grabowski-task-output-<task-id>-a<attempt>`-Verzeichnisse werden erst nach einem verifizierten Archivsegment und dem exakten Projection Switch bereinigt. Taskzeile, Archivrecord, Segment und Projection bleiben unverändert erhalten. Die Output-Retention beträgt mindestens 24 Stunden ab dem terminalen Taskanker; eine kleinere `minimum_age_seconds`-Archivschwelle verkürzt diese Grenze nicht. Vor Ablauf ist der Zustand ausschließlich `deferred` und wirkungsfrei.
+
+Nach Ablauf serialisiert eine exakte `component:grabowski-task-output-cleanup:<task-id>:a<attempt>`-Lease den Effekt. Ein create-only Intent bindet Taskversuch, Lifecycle-Receipt, Retentionsgrenze, Segment-/Manifest-/Plan-/Record-Digests, Projection-Digests sowie SHA-256 und Bytegröße beider Streams. Erst danach darf der hashgebundene lokale oder Fleet-Adapter wirken. Der Adapter akzeptiert nur den kanonischen Outputpfad, `stdout.log` und `stderr.log`, private Eigentümer-/Modus-/Linkzustände und höchstens 8 MiB je Stream. Unerwartete Verzeichniseinträge blockieren.
+
+Die Löschung erfolgt über ein atomisches Rename in einen aus Material-Digest und Taskversuch abgeleiteten Staging-Pfad. Ein unterbrochener Effekt kann fehlende, bereits entfernte Streams im exakt gebundenen Staging-Verzeichnis tolerieren und die verbliebenen Streams entfernen; ein Staging-Pfad ohne persistiertes Intent ist dagegen recovery-pflichtig. Der ursprüngliche oder der Staging-Pfad darf nie gleichzeitig mit einem widersprechenden Gegenstück existieren. Nach belegtem `absent`-Post-State wird ein create-only Completion-Receipt geschrieben. Ist nach einem persistenten Intent weder Original- noch Staging-Verzeichnis vorhanden, kann der Readback als `mutation_state=reconciled_absent` abgeschlossen werden; dies belegt nur den fehlenden Post-State und weder den verursachenden Same-UID-Prozess noch einen vollständig durchgelaufenen Cleanup. Ein Completion-Receipt ohne Intent, Hashdrift oder jede Pfad-/Inodedrift schlägt fail-closed fehl.
+
+Der generische Produktions-Fleet-Pfad erhält keine Python-Freigabe. Reader und Cleanup verwenden stattdessen feste SHA-256-gebundene Programme mit serverseitig validierter Task-ID-, Versuch-, Pfad-, Stream-, Digest- und Größenform. Das begründet weder Same-UID-Authentizität noch eine Löschbefugnis für andere Task-, Workspace- oder Checkoutdaten.
+
+Der periodische globale Task-Refresh führt einen separaten bounded Cleanup-Replay aus. Pro Lauf werden höchstens zehn archivierte Taskbindungen geprüft. Der Cursor ist an den verifizierten Gesamt-Projection-Digest gebunden; jede Projection-Änderung setzt die Traversierung auf einen neuen Snapshot zurück. Ein einzelner fehlerhafter Task wird als begrenzter `error`-Eintrag ausgewiesen, der Cursor schreitet jedoch fort und der Fall wird im nächsten Zyklus erneut besucht. Ein globaler Projection- oder Cursorfehler degradiert ausschließlich den Cleanup-Teil des Refresh-Ergebnisses und verhindert nicht die Taskzustandsaktualisierung.
+
 ## Produktive Current-Task-Leseoberfläche
 
 `grabowski_task_list` lädt vor jeder paginierten Ausgabe den verifizierten Task-Projection-Switch-State. Der Standardpfad ist damit die aktuelle Handlungsprojektion und nicht mehr die unverdichtete historische Datenbankansicht.
