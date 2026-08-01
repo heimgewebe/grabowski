@@ -50,7 +50,7 @@ AUDIT_PUBLICATION_CONTRACT = "audit-before-create-exact-bytes-v1"
 AUDIT_RECOVERY_CONTRACT = "audit-recovered-existing-exact-bytes-v1"
 AUDIT_CONTRACTS = frozenset({AUDIT_PUBLICATION_CONTRACT, AUDIT_RECOVERY_CONTRACT})
 TOOL_KIND = "grabowski_reposkop_context"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ReposkopContextError(RuntimeError):
@@ -399,12 +399,36 @@ def _required_sha256(value: Any, *, label: str) -> str:
     return value
 
 
-def _is_schema_version_one(value: Any) -> bool:
-    return type(value) is int and value == 1
+def _is_schema_version(value: Any, expected: int) -> bool:
+    return type(value) is int and value == expected
 
 
 def _reject_nonfinite_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON constant is unsupported: {value}")
+
+
+def _reposkop_artifact_sha256(value: dict[str, Any]) -> str:
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return _sha256_bytes(payload)
+
+
+def _verify_reposkop_digest(
+    artifact: dict[str, Any], *, field: str, label: str
+) -> str:
+    expected = _required_sha256(artifact.get(field), label=label)
+    unsigned = dict(artifact)
+    unsigned.pop(field, None)
+    if _reposkop_artifact_sha256(unsigned) != expected:
+        raise ReposkopContextError(
+            f"Reposkop report has mismatched {label}"
+        )
+    return expected
 
 
 def _validate_report(
@@ -418,11 +442,20 @@ def _validate_report(
         raise ReposkopContextError("Reposkop report must be a JSON object")
     if (
         report.get("kind") != "reposkop_coherence_report"
-        or not _is_schema_version_one(report.get("schema_version"))
+        or not _is_schema_version(report.get("schema_version"), 2)
     ):
         raise ReposkopContextError("Reposkop report kind or schema is unsupported")
     if report.get("effect_authorized") is not False:
         raise ReposkopContextError("Reposkop report must keep effect_authorized=false")
+    if report.get("authority_boundary") != {
+        "checkout_identity_truth": "reposkop",
+        "checkout_transition_truth": "reposkop",
+        "effect_executor": "grabowski",
+        "task_truth": "bureau",
+        "pull_request_truth": "github",
+        "display": "leitstand",
+    }:
+        raise ReposkopContextError("Reposkop report authority boundary is unsupported")
     observation = report.get("observation")
     projection = report.get("projection")
     if not isinstance(observation, dict) or not isinstance(projection, dict):
@@ -431,14 +464,22 @@ def _validate_report(
         )
     if (
         observation.get("kind") != "reposkop_checkout_observation"
-        or not _is_schema_version_one(observation.get("schema_version"))
+        or not _is_schema_version(observation.get("schema_version"), 2)
     ):
         raise ReposkopContextError(
             "Reposkop observation kind or schema is unsupported"
         )
+    if observation.get("authority") != {
+        "producer": "reposkop",
+        "domain": "local_checkout_identity",
+        "claim": "canonical",
+    }:
+        raise ReposkopContextError("Reposkop observation authority is unsupported")
+    if observation.get("observation_complete") is not True:
+        raise ReposkopContextError("Reposkop observation must be complete")
     if (
         projection.get("kind") != "reposkop_coherence_projection"
-        or not _is_schema_version_one(projection.get("schema_version"))
+        or not _is_schema_version(projection.get("schema_version"), 1)
     ):
         raise ReposkopContextError(
             "Reposkop projection kind or schema is unsupported"
@@ -461,14 +502,33 @@ def _validate_report(
             "Reposkop report target or purpose does not match the request"
         )
     _required_sha256(
-        observation.get("observation_sha256"), label="observation_sha256"
+        identities.get("repository_identity_sha256"),
+        label="repository_identity_sha256",
     )
     _required_sha256(
-        projection.get("projection_sha256"), label="projection_sha256"
+        identities.get("checkout_identity_sha256"),
+        label="checkout_identity_sha256",
     )
-    _required_sha256(report.get("report_sha256"), label="report_sha256")
+    observation_sha256 = _verify_reposkop_digest(
+        observation,
+        field="observation_sha256",
+        label="observation_sha256",
+    )
+    if projection.get("observation_sha256") != observation_sha256:
+        raise ReposkopContextError(
+            "Reposkop projection is not bound to the observation"
+        )
+    _verify_reposkop_digest(
+        projection,
+        field="projection_sha256",
+        label="projection_sha256",
+    )
+    _verify_reposkop_digest(
+        report,
+        field="report_sha256",
+        label="report_sha256",
+    )
     return report
-
 
 def _kill_process_group(process: subprocess.Popen[bytes], *, pgid: int | None = None) -> None:
     # With start_new_session=True the child pid is the session/process-group id.
@@ -1350,15 +1410,19 @@ def _fsync_directory(root_descriptor: int) -> None:
 def _receipt_identity(
     report: dict[str, Any], *, target: Path, purpose: str, executable_sha256: str
 ) -> dict[str, Any]:
+    observation = report["observation"]
+    identities = observation["identities"]
     return {
         "schema_version": SCHEMA_VERSION,
         "target_path": str(target),
         "purpose": purpose,
         "reposkop_executable_sha256": executable_sha256,
-        "observation_sha256": report["observation"]["observation_sha256"],
+        "report_sha256": report["report_sha256"],
+        "observation_sha256": observation["observation_sha256"],
+        "repository_identity_sha256": identities["repository_identity_sha256"],
+        "checkout_identity_sha256": identities["checkout_identity_sha256"],
         "projection_sha256": report["projection"]["projection_sha256"],
     }
-
 
 def _receipt_payload(
     identity: dict[str, Any], *, usage_key_sha256: str
