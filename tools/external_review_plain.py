@@ -368,10 +368,12 @@ def sanitized_environment() -> tuple[
 
 
 def _trusted_executable_owner_ids() -> set[int]:
-    return {0, os.getuid()}
+    # In user-namespaced runtimes the filesystem root owner can be mapped to a
+    # synthetic uid even though it still represents the root trust boundary.
+    return {0, os.getuid(), Path("/").stat().st_uid}
 
 
-def _validate_executable_ancestry(path: Path, *, label: str) -> None:
+def _validate_path_ancestry(path: Path, *, label: str) -> None:
     """Reject path components another local user could replace."""
     trusted_owners = _trusted_executable_owner_ids()
     child = path
@@ -427,7 +429,7 @@ def _validated_executable(path: Path, *, label: str) -> Path:
         raise PlainReviewError(
             f"{label} must be an owner-controlled executable regular file"
         )
-    _validate_executable_ancestry(resolved, label=label)
+    _validate_path_ancestry(resolved, label=label)
     return resolved
 
 
@@ -797,6 +799,18 @@ def _is_owner_controlled_directory(metadata: os.stat_result) -> bool:
     )
 
 
+def _is_trusted_ancestry_directory(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid in _trusted_executable_owner_ids()
+        and metadata.st_nlink >= 1
+        and (
+            metadata.st_mode & 0o022 == 0
+            or metadata.st_mode & stat.S_ISVTX != 0
+        )
+    )
+
+
 def _parent_directory_open_flags() -> int:
     parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_DIRECTORY"):
@@ -806,11 +820,135 @@ def _parent_directory_open_flags() -> int:
     return parent_flags
 
 
+def _discard_created_directories(
+    directories: list[tuple[Path, os.stat_result]],
+) -> None:
+    """Best-effort removal of empty directories created by this run."""
+    while directories:
+        directory, created = directories.pop()
+        parent_descriptor = -1
+        try:
+            linked = directory.lstat()
+            if (
+                not _is_owner_controlled_directory(linked)
+                or not _same_file_identity(created, linked)
+            ):
+                continue
+            _validate_path_ancestry(
+                directory,
+                label="created artifact directory cleanup",
+            )
+            parent_descriptor = os.open(
+                directory.parent,
+                _parent_directory_open_flags(),
+            )
+            parent_linked = directory.parent.lstat()
+            parent_opened = os.fstat(parent_descriptor)
+            linked_from_parent = os.stat(
+                directory.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(parent_linked.st_mode)
+                or not _is_trusted_ancestry_directory(parent_linked)
+                or not _is_trusted_ancestry_directory(parent_opened)
+                or not _same_file_identity(parent_opened, parent_linked)
+                or not _is_owner_controlled_directory(linked_from_parent)
+                or not _same_file_identity(created, linked_from_parent)
+            ):
+                continue
+            os.rmdir(directory.name, dir_fd=parent_descriptor)
+            try:
+                os.fsync(parent_descriptor)
+            except OSError:
+                pass
+        except (OSError, PlainReviewError):
+            pass
+        finally:
+            if parent_descriptor >= 0:
+                try:
+                    os.close(parent_descriptor)
+                except OSError:
+                    pass
+
+
+def _ensure_private_parent_directories(
+    path: Path,
+    *,
+    label: str,
+) -> list[tuple[Path, os.stat_result]]:
+    """Create missing parents as 0700 and return their exact identities."""
+    parent = Path(os.path.abspath(path.parent))
+    missing: list[Path] = []
+    cursor = parent
+    try:
+        while True:
+            try:
+                existing = cursor.lstat()
+                break
+            except FileNotFoundError:
+                missing.append(cursor)
+                if cursor.parent == cursor:
+                    raise PlainReviewError(
+                        f"cannot write {label}: parent root is unavailable"
+                    )
+                cursor = cursor.parent
+        if stat.S_ISLNK(existing.st_mode) or (
+            cursor != parent
+            and not _is_trusted_ancestry_directory(existing)
+        ):
+            raise PlainReviewError(
+                f"cannot write {label}: unsafe parent ancestry"
+            )
+        _validate_path_ancestry(cursor, label=f"{label} parent")
+    except OSError as exc:
+        raise PlainReviewError(f"cannot write {label}: {exc}") from exc
+
+    created_directories: list[tuple[Path, os.stat_result]] = []
+    try:
+        for directory in reversed(missing):
+            created = False
+            try:
+                os.mkdir(directory, 0o700)
+                created = True
+            except FileExistsError:
+                pass
+            metadata = directory.lstat()
+            if created:
+                created_directories.append((directory, metadata))
+                os.chmod(directory, 0o700)
+                secured = directory.lstat()
+                if not _same_file_identity(metadata, secured):
+                    raise PlainReviewError(
+                        f"cannot write {label}: created parent identity drifted"
+                    )
+                metadata = secured
+                created_directories[-1] = (directory, metadata)
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not _is_owner_controlled_directory(metadata)
+            ):
+                raise PlainReviewError(
+                    f"cannot write {label}: unsafe created parent identity"
+                )
+        _validate_path_ancestry(parent, label=f"{label} parent")
+        return created_directories
+    except BaseException as exc:
+        _discard_created_directories(created_directories)
+        if isinstance(exc, PlainReviewError):
+            raise
+        if isinstance(exc, OSError):
+            raise PlainReviewError(f"cannot write {label}: {exc}") from exc
+        raise
+
+
 def _open_owner_controlled_parent(
     path: Path,
     *,
     label: str,
 ) -> tuple[int, os.stat_result]:
+    path = Path(os.path.abspath(path))
     try:
         parent_descriptor = os.open(
             path.parent,
@@ -831,6 +969,7 @@ def _open_owner_controlled_parent(
             raise PlainReviewError(
                 f"cannot write {label}: unsafe parent identity"
             )
+        _validate_path_ancestry(path.parent, label=f"{label} parent")
         return parent_descriptor, parent_opened
     except BaseException:
         try:
@@ -845,12 +984,21 @@ def write_text_create_only(
     text: str,
     *,
     label: str,
+    created_directories: list[tuple[Path, os.stat_result]] | None = None,
 ) -> os.stat_result:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent_descriptor, parent_opened = _open_owner_controlled_parent(
+    path = Path(os.path.abspath(path))
+    local_created_directories = _ensure_private_parent_directories(
         path,
         label=label,
     )
+    try:
+        parent_descriptor, parent_opened = _open_owner_controlled_parent(
+            path,
+            label=label,
+        )
+    except BaseException:
+        _discard_created_directories(local_created_directories)
+        raise
     descriptor = -1
     handle = None
     created: os.stat_result | None = None
@@ -873,6 +1021,7 @@ def write_text_create_only(
         except FileExistsError as exc:
             raise PlainReviewError(f"{label} already exists: {path}") from exc
 
+        os.fchmod(descriptor, 0o600)
         created = os.fstat(descriptor)
         linked = os.stat(
             path.name,
@@ -921,6 +1070,8 @@ def write_text_create_only(
             raise PlainReviewError(
                 f"cannot write {label}: created path identity drifted"
             )
+        if created_directories is not None:
+            created_directories.extend(local_created_directories)
         return linked_after
     except BaseException as exc:
         if created is not None:
@@ -929,6 +1080,7 @@ def write_text_create_only(
                 path.name,
                 created,
             )
+        _discard_created_directories(local_created_directories)
         if isinstance(exc, PlainReviewError):
             raise
         if isinstance(exc, OSError):
@@ -953,6 +1105,7 @@ def write_text_create_only(
 
 def discard_created_paths(
     paths: list[tuple[Path, os.stat_result]],
+    directories: list[tuple[Path, os.stat_result]] | None = None,
 ) -> None:
     """Remove only paths this run created with O_EXCL, restoring the prior state.
 
@@ -992,6 +1145,8 @@ def discard_created_paths(
                 os.close(parent_descriptor)
             except OSError:
                 pass
+    if directories is not None:
+        _discard_created_directories(directories)
 
 
 def ensure_distinct_output_paths(paths: list[Path]) -> None:
@@ -1197,9 +1352,13 @@ def run_from_manifest(
     # Paths created by this run, discarded again if the run fails before the
     # provider returned a structurally valid review.
     created_paths: list[tuple[Path, os.stat_result]] = []
+    created_directories: list[tuple[Path, os.stat_result]] = []
     try:
         sent_prompt_identity = write_text_create_only(
-            sent_prompt_path, prompt, label="transmitted prompt output"
+            sent_prompt_path,
+            prompt,
+            label="transmitted prompt output",
+            created_directories=created_directories,
         )
         created_paths.append((sent_prompt_path, sent_prompt_identity))
         (
@@ -1227,7 +1386,10 @@ def run_from_manifest(
             )
         if completed.stdout:
             raw_identity = write_text_create_only(
-                raw_path, completed.stdout, label="raw review output"
+                raw_path,
+                completed.stdout,
+                label="raw review output",
+                created_directories=created_directories,
             )
             created_paths.append((raw_path, raw_identity))
         if completed.returncode != 0:
@@ -1240,12 +1402,13 @@ def run_from_manifest(
             raise PlainReviewError(f"{provider} CLI returned empty stdout")
         review = parse_review_json(completed.stdout)
     except BaseException:
-        discard_created_paths(created_paths)
+        discard_created_paths(created_paths, created_directories)
         raise
     # The provider answered with a valid review, so the transmitted prompt and
     # raw response are the forensic record and are kept even if publication
     # below fails.
     created_paths.clear()
+    created_directories.clear()
     evidence = build_evidence(
         manifest=manifest,
         provider=provider,

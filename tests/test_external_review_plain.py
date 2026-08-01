@@ -796,7 +796,8 @@ class PlainExternalReviewTests(unittest.TestCase):
         ]
         for name, fail_write, fail_flush, fail_close, expected in scenarios:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                target = Path(directory) / "artifact.txt"
+                root = Path(directory)
+                target = root / "new" / "nested" / "artifact.txt"
                 real_fdopen = plain.os.fdopen
 
                 def faulting_fdopen(*args, **kwargs):
@@ -821,6 +822,7 @@ class PlainExternalReviewTests(unittest.TestCase):
                         label="test artifact",
                     )
                 self.assertFalse(target.exists())
+                self.assertFalse((root / "new").exists())
 
                 plain.write_text_create_only(
                     target,
@@ -1013,6 +1015,98 @@ class PlainExternalReviewTests(unittest.TestCase):
 
             self.assertFalse(target.exists())
 
+    def test_create_only_rejects_writable_higher_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsafe = root / "shared"
+            unsafe.mkdir(mode=0o700)
+            unsafe.chmod(0o770)
+            parent = unsafe / "private"
+            parent.mkdir(mode=0o700)
+            target = parent / "artifact.txt"
+
+            with self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "unsafe path ancestry",
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "must not be written",
+                    label="test artifact",
+                )
+
+            self.assertFalse(target.exists())
+
+    def test_create_only_makes_missing_parents_private_under_open_umask(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "new" / "nested"
+            target = parent / "artifact.txt"
+            for attempt, process_umask in enumerate((0o002, 0o777)):
+                with self.subTest(umask=oct(process_umask)):
+                    attempt_parent = parent / str(attempt)
+                    attempt_target = attempt_parent / target.name
+                    previous_umask = os.umask(process_umask)
+                    try:
+                        plain.write_text_create_only(
+                            attempt_target,
+                            "private artifact",
+                            label="test artifact",
+                        )
+                    finally:
+                        os.umask(previous_umask)
+
+                    for created_parent in (
+                        root / "new",
+                        parent,
+                        attempt_parent,
+                    ):
+                        self.assertEqual(
+                            stat.S_IMODE(created_parent.stat().st_mode),
+                            0o700,
+                        )
+                    self.assertEqual(
+                        stat.S_IMODE(attempt_target.stat().st_mode),
+                        0o600,
+                    )
+
+    def test_failed_run_removes_private_parents_created_for_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            artifact_root = root / "new" / "nested"
+            output = artifact_root / "evidence.json"
+            previous_umask = os.umask(0o002)
+            try:
+                with (
+                    mock.patch.object(
+                        plain,
+                        "run_bounded_process",
+                        side_effect=plain.PlainReviewError(
+                            "simulated provider failure"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        plain.PlainReviewError,
+                        "simulated provider failure",
+                    ),
+                ):
+                    self._run(
+                        manifest,
+                        output,
+                        provider="gemini",
+                        executable="gemini",
+                        model=None,
+                    )
+            finally:
+                os.umask(previous_umask)
+
+            self.assertFalse((root / "new").exists())
+
     def test_partial_owned_artifacts_are_preserved_on_final_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1020,10 +1114,21 @@ class PlainExternalReviewTests(unittest.TestCase):
             output = root / "evidence.json"
             original_write = plain.write_text_create_only
 
-            def fail_evidence(path, text, *, label):
+            def fail_evidence(
+                path,
+                text,
+                *,
+                label,
+                created_directories=None,
+            ):
                 if label == "evidence output":
                     raise plain.PlainReviewError("simulated evidence failure")
-                return original_write(path, text, label=label)
+                return original_write(
+                    path,
+                    text,
+                    label=label,
+                    created_directories=created_directories,
+                )
 
             def fake_run(argv, **kwargs):
                 return subprocess.CompletedProcess(

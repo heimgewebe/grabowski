@@ -37,7 +37,11 @@ This path is deliberately distinct from coding-agent review:
 - the private temporary workspace is checked before and after the provider
   turn, including the contents and mode of Grok's prompt file;
 - the exact transmitted prompt, raw stdout, argv digest, and evidence are
-  create-only artifacts; local text artifacts are created with mode `0600`.
+  create-only artifacts; missing artifact directories are created with mode
+  `0700`, their full ancestry is validated against replacement by another local
+  user, and local text artifacts are created with mode `0600`; directories
+  created by an attempt are removed again if that attempt fails before a valid
+  review is retained.
 
 The external result remains diagnostic. It never replaces, satisfies, or
 shortens the head/diff-bound Grabowski self-review loop.
