@@ -1496,6 +1496,8 @@ class ConnectorSnapshotRefreshTests(unittest.TestCase):
             self.assertIn("123", command)
             self.assertIn("456", command)
             self.assertIn("http://127.0.0.1:18181/mcp", command)
+            self.assertIn("20.0", command)
+            self.assertEqual(runner.call_args.kwargs["timeout"], 22.0)
 
     def test_refresh_failure_is_reported_without_raising(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
