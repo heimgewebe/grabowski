@@ -1116,6 +1116,7 @@ class TaskAttentionTests(unittest.TestCase):
             archive_binding: dict[str, object],
             projection: dict[str, object],
             retention_boundary_unix: int,
+            archived_record: dict[str, object] | None = None,
         ) -> dict[str, object]:
             nonlocal calls
             calls += 1
@@ -1248,6 +1249,144 @@ class TaskAttentionTests(unittest.TestCase):
                 retention_boundary_unix=123,
             )
 
+    def test_task_output_cleanup_covers_every_resumed_attempt(self) -> None:
+        record = self._completed_task()
+        task_id = str(record["task_id"])
+        final_attempt = 3
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record = {
+            **record,
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        }
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        inspected_attempts: list[int] = []
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            self.assertEqual(mode, "inspect")
+            inspected_attempts.append(int(current["attempt"]))
+            return {
+                "status": "missing",
+                "mode": mode,
+                "observer": "task-output-cleanup-v1",
+            }
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention, "_assert_no_live_task_resource_leases",
+            return_value={"active_lease": False},
+        ) as leases, patch.object(
+            attention, "_assert_no_live_task_process",
+            return_value={"active_process": False},
+        ) as processes:
+            results = []
+            for _index in range(final_attempt):
+                results.append(
+                    attention._task_output_cleanup_all_attempts_after_archive(
+                        record,
+                        archive_binding=archive_binding,
+                        projection=projection,
+                        retention_boundary_unix=123,
+                    )
+                )
+
+        self.assertEqual(inspected_attempts, [1, 2, 3])
+        self.assertEqual(
+            [result["status"] for result in results],
+            ["deferred", "deferred", "not_present"],
+        )
+        self.assertEqual(
+            [result["attempt_cursor_before"] for result in results],
+            [0, 1, 2],
+        )
+        self.assertEqual(
+            [result["attempt_cursor_after"] for result in results],
+            [1, 2, 0],
+        )
+        self.assertEqual(results[-1]["attempt_count"], 3)
+        self.assertEqual(results[-1]["not_present_attempts"], [3])
+        self.assertEqual(leases.call_count, 3)
+        self.assertEqual(
+            [int(call.args[0]["attempt"]) for call in processes.call_args_list],
+            [1, 2, 3],
+        )
+
+    def test_task_output_cleanup_refreshes_live_guard_time_per_attempt(self) -> None:
+        record = self._completed_task()
+        task_id = str(record["task_id"])
+        final_attempt = 2
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record = {
+            **record,
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        }
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        def cleanup_attempt(
+            current: dict[str, object], **_kwargs: object
+        ) -> dict[str, object]:
+            return {
+                "status": "not_present",
+                "task_binding": attention._task_binding(current),
+            }
+
+        with patch.object(
+            attention,
+            "_task_output_cleanup_now_unix",
+            side_effect=[100, 101, 200, 202],
+        ), patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            return_value=100,
+        ), patch.object(
+            attention, "_assert_no_live_task_resource_leases",
+            return_value={"active_lease": False},
+        ) as leases, patch.object(
+            attention, "_assert_no_live_task_process",
+            return_value={"active_process": False},
+        ), patch.object(
+            attention, "_task_output_cleanup_after_archive",
+            side_effect=cleanup_attempt,
+        ) as cleanup:
+            first = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=100,
+            )
+            second = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=100,
+            )
+
+        self.assertEqual(first["status"], "deferred")
+        self.assertEqual(second["status"], "not_present")
+        self.assertEqual(
+            [call.kwargs["now_unix"] for call in leases.call_args_list],
+            [101, 202],
+        )
+        self.assertEqual(
+            [int(call.args[0]["attempt"]) for call in cleanup.call_args_list],
+            [1, 2],
+        )
+        self.assertEqual(second["status"], "not_present")
+
     def _automatic_cleanup_fixture(
         self, count: int, *, projection_sha256: str = "9" * 64
     ) -> tuple[list[dict[str, object]], dict[str, object], object]:
@@ -1302,15 +1441,17 @@ class TaskAttentionTests(unittest.TestCase):
 
     def test_archived_output_reconcile_canonicalizes_boundary_before_live_checks(self) -> None:
         records, projection, manifest = self._automatic_cleanup_fixture(1)
+        record = records[0]
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection_binding = {
+            "task_id": str(record["task_id"]),
+            **projection["archived_task_bindings"][str(record["task_id"])],
+            "projection_sha256": str(projection["projection_sha256"]),
+        }
         future_boundary_unix = int(attention.time.time()) + 3600
 
         with patch.object(
-            tasks, "_task_current_projection", return_value=projection
-        ), patch.object(
-            lifecycle_archive,
-            "verify_task_archive_segment",
-            return_value={"manifest": manifest},
-        ), patch.object(
             attention,
             "_canonical_task_output_cleanup_retention_boundary",
             return_value=future_boundary_unix,
@@ -1319,25 +1460,21 @@ class TaskAttentionTests(unittest.TestCase):
         ) as leases, patch.object(
             attention, "_assert_no_live_task_process"
         ) as process, patch.object(
-            attention,
-            "_task_output_cleanup_after_archive",
-            return_value={
-                "status": "deferred",
-                "eligible_at_unix": future_boundary_unix,
-            },
+            attention, "_task_output_cleanup_after_archive"
         ) as cleanup:
-            result = attention.reconcile_archived_task_outputs(limit=1)
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection_binding,
+                retention_boundary_unix=123,
+            )
 
         canonicalize.assert_called_once()
         leases.assert_not_called()
         process.assert_not_called()
-        cleanup.assert_called_once()
-        self.assertEqual(
-            cleanup.call_args.kwargs["retention_boundary_unix"],
-            future_boundary_unix,
-        )
-        self.assertEqual(result["counts"]["deferred"], 1)
-        self.assertEqual(result["results"][0]["task_id"], records[0]["task_id"])
+        cleanup.assert_not_called()
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["retention_boundary_unix"], future_boundary_unix)
 
     def test_archived_output_reconcile_cursor_is_fair_and_bounded(self) -> None:
         records, projection, manifest = self._automatic_cleanup_fixture(3)
@@ -1355,7 +1492,7 @@ class TaskAttentionTests(unittest.TestCase):
             "verify_task_archive_segment",
             return_value={"manifest": manifest},
         ), patch.object(
-            attention, "_task_output_cleanup_after_archive", side_effect=cleanup
+            attention, "_task_output_cleanup_all_attempts_after_archive", side_effect=cleanup
         ):
             first = attention.reconcile_archived_task_outputs(limit=2)
             second = attention.reconcile_archived_task_outputs(limit=2)
@@ -1397,7 +1534,7 @@ class TaskAttentionTests(unittest.TestCase):
             "verify_task_archive_segment",
             return_value={"manifest": manifest},
         ), patch.object(
-            attention, "_task_output_cleanup_after_archive", side_effect=cleanup
+            attention, "_task_output_cleanup_all_attempts_after_archive", side_effect=cleanup
         ):
             result = attention.reconcile_archived_task_outputs(limit=1)
 
@@ -1425,7 +1562,7 @@ class TaskAttentionTests(unittest.TestCase):
             "verify_task_archive_segment",
             return_value={"manifest": manifest},
         ), patch.object(
-            attention, "_task_output_cleanup_after_archive", side_effect=cleanup
+            attention, "_task_output_cleanup_all_attempts_after_archive", side_effect=cleanup
         ):
             result = attention.reconcile_archived_task_outputs(limit=2)
 

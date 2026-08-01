@@ -55,6 +55,11 @@ TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE = (
     "component:grabowski-task-output-cleanup-reconcile"
 )
 TASK_OUTPUT_CLEANUP_RECONCILE_LEASE_TTL_SECONDS = 15 * 60
+TASK_OUTPUT_CLEANUP_ATTEMPT_CURSOR_METADATA_PREFIX = (
+    "task_output_cleanup_attempt_cursor_v1:"
+)
+TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE = 1
+TASK_OUTPUT_CLEANUP_TASK_LEASE_TTL_SECONDS = 15 * 60
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
 DECISION_FILE_RE = re.compile(r"(?P<task_id>[0-9a-f]{24})\.a(?P<attempt>[1-9][0-9]*)\.json\Z")
@@ -302,6 +307,33 @@ def _task_binding(record: dict[str, Any]) -> dict[str, Any]:
         "authoritative_unit": tasks._authoritative_unit(record),
         "argv_sha256": argv_sha256,
         "execution_envelope_sha256": envelope,
+    }
+
+
+def _task_output_cleanup_now_unix() -> int:
+    return int(time.time())
+
+
+def _task_output_attempt_record(
+    archived_record: dict[str, Any],
+    attempt: int,
+) -> dict[str, Any]:
+    archived_binding = _task_binding(archived_record)
+    final_attempt = int(archived_binding["attempt"])
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or not 1 <= attempt <= final_attempt
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup attempt is outside the archived attempt range"
+        )
+    unit = tasks._task_unit(str(archived_binding["task_id"]), attempt)
+    return {
+        **archived_record,
+        "attempt": attempt,
+        "unit": unit,
+        "authoritative_unit": unit,
     }
 
 
@@ -1626,8 +1658,18 @@ def _task_output_cleanup_after_archive_unlocked(
     archive_binding: dict[str, Any],
     projection: dict[str, Any],
     retention_boundary_unix: int,
+    archived_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    archived_record = record if archived_record is None else archived_record
+    archived_binding = _task_binding(archived_record)
     binding = _task_binding(record)
+    if (
+        binding["task_id"] != archived_binding["task_id"]
+        or int(binding["attempt"]) > int(archived_binding["attempt"])
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup attempt is not bound to the archived task"
+        )
     lifecycle_receipt = record.get("lifecycle_receipt_sha256")
     if not isinstance(lifecycle_receipt, str) or SHA256_RE.fullmatch(lifecycle_receipt) is None:
         raise TaskAttentionIntegrityError("task output cleanup lifecycle receipt is unavailable")
@@ -1713,15 +1755,27 @@ def _task_output_cleanup_after_archive_unlocked(
             "post_state": "absent",
         }
     current = tasks._row_raw(str(binding["task_id"]))
-    if _task_binding(current) != binding or current.get("lifecycle_receipt_sha256") != lifecycle_receipt:
-        raise TaskAttentionConflictError("task binding changed before output cleanup")
+    if (
+        _task_binding(current) != archived_binding
+        or current.get("lifecycle_receipt_sha256") != lifecycle_receipt
+    ):
+        raise TaskAttentionConflictError(
+            "archived task binding changed before output cleanup"
+        )
+    current_attempt_record = _task_output_attempt_record(
+        current, int(binding["attempt"])
+    )
+    if _task_binding(current_attempt_record) != binding:
+        raise TaskAttentionConflictError(
+            "task output attempt binding changed before cleanup"
+        )
     current_projection = _existing_task_projection_binding(
         str(binding["task_id"]), expected_record_sha256=str(projection_binding["record_sha256"])
     )
     if _task_output_cleanup_projection_binding(current_projection or {}) != projection_binding:
         raise TaskAttentionConflictError("task archive projection changed before output cleanup")
     deletion = tasks._task_output_cleanup_run(
-        current,
+        current_attempt_record,
         mode="delete",
         token=str(intent["material_sha256"]),
         inventory=inventory,
@@ -1732,7 +1786,9 @@ def _task_output_cleanup_after_archive_unlocked(
             "kind": "grabowski_task_output_cleanup_absent_readback",
             "task_id": binding["task_id"],
             "attempt": binding["attempt"],
-            "directory": str(tasks._task_output_paths(current)["directory"]),
+            "directory": str(
+                tasks._task_output_paths(current_attempt_record)["directory"]
+            ),
             "token": intent["material_sha256"],
             "observer": deletion.get("observer"),
             "mutation_state": "unknown",
@@ -1791,8 +1847,18 @@ def _task_output_cleanup_after_archive(
     archive_binding: dict[str, Any],
     projection: dict[str, Any],
     retention_boundary_unix: int,
+    archived_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    archived_record = record if archived_record is None else archived_record
+    archived_binding = _task_binding(archived_record)
     binding = _task_binding(record)
+    if (
+        binding["task_id"] != archived_binding["task_id"]
+        or int(binding["attempt"]) > int(archived_binding["attempt"])
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup attempt is not bound to the archived task"
+        )
     retention_boundary_unix = (
         _canonical_task_output_cleanup_retention_boundary(
             record,
@@ -1857,6 +1923,7 @@ def _task_output_cleanup_after_archive(
             archive_binding=archive_binding,
             projection=projection,
             retention_boundary_unix=retention_boundary_unix,
+            archived_record=archived_record,
         )
     except BaseException:
         _release_owned_archive_resources(owner, [resource_key])
@@ -1865,6 +1932,298 @@ def _task_output_cleanup_after_archive(
     if release.get("status") not in {"released", "not_required"}:
         raise TaskAttentionError("task output cleanup resource release failed")
     return {**result, "cleanup_resource_release": release}
+
+
+def _task_output_cleanup_attempt_cursor_key(task_id: str) -> str:
+    return (
+        TASK_OUTPUT_CLEANUP_ATTEMPT_CURSOR_METADATA_PREFIX
+        + tasks._validate_task_id(task_id)
+    )
+
+
+def _load_task_output_cleanup_attempt_cursor(
+    record: dict[str, Any],
+    *,
+    archive_binding: dict[str, Any],
+) -> int:
+    binding = _task_binding(record)
+    record_sha256 = archive_binding.get("record_sha256")
+    if not isinstance(record_sha256, str) or SHA256_RE.fullmatch(record_sha256) is None:
+        raise TaskAttentionIntegrityError("task output cleanup archive record digest is invalid")
+    key = _task_output_cleanup_attempt_cursor_key(str(binding["task_id"]))
+    with tasks._database_connection() as connection:
+        row = connection.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return 0
+    try:
+        value = json.loads(str(row[0]))
+    except json.JSONDecodeError as exc:
+        raise TaskAttentionIntegrityError("task output cleanup attempt cursor is malformed") from exc
+    expected_keys = {
+        "schema_version",
+        "task_id",
+        "archived_attempt",
+        "record_sha256",
+        "cursor",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise TaskAttentionIntegrityError(
+            "task output cleanup attempt cursor shape is invalid"
+        )
+    if (
+        value.get("schema_version") != 1
+        or value.get("task_id") != binding["task_id"]
+        or value.get("archived_attempt") != binding["attempt"]
+        or value.get("record_sha256") != record_sha256
+    ):
+        raise TaskAttentionConflictError(
+            "task output cleanup attempt cursor binding changed"
+        )
+    cursor = value.get("cursor")
+    final_attempt = int(binding["attempt"])
+    if (
+        isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or not 0 <= cursor < final_attempt
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup attempt cursor value is invalid"
+        )
+    return cursor
+
+
+def _save_task_output_cleanup_attempt_cursor(
+    record: dict[str, Any],
+    *,
+    archive_binding: dict[str, Any],
+    cursor: int,
+) -> None:
+    binding = _task_binding(record)
+    final_attempt = int(binding["attempt"])
+    if (
+        isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or not 0 <= cursor < final_attempt
+    ):
+        raise TaskAttentionIntegrityError(
+            "task output cleanup attempt cursor value is invalid"
+        )
+    record_sha256 = archive_binding.get("record_sha256")
+    if not isinstance(record_sha256, str) or SHA256_RE.fullmatch(record_sha256) is None:
+        raise TaskAttentionIntegrityError("task output cleanup archive record digest is invalid")
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "task_id": binding["task_id"],
+            "archived_attempt": final_attempt,
+            "record_sha256": record_sha256,
+            "cursor": cursor,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    key = _task_output_cleanup_attempt_cursor_key(str(binding["task_id"]))
+    with tasks._database_connection() as connection:
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, payload),
+        )
+
+
+def _task_output_cleanup_all_attempts_after_archive(
+    record: dict[str, Any],
+    *,
+    archive_binding: dict[str, Any],
+    projection: dict[str, Any],
+    retention_boundary_unix: int,
+) -> dict[str, Any]:
+    archived_binding = _task_binding(record)
+    final_attempt = int(archived_binding["attempt"])
+    canonical_boundary_unix = (
+        _canonical_task_output_cleanup_retention_boundary(
+            record,
+            archive_binding=archive_binding,
+            projection=projection,
+            proposed_boundary_unix=retention_boundary_unix,
+        )
+    )
+    initial_now_unix = _task_output_cleanup_now_unix()
+    if initial_now_unix < canonical_boundary_unix:
+        return {
+            "status": "deferred",
+            "reason": "retention_boundary_not_reached",
+            "task_binding": archived_binding,
+            "attempt_count": final_attempt,
+            "attempt_results": [],
+            "retention_boundary_unix": canonical_boundary_unix,
+            "eligible_at_unix": canonical_boundary_unix,
+            "remaining_seconds": canonical_boundary_unix - initial_now_unix,
+            "minimum_retention_seconds": TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+            "does_not_establish": [
+                "task_output_deleted",
+                "retention_or_archive_completion",
+            ],
+        }
+    task_id = str(archived_binding["task_id"])
+    resource_key = "component:grabowski-task-output-cleanup-task:" + task_id
+    owner = tasks.resources._owner(
+        "operator:task-output-cleanup-task:"
+        + task_id
+        + ":"
+        + uuid.uuid4().hex[:24]
+    )
+    try:
+        tasks.resources.acquire_resources(
+            owner,
+            [resource_key],
+            purpose="task output cleanup attempt traversal " + task_id,
+            ttl_seconds=TASK_OUTPUT_CLEANUP_TASK_LEASE_TTL_SECONDS,
+            metadata={
+                "schema_version": 1,
+                "operation": "task-output-cleanup-attempt-traversal",
+                "task_id": task_id,
+                "archived_attempt": final_attempt,
+                "record_sha256": archive_binding.get("record_sha256"),
+            },
+        )
+    except tasks.resources.ResourceConflict as exc:
+        raise TaskAttentionConflictError(str(exc)) from exc
+    result: dict[str, Any]
+    try:
+        cursor_before = _load_task_output_cleanup_attempt_cursor(
+            record, archive_binding=archive_binding
+        )
+        start_attempt = cursor_before + 1
+        end_attempt = min(
+            final_attempt,
+            start_attempt + TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE - 1,
+        )
+        selected_attempts = list(range(start_attempt, end_attempt + 1))
+        attempt_results: list[dict[str, Any]] = []
+        counts = {"deleted": 0, "deferred": 0, "not_present": 0, "errors": 0}
+        for attempt in selected_attempts:
+            attempt_record = _task_output_attempt_record(record, attempt)
+            observed_at_unix = _task_output_cleanup_now_unix()
+            if observed_at_unix < canonical_boundary_unix:
+                attempt_results.append({
+                    "attempt": attempt,
+                    "status": "error",
+                    "error_type": "TaskAttentionIntegrityError",
+                    "error": "task output cleanup clock moved behind the retention boundary",
+                })
+                counts["errors"] += 1
+                continue
+            try:
+                lease_observation = _assert_no_live_task_resource_leases(
+                    record, now_unix=observed_at_unix
+                )
+                process_observation = _assert_no_live_task_process(attempt_record)
+                cleanup = _task_output_cleanup_after_archive(
+                    attempt_record,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=canonical_boundary_unix,
+                    archived_record=record,
+                )
+                status = str(cleanup.get("status"))
+                if status not in {"deleted", "deferred", "not_present"}:
+                    raise TaskAttentionIntegrityError(
+                        "task output cleanup attempt status is invalid"
+                    )
+                counts[status] += 1
+                attempt_results.append({
+                    **cleanup,
+                    "attempt": attempt,
+                    "eligibility_observed_at_unix": observed_at_unix,
+                    "lease_observation": lease_observation,
+                    "process_observation": process_observation,
+                })
+            except Exception as exc:
+                counts["errors"] += 1
+                attempt_results.append({
+                    "attempt": attempt,
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "error": tasks.operator._redact(str(exc))[:512],
+                })
+        cycle_completed = end_attempt >= final_attempt
+        cursor_after = 0 if cycle_completed else end_attempt
+        _save_task_output_cleanup_attempt_cursor(
+            record, archive_binding=archive_binding, cursor=cursor_after
+        )
+        deleted_attempts = [
+            int(item["attempt"]) for item in attempt_results
+            if item.get("status") == "deleted"
+        ]
+        not_present_attempts = [
+            int(item["attempt"]) for item in attempt_results
+            if item.get("status") == "not_present"
+        ]
+        if counts["errors"]:
+            status = "error"
+            reason = "attempt_cleanup_error"
+        elif counts["deferred"] or not cycle_completed:
+            status = "deferred"
+            reason = (
+                "attempt_deferred"
+                if counts["deferred"]
+                else "attempt_batch_remaining"
+            )
+        elif counts["deleted"]:
+            status = "deleted"
+            reason = "attempt_cycle_completed"
+        else:
+            status = "not_present"
+            reason = "attempt_cycle_completed"
+        eligible_at_unix: int | None = None
+        if status == "deferred":
+            eligible_at_unix = canonical_boundary_unix
+            if reason == "attempt_batch_remaining" and attempt_results:
+                observed_at = attempt_results[-1].get(
+                    "eligibility_observed_at_unix"
+                )
+                if isinstance(observed_at, int) and not isinstance(
+                    observed_at, bool
+                ):
+                    eligible_at_unix = observed_at
+            elif reason == "attempt_deferred" and attempt_results:
+                deferred_at = attempt_results[-1].get("eligible_at_unix")
+                if isinstance(deferred_at, int) and not isinstance(
+                    deferred_at, bool
+                ):
+                    eligible_at_unix = deferred_at
+        result = {
+            "status": status,
+            "reason": reason,
+            "task_binding": archived_binding,
+            "attempt_count": final_attempt,
+            "attempt_batch_size": TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE,
+            "attempts_scanned": len(selected_attempts),
+            "attempt_cursor_before": cursor_before,
+            "attempt_cursor_after": cursor_after,
+            "attempt_cycle_completed": cycle_completed,
+            "attempt_results": attempt_results,
+            "counts": counts,
+            "retention_boundary_unix": canonical_boundary_unix,
+            "eligible_at_unix": eligible_at_unix,
+            "deleted_attempts": deleted_attempts,
+            "not_present_attempts": not_present_attempts,
+        }
+        if (
+            final_attempt == 1
+            and len(attempt_results) == 1
+            and attempt_results[0].get("status")
+            in {"deleted", "deferred", "not_present"}
+        ):
+            result = {**attempt_results[0], **result}
+    finally:
+        release = _release_owned_archive_resources(owner, [resource_key])
+    if release.get("status") not in {"released", "not_required"}:
+        raise TaskAttentionError(
+            "task output cleanup attempt traversal release failed"
+        )
+    return {**result, "attempt_traversal_resource_release": release}
 
 
 def _load_task_output_cleanup_cursor(
@@ -2006,7 +2365,6 @@ def _reconcile_archived_task_outputs_owned(
     }
     archive_root = tasks._task_archive_root()
     lifecycle = importlib.import_module("grabowski_lifecycle_archive")
-    now_unix = int(time.time())
     for task_id in selected:
         try:
             binding = bindings.get(task_id)
@@ -2045,31 +2403,21 @@ def _reconcile_archived_task_outputs_owned(
                 record,
                 minimum_age_seconds=TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
             )
-            retention_boundary_unix = (
-                _canonical_task_output_cleanup_retention_boundary(
-                    record,
-                    archive_binding=archive_binding,
-                    projection=projection_binding,
-                    proposed_boundary_unix=proposed_retention_boundary_unix,
-                )
-            )
-            if now_unix >= retention_boundary_unix:
-                _assert_no_live_task_resource_leases(
-                    record, now_unix=now_unix
-                )
-                _assert_no_live_task_process(record)
-            cleanup = _task_output_cleanup_after_archive(
+            cleanup = _task_output_cleanup_all_attempts_after_archive(
                 record,
                 archive_binding=archive_binding,
                 projection=projection_binding,
-                retention_boundary_unix=retention_boundary_unix,
+                retention_boundary_unix=proposed_retention_boundary_unix,
             )
             status = str(cleanup.get("status"))
-            if status not in {"deleted", "deferred", "not_present"}:
+            if status not in {"deleted", "deferred", "not_present", "error"}:
                 raise TaskAttentionIntegrityError(
                     "task output cleanup returned an unknown status"
                 )
-            counts[status] += 1
+            if status == "error":
+                counts["errors"] += 1
+            else:
+                counts[status] += 1
             results.append(
                 {
                     "task_id": task_id,
@@ -2082,6 +2430,23 @@ def _reconcile_archived_task_outputs_owned(
                     "completion_receipt_sha256": cleanup.get(
                         "completion_receipt_sha256"
                     ),
+                    "attempts_scanned": cleanup.get("attempts_scanned"),
+                    "attempt_cursor_before": cleanup.get(
+                        "attempt_cursor_before"
+                    ),
+                    "attempt_cursor_after": cleanup.get(
+                        "attempt_cursor_after"
+                    ),
+                    "attempt_cycle_completed": cleanup.get(
+                        "attempt_cycle_completed"
+                    ),
+                    "attempt_counts": cleanup.get("counts"),
+                    "attempt_results": cleanup.get("attempt_results"),
+                    "deleted_attempts": cleanup.get("deleted_attempts"),
+                    "not_present_attempts": cleanup.get(
+                        "not_present_attempts"
+                    ),
+                    "reason": cleanup.get("reason"),
                 }
             )
         except Exception as exc:
@@ -2112,7 +2477,7 @@ def _reconcile_archived_task_outputs_owned(
         "scanned": len(selected),
         "counts": counts,
         "results": results,
-        "checked_at_unix": now_unix,
+        "checked_at_unix": int(time.time()),
         "does_not_establish": [
             "physical_task_row_deletion",
             "same_uid_output_authenticity",
@@ -2219,24 +2584,16 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             verified_segment["manifest"],
             record_sha256=record_sha256,
         )
-        task_output_retention_boundary_unix = (
-            _canonical_task_output_cleanup_retention_boundary(
-                record,
-                archive_binding=archive_binding,
-                projection=existing_projection,
-                proposed_boundary_unix=(
-                    proposed_task_output_retention_boundary_unix
-                ),
-            )
-        )
-        if now_unix >= task_output_retention_boundary_unix:
-            _assert_no_live_task_resource_leases(record, now_unix=now_unix)
-            _assert_no_live_task_process(record)
-        task_output_cleanup = _task_output_cleanup_after_archive(
+        task_output_cleanup = _task_output_cleanup_all_attempts_after_archive(
             record,
             archive_binding=archive_binding,
             projection=existing_projection,
-            retention_boundary_unix=task_output_retention_boundary_unix,
+            retention_boundary_unix=(
+                proposed_task_output_retention_boundary_unix
+            ),
+        )
+        task_output_retention_boundary_unix = int(
+            task_output_cleanup["retention_boundary_unix"]
         )
         resource_release = _release_owned_archive_resources(
             owner,
@@ -2479,11 +2836,14 @@ def execute_closeout_archive(parameters: dict[str, Any]) -> dict[str, Any]:
             manifest,
             record_sha256=record_sha256,
         )
-        task_output_cleanup = _task_output_cleanup_after_archive(
+        task_output_cleanup = _task_output_cleanup_all_attempts_after_archive(
             revalidated_record,
             archive_binding=cleanup_archive_binding,
             projection=final_projection,
             retention_boundary_unix=task_output_retention_boundary_unix,
+        )
+        task_output_retention_boundary_unix = int(
+            task_output_cleanup["retention_boundary_unix"]
         )
         output = {
             "schema_version": 1,
