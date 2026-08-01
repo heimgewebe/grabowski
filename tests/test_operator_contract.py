@@ -318,6 +318,44 @@ class OperatorContractTests(unittest.TestCase):
         self.assertNotEqual(caller_thread, result["thread_id"])
         self.assertEqual(8, operator.SYNC_TOOL_EXECUTOR_MAX_WORKERS)
 
+    def test_cancelled_sync_tool_remains_admission_active_until_worker_finishes(self) -> None:
+        operator = _load_operator_module()
+        started = threading.Event()
+        release = threading.Event()
+
+        async def slow_call_tool(*args, **kwargs):
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+            return {"called": True, "args": args, "kwargs": kwargs}
+
+        operator.mcp._tool_manager.call_tool = slow_call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+        )
+        operator._configure_http_runtime()
+
+        async def exercise() -> None:
+            call = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool("read", {})
+            )
+            started_ok = await operator.asyncio.to_thread(started.wait, 2)
+            self.assertTrue(started_ok)
+            self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+            call.cancel()
+            with self.assertRaises(operator.asyncio.CancelledError):
+                await call
+            self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+            release.set()
+            for _attempt in range(100):
+                if operator._deployment_admission_active_tool_calls() == 0:
+                    break
+                await operator.asyncio.sleep(0.01)
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+        operator.asyncio.run(exercise())
+
     def test_deployment_admission_gate_keeps_async_tools_on_event_loop(self) -> None:
         operator = _load_operator_module()
         caller_thread = threading.get_ident()

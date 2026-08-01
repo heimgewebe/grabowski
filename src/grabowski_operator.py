@@ -407,6 +407,14 @@ def _deployment_admission_active_tool_calls() -> int:
         return _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
 
 
+def _deployment_admission_release_tool_call(_completed: Any = None) -> None:
+    global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS -= 1
+        if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS < 0:
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+
+
 def _deployment_admission_snapshot() -> dict[str, Any]:
     return {
         **_read_deployment_admission_marker(),
@@ -437,6 +445,7 @@ def _install_deployment_admission_gate() -> None:
         global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
         with _DEPLOYMENT_ADMISSION_LOCK:
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS += 1
+        release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()
             if marker.get("active") or marker.get("state") == "invalid":
@@ -452,19 +461,22 @@ def _install_deployment_admission_gate() -> None:
                 and getattr(tool, "is_async", True) is False
             ):
                 loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(
+                worker_future = loop.run_in_executor(
                     _SYNC_TOOL_EXECUTOR,
                     _run_sync_tool_call,
                     original,
                     args,
                     kwargs,
                 )
+                worker_future.add_done_callback(
+                    _deployment_admission_release_tool_call
+                )
+                release_in_finally = False
+                return await asyncio.shield(worker_future)
             return await original(*args, **kwargs)
         finally:
-            with _DEPLOYMENT_ADMISSION_LOCK:
-                _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS -= 1
-                if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS < 0:
-                    _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+            if release_in_finally:
+                _deployment_admission_release_tool_call()
 
     gated_call_tool._grabowski_deployment_admission_gate = True
     manager.call_tool = gated_call_tool
