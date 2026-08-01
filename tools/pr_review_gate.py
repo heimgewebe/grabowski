@@ -19,6 +19,31 @@ try:
 except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
     from tools.review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
 
+try:
+    from plain_llm_review_contract import (
+        PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_PROMPT_NONCE_RE,
+        PLAIN_LLM_PROVIDERS,
+        PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_REVIEW_GATE_AUTHORITY,
+        PLAIN_LLM_REVIEW_INPUT_MODE,
+        PLAIN_LLM_REVIEW_SOURCE_PREFIX,
+        build_plain_llm_review_prompt,
+    )
+except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
+    from tools.plain_llm_review_contract import (
+        PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_PROMPT_NONCE_RE,
+        PLAIN_LLM_PROVIDERS,
+        PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_REVIEW_GATE_AUTHORITY,
+        PLAIN_LLM_REVIEW_INPUT_MODE,
+        PLAIN_LLM_REVIEW_SOURCE_PREFIX,
+        build_plain_llm_review_prompt,
+    )
+
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
@@ -1225,6 +1250,356 @@ def _claude_cli_review_input_failures(
     return failures
 
 
+def _plain_llm_review_input_failures(
+    external_review: dict[str, Any],
+    *,
+    repo_name: str | None,
+    pr_number: Any,
+    head_sha: Any,
+    diff_sha256: Any,
+    expected_packet_prompt_sha256: str | None,
+    expected_prompt_sha256: str | None,
+) -> list[str]:
+    failures: list[str] = []
+    review_input = external_review.get("review_input")
+    if not isinstance(review_input, dict):
+        return ["review_input is missing or not a JSON object"]
+
+    if review_input.get("mode") != PLAIN_LLM_REVIEW_INPUT_MODE:
+        failures.append(
+            f"review_input.mode is not {PLAIN_LLM_REVIEW_INPUT_MODE}"
+        )
+    if (
+        repo_name is not None
+        and _canonical_repo_slug(review_input.get("repo")) != repo_name
+    ):
+        failures.append("review_input.repo mismatch")
+    input_pr = review_input.get("pr")
+    if pr_number is not None and (
+        isinstance(input_pr, bool)
+        or not isinstance(input_pr, int)
+        or input_pr != pr_number
+    ):
+        failures.append("review_input.pr mismatch")
+    if (
+        not isinstance(head_sha, str)
+        or not head_sha
+        or review_input.get("head_sha") != head_sha
+    ):
+        failures.append("review_input.head_sha mismatch")
+
+    input_diff_sha256 = review_input.get("diff_sha256")
+    if not _valid_sha256(input_diff_sha256) or not _valid_sha256(
+        diff_sha256
+    ):
+        failures.append("review_input.diff_sha256 is missing or invalid")
+    elif _normalize_sha256(input_diff_sha256) != _normalize_sha256(
+        diff_sha256
+    ):
+        failures.append("review_input.diff_sha256 mismatch")
+
+    packet_prompt_sha256 = review_input.get("packet_prompt_sha256")
+    if not _valid_sha256(packet_prompt_sha256):
+        failures.append(
+            "review_input.packet_prompt_sha256 is missing or invalid"
+        )
+    elif expected_packet_prompt_sha256 is None:
+        failures.append("expected packet prompt sha256 is unavailable")
+    elif _normalize_sha256(packet_prompt_sha256) != _normalize_sha256(
+        expected_packet_prompt_sha256
+    ):
+        failures.append("review_input.packet_prompt_sha256 mismatch")
+
+    prompt_nonce = review_input.get("prompt_nonce")
+    if (
+        not isinstance(prompt_nonce, str)
+        or PLAIN_LLM_PROMPT_NONCE_RE.fullmatch(prompt_nonce) is None
+    ):
+        failures.append("review_input.prompt_nonce is missing or invalid")
+    prompt_sha256 = external_review.get("prompt_sha256")
+    input_prompt_sha256 = review_input.get("prompt_sha256")
+    if not _valid_sha256(input_prompt_sha256):
+        failures.append("review_input.prompt_sha256 is missing or invalid")
+    elif (
+        not _valid_sha256(prompt_sha256)
+        or _normalize_sha256(input_prompt_sha256)
+        != _normalize_sha256(prompt_sha256)
+    ):
+        failures.append("review_input.prompt_sha256 mismatch")
+    elif expected_prompt_sha256 is None:
+        failures.append("expected transmitted prompt sha256 is unavailable")
+    elif _normalize_sha256(input_prompt_sha256) != _normalize_sha256(
+        expected_prompt_sha256
+    ):
+        failures.append(
+            "review_input.prompt_sha256 does not match independently "
+            "reconstructed plain-LLM prompt"
+        )
+
+    provider = review_input.get("provider")
+    if provider not in PLAIN_LLM_PROVIDERS:
+        failures.append("review_input.provider is missing or unsupported")
+    else:
+        expected_transport = (
+            "prompt_file" if provider == "grok" else "argv"
+        )
+        expected_argument_exposure = provider == "gemini"
+        expected_ephemeral_prompt_file = provider == "grok"
+        if review_input.get("transport") != expected_transport:
+            failures.append("review_input.transport mismatch")
+        if (
+            review_input.get("prompt_argument_exposure")
+            != expected_argument_exposure
+        ):
+            failures.append("review_input.prompt_argument_exposure mismatch")
+        if (
+            review_input.get("ephemeral_prompt_file")
+            != expected_ephemeral_prompt_file
+        ):
+            failures.append("review_input.ephemeral_prompt_file mismatch")
+
+        expected_web_policy = (
+            "disabled_by_cli"
+            if provider == "grok"
+            else "forbidden_by_prompt_unverified"
+        )
+        expected_memory_policy = (
+            "disabled_by_cli"
+            if provider == "grok"
+            else "new_single_turn_no_resume"
+        )
+        if review_input.get("web_search_policy") != expected_web_policy:
+            failures.append("review_input.web_search_policy mismatch")
+        if review_input.get("memory_policy") != expected_memory_policy:
+            failures.append("review_input.memory_policy mismatch")
+
+    if review_input.get("account_transport") != "account_cli":
+        failures.append("review_input.account_transport is not account_cli")
+    requested_model = review_input.get("requested_model")
+    if not isinstance(requested_model, str) or not requested_model.strip():
+        failures.append("review_input.requested_model is missing")
+    if (
+        review_input.get("model_identity_attestation")
+        != "requested_not_provider_attested"
+    ):
+        failures.append(
+            "review_input.model_identity_attestation overclaims provider identity"
+        )
+    executable = review_input.get("executable")
+    if (
+        not isinstance(executable, str)
+        or not Path(executable).is_absolute()
+        or "\x00" in executable
+    ):
+        failures.append("review_input.executable is missing or not absolute")
+    requested_executable = review_input.get("requested_executable")
+    if (
+        not isinstance(requested_executable, str)
+        or not requested_executable.strip()
+        or "\x00" in requested_executable
+    ):
+        failures.append("review_input.requested_executable is missing")
+    expected_executable_identity = (
+        "canonical_native_owner_controlled"
+        if provider == "grok"
+        else "owner_regular_executable_not_group_world_writable"
+    )
+    if review_input.get("executable_identity") != expected_executable_identity:
+        failures.append("review_input.executable_identity mismatch")
+    prompt_bytes = review_input.get("transmitted_prompt_bytes")
+    if (
+        isinstance(prompt_bytes, bool)
+        or not isinstance(prompt_bytes, int)
+        or prompt_bytes <= 0
+    ):
+        failures.append("review_input.transmitted_prompt_bytes is invalid")
+    for key in ("transmitted_prompt_path", "raw_review_path"):
+        value = review_input.get(key)
+        if not isinstance(value, str) or not value.strip():
+            failures.append(f"review_input.{key} is missing")
+    if review_input.get("isolated_working_directory") is not True:
+        failures.append("review_input.isolated_working_directory is not true")
+    if review_input.get("local_repository_context_provided") is not False:
+        failures.append(
+            "review_input.local_repository_context_provided is not false"
+        )
+    if review_input.get("quota_attestation") != "not_established_by_adapter":
+        failures.append("review_input.quota_attestation is not conservative")
+    if (
+        review_input.get("review_gate_authority")
+        != PLAIN_LLM_REVIEW_GATE_AUTHORITY
+    ):
+        failures.append("review_input.review_gate_authority is not advisory-only")
+    if review_input.get("environment_policy") != PLAIN_LLM_ENVIRONMENT_POLICY:
+        failures.append("review_input.environment_policy mismatch")
+    passed_environment = review_input.get("environment_passed_keys")
+    if (
+        not isinstance(passed_environment, list)
+        or not all(
+            isinstance(item, str) and item for item in passed_environment
+        )
+        or len(passed_environment) != len(set(passed_environment))
+    ):
+        failures.append("review_input.environment_passed_keys is invalid")
+    else:
+        passed_keys = set(passed_environment)
+        if not PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS.issubset(passed_keys):
+            failures.append(
+                "review_input.environment_passed_keys misses required keys"
+            )
+        if not passed_keys.issubset(PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS):
+            failures.append(
+                "review_input.environment_passed_keys contains forbidden keys"
+            )
+    session_removed = review_input.get("session_environment_removed")
+    if not isinstance(session_removed, list) or not all(
+        isinstance(item, str) and item for item in session_removed
+    ):
+        failures.append("review_input.session_environment_removed is invalid")
+    if review_input.get("session_bus_exposed") is not False:
+        failures.append("review_input.session_bus_exposed is not false")
+    if review_input.get("stdin_policy") != "null_device":
+        failures.append("review_input.stdin_policy is not null_device")
+    if review_input.get("process_group_isolated") is not True:
+        failures.append("review_input.process_group_isolated is not true")
+    if (
+        review_input.get("provider_output_limit_enforcement")
+        != "kill_process_group"
+    ):
+        failures.append(
+            "review_input.provider_output_limit_enforcement mismatch"
+        )
+    if review_input.get("workspace_readback") != "unchanged":
+        failures.append("review_input.workspace_readback is not unchanged")
+    for key in (
+        "billable_api_environment_removed",
+        "git_context_environment_removed",
+    ):
+        value = review_input.get(key)
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            failures.append(f"review_input.{key} is invalid")
+    if external_review.get("prompt_transmitted") is not True:
+        failures.append("prompt_transmitted must be true for plain-LLM review")
+    if external_review.get("prompt_includes_diff") is not True:
+        failures.append("prompt_includes_diff must be true for plain-LLM review")
+    return failures
+
+
+def _plain_llm_external_review_failures(
+    review: dict[str, Any],
+    review_input: dict[str, Any],
+) -> list[str]:
+    failures: list[str] = []
+    provider = review_input.get("provider")
+    requested_model = review_input.get("requested_model")
+    expected_source = (
+        f"{PLAIN_LLM_REVIEW_SOURCE_PREFIX}{provider}:{requested_model}"
+    )
+    if review.get("source") != expected_source:
+        failures.append("source does not match provider and requested model")
+    if review.get("provider") != provider:
+        failures.append("provider does not match review_input.provider")
+    if review.get("model") != requested_model:
+        failures.append("model does not match review_input.requested_model")
+    if review.get("transport") != "account_cli":
+        failures.append("transport is not account_cli")
+    if review.get("execution_mode") != "single_turn":
+        failures.append("execution_mode is not single_turn")
+
+    expected_tool_policy = (
+        "empty_tools_plan_mode"
+        if provider == "grok"
+        else "sandboxed_plan_mode"
+    )
+    if (
+        provider in PLAIN_LLM_PROVIDERS
+        and review.get("tool_policy") != expected_tool_policy
+    ):
+        failures.append("tool_policy does not match provider contract")
+
+    for key in (
+        "argv_sha256",
+        "stdout_sha256",
+        "stderr_sha256",
+        "review_sha256",
+    ):
+        if not _valid_sha256(review.get(key)):
+            failures.append(f"{key} is missing or invalid")
+    if (
+        _valid_sha256(review.get("stdout_sha256"))
+        and _valid_sha256(review.get("review_sha256"))
+        and _normalize_sha256(review.get("stdout_sha256"))
+        != _normalize_sha256(review.get("review_sha256"))
+    ):
+        failures.append("review_sha256 does not match stdout_sha256")
+
+    verdict = review.get("verdict")
+    finding_count = review.get("finding_count")
+    findings = review.get("findings")
+    if verdict not in EXTERNAL_REVIEW_VERDICTS:
+        failures.append("verdict is invalid")
+    valid_count = (
+        isinstance(finding_count, int)
+        and not isinstance(finding_count, bool)
+        and finding_count >= 0
+    )
+    if not valid_count:
+        failures.append("finding_count must be an integer >= 0")
+    if not isinstance(findings, list):
+        failures.append("findings is not a list")
+    elif valid_count and len(findings) != finding_count:
+        failures.append("finding_count does not match findings length")
+    if verdict == "PASS" and valid_count and finding_count != 0:
+        failures.append("PASS plain-LLM review must have finding_count 0")
+    if (
+        verdict in {"NEEDS_CHANGE", "BLOCK"}
+        and valid_count
+        and finding_count == 0
+    ):
+        failures.append(
+            f"{verdict} plain-LLM review must report at least one finding"
+        )
+
+    if isinstance(findings, list):
+        allowed_fields = {"severity", "summary", "file", "line", "fix"}
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict):
+                failures.append(f"finding {index} is not a JSON object")
+                continue
+            unknown_fields = sorted(set(finding) - allowed_fields)
+            if unknown_fields:
+                failures.append(
+                    f"finding {index} has unknown fields: "
+                    + ", ".join(unknown_fields)
+                )
+            if finding.get("severity") not in {
+                "low",
+                "medium",
+                "high",
+                "critical",
+            }:
+                failures.append(f"finding {index} severity is invalid")
+            summary = finding.get("summary")
+            if not isinstance(summary, str) or not summary.strip():
+                failures.append(f"finding {index} summary is missing")
+            for key in ("file", "fix"):
+                value = finding.get(key)
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    failures.append(f"finding {index} {key} is invalid")
+            line = finding.get("line")
+            if line is not None and (
+                isinstance(line, bool)
+                or not isinstance(line, int)
+                or line <= 0
+            ):
+                failures.append(f"finding {index} line is invalid")
+    return failures
+
+
 def _external_review_failures(
     state: dict[str, Any],
     pr: dict[str, Any],
@@ -1285,9 +1660,17 @@ def _external_review_failures(
     if not _valid_sha256(external_review.get("prompt_sha256")):
         failures.append("prompt_sha256 is missing or invalid")
     raw_review_input = external_review.get("review_input")
-    claude_cli_input_mode = isinstance(raw_review_input, dict) and raw_review_input.get("mode") == CLAUDE_CLI_REVIEW_INPUT_MODE
+    claude_cli_input_mode = (
+        isinstance(raw_review_input, dict)
+        and raw_review_input.get("mode") == CLAUDE_CLI_REVIEW_INPUT_MODE
+    )
+    plain_llm_input_mode = (
+        isinstance(raw_review_input, dict)
+        and raw_review_input.get("mode") == PLAIN_LLM_REVIEW_INPUT_MODE
+    )
     expected_packet_prompt_sha256: str | None = None
-    expected_prompt_sha256: str | None = None
+    expected_claude_prompt_sha256: str | None = None
+    expected_plain_llm_prompt_sha256: str | None = None
     normalized_diff_sha256 = _normalize_sha256(diff_sha256)
     if (
         isinstance(pr_number, int)
@@ -1301,10 +1684,19 @@ def _external_review_failures(
         expected_packet_prompt_sha256 = _sha256_text(packet_prompt)
         prompt_nonce = raw_review_input.get("prompt_nonce") if isinstance(raw_review_input, dict) else None
         diff_text = state.get("pr_diff_text")
-        if isinstance(prompt_nonce, str) and PROMPT_NONCE_RE.fullmatch(prompt_nonce) and isinstance(diff_text, str):
-            expected_prompt_sha256 = _sha256_text(
-                build_claude_review_prompt(packet_prompt, diff_text, prompt_nonce)
-            )
+        if isinstance(prompt_nonce, str) and isinstance(diff_text, str):
+            if PROMPT_NONCE_RE.fullmatch(prompt_nonce):
+                expected_claude_prompt_sha256 = _sha256_text(
+                    build_claude_review_prompt(
+                        packet_prompt, diff_text, prompt_nonce
+                    )
+                )
+            if PLAIN_LLM_PROMPT_NONCE_RE.fullmatch(prompt_nonce):
+                expected_plain_llm_prompt_sha256 = _sha256_text(
+                    build_plain_llm_review_prompt(
+                        packet_prompt, diff_text, prompt_nonce
+                    )
+                )
     if claude_cli_required or claude_cli_input_mode:
         failures.extend(
             _claude_cli_review_input_failures(
@@ -1314,7 +1706,23 @@ def _external_review_failures(
                 head_sha=head,
                 diff_sha256=diff_sha256,
                 expected_packet_prompt_sha256=expected_packet_prompt_sha256,
-                expected_prompt_sha256=expected_prompt_sha256,
+                expected_prompt_sha256=expected_claude_prompt_sha256,
+            )
+        )
+    elif plain_llm_input_mode:
+        failures.extend(
+            _plain_llm_review_input_failures(
+                external_review,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head,
+                diff_sha256=diff_sha256,
+                expected_packet_prompt_sha256=(
+                    expected_packet_prompt_sha256
+                ),
+                expected_prompt_sha256=(
+                    expected_plain_llm_prompt_sha256
+                ),
             )
         )
     elif external_review.get("prompt_includes_diff") is not True:
@@ -1323,6 +1731,7 @@ def _external_review_failures(
     reviews = external_review.get("reviews")
     reported_external_findings = 0
     valid_claude_cli_reviews = 0
+    valid_plain_llm_reviews = 0
     if not isinstance(reviews, list):
         failures.append("reviews is not a list")
     elif required and not reviews:
@@ -1341,6 +1750,21 @@ def _external_review_failures(
                     failures.extend(f"review {index} Claude CLI evidence invalid: {failure}" for failure in claude_failures)
                 else:
                     valid_claude_cli_reviews += 1
+            elif (
+                plain_llm_input_mode
+                and source.startswith(PLAIN_LLM_REVIEW_SOURCE_PREFIX)
+                and isinstance(raw_review_input, dict)
+            ):
+                plain_failures = _plain_llm_external_review_failures(
+                    review, raw_review_input
+                )
+                if plain_failures:
+                    failures.extend(
+                        f"review {index} plain-LLM evidence invalid: {failure}"
+                        for failure in plain_failures
+                    )
+                else:
+                    valid_plain_llm_reviews += 1
             if not _valid_sha256(review.get("review_sha256")):
                 failures.append(f"review {index} review_sha256 is missing or invalid")
             verdict = review.get("verdict")
@@ -1352,8 +1776,18 @@ def _external_review_failures(
             else:
                 reported_external_findings += _reported_external_finding_count(verdict, finding_count)
 
-    if (claude_cli_required or claude_cli_input_mode) and valid_claude_cli_reviews == 0:
-        failures.append("Claude CLI packet review is required but no valid review entry was provided")
+    if (
+        claude_cli_required or claude_cli_input_mode
+    ) and valid_claude_cli_reviews == 0:
+        failures.append(
+            "Claude CLI packet review is required but no valid review entry "
+            "was provided"
+        )
+    if plain_llm_input_mode and valid_plain_llm_reviews == 0:
+        failures.append(
+            "plain-LLM review input is declared but no valid plain-LLM review "
+            "entry was provided"
+        )
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
