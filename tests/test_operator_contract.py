@@ -8,6 +8,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -37,11 +38,23 @@ class _FakeFastMCP:
             _session_creation_lock=_FakeAsyncLock(),
             stateless=False,
         )
+        self._registered_tools = {
+            name: types.SimpleNamespace(is_async=False, context_kwarg=None)
+            for name in ("read", "write")
+        }
 
         async def call_tool(*args, **kwargs):
-            return {"called": True, "args": args, "kwargs": kwargs}
+            return {
+                "called": True,
+                "args": args,
+                "kwargs": kwargs,
+                "thread_id": threading.get_ident(),
+            }
 
-        self._tool_manager = types.SimpleNamespace(call_tool=call_tool)
+        self._tool_manager = types.SimpleNamespace(
+            call_tool=call_tool,
+            get_tool=self._registered_tools.get,
+        )
 
 
 
@@ -289,6 +302,125 @@ class OperatorContractTests(unittest.TestCase):
                 )
         self.assertTrue(result["called"])
         self.assertTrue(operator._DEPLOYMENT_ADMISSION_GATE_INSTALLED)
+
+    def test_deployment_admission_gate_offloads_sync_tools_from_event_loop(self) -> None:
+        operator = _load_operator_module()
+        caller_thread = threading.get_ident()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg="ctx",
+        )
+        operator._configure_http_runtime()
+        result = operator.asyncio.run(
+            operator.mcp._tool_manager.call_tool("read", {})
+        )
+        self.assertTrue(result["called"])
+        self.assertNotEqual(caller_thread, result["thread_id"])
+        self.assertEqual(8, operator.SYNC_TOOL_EXECUTOR_MAX_WORKERS)
+
+    def test_cancelled_sync_tool_remains_admission_active_until_worker_finishes(self) -> None:
+        operator = _load_operator_module()
+        started = threading.Event()
+        release = threading.Event()
+
+        async def slow_call_tool(*args, **kwargs):
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+            return {"called": True, "args": args, "kwargs": kwargs}
+
+        operator.mcp._tool_manager.call_tool = slow_call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+        )
+        operator._configure_http_runtime()
+
+        async def exercise() -> None:
+            call = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool("read", {})
+            )
+            started_ok = await operator.asyncio.to_thread(started.wait, 2)
+            self.assertTrue(started_ok)
+            self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+            call.cancel()
+            with self.assertRaises(operator.asyncio.CancelledError):
+                await call
+            self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+            release.set()
+            for _attempt in range(100):
+                if operator._deployment_admission_active_tool_calls() == 0:
+                    break
+                await operator.asyncio.sleep(0.01)
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+        operator.asyncio.run(exercise())
+
+    def test_cancelled_queued_sync_tool_never_executes_and_releases_admission(self) -> None:
+        operator = _load_operator_module()
+        started = threading.Event()
+        release = threading.Event()
+        executed: list[int] = []
+        executor = operator.concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        operator._SYNC_TOOL_EXECUTOR = executor
+
+        async def slow_call_tool(_name, arguments):
+            executed.append(arguments["slot"])
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+            return {"called": True, "slot": arguments["slot"]}
+
+        operator.mcp._tool_manager.call_tool = slow_call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+        )
+        operator._configure_http_runtime()
+
+        async def exercise() -> None:
+            running = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool("read", {"slot": 1})
+            )
+            started_ok = await operator.asyncio.to_thread(started.wait, 2)
+            self.assertTrue(started_ok)
+            queued = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool("read", {"slot": 2})
+            )
+            await operator.asyncio.sleep(0)
+            self.assertEqual(2, operator._deployment_admission_active_tool_calls())
+            queued.cancel()
+            with self.assertRaises(operator.asyncio.CancelledError):
+                await queued
+            self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+            release.set()
+            self.assertEqual(1, (await running)["slot"])
+            for _attempt in range(100):
+                if operator._deployment_admission_active_tool_calls() == 0:
+                    break
+                await operator.asyncio.sleep(0.01)
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+            self.assertEqual([1], executed)
+
+        try:
+            operator.asyncio.run(exercise())
+        finally:
+            release.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_deployment_admission_gate_keeps_async_tools_on_event_loop(self) -> None:
+        operator = _load_operator_module()
+        caller_thread = threading.get_ident()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+        )
+        operator._configure_http_runtime()
+        result = operator.asyncio.run(
+            operator.mcp._tool_manager.call_tool("read", {})
+        )
+        self.assertTrue(result["called"])
+        self.assertEqual(caller_thread, result["thread_id"])
 
 
     def test_liveness_probe_times_out_on_held_session_creation_lock(self) -> None:
