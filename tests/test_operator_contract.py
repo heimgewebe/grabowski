@@ -28,9 +28,14 @@ class _FakeAsyncLock:
 
 class _FakeFastMCP:
     def __init__(self, *args, **kwargs):
+        self.settings = types.SimpleNamespace(
+            log_level="INFO",
+            stateless_http=False,
+        )
         self.session_manager = types.SimpleNamespace(
             session_idle_timeout=None,
             _session_creation_lock=_FakeAsyncLock(),
+            stateless=False,
         )
 
         async def call_tool(*args, **kwargs):
@@ -47,6 +52,7 @@ class _FakeFastMCP:
         return lambda function: function
 
     def streamable_http_app(self):
+        self.session_manager.stateless = self.settings.stateless_http
         return object()
 
 
@@ -189,14 +195,28 @@ class OperatorContractTests(unittest.TestCase):
             "DEPLOYMENT_ADMISSION_STATUS_PATH", decorators[0].args[0].id
         )
 
-    def test_http_sessions_and_liveness_lock_are_bounded(self) -> None:
+    def test_http_transport_is_stateless_and_liveness_lock_is_bounded(self) -> None:
         operator = _load_operator_module()
         operator._configure_http_runtime()
+        self.assertTrue(operator.HTTP_STATELESS_MODE)
+        self.assertTrue(operator.mcp.settings.stateless_http)
+        self.assertEqual("WARNING", operator.HTTP_LOG_LEVEL)
+        self.assertEqual(operator.HTTP_LOG_LEVEL, operator.mcp.settings.log_level)
+        self.assertTrue(operator.mcp.session_manager.stateless)
+        self.assertIsNone(operator.mcp.session_manager.session_idle_timeout)
         self.assertEqual(
-            operator.HTTP_SESSION_IDLE_TIMEOUT_SECONDS,
-            operator.mcp.session_manager.session_idle_timeout,
+            {
+                "mcp.server.lowlevel.server",
+                "mcp.server.streamable_http",
+                "mcp.server.streamable_http_manager",
+            },
+            set(operator.HTTP_TRANSPORT_VERBOSE_LOGGERS),
         )
-        self.assertEqual(1_800, operator.HTTP_SESSION_IDLE_TIMEOUT_SECONDS)
+        for logger_name in operator.HTTP_TRANSPORT_VERBOSE_LOGGERS:
+            self.assertEqual(
+                operator.logging.WARNING,
+                operator.logging.getLogger(logger_name).level,
+            )
         self.assertTrue(
             operator.asyncio.run(
                 operator._session_creation_lock_available(
