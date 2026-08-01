@@ -857,6 +857,25 @@ class PlainExternalReviewTests(unittest.TestCase):
                 "retry succeeded",
             )
 
+    def test_create_only_rejects_writable_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "output"
+            parent.mkdir()
+            parent.chmod(0o770)
+            target = parent / "artifact.txt"
+
+            with self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "unsafe parent identity",
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "must not be written",
+                    label="test artifact",
+                )
+
+            self.assertFalse(target.exists())
+
     def test_partial_owned_artifacts_are_preserved_on_final_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

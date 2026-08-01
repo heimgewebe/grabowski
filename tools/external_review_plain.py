@@ -194,6 +194,7 @@ def build_plain_prompt(
     except ValueError as exc:
         raise PlainReviewError(str(exc)) from exc
 
+
 def strip_ansi(value: str) -> str:
     return re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", value)
 
@@ -718,6 +719,15 @@ def _is_private_created_file(metadata: os.stat_result) -> bool:
     )
 
 
+def _is_owner_controlled_directory(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink >= 1
+        and metadata.st_mode & 0o022 == 0
+    )
+
+
 def write_text_create_only(path: Path, text: str, *, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -737,7 +747,8 @@ def write_text_create_only(path: Path, text: str, *, label: str) -> None:
         parent_linked = path.parent.lstat()
         parent_opened = os.fstat(parent_descriptor)
         if (
-            not stat.S_ISDIR(parent_opened.st_mode)
+            not _is_owner_controlled_directory(parent_opened)
+            or not _is_owner_controlled_directory(parent_linked)
             or stat.S_ISLNK(parent_linked.st_mode)
             or not _same_file_identity(parent_opened, parent_linked)
         ):
@@ -802,7 +813,8 @@ def write_text_create_only(path: Path, text: str, *, label: str) -> None:
             follow_symlinks=False,
         )
         if (
-            stat.S_ISLNK(parent_after.st_mode)
+            not _is_owner_controlled_directory(parent_after)
+            or stat.S_ISLNK(parent_after.st_mode)
             or not _same_file_identity(parent_opened, parent_after)
             or not _is_private_created_file(linked_after)
             or not _same_file_identity(created, linked_after)
