@@ -2064,6 +2064,54 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.with_suffix(".review.txt").exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_main_rejects_surrogate_environment_name_before_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"X\udcff_API_KEY": "must-not-be-recorded"},
+                ),
+                mock.patch.object(plain, "run_provider") as run,
+                contextlib.redirect_stderr(stderr),
+            ):
+                rc = plain.main(
+                    [
+                        "--manifest",
+                        str(manifest),
+                        "--output",
+                        str(output),
+                        "--provider",
+                        "grok",
+                        "--executable",
+                        "grok",
+                    ]
+                )
+
+            self.assertEqual(rc, 2)
+            self.assertIn(
+                "inherited environment contains an invalid variable name",
+                stderr.getvalue(),
+            )
+            self.assertNotIn("Traceback", stderr.getvalue())
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
+
+    def test_rejects_surrogate_allowlisted_environment_value(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"LANG": "C.\udcff"}),
+            self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "inherited environment LANG contains an invalid value",
+            ),
+        ):
+            plain.sanitized_environment()
+
 
 if __name__ == "__main__":
     unittest.main()

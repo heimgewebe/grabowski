@@ -23,9 +23,11 @@ This path is deliberately distinct from coding-agent review:
 - a fixed environment allowlist passes only account-client configuration,
   locale, network, certificate, and temporary-directory settings; API keys,
   Git context, DBus, display, runtime-directory, and SSH-agent variables never
-  reach the provider process; inherited `HOME` and explicit XDG account roots
-  must be absolute, owner-controlled, non-symlink directories with trusted full
-  ancestry and stable inode identity rechecked immediately before launch;
+  reach the provider process; inherited variable names and passed values must
+  be free of surrogate-escaped non-UTF-8 text before artifact creation;
+  inherited `HOME` and explicit XDG account roots must be absolute,
+  owner-controlled, non-symlink directories with trusted full ancestry and
+  stable inode identity rechecked immediately before launch;
 - stdin is `/dev/null`, each provider has a new process group, and stdout and
   stderr are byte-bounded while they are read and decoded as strict UTF-8;
   malformed output is rejected, while timeout or overflow terminates the whole

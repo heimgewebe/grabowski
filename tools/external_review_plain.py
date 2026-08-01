@@ -492,10 +492,28 @@ def is_billable_api_variable(key: str) -> bool:
     return key in BILLABLE_API_ENV or key.endswith(BILLABLE_API_ENV_SUFFIXES)
 
 
+def _validate_inherited_environment_text(
+    inherited: dict[str, str],
+) -> None:
+    for key, value in inherited.items():
+        if _contains_unicode_surrogate(key):
+            raise PlainReviewError(
+                "inherited environment contains an invalid variable name"
+            )
+        if (
+            key in PROVIDER_ENV_ALLOWLIST
+            and _contains_unicode_surrogate(value)
+        ):
+            raise PlainReviewError(
+                f"inherited environment {key} contains an invalid value"
+            )
+
+
 def sanitized_environment() -> tuple[
     dict[str, str], list[str], list[str], list[str]
 ]:
     inherited = dict(os.environ)
+    _validate_inherited_environment_text(inherited)
     environment = {
         key: value
         for key, value in inherited.items()
@@ -1881,6 +1899,7 @@ def run_from_manifest(
 ) -> dict[str, Any]:
     if provider not in PROVIDERS:
         raise PlainReviewError(f"unsupported plain review provider: {provider}")
+    _validate_inherited_environment_text(dict(os.environ))
     if (
         not isinstance(executable, str)
         or not executable
