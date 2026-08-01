@@ -322,6 +322,22 @@ class PlainLlmReviewGateTests(unittest.TestCase):
             _warnings(result),
         )
 
+    def test_prompt_byte_count_is_reconstructed_not_trusted(self) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(state)
+        evidence["review_input"]["transmitted_prompt_bytes"] += 1
+        result = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            external_review_evidence=evidence,
+        )
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertIn(
+            "transmitted_prompt_bytes does not match independently "
+            "reconstructed plain-LLM prompt",
+            _warnings(result),
+        )
+
     def test_source_and_tool_policy_are_provider_bound(self) -> None:
         state = _state()
         evidence = _plain_external_evidence(state)

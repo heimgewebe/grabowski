@@ -37,6 +37,18 @@ schemas = _load(
 
 
 class PlainExternalReviewTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._account_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._account_home.cleanup)
+        account_home = Path(self._account_home.name)
+        account_home.chmod(0o700)
+        self._account_home_patch = mock.patch.dict(
+            os.environ,
+            {"HOME": str(account_home)},
+        )
+        self._account_home_patch.start()
+        self.addCleanup(self._account_home_patch.stop)
+
     def _packet(self, root: Path) -> Path:
         packet = root / "packet"
         packet.mkdir()
@@ -821,6 +833,104 @@ class PlainExternalReviewTests(unittest.TestCase):
                             executable,
                             label="test provider",
                         )
+
+    def test_provider_rejects_unsafe_account_configuration_ancestry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            unsafe = root / "shared"
+            unsafe.mkdir(mode=0o700)
+            home = unsafe / "home"
+            home.mkdir(mode=0o700)
+            unsafe.chmod(0o770)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                    clear=True,
+                ),
+                mock.patch.object(plain, "run_bounded_process") as runner,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "account configuration HOME has unsafe path ancestry",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    root / "out.json",
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                )
+
+            runner.assert_not_called()
+
+    def test_provider_rejects_writable_explicit_xdg_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            config = root / "config"
+            config.mkdir(mode=0o700)
+            config.chmod(0o770)
+
+            with self.assertRaisesRegex(
+                plain.PlainReviewError,
+                "account configuration XDG_CONFIG_HOME identity is unsafe",
+            ):
+                plain._validate_account_configuration_roots(
+                    {
+                        "HOME": str(home),
+                        "XDG_CONFIG_HOME": str(config),
+                    }
+                )
+
+    def test_provider_rechecks_account_configuration_identity_before_launch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            displaced = root / "displaced-home"
+            original_build_argv = plain.build_provider_argv
+
+            def displacing_build_argv(**kwargs):
+                argv = original_build_argv(**kwargs)
+                home.rename(displaced)
+                home.mkdir(mode=0o700)
+                return argv
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                    clear=True,
+                ),
+                mock.patch.object(
+                    plain,
+                    "build_provider_argv",
+                    side_effect=displacing_build_argv,
+                ),
+                mock.patch.object(plain, "run_bounded_process") as runner,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "account configuration HOME identity drifted",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    root / "out.json",
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                )
+
+            runner.assert_not_called()
 
     def test_grok_requires_canonical_native_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

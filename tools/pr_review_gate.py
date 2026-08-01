@@ -1259,6 +1259,7 @@ def _plain_llm_review_input_failures(
     diff_sha256: Any,
     expected_packet_prompt_sha256: str | None,
     expected_prompt_sha256: str | None,
+    expected_prompt_bytes: int | None,
 ) -> list[str]:
     failures: list[str] = []
     review_input = external_review.get("review_input")
@@ -1413,6 +1414,13 @@ def _plain_llm_review_input_failures(
         or prompt_bytes <= 0
     ):
         failures.append("review_input.transmitted_prompt_bytes is invalid")
+    elif expected_prompt_bytes is None:
+        failures.append("expected transmitted prompt byte count is unavailable")
+    elif prompt_bytes != expected_prompt_bytes:
+        failures.append(
+            "review_input.transmitted_prompt_bytes does not match independently "
+            "reconstructed plain-LLM prompt"
+        )
     for key in ("transmitted_prompt_path", "raw_review_path"):
         value = review_input.get(key)
         if not isinstance(value, str) or not value.strip():
@@ -1697,6 +1705,7 @@ def _external_review_failures(
     expected_packet_prompt_sha256: str | None = None
     expected_claude_prompt_sha256: str | None = None
     expected_plain_llm_prompt_sha256: str | None = None
+    expected_plain_llm_prompt_bytes: int | None = None
     normalized_diff_sha256 = _normalize_sha256(diff_sha256)
     if (
         isinstance(pr_number, int)
@@ -1718,10 +1727,14 @@ def _external_review_failures(
                     )
                 )
             if PLAIN_LLM_PROMPT_NONCE_RE.fullmatch(prompt_nonce):
+                expected_plain_llm_prompt = build_plain_llm_review_prompt(
+                    packet_prompt, diff_text, prompt_nonce
+                )
                 expected_plain_llm_prompt_sha256 = _sha256_text(
-                    build_plain_llm_review_prompt(
-                        packet_prompt, diff_text, prompt_nonce
-                    )
+                    expected_plain_llm_prompt
+                )
+                expected_plain_llm_prompt_bytes = len(
+                    expected_plain_llm_prompt.encode("utf-8")
                 )
     specialized_input_validation_required = (
         claude_cli_validation_required
@@ -1753,6 +1766,7 @@ def _external_review_failures(
                 expected_prompt_sha256=(
                     expected_plain_llm_prompt_sha256
                 ),
+                expected_prompt_bytes=expected_plain_llm_prompt_bytes,
             )
         )
     if (

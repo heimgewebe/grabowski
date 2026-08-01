@@ -82,6 +82,9 @@ SESSION_ENV = frozenset(
         "XDG_RUNTIME_DIR",
     }
 )
+ACCOUNT_CONFIGURATION_ROOT_KEYS = frozenset(
+    {"HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
+)
 FINDING_SEVERITIES = {"low", "medium", "high", "critical"}
 
 
@@ -551,6 +554,74 @@ def _validate_path_ancestry(path: Path, *, label: str) -> None:
         raise PlainReviewError(
             f"{label} path ancestry is unavailable: {exc}"
         ) from exc
+
+
+def _validate_account_configuration_roots(
+    environment: dict[str, str],
+    *,
+    expected: dict[str, os.stat_result] | None = None,
+) -> dict[str, os.stat_result]:
+    """Pin every account-configuration root to trusted local ancestry."""
+    observed: dict[str, os.stat_result] = {}
+    for key in sorted(ACCOUNT_CONFIGURATION_ROOT_KEYS):
+        raw = environment.get(key)
+        if key == "HOME" and not raw:
+            raise PlainReviewError("account configuration HOME is unavailable")
+        if raw is None:
+            continue
+        if not raw or "\x00" in raw or not Path(raw).is_absolute():
+            raise PlainReviewError(
+                f"account configuration {key} is missing or not absolute"
+            )
+        root = Path(os.path.abspath(raw))
+        descriptor = -1
+        try:
+            descriptor = os.open(root, _parent_directory_open_flags())
+            linked = root.lstat()
+            opened = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(linked.st_mode)
+                or not stat.S_ISDIR(linked.st_mode)
+                or linked.st_uid != os.getuid()
+                or linked.st_nlink < 1
+                or linked.st_mode & 0o022
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink < 1
+                or opened.st_mode & 0o022
+                or not _same_file_identity(linked, opened)
+            ):
+                raise PlainReviewError(
+                    f"account configuration {key} identity is unsafe"
+                )
+            _validate_path_ancestry(
+                root,
+                label=f"account configuration {key}",
+            )
+            expected_identity = (expected or {}).get(key)
+            if expected_identity is not None and not _same_file_identity(
+                expected_identity,
+                opened,
+            ):
+                raise PlainReviewError(
+                    f"account configuration {key} identity drifted"
+                )
+            observed[key] = opened
+        except PlainReviewError:
+            raise
+        except OSError as exc:
+            raise PlainReviewError(
+                f"account configuration {key} is unavailable: {exc}"
+            ) from exc
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+    if expected is not None and set(observed) != set(expected):
+        raise PlainReviewError("account configuration roots changed before launch")
+    return observed
 
 
 def _validated_executable(path: Path, *, label: str) -> Path:
@@ -1065,6 +1136,9 @@ def run_provider(
         removed_git_context,
         removed_session,
     ) = sanitized_environment()
+    account_configuration_roots = _validate_account_configuration_roots(
+        environment
+    )
     resolved_executable = resolve_provider_executable(
         provider=provider,
         executable=executable,
@@ -1116,6 +1190,10 @@ def run_provider(
             _verify_private_workspace_identity(
                 isolated_root,
                 expected_identity=isolated_identity,
+            )
+            _validate_account_configuration_roots(
+                environment,
+                expected=account_configuration_roots,
             )
             try:
                 completed = run_bounded_process(

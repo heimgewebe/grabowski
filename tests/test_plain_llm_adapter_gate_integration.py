@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -96,6 +97,18 @@ def _self_review(diff_sha256: str) -> dict[str, object]:
 
 
 class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._account_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._account_home.cleanup)
+        account_home = Path(self._account_home.name)
+        account_home.chmod(0o700)
+        self._account_home_patch = mock.patch.dict(
+            os.environ,
+            {"HOME": str(account_home)},
+        )
+        self._account_home_patch.start()
+        self.addCleanup(self._account_home_patch.stop)
+
     def test_adapter_output_passes_independent_gate_reconstruction(self) -> None:
         diff = b"diff --git a/x b/x\n+changed\n"
         state = _state(diff)

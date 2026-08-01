@@ -23,7 +23,9 @@ This path is deliberately distinct from coding-agent review:
 - a fixed environment allowlist passes only account-client configuration,
   locale, network, certificate, and temporary-directory settings; API keys,
   Git context, DBus, display, runtime-directory, and SSH-agent variables never
-  reach the provider process;
+  reach the provider process; inherited `HOME` and explicit XDG account roots
+  must be absolute, owner-controlled, non-symlink directories with trusted full
+  ancestry and stable inode identity rechecked immediately before launch;
 - stdin is `/dev/null`, each provider has a new process group, and stdout and
   stderr are byte-bounded while they are read and decoded as strict UTF-8;
   malformed output is rejected, while timeout or overflow terminates the whole
@@ -72,8 +74,9 @@ prompt. When the evidence is later supplied through `--external-review-evidence`
 the central review gate reconstructs the packet prompt and full nonce-bound
 prompt independently from the current PR identity and diff. A copied or stale
 prompt hash therefore cannot become valid merely because the adapter asserts it.
-The gate also binds provider, requested model label, source identifier, transport,
-tool policy, verdict, finding count, and response hashes.
+The gate also binds the reconstructed prompt's exact UTF-8 byte count, provider,
+requested model label, source identifier, transport, tool policy, verdict,
+finding count, and response hashes.
 
 Any path escape, stale digest, malformed identity, oversized prompt or provider
 output, colliding or existing output artifact, provider failure, empty response,

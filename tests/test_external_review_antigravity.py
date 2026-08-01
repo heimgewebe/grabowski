@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -27,6 +28,18 @@ antigravity = _load_tool()
 
 
 class ExternalReviewAntigravityCompatibilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._account_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._account_home.cleanup)
+        account_home = Path(self._account_home.name)
+        account_home.chmod(0o700)
+        self._account_home_patch = mock.patch.dict(
+            os.environ,
+            {"HOME": str(account_home)},
+        )
+        self._account_home_patch.start()
+        self.addCleanup(self._account_home_patch.stop)
+
     def _packet(self, root: Path) -> Path:
         packet = root / "packet"
         packet.mkdir()
