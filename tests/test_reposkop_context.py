@@ -260,6 +260,44 @@ class ReposkopContextTests(unittest.TestCase):
         ):
             context._validate_executable(linked / "reposkop")
 
+    def test_capture_timestamps_do_not_change_semantic_receipt_key(self) -> None:
+        first = self.report()
+        second = json.loads(json.dumps(first))
+        second["generated_at"] = "2026-07-29T08:01:00Z"
+        second["observation"]["observed_at"] = "2026-07-29T08:01:00Z"
+        observation = second["observation"]
+        observation.pop("observation_sha256", None)
+        observation["observation_sha256"] = context._reposkop_artifact_sha256(
+            observation
+        )
+        projection = second["projection"]
+        projection["observation_sha256"] = observation["observation_sha256"]
+        projection.pop("projection_sha256", None)
+        projection["projection_sha256"] = context._reposkop_artifact_sha256(
+            projection
+        )
+        second.pop("report_sha256", None)
+        second["report_sha256"] = context._reposkop_artifact_sha256(second)
+
+        executable = {"sha256": "f" * 64}
+        first_binding = context._usage_binding(
+            first,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+            executable=executable,
+        )
+        second_binding = context._usage_binding(
+            second,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+            executable=executable,
+        )
+        self.assertNotEqual(first["report_sha256"], second["report_sha256"])
+        self.assertEqual(
+            first_binding["usage_key_sha256"], second_binding["usage_key_sha256"]
+        )
+        self.assertEqual(first_binding["data"], second_binding["data"])
+
     def test_records_one_receipt_and_replays_unchanged_semantic_state(self) -> None:
         patches = self.patches(self.report())
         with self.patch_context(patches):
@@ -306,11 +344,9 @@ class ReposkopContextTests(unittest.TestCase):
         self.assertEqual(receipt["kind"], context.RECEIPT_KIND)
         self.assertFalse(receipt["effect_authorized"])
         self.assertNotIn("recorded_at", receipt)
-        self.assertEqual(receipt["report_sha256"], first["report"]["report_sha256"])
-        self.assertEqual(
-            receipt["observation_sha256"],
-            first["report"]["observation"]["observation_sha256"],
-        )
+        self.assertNotIn("report_sha256", receipt)
+        self.assertNotIn("observation_sha256", receipt)
+        self.assertNotIn("projection_sha256", receipt)
         self.assertEqual(
             receipt["repository_identity_sha256"],
             first["report"]["observation"]["identities"][
@@ -323,6 +359,8 @@ class ReposkopContextTests(unittest.TestCase):
                 "checkout_identity_sha256"
             ],
         )
+        self.assertRegex(receipt["semantic_observation_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(receipt["semantic_projection_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(first["report"]["effect_authorized"], False)
         self.assertEqual(len(self.run_calls), 2)
         self.assertTrue(

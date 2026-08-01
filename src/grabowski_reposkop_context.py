@@ -1407,21 +1407,39 @@ def _fsync_directory(root_descriptor: int) -> None:
     os.fsync(root_descriptor)
 
 
+def _semantic_report_identity(report: dict[str, Any]) -> dict[str, Any]:
+    observation = dict(report["observation"])
+    observation.pop("observed_at", None)
+    observation.pop("observation_sha256", None)
+    projection = dict(report["projection"])
+    projection.pop("observation_sha256", None)
+    projection.pop("observation_validation", None)
+    projection.pop("projection_sha256", None)
+    return {
+        "observation": observation,
+        "projection": projection,
+    }
+
+
 def _receipt_identity(
     report: dict[str, Any], *, target: Path, purpose: str, executable_sha256: str
 ) -> dict[str, Any]:
     observation = report["observation"]
     identities = observation["identities"]
+    semantic = _semantic_report_identity(report)
     return {
         "schema_version": SCHEMA_VERSION,
         "target_path": str(target),
         "purpose": purpose,
         "reposkop_executable_sha256": executable_sha256,
-        "report_sha256": report["report_sha256"],
-        "observation_sha256": observation["observation_sha256"],
         "repository_identity_sha256": identities["repository_identity_sha256"],
         "checkout_identity_sha256": identities["checkout_identity_sha256"],
-        "projection_sha256": report["projection"]["projection_sha256"],
+        "semantic_observation_sha256": _sha256_bytes(
+            _canonical_json(semantic["observation"])
+        ),
+        "semantic_projection_sha256": _sha256_bytes(
+            _canonical_json(semantic["projection"])
+        ),
     }
 
 def _receipt_payload(
