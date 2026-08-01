@@ -28,9 +28,11 @@ This path is deliberately distinct from coding-agent review:
   stderr are byte-bounded while they are read; timeout or overflow terminates
   the whole process group;
 - the executable resolves to an owner-controlled, executable regular file that
-  is not group- or world-writable; Grok additionally requires the canonical
-  native binary under the private `~/.grok/bin` directory rather than an npm or
-  Node trampoline;
+  is not group- or world-writable; every resolved ancestor must be owned by the
+  current user or root and may be group- or world-writable only with sticky-bit
+  replacement protection; Grok additionally requires the canonical native
+  binary under the private `~/.grok/bin` directory rather than an npm or Node
+  trampoline;
 - the private temporary workspace is checked before and after the provider
   turn, including the contents and mode of Grok's prompt file;
 - the exact transmitted prompt, raw stdout, argv digest, and evidence are

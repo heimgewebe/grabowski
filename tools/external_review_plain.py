@@ -367,10 +367,52 @@ def sanitized_environment() -> tuple[
     return environment, removed_billable, removed_git_context, removed_session
 
 
+def _trusted_executable_owner_ids() -> set[int]:
+    return {0, os.getuid()}
+
+
+def _validate_executable_ancestry(path: Path, *, label: str) -> None:
+    """Reject path components another local user could replace."""
+    trusted_owners = _trusted_executable_owner_ids()
+    child = path
+    try:
+        child_metadata = child.lstat()
+        directory = child.parent
+        while True:
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_nlink < 1
+                or metadata.st_uid not in trusted_owners
+                or (
+                    metadata.st_mode & 0o022
+                    and not metadata.st_mode & stat.S_ISVTX
+                )
+                or (
+                    metadata.st_mode & stat.S_ISVTX
+                    and child_metadata.st_uid not in trusted_owners
+                )
+            ):
+                raise PlainReviewError(
+                    f"{label} has unsafe path ancestry: {directory}"
+                )
+            if directory.parent == directory:
+                return
+            child = directory
+            child_metadata = metadata
+            directory = child.parent
+    except OSError as exc:
+        raise PlainReviewError(
+            f"{label} path ancestry is unavailable: {exc}"
+        ) from exc
+
+
 def _validated_executable(path: Path, *, label: str) -> Path:
     try:
         resolved = path.resolve(strict=True)
         metadata = resolved.stat()
+        linked = resolved.lstat()
     except OSError as exc:
         raise PlainReviewError(f"{label} is unavailable: {exc}") from exc
     if (
@@ -378,10 +420,14 @@ def _validated_executable(path: Path, *, label: str) -> Path:
         or metadata.st_uid != os.getuid()
         or metadata.st_mode & 0o022
         or not os.access(resolved, os.X_OK)
+        or stat.S_ISLNK(linked.st_mode)
+        or (metadata.st_dev, metadata.st_ino)
+        != (linked.st_dev, linked.st_ino)
     ):
         raise PlainReviewError(
             f"{label} must be an owner-controlled executable regular file"
         )
+    _validate_executable_ancestry(resolved, label=label)
     return resolved
 
 
@@ -687,6 +733,15 @@ def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
+def _is_private_created_file(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+    )
+
+
 def _discard_failed_create(
     parent_descriptor: int,
     name: str,
@@ -699,7 +754,10 @@ def _discard_failed_create(
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        if not _same_file_identity(created, linked):
+        if (
+            not _is_private_created_file(linked)
+            or not _same_file_identity(created, linked)
+        ):
             return
         os.unlink(name, dir_fd=parent_descriptor)
         try:
@@ -710,12 +768,15 @@ def _discard_failed_create(
         pass
 
 
-def _is_private_created_file(metadata: os.stat_result) -> bool:
+def _same_completed_file(
+    created: os.stat_result,
+    linked: os.stat_result,
+) -> bool:
     return (
-        stat.S_ISREG(metadata.st_mode)
-        and metadata.st_uid == os.getuid()
-        and metadata.st_nlink == 1
-        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+        _same_file_identity(created, linked)
+        and created.st_ctime_ns == linked.st_ctime_ns
+        and created.st_mtime_ns == linked.st_mtime_ns
+        and created.st_size == linked.st_size
     )
 
 
@@ -728,21 +789,28 @@ def _is_owner_controlled_directory(metadata: os.stat_result) -> bool:
     )
 
 
-def write_text_create_only(path: Path, text: str, *, label: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _parent_directory_open_flags() -> int:
     parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_DIRECTORY"):
         parent_flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         parent_flags |= os.O_NOFOLLOW
+    return parent_flags
+
+
+def _open_owner_controlled_parent(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[int, os.stat_result]:
     try:
-        parent_descriptor = os.open(path.parent, parent_flags)
+        parent_descriptor = os.open(
+            path.parent,
+            _parent_directory_open_flags(),
+        )
     except OSError as exc:
         raise PlainReviewError(f"cannot write {label}: {exc}") from exc
 
-    descriptor = -1
-    handle = None
-    created: os.stat_result | None = None
     try:
         parent_linked = path.parent.lstat()
         parent_opened = os.fstat(parent_descriptor)
@@ -755,7 +823,30 @@ def write_text_create_only(path: Path, text: str, *, label: str) -> None:
             raise PlainReviewError(
                 f"cannot write {label}: unsafe parent identity"
             )
+        return parent_descriptor, parent_opened
+    except BaseException:
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
+        raise
 
+
+def write_text_create_only(
+    path: Path,
+    text: str,
+    *,
+    label: str,
+) -> os.stat_result:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent_descriptor, parent_opened = _open_owner_controlled_parent(
+        path,
+        label=label,
+    )
+    descriptor = -1
+    handle = None
+    created: os.stat_result | None = None
+    try:
         flags = (
             os.O_WRONLY
             | os.O_CREAT
@@ -822,6 +913,7 @@ def write_text_create_only(path: Path, text: str, *, label: str) -> None:
             raise PlainReviewError(
                 f"cannot write {label}: created path identity drifted"
             )
+        return linked_after
     except BaseException as exc:
         if created is not None:
             _discard_failed_create(
@@ -851,7 +943,9 @@ def write_text_create_only(path: Path, text: str, *, label: str) -> None:
             pass
 
 
-def discard_created_paths(paths: list[Path]) -> None:
+def discard_created_paths(
+    paths: list[tuple[Path, os.stat_result]],
+) -> None:
     """Remove only paths this run created with O_EXCL, restoring the prior state.
 
     A failed provider run must not leave a partial artifact behind: it would be
@@ -859,11 +953,37 @@ def discard_created_paths(paths: list[Path]) -> None:
     same output path.
     """
     while paths:
-        path = paths.pop()
+        path, created = paths.pop()
         try:
-            os.unlink(path)
-        except OSError:
-            pass
+            parent_descriptor, _ = _open_owner_controlled_parent(
+                path,
+                label="created artifact cleanup",
+            )
+        except PlainReviewError:
+            continue
+        try:
+            try:
+                linked = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                continue
+            if (
+                _is_private_created_file(linked)
+                and _same_completed_file(created, linked)
+            ):
+                _discard_failed_create(
+                    parent_descriptor,
+                    path.name,
+                    linked,
+                )
+        finally:
+            try:
+                os.close(parent_descriptor)
+            except OSError:
+                pass
 
 
 def ensure_distinct_output_paths(paths: list[Path]) -> None:
@@ -1068,12 +1188,12 @@ def run_from_manifest(
         )
     # Paths created by this run, discarded again if the run fails before the
     # provider returned a structurally valid review.
-    created_paths: list[Path] = []
+    created_paths: list[tuple[Path, os.stat_result]] = []
     try:
-        write_text_create_only(
+        sent_prompt_identity = write_text_create_only(
             sent_prompt_path, prompt, label="transmitted prompt output"
         )
-        created_paths.append(sent_prompt_path)
+        created_paths.append((sent_prompt_path, sent_prompt_identity))
         (
             completed,
             argv,
@@ -1098,10 +1218,10 @@ def run_from_manifest(
                 f"(stdout={stdout_bytes}, stderr={stderr_bytes})"
             )
         if completed.stdout:
-            write_text_create_only(
+            raw_identity = write_text_create_only(
                 raw_path, completed.stdout, label="raw review output"
             )
-            created_paths.append(raw_path)
+            created_paths.append((raw_path, raw_identity))
         if completed.returncode != 0:
             raise PlainReviewError(
                 f"{provider} CLI exited with {completed.returncode}; "

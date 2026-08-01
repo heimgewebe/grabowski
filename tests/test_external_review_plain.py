@@ -573,13 +573,51 @@ class PlainExternalReviewTests(unittest.TestCase):
                     label="test provider",
                 )
             executable.chmod(0o700)
-            self.assertEqual(
-                plain._validated_executable(
+            trusted_owners = {
+                0,
+                os.getuid(),
+                Path(tempfile.gettempdir()).stat().st_uid,
+            }
+            with mock.patch.object(
+                plain,
+                "_trusted_executable_owner_ids",
+                return_value=trusted_owners,
+            ):
+                self.assertEqual(
+                    plain._validated_executable(
+                        executable,
+                        label="test provider",
+                    ),
                     executable,
-                    label="test provider",
-                ),
-                executable,
-            )
+                )
+
+    def test_executable_identity_rejects_replaceable_path_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for nested in (False, True):
+                with self.subTest(nested=nested):
+                    unsafe = root / f"unsafe-{nested}"
+                    unsafe.mkdir(mode=0o700)
+                    parent = unsafe
+                    if nested:
+                        parent = unsafe / "private"
+                        parent.mkdir(mode=0o700)
+                    executable = parent / "provider"
+                    executable.write_text(
+                        "#!/bin/sh\nexit 0\n",
+                        encoding="utf-8",
+                    )
+                    executable.chmod(0o700)
+                    unsafe.chmod(0o777)
+
+                    with self.assertRaisesRegex(
+                        plain.PlainReviewError,
+                        "unsafe path ancestry",
+                    ):
+                        plain._validated_executable(
+                            executable,
+                            label="test provider",
+                        )
 
     def test_grok_requires_canonical_native_binary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -593,10 +631,21 @@ class PlainExternalReviewTests(unittest.TestCase):
             canonical = bin_directory / "grok"
             canonical.symlink_to(native.name)
             environment = {"HOME": str(home), "PATH": str(bin_directory)}
-            with mock.patch.object(
-                plain.shutil,
-                "which",
-                return_value=str(canonical),
+            with (
+                mock.patch.object(
+                    plain.shutil,
+                    "which",
+                    return_value=str(canonical),
+                ),
+                mock.patch.object(
+                    plain,
+                    "_trusted_executable_owner_ids",
+                    return_value={
+                        0,
+                        os.getuid(),
+                        Path(tempfile.gettempdir()).stat().st_uid,
+                    },
+                ),
             ):
                 self.assertEqual(
                     plain.resolve_provider_executable(
@@ -614,6 +663,15 @@ class PlainExternalReviewTests(unittest.TestCase):
                     plain.shutil,
                     "which",
                     return_value=str(wrapper),
+                ),
+                mock.patch.object(
+                    plain,
+                    "_trusted_executable_owner_ids",
+                    return_value={
+                        0,
+                        os.getuid(),
+                        Path(tempfile.gettempdir()).stat().st_uid,
+                    },
                 ),
                 self.assertRaisesRegex(
                     plain.PlainReviewError,
@@ -799,6 +857,61 @@ class PlainExternalReviewTests(unittest.TestCase):
 
             self.assertTrue(target.is_symlink())
             self.assertEqual(replacement.read_text(encoding="utf-8"), "replacement")
+
+    def test_failed_run_does_not_unlink_displaced_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            output = root / "evidence.json"
+            prompt_path = output.with_suffix(".prompt.txt")
+            raw_path = output.with_suffix(".review.txt")
+            replacement = root / "replacement.txt"
+            replacement.write_text("replacement", encoding="utf-8")
+
+            def fake_run(argv, **kwargs):
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    '{"verdict":"PASS","finding_count":0,"findings":[]}',
+                    "",
+                )
+
+            def fail_parse(raw_review: str):
+                self.assertTrue(raw_review)
+                prompt_path.unlink()
+                prompt_path.symlink_to(replacement.name)
+                raise plain.PlainReviewError("simulated parse failure")
+
+            with (
+                mock.patch.object(
+                    plain,
+                    "run_bounded_process",
+                    side_effect=fake_run,
+                ),
+                mock.patch.object(
+                    plain,
+                    "parse_review_json",
+                    side_effect=fail_parse,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "simulated parse failure",
+                ),
+            ):
+                self._run(
+                    manifest,
+                    output,
+                    provider="grok",
+                    executable="grok",
+                    model=None,
+                )
+
+            self.assertTrue(prompt_path.is_symlink())
+            self.assertFalse(raw_path.exists())
+            self.assertEqual(
+                replacement.read_text(encoding="utf-8"),
+                "replacement",
+            )
 
     def test_parent_drift_removes_created_inode_and_allows_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
