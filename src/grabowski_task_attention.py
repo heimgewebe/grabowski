@@ -1760,6 +1760,8 @@ def _task_output_cleanup_after_archive(
         + str(binding["task_id"])
         + ":a"
         + str(binding["attempt"])
+        + ":"
+        + uuid.uuid4().hex[:24]
     )
     try:
         tasks.resources.acquire_resources(

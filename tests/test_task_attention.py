@@ -1033,6 +1033,55 @@ class TaskAttentionTests(unittest.TestCase):
         finally:
             tasks.resources.release_resources(foreign_owner, [resource_key])
 
+    def test_task_output_cleanup_uses_distinct_owner_per_invocation(self) -> None:
+        record = self._completed_task()
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        calls = 0
+
+        def cleanup_unlocked(
+            current: dict[str, object],
+            *,
+            archive_binding: dict[str, object],
+            projection: dict[str, object],
+            retention_boundary_unix: int,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls != 1:
+                self.fail("parallel cleanup reached the unlocked effect body")
+            with self.assertRaises(attention.TaskAttentionConflictError):
+                attention._task_output_cleanup_after_archive(
+                    current,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=retention_boundary_unix,
+                )
+            return {"status": "deleted", "task_binding": attention._task_binding(current)}
+
+        invocation_ids = [
+            types.SimpleNamespace(hex="1" * 32),
+            types.SimpleNamespace(hex="2" * 32),
+        ]
+        with patch.object(
+            attention.uuid, "uuid4", side_effect=invocation_ids
+        ) as uuid4, patch.object(
+            attention,
+            "_task_output_cleanup_after_archive_unlocked",
+            side_effect=cleanup_unlocked,
+        ):
+            result = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(calls, 1)
+        self.assertEqual(uuid4.call_count, 2)
+
     def test_task_output_cleanup_reconciles_absent_after_effect_interruption(self) -> None:
         record = self._completed_task()
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
