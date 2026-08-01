@@ -25,8 +25,9 @@ This path is deliberately distinct from coding-agent review:
   Git context, DBus, display, runtime-directory, and SSH-agent variables never
   reach the provider process;
 - stdin is `/dev/null`, each provider has a new process group, and stdout and
-  stderr are byte-bounded while they are read; timeout or overflow terminates
-  the whole process group;
+  stderr are byte-bounded while they are read and decoded as strict UTF-8;
+  malformed output is rejected, while timeout or overflow terminates the whole
+  process group;
 - the executable resolves to an owner-controlled, executable regular file that
   is not group- or world-writable; every resolved ancestor must be owned by the
   current user or root and may be group- or world-writable only with sticky-bit

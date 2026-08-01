@@ -559,6 +559,30 @@ class PlainExternalReviewTests(unittest.TestCase):
                     environment=plain.sanitized_environment()[0],
                 )
 
+    def test_process_rejects_non_utf8_output_without_rewriting_it(self) -> None:
+        json_bytes = (
+            "b'{\"verdict\":\"PASS\",\"finding_count\":0,"
+            "\"findings\":[],\"note\":\"\\xff\"}'"
+        )
+        for descriptor, stream_name in ((1, "stdout"), (2, "stderr")):
+            with self.subTest(stream=stream_name), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    f"provider {stream_name} is not valid UTF-8",
+                ):
+                    plain.run_bounded_process(
+                        [
+                            sys.executable,
+                            "-c",
+                            f"import os; os.write({descriptor}, {json_bytes})",
+                        ],
+                        executable=sys.executable,
+                        cwd=Path(directory),
+                        timeout_seconds=5,
+                        max_output_bytes=1_000,
+                        environment=plain.sanitized_environment()[0],
+                    )
+
     def test_executable_identity_rejects_group_or_world_writable_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "provider"

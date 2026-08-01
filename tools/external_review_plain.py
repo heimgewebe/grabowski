@@ -603,11 +603,19 @@ def run_bounded_process(
             process.wait(timeout=5)
     if failure is not None:
         raise PlainReviewError(failure)
+    decoded: dict[str, str] = {}
+    for name, payload in buffers.items():
+        try:
+            decoded[name] = bytes(payload).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise PlainReviewError(
+                f"provider {name} is not valid UTF-8"
+            ) from exc
     return subprocess.CompletedProcess(
         argv,
         returncode,
-        bytes(buffers["stdout"]).decode("utf-8", errors="replace"),
-        bytes(buffers["stderr"]).decode("utf-8", errors="replace"),
+        decoded["stdout"],
+        decoded["stderr"],
     )
 
 
