@@ -7236,6 +7236,78 @@ class TaskTests(unittest.TestCase):
         rows = tasks.grabowski_task_list(limit=20, view="evidence")
         self.assertEqual(1, rows["total_matching"])
 
+    def test_active_execution_identity_scan_skips_newer_operation_bound_rows(self) -> None:
+        common = {
+            "host": "local",
+            "argv": ["/bin/echo", "active-mixed-execution"],
+            "cwd": str(self.root),
+            "runtime_seconds": 60,
+            "resume_policy": "verify-then-retry",
+            "cpu_weight": 50,
+            "io_weight": 25,
+            "memory_max_bytes": 64 * 1024 * 1024,
+        }
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()),
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 123}
+            ),
+        ):
+            unbound = tasks.grabowski_task_start(**common)
+        unbound_task_id = str(unbound["task"]["task_id"])
+        tasks._set_state(
+            unbound_task_id,
+            "running",
+            observation={
+                "state": "running",
+                "observed_at_unix": tasks._now(),
+                "properties": {"ActiveState": "active", "SubState": "running"},
+            },
+        )
+        for source in ("d", "e"):
+            with (
+                patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+                patch.object(tasks, "_dispatch", return_value=_launcher()),
+                patch.object(tasks.base, "_append_audit"),
+                patch.object(
+                    tasks,
+                    "_require_recovery_gate",
+                    return_value={"checked_at_unix": 124},
+                ),
+            ):
+                bound = tasks.grabowski_task_start(
+                    **common,
+                    operation_identity=self._operation_identity_fixture(source=source),
+                )
+            tasks._set_state(
+                str(bound["task"]["task_id"]),
+                "running",
+                observation={
+                    "state": "running",
+                    "observed_at_unix": tasks._now(),
+                    "properties": {"ActiveState": "active", "SubState": "running"},
+                },
+            )
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks, "_observe") as observe,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks, "_require_recovery_gate", return_value={"checked_at_unix": 125}
+            ),
+        ):
+            reused = tasks.grabowski_task_start(**common)
+        dispatch.assert_not_called()
+        observe.assert_not_called()
+        self.assertEqual(unbound_task_id, reused["task"]["task_id"])
+        self.assertEqual(
+            "active_execution_identity",
+            reused["deduplicated_reuse"]["reason"],
+        )
+
     def test_active_execution_identity_resume_policy_mismatch_blocks_duplicate(self) -> None:
         common = {
             "host": "local",

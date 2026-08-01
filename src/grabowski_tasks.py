@@ -2484,7 +2484,7 @@ def _latest_matching_active_execution_record(
             "AND chronik_outbox_enabled=? AND chronik_outbox_state_root IS ? "
             "AND chronik_context_json IS ? AND execution_backend=? AND systemd_scope=? "
             f"AND state IN ({placeholders}) "
-            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 2",
+            "ORDER BY created_at_unix DESC, rowid DESC LIMIT 50001",
             (
                 identity["host"],
                 identity["argv_sha256"],
@@ -2506,6 +2506,8 @@ def _latest_matching_active_execution_record(
                 *active_states,
             ),
         ).fetchall()
+    if len(rows) > 50000:
+        raise RuntimeError("active execution identity scan limit exceeded")
     matching: list[dict[str, Any]] = []
     for row in rows:
         record = dict(row)
