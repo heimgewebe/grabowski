@@ -829,6 +829,21 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertTrue(result["review_performed"])
         self.assertTrue(result["settled"])
 
+    def test_explicit_operator_actor_is_trusted_without_visible_membership(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [request_comment(actor="alexdermohr", association="NONE")],
+            hasPreviousPage=False,
+        )
+        state["reviews"] = connection([codex_review()], hasPreviousPage=False)
+
+        result = self.evaluate(state)
+
+        self.assertEqual(result["status"], "pass")
+        self.assertTrue(result["request_present"])
+        self.assertTrue(result["review_performed"])
+        self.assertTrue(result["settled"])
+
     def test_untrusted_request_marker_is_ignored(self) -> None:
         state = base_state()
         state["comments"] = connection(

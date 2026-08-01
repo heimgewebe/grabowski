@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import errno
 import faulthandler
 import fcntl
@@ -64,6 +65,11 @@ DEPLOYMENT_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DEPLOYMENT_ADMISSION_LOCK = threading.Lock()
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
 _DEPLOYMENT_ADMISSION_GATE_INSTALLED = False
+SYNC_TOOL_EXECUTOR_MAX_WORKERS = 8
+_SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
+    thread_name_prefix="grabowski-sync-tool",
+)
 JOB_PREFIX = "grabowski-job-"
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
@@ -401,12 +407,28 @@ def _deployment_admission_active_tool_calls() -> int:
         return _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
 
 
+def _deployment_admission_release_tool_call(_completed: Any = None) -> None:
+    global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS -= 1
+        if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS < 0:
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+
+
 def _deployment_admission_snapshot() -> dict[str, Any]:
     return {
         **_read_deployment_admission_marker(),
         "active_tool_calls": _deployment_admission_active_tool_calls(),
         "admission_gate_installed": _DEPLOYMENT_ADMISSION_GATE_INSTALLED,
     }
+
+
+def _run_sync_tool_call(
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    return asyncio.run(original(*args, **kwargs))
 
 
 def _install_deployment_admission_gate() -> None:
@@ -423,6 +445,7 @@ def _install_deployment_admission_gate() -> None:
         global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
         with _DEPLOYMENT_ADMISSION_LOCK:
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS += 1
+        release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()
             if marker.get("active") or marker.get("state") == "invalid":
@@ -430,12 +453,29 @@ def _install_deployment_admission_gate() -> None:
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
                 )
+            tool_name = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
+            get_tool = getattr(manager, "get_tool", None)
+            tool = get_tool(tool_name) if callable(get_tool) and isinstance(tool_name, str) else None
+            if (
+                tool is not None
+                and getattr(tool, "is_async", True) is False
+            ):
+                loop = asyncio.get_running_loop()
+                worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                    _run_sync_tool_call,
+                    original,
+                    args,
+                    kwargs,
+                )
+                worker_future.add_done_callback(
+                    _deployment_admission_release_tool_call
+                )
+                release_in_finally = False
+                return await asyncio.wrap_future(worker_future, loop=loop)
             return await original(*args, **kwargs)
         finally:
-            with _DEPLOYMENT_ADMISSION_LOCK:
-                _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS -= 1
-                if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS < 0:
-                    _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+            if release_in_finally:
+                _deployment_admission_release_tool_call()
 
     gated_call_tool._grabowski_deployment_admission_gate = True
     manager.call_tool = gated_call_tool
