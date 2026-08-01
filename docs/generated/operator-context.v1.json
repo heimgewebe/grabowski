@@ -1531,7 +1531,7 @@
     },
     {
       "category": "bureau",
-      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors and cannot make an otherwise incomplete call valid.",
+      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors. ``candidate_id``, ``event_id``, ``initiative``\nand ``task_id`` remain accepted only as a compatibility bridge for connector\ncatalogs cached before the typed ``selector`` contract was published.",
       "effects": [],
       "id": "grabowski_bureau_candidate_assess",
       "purpose": "Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors.",
@@ -2968,7 +2968,7 @@
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
-      "src/grabowski_bureau_intake.py": "5730d2f7fa0c359f078a920d3ad41e18437cb18d2469d5fcde4a04a7ce746afc",
+      "src/grabowski_bureau_intake.py": "ab613eef412310c49b292d85d3f478d65deeecd79cd6eaf43ca6f56eda936bcb",
       "src/grabowski_bureau_leases.py": "cce8133d87db6a517ca0226537030f64c30054b862b7c95fb4a5a045a3566cb3",
       "src/grabowski_bureau_pickup.py": "f1f7374486b3a0c9d730a50550c76dc9c68bf4910272ad7a826f596c0d735681",
       "src/grabowski_capabilities.py": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19",

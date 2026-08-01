@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:
     from typing import TypedDict
 
+try:
+    from pydantic import StrictInt
+except ModuleNotFoundError:
+    StrictInt = int
+
 import grabowski_bureau_leases as bureau_runtime
 import grabowski_mcp as base
 import grabowski_resources as resources
@@ -722,17 +727,65 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
 
 @mcp.tool(name="grabowski_bureau_candidate_assess", annotations=READ_ONLY)
 def grabowski_bureau_candidate_assess(
-    selector: BureauCandidateIdSelector | BureauEventIdSelector,
+    selector: BureauCandidateIdSelector | BureauEventIdSelector | None = None,
     expected_initiative: str = "",
     expected_task_id: str = "",
+    candidate_id: str = "",
+    event_id: StrictInt = 0,
+    initiative: str = "",
+    task_id: str = "",
 ) -> dict[str, Any]:
     """Assess one explicitly selected operator-intake candidate read-only.
 
     ``expected_initiative`` and ``expected_task_id`` are optional binding checks;
-    they are never candidate selectors and cannot make an otherwise incomplete call valid.
+    they are never candidate selectors. ``candidate_id``, ``event_id``, ``initiative``
+    and ``task_id`` remain accepted only as a compatibility bridge for connector
+    catalogs cached before the typed ``selector`` contract was published.
     """
+
+    if not isinstance(candidate_id, str):
+        raise ValueError("candidate_id must be text")
+    legacy_candidate_id = candidate_id.strip()
+    if "\x00" in legacy_candidate_id:
+        raise ValueError("candidate_id contains NUL")
+    if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id < 0:
+        raise ValueError("event_id must be a non-negative integer")
+    legacy_selector_count = int(bool(legacy_candidate_id)) + int(event_id > 0)
+    if selector is not None and legacy_selector_count:
+        raise ValueError("provide selector or one legacy selector, not both")
+    if selector is None:
+        if legacy_selector_count != 1:
+            raise ValueError("provide selector or exactly one of candidate_id and event_id")
+        selector = (
+            {"kind": "candidate_id", "candidate_id": legacy_candidate_id}
+            if legacy_candidate_id
+            else {"kind": "event_id", "event_id": event_id}
+        )
     if not isinstance(selector, dict):
         raise ValueError("selector must be an object")
+
+    def binding_value(current: str, legacy: str, *, label: str) -> str:
+        if not isinstance(current, str) or not isinstance(legacy, str):
+            raise ValueError(f"{label} must be text")
+        normalized = current.strip()
+        normalized_legacy = legacy.strip()
+        if "\x00" in normalized or "\x00" in normalized_legacy:
+            raise ValueError(f"{label} contains NUL")
+        if normalized and normalized_legacy and normalized != normalized_legacy:
+            raise ValueError(f"conflicting {label} values")
+        return normalized or normalized_legacy
+
+    initiative_binding = binding_value(
+        expected_initiative,
+        initiative,
+        label="initiative binding",
+    )
+    task_binding = binding_value(
+        expected_task_id,
+        task_id,
+        label="task binding",
+    )
+
     selector_kind = selector.get("kind")
     arguments = ["--json", "--json-envelope", "operator-candidate-assess"]
     if selector_kind == "candidate_id":
@@ -758,17 +811,12 @@ def grabowski_bureau_candidate_assess(
         arguments.extend(["--event-id", str(selector_value)])
     else:
         raise ValueError("selector kind must be candidate_id or event_id")
-    for label, value, option in (
-        ("expected_initiative", expected_initiative, "--initiative"),
-        ("expected_task_id", expected_task_id, "--task-id"),
+    for value, option in (
+        (initiative_binding, "--initiative"),
+        (task_binding, "--task-id"),
     ):
-        if not isinstance(value, str):
-            raise ValueError(f"{label} must be text")
-        normalized = value.strip()
-        if "\x00" in normalized:
-            raise ValueError(f"{label} contains NUL")
-        if normalized:
-            arguments.extend([option, normalized])
+        if value:
+            arguments.extend([option, value])
     return _invoke_bureau(arguments)
 
 
