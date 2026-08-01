@@ -120,10 +120,12 @@ removed with that directory after the client exits. Its evidence therefore recor
 `prompt_argument_exposure: false`. Gemini has no documented prompt-file option in
 the installed account CLI and still receives the prompt through `--print`; its
 evidence records `transport: argv`, `ephemeral_prompt_file: false`, and
-`prompt_argument_exposure: true`. Another process running as the same local user
-may be able to observe Gemini command arguments while the client is active. A
-future Gemini stdin, file, or browser transport should be preferred only if it
-preserves the same independent prompt and response binding.
+`prompt_argument_exposure: true`. Gemini prompts are capped at 120,000 UTF-8
+bytes so the single prompt argument remains below Linux's per-argument exec
+limit, even when the generic prompt budget is larger. Another process running as
+the same local user may be able to observe Gemini command arguments while the
+client is active. A future Gemini stdin, file, or browser transport should be
+preferred only if it preserves the same independent prompt and response binding.
 
 No model request is performed by repository tests. Tests replace the provider
 process and validate argv, environment isolation, prompt reconstruction,

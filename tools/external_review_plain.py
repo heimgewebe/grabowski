@@ -42,6 +42,10 @@ PROVIDERS = {"gemini", "grok"}
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_PROMPT_BYTES = 500_000
 DEFAULT_MAX_REVIEW_BYTES = 1_000_000
+# Linux rejects a single exec argument at 128 KiB including its terminator.
+# Keep enough headroom for platform and encoding details while Gemini still
+# requires the complete prompt in one --print argument.
+GEMINI_MAX_ARG_PROMPT_BYTES = 120_000
 MAX_WORKSPACE_CLEANUP_ENTRIES = 1_024
 MAX_WORKSPACE_CLEANUP_DEPTH = 32
 # Any inherited credential can silently move an account-backed CLI onto a
@@ -305,6 +309,10 @@ def build_provider_argv(
     if provider == "gemini":
         if prompt is None:
             raise PlainReviewError("Gemini plain review prompt is missing")
+        _validate_provider_prompt_transport(
+            provider,
+            prompt.encode("utf-8"),
+        )
         argv = [
             executable,
             f"--print-timeout={timeout_seconds}s",
@@ -340,6 +348,21 @@ def build_provider_argv(
             argv.extend(["--model", model])
         return argv
     raise PlainReviewError(f"unsupported plain review provider: {provider}")
+
+
+def _validate_provider_prompt_transport(
+    provider: str,
+    prompt_bytes: bytes,
+) -> None:
+    if (
+        provider == "gemini"
+        and len(prompt_bytes) > GEMINI_MAX_ARG_PROMPT_BYTES
+    ):
+        raise PlainReviewError(
+            "Gemini plain review prompt exceeds the safe single-argument "
+            "transport limit: "
+            f"{len(prompt_bytes)} bytes > {GEMINI_MAX_ARG_PROMPT_BYTES}"
+        )
 
 
 def is_billable_api_variable(key: str) -> bool:
@@ -1603,6 +1626,7 @@ def run_from_manifest(
             "plain review prompt is too large for transport: "
             f"{len(prompt_bytes)} bytes > {max_prompt_bytes}"
         )
+    _validate_provider_prompt_transport(provider, prompt_bytes)
     raw_path = raw_review_path or output_path.with_suffix(".review.txt")
     sent_prompt_path = (
         transmitted_prompt_path or output_path.with_suffix(".prompt.txt")

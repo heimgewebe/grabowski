@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import unittest
 
@@ -200,6 +201,78 @@ def _plain_external_evidence(
     }
 
 
+def _claude_external_evidence(
+    state: dict[str, object],
+) -> dict[str, object]:
+    diff_filename = f"pr-7-{HEAD[:12]}.diff"
+    packet_prompt = gate.build_external_review_prompt(
+        state, diff_filename, DIFF_SHA
+    )
+    prompt_nonce = "5" * 32
+    prompt = gate.build_claude_review_prompt(
+        packet_prompt, str(state["pr_diff_text"]), prompt_nonce
+    )
+    prompt_sha256 = gate._sha256_text(prompt)
+    return {
+        "schema_version": 1,
+        "kind": "external_review",
+        "repo": "heimgewebe/grabowski",
+        "pr": 7,
+        "head_sha": HEAD,
+        "diff_sha256": DIFF_SHA,
+        "prompt_sha256": prompt_sha256,
+        "prompt_includes_diff": True,
+        "prompt_transmitted": True,
+        "review_input": {
+            "mode": gate.CLAUDE_CLI_REVIEW_INPUT_MODE,
+            "repo": "heimgewebe/grabowski",
+            "pr": 7,
+            "head_sha": HEAD,
+            "diff_sha256": DIFF_SHA,
+            "packet_prompt_sha256": gate._sha256_text(packet_prompt),
+            "prompt_nonce": prompt_nonce,
+            "prompt_sha256": prompt_sha256,
+            "transport": "stdin",
+        },
+        "reviews": [
+            {
+                "source": gate.CLAUDE_CLI_REVIEW_SOURCE,
+                "tool": "claude-code",
+                "tool_version": "test",
+                "command": [
+                    "claude",
+                    "-p",
+                    "--output-format",
+                    "json",
+                    "--json-schema",
+                    json.dumps(gate.CLAUDE_PACKET_REVIEW_SCHEMA),
+                    "--tools=",
+                    "--permission-mode",
+                    "plan",
+                    "--no-session-persistence",
+                    "--safe-mode",
+                    "--model",
+                    "opus",
+                    "--effort",
+                    "high",
+                    "--max-budget-usd",
+                    "1",
+                ],
+                "stdin_sha256": prompt_sha256,
+                "model": "opus",
+                "effort": "high",
+                "exit_code": 0,
+                "json_ok": True,
+                "review_sha256": "6" * 64,
+                "verdict": "PASS",
+                "finding_count": 0,
+            }
+        ],
+        "external_reviews_triaged": True,
+        "findings": [],
+    }
+
+
 def _warnings(result: dict[str, object]) -> str:
     return "\n".join(str(item) for item in result.get("warnings", []))
 
@@ -290,6 +363,39 @@ class PlainLlmReviewGateTests(unittest.TestCase):
                 self.assertIn(
                     "review_input.mode is not "
                     f"{gate.PLAIN_LLM_REVIEW_INPUT_MODE}",
+                    _warnings(result),
+                )
+
+    def test_reserved_claude_source_cannot_skip_prompt_binding(
+        self,
+    ) -> None:
+        state = _state()
+        valid = gate.evaluate_review_gate(
+            state,
+            self_review=_self_review(),
+            external_review_evidence=_claude_external_evidence(state),
+        )
+        self.assertNotIn(
+            "Optional external review evidence invalid", _warnings(valid)
+        )
+
+        for tampered_mode in (None, "legacy-external-review-v1"):
+            with self.subTest(tampered_mode=tampered_mode):
+                evidence = _claude_external_evidence(state)
+                review_input = evidence["review_input"]
+                if tampered_mode is None:
+                    review_input.pop("mode")
+                else:
+                    review_input["mode"] = tampered_mode
+                result = gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(),
+                    external_review_evidence=evidence,
+                )
+                self.assertEqual(result["verdict"], "PASS")
+                self.assertIn(
+                    "review_input.mode is not "
+                    f"{gate.CLAUDE_CLI_REVIEW_INPUT_MODE}",
                     _warnings(result),
                 )
 

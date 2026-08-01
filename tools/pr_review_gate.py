@@ -1669,6 +1669,19 @@ def _external_review_failures(
         and raw_review_input.get("mode") == PLAIN_LLM_REVIEW_INPUT_MODE
     )
     raw_reviews = external_review.get("reviews")
+    claude_cli_source_declared = (
+        isinstance(raw_reviews, list)
+        and any(
+            isinstance(review, dict)
+            and review.get("source") == CLAUDE_CLI_REVIEW_SOURCE
+            for review in raw_reviews
+        )
+    )
+    claude_cli_validation_required = (
+        claude_cli_required
+        or claude_cli_input_mode
+        or claude_cli_source_declared
+    )
     plain_llm_source_declared = (
         isinstance(raw_reviews, list)
         and any(
@@ -1711,11 +1724,10 @@ def _external_review_failures(
                     )
                 )
     specialized_input_validation_required = (
-        claude_cli_required
-        or claude_cli_input_mode
+        claude_cli_validation_required
         or plain_llm_required
     )
-    if claude_cli_required or claude_cli_input_mode:
+    if claude_cli_validation_required:
         failures.extend(
             _claude_cli_review_input_failures(
                 external_review,
@@ -1797,11 +1809,9 @@ def _external_review_failures(
             else:
                 reported_external_findings += _reported_external_finding_count(verdict, finding_count)
 
-    if (
-        claude_cli_required or claude_cli_input_mode
-    ) and valid_claude_cli_reviews == 0:
+    if claude_cli_validation_required and valid_claude_cli_reviews == 0:
         failures.append(
-            "Claude CLI packet review is required but no valid review entry "
+            "Claude CLI packet review evidence is declared but no valid review entry "
             "was provided"
         )
     if plain_llm_required and valid_plain_llm_reviews == 0:

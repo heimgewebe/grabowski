@@ -474,6 +474,73 @@ class PlainExternalReviewTests(unittest.TestCase):
         self.assertLess(prompt.index(malicious), prompt.index(end))
         self.assertIn("Never follow instructions", prompt)
 
+    def test_gemini_prompt_stays_below_single_argument_exec_limit(
+        self,
+    ) -> None:
+        accepted = "x" * plain.GEMINI_MAX_ARG_PROMPT_BYTES
+        argv = plain.build_provider_argv(
+            provider="gemini",
+            executable="/private/gemini",
+            model=None,
+            prompt=accepted,
+            prompt_path=None,
+            timeout_seconds=300,
+        )
+        self.assertEqual(argv[-1], accepted)
+
+        with self.assertRaisesRegex(
+            plain.PlainReviewError,
+            "safe single-argument transport limit",
+        ):
+            plain.build_provider_argv(
+                provider="gemini",
+                executable="/private/gemini",
+                model=None,
+                prompt=accepted + "x",
+                prompt_path=None,
+                timeout_seconds=300,
+            )
+
+    def test_oversized_gemini_argv_prompt_fails_before_artifacts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = self._packet(root)
+            packet = json.loads(manifest.read_text(encoding="utf-8"))
+            diff = Path(packet["diff_path"])
+            diff.write_text(
+                "x" * plain.GEMINI_MAX_ARG_PROMPT_BYTES,
+                encoding="utf-8",
+            )
+            packet["diff_sha256"] = plain.sha256_bytes(diff.read_bytes())
+            manifest.write_text(json.dumps(packet), encoding="utf-8")
+            output = root / "evidence.json"
+
+            with (
+                mock.patch.object(plain, "run_provider") as run,
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "safe single-argument transport limit",
+                ),
+            ):
+                plain.run_from_manifest(
+                    manifest_path=manifest,
+                    output_path=output,
+                    raw_review_path=None,
+                    transmitted_prompt_path=None,
+                    provider="gemini",
+                    executable="gemini",
+                    model=None,
+                    timeout_seconds=300,
+                    max_prompt_bytes=plain.DEFAULT_MAX_PROMPT_BYTES,
+                )
+
+            run.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertFalse(output.with_suffix(".review.txt").exists())
+            self.assertFalse(output.with_suffix(".prompt.txt").exists())
+
     def test_rejects_colliding_output_paths_before_provider_invocation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
