@@ -461,8 +461,7 @@ def _install_deployment_admission_gate() -> None:
                 and getattr(tool, "is_async", True) is False
             ):
                 loop = asyncio.get_running_loop()
-                worker_future = loop.run_in_executor(
-                    _SYNC_TOOL_EXECUTOR,
+                worker_future = _SYNC_TOOL_EXECUTOR.submit(
                     _run_sync_tool_call,
                     original,
                     args,
@@ -472,7 +471,7 @@ def _install_deployment_admission_gate() -> None:
                     _deployment_admission_release_tool_call
                 )
                 release_in_finally = False
-                return await asyncio.shield(worker_future)
+                return await asyncio.wrap_future(worker_future, loop=loop)
             return await original(*args, **kwargs)
         finally:
             if release_in_finally:

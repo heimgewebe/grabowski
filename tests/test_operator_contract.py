@@ -356,6 +356,58 @@ class OperatorContractTests(unittest.TestCase):
 
         operator.asyncio.run(exercise())
 
+    def test_cancelled_queued_sync_tool_never_executes_and_releases_admission(self) -> None:
+        operator = _load_operator_module()
+        started = threading.Event()
+        release = threading.Event()
+        executed: list[int] = []
+        executor = operator.concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        operator._SYNC_TOOL_EXECUTOR = executor
+
+        async def slow_call_tool(_name, arguments):
+            executed.append(arguments["slot"])
+            started.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("test worker release timed out")
+            return {"called": True, "slot": arguments["slot"]}
+
+        operator.mcp._tool_manager.call_tool = slow_call_tool
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg=None,
+        )
+        operator._configure_http_runtime()
+
+        async def exercise() -> None:
+            running = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool("read", {"slot": 1})
+            )
+            started_ok = await operator.asyncio.to_thread(started.wait, 2)
+            self.assertTrue(started_ok)
+            queued = operator.asyncio.create_task(
+                operator.mcp._tool_manager.call_tool("read", {"slot": 2})
+            )
+            await operator.asyncio.sleep(0)
+            self.assertEqual(2, operator._deployment_admission_active_tool_calls())
+            queued.cancel()
+            with self.assertRaises(operator.asyncio.CancelledError):
+                await queued
+            self.assertEqual(1, operator._deployment_admission_active_tool_calls())
+            release.set()
+            self.assertEqual(1, (await running)["slot"])
+            for _attempt in range(100):
+                if operator._deployment_admission_active_tool_calls() == 0:
+                    break
+                await operator.asyncio.sleep(0.01)
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+            self.assertEqual([1], executed)
+
+        try:
+            operator.asyncio.run(exercise())
+        finally:
+            release.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+
     def test_deployment_admission_gate_keeps_async_tools_on_event_loop(self) -> None:
         operator = _load_operator_module()
         caller_thread = threading.get_ident()
