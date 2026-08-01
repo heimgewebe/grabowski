@@ -13,6 +13,7 @@ SCHEMA_VERSION = 1
 KIND = "grabowski_process_reference_observation"
 ALLOWED_ROOTS = (
     Path("/home/alex/repos/.weltgewebe-worktrees"),
+    Path("/home/alex/repos/.weltgewebe-standalone"),
     Path("/home/alex/worktrees"),
     Path("/home/alex/repos/.semantah-worktrees"),
     Path("/home/alex/repos/.heimlern-worktrees"),

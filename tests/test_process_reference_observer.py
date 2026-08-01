@@ -19,6 +19,12 @@ SPEC.loader.exec_module(observer)
 
 
 class ProcessReferenceObserverTests(unittest.TestCase):
+    def test_production_allowed_roots_include_weltgewebe_standalone(self) -> None:
+        self.assertIn(
+            Path("/home/alex/repos/.weltgewebe-standalone"),
+            observer.ALLOWED_ROOTS,
+        )
+
     def make_root(self) -> tempfile.TemporaryDirectory[str]:
         return tempfile.TemporaryDirectory(prefix="observer-root-")
 
