@@ -17,7 +17,10 @@ try:
 except ModuleNotFoundError:
     from typing import TypedDict
 
-from pydantic import StrictInt
+try:
+    from pydantic import StrictInt
+except ModuleNotFoundError:
+    StrictInt = int
 
 import grabowski_bureau_leases as bureau_runtime
 import grabowski_mcp as base
