@@ -1038,6 +1038,74 @@ class PlainExternalReviewTests(unittest.TestCase):
                     "retry succeeded",
                 )
 
+    def test_create_only_syncs_file_then_parent_before_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "artifact.txt"
+            real_fsync = plain.os.fsync
+            synced_types: list[int] = []
+
+            def tracking_fsync(descriptor: int) -> None:
+                synced_types.append(
+                    stat.S_IFMT(os.fstat(descriptor).st_mode)
+                )
+                real_fsync(descriptor)
+
+            with mock.patch.object(
+                plain.os,
+                "fsync",
+                side_effect=tracking_fsync,
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "durable artifact",
+                    label="test artifact",
+                )
+
+            self.assertEqual(
+                synced_types,
+                [stat.S_IFREG, stat.S_IFDIR],
+            )
+
+    def test_parent_sync_failure_rolls_back_create_and_allows_retry(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "artifact.txt"
+            real_fsync = plain.os.fsync
+
+            def fail_parent_fsync(descriptor: int) -> None:
+                if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise OSError("simulated parent sync failure")
+                real_fsync(descriptor)
+
+            with (
+                mock.patch.object(
+                    plain.os,
+                    "fsync",
+                    side_effect=fail_parent_fsync,
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "simulated parent sync failure",
+                ),
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "not durable",
+                    label="test artifact",
+                )
+
+            self.assertFalse(target.exists())
+            plain.write_text_create_only(
+                target,
+                "retry succeeded",
+                label="test artifact",
+            )
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "retry succeeded",
+            )
+
     def test_failed_create_does_not_unlink_displaced_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

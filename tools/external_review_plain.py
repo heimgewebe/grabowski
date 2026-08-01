@@ -1362,6 +1362,7 @@ def write_text_create_only(
             raise PlainReviewError(
                 f"cannot write {label}: created path identity drifted"
             )
+        os.fsync(parent_descriptor)
         if created_directories is not None:
             created_directories.extend(local_created_directories)
         return linked_after
