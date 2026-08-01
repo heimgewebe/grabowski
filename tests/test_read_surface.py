@@ -115,6 +115,9 @@ class ReadSurfaceTests(unittest.TestCase):
         self.assertEqual(get_args(read_surface.OutputBytes)[1]["ge"], 1024)
         self.assertEqual(get_args(read_surface.OutputBytes)[1]["le"], read_surface.MAX_OUTPUT_BYTES)
         self.assertEqual(get_args(read_surface.GitCommitCount)[1]["ge"], 1)
+        self.assertIn(
+            "canonical GitHub", get_args(read_surface.GitHubRepository)[1]["description"]
+        )
         self.assertEqual(get_args(read_surface.LogLineCount)[1]["le"], read_surface.MAX_LOG_LINES)
 
     def test_run_read_uses_streaming_bound(self) -> None:
@@ -154,6 +157,106 @@ class ReadSurfaceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     read_surface._validate_pr(value)
         self.assertEqual(read_surface._validate_pr(12), 12)
+
+    def test_github_repository_accepts_canonical_identifier(self) -> None:
+        with patch.object(read_surface, "_resolve_repository") as resolver:
+            cwd, argv = read_surface._resolve_github_repository(
+                "heimgewebe/grabowski"
+            )
+        resolver.assert_not_called()
+        self.assertEqual(cwd, read_surface.operator.HOME)
+        self.assertEqual(argv, ["--repo", "heimgewebe/grabowski"])
+
+    def test_github_repository_rejects_relative_paths_and_option_like_names(
+        self,
+    ) -> None:
+        for repo in (
+            "../grabowski",
+            "heimgewebe/grabowski/extra",
+            "heimgewebe/-grabowski",
+            "--repo/heimgewebe",
+        ):
+            with self.subTest(repo=repo):
+                with self.assertRaisesRegex(ValueError, "canonical GitHub"):
+                    read_surface._resolve_github_repository(repo)
+
+    def test_github_checks_uses_repo_flag_for_canonical_identifier(self) -> None:
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": "[]",
+            "stderr": "",
+        }
+        with patch.object(read_surface, "_run_read", return_value=result) as runner:
+            response = read_surface.grabowski_github_checks(
+                "heimgewebe/grabowski", 546
+            )
+        self.assertEqual(response["data"], [])
+        argv = runner.call_args.args[0]
+        self.assertEqual(
+            argv[:7],
+            [
+                "gh",
+                "pr",
+                "checks",
+                "546",
+                "--repo",
+                "heimgewebe/grabowski",
+                "--json",
+            ],
+        )
+        self.assertEqual(runner.call_args.kwargs["cwd"], read_surface.operator.HOME)
+
+    def test_github_pr_view_uses_repo_flag_for_canonical_identifier(self) -> None:
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": "{}",
+            "stderr": "",
+        }
+        with patch.object(read_surface, "_run_read", return_value=result) as runner:
+            response = read_surface.grabowski_github_pr_view(
+                "heimgewebe/grabowski", 546
+            )
+        self.assertEqual(response["data"], {})
+        self.assertEqual(
+            runner.call_args.args[0][:7],
+            [
+                "gh",
+                "pr",
+                "view",
+                "546",
+                "--repo",
+                "heimgewebe/grabowski",
+                "--json",
+            ],
+        )
+        self.assertEqual(runner.call_args.kwargs["cwd"], read_surface.operator.HOME)
+
+    def test_github_pr_view_keeps_absolute_worktree_behavior(self) -> None:
+        repository = Path("/tmp/repository")
+        result = {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout": "{}",
+            "stderr": "",
+        }
+        with (
+            patch.object(
+                read_surface, "_resolve_repository", return_value=repository
+            ) as resolver,
+            patch.object(read_surface, "_run_read", return_value=result) as runner,
+        ):
+            read_surface.grabowski_github_pr_view(str(repository), 12)
+        resolver.assert_called_once_with(str(repository))
+        self.assertNotIn("--repo", runner.call_args.args[0])
+        self.assertEqual(runner.call_args.kwargs["cwd"], repository)
 
     def test_git_status_uses_fixed_arguments(self) -> None:
         repo = Path("/tmp/repository")
