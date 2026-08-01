@@ -160,6 +160,7 @@ class PlainLlmAdapterGateIntegrationTests(unittest.TestCase):
                 state,
                 self_review=_self_review(state["pr_diff_sha256"]),
                 external_review_evidence=evidence,
+                external_review_artifact_root=root,
             )
             self.assertEqual(result["verdict"], "PASS")
             warnings = "\n".join(result["warnings"])

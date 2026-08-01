@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -46,6 +47,17 @@ except ModuleNotFoundError:  # importlib-based tests load this file from the rep
         plain_llm_review_payload_sha256,
     )
 
+try:
+    from external_review_plain import (
+        PlainReviewError,
+        parse_review_json as parse_plain_llm_review_json,
+    )
+except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
+    from tools.external_review_plain import (
+        PlainReviewError,
+        parse_review_json as parse_plain_llm_review_json,
+    )
+
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
 STRONG_SEVERITIES = {"p0", "p1", "high", "critical"}
@@ -61,6 +73,7 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 }
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
+MAX_PLAIN_LLM_RAW_REVIEW_BYTES = 1_000_000
 PASS_CHECK_BUCKETS = {"pass"}
 DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate",
@@ -719,6 +732,154 @@ def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
         validate_schema=True,
         schema_failures_fatal=False,
     )
+
+
+def _read_private_artifact_inside_root(
+    root: Path | None,
+    artifact_path: Any,
+    *,
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    if root is None:
+        raise GateInputError(f"{label} root is unavailable")
+    if (
+        not isinstance(artifact_path, str)
+        or not artifact_path.strip()
+        or "\x00" in artifact_path
+    ):
+        raise GateInputError(f"{label} path is missing or invalid")
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise GateInputError(f"cannot resolve {label} root: {exc}") from exc
+    candidate = Path(artifact_path)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as exc:
+            raise GateInputError(f"{label} path escapes artifact root") from exc
+    else:
+        relative = candidate
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise GateInputError(f"{label} path escapes artifact root")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    file_flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+
+    def validate_directory(info: os.stat_result) -> None:
+        if not stat.S_ISDIR(info.st_mode):
+            raise GateInputError(f"{label} ancestry contains a non-directory")
+        if info.st_uid not in {0, os.getuid()} or info.st_mode & 0o022:
+            raise GateInputError(f"{label} ancestry is not owner-controlled")
+
+    def file_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_nlink,
+            info.st_mode,
+        )
+
+    try:
+        descriptor = os.open(root, directory_flags)
+    except OSError as exc:
+        raise GateInputError(f"cannot open {label} root: {exc}") from exc
+    try:
+        validate_directory(os.fstat(descriptor))
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=descriptor)
+            try:
+                validate_directory(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+
+        file_descriptor = os.open(parts[-1], file_flags, dir_fd=descriptor)
+        try:
+            before = os.fstat(file_descriptor)
+            linked_before = os.stat(
+                parts[-1],
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            identity_before = file_identity(before)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or file_identity(linked_before) != identity_before
+            ):
+                raise GateInputError(
+                    f"{label} is not a private single-link regular file"
+                )
+            if before.st_size > max_bytes:
+                raise GateInputError(f"{label} exceeds {max_bytes} bytes")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(
+                    file_descriptor,
+                    min(65_536, max_bytes + 1 - total),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > max_bytes:
+                raise GateInputError(f"{label} exceeds {max_bytes} bytes")
+            after = os.fstat(file_descriptor)
+            linked_after = os.stat(
+                parts[-1],
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            identity_after = file_identity(after)
+            linked_identity_after = file_identity(linked_after)
+            if (
+                identity_after != identity_before
+                or linked_identity_after != identity_before
+                or total != before.st_size
+            ):
+                raise GateInputError(f"{label} changed while it was read")
+            return b"".join(chunks)
+        finally:
+            os.close(file_descriptor)
+    except (OSError, ValueError) as exc:
+        raise GateInputError(f"cannot read {label}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _retained_plain_llm_review(
+    review_input: dict[str, Any],
+    artifact_root: Path | None,
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    try:
+        raw = _read_private_artifact_inside_root(
+            artifact_root,
+            review_input.get("raw_review_path"),
+            label="retained raw review artifact",
+            max_bytes=MAX_PLAIN_LLM_RAW_REVIEW_BYTES,
+        )
+        text = raw.decode("utf-8")
+        parsed = parse_plain_llm_review_json(text)
+    except (GateInputError, UnicodeDecodeError, PlainReviewError) as exc:
+        return None, None, str(exc)
+    return _sha256_bytes(raw), parsed, None
 
 
 def load_policy_waiver(path: Path | None) -> dict[str, Any] | None:
@@ -1500,6 +1661,10 @@ def _plain_llm_review_input_failures(
 def _plain_llm_external_review_failures(
     review: dict[str, Any],
     review_input: dict[str, Any],
+    *,
+    retained_review_sha256: str | None,
+    retained_review: dict[str, Any] | None,
+    retained_review_failure: str | None,
 ) -> list[str]:
     failures: list[str] = []
     provider = review_input.get("provider")
@@ -1549,6 +1714,31 @@ def _plain_llm_external_review_failures(
     verdict = review.get("verdict")
     finding_count = review.get("finding_count")
     findings = review.get("findings")
+    if retained_review_failure is not None:
+        failures.append(
+            "retained raw review artifact is invalid: "
+            + retained_review_failure
+        )
+    elif retained_review is not None:
+        stdout_sha256 = review.get("stdout_sha256")
+        if (
+            _valid_sha256(stdout_sha256)
+            and _normalize_sha256(stdout_sha256)
+            != retained_review_sha256
+        ):
+            failures.append(
+                "stdout_sha256 does not match retained raw review artifact"
+            )
+        structured_review = {
+            "verdict": verdict,
+            "finding_count": finding_count,
+            "findings": findings,
+        }
+        if structured_review != retained_review:
+            failures.append(
+                "structured review payload does not match retained raw "
+                "review artifact"
+            )
     if verdict not in EXTERNAL_REVIEW_VERDICTS:
         failures.append("verdict is invalid")
     valid_count = (
@@ -1638,6 +1828,7 @@ def _external_review_failures(
     required: bool,
     repo_name: str | None = None,
     claude_cli_required: bool = False,
+    external_review_artifact_root: Path | None = None,
 ) -> list[str]:
     if external_review is None:
         return ["external review is required but evidence is missing"] if required else []
@@ -1724,6 +1915,16 @@ def _external_review_failures(
         )
     )
     plain_llm_required = plain_llm_input_mode or plain_llm_source_declared
+    retained_review_sha256: str | None = None
+    retained_review: dict[str, Any] | None = None
+    retained_review_failure: str | None = None
+    if plain_llm_required:
+        retained_review_sha256, retained_review, retained_review_failure = (
+            _retained_plain_llm_review(
+                raw_review_input if isinstance(raw_review_input, dict) else {},
+                external_review_artifact_root,
+            )
+        )
     expected_packet_prompt_sha256: str | None = None
     expected_claude_prompt_sha256: str | None = None
     expected_plain_llm_prompt_sha256: str | None = None
@@ -1825,7 +2026,11 @@ def _external_review_failures(
                 and isinstance(raw_review_input, dict)
             ):
                 plain_failures = _plain_llm_external_review_failures(
-                    review, raw_review_input
+                    review,
+                    raw_review_input,
+                    retained_review_sha256=retained_review_sha256,
+                    retained_review=retained_review,
+                    retained_review_failure=retained_review_failure,
                 )
                 if plain_failures:
                     failures.extend(
@@ -2413,6 +2618,7 @@ def evaluate_review_gate(
     self_review: dict[str, Any] | None = None,
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
+    external_review_artifact_root: Path | None = None,
     policy_waiver: dict[str, Any] | None = None,
     expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
@@ -2588,6 +2794,7 @@ def evaluate_review_gate(
         required=False,
         repo_name=repo_name,
         claude_cli_required=False,
+        external_review_artifact_root=external_review_artifact_root,
     )
     for failure in external_failures:
         warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
@@ -2733,6 +2940,7 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            external_review_artifact_root=repo,
             policy_waiver=policy_waiver,
             expected_check_names=expected_check_names_for_repo(
                 repo,

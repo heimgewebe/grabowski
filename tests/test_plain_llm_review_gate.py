@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,26 @@ REVIEW_FOCUS = [
     "security",
     "integration",
 ]
+PLAIN_REVIEW_TEXT = '{"verdict":"PASS","finding_count":0,"findings":[]}'
+PLAIN_ARTIFACT_ROOT: Path
+PLAIN_RAW_REVIEW_PATH: Path
+_PLAIN_ARTIFACT_DIRECTORY = None
+
+
+def setUpModule() -> None:
+    global _PLAIN_ARTIFACT_DIRECTORY
+    global PLAIN_ARTIFACT_ROOT
+    global PLAIN_RAW_REVIEW_PATH
+    _PLAIN_ARTIFACT_DIRECTORY = tempfile.TemporaryDirectory()
+    PLAIN_ARTIFACT_ROOT = Path(_PLAIN_ARTIFACT_DIRECTORY.name)
+    PLAIN_RAW_REVIEW_PATH = PLAIN_ARTIFACT_ROOT / "review.txt"
+    PLAIN_RAW_REVIEW_PATH.write_text(PLAIN_REVIEW_TEXT, encoding="utf-8")
+    PLAIN_RAW_REVIEW_PATH.chmod(0o600)
+
+
+def tearDownModule() -> None:
+    if _PLAIN_ARTIFACT_DIRECTORY is not None:
+        _PLAIN_ARTIFACT_DIRECTORY.cleanup()
 
 
 def _load_gate():
@@ -31,6 +52,14 @@ def _load_gate():
 
 
 gate = _load_gate()
+
+
+def _evaluate_review_gate(state, **kwargs):
+    kwargs.setdefault(
+        "external_review_artifact_root",
+        PLAIN_ARTIFACT_ROOT,
+    )
+    return gate.evaluate_review_gate(state, **kwargs)
 
 
 def _state() -> dict[str, object]:
@@ -107,7 +136,7 @@ def _plain_external_evidence(
     )
     prompt_sha256 = gate._sha256_text(prompt)
     packet_prompt_sha256 = gate._sha256_text(packet_prompt)
-    response_sha256 = "2" * 64
+    response_sha256 = gate._sha256_text(PLAIN_REVIEW_TEXT)
     parsed_review_sha256 = gate.plain_llm_review_payload_sha256(
         verdict="PASS",
         finding_count=0,
@@ -152,7 +181,7 @@ def _plain_external_evidence(
             "ephemeral_prompt_file": provider == "grok",
             "transmitted_prompt_bytes": len(prompt.encode("utf-8")),
             "transmitted_prompt_path": "prompt.txt",
-            "raw_review_path": "review.txt",
+            "raw_review_path": str(PLAIN_RAW_REVIEW_PATH),
             "isolated_working_directory": True,
             "local_repository_context_provided": False,
             "web_search_policy": (
@@ -286,7 +315,7 @@ def _warnings(result: dict[str, object]) -> str:
 class PlainLlmReviewGateTests(unittest.TestCase):
     def test_valid_grok_evidence_is_independently_bound(self) -> None:
         state = _state()
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=_plain_external_evidence(state),
@@ -298,7 +327,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
 
     def test_valid_gemini_evidence_is_independently_bound(self) -> None:
         state = _state()
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=_plain_external_evidence(
@@ -317,7 +346,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         evidence = _plain_external_evidence(state)
         evidence["prompt_sha256"] = "f" * 64
         evidence["review_input"]["prompt_sha256"] = "f" * 64
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=evidence,
@@ -332,7 +361,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         state = _state()
         evidence = _plain_external_evidence(state)
         evidence["review_input"]["transmitted_prompt_bytes"] += 1
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=evidence,
@@ -350,7 +379,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         review = evidence["reviews"][0]
         review["source"] = "plain-llm:gemini:grok-4.5"
         review["tool_policy"] = "sandboxed_plan_mode"
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=evidence,
@@ -364,7 +393,9 @@ class PlainLlmReviewGateTests(unittest.TestCase):
             "tool_policy does not match provider contract", warnings
         )
 
-    def test_parsed_review_fields_are_bound_to_canonical_digest(self) -> None:
+    def test_parsed_review_fields_are_bound_to_retained_raw_response(
+        self,
+    ) -> None:
         evidence = _plain_external_evidence(_state())
         review = evidence["reviews"][0]
         review.update(
@@ -380,6 +411,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
                 }
             ],
         )
+        review["findings"][0]["summary"] = "Edited after retention"
         review["parsed_review_sha256"] = (
             gate.plain_llm_review_payload_sha256(
                 verdict=review["verdict"],
@@ -387,17 +419,92 @@ class PlainLlmReviewGateTests(unittest.TestCase):
                 findings=review["findings"],
             )
         )
-        review["findings"][0]["summary"] = "Edited after retention"
         self.assertEqual(
             gate._plain_llm_external_review_failures(
                 review,
                 evidence["review_input"],
+                retained_review_sha256=gate._sha256_text(
+                    PLAIN_REVIEW_TEXT
+                ),
+                retained_review={
+                    "verdict": "PASS",
+                    "finding_count": 0,
+                    "findings": [],
+                },
+                retained_review_failure=None,
             ),
             [
-                "parsed_review_sha256 does not match canonical verdict, "
-                "finding_count, and findings payload"
+                "structured review payload does not match retained raw "
+                "review artifact"
             ],
         )
+
+    def test_retained_raw_review_hash_is_recomputed(self) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(state)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            raw_review = artifact_root / "review.txt"
+            raw_review.write_text(PLAIN_REVIEW_TEXT + "\n", encoding="utf-8")
+            raw_review.chmod(0o600)
+            evidence["review_input"]["raw_review_path"] = str(raw_review)
+            result = _evaluate_review_gate(
+                state,
+                self_review=_self_review(),
+                external_review_evidence=evidence,
+                external_review_artifact_root=artifact_root,
+            )
+        self.assertIn(
+            "stdout_sha256 does not match retained raw review artifact",
+            _warnings(result),
+        )
+
+    def test_retained_raw_review_cannot_escape_explicit_root(self) -> None:
+        state = _state()
+        evidence = _plain_external_evidence(state)
+        with tempfile.TemporaryDirectory() as directory:
+            result = _evaluate_review_gate(
+                state,
+                self_review=_self_review(),
+                external_review_evidence=evidence,
+                external_review_artifact_root=Path(directory),
+            )
+        self.assertIn(
+            "retained raw review artifact path escapes artifact root",
+            _warnings(result),
+        )
+
+    def test_retained_raw_review_rejects_symlink_and_public_file(
+        self,
+    ) -> None:
+        state = _state()
+        for unsafe_kind in ("symlink", "public"):
+            with (
+                self.subTest(unsafe_kind=unsafe_kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                artifact_root = Path(directory)
+                raw_review = artifact_root / "review.txt"
+                if unsafe_kind == "symlink":
+                    target = artifact_root / "target.txt"
+                    target.write_text(PLAIN_REVIEW_TEXT, encoding="utf-8")
+                    target.chmod(0o600)
+                    raw_review.symlink_to(target.name)
+                else:
+                    raw_review.write_text(PLAIN_REVIEW_TEXT, encoding="utf-8")
+                    raw_review.chmod(0o644)
+                evidence = _plain_external_evidence(state)
+                evidence["review_input"]["raw_review_path"] = str(raw_review)
+                result = _evaluate_review_gate(
+                    state,
+                    self_review=_self_review(),
+                    external_review_evidence=evidence,
+                    external_review_artifact_root=artifact_root,
+                )
+            self.assertIn(
+                "retained raw review artifact is invalid",
+                _warnings(result),
+            )
 
     def test_reserved_source_cannot_downgrade_to_legacy_input_mode(
         self,
@@ -411,7 +518,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
                     review_input.pop("mode")
                 else:
                     review_input["mode"] = tampered_mode
-                result = gate.evaluate_review_gate(
+                result = _evaluate_review_gate(
                     state,
                     self_review=_self_review(),
                     external_review_evidence=evidence,
@@ -427,7 +534,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         self,
     ) -> None:
         state = _state()
-        valid = gate.evaluate_review_gate(
+        valid = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=_claude_external_evidence(state),
@@ -444,7 +551,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
                     review_input.pop("mode")
                 else:
                     review_input["mode"] = tampered_mode
-                result = gate.evaluate_review_gate(
+                result = _evaluate_review_gate(
                     state,
                     self_review=_self_review(),
                     external_review_evidence=evidence,
@@ -462,7 +569,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         evidence["review_input"]["model_identity_attestation"] = (
             "provider_verified"
         )
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=evidence,
@@ -474,7 +581,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         state = _state()
         evidence = _plain_external_evidence(state)
         evidence["review_input"]["prompt_nonce"] = "invalid"
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=evidence,
@@ -492,7 +599,7 @@ class PlainLlmReviewGateTests(unittest.TestCase):
         review_input["environment_passed_keys"].append("SSH_AUTH_SOCK")
         review_input["session_bus_exposed"] = True
         review_input["workspace_readback"] = "not_checked"
-        result = gate.evaluate_review_gate(
+        result = _evaluate_review_gate(
             state,
             self_review=_self_review(),
             external_review_evidence=evidence,

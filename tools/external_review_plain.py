@@ -1769,8 +1769,12 @@ def build_evidence(
             "prompt_argument_exposure": provider == "gemini",
             "ephemeral_prompt_file": provider == "grok",
             "transmitted_prompt_bytes": prompt_bytes,
-            "transmitted_prompt_path": str(prompt_path),
-            "raw_review_path": str(raw_review_path),
+            "transmitted_prompt_path": str(
+                Path(os.path.abspath(prompt_path))
+            ),
+            "raw_review_path": str(
+                Path(os.path.abspath(raw_review_path))
+            ),
             "isolated_working_directory": True,
             "local_repository_context_provided": False,
             "web_search_policy": (
