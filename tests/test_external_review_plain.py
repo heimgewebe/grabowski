@@ -665,6 +665,198 @@ class PlainExternalReviewTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertFalse(output.with_suffix(".prompt.txt").exists())
 
+    def test_create_only_failure_removes_partial_file_and_allows_retry(self) -> None:
+        class FaultingHandle:
+            def __init__(
+                self,
+                handle,
+                *,
+                fail_write: bool = False,
+                fail_flush: bool = False,
+                fail_close: bool = False,
+            ) -> None:
+                self.handle = handle
+                self.fail_write = fail_write
+                self.fail_flush = fail_flush
+                self.fail_close = fail_close
+
+            def write(self, text: str) -> int:
+                if self.fail_write:
+                    self.handle.write(text[:7])
+                    self.handle.flush()
+                    raise OSError("simulated write failure")
+                return self.handle.write(text)
+
+            def flush(self) -> None:
+                self.handle.flush()
+                if self.fail_flush:
+                    raise OSError("simulated flush failure")
+
+            def fileno(self) -> int:
+                return self.handle.fileno()
+
+            def close(self) -> None:
+                self.handle.close()
+                if self.fail_close:
+                    raise OSError("simulated close failure")
+
+        scenarios = [
+            ("write", True, False, False, "simulated write failure"),
+            ("flush", False, True, False, "simulated flush failure"),
+            ("close", False, False, True, "simulated close failure"),
+            (
+                "write-and-close",
+                True,
+                False,
+                True,
+                "simulated write failure",
+            ),
+        ]
+        for name, fail_write, fail_flush, fail_close, expected in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "artifact.txt"
+                real_fdopen = plain.os.fdopen
+
+                def faulting_fdopen(*args, **kwargs):
+                    return FaultingHandle(
+                        real_fdopen(*args, **kwargs),
+                        fail_write=fail_write,
+                        fail_flush=fail_flush,
+                        fail_close=fail_close,
+                    )
+
+                with (
+                    mock.patch.object(
+                        plain.os,
+                        "fdopen",
+                        side_effect=faulting_fdopen,
+                    ),
+                    self.assertRaisesRegex(plain.PlainReviewError, expected),
+                ):
+                    plain.write_text_create_only(
+                        target,
+                        "complete artifact",
+                        label="test artifact",
+                    )
+                self.assertFalse(target.exists())
+
+                plain.write_text_create_only(
+                    target,
+                    "retry succeeded",
+                    label="test artifact",
+                )
+                self.assertEqual(
+                    target.read_text(encoding="utf-8"),
+                    "retry succeeded",
+                )
+
+    def test_failed_create_does_not_unlink_displaced_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "artifact.txt"
+            replacement = root / "replacement.txt"
+            replacement.write_text("replacement", encoding="utf-8")
+            real_fdopen = plain.os.fdopen
+
+            class DisplacingHandle:
+                def __init__(self, handle) -> None:
+                    self.handle = handle
+
+                def write(self, text: str) -> int:
+                    self.handle.write(text[:7])
+                    self.handle.flush()
+                    target.unlink()
+                    target.symlink_to(replacement.name)
+                    raise OSError("simulated displaced write failure")
+
+                def flush(self) -> None:
+                    self.handle.flush()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+                def close(self) -> None:
+                    self.handle.close()
+
+            with (
+                mock.patch.object(
+                    plain.os,
+                    "fdopen",
+                    side_effect=lambda *args, **kwargs: DisplacingHandle(
+                        real_fdopen(*args, **kwargs)
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "simulated displaced write failure",
+                ),
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "complete artifact",
+                    label="test artifact",
+                )
+
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(replacement.read_text(encoding="utf-8"), "replacement")
+
+    def test_parent_drift_removes_created_inode_and_allows_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / "output"
+            parent.mkdir()
+            displaced_parent = root / "displaced-output"
+            target = parent / "artifact.txt"
+            real_fdopen = plain.os.fdopen
+
+            class ParentDisplacingHandle:
+                def __init__(self, handle) -> None:
+                    self.handle = handle
+
+                def write(self, text: str) -> int:
+                    return self.handle.write(text)
+
+                def flush(self) -> None:
+                    self.handle.flush()
+
+                def fileno(self) -> int:
+                    return self.handle.fileno()
+
+                def close(self) -> None:
+                    self.handle.close()
+                    parent.rename(displaced_parent)
+                    parent.mkdir()
+
+            with (
+                mock.patch.object(
+                    plain.os,
+                    "fdopen",
+                    side_effect=lambda *args, **kwargs: ParentDisplacingHandle(
+                        real_fdopen(*args, **kwargs)
+                    ),
+                ),
+                self.assertRaisesRegex(
+                    plain.PlainReviewError,
+                    "created path identity drifted",
+                ),
+            ):
+                plain.write_text_create_only(
+                    target,
+                    "complete artifact",
+                    label="test artifact",
+                )
+
+            self.assertFalse((displaced_parent / target.name).exists())
+            plain.write_text_create_only(
+                target,
+                "retry succeeded",
+                label="test artifact",
+            )
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "retry succeeded",
+            )
+
     def test_partial_owned_artifacts_are_preserved_on_final_write_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

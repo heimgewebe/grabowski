@@ -682,21 +682,161 @@ def run_provider(
     )
 
 
+def _same_file_identity(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+def _discard_failed_create(
+    parent_descriptor: int,
+    name: str,
+    created: os.stat_result,
+) -> None:
+    """Best-effort removal of the exact inode created by this helper."""
+    try:
+        linked = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_file_identity(created, linked):
+            return
+        os.unlink(name, dir_fd=parent_descriptor)
+        try:
+            os.fsync(parent_descriptor)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def _is_private_created_file(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.getuid()
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) & 0o077 == 0
+    )
+
+
 def write_text_create_only(path: Path, text: str, *, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    parent_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_DIRECTORY"):
+        parent_flags |= os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+        parent_flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        parent_descriptor = os.open(path.parent, parent_flags)
+    except OSError as exc:
+        raise PlainReviewError(f"cannot write {label}: {exc}") from exc
+
+    descriptor = -1
+    handle = None
+    created: os.stat_result | None = None
+    try:
+        parent_linked = path.parent.lstat()
+        parent_opened = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_opened.st_mode)
+            or stat.S_ISLNK(parent_linked.st_mode)
+            or not _same_file_identity(parent_opened, parent_linked)
+        ):
+            raise PlainReviewError(
+                f"cannot write {label}: unsafe parent identity"
+            )
+
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(
+                path.name,
+                flags,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+        except FileExistsError as exc:
+            raise PlainReviewError(f"{label} already exists: {path}") from exc
+
+        created = os.fstat(descriptor)
+        linked = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not _is_private_created_file(created)
+            or not _same_file_identity(created, linked)
+        ):
+            raise PlainReviewError(
+                f"cannot write {label}: unsafe created path identity"
+            )
+
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        primary_error: BaseException | None = None
+        try:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-    except FileExistsError as exc:
-        raise PlainReviewError(f"{label} already exists: {path}") from exc
-    except OSError as exc:
-        raise PlainReviewError(f"cannot write {label}: {exc}") from exc
+        except BaseException as exc:
+            primary_error = exc
+        try:
+            handle.close()
+        except BaseException as exc:
+            if primary_error is None:
+                primary_error = exc
+        if primary_error is not None:
+            raise primary_error
+        handle = None
+
+        parent_after = path.parent.lstat()
+        linked_after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            stat.S_ISLNK(parent_after.st_mode)
+            or not _same_file_identity(parent_opened, parent_after)
+            or not _is_private_created_file(linked_after)
+            or not _same_file_identity(created, linked_after)
+        ):
+            raise PlainReviewError(
+                f"cannot write {label}: created path identity drifted"
+            )
+    except BaseException as exc:
+        if created is not None:
+            _discard_failed_create(
+                parent_descriptor,
+                path.name,
+                created,
+            )
+        if isinstance(exc, PlainReviewError):
+            raise
+        if isinstance(exc, OSError):
+            raise PlainReviewError(f"cannot write {label}: {exc}") from exc
+        raise
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException:
+                pass
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.close(parent_descriptor)
+        except OSError:
+            pass
 
 
 def discard_created_paths(paths: list[Path]) -> None:
