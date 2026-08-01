@@ -347,7 +347,16 @@ class AgentCompetitionTests(unittest.TestCase):
             )
         call = start.call_args.kwargs
         self.assertEqual(call["resume_policy"], "never")
-        self.assertEqual(call["resource_keys"], [f"path:{self.state / result['competition_id']}"])
+        packet = competition._validated_packet(result["competition_id"])
+        self.assertEqual(
+            call["resource_keys"],
+            competition._competition_task_resource_keys(
+                result["competition_id"], packet
+            ),
+        )
+        intent = competition._validated_start_intent(result["competition_id"])
+        self.assertEqual(intent["schema_version"], 3)
+        self.assertEqual(intent["resource_keys"], call["resource_keys"])
         self.assertEqual(call["cwd"], str(self.state / result["competition_id"]))
         return result
 
@@ -1680,6 +1689,55 @@ class AgentCompetitionTests(unittest.TestCase):
                 require_hard_budget=True,
             )
 
+    def test_v3_reconciliation_rejects_path_only_task_resource_binding(self) -> None:
+        started = self._start()
+        identifier = started["competition_id"]
+        directory = self.state / identifier
+        intent = competition._validated_start_intent(identifier)
+        path_only = {
+            "task_id": "path-only-task",
+            "host": "heim-pc",
+            "unit": "u",
+            "attempt": 1,
+            "state": "running",
+            "resume_policy": "never",
+            "argv_sha256": intent["command_sha256"],
+            "cwd": str(directory),
+            "resource_keys": [f"path:{directory}"],
+            "created_at_unix": intent["created_at_unix"],
+        }
+        with mock.patch.object(
+            competition.tasks,
+            "grabowski_task_list",
+            return_value={
+                "tasks": [path_only],
+                "pagination": {"has_more": False, "next_cursor": None},
+            },
+        ):
+            result = competition._start_reconciliation(identifier, intent)
+        self.assertEqual(result["state"], "no_match")
+        self.assertEqual(result["matches"], [])
+
+    def test_self_hashed_v3_intent_cannot_weaken_task_resource_binding(self) -> None:
+        started = self._start()
+        identifier = started["competition_id"]
+        path = self.state / identifier / "start-intent.json"
+        intent = json.loads(path.read_text())
+        path.unlink()
+        intent["resource_keys"] = [f"path:{self.state / identifier}"]
+        intent["start_intent_sha256"] = competition._sha256_json(
+            {
+                key: value
+                for key, value in intent.items()
+                if key != "start_intent_sha256"
+            }
+        )
+        competition._atomic_json(path, intent)
+        with self.assertRaisesRegex(
+            competition.AgentCompetitionError, "task resource binding"
+        ):
+            competition._validated_start_intent(identifier)
+
     def test_task_start_exception_reconciles_one_exact_persistent_task(self) -> None:
         request_id = "reconcile-exact"
 
@@ -1702,7 +1760,7 @@ class AgentCompetitionTests(unittest.TestCase):
                     "resume_policy": "never",
                     "argv_sha256": intent["command_sha256"],
                     "cwd": str(directory),
-                    "resource_keys": [f"path:{directory}"],
+                    "resource_keys": intent["resource_keys"],
                     "created_at_unix": intent["created_at_unix"],
                 }],
                 "pagination": {"has_more": False, "next_cursor": None},
@@ -1747,7 +1805,7 @@ class AgentCompetitionTests(unittest.TestCase):
                 "resume_policy": "never",
                 "argv_sha256": intent["command_sha256"],
                 "cwd": str(directory),
-                "resource_keys": [f"path:{directory}"],
+                "resource_keys": intent["resource_keys"],
                 "created_at_unix": intent["created_at_unix"],
             }
             return {
@@ -1793,7 +1851,7 @@ class AgentCompetitionTests(unittest.TestCase):
             "resume_policy": "never",
             "argv_sha256": intent["command_sha256"],
             "cwd": str(directory),
-            "resource_keys": [f"path:{directory}"],
+            "resource_keys": intent["resource_keys"],
             "created_at_unix": intent["created_at_unix"],
         }
         calls: list[dict[str, object]] = []
@@ -1990,7 +2048,7 @@ class AgentCompetitionTests(unittest.TestCase):
             "resume_policy": "never",
             "argv_sha256": intent["command_sha256"],
             "cwd": str(directory),
-            "resource_keys": [f"path:{directory}"],
+            "resource_keys": intent["resource_keys"],
             "created_at_unix": intent["created_at_unix"],
         }
         early = {**wrong, "task_id": "too-early", "host": "heim-pc", "created_at_unix": intent["created_at_unix"] - 1}
@@ -2045,6 +2103,7 @@ class AgentCompetitionTests(unittest.TestCase):
         )
         intent["schema_version"] = 1
         intent.pop("created_at_unix")
+        intent.pop("resource_keys")
         intent["request_fingerprint"] = legacy_fingerprint
         intent["packet_sha256"] = packet["packet_sha256"]
         intent["start_intent_sha256"] = competition._sha256_json(
