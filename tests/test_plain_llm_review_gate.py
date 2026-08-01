@@ -269,6 +269,30 @@ class PlainLlmReviewGateTests(unittest.TestCase):
             "tool_policy does not match provider contract", warnings
         )
 
+    def test_reserved_source_cannot_downgrade_to_legacy_input_mode(
+        self,
+    ) -> None:
+        state = _state()
+        for tampered_mode in (None, "legacy-external-review-v1"):
+            with self.subTest(tampered_mode=tampered_mode):
+                evidence = _plain_external_evidence(state)
+                review_input = evidence["review_input"]
+                if tampered_mode is None:
+                    review_input.pop("mode")
+                else:
+                    review_input["mode"] = tampered_mode
+                result = gate.evaluate_review_gate(
+                    state,
+                    self_review=_self_review(),
+                    external_review_evidence=evidence,
+                )
+                self.assertEqual(result["verdict"], "PASS")
+                self.assertIn(
+                    "review_input.mode is not "
+                    f"{gate.PLAIN_LLM_REVIEW_INPUT_MODE}",
+                    _warnings(result),
+                )
+
     def test_model_identity_cannot_be_overclaimed(self) -> None:
         state = _state()
         evidence = _plain_external_evidence(state)

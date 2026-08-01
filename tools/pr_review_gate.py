@@ -1668,6 +1668,19 @@ def _external_review_failures(
         isinstance(raw_review_input, dict)
         and raw_review_input.get("mode") == PLAIN_LLM_REVIEW_INPUT_MODE
     )
+    raw_reviews = external_review.get("reviews")
+    plain_llm_source_declared = (
+        isinstance(raw_reviews, list)
+        and any(
+            isinstance(review, dict)
+            and isinstance(review.get("source"), str)
+            and review["source"].startswith(
+                PLAIN_LLM_REVIEW_SOURCE_PREFIX
+            )
+            for review in raw_reviews
+        )
+    )
+    plain_llm_required = plain_llm_input_mode or plain_llm_source_declared
     expected_packet_prompt_sha256: str | None = None
     expected_claude_prompt_sha256: str | None = None
     expected_plain_llm_prompt_sha256: str | None = None
@@ -1697,6 +1710,11 @@ def _external_review_failures(
                         packet_prompt, diff_text, prompt_nonce
                     )
                 )
+    specialized_input_validation_required = (
+        claude_cli_required
+        or claude_cli_input_mode
+        or plain_llm_required
+    )
     if claude_cli_required or claude_cli_input_mode:
         failures.extend(
             _claude_cli_review_input_failures(
@@ -1709,7 +1727,7 @@ def _external_review_failures(
                 expected_prompt_sha256=expected_claude_prompt_sha256,
             )
         )
-    elif plain_llm_input_mode:
+    if plain_llm_required:
         failures.extend(
             _plain_llm_review_input_failures(
                 external_review,
@@ -1725,10 +1743,13 @@ def _external_review_failures(
                 ),
             )
         )
-    elif external_review.get("prompt_includes_diff") is not True:
+    if (
+        not specialized_input_validation_required
+        and external_review.get("prompt_includes_diff") is not True
+    ):
         failures.append("prompt_includes_diff is not true")
 
-    reviews = external_review.get("reviews")
+    reviews = raw_reviews
     reported_external_findings = 0
     valid_claude_cli_reviews = 0
     valid_plain_llm_reviews = 0
@@ -1751,7 +1772,7 @@ def _external_review_failures(
                 else:
                     valid_claude_cli_reviews += 1
             elif (
-                plain_llm_input_mode
+                plain_llm_required
                 and source.startswith(PLAIN_LLM_REVIEW_SOURCE_PREFIX)
                 and isinstance(raw_review_input, dict)
             ):
@@ -1783,9 +1804,9 @@ def _external_review_failures(
             "Claude CLI packet review is required but no valid review entry "
             "was provided"
         )
-    if plain_llm_input_mode and valid_plain_llm_reviews == 0:
+    if plain_llm_required and valid_plain_llm_reviews == 0:
         failures.append(
-            "plain-LLM review input is declared but no valid plain-LLM review "
+            "plain-LLM review evidence is declared but no valid plain-LLM review "
             "entry was provided"
         )
 
