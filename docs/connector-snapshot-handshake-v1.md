@@ -76,7 +76,7 @@ A future platform-attested connector identity can strengthen this boundary witho
 
 ## Automatic renewal
 
-The tunnel semantic watchdog runs every 30 seconds. When the tunnel is healthy, it asks the release-bound `grabowski_client_snapshot` module to decide whether renewal is due. Renewal is triggered when the local tunnel process lifetime changes, the bound runtime release changes, the snapshot is missing or invalid, or the receipt enters a 15-minute pre-expiry window.
+The tunnel semantic watchdog runs every two minutes, deliberately offset by 30 seconds from the operator watchdog so both do not contend for the shared watchdog lock. When the tunnel is healthy, it asks the release-bound `grabowski_client_snapshot` module to decide whether renewal is due. Renewal is triggered when the local tunnel process lifetime changes, the bound runtime release changes, the snapshot is missing or invalid, or the receipt enters a 15-minute pre-expiry window. The local refresh receives a bounded 20-second observation budget so a healthy but briefly loaded loopback MCP session does not lose its renewal opportunity.
 
 Renewal does not copy server contract values into a fresh receipt. A real loopback MCP client session performs `tools/list`, computes the canonical tool-name hash from the returned names, reads `grabowski_status` through the same MCP session, and submits that client-observed declaration through the existing `connector-snapshot-bind` grip. The grip performs the independent server-side comparison and persists only its receipt. A mismatch remains fail-closed.
 
