@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Kept the exact-head Codex settlement gate reproducible under the restricted GitHub Actions token by explicitly trusting the connected operator account even when private organization membership is not visible to that token.
+- Kept streamable-HTTP admission responsive during long synchronous tools by moving every sync tool invocation, including context-bound grips, to a bounded eight-worker executor while async tools and admission rejection remain on the server event loop; cancelled or disconnected callers cancel queued work immediately while already-running workers remain drain-accounted until they actually finish.
 - Made Bureau candidate assessment safe across cached connector catalogs: the typed selector remains available, the previously published candidate/event fields are accepted as bounded compatibility aliases, mixed contracts fail closed, and the connector schema probe now treats every selector and binding field as a required sentinel.
 - Hardened Juno picker presentation so a healthy background agent is no longer mistaken for an active UIKit surface: presenter readiness is resolved before picker allocation, and failed native presentation leaves no retained false-arm state.
 - Added one shared, private Juno agent identity in application support, with fail-closed migration of legacy provider-local keys, so switching among user-consented iCloud, on-device, external-drive, and document-provider roots no longer requires re-pairing.
