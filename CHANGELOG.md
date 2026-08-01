@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made Bureau candidate assessment safe across cached connector catalogs: the typed selector remains available, the previously published candidate/event fields are accepted as bounded compatibility aliases, mixed contracts fail closed, and the connector schema probe now treats every selector and binding field as a required sentinel.
 - Hardened Juno picker presentation so a healthy background agent is no longer mistaken for an active UIKit surface: presenter readiness is resolved before picker allocation, and failed native presentation leaves no retained false-arm state.
 - Added one shared, private Juno agent identity in application support, with fail-closed migration of legacy provider-local keys, so switching among user-consented iCloud, on-device, external-drive, and document-provider roots no longer requires re-pairing.
 - Fixed the live Juno folder picker for the installed bridge: `ObjCProtocol` is optional, delegate retention is deferred until the next picker run to avoid releasing UIKit's weak delegate inside its callback, callback-time alerts are removed, and successful interactive runs no longer surface as `SystemExit` failures.
