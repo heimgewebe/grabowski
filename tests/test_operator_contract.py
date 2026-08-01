@@ -8,6 +8,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -37,11 +38,23 @@ class _FakeFastMCP:
             _session_creation_lock=_FakeAsyncLock(),
             stateless=False,
         )
+        self._registered_tools = {
+            name: types.SimpleNamespace(is_async=False, context_kwarg=None)
+            for name in ("read", "write")
+        }
 
         async def call_tool(*args, **kwargs):
-            return {"called": True, "args": args, "kwargs": kwargs}
+            return {
+                "called": True,
+                "args": args,
+                "kwargs": kwargs,
+                "thread_id": threading.get_ident(),
+            }
 
-        self._tool_manager = types.SimpleNamespace(call_tool=call_tool)
+        self._tool_manager = types.SimpleNamespace(
+            call_tool=call_tool,
+            get_tool=self._registered_tools.get,
+        )
 
 
 
@@ -289,6 +302,35 @@ class OperatorContractTests(unittest.TestCase):
                 )
         self.assertTrue(result["called"])
         self.assertTrue(operator._DEPLOYMENT_ADMISSION_GATE_INSTALLED)
+
+    def test_deployment_admission_gate_offloads_sync_tools_from_event_loop(self) -> None:
+        operator = _load_operator_module()
+        caller_thread = threading.get_ident()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg="ctx",
+        )
+        operator._configure_http_runtime()
+        result = operator.asyncio.run(
+            operator.mcp._tool_manager.call_tool("read", {})
+        )
+        self.assertTrue(result["called"])
+        self.assertNotEqual(caller_thread, result["thread_id"])
+        self.assertEqual(8, operator.SYNC_TOOL_EXECUTOR_MAX_WORKERS)
+
+    def test_deployment_admission_gate_keeps_async_tools_on_event_loop(self) -> None:
+        operator = _load_operator_module()
+        caller_thread = threading.get_ident()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg=None,
+        )
+        operator._configure_http_runtime()
+        result = operator.asyncio.run(
+            operator.mcp._tool_manager.call_tool("read", {})
+        )
+        self.assertTrue(result["called"])
+        self.assertEqual(caller_thread, result["thread_id"])
 
 
     def test_liveness_probe_times_out_on_held_session_creation_lock(self) -> None:

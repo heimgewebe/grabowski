@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import errno
 import faulthandler
 import fcntl
@@ -64,6 +65,11 @@ DEPLOYMENT_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DEPLOYMENT_ADMISSION_LOCK = threading.Lock()
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
 _DEPLOYMENT_ADMISSION_GATE_INSTALLED = False
+SYNC_TOOL_EXECUTOR_MAX_WORKERS = 8
+_SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=SYNC_TOOL_EXECUTOR_MAX_WORKERS,
+    thread_name_prefix="grabowski-sync-tool",
+)
 JOB_PREFIX = "grabowski-job-"
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
@@ -409,6 +415,14 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     }
 
 
+def _run_sync_tool_call(
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    return asyncio.run(original(*args, **kwargs))
+
+
 def _install_deployment_admission_gate() -> None:
     global _DEPLOYMENT_ADMISSION_GATE_INSTALLED
     manager = getattr(mcp, "_tool_manager", None)
@@ -429,6 +443,21 @@ def _install_deployment_admission_gate() -> None:
                 raise RuntimeError(
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
+                )
+            tool_name = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
+            get_tool = getattr(manager, "get_tool", None)
+            tool = get_tool(tool_name) if callable(get_tool) and isinstance(tool_name, str) else None
+            if (
+                tool is not None
+                and getattr(tool, "is_async", True) is False
+            ):
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    _SYNC_TOOL_EXECUTOR,
+                    _run_sync_tool_call,
+                    original,
+                    args,
+                    kwargs,
                 )
             return await original(*args, **kwargs)
         finally:

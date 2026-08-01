@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Kept streamable-HTTP admission responsive during long synchronous tools by moving every sync tool invocation, including context-bound grips, to a bounded eight-worker executor while async tools, admission rejection and active-call drain accounting remain on the server event loop.
 - Made Bureau candidate assessment safe across cached connector catalogs: the typed selector remains available, the previously published candidate/event fields are accepted as bounded compatibility aliases, mixed contracts fail closed, and the connector schema probe now treats every selector and binding field as a required sentinel.
 - Hardened Juno picker presentation so a healthy background agent is no longer mistaken for an active UIKit surface: presenter readiness is resolved before picker allocation, and failed native presentation leaves no retained false-arm state.
 - Added one shared, private Juno agent identity in application support, with fail-closed migration of legacy provider-local keys, so switching among user-consented iCloud, on-device, external-drive, and document-provider roots no longer requires re-pairing.
