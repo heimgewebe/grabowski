@@ -1161,6 +1161,12 @@ def _check_repository_semantic_conflicts(
             )
         return None
     requested_scope = _scope_manifest_from_metadata(metadata, required=False)
+    if requested_scope is not None and any(
+        key.startswith("operation:") for key in keys
+    ):
+        raise ValueError(
+            "operation resources do not accept repository scope manifests"
+        )
     repo_keys = [key for key in keys if key.startswith("repo:")]
     if requested_scope is not None and not repo_keys:
         requested_scope = nonconflict.validate_resource_scope_binding(keys, requested_scope)

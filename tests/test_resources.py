@@ -548,6 +548,25 @@ class ResourceTests(unittest.TestCase):
             "owner-b", [second], purpose="disjoint operation", ttl_seconds=60
         )
 
+        scoped = "operation:bug-fix:lane-c:repo-grabowski:stage-review"
+        with self.assertRaisesRegex(
+            ValueError, "do not accept repository scope manifests"
+        ):
+            resources.acquire_resources(
+                "owner-c",
+                [scoped],
+                purpose="operation may not inherit repository authority",
+                ttl_seconds=60,
+                metadata={
+                    "scope_manifest": self.scope_manifest(
+                        self.root / "grabowski",
+                        name="operation-scope",
+                        path=self.root / "grabowski" / "src" / "example.py",
+                    ),
+                    "scope_manifest_complete": True,
+                },
+            )
+
         with sqlite3.connect(self.database) as connection:
             rows = connection.execute(
                 "SELECT resource_key, owner_id FROM leases "
