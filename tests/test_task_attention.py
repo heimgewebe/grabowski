@@ -44,6 +44,7 @@ if "mcp" not in sys.modules:
 
 
 import grabowski_current_work_surface as current_work_surface
+import grabowski_lifecycle_archive as lifecycle_archive
 import grabowski_task_attention as attention
 import grabowski_tasks as tasks
 
@@ -90,6 +91,15 @@ class TaskAttentionTests(unittest.TestCase):
             patch.object(tasks.resources, "RESOURCE_DB", self.resource_database),
             patch.object(tasks.base, "AUDIT_LOG", self.audit_log),
             patch.object(attention.alert_outbox, "enqueue_and_schedule"),
+            patch.object(
+                tasks,
+                "_task_output_cleanup_run",
+                return_value={
+                    "status": "missing",
+                    "mode": "inspect",
+                    "observer": "task-output-cleanup-v1",
+                },
+            ),
             patch.dict(
                 os.environ,
                 {
@@ -712,6 +722,1126 @@ class TaskAttentionTests(unittest.TestCase):
                 evidence_snapshot["source_applicability"][source],
             )
 
+    @staticmethod
+    def _cleanup_inventory(record: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_inventory",
+            "task_id": record["task_id"],
+            "attempt": record["attempt"],
+            "directory": str(tasks._task_output_paths(record)["directory"]),
+            "streams": {
+                "stdout": {
+                    "sha256": "1" * 64,
+                    "bytes": 12,
+                    "mode": 0o600,
+                    "nlink": 1,
+                },
+                "stderr": {
+                    "sha256": "2" * 64,
+                    "bytes": 3,
+                    "mode": 0o600,
+                    "nlink": 1,
+                },
+            },
+        }
+
+    @staticmethod
+    def _cleanup_archive_binding(record_sha256: str) -> dict[str, str]:
+        return {
+            "segment_id": "segment-" + "a" * 24,
+            "segment_identity_sha256": "b" * 64,
+            "manifest_sha256": "c" * 64,
+            "segment_sha256": "d" * 64,
+            "plan_sha256": "e" * 64,
+            "record_sha256": record_sha256,
+        }
+
+    @staticmethod
+    def _cleanup_projection(record: dict[str, object], record_sha256: str) -> dict[str, str]:
+        return {
+            "task_id": str(record["task_id"]),
+            "record_sha256": record_sha256,
+            "segment_id": "segment-" + "a" * 24,
+            "switch_sha256": "f" * 64,
+            "projection_sha256": "0" * 64,
+        }
+
+    @staticmethod
+    def _cleanup_ready_record(record: dict[str, object]) -> dict[str, object]:
+        return {**record, "terminalized_at_unix": 0, "updated_at_unix": 0}
+
+    def test_task_output_cleanup_writes_intent_completion_and_replays(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        inventory = self._cleanup_inventory(record)
+        deleted = {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_delete_result",
+            "task_id": record["task_id"],
+            "attempt": record["attempt"],
+            "directory": inventory["directory"],
+            "token": "unused",
+            "resumed_from_staging": False,
+            "removed": ["stdout.log", "stderr.log"],
+            "streams": inventory["streams"],
+            "post_state": "absent",
+        }
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            if mode == "inspect":
+                return {"status": "present", "inventory": self._cleanup_inventory(current)}
+            result = dict(deleted)
+            result["token"] = token
+            return {"status": "deleted", "delete_result": result}
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ) as runner, patch.object(
+            attention, "_existing_task_projection_binding", return_value=projection
+        ):
+            first = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+            second = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(first["status"], "deleted")
+        self.assertFalse(first["idempotent_replay"])
+        self.assertTrue(second["idempotent_replay"])
+        self.assertEqual(2, runner.call_count)
+        intent_path, completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        self.assertTrue(intent_path.is_file())
+        self.assertTrue(completion_path.is_file())
+        self.assertEqual(
+            first["intent_receipt_sha256"], second["intent_receipt_sha256"]
+        )
+        self.assertEqual(
+            first["completion_receipt_sha256"],
+            second["completion_receipt_sha256"],
+        )
+
+    def test_task_output_cleanup_recovers_after_intent_before_completion(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        inventory = self._cleanup_inventory(record)
+        calls = 0
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if mode == "inspect":
+                return {"status": "present", "inventory": self._cleanup_inventory(current)}
+            if calls == 2:
+                raise RuntimeError("simulated interruption after durable intent")
+            result = {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_delete_result",
+                "task_id": current["task_id"],
+                "attempt": current["attempt"],
+                "directory": self._cleanup_inventory(current)["directory"],
+                "token": token,
+                "resumed_from_staging": True,
+                "removed": ["stderr.log"],
+                "streams": self._cleanup_inventory(current)["streams"],
+                "post_state": "absent",
+            }
+            return {"status": "deleted", "delete_result": result}
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention, "_existing_task_projection_binding", return_value=projection
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                attention._task_output_cleanup_after_archive(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=123,
+                )
+            recovered = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(recovered["status"], "deleted")
+        self.assertFalse(recovered["idempotent_replay"])
+        self.assertEqual(calls, 3)
+        intent_path, completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        self.assertTrue(intent_path.is_file())
+        self.assertTrue(completion_path.is_file())
+
+    def test_task_output_cleanup_replay_uses_persisted_higher_retention_boundary(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        persisted_boundary_unix = attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS + 456
+        calls = 0
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if mode == "inspect":
+                return {
+                    "status": "present",
+                    "inventory": self._cleanup_inventory(current),
+                }
+            if calls == 2:
+                raise RuntimeError("simulated interruption after durable intent")
+            result = {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_delete_result",
+                "task_id": current["task_id"],
+                "attempt": current["attempt"],
+                "directory": self._cleanup_inventory(current)["directory"],
+                "token": token,
+                "resumed_from_staging": True,
+                "removed": ["stdout.log", "stderr.log"],
+                "streams": self._cleanup_inventory(current)["streams"],
+                "post_state": "absent",
+            }
+            return {"status": "deleted", "delete_result": result}
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention, "_existing_task_projection_binding", return_value=projection
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                attention._task_output_cleanup_after_archive(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=persisted_boundary_unix,
+                )
+            recovered = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(recovered["status"], "deleted")
+        self.assertEqual(recovered["mutation_state"], "performed")
+        intent_path, _completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        intent, _file_sha256 = attention._task_output_cleanup_read_receipt(
+            intent_path, kind=attention.TASK_OUTPUT_CLEANUP_INTENT_KIND
+        )
+        self.assertEqual(
+            intent["material"]["retention_boundary_unix"],
+            persisted_boundary_unix,
+        )
+
+    def test_task_output_cleanup_intent_survives_global_projection_digest_change(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        first_projection = self._cleanup_projection(record, record_sha256)
+        second_projection = dict(first_projection)
+        second_projection["projection_sha256"] = "9" * 64
+        calls = 0
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if mode == "inspect":
+                return {
+                    "status": "present",
+                    "inventory": self._cleanup_inventory(current),
+                }
+            if calls == 2:
+                raise RuntimeError("simulated interruption after intent")
+            result = {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_delete_result",
+                "task_id": current["task_id"],
+                "attempt": current["attempt"],
+                "directory": self._cleanup_inventory(current)["directory"],
+                "token": token,
+                "resumed_from_staging": False,
+                "removed": ["stdout.log", "stderr.log"],
+                "streams": self._cleanup_inventory(current)["streams"],
+                "post_state": "absent",
+            }
+            return {"status": "deleted", "delete_result": result}
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention,
+            "_existing_task_projection_binding",
+            return_value=second_projection,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                attention._task_output_cleanup_after_archive(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=first_projection,
+                    retention_boundary_unix=123,
+                )
+            recovered = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=second_projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(recovered["status"], "deleted")
+        self.assertEqual(recovered["mutation_state"], "performed")
+        intent_path, _completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        intent, _file_sha = attention._task_output_cleanup_read_receipt(
+            intent_path, kind=attention.TASK_OUTPUT_CLEANUP_INTENT_KIND
+        )
+        stable_projection = intent["material"]["projection"]
+        self.assertEqual(
+            set(stable_projection),
+            {"task_id", "record_sha256", "segment_id", "switch_sha256"},
+        )
+        self.assertNotIn("projection_sha256", stable_projection)
+
+    def test_task_output_cleanup_defers_before_fixed_retention_without_effect(self) -> None:
+        record = self._completed_task()
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        boundary = int(record["terminalized_at_unix"]) + (24 * 60 * 60)
+        with patch.object(tasks, "_task_output_cleanup_run") as cleanup_run, patch.object(
+            tasks.resources, "acquire_resources"
+        ) as acquire:
+            result = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=boundary,
+            )
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["eligible_at_unix"], boundary)
+        self.assertEqual(
+            result["minimum_retention_seconds"],
+            attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+        )
+        cleanup_run.assert_not_called()
+        acquire.assert_not_called()
+        intent_path, completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        self.assertFalse(intent_path.exists())
+        self.assertFalse(completion_path.exists())
+
+    def test_task_output_cleanup_canonical_boundary_enforces_fixed_minimum(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        boundary = attention._canonical_task_output_cleanup_retention_boundary(
+            record,
+            archive_binding=archive_binding,
+            projection=projection,
+            proposed_boundary_unix=123,
+        )
+
+        self.assertEqual(
+            boundary,
+            attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+        )
+
+    def test_task_output_cleanup_rejects_intent_below_fixed_minimum(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        binding = attention._task_binding(record)
+        projection_binding = attention._task_output_cleanup_projection_binding(
+            projection
+        )
+        material = {
+            "schema_version": 1,
+            "task_binding": binding,
+            "lifecycle_receipt_sha256": record["lifecycle_receipt_sha256"],
+            "retention_boundary_unix": 123,
+            "archive": archive_binding,
+            "projection": projection_binding,
+            "inventory": self._cleanup_inventory(record),
+        }
+        intent_payload = {
+            "schema_version": 1,
+            "kind": attention.TASK_OUTPUT_CLEANUP_INTENT_KIND,
+            "material": material,
+            "material_sha256": attention._sha256_json(material),
+            "created_at_unix": 123,
+        }
+        intent_path, _completion_path = attention._task_output_cleanup_paths(binding)
+        attention._task_output_cleanup_publish(intent_path, intent_payload)
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError,
+            "fixed minimum retention",
+        ):
+            attention._canonical_task_output_cleanup_retention_boundary(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                proposed_boundary_unix=attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+            )
+
+    def test_task_output_cleanup_empty_attempt_selection_is_bounded(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        with patch.object(
+            attention,
+            "_load_task_output_cleanup_attempt_cursor",
+            return_value=int(record["attempt"]),
+        ), patch.object(
+            attention,
+            "_save_task_output_cleanup_attempt_cursor",
+        ) as save_cursor:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(result["status"], "not_present")
+        self.assertEqual(result["attempts_scanned"], 0)
+        self.assertEqual(result["retention_boundary_unix"], 123)
+        self.assertEqual(result["retention_boundaries_unix"], [])
+        save_cursor.assert_called_once()
+
+    def test_task_output_cleanup_single_attempt_preserves_attempt_evidence(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        lease_observation = {"active_lease": False}
+        process_observation = {"active_process": False}
+        cleanup_release = {"status": "released"}
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            return_value=0,
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_now_unix",
+            return_value=100,
+        ), patch.object(
+            attention,
+            "_assert_no_live_task_resource_leases",
+            return_value=lease_observation,
+        ), patch.object(
+            attention,
+            "_assert_no_live_task_process",
+            return_value=process_observation,
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_after_archive",
+            return_value={
+                "status": "deleted",
+                "idempotent_replay": False,
+                "cleanup_resource_release": cleanup_release,
+            },
+        ):
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=0,
+            )
+
+        self.assertEqual(result["attempt"], 1)
+        self.assertEqual(result["eligibility_observed_at_unix"], 100)
+        self.assertEqual(result["lease_observation"], lease_observation)
+        self.assertEqual(result["process_observation"], process_observation)
+        self.assertEqual(result["cleanup_resource_release"], cleanup_release)
+        self.assertEqual(result["attempt_traversal_resource_release"]["status"], "released")
+
+    def test_task_output_cleanup_blocks_parallel_owner(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        binding = attention._task_binding(record)
+        resource_key = (
+            "component:grabowski-task-output-cleanup:"
+            + str(binding["task_id"])
+            + ":a"
+            + str(binding["attempt"])
+        )
+        foreign_owner = "operator:test-parallel-output-cleanup"
+        tasks.resources.acquire_resources(
+            foreign_owner,
+            [resource_key],
+            purpose="simulate concurrent task output cleanup",
+            ttl_seconds=60,
+        )
+        try:
+            with patch.object(tasks, "_task_output_cleanup_run") as cleanup_run:
+                with self.assertRaises(attention.TaskAttentionConflictError):
+                    attention._task_output_cleanup_after_archive(
+                        record,
+                        archive_binding=archive_binding,
+                        projection=projection,
+                        retention_boundary_unix=123,
+                    )
+            cleanup_run.assert_not_called()
+        finally:
+            tasks.resources.release_resources(foreign_owner, [resource_key])
+
+    def test_task_output_cleanup_uses_distinct_owner_per_invocation(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        calls = 0
+
+        def cleanup_unlocked(
+            current: dict[str, object],
+            *,
+            archive_binding: dict[str, object],
+            projection: dict[str, object],
+            retention_boundary_unix: int,
+            archived_record: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls != 1:
+                self.fail("parallel cleanup reached the unlocked effect body")
+            with self.assertRaises(attention.TaskAttentionConflictError):
+                attention._task_output_cleanup_after_archive(
+                    current,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=retention_boundary_unix,
+                )
+            return {"status": "deleted", "task_binding": attention._task_binding(current)}
+
+        invocation_ids = [
+            types.SimpleNamespace(hex="1" * 32),
+            types.SimpleNamespace(hex="2" * 32),
+        ]
+        with patch.object(
+            attention.uuid, "uuid4", side_effect=invocation_ids
+        ) as uuid4, patch.object(
+            attention,
+            "_task_output_cleanup_after_archive_unlocked",
+            side_effect=cleanup_unlocked,
+        ):
+            result = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(calls, 1)
+        self.assertEqual(uuid4.call_count, 2)
+
+    def test_task_output_cleanup_reconciles_absent_after_effect_interruption(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        calls = 0
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if mode == "inspect":
+                return {"status": "present", "inventory": self._cleanup_inventory(current)}
+            if calls == 2:
+                raise RuntimeError("simulated crash after absent post-state")
+            return {
+                "status": "missing",
+                "mode": "delete",
+                "observer": "task-output-cleanup-v1",
+            }
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention, "_existing_task_projection_binding", return_value=projection
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                attention._task_output_cleanup_after_archive(
+                    record,
+                    archive_binding=archive_binding,
+                    projection=projection,
+                    retention_boundary_unix=123,
+                )
+            recovered = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+            replay = attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(recovered["status"], "deleted")
+        self.assertEqual(recovered["mutation_state"], "reconciled_absent")
+        self.assertFalse(recovered["idempotent_replay"])
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["mutation_state"], "reconciled_absent")
+        self.assertEqual(
+            recovered["completion_receipt_sha256"],
+            replay["completion_receipt_sha256"],
+        )
+
+    def test_task_output_cleanup_rejects_completion_without_intent(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        intent_path, completion_path = attention._task_output_cleanup_paths(
+            attention._task_binding(record)
+        )
+        completion_payload = {
+            "schema_version": 1,
+            "kind": attention.TASK_OUTPUT_CLEANUP_COMPLETION_KIND,
+            "task_binding": attention._task_binding(record),
+            "intent_receipt_sha256": "1" * 64,
+            "intent_file_sha256": "2" * 64,
+            "material_sha256": "3" * 64,
+            "delete_result_sha256": "4" * 64,
+            "post_state": "absent",
+            "completed_at_unix": 123,
+        }
+        attention._task_output_cleanup_publish(
+            completion_path, completion_payload
+        )
+        self.assertFalse(intent_path.exists())
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError, "without its intent"
+        ):
+            attention._task_output_cleanup_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+    def test_task_output_cleanup_covers_every_resumed_attempt(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        task_id = str(record["task_id"])
+        final_attempt = 3
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record = {
+            **record,
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        }
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        inspected_attempts: list[int] = []
+
+        def cleanup_run(
+            current: dict[str, object],
+            *,
+            mode: str,
+            token: str,
+            inventory: dict[str, object] | None = None,
+        ) -> dict[str, object]:
+            self.assertEqual(mode, "inspect")
+            inspected_attempts.append(int(current["attempt"]))
+            return {
+                "status": "missing",
+                "mode": mode,
+                "observer": "task-output-cleanup-v1",
+            }
+
+        with patch.object(
+            tasks, "_task_output_cleanup_run", side_effect=cleanup_run
+        ), patch.object(
+            attention, "_assert_no_live_task_resource_leases",
+            return_value={"active_lease": False},
+        ) as leases, patch.object(
+            attention, "_assert_no_live_task_process",
+            return_value={"active_process": False},
+        ) as processes:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(inspected_attempts, [1, 2, 3])
+        self.assertEqual(result["status"], "not_present")
+        self.assertEqual(result["attempt_cursor_before"], 0)
+        self.assertEqual(result["attempt_cursor_after"], 0)
+        self.assertTrue(result["attempt_cycle_completed"])
+        self.assertEqual(result["attempt_count"], 3)
+        self.assertEqual(result["attempts_scanned"], 3)
+        self.assertEqual(result["not_present_attempts"], [1, 2, 3])
+        self.assertEqual(leases.call_count, 3)
+        self.assertEqual(
+            [int(call.args[0]["attempt"]) for call in processes.call_args_list],
+            [1, 2, 3],
+        )
+
+    def test_task_output_cleanup_refreshes_live_guard_time_per_attempt(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        task_id = str(record["task_id"])
+        final_attempt = 2
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record = {
+            **record,
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        }
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        def cleanup_attempt(
+            current: dict[str, object], **_kwargs: object
+        ) -> dict[str, object]:
+            return {
+                "status": "not_present",
+                "task_binding": attention._task_binding(current),
+            }
+
+        with patch.object(
+            attention,
+            "_task_output_cleanup_now_unix",
+            side_effect=[101, 202],
+        ), patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            return_value=100,
+        ), patch.object(
+            attention, "_assert_no_live_task_resource_leases",
+            return_value={"active_lease": False},
+        ) as leases, patch.object(
+            attention, "_assert_no_live_task_process",
+            return_value={"active_process": False},
+        ), patch.object(
+            attention, "_task_output_cleanup_after_archive",
+            side_effect=cleanup_attempt,
+        ) as cleanup:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=100,
+            )
+
+        self.assertEqual(result["status"], "not_present")
+        self.assertEqual(
+            [call.kwargs["now_unix"] for call in leases.call_args_list],
+            [101, 202],
+        )
+        self.assertEqual(
+            [int(call.args[0]["attempt"]) for call in cleanup.call_args_list],
+            [1, 2],
+        )
+
+    def test_task_output_cleanup_canonicalizes_retention_per_attempt(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        task_id = str(record["task_id"])
+        final_attempt = 2
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record = {
+            **record,
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        }
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        def cleanup_attempt(
+            current: dict[str, object], **kwargs: object
+        ) -> dict[str, object]:
+            return {
+                "status": "not_present",
+                "task_binding": attention._task_binding(current),
+                "retention_boundary_unix": kwargs["retention_boundary_unix"],
+            }
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            side_effect=[24, 48],
+        ) as canonical, patch.object(
+            attention, "_task_output_cleanup_now_unix", side_effect=[100, 100],
+        ), patch.object(
+            attention, "_assert_no_live_task_resource_leases",
+            return_value={"active_lease": False},
+        ), patch.object(
+            attention, "_assert_no_live_task_process",
+            return_value={"active_process": False},
+        ), patch.object(
+            attention, "_task_output_cleanup_after_archive",
+            side_effect=cleanup_attempt,
+        ) as cleanup:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=48,
+            )
+
+        self.assertEqual([24, 48], [
+            call.kwargs["retention_boundary_unix"]
+            for call in cleanup.call_args_list
+        ])
+        self.assertEqual([1, 2], [
+            int(call.args[0]["attempt"]) for call in canonical.call_args_list
+        ])
+        self.assertEqual("not_present", result["status"])
+        self.assertEqual([24, 48], result["retention_boundaries_unix"])
+        self.assertEqual(24, result["retention_boundary_unix"])
+
+    def test_task_output_cleanup_reports_earliest_selected_deferred_boundary(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        task_id = str(record["task_id"])
+        final_attempt = 2
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record.update({
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        })
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            side_effect=[48, 24],
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_now_unix",
+            side_effect=[10, 10],
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_after_archive",
+        ) as cleanup:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=12,
+            )
+
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["reason"], "attempt_deferred")
+        self.assertEqual(result["eligible_at_unix"], 24)
+        self.assertEqual(result["retention_boundary_unix"], 24)
+        self.assertEqual(result["retention_boundaries_unix"], [48, 24])
+        self.assertEqual(result["counts"]["deferred"], 2)
+        cleanup.assert_not_called()
+
+    def _automatic_cleanup_fixture(
+        self, count: int, *, projection_sha256: str = "9" * 64
+    ) -> tuple[list[dict[str, object]], dict[str, object], object]:
+        records = [self._completed_task() for _ in range(count)]
+        hashes: dict[str, str] = {}
+        bindings: dict[str, dict[str, str]] = {}
+        for record in records:
+            _archive, record_sha256, _source = (
+                attention._task_archive_source_binding(record)
+            )
+            task_id = str(record["task_id"])
+            hashes[task_id] = record_sha256
+            bindings[task_id] = {
+                "record_sha256": record_sha256,
+                "segment_id": "segment-" + "a" * 24,
+                "switch_sha256": "b" * 64,
+            }
+        manifest = {
+            "segment_id": "segment-" + "a" * 24,
+            "segment_identity_sha256": "c" * 64,
+            "manifest_sha256": "d" * 64,
+            "segment_sha256": "e" * 64,
+            "plan_sha256": "f" * 64,
+            "record_sha256s": [hashes[key] for key in sorted(hashes)],
+        }
+        projection: dict[str, object] = {
+            "schema_version": 1,
+            "projection_sha256": projection_sha256,
+            "archived_task_bindings": bindings,
+            "switches": [],
+        }
+        return records, projection, manifest
+
+    def test_archived_output_reconcile_component_lease_blocks_parallel_run(self) -> None:
+        foreign_owner = "operator:test-parallel-output-reconcile"
+        tasks.resources.acquire_resources(
+            foreign_owner,
+            [attention.TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
+            purpose="simulate parallel archived output reconcile",
+            ttl_seconds=60,
+        )
+        try:
+            with patch.object(tasks, "_task_current_projection") as projection:
+                with self.assertRaises(attention.TaskAttentionConflictError):
+                    attention.reconcile_archived_task_outputs(limit=1)
+            projection.assert_not_called()
+        finally:
+            tasks.resources.release_resources(
+                foreign_owner,
+                [attention.TASK_OUTPUT_CLEANUP_RECONCILE_RESOURCE],
+            )
+
+    def test_archived_output_reconcile_renews_component_lease_per_task(self) -> None:
+        records, projection, manifest = self._automatic_cleanup_fixture(2)
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            return_value={"status": "not_present"},
+        ), patch.object(
+            attention,
+            "_renew_task_output_cleanup_reconcile_lease",
+            return_value={"status": "renewed"},
+        ) as renew:
+            result = attention.reconcile_archived_task_outputs(limit=2)
+
+        self.assertEqual(result["scanned"], 2)
+        self.assertEqual(renew.call_count, 2)
+        owners = {str(call.args[0]) for call in renew.call_args_list}
+        self.assertEqual(len(owners), 1)
+
+    def test_archived_output_reconcile_stops_after_component_lease_loss(self) -> None:
+        _records, projection, manifest = self._automatic_cleanup_fixture(2)
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            return_value={"status": "not_present"},
+        ) as cleanup, patch.object(
+            attention,
+            "_renew_task_output_cleanup_reconcile_lease",
+            side_effect=[
+                {"status": "renewed"},
+                attention.TaskAttentionConflictError("lost component lease"),
+            ],
+        ):
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError, "lost component lease"
+            ):
+                attention.reconcile_archived_task_outputs(limit=2)
+
+        self.assertEqual(cleanup.call_count, 1)
+
+    def test_archived_output_reconcile_canonicalizes_boundary_before_live_checks(self) -> None:
+        records, projection, manifest = self._automatic_cleanup_fixture(1)
+        record = records[0]
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection_binding = {
+            "task_id": str(record["task_id"]),
+            **projection["archived_task_bindings"][str(record["task_id"])],
+            "projection_sha256": str(projection["projection_sha256"]),
+        }
+        future_boundary_unix = int(attention.time.time()) + 3600
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            return_value=future_boundary_unix,
+        ) as canonicalize, patch.object(
+            attention, "_assert_no_live_task_resource_leases"
+        ) as leases, patch.object(
+            attention, "_assert_no_live_task_process"
+        ) as process, patch.object(
+            attention, "_task_output_cleanup_after_archive"
+        ) as cleanup:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection_binding,
+                retention_boundary_unix=123,
+            )
+
+        canonicalize.assert_called_once()
+        leases.assert_not_called()
+        process.assert_not_called()
+        cleanup.assert_not_called()
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["retention_boundary_unix"], future_boundary_unix)
+
+    def test_archived_output_reconcile_cursor_is_fair_and_bounded(self) -> None:
+        records, projection, manifest = self._automatic_cleanup_fixture(3)
+        ordered = sorted(str(record["task_id"]) for record in records)
+        observed: list[str] = []
+
+        def cleanup(record: dict[str, object], **_kwargs: object) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {"status": "not_present"}
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention, "_task_output_cleanup_all_attempts_after_archive", side_effect=cleanup
+        ):
+            first = attention.reconcile_archived_task_outputs(limit=2)
+            second = attention.reconcile_archived_task_outputs(limit=2)
+
+        self.assertEqual(observed, ordered)
+        self.assertEqual(first["scanned"], 2)
+        self.assertFalse(first["cycle_completed"])
+        self.assertEqual(first["cursor_after"], ordered[1])
+        self.assertEqual(second["scanned"], 1)
+        self.assertTrue(second["cycle_completed"])
+        self.assertIsNone(second["cursor_after"])
+        self.assertEqual(first["counts"]["not_present"], 2)
+        self.assertEqual(second["counts"]["not_present"], 1)
+
+    def test_archived_output_reconcile_additive_projection_drift_preserves_cursor(self) -> None:
+        records, full_projection, manifest = self._automatic_cleanup_fixture(4)
+        ordered = sorted(str(record["task_id"]) for record in records)
+        first_projection = dict(full_projection)
+        first_projection["archived_task_bindings"] = {
+            task_id: full_projection["archived_task_bindings"][task_id]
+            for task_id in ordered[:3]
+        }
+        attention._save_task_output_cleanup_cursor(
+            projection_sha256=str(first_projection["projection_sha256"]),
+            cursor=ordered[1],
+        )
+        second_projection = dict(full_projection)
+        second_projection["projection_sha256"] = "8" * 64
+        observed: list[str] = []
+
+        def cleanup(record: dict[str, object], **_kwargs: object) -> dict[str, object]:
+            observed.append(str(record["task_id"]))
+            return {"status": "not_present"}
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=second_projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention, "_task_output_cleanup_all_attempts_after_archive", side_effect=cleanup
+        ):
+            result = attention.reconcile_archived_task_outputs(limit=1)
+
+        self.assertEqual(result["cursor_before"], ordered[1])
+        self.assertEqual(observed, [ordered[2]])
+        self.assertEqual(result["cursor_after"], ordered[2])
+        self.assertFalse(result["cycle_completed"])
+
+    def test_archived_output_reconcile_isolates_errors_and_advances(self) -> None:
+        records, projection, manifest = self._automatic_cleanup_fixture(2)
+        ordered = sorted(str(record["task_id"]) for record in records)
+        calls = 0
+
+        def cleanup(record: dict[str, object], **_kwargs: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("poison cleanup")
+            return {"status": "not_present"}
+
+        with patch.object(
+            tasks, "_task_current_projection", return_value=projection
+        ), patch.object(
+            lifecycle_archive,
+            "verify_task_archive_segment",
+            return_value={"manifest": manifest},
+        ), patch.object(
+            attention, "_task_output_cleanup_all_attempts_after_archive", side_effect=cleanup
+        ):
+            result = attention.reconcile_archived_task_outputs(limit=2)
+
+        self.assertEqual([item["task_id"] for item in result["results"]], ordered)
+        self.assertEqual(result["status"], "degraded")
+        self.assertEqual(result["counts"]["errors"], 1)
+        self.assertEqual(result["counts"]["not_present"], 1)
+        self.assertTrue(result["cycle_completed"])
+        self.assertIsNone(result["cursor_after"])
+
     def test_closeout_archive_completed_task_writes_segment_and_projection_idempotently(self) -> None:
         record = self._completed_task()
         parameters = self._archive_parameters(record)
@@ -736,6 +1866,72 @@ class TaskAttentionTests(unittest.TestCase):
             first["projection"]["projection_sha256"],
             second["projection"]["projection_sha256"],
         )
+
+    def test_closeout_archive_releases_archive_resources_before_output_cleanup(self) -> None:
+        import grabowski_lifecycle_archive as lifecycle
+        import grabowski_lifecycle_projection as lifecycle_projection
+
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        resource_keys = sorted(
+            {
+                lifecycle._task_archive_effect_resource_key(self.archive_root),
+                lifecycle._task_archive_effect_resource_key(self.archive_effect_root),
+                lifecycle_projection._projection_resource_key(self.projection_root),
+            }
+        )
+        original_cleanup = attention._task_output_cleanup_all_attempts_after_archive
+        observed: list[object] = []
+
+        def cleanup(*args: object, **kwargs: object) -> dict[str, object]:
+            observed.extend(
+                tasks.resources.inspect_resource(resource_key)
+                for resource_key in resource_keys
+            )
+            return original_cleanup(*args, **kwargs)
+
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            side_effect=cleanup,
+        ):
+            result = attention.execute_closeout_archive(parameters)
+
+        self.assertEqual("released", result["resource_release"]["status"])
+        self.assertEqual([None, None, None], observed)
+
+    def test_closeout_archive_blocks_output_cleanup_when_archive_release_fails(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ), patch.object(
+            attention,
+            "_release_owned_archive_resources",
+            return_value={
+                "status": "release_failed",
+                "released": [],
+                "foreign_preserved": [],
+                "error_type": "OSError",
+            },
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "could not be released before output cleanup",
+            ):
+                attention.execute_closeout_archive(parameters)
+
+        cleanup.assert_not_called()
 
     def test_closeout_archive_namespaces_same_caller_execution_id_per_task(self) -> None:
         first_record = self._completed_task()
@@ -809,6 +2005,88 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(resource_keys, replay["resource_release"]["released"])
         for resource_key in resource_keys:
             self.assertIsNone(tasks.resources.inspect_resource(resource_key))
+
+    def test_closeout_archive_replay_releases_archive_resources_before_output_cleanup(self) -> None:
+        import grabowski_lifecycle_archive as lifecycle
+        import grabowski_lifecycle_projection as lifecycle_projection
+
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            first = attention.execute_closeout_archive(parameters)
+
+        owner = (
+            "operator:task-closeout-archive:"
+            + first["execution_id_sha256"][:24]
+        )
+        resource_keys = sorted(
+            {
+                lifecycle._task_archive_effect_resource_key(self.archive_root),
+                lifecycle._task_archive_effect_resource_key(self.archive_effect_root),
+                lifecycle_projection._projection_resource_key(self.projection_root),
+            }
+        )
+        tasks.resources.acquire_resources(
+            owner,
+            resource_keys,
+            purpose="simulate ambiguous release after successful projection",
+            ttl_seconds=60,
+        )
+        original_cleanup = attention._task_output_cleanup_all_attempts_after_archive
+        observed: list[object] = []
+
+        def cleanup(*args: object, **kwargs: object) -> dict[str, object]:
+            observed.extend(
+                tasks.resources.inspect_resource(resource_key)
+                for resource_key in resource_keys
+            )
+            return original_cleanup(*args, **kwargs)
+
+        with patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+            side_effect=cleanup,
+        ):
+            replay = attention.execute_closeout_archive(parameters)
+
+        self.assertTrue(replay["already_archived"])
+        self.assertEqual("released", replay["resource_release"]["status"])
+        self.assertEqual([None, None, None], observed)
+
+    def test_closeout_archive_replay_blocks_cleanup_when_archive_release_fails(self) -> None:
+        record = self._completed_task()
+        parameters = self._archive_parameters(record)
+        with patch.object(
+            tasks,
+            "_observe",
+            return_value=self._inactive_process_observation(),
+        ):
+            attention.execute_closeout_archive(parameters)
+
+        with patch.object(
+            attention,
+            "_release_owned_archive_resources",
+            return_value={
+                "status": "release_failed",
+                "released": [],
+                "foreign_preserved": [],
+                "error_type": "OSError",
+            },
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_all_attempts_after_archive",
+        ) as cleanup:
+            with self.assertRaisesRegex(
+                attention.TaskAttentionConflictError,
+                "could not be released before output cleanup",
+            ):
+                attention.execute_closeout_archive(parameters)
+
+        cleanup.assert_not_called()
 
     def test_closeout_archive_failed_task_requires_attention_decision(self) -> None:
         record = self._failed_task()

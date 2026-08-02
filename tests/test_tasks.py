@@ -57,6 +57,7 @@ import grabowski_command_identity as command_identity
 import grabowski_resources as resources
 import grabowski_operator_routing_shadow_capture as routing_shadow
 import grabowski_tasks as tasks
+import grabowski_task_attention as task_attention
 import grabowski_task_reconcile as task_reconcile_cli
 
 
@@ -547,16 +548,23 @@ class TaskTests(unittest.TestCase):
             }
         )
         with patch.object(tasks.fleet, "fleet_host", return_value=REMOTE_HOST), patch.object(
-            tasks, "_dispatch", side_effect=[stdout, stderr]
-        ) as dispatch:
+            tasks.fleet,
+            "run_fleet_task_output_read",
+            side_effect=[{"result": stdout}, {"result": stderr}],
+        ) as reader:
             output = tasks.grabowski_task_logs(str(task["task_id"]), max_lines=25)
-        self.assertEqual(dispatch.call_count, 2)
-        for call in dispatch.call_args_list:
+        self.assertEqual(reader.call_count, 2)
+        for call in reader.call_args_list:
             self.assertEqual(call.args[1][:3], [
                 tasks.TASK_OUTPUT_CAPTURE_PYTHON,
                 "-c",
                 tasks.TASK_OUTPUT_REMOTE_READ_CODE,
             ])
+            self.assertEqual(call.kwargs["timeout_seconds"], 30)
+            self.assertEqual(
+                call.kwargs["max_output_bytes"],
+                int(tasks.operator.DEFAULT_OUTPUT_BYTES),
+            )
         self.assertEqual(output["output_source"], "private-task-files-v1")
         self.assertEqual(output["result"]["output_reader"], "fleet-descriptor-v1")
         self.assertEqual(output["result"]["stdout"], "remote-out\n")
@@ -569,7 +577,9 @@ class TaskTests(unittest.TestCase):
         invalid = _launcher()
         invalid.update({"stdout": "remote-out\n", "stderr": "not metadata\n"})
         with patch.object(tasks.fleet, "fleet_host", return_value=REMOTE_HOST), patch.object(
-            tasks, "_dispatch", return_value=invalid
+            tasks.fleet,
+            "run_fleet_task_output_read",
+            return_value={"result": invalid},
         ):
             with self.assertRaisesRegex(RuntimeError, "metadata is invalid"):
                 tasks.grabowski_task_logs(str(task["task_id"]), max_lines=25)
@@ -602,6 +612,164 @@ class TaskTests(unittest.TestCase):
             "GRABOWSKI_TASK_OUTPUT_READ_METADATA byte_truncated=0 line_truncated=1",
             completed.stderr,
         )
+
+    def _cleanup_command(
+        self,
+        mode: str,
+        task: dict[str, object],
+        token: str,
+        *,
+        stdout_sha256: str = "-",
+        stderr_sha256: str = "-",
+        stdout_bytes: int = -1,
+        stderr_bytes: int = -1,
+    ) -> list[str]:
+        paths = tasks._task_output_paths(task)
+        return [
+            tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+            "-c",
+            tasks.TASK_OUTPUT_CLEANUP_CODE,
+            mode,
+            str(paths["directory"]),
+            token,
+            stdout_sha256,
+            stderr_sha256,
+            str(stdout_bytes),
+            str(stderr_bytes),
+        ]
+
+    def test_cleanup_code_inspects_and_deletes_exact_private_output(self) -> None:
+        task = self._start()["task"]
+        paths = self._write_task_output(
+            task, stdout="alpha\nbeta\n", stderr="error\n"
+        )
+        token = "1" * 64
+        inspected = subprocess.run(
+            self._cleanup_command("inspect", task, token),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(inspected.returncode, 0)
+        inventory = json.loads(inspected.stdout)
+        self.assertEqual(inventory["task_id"], task["task_id"])
+        self.assertEqual(inventory["attempt"], task["attempt"])
+        self.assertEqual(inventory["streams"]["stdout"]["bytes"], 11)
+        self.assertEqual(inventory["streams"]["stderr"]["bytes"], 6)
+        deleted = subprocess.run(
+            self._cleanup_command(
+                "delete",
+                task,
+                token,
+                stdout_sha256=inventory["streams"]["stdout"]["sha256"],
+                stderr_sha256=inventory["streams"]["stderr"]["sha256"],
+                stdout_bytes=inventory["streams"]["stdout"]["bytes"],
+                stderr_bytes=inventory["streams"]["stderr"]["bytes"],
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(deleted.returncode, 0, deleted.stderr)
+        result = json.loads(deleted.stdout)
+        self.assertEqual(result["post_state"], "absent")
+        self.assertEqual(result["removed"], ["stdout.log", "stderr.log"])
+        self.assertFalse(paths["directory"].exists())
+        self.assertFalse(any(self.output_root.glob(".grabowski-task-output-cleanup-*")))
+
+    def test_cleanup_code_hash_drift_preserves_original_directory(self) -> None:
+        task = self._start()["task"]
+        paths = self._write_task_output(task, stdout="original\n", stderr="")
+        token = "2" * 64
+        inspected = subprocess.run(
+            self._cleanup_command("inspect", task, token),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        inventory = json.loads(inspected.stdout)
+        paths["stdout"].write_text("changed\n", encoding="utf-8")
+        os.chmod(paths["stdout"], 0o600)
+        deleted = subprocess.run(
+            self._cleanup_command(
+                "delete",
+                task,
+                token,
+                stdout_sha256=inventory["streams"]["stdout"]["sha256"],
+                stderr_sha256=inventory["streams"]["stderr"]["sha256"],
+                stdout_bytes=inventory["streams"]["stdout"]["bytes"],
+                stderr_bytes=inventory["streams"]["stderr"]["bytes"],
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(deleted.returncode, 0)
+        self.assertIn("inventory mismatch", deleted.stderr)
+        self.assertTrue(paths["directory"].is_dir())
+        self.assertEqual(paths["stdout"].read_text(encoding="utf-8"), "changed\n")
+        self.assertFalse(any(self.output_root.glob(".grabowski-task-output-cleanup-*")))
+
+    def test_cleanup_code_resumes_exact_staging_after_partial_delete(self) -> None:
+        task = self._start()["task"]
+        paths = self._write_task_output(task, stdout="stdout\n", stderr="stderr\n")
+        token = "3" * 64
+        inspected = subprocess.run(
+            self._cleanup_command("inspect", task, token),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        inventory = json.loads(inspected.stdout)
+        staging = self.output_root / (
+            f".grabowski-task-output-cleanup-{task['task_id']}-a{task['attempt']}-"
+            + token[:16]
+        )
+        paths["directory"].rename(staging)
+        (staging / "stdout.log").unlink()
+        resumed = subprocess.run(
+            self._cleanup_command(
+                "delete",
+                task,
+                token,
+                stdout_sha256=inventory["streams"]["stdout"]["sha256"],
+                stderr_sha256=inventory["streams"]["stderr"]["sha256"],
+                stdout_bytes=inventory["streams"]["stdout"]["bytes"],
+                stderr_bytes=inventory["streams"]["stderr"]["bytes"],
+            ),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        result = json.loads(resumed.stdout)
+        self.assertTrue(result["resumed_from_staging"])
+        self.assertEqual(result["removed"], ["stderr.log"])
+        self.assertFalse(staging.exists())
+        self.assertFalse(paths["directory"].exists())
+
+    def test_cleanup_code_rejects_unexpected_directory_entry(self) -> None:
+        task = self._start()["task"]
+        paths = self._write_task_output(task, stdout="stdout\n", stderr="")
+        extra = paths["directory"] / "unexpected"
+        extra.write_text("no", encoding="utf-8")
+        os.chmod(extra, 0o600)
+        inspected = subprocess.run(
+            self._cleanup_command("inspect", task, "4" * 64),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(inspected.returncode, 0)
+        self.assertIn("unexpected entries", inspected.stderr)
+        self.assertTrue(paths["directory"].exists())
 
     def _prepare_pending_terminalization(
         self,
@@ -3573,6 +3741,166 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["refreshed"][0]["state"], "outcome_unknown")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:refresh.service"))
 
+    def test_reconcile_refresh_runs_bounded_archived_output_cleanup(self) -> None:
+        cleanup = {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_reconcile",
+            "status": "ok",
+            "scanned": 2,
+            "counts": {
+                "deleted": 1,
+                "deferred": 0,
+                "not_present": 1,
+                "errors": 0,
+            },
+        }
+        with patch.object(
+            task_attention,
+            "reconcile_archived_task_outputs",
+            return_value=cleanup,
+        ) as converge:
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+        converge.assert_called_once_with(
+            limit=task_attention.DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE
+        )
+        self.assertEqual(result["task_output_cleanup"], cleanup)
+
+    def test_reconcile_refresh_runs_output_cleanup_after_mutation_lock_release(self) -> None:
+        lock_active = False
+        order: list[str] = []
+        core = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+            "batch": {"limit": 1},
+        }
+        cleanup = {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_reconcile",
+            "status": "ok",
+            "scanned": 0,
+        }
+
+        @contextmanager
+        def mutation_lock():
+            nonlocal lock_active
+            self.assertFalse(lock_active)
+            lock_active = True
+            order.append("lock-enter")
+            try:
+                yield
+            finally:
+                lock_active = False
+                order.append("lock-exit")
+
+        def run_cleanup(*, limit: int) -> dict[str, object]:
+            self.assertFalse(lock_active)
+            self.assertEqual(
+                limit, task_attention.DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE
+            )
+            order.append("cleanup")
+            return cleanup
+
+        with patch.object(
+            tasks, "_task_mutation_lock", side_effect=mutation_lock
+        ), patch.object(
+            tasks, "_reconcile_tasks_refresh_locked", return_value=core
+        ), patch.object(
+            task_attention,
+            "reconcile_archived_task_outputs",
+            side_effect=run_cleanup,
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+
+        self.assertEqual(order, ["lock-enter", "lock-exit", "cleanup"])
+        self.assertEqual(result["task_output_cleanup"], cleanup)
+
+    def test_mcp_refresh_guard_releases_mutation_lock_before_output_cleanup(self) -> None:
+        lock_active = False
+        order: list[str] = []
+        core = {
+            "mode": "refresh",
+            "task_id": "",
+            "scanned": 0,
+            "refreshed": [],
+            "released": [],
+            "resumed": [],
+            "blocked": [],
+            "checked_at_unix": 123,
+            "batch": {"limit": 1},
+        }
+
+        @contextmanager
+        def mutation_lock():
+            nonlocal lock_active
+            lock_active = True
+            order.append("lock-enter")
+            try:
+                yield
+            finally:
+                lock_active = False
+                order.append("lock-exit")
+
+        def run_cleanup(*, limit: int) -> dict[str, object]:
+            self.assertFalse(lock_active)
+            order.append("cleanup")
+            return {
+                "schema_version": 1,
+                "kind": "grabowski_task_output_cleanup_reconcile",
+                "status": "ok",
+                "scanned": 0,
+            }
+
+        with patch.object(
+            tasks, "_task_mutation_lock", side_effect=mutation_lock
+        ), patch.object(
+            tasks.operator, "_require_operator_mutation"
+        ), patch.object(
+            tasks, "_reconcile_tasks_refresh_locked", return_value=core
+        ), patch.object(
+            task_attention,
+            "reconcile_archived_task_outputs",
+            side_effect=run_cleanup,
+        ), patch.object(tasks.base, "_append_audit"):
+            result = tasks._task_reconcile_refresh_after_guard("")
+
+        self.assertEqual(order, ["lock-enter", "lock-exit", "cleanup"])
+        self.assertEqual(result["task_output_cleanup"]["status"], "ok")
+
+    def test_reconcile_refresh_isolates_archived_output_cleanup_failure(self) -> None:
+        with patch.object(
+            task_attention,
+            "reconcile_archived_task_outputs",
+            side_effect=RuntimeError("cleanup unavailable"),
+        ):
+            result = tasks.reconcile_tasks_refresh(batch_size=1)
+        cleanup = result["task_output_cleanup"]
+        self.assertEqual(cleanup["status"], "degraded")
+        self.assertEqual(cleanup["error_type"], "RuntimeError")
+        self.assertIn("cleanup unavailable", cleanup["error"])
+        self.assertEqual(result["mode"], "refresh")
+        self.assertIn("batch", result)
+
+    def test_exact_task_refresh_does_not_run_global_output_cleanup(self) -> None:
+        started = self._start()["task"]
+        task_id = str(started["task_id"])
+        with patch.object(
+            task_attention, "reconcile_archived_task_outputs"
+        ) as converge, patch.object(
+            tasks, "_reconcile_observation", return_value={
+                "state": "running",
+                "properties": {"ActiveState": "active"},
+            }
+        ), patch.object(tasks, "_maintain_record_resources", return_value=None):
+            result = tasks.reconcile_tasks_refresh(task_id=task_id)
+        converge.assert_not_called()
+        self.assertNotIn("task_output_cleanup", result)
+
     def test_serialized_task_mcp_entrypoints_offload_to_worker_threads(self) -> None:
         expected = {
             "grabowski_task_start",
@@ -3865,7 +4193,9 @@ class TaskTests(unittest.TestCase):
 
         with (
             patch.object(tasks.operator, "_require_operator_mutation"),
-            patch.object(tasks, "reconcile_tasks_refresh", side_effect=refresh),
+            patch.object(
+                tasks, "_reconcile_tasks_refresh_locked", side_effect=refresh
+            ),
             patch.object(tasks.base, "_append_audit"),
         ):
             asyncio.run(run_both())
@@ -3943,7 +4273,7 @@ class TaskTests(unittest.TestCase):
                 "_require_operator_mutation",
                 side_effect=PermissionError("blocked after wait"),
             ) as mutation,
-            patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+            patch.object(tasks, "_reconcile_tasks_refresh_locked") as refresh,
         ):
             with self.assertRaisesRegex(PermissionError, "blocked after wait"):
                 asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())
@@ -3957,7 +4287,7 @@ class TaskTests(unittest.TestCase):
             (
                 "refresh",
                 lambda: tasks._task_reconcile_refresh_after_guard(""),
-                "reconcile_tasks_refresh",
+                "_reconcile_tasks_refresh_locked",
             ),
             (
                 "resume",
@@ -3967,7 +4297,7 @@ class TaskTests(unittest.TestCase):
             (
                 "reconcile",
                 lambda: tasks._task_reconcile_after_guard(False),
-                "reconcile_tasks",
+                "_reconcile_tasks_locked",
             ),
         )
 
@@ -4057,7 +4387,7 @@ class TaskTests(unittest.TestCase):
                     "_require_operator_mutation",
                     side_effect=deny_after_wait,
                 ),
-                patch.object(tasks, "reconcile_tasks_refresh") as refresh,
+                patch.object(tasks, "_reconcile_tasks_refresh_locked") as refresh,
             ):
                 thread.start()
                 self.assertFalse(mutation_checked.wait(timeout=0.15))
@@ -4109,7 +4439,9 @@ class TaskTests(unittest.TestCase):
         with (
             patch.object(tasks.operator, "_require_operator_capability"),
             patch.object(tasks.operator, "_require_operator_mutation", side_effect=mutation),
-            patch.object(tasks, "reconcile_tasks_refresh", return_value=payload),
+            patch.object(
+                tasks, "_reconcile_tasks_refresh_locked", return_value=payload
+            ),
             patch.object(tasks.base, "_append_audit"),
         ):
             result = asyncio.run(tasks._grabowski_task_reconcile_refresh_tool())

@@ -433,6 +433,304 @@ finally:
     os.close(directory_fd)
     os.close(parent_fd)
 """.strip()
+TASK_OUTPUT_CLEANUP_CODE = r"""
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+mode = sys.argv[1]
+directory = sys.argv[2]
+token = sys.argv[3]
+expected_stdout_sha256 = sys.argv[4]
+expected_stderr_sha256 = sys.argv[5]
+expected_stdout_bytes = int(sys.argv[6])
+expected_stderr_bytes = int(sys.argv[7])
+parent = os.path.dirname(directory)
+directory_name = os.path.basename(directory)
+match = re.fullmatch(
+    r"\.grabowski-task-output-([0-9a-f]{24})-a([1-9][0-9]*)",
+    directory_name,
+)
+if (
+    mode not in {"inspect", "delete"}
+    or not os.path.isabs(directory)
+    or os.path.normpath(directory) != directory
+    or match is None
+    or parent == directory
+    or re.fullmatch(r"[0-9a-f]{64}", token) is None
+):
+    raise SystemExit(125)
+if mode == "inspect":
+    if (
+        expected_stdout_sha256 != "-"
+        or expected_stderr_sha256 != "-"
+        or expected_stdout_bytes != -1
+        or expected_stderr_bytes != -1
+    ):
+        raise SystemExit(125)
+else:
+    if (
+        re.fullmatch(r"[0-9a-f]{64}", expected_stdout_sha256) is None
+        or re.fullmatch(r"[0-9a-f]{64}", expected_stderr_sha256) is None
+        or not 0 <= expected_stdout_bytes <= 8 * 1024 * 1024
+        or not 0 <= expected_stderr_bytes <= 8 * 1024 * 1024
+    ):
+        raise SystemExit(125)
+
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+file_flags = os.O_RDONLY | os.O_CLOEXEC
+if hasattr(os, "O_NOFOLLOW"):
+    directory_flags |= os.O_NOFOLLOW
+    file_flags |= os.O_NOFOLLOW
+parent_fd = os.open(parent, directory_flags)
+parent_before = os.fstat(parent_fd)
+linked_parent = os.lstat(parent)
+if (
+    not stat.S_ISDIR(parent_before.st_mode)
+    or stat.S_ISLNK(linked_parent.st_mode)
+    or parent_before.st_dev != linked_parent.st_dev
+    or parent_before.st_ino != linked_parent.st_ino
+    or parent_before.st_uid != os.geteuid()
+    or parent_before.st_gid != os.getegid()
+    or parent_before.st_nlink < 1
+    or (stat.S_IMODE(parent_before.st_mode) & 0o022) != 0
+):
+    raise RuntimeError("task output cleanup parent identity is unsafe")
+
+staging_name = (
+    ".grabowski-task-output-cleanup-"
+    + match.group(1)
+    + "-a"
+    + match.group(2)
+    + "-"
+    + token[:16]
+)
+
+def exists_at(name):
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+def open_directory(name):
+    descriptor = os.open(name, directory_flags, dir_fd=parent_fd)
+    opened = os.fstat(descriptor)
+    linked = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or opened.st_dev != linked.st_dev
+        or opened.st_ino != linked.st_ino
+        or opened.st_mode != linked.st_mode
+        or opened.st_nlink != linked.st_nlink
+        or opened.st_uid != parent_before.st_uid
+        or opened.st_gid != parent_before.st_gid
+        or opened.st_nlink < 1
+        or stat.S_IMODE(opened.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise RuntimeError("task output cleanup directory identity is unsafe")
+    return descriptor, opened
+
+def stream_inventory(directory_fd, directory_metadata, name, *, allow_missing):
+    try:
+        descriptor = os.open(name, file_flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        if allow_missing:
+            return None
+        raise RuntimeError("task output cleanup stream is missing")
+    try:
+        before = os.fstat(descriptor)
+        linked = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != 1
+            or before.st_uid != directory_metadata.st_uid
+            or before.st_gid != directory_metadata.st_gid
+            or before.st_dev != linked.st_dev
+            or before.st_ino != linked.st_ino
+            or before.st_mode != linked.st_mode
+            or before.st_nlink != linked.st_nlink
+            or before.st_size > 8 * 1024 * 1024
+        ):
+            raise RuntimeError("task output cleanup stream identity is unsafe")
+        digest = hashlib.sha256()
+        remaining = int(before.st_size)
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                raise RuntimeError("short task output cleanup stream read")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+        linked_after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_mode != before.st_mode
+            or after.st_nlink != before.st_nlink
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_ctime_ns != before.st_ctime_ns
+            or linked_after.st_dev != before.st_dev
+            or linked_after.st_ino != before.st_ino
+            or linked_after.st_mode != before.st_mode
+            or linked_after.st_nlink != before.st_nlink
+            or linked_after.st_size != before.st_size
+            or linked_after.st_mtime_ns != before.st_mtime_ns
+            or linked_after.st_ctime_ns != before.st_ctime_ns
+        ):
+            raise RuntimeError("task output cleanup stream changed during read")
+        return {
+            "sha256": digest.hexdigest(),
+            "bytes": int(before.st_size),
+            "mode": stat.S_IMODE(before.st_mode),
+            "nlink": int(before.st_nlink),
+        }
+    finally:
+        os.close(descriptor)
+
+def inventory(directory_fd, directory_metadata, *, allow_missing):
+    names = set(os.listdir(directory_fd))
+    unexpected = sorted(names - {"stdout.log", "stderr.log"})
+    if unexpected:
+        raise RuntimeError("task output cleanup directory contains unexpected entries")
+    streams = {
+        "stdout": stream_inventory(
+            directory_fd, directory_metadata, "stdout.log", allow_missing=allow_missing
+        ),
+        "stderr": stream_inventory(
+            directory_fd, directory_metadata, "stderr.log", allow_missing=allow_missing
+        ),
+    }
+    return streams
+
+def compare_expected(streams):
+    expected = {
+        "stdout": (expected_stdout_sha256, expected_stdout_bytes),
+        "stderr": (expected_stderr_sha256, expected_stderr_bytes),
+    }
+    for stream, (sha256, size) in expected.items():
+        value = streams[stream]
+        if value is None:
+            continue
+        if value["sha256"] != sha256 or value["bytes"] != size:
+            raise RuntimeError("task output cleanup inventory mismatch")
+
+original_exists = exists_at(directory_name)
+staging_exists = exists_at(staging_name)
+if original_exists and staging_exists:
+    raise RuntimeError("task output cleanup has conflicting original and staging paths")
+if mode == "inspect":
+    if staging_exists:
+        print("GRABOWSKI_TASK_OUTPUT_CLEANUP_STAGING_PRESENT", file=sys.stderr)
+        os.close(parent_fd)
+        raise SystemExit(46)
+    if not original_exists:
+        print("GRABOWSKI_TASK_OUTPUT_DIRECTORY_MISSING", file=sys.stderr)
+        os.close(parent_fd)
+        raise SystemExit(44)
+    directory_fd, directory_metadata = open_directory(directory_name)
+    try:
+        streams = inventory(directory_fd, directory_metadata, allow_missing=False)
+        print(json.dumps({
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_inventory",
+            "task_id": match.group(1),
+            "attempt": int(match.group(2)),
+            "directory": directory,
+            "streams": streams,
+        }, sort_keys=True, separators=(",", ":")))
+    finally:
+        os.close(directory_fd)
+        os.close(parent_fd)
+    raise SystemExit(0)
+
+if original_exists:
+    active_name = directory_name
+    resumed_from_staging = False
+elif staging_exists:
+    active_name = staging_name
+    resumed_from_staging = True
+else:
+    print("GRABOWSKI_TASK_OUTPUT_DIRECTORY_MISSING", file=sys.stderr)
+    os.close(parent_fd)
+    raise SystemExit(44)
+
+directory_fd, directory_metadata = open_directory(active_name)
+try:
+    streams = inventory(
+        directory_fd,
+        directory_metadata,
+        allow_missing=resumed_from_staging,
+    )
+    compare_expected(streams)
+    if not resumed_from_staging:
+        if streams["stdout"] is None or streams["stderr"] is None:
+            raise RuntimeError("task output cleanup original contract is incomplete")
+        os.rename(
+            directory_name,
+            staging_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+        linked_staging = os.stat(
+            staging_name, dir_fd=parent_fd, follow_symlinks=False
+        )
+        if (
+            linked_staging.st_dev != directory_metadata.st_dev
+            or linked_staging.st_ino != directory_metadata.st_ino
+            or linked_staging.st_mode != directory_metadata.st_mode
+            or linked_staging.st_nlink != directory_metadata.st_nlink
+        ):
+            raise RuntimeError("task output cleanup staging identity mismatch")
+    removed = []
+    for stream_name in ("stdout.log", "stderr.log"):
+        try:
+            os.unlink(stream_name, dir_fd=directory_fd)
+            removed.append(stream_name)
+        except FileNotFoundError:
+            if not resumed_from_staging:
+                raise
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+try:
+    os.rmdir(staging_name, dir_fd=parent_fd)
+except FileNotFoundError:
+    raise RuntimeError("task output cleanup staging path disappeared")
+os.fsync(parent_fd)
+parent_after = os.fstat(parent_fd)
+linked_parent_after = os.lstat(parent)
+if (
+    parent_after.st_dev != parent_before.st_dev
+    or parent_after.st_ino != parent_before.st_ino
+    or parent_after.st_mode != parent_before.st_mode
+    or linked_parent_after.st_dev != parent_before.st_dev
+    or linked_parent_after.st_ino != parent_before.st_ino
+    or linked_parent_after.st_mode != parent_before.st_mode
+):
+    raise RuntimeError("task output cleanup parent changed during delete")
+os.close(parent_fd)
+print(json.dumps({
+    "schema_version": 1,
+    "kind": "grabowski_task_output_cleanup_delete_result",
+    "task_id": match.group(1),
+    "attempt": int(match.group(2)),
+    "directory": directory,
+    "token": token,
+    "resumed_from_staging": resumed_from_staging,
+    "removed": removed,
+    "streams": streams,
+    "post_state": "absent",
+}, sort_keys=True, separators=(",", ":")))
+""".strip()
+
 # One re-entrant in-process lock plus one shared file lock serializes every
 # persistent-task mutation across the MCP runtime and the timer-driven
 # reconciler process. Nested task operations reuse the outer file lock.
@@ -3796,7 +4094,7 @@ def _read_remote_task_output_stream(
     if stream not in {"stdout", "stderr"}:
         raise ValueError("task output stream is invalid")
     paths = _task_output_paths(record)
-    result = _dispatch(
+    envelope = fleet.run_fleet_task_output_read(
         str(record["host"]),
         [
             TASK_OUTPUT_CAPTURE_PYTHON,
@@ -3808,7 +4106,9 @@ def _read_remote_task_output_stream(
             str(min(int(operator.DEFAULT_OUTPUT_BYTES) - 1024, 60 * 1024)),
         ],
         timeout_seconds=30,
+        max_output_bytes=int(operator.DEFAULT_OUTPUT_BYTES),
     )
+    result = envelope["result"]
     returncode = int(result.get("returncode", 1))
     diagnostic = str(result.get("stderr", ""))
     if returncode == 44 and "GRABOWSKI_TASK_OUTPUT_DIRECTORY_MISSING" in diagnostic:
@@ -3872,6 +4172,149 @@ def _read_task_output_files(
     if target["transport"] == "local":
         return _read_local_task_output_files(record, max_lines)
     return _read_remote_task_output_files(record, max_lines)
+
+
+def _task_output_cleanup_argv(
+    record: dict[str, Any],
+    *,
+    mode: str,
+    token: str,
+    inventory: dict[str, Any] | None = None,
+) -> list[str]:
+    paths = _task_output_paths(record)
+    if not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{64}", token) is None:
+        raise ValueError("task output cleanup token must be a SHA-256 digest")
+    if mode == "inspect":
+        bindings = ["-", "-", "-1", "-1"]
+    elif mode == "delete":
+        if not isinstance(inventory, dict):
+            raise ValueError("task output cleanup delete requires inventory")
+        streams = inventory.get("streams")
+        if not isinstance(streams, dict):
+            raise ValueError("task output cleanup inventory streams are invalid")
+        values: list[str] = []
+        for stream in ("stdout", "stderr"):
+            item = streams.get(stream)
+            if not isinstance(item, dict):
+                raise ValueError("task output cleanup inventory stream is invalid")
+            sha256 = item.get("sha256")
+            size = item.get("bytes")
+            if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+                raise ValueError("task output cleanup inventory digest is invalid")
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or not 0 <= size <= TASK_OUTPUT_MAX_BYTES
+            ):
+                raise ValueError("task output cleanup inventory size is invalid")
+            values.extend([sha256, str(size)])
+        bindings = [values[0], values[2], values[1], values[3]]
+    else:
+        raise ValueError("task output cleanup mode is invalid")
+    return [
+        TASK_OUTPUT_CAPTURE_PYTHON,
+        "-c",
+        TASK_OUTPUT_CLEANUP_CODE,
+        mode,
+        str(paths["directory"]),
+        token,
+        *bindings,
+    ]
+
+
+def _task_output_cleanup_run(
+    record: dict[str, Any],
+    *,
+    mode: str,
+    token: str,
+    inventory: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    command = _task_output_cleanup_argv(
+        record, mode=mode, token=token, inventory=inventory
+    )
+    envelope = fleet.run_fleet_task_output_cleanup(
+        str(record["host"]),
+        command,
+        timeout_seconds=30,
+        max_output_bytes=int(operator.DEFAULT_OUTPUT_BYTES),
+    )
+    result = envelope.get("result")
+    if not isinstance(result, dict):
+        raise RuntimeError("task output cleanup result is invalid")
+    returncode = result.get("returncode")
+    diagnostic = str(result.get("stderr", ""))
+    if returncode == 44 and "GRABOWSKI_TASK_OUTPUT_DIRECTORY_MISSING" in diagnostic:
+        return {
+            "status": "missing",
+            "mode": mode,
+            "observer": envelope.get("observer"),
+        }
+    if returncode == 46 and "GRABOWSKI_TASK_OUTPUT_CLEANUP_STAGING_PRESENT" in diagnostic:
+        return {
+            "status": "staging_present",
+            "mode": mode,
+            "observer": envelope.get("observer"),
+        }
+    if returncode != 0:
+        raise RuntimeError("task output cleanup command failed")
+    stdout = result.get("stdout")
+    if not isinstance(stdout, str) or len(stdout.encode("utf-8")) > 64 * 1024:
+        raise RuntimeError("task output cleanup payload is invalid")
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("task output cleanup payload is not JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("task output cleanup payload must be an object")
+    if payload.get("task_id") != record.get("task_id") or payload.get("attempt") != record.get("attempt"):
+        raise RuntimeError("task output cleanup payload binding mismatch")
+    if payload.get("directory") != str(_task_output_paths(record)["directory"]):
+        raise RuntimeError("task output cleanup directory binding mismatch")
+    expected_kind = (
+        "grabowski_task_output_cleanup_inventory"
+        if mode == "inspect"
+        else "grabowski_task_output_cleanup_delete_result"
+    )
+    if payload.get("schema_version") != 1 or payload.get("kind") != expected_kind:
+        raise RuntimeError("task output cleanup payload kind is invalid")
+    if mode == "inspect":
+        streams = payload.get("streams")
+        if not isinstance(streams, dict) or set(streams) != {"stdout", "stderr"}:
+            raise RuntimeError("task output cleanup inventory shape is invalid")
+        for stream in ("stdout", "stderr"):
+            item = streams.get(stream)
+            if not isinstance(item, dict) or set(item) != {"sha256", "bytes", "mode", "nlink"}:
+                raise RuntimeError("task output cleanup inventory stream shape is invalid")
+            if (
+                not isinstance(item.get("sha256"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+                or not isinstance(item.get("bytes"), int)
+                or isinstance(item.get("bytes"), bool)
+                or not 0 <= item["bytes"] <= TASK_OUTPUT_MAX_BYTES
+                or item.get("mode") != 0o600
+                or item.get("nlink") != 1
+            ):
+                raise RuntimeError("task output cleanup inventory stream is invalid")
+        return {
+            "status": "present",
+            "mode": mode,
+            "inventory": payload,
+            "observer": envelope.get("observer"),
+            "code_sha256": envelope.get("cleanup_code_sha256"),
+        }
+    if payload.get("token") != token or payload.get("post_state") != "absent":
+        raise RuntimeError("task output cleanup delete binding is invalid")
+    if not isinstance(payload.get("removed"), list) or any(
+        item not in {"stdout.log", "stderr.log"} for item in payload["removed"]
+    ):
+        raise RuntimeError("task output cleanup removed-set is invalid")
+    return {
+        "status": "deleted",
+        "mode": mode,
+        "delete_result": payload,
+        "observer": envelope.get("observer"),
+        "code_sha256": envelope.get("cleanup_code_sha256"),
+    }
 
 
 def _launch_argv(record: dict[str, Any]) -> list[str]:
@@ -6960,8 +7403,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
     }
 
 
-@_serialize_task_mutation
-def reconcile_tasks_refresh(
+def _reconcile_tasks_refresh_locked(
     *,
     task_id: str = "",
     batch_size: int | None = None,
@@ -7053,6 +7495,50 @@ def reconcile_tasks_refresh(
             "terminalization_recovery"
         ]
     return result
+
+
+def _attach_task_output_cleanup(
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    if "batch" not in result:
+        return result
+    output = dict(result)
+    try:
+        import grabowski_task_attention as task_attention
+
+        output["task_output_cleanup"] = (
+            task_attention.reconcile_archived_task_outputs(
+                limit=task_attention.DEFAULT_TASK_OUTPUT_CLEANUP_BATCH_SIZE
+            )
+        )
+    except Exception as exc:
+        output["task_output_cleanup"] = {
+            "schema_version": 1,
+            "kind": "grabowski_task_output_cleanup_reconcile",
+            "status": "degraded",
+            "error_type": type(exc).__name__,
+            "error": operator._redact(str(exc))[:512],
+            "checked_at_unix": _now(),
+            "does_not_establish": [
+                "task_output_cleanup_completed",
+                "absence_of_archived_output",
+                "safe_blind_retry",
+            ],
+        }
+    return output
+
+
+def reconcile_tasks_refresh(
+    *,
+    task_id: str = "",
+    batch_size: int | None = None,
+) -> dict[str, Any]:
+    with _task_mutation_lock():
+        result = _reconcile_tasks_refresh_locked(
+            task_id=task_id,
+            batch_size=batch_size,
+        )
+    return _attach_task_output_cleanup(result)
 
 
 @_serialize_task_mutation
@@ -7257,13 +7743,15 @@ def reconcile_tasks_resume(
     }
 
 
-@_serialize_task_mutation
-def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
+def _reconcile_tasks_locked(
+    *,
+    auto_resume: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     if not isinstance(auto_resume, bool):
         raise ValueError("auto_resume must be boolean")
     if auto_resume:
         preview = reconcile_tasks_check()
-        result = reconcile_tasks_refresh()
+        refresh = _reconcile_tasks_refresh_locked()
         disabled = [
             {
                 "task_id": item["task_id"],
@@ -7272,24 +7760,35 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
             }
             for item in preview["would_resume"]
         ]
-        return {
+        result = {
             "auto_resume": auto_resume,
             "legacy_auto_resume_disabled": True,
-            "scanned": result["scanned"],
-            "refreshed": result["refreshed"],
+            "scanned": refresh["scanned"],
+            "refreshed": refresh["refreshed"],
             "resumed": [],
             "blocked": [*preview["blocked"], *disabled],
-            "checked_at_unix": result["checked_at_unix"],
+            "checked_at_unix": refresh["checked_at_unix"],
         }
-    result = reconcile_tasks_refresh()
-    return {
+        return result, refresh
+    refresh = _reconcile_tasks_refresh_locked()
+    result = {
         "auto_resume": auto_resume,
-        "scanned": result["scanned"],
-        "refreshed": result["refreshed"],
-        "resumed": result["resumed"],
-        "blocked": result["blocked"],
-        "checked_at_unix": result["checked_at_unix"],
+        "scanned": refresh["scanned"],
+        "refreshed": refresh["refreshed"],
+        "resumed": refresh["resumed"],
+        "blocked": refresh["blocked"],
+        "checked_at_unix": refresh["checked_at_unix"],
     }
+    return result, refresh
+
+
+def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
+    with _task_mutation_lock():
+        result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
+    cleanup = _attach_task_output_cleanup(refresh)
+    if "task_output_cleanup" in cleanup:
+        result["task_output_cleanup"] = cleanup["task_output_cleanup"]
+    return result
 
 
 def _task_reconcile_check_after_guard(task_id: str) -> dict[str, Any]:
@@ -7314,7 +7813,7 @@ async def _grabowski_task_reconcile_check_tool(task_id: str = "") -> dict[str, A
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
-        result = reconcile_tasks_refresh(task_id=task_id)
+        result = _reconcile_tasks_refresh_locked(task_id=task_id)
         base._append_audit(
             {
                 "timestamp_unix": _now(),
@@ -7324,7 +7823,7 @@ def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
                 "released_count": len(result["released"]),
             }
         )
-        return result
+    return _attach_task_output_cleanup(result)
 
 
 def grabowski_task_reconcile_refresh(task_id: str = "") -> dict[str, Any]:
@@ -7396,7 +7895,7 @@ async def _grabowski_task_reconcile_resume_tool(
 def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
     with _task_mutation_lock():
         operator._require_operator_mutation("durable_job")
-        result = reconcile_tasks(auto_resume=auto_resume)
+        result, refresh = _reconcile_tasks_locked(auto_resume=auto_resume)
         base._append_audit(
             {
                 "timestamp_unix": _now(),
@@ -7407,7 +7906,10 @@ def _task_reconcile_after_guard(auto_resume: bool) -> dict[str, Any]:
                 "blocked_count": len(result["blocked"]),
             }
         )
-        return result
+    cleanup = _attach_task_output_cleanup(refresh)
+    if "task_output_cleanup" in cleanup:
+        result["task_output_cleanup"] = cleanup["task_output_cleanup"]
+    return result
 
 
 def grabowski_task_reconcile(auto_resume: bool = False) -> dict[str, Any]:

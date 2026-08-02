@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,24 @@ TASK_UNIT_SHOW_PROPERTIES = (
     "ExecMainCode",
     "ExecMainStatus",
 )
+
+TASK_OUTPUT_READ_OBSERVER = "task-output-read-v1"
+TASK_OUTPUT_READ_CODE_SHA256 = (
+    "1865172d0eaeca612e2047b3fa7c689458faba1aed130953324ff91bf47da31c"
+)
+TASK_OUTPUT_READ_PYTHON = "/usr/bin/python3"
+TASK_OUTPUT_DIRECTORY = re.compile(
+    re.escape(str(HOME))
+    + r"/\.grabowski-task-output-([0-9a-f]{24})-a([1-9][0-9]*)\Z"
+)
+TASK_OUTPUT_STREAM = frozenset({"stdout.log", "stderr.log"})
+TASK_OUTPUT_MAX_READ_LINES = 2000
+TASK_OUTPUT_MAX_READ_BYTES = 60 * 1024
+TASK_OUTPUT_CLEANUP_OBSERVER = "task-output-cleanup-v1"
+TASK_OUTPUT_CLEANUP_CODE_SHA256 = (
+    "6001b35604486ad1976ccb3b3efac6115ee02e5175c56138ef3cbbdaee2e294b"
+)
+TASK_OUTPUT_CLEANUP_MAX_STREAM_BYTES = 8 * 1024 * 1024
 
 
 class FleetCommandDenied(PermissionError):
@@ -162,6 +181,199 @@ def run_fleet_host(name: str, argv: list[str], *, timeout_seconds: int,
 
 _TASK_UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
 _SYSTEMD_SHOW_PROPERTY = re.compile(r"[A-Za-z][A-Za-z0-9]*\Z")
+
+
+def run_fleet_task_output_read(
+    name: str,
+    argv: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Run the narrow descriptor-bound task-output reader.
+
+    This path deliberately bypasses the generic production executable allowlist
+    only after binding the exact embedded Python program by SHA-256 and validating
+    every remaining argument against the task-output path grammar. It therefore
+    does not authorize arbitrary Python execution through ``grabowski_fleet_run``.
+    """
+    host = fleet_host(name)
+    command = operator._validate_argv(argv, cwd=HOME)
+    if len(command) < 3:
+        raise ValueError("Invalid task-output reader argv length")
+    redaction_probe = [
+        command[0],
+        command[1],
+        "<hash-bound-task-output-read-code>",
+        *command[3:],
+    ]
+    if operator._redact_argv(redaction_probe) != redaction_probe:
+        raise ValueError("task-output reader argv appears to contain secret material")
+    if len(command) != 7:
+        raise ValueError("Invalid task-output reader argv length")
+    if command[0] != TASK_OUTPUT_READ_PYTHON or command[1] != "-c":
+        raise ValueError("Invalid task-output reader executable")
+    code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
+    if code_sha256 != TASK_OUTPUT_READ_CODE_SHA256:
+        raise PermissionError("Task-output reader code identity mismatch")
+    directory_match = TASK_OUTPUT_DIRECTORY.fullmatch(command[3])
+    if directory_match is None:
+        raise ValueError("Invalid task-output directory")
+    if command[4] not in TASK_OUTPUT_STREAM:
+        raise ValueError("Invalid task-output stream")
+    try:
+        max_lines = int(command[5])
+        byte_limit = int(command[6])
+    except ValueError as exc:
+        raise ValueError("Invalid task-output reader limits") from exc
+    if str(max_lines) != command[5] or not 1 <= max_lines <= TASK_OUTPUT_MAX_READ_LINES:
+        raise ValueError("Invalid task-output reader line limit")
+    if str(byte_limit) != command[6] or not 1024 <= byte_limit <= TASK_OUTPUT_MAX_READ_BYTES:
+        raise ValueError("Invalid task-output reader byte limit")
+    timeout = operator._timeout(timeout_seconds)
+    output_limit = operator._output_limit(max_output_bytes)
+    if host["transport"] == "local":
+        result = operator._run(
+            command,
+            cwd=HOME,
+            timeout_seconds=timeout,
+            max_output_bytes=output_limit,
+        )
+    else:
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise RuntimeError("OpenSSH client is not installed")
+        remote_command = "exec " + shlex.join(command)
+        result = operator._run(
+            [
+                ssh,
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                f"ConnectTimeout={host['connect_timeout_seconds']}",
+                "--",
+                host["target"],
+                remote_command,
+            ],
+            cwd=HOME,
+            timeout_seconds=timeout,
+            max_output_bytes=output_limit,
+        )
+    return {
+        "host": name,
+        "transport": host["transport"],
+        "roles": host["roles"],
+        "remote_argv": command,
+        "observer": TASK_OUTPUT_READ_OBSERVER,
+        "reader_code_sha256": code_sha256,
+        "task_id": directory_match.group(1),
+        "attempt": int(directory_match.group(2)),
+        "stream": command[4],
+        "result": result,
+    }
+
+
+def run_fleet_task_output_cleanup(
+    name: str,
+    argv: list[str],
+    *,
+    timeout_seconds: int,
+    max_output_bytes: int,
+) -> dict[str, Any]:
+    """Run the fixed task-output inventory/delete contract on one fleet host.
+
+    The generic fleet allowlist is not consulted because this path accepts only
+    the hash-bound embedded program and exact task-output arguments. No caller-
+    supplied Python program, executable, path family or deletion target is allowed.
+    """
+    host = fleet_host(name)
+    command = operator._validate_argv(argv, cwd=HOME)
+    if len(command) != 10:
+        raise ValueError("Invalid task-output cleanup argv length")
+    if command[0] != TASK_OUTPUT_READ_PYTHON or command[1] != "-c":
+        raise ValueError("Invalid task-output cleanup executable")
+    code_sha256 = hashlib.sha256(command[2].encode("utf-8")).hexdigest()
+    if code_sha256 != TASK_OUTPUT_CLEANUP_CODE_SHA256:
+        raise PermissionError("Task-output cleanup code identity mismatch")
+    redaction_probe = [
+        command[0],
+        command[1],
+        "<hash-bound-task-output-cleanup-code>",
+        *command[3:],
+    ]
+    if operator._redact_argv(redaction_probe) != redaction_probe:
+        raise ValueError("task-output cleanup argv appears to contain secret material")
+    mode = command[3]
+    if mode not in {"inspect", "delete"}:
+        raise ValueError("Invalid task-output cleanup mode")
+    directory_match = TASK_OUTPUT_DIRECTORY.fullmatch(command[4])
+    if directory_match is None:
+        raise ValueError("Invalid task-output cleanup directory")
+    if re.fullmatch(r"[0-9a-f]{64}", command[5]) is None:
+        raise ValueError("Invalid task-output cleanup token")
+    if mode == "inspect":
+        if command[6:10] != ["-", "-", "-1", "-1"]:
+            raise ValueError("Invalid task-output cleanup inspect binding")
+    else:
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", command[6]) is None
+            or re.fullmatch(r"[0-9a-f]{64}", command[7]) is None
+        ):
+            raise ValueError("Invalid task-output cleanup digest binding")
+        try:
+            stdout_bytes = int(command[8])
+            stderr_bytes = int(command[9])
+        except ValueError as exc:
+            raise ValueError("Invalid task-output cleanup size binding") from exc
+        if (
+            str(stdout_bytes) != command[8]
+            or str(stderr_bytes) != command[9]
+            or not 0 <= stdout_bytes <= TASK_OUTPUT_CLEANUP_MAX_STREAM_BYTES
+            or not 0 <= stderr_bytes <= TASK_OUTPUT_CLEANUP_MAX_STREAM_BYTES
+        ):
+            raise ValueError("Invalid task-output cleanup size binding")
+    timeout = operator._timeout(timeout_seconds)
+    output_limit = operator._output_limit(max_output_bytes)
+    if host["transport"] == "local":
+        result = operator._run(
+            command, cwd=HOME, timeout_seconds=timeout, max_output_bytes=output_limit
+        )
+    else:
+        ssh = shutil.which("ssh")
+        if not ssh:
+            raise RuntimeError("OpenSSH client is not installed")
+        remote_command = "exec " + shlex.join(command)
+        result = operator._run(
+            [
+                ssh,
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                f"ConnectTimeout={host['connect_timeout_seconds']}",
+                "--",
+                host["target"],
+                remote_command,
+            ],
+            cwd=HOME,
+            timeout_seconds=timeout,
+            max_output_bytes=output_limit,
+        )
+    return {
+        "host": name,
+        "transport": host["transport"],
+        "roles": host["roles"],
+        "remote_argv": command,
+        "observer": TASK_OUTPUT_CLEANUP_OBSERVER,
+        "cleanup_code_sha256": code_sha256,
+        "task_id": directory_match.group(1),
+        "attempt": int(directory_match.group(2)),
+        "mode": mode,
+        "result": result,
+    }
 
 
 def run_fleet_task_unit_show(

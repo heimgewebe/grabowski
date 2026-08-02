@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -45,6 +46,7 @@ if "mcp" not in sys.modules:
     sys.modules["mcp.types"] = fake_types
 
 import grabowski_fleet as fleet
+import grabowski_tasks as tasks
 import grabowski_operations as operations
 import grabowski_privileged as privileged
 import grabowski_privileged_broker as privileged_broker
@@ -179,6 +181,309 @@ class FleetTests(unittest.TestCase):
             call_argv = run.call_args.args[0]
             self.assertEqual(call_argv[-2:], ["prod.example", "exec hostname"])
 
+
+    def test_task_output_embedded_code_hashes_match_typed_fleet_contract(self) -> None:
+        self.assertEqual(
+            hashlib.sha256(
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE.encode("utf-8")
+            ).hexdigest(),
+            fleet.TASK_OUTPUT_READ_CODE_SHA256,
+        )
+        self.assertEqual(
+            hashlib.sha256(
+                tasks.TASK_OUTPUT_CLEANUP_CODE.encode("utf-8")
+            ).hexdigest(),
+            fleet.TASK_OUTPUT_CLEANUP_CODE_SHA256,
+        )
+
+    def test_task_output_reader_does_not_open_generic_python_on_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "prod": {
+                        "transport": "ssh",
+                        "target": "prod.example",
+                        "enabled": True,
+                        "roles": ["vps", "production"],
+                        "command_allowlist": ["hostname"],
+                        "connect_timeout_seconds": 7,
+                    }
+                },
+            })
+            completed = {
+                "returncode": 0,
+                "stdout": "tail\n",
+                "stderr": (
+                    "GRABOWSKI_TASK_OUTPUT_READ_METADATA "
+                    "byte_truncated=0 line_truncated=0\n"
+                ),
+                "timed_out": False,
+            }
+            command = [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE,
+                str(fleet.HOME / ".grabowski-task-output-0123456789abcdef01234567-a2"),
+                "stdout.log",
+                "25",
+                "60000",
+            ]
+            with (
+                patch.object(fleet, "FLEET_CONFIG", config),
+                patch.object(fleet.shutil, "which", return_value="/usr/bin/ssh"),
+                patch.object(fleet.operator, "_run", return_value=completed) as run,
+            ):
+                with self.assertRaisesRegex(
+                    fleet.FleetCommandDenied, "Executable is not allowed"
+                ):
+                    fleet.run_fleet_host(
+                        "prod",
+                        command,
+                        timeout_seconds=10,
+                        max_output_bytes=65536,
+                    )
+                result = fleet.run_fleet_task_output_read(
+                    "prod",
+                    command,
+                    timeout_seconds=10,
+                    max_output_bytes=65536,
+                )
+
+            self.assertEqual(result["observer"], fleet.TASK_OUTPUT_READ_OBSERVER)
+            self.assertEqual(result["reader_code_sha256"], fleet.TASK_OUTPUT_READ_CODE_SHA256)
+            self.assertEqual(result["task_id"], "0123456789abcdef01234567")
+            self.assertEqual(result["attempt"], 2)
+            self.assertEqual(result["stream"], "stdout.log")
+            call_argv = run.call_args.args[0]
+            self.assertEqual(call_argv[-2], "prod.example")
+            self.assertTrue(call_argv[-1].startswith("exec /usr/bin/python3 -c "))
+
+    def test_task_output_reader_rejects_code_path_stream_and_limit_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "local": {
+                        "transport": "local",
+                        "target": "local",
+                        "enabled": True,
+                        "roles": ["test"],
+                        "command_allowlist": ["hostname"],
+                    }
+                },
+            })
+            valid = [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE,
+                str(fleet.HOME / ".grabowski-task-output-0123456789abcdef01234567-a1"),
+                "stdout.log",
+                "25",
+                "60000",
+            ]
+            with patch.object(fleet, "FLEET_CONFIG", config), patch.object(
+                fleet.operator, "_run"
+            ) as run:
+                variants = [
+                    [*valid[:2], "print('arbitrary')", *valid[3:]],
+                    [*valid[:3], "/tmp/output", *valid[4:]],
+                    [*valid[:4], "other.log", *valid[5:]],
+                    [*valid[:5], "0", valid[6]],
+                    [*valid[:6], "999999"],
+                ]
+                for command in variants:
+                    with self.assertRaises((ValueError, PermissionError)):
+                        fleet.run_fleet_task_output_read(
+                            "local",
+                            command,
+                            timeout_seconds=10,
+                            max_output_bytes=65536,
+                        )
+            run.assert_not_called()
+
+    def test_task_output_reader_rejects_secret_bearing_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "local": {
+                        "transport": "local",
+                        "target": "local",
+                        "enabled": True,
+                        "roles": ["test"],
+                        "command_allowlist": ["hostname"],
+                    }
+                },
+            })
+            command = [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE,
+                str(fleet.HOME / ".grabowski-task-output-0123456789abcdef01234567-a1"),
+                "stdout.log",
+                "25",
+                "60000",
+            ]
+            with patch.object(fleet, "FLEET_CONFIG", config), patch.object(
+                fleet.operator,
+                "_redact_argv",
+                return_value=["<redacted>"],
+            ), patch.object(fleet.operator, "_run") as run:
+                with self.assertRaisesRegex(ValueError, "secret material"):
+                    fleet.run_fleet_task_output_read(
+                        "local",
+                        command,
+                        timeout_seconds=10,
+                        max_output_bytes=65536,
+                    )
+            run.assert_not_called()
+
+    def test_task_output_cleanup_does_not_open_generic_python_on_production(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "prod": {
+                        "transport": "ssh",
+                        "target": "prod.example",
+                        "enabled": True,
+                        "roles": ["vps", "production"],
+                        "command_allowlist": ["hostname"],
+                        "connect_timeout_seconds": 7,
+                    }
+                },
+            })
+            completed = {
+                "returncode": 0,
+                "stdout": json.dumps({
+                    "schema_version": 1,
+                    "kind": "grabowski_task_output_cleanup_inventory",
+                    "task_id": "0123456789abcdef01234567",
+                    "attempt": 2,
+                    "directory": str(
+                        fleet.HOME
+                        / ".grabowski-task-output-0123456789abcdef01234567-a2"
+                    ),
+                    "streams": {
+                        "stdout": {
+                            "sha256": "1" * 64,
+                            "bytes": 1,
+                            "mode": 384,
+                            "nlink": 1,
+                        },
+                        "stderr": {
+                            "sha256": "2" * 64,
+                            "bytes": 0,
+                            "mode": 384,
+                            "nlink": 1,
+                        },
+                    },
+                }) + "\n",
+                "stderr": "",
+                "timed_out": False,
+            }
+            command = [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_CLEANUP_CODE,
+                "inspect",
+                str(
+                    fleet.HOME
+                    / ".grabowski-task-output-0123456789abcdef01234567-a2"
+                ),
+                "0" * 64,
+                "-",
+                "-",
+                "-1",
+                "-1",
+            ]
+            with (
+                patch.object(fleet, "FLEET_CONFIG", config),
+                patch.object(fleet.shutil, "which", return_value="/usr/bin/ssh"),
+                patch.object(fleet.operator, "_run", return_value=completed) as run,
+            ):
+                with self.assertRaises((ValueError, fleet.FleetCommandDenied)):
+                    fleet.run_fleet_host(
+                        "prod", command, timeout_seconds=10, max_output_bytes=65536
+                    )
+                result = fleet.run_fleet_task_output_cleanup(
+                    "prod", command, timeout_seconds=10, max_output_bytes=65536
+                )
+
+            self.assertEqual(result["observer"], fleet.TASK_OUTPUT_CLEANUP_OBSERVER)
+            self.assertEqual(
+                result["cleanup_code_sha256"],
+                fleet.TASK_OUTPUT_CLEANUP_CODE_SHA256,
+            )
+            self.assertEqual(result["task_id"], "0123456789abcdef01234567")
+            self.assertEqual(result["attempt"], 2)
+            self.assertEqual(result["mode"], "inspect")
+            self.assertTrue(run.call_args.args[0][-1].startswith("exec /usr/bin/python3 -c "))
+
+    def test_task_output_cleanup_rejects_code_target_mode_and_binding_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "local": {
+                        "transport": "local",
+                        "target": "local",
+                        "enabled": True,
+                        "roles": ["test"],
+                        "command_allowlist": ["hostname"],
+                    }
+                },
+            })
+            valid = [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_CLEANUP_CODE,
+                "inspect",
+                str(
+                    fleet.HOME
+                    / ".grabowski-task-output-0123456789abcdef01234567-a1"
+                ),
+                "0" * 64,
+                "-",
+                "-",
+                "-1",
+                "-1",
+            ]
+            variants = [
+                [*valid[:2], "print('arbitrary')", *valid[3:]],
+                [*valid[:3], "purge", *valid[4:]],
+                [*valid[:4], "/tmp/foreign", *valid[5:]],
+                [*valid[:5], "short", *valid[6:]],
+                [*valid[:6], "1" * 64, "-", "-1", "-1"],
+                [
+                    *valid[:3],
+                    "delete",
+                    valid[4],
+                    valid[5],
+                    "1" * 64,
+                    "2" * 64,
+                    "8388609",
+                    "0",
+                ],
+            ]
+            with patch.object(fleet, "FLEET_CONFIG", config), patch.object(
+                fleet.operator, "_run"
+            ) as run:
+                for command in variants:
+                    with self.assertRaises((ValueError, PermissionError)):
+                        fleet.run_fleet_task_output_cleanup(
+                            "local",
+                            command,
+                            timeout_seconds=10,
+                            max_output_bytes=65536,
+                        )
+            run.assert_not_called()
 
     def test_task_unit_observer_does_not_open_generic_systemctl_on_production(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
