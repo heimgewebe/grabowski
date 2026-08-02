@@ -54,6 +54,10 @@ def _load_read_surface():
     )
     base._audit_records = lambda: []
     base._kill_switch_state = lambda: {"engaged": False}
+    base._runtime_tool_contract_summary = lambda: {
+        "client_snapshot_observable": False,
+        "client_schema_snapshot_observable": False,
+    }
     base._read_limited_process_pipes = lambda *args, **kwargs: (b"", b"", False, False, False)
     capabilities = types.ModuleType("grabowski_capabilities")
     capabilities.classify_contract = lambda expected: {}

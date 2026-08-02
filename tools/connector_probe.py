@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,59 +11,17 @@ import tempfile
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tools"))
 import deploy_runtime
+from grabowski_connector_contract import (
+    MAX_OBSERVED_ARTIFACT_BYTES,
+    fingerprint,
+    parse_observed_artifact,
+    probe_contract,
+)
 
 DEFAULT_RUNTIME = Path.home() / ".local" / "share" / "grabowski-mcp"
-REQUIRED_SCHEMA_PROPERTIES = {
-    "grabowski_bureau_candidate_assess": {
-        "candidate_id",
-        "event_id",
-        "expected_initiative",
-        "expected_task_id",
-        "initiative",
-        "selector",
-        "task_id",
-    },
-    "grabowski_task_start": {
-        "force_new_reason",
-        "operation_identity",
-        "supersedes_receipt_sha256",
-        "supersedes_task_id",
-    },
-}
-REQUIRED_SCHEMA_SENTINELS = {
-    "grabowski_secret_reveal",
-    *REQUIRED_SCHEMA_PROPERTIES,
-}
-SCHEMA_METADATA_KEYS = {"title", "description"}
-
-
-def fingerprint(names: list[str]) -> str:
-    raw = json.dumps(sorted(names), separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _normalize_schema(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _normalize_schema(item)
-            for key, item in sorted(value.items())
-            if key not in SCHEMA_METADATA_KEYS
-        }
-    if isinstance(value, list):
-        return [_normalize_schema(item) for item in value]
-    return value
-
-
-def schema_fingerprint(schema: dict[str, Any]) -> str:
-    raw = json.dumps(
-        _normalize_schema(schema),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
 
 
 def _runtime_tools(runtime: Path) -> list[dict[str, Any]]:
@@ -87,35 +44,44 @@ def _runtime_tools(runtime: Path) -> list[dict[str, Any]]:
                 env={**os.environ, "PYTHONNOUSERSITE": "1"},
             )
             try:
-                deploy_runtime.send_json(process, {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": version,
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "grabowski-connector-contract-probe",
-                            "version": "2.0",
+                deploy_runtime.send_json(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": version,
+                            "capabilities": {},
+                            "clientInfo": {
+                                "name": "grabowski-connector-contract-probe",
+                                "version": "2.0",
+                            },
                         },
                     },
-                })
+                )
                 initialized = deploy_runtime.wait_for_id(
                     process, 1, deploy_runtime.TIMEOUTS["mcp_probe"]
                 )
                 if "error" in initialized:
                     raise RuntimeError(str(initialized["error"]))
-                deploy_runtime.send_json(process, {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {},
-                })
-                deploy_runtime.send_json(process, {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/list",
-                    "params": {},
-                })
+                deploy_runtime.send_json(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                        "params": {},
+                    },
+                )
+                deploy_runtime.send_json(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                        "params": {},
+                    },
+                )
                 listed = deploy_runtime.wait_for_id(
                     process, 2, deploy_runtime.TIMEOUTS["mcp_probe"]
                 )
@@ -125,7 +91,9 @@ def _runtime_tools(runtime: Path) -> list[dict[str, Any]]:
                 if not isinstance(tools, list) or not all(
                     isinstance(item, dict) for item in tools
                 ):
-                    raise RuntimeError("runtime tools/list did not return tool objects")
+                    raise RuntimeError(
+                        "runtime tools/list did not return tool objects"
+                    )
                 deploy_runtime.stop_process(process)
                 return tools
             except Exception as exc:
@@ -134,41 +102,20 @@ def _runtime_tools(runtime: Path) -> list[dict[str, Any]]:
     raise RuntimeError(f"runtime tools/list failed: {last_error}")
 
 
-def _observed(path: Path | None, positional: list[str]) -> tuple[list[str], dict[str, dict[str, Any]]]:
+def _observed(
+    path: Path | None,
+    positional: list[str],
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
     if path is None:
         if not positional:
             raise ValueError("observed tools are required")
         return positional, {}
+    if path.stat().st_size > MAX_OBSERVED_ARTIFACT_BYTES:
+        raise ValueError("observed file exceeds the 32-KiB size limit")
     value = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value, {}
-    if not isinstance(value, dict) or value.get("schema_version") != 1:
-        raise ValueError("observed file must use schema_version 1")
-    tools = value.get("tools")
-    if not isinstance(tools, list) or not tools:
-        raise ValueError("observed file must contain a non-empty tools list")
-    names: list[str] = []
-    schemas: dict[str, dict[str, Any]] = {}
-    for index, item in enumerate(tools):
-        if isinstance(item, str):
-            name = item
-            schema = None
-        elif isinstance(item, dict):
-            if set(item) - {"name", "inputSchema"}:
-                raise ValueError(f"observed tools[{index}] has unknown keys")
-            name = item.get("name")
-            schema = item.get("inputSchema")
-        else:
-            raise ValueError(f"observed tools[{index}] is invalid")
-        if not isinstance(name, str) or not name:
-            raise ValueError(f"observed tools[{index}] has invalid name")
-        if name in names:
-            raise ValueError(f"duplicate observed tool: {name}")
-        names.append(name)
-        if schema is not None:
-            if not isinstance(schema, dict):
-                raise ValueError(f"observed schema for {name} must be an object")
-            schemas[name] = schema
+    names, schemas, _metadata = parse_observed_artifact(value)
     return names, schemas
 
 
@@ -182,94 +129,29 @@ def probe(
         for item in runtime_tools
         if isinstance(item.get("name"), str)
     }
-    runtime_names = sorted(runtime_by_name)
     contract_names = json.loads(
-        (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        (ROOT / "config" / "runtime-entrypoint.json").read_text(
+            encoding="utf-8"
+        )
     )["expected_tools"]
-    schema_mismatches = []
-    for name, observed_schema in sorted(observed_schemas.items()):
-        runtime_schema = runtime_by_name.get(name, {}).get("inputSchema")
-        if not isinstance(runtime_schema, dict):
-            schema_mismatches.append({
-                "tool": name,
-                "reason": "runtime schema missing",
-            })
-            continue
-        observed_hash = schema_fingerprint(observed_schema)
-        runtime_hash = schema_fingerprint(runtime_schema)
-        if observed_hash != runtime_hash:
-            schema_mismatches.append({
-                "tool": name,
-                "observed_sha256": observed_hash,
-                "runtime_sha256": runtime_hash,
-            })
-    required_schema_property_mismatches = []
-    for name, required_properties in sorted(REQUIRED_SCHEMA_PROPERTIES.items()):
-        for source, schema in (
-            ("connector", observed_schemas.get(name)),
-            ("runtime", runtime_by_name.get(name, {}).get("inputSchema")),
-        ):
-            properties = schema.get("properties") if isinstance(schema, dict) else None
-            missing = sorted(
-                required_properties - set(properties)
-                if isinstance(properties, dict)
-                else required_properties
-            )
-            if missing:
-                required_schema_property_mismatches.append({
-                    "tool": name,
-                    "source": source,
-                    "missing_properties": missing,
-                })
-
-    missing_schema_sentinels = sorted(
-        REQUIRED_SCHEMA_SENTINELS - set(observed_schemas)
-    )
-    missing_from_connector = sorted(set(runtime_names) - set(observed_names))
-    unexpected_in_connector = sorted(set(observed_names) - set(runtime_names))
-    contract_missing_from_runtime = sorted(set(contract_names) - set(runtime_names))
-    runtime_unexpected_from_contract = sorted(set(runtime_names) - set(contract_names))
-    matches = not any((
-        missing_from_connector,
-        unexpected_in_connector,
-        contract_missing_from_runtime,
-        runtime_unexpected_from_contract,
-        schema_mismatches,
-        missing_schema_sentinels,
-        required_schema_property_mismatches,
-    ))
-    return {
-        "matches": matches,
-        "name_contract_matches": not missing_from_connector and not unexpected_in_connector,
-        "runtime_contract_matches": not contract_missing_from_runtime and not runtime_unexpected_from_contract,
-        "schema_contract_matches": (
-            not schema_mismatches
-            and not missing_schema_sentinels
-            and not required_schema_property_mismatches
-        ),
-        "runtime_count": len(runtime_names),
-        "observed_count": len(observed_names),
-        "runtime_names_sha256": fingerprint(runtime_names),
-        "observed_names_sha256": fingerprint(observed_names),
-        "schema_coverage_count": len(observed_schemas),
-        "required_schema_sentinels": sorted(REQUIRED_SCHEMA_SENTINELS),
-        "missing_schema_sentinels": missing_schema_sentinels,
-        "required_schema_properties": {
-            name: sorted(properties)
-            for name, properties in sorted(REQUIRED_SCHEMA_PROPERTIES.items())
+    return probe_contract(
+        observed_names,
+        observed_schemas,
+        sorted(runtime_by_name),
+        {
+            name: item["inputSchema"]
+            for name, item in runtime_by_name.items()
+            if isinstance(item.get("inputSchema"), dict)
         },
-        "required_schema_property_mismatches": required_schema_property_mismatches,
-        "schema_mismatches": schema_mismatches,
-        "missing_from_connector": missing_from_connector,
-        "unexpected_in_connector": unexpected_in_connector,
-        "contract_missing_from_runtime": contract_missing_from_runtime,
-        "runtime_unexpected_from_contract": runtime_unexpected_from_contract,
-    }
+        contract_names,
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compare connector names and input schemas with live MCP tools/list"
+        description=(
+            "Compare connector names and selected input schemas with live MCP tools/list"
+        )
     )
     parser.add_argument("tools", nargs="*")
     parser.add_argument("--observed-file", type=Path)

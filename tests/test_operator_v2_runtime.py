@@ -538,6 +538,24 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     )
 
     def test_connector_snapshot_wrapper_injects_server_owned_binding(self) -> None:
+        server_observed_tools = {
+            "schema_version": 1,
+            "tools": [
+                "alpha",
+                {
+                    "name": "grabowski_bureau_candidate_assess",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "grabowski_secret_reveal",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "grabowski_task_start",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+            ],
+        }
         client_parameters = {
             "client_id": "chatgpt-api-tool",
             "session_id": "session-1",
@@ -545,9 +563,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             "observed_names_sha256": "a" * 64,
             "observed_release_id": "release-real",
             "observed_agent_instructions_sha256": "b" * 64,
-            "_server_tool_contract": {"registered_tool_count": 1},
-            "_server_runtime": {"release_id": "spoofed"},
-            "_server_agent_instructions_sha256": "f" * 64,
+            "observed_tools": server_observed_tools,
         }
         deployment = {
             "release_id": "release-real",
@@ -577,6 +593,11 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                 return_value=contract,
             ) as summary,
             patch.object(
+                grabowski_mcp,
+                "_runtime_connector_observed_tools",
+                return_value=server_observed_tools,
+            ) as observed,
+            patch.object(
                 grabowski_mcp.grabowski_grips,
                 "grip_run",
                 return_value={"ok": True},
@@ -591,6 +612,7 @@ class OperatorV2RuntimeTests(unittest.TestCase):
 
         self.assertEqual({"ok": True}, result)
         summary.assert_called_once_with(deployment)
+        observed.assert_called_once_with()
         dispatched = run.call_args.args[1]
         self.assertEqual(
             {
@@ -605,6 +627,43 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             grabowski_mcp.AGENT_INSTRUCTIONS_SHA256,
             dispatched["_server_agent_instructions_sha256"],
         )
+        self.assertIs(
+            server_observed_tools,
+            dispatched["_server_observed_tools"],
+        )
+
+    def test_connector_snapshot_wrapper_rejects_server_binding_spoofing(self) -> None:
+        public_parameters = {
+            "client_id": "chatgpt-api-tool",
+            "session_id": "session-1",
+            "observed_tool_count": 140,
+            "observed_names_sha256": "a" * 64,
+            "observed_release_id": "release-real",
+            "observed_agent_instructions_sha256": "b" * 64,
+        }
+        server_parameters = (
+            "_server_tool_contract",
+            "_server_runtime",
+            "_server_agent_instructions_sha256",
+            "_server_observed_tools",
+        )
+        for parameter in server_parameters:
+            with self.subTest(parameter=parameter):
+                with (
+                    patch.object(grabowski_mcp, "_require_capability"),
+                    patch.object(grabowski_mcp, "_require_mutations_enabled"),
+                ):
+                    result = grabowski_mcp.grip_run(
+                        "connector-snapshot-bind",
+                        {**public_parameters, parameter: {"spoofed": True}},
+                        profile="operator",
+                        allow_mutation=True,
+                    )
+                self.assertEqual("blocked", result["status"])
+                self.assertIn(
+                    f"caller supplied reserved server parameter: {parameter}",
+                    result["output"]["error"],
+                )
 
     def test_high_risk_grip_requires_explicit_session_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

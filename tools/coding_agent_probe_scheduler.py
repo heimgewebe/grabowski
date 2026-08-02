@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import selectors
@@ -88,6 +89,16 @@ EXPECTED_ROUTER_SCRUBBED_API_KEY_ENV = (
     "GEMINI_API_KEY",
     "OPENROUTER_API_KEY",
 )
+DEFAULT_CODEX_SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+CODEX_QUOTA_POOL = "openai-agentic"
+CODEX_QUOTA_SOURCE = "codex-rollout-rate-limits-v1"
+MAX_CODEX_DAY_DIRECTORIES = 4
+MAX_CODEX_DIRECTORY_ENTRIES = 512
+MAX_CODEX_ROLLOUT_FILES = 128
+MAX_CODEX_ROLLOUT_BYTES = 16 * 1024 * 1024
+MAX_CODEX_ROLLOUT_TAIL_BYTES = 256 * 1024
+MAX_CODEX_ROLLOUT_SCAN_BYTES = 32 * 1024 * 1024
+MAX_CODEX_QUOTA_AGE_SECONDS = 36 * 60 * 60
 
 
 class ProbeSchedulerError(RuntimeError):
@@ -175,6 +186,307 @@ def parse_time(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _owned_directory(path: Path, *, label: str) -> bool:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise ProbeSchedulerError(f"{label} is not an owned real directory")
+    return True
+
+
+def _bounded_directory_entries(path: Path) -> list[Path]:
+    entries: list[Path] = []
+    try:
+        with os.scandir(path) as iterator:
+            for entry in iterator:
+                if len(entries) >= MAX_CODEX_DIRECTORY_ENTRIES:
+                    raise ProbeSchedulerError(
+                        "Codex sessions directory exceeds the bounded entry limit"
+                    )
+                entries.append(Path(entry.path))
+    except OSError as exc:
+        raise ProbeSchedulerError(
+            "cannot enumerate Codex sessions directory"
+        ) from exc
+    return sorted(entries, key=lambda item: item.name, reverse=True)
+
+
+def _codex_rollout_candidates(root: Path) -> list[Path]:
+    if not _owned_directory(root, label="Codex sessions root"):
+        return []
+    day_directories: list[Path] = []
+    for year in _bounded_directory_entries(root):
+        if not year.name.isdigit() or len(year.name) != 4:
+            continue
+        if not _owned_directory(year, label="Codex sessions year"):
+            continue
+        for month in _bounded_directory_entries(year):
+            if not month.name.isdigit() or len(month.name) != 2:
+                continue
+            if not _owned_directory(month, label="Codex sessions month"):
+                continue
+            for day in _bounded_directory_entries(month):
+                if not day.name.isdigit() or len(day.name) != 2:
+                    continue
+                if not _owned_directory(day, label="Codex sessions day"):
+                    continue
+                day_directories.append(day)
+                if len(day_directories) >= MAX_CODEX_DAY_DIRECTORIES:
+                    break
+            if len(day_directories) >= MAX_CODEX_DAY_DIRECTORIES:
+                break
+        if len(day_directories) >= MAX_CODEX_DAY_DIRECTORIES:
+            break
+    candidates: list[tuple[int, Path]] = []
+    for day in day_directories:
+        for entry in _bounded_directory_entries(day):
+            if not entry.name.startswith("rollout-") or entry.suffix != ".jsonl":
+                continue
+            try:
+                metadata = entry.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or metadata.st_nlink != 1
+                or metadata.st_mode & 0o077
+                or not 1 <= metadata.st_size <= MAX_CODEX_ROLLOUT_BYTES
+            ):
+                continue
+            candidates.append((metadata.st_mtime_ns, entry))
+    candidates.sort(key=lambda item: (item[0], str(item[1])), reverse=True)
+    return [path for _mtime, path in candidates[:MAX_CODEX_ROLLOUT_FILES]]
+
+
+def _read_codex_rollout_tail(path: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ProbeSchedulerError("cannot open Codex rollout receipt") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.getuid()
+            or before.st_nlink != 1
+            or before.st_mode & 0o077
+            or not 1 <= before.st_size <= MAX_CODEX_ROLLOUT_BYTES
+        ):
+            raise ProbeSchedulerError("Codex rollout receipt is unsafe")
+        offset = max(0, before.st_size - MAX_CODEX_ROLLOUT_TAIL_BYTES)
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        remaining = before.st_size - offset
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, IO_CHUNK_BYTES))
+            if not chunk:
+                raise ProbeSchedulerError("Codex rollout receipt ended early")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity_before = (
+        before.st_dev, before.st_ino, before.st_mode, before.st_uid,
+        before.st_nlink, before.st_size, before.st_mtime_ns, before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev, after.st_ino, after.st_mode, after.st_uid,
+        after.st_nlink, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+    )
+    if identity_before != identity_after:
+        raise ProbeSchedulerError("Codex rollout receipt changed while being read")
+    payload = b"".join(chunks)
+    if offset:
+        separator = payload.find(b"\n")
+        payload = b"" if separator < 0 else payload[separator + 1 :]
+    return payload
+
+
+def _codex_quota_window(
+    value: Any,
+    *,
+    label: str,
+    observed_at: datetime,
+    now: datetime,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    used_percent = value.get("used_percent")
+    resets_at = value.get("resets_at")
+    window_minutes = value.get("window_minutes")
+    if (
+        isinstance(used_percent, bool)
+        or not isinstance(used_percent, (int, float))
+        or not math.isfinite(float(used_percent))
+        or not 0 <= float(used_percent) <= 100
+        or isinstance(resets_at, bool)
+        or not isinstance(resets_at, int)
+        or isinstance(window_minutes, bool)
+        or not isinstance(window_minutes, int)
+        or not 0 < window_minutes <= 30 * 24 * 60
+    ):
+        return None
+    try:
+        reset_at = datetime.fromtimestamp(resets_at, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    latest_plausible_reset = observed_at + timedelta(minutes=window_minutes + 5)
+    if reset_at <= now or reset_at > latest_plausible_reset:
+        return None
+    reset_text = (
+        reset_at.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    )
+    return {
+        "label": label,
+        "remaining_ratio": round(
+            max(0.0, 1.0 - float(used_percent) / 100.0), 12
+        ),
+        "used_percent": float(used_percent),
+        "reset_at": reset_text,
+        "reset_at_unix": resets_at,
+        "window_minutes": window_minutes,
+    }
+
+
+def _codex_quota_event(
+    value: Any, *, now: datetime, line_sha256: str
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or value.get("type") != "event_msg":
+        return None
+    observed_at = parse_time(value.get("timestamp"))
+    payload = value.get("payload")
+    rate_limits = payload.get("rate_limits") if isinstance(payload, dict) else None
+    if observed_at is None or not isinstance(rate_limits, dict):
+        return None
+    age_seconds = (now - observed_at).total_seconds()
+    if not 0 <= age_seconds <= MAX_CODEX_QUOTA_AGE_SECONDS:
+        return None
+    if rate_limits.get("limit_id") != "codex":
+        return None
+    windows: list[dict[str, Any]] = []
+    for label in ("primary", "secondary", "individual_limit"):
+        raw_window = rate_limits.get(label)
+        if raw_window is None:
+            continue
+        window = _codex_quota_window(
+            raw_window, label=label, observed_at=observed_at, now=now
+        )
+        if window is None:
+            return None
+        windows.append(window)
+    if not windows:
+        return None
+    limiting_window = min(
+        windows,
+        key=lambda item: (
+            float(item["remaining_ratio"]),
+            -int(item["reset_at_unix"]),
+        ),
+    )
+    reached_type = rate_limits.get("rate_limit_reached_type")
+    if reached_type is not None and not isinstance(reached_type, str):
+        return None
+    spend_control_reached = rate_limits.get("spend_control_reached")
+    if spend_control_reached not in {None, True, False}:
+        return None
+    credits = rate_limits.get("credits")
+    purchased_credits_available: bool | None = None
+    if isinstance(credits, dict) and isinstance(credits.get("has_credits"), bool):
+        purchased_credits_available = credits["has_credits"]
+    status = (
+        "exhausted"
+        if any(float(item["used_percent"]) >= 100 for item in windows)
+        or bool(reached_type)
+        or spend_control_reached is True
+        else "available"
+    )
+    plan_type = rate_limits.get("plan_type")
+    if not isinstance(plan_type, str) or not plan_type or len(plan_type) > 64:
+        plan_type = None
+    core = {
+        "schema_version": 1,
+        "pool": CODEX_QUOTA_POOL,
+        "source": CODEX_QUOTA_SOURCE,
+        "status": status,
+        "remaining_ratio": limiting_window["remaining_ratio"],
+        "used_percent": limiting_window["used_percent"],
+        "reset_at": limiting_window["reset_at"],
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "window_minutes": limiting_window["window_minutes"],
+        "limiting_window": limiting_window["label"],
+        "limits": windows,
+        "plan_type": plan_type,
+        "purchased_credits_available": purchased_credits_available,
+        "paid_fallback_authorized": False,
+        "model_invocations": 0,
+        "source_line_sha256": line_sha256,
+    }
+    return {**core, "observation_sha256": value_sha256(core)}
+
+
+def collect_codex_quota_observation(
+    root: Path, *, now: datetime | None = None
+) -> dict[str, Any]:
+    boundary = (now or utc_now()).astimezone(timezone.utc)
+    best: tuple[datetime, dict[str, Any]] | None = None
+    try:
+        candidates = _codex_rollout_candidates(root)
+    except (OSError, ProbeSchedulerError):
+        candidates = []
+    scanned_bytes = 0
+    for path in candidates:
+        try:
+            payload = _read_codex_rollout_tail(path)
+        except ProbeSchedulerError:
+            continue
+        if scanned_bytes + len(payload) > MAX_CODEX_ROLLOUT_SCAN_BYTES:
+            break
+        scanned_bytes += len(payload)
+        for line in reversed(payload.splitlines()):
+            if not line or len(line) > MAX_COMMAND_OUTPUT_BYTES:
+                continue
+            try:
+                value = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            observation = _codex_quota_event(
+                value, now=boundary, line_sha256=bytes_sha256(line)
+            )
+            if observation is None:
+                continue
+            observed = parse_time(observation["observed_at"])
+            assert observed is not None
+            if best is None or observed > best[0]:
+                best = observed, observation
+            break
+    if best is not None:
+        return best[1]
+    core = {
+        "schema_version": 1,
+        "pool": CODEX_QUOTA_POOL,
+        "source": CODEX_QUOTA_SOURCE,
+        "status": "unknown",
+        "reason": "no_fresh_provider_quota_receipt",
+        "observed_at": iso_now(),
+        "paid_fallback_authorized": False,
+        "model_invocations": 0,
+    }
+    return {**core, "observation_sha256": value_sha256(core)}
 
 
 def read_json(path: Path, *, required: bool = True) -> tuple[dict[str, Any], bytes]:
@@ -695,6 +1007,101 @@ def validate_state_after_probe(
         raise ProbeSchedulerError("router pool state is invalid")
 
 
+def quota_update_plan(
+    router_invocation: str,
+    observation: dict[str, Any],
+    current_state: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    status = observation.get("status")
+    if status in {"available", "exhausted"}:
+        remaining = observation.get("remaining_ratio")
+        reset_at = observation.get("reset_at")
+        if (
+            isinstance(remaining, bool)
+            or not isinstance(remaining, (int, float))
+            or not 0 <= float(remaining) <= 1
+            or parse_time(reset_at) is None
+        ):
+            raise ProbeSchedulerError("Codex quota observation is invalid")
+        return {
+            "reason": "fresh_provider_observation",
+            "argv": [
+                router_invocation,
+                "set-quota",
+                "--pool",
+                CODEX_QUOTA_POOL,
+                "--status",
+                str(status),
+                "--remaining-ratio",
+                format(float(remaining), ".12g"),
+                "--reset-at",
+                str(reset_at),
+                "--verified-now",
+            ],
+        }
+    if status != "unknown":
+        return None
+    pools = current_state.get("pools")
+    pool = pools.get(CODEX_QUOTA_POOL) if isinstance(pools, dict) else None
+    reset_at = parse_time(pool.get("reset_at")) if isinstance(pool, dict) else None
+    boundary = (now or utc_now()).astimezone(timezone.utc)
+    if reset_at is None or reset_at > boundary:
+        return None
+    return {
+        "reason": "expired_reset_to_unknown",
+        "argv": [
+            router_invocation,
+            "set-quota",
+            "--pool",
+            CODEX_QUOTA_POOL,
+            "--status",
+            "unknown",
+            "--verified-now",
+        ],
+    }
+
+
+def validate_state_after_quota_update(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    observation: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    if result.get("updated") is not True or result.get("pool") != CODEX_QUOTA_POOL:
+        raise ProbeSchedulerError("router quota update result is invalid")
+    pool_state = result.get("pool_state")
+    if not isinstance(pool_state, dict):
+        raise ProbeSchedulerError("router quota update pool state is invalid")
+    expected_status = observation.get("status")
+    if expected_status not in {"available", "exhausted"}:
+        expected_status = "unknown"
+    if (
+        pool_state.get("status") != expected_status
+        or parse_time(pool_state.get("verified_at")) is None
+        or parse_time(pool_state.get("updated_at")) is None
+    ):
+        raise ProbeSchedulerError("router quota update does not match observation")
+    if expected_status in {"available", "exhausted"}:
+        if (
+            pool_state.get("remaining_ratio") != observation.get("remaining_ratio")
+            or pool_state.get("reset_at") != observation.get("reset_at")
+        ):
+            raise ProbeSchedulerError("router quota update does not match observation")
+    elif any(field in pool_state for field in ("remaining_ratio", "reset_at")):
+        raise ProbeSchedulerError("expired quota reset retained stale quota fields")
+    for field in ("schema_version", "catalog_sha256", "catalog", "routes", "history"):
+        if after.get(field) != before.get(field):
+            raise ProbeSchedulerError(f"quota update changed router {field}")
+    expected_pools = json.loads(json.dumps(before.get("pools", {}), sort_keys=True))
+    if not isinstance(expected_pools, dict):
+        raise ProbeSchedulerError("router pool state before quota update is invalid")
+    expected_pools[CODEX_QUOTA_POOL] = pool_state
+    if after.get("pools") != expected_pools:
+        raise ProbeSchedulerError("quota update changed unrelated pool state")
+
+
 def validate_status(status_value: dict[str, Any]) -> None:
     if status_value.get("schema_version") != 2:
         raise ProbeSchedulerError("router status schema_version is invalid")
@@ -730,6 +1137,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--lock", type=Path, default=DEFAULT_LOCK)
     result.add_argument("--receipt", type=Path, default=DEFAULT_RECEIPT)
     result.add_argument("--failure", type=Path, default=DEFAULT_FAILURE)
+    result.add_argument(
+        "--codex-sessions-root", type=Path, default=DEFAULT_CODEX_SESSIONS_ROOT
+    )
     result.add_argument("--timeout-seconds", type=int, default=120)
     return result
 
@@ -757,8 +1167,28 @@ def main(argv: list[str] | None = None) -> int:
                 pass_fds=(router_descriptor,),
             )
             validate_probe(probe)
-            after, after_bytes = read_json(arguments.state)
-            validate_state_after_probe(before, after, probe)
+            after_probe, after_probe_bytes = read_json(arguments.state)
+            validate_state_after_probe(before, after_probe, probe)
+            quota_observation = collect_codex_quota_observation(
+                arguments.codex_sessions_root
+            )
+            quota_plan = quota_update_plan(
+                router_invocation, quota_observation, after_probe
+            )
+            quota_result: dict[str, Any] | None = None
+            if quota_plan is not None:
+                quota_result = run_json_command(
+                    quota_plan["argv"],
+                    environment=environment,
+                    timeout_seconds=arguments.timeout_seconds,
+                    pass_fds=(router_descriptor,),
+                )
+                after, after_bytes = read_json(arguments.state)
+                validate_state_after_quota_update(
+                    after_probe, after, quota_observation, quota_result
+                )
+            else:
+                after, after_bytes = after_probe, after_probe_bytes
             status_value = run_json_command(
                 [router_invocation, "status"],
                 environment=environment,
@@ -766,6 +1196,33 @@ def main(argv: list[str] | None = None) -> int:
                 pass_fds=(router_descriptor,),
             )
             validate_status(status_value)
+            if quota_result is not None:
+                effective_pool = status_value.get("pools", {}).get(CODEX_QUOTA_POOL)
+                expected_status = quota_observation.get("status")
+                if expected_status not in {"available", "exhausted"}:
+                    expected_status = "unknown"
+                if (
+                    not isinstance(effective_pool, dict)
+                    or effective_pool.get("status") != expected_status
+                ):
+                    raise ProbeSchedulerError(
+                        "router status does not confirm the Codex quota update"
+                    )
+                if expected_status in {"available", "exhausted"} and (
+                    effective_pool.get("remaining_ratio")
+                    != quota_observation["remaining_ratio"]
+                    or effective_pool.get("reset_at")
+                    != quota_observation["reset_at"]
+                ):
+                    raise ProbeSchedulerError(
+                        "router status does not confirm the Codex quota update"
+                    )
+                if expected_status == "unknown" and any(
+                    field in effective_pool for field in ("remaining_ratio", "reset_at")
+                ):
+                    raise ProbeSchedulerError(
+                        "router status retained expired Codex quota fields"
+                    )
             receipt = {
                 "schema_version": 1,
                 "kind": "coding-agent-probe-scheduler-receipt",
@@ -776,8 +1233,14 @@ def main(argv: list[str] | None = None) -> int:
                 "router_sha256_pin": str(arguments.router_sha256_file),
                 "state": str(arguments.state),
                 "state_sha256_before": bytes_sha256(before_bytes),
+                "state_sha256_after_probe": bytes_sha256(after_probe_bytes),
                 "state_sha256_after": bytes_sha256(after_bytes),
                 "history_sha256": value_sha256(after.get("history", {})),
+                "quota_observation": quota_observation,
+                "quota_state_updated": quota_result is not None,
+                "quota_update_reason": (
+                    quota_plan["reason"] if quota_plan is not None else None
+                ),
                 "catalog_probe_sha256": probe["catalog_probe_sha256"],
                 "observed_at": probe["observed_at"],
                 "status_readback": {
@@ -789,7 +1252,9 @@ def main(argv: list[str] | None = None) -> int:
                 "paid_api_requests_authorized": 0,
                 "api_key_environment_removed_count": len(FORBIDDEN_API_KEY_ENV),
                 "does_not_establish": [
-                    "provider quota remaining beyond observed metadata",
+                    "provider quota after the observation timestamp",
+                    "quota for providers without fresh receipt metadata",
+                    "provider-side authenticity beyond same-uid local receipt storage",
                     "future route availability",
                     "execution authority",
                 ],
