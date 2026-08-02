@@ -494,6 +494,86 @@ class ResourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resources.normalize_resource_key("port:70000")
 
+    def test_normalizes_top_level_operation_resource_keys(self) -> None:
+        key = (
+            "operation:bug-fix:"
+            "lane-6a6ba53c457c8191b71efd721ebf8df6:"
+            "repo-heimgewebe-grabowski:pr-560:"
+            f"head-{'a' * 40}:diff-{'b' * 64}:stage-review"
+        )
+
+        self.assertEqual(key, resources.normalize_resource_key(key))
+        embedded = (
+            f"repo:{self.root}/grabowski:operation:bug-fix:"
+            "lane-6a6ba53c457c8191b71efd721ebf8df6"
+        )
+        self.assertEqual(embedded, resources.normalize_resource_key(embedded))
+        self.assertNotEqual(key, resources.normalize_resource_key(embedded))
+
+        invalid = (
+            "operation:bug-fix",
+            "operation:bug-fix:",
+            "operation:bug-fix::lane-example",
+            "operation:bug fix:lane-example",
+            "operation:-bug-fix:lane-example",
+        )
+        for candidate in invalid:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(ValueError):
+                    resources.normalize_resource_key(candidate)
+
+        with self.assertRaisesRegex(ValueError, "too large"):
+            resources.normalize_resource_key(
+                "operation:bug-fix:" + "a" * 4090
+            )
+
+    def test_operation_resource_leases_conflict_only_on_exact_identity(self) -> None:
+        first = (
+            "operation:bug-fix:lane-a:repo-grabowski:"
+            "head-aaaaaaaa:stage-review"
+        )
+        second = (
+            "operation:bug-fix:lane-b:repo-grabowski:"
+            "head-aaaaaaaa:stage-review"
+        )
+
+        resources.acquire_resources(
+            "owner-a", [first], purpose="first operation", ttl_seconds=60
+        )
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "owner-b", [first], purpose="duplicate operation", ttl_seconds=60
+            )
+        resources.acquire_resources(
+            "owner-b", [second], purpose="disjoint operation", ttl_seconds=60
+        )
+
+        scoped = "operation:bug-fix:lane-c:repo-grabowski:stage-review"
+        with self.assertRaisesRegex(
+            ValueError, "do not accept repository scope manifests"
+        ):
+            resources.acquire_resources(
+                "owner-c",
+                [scoped],
+                purpose="operation may not inherit repository authority",
+                ttl_seconds=60,
+                metadata={
+                    "scope_manifest": self.scope_manifest(
+                        self.root / "grabowski",
+                        name="operation-scope",
+                        path=self.root / "grabowski" / "src" / "example.py",
+                    ),
+                    "scope_manifest_complete": True,
+                },
+            )
+
+        with sqlite3.connect(self.database) as connection:
+            rows = connection.execute(
+                "SELECT resource_key, owner_id FROM leases "
+                "WHERE resource_key LIKE 'operation:%' ORDER BY resource_key"
+            ).fetchall()
+        self.assertEqual([(first, "owner-a"), (second, "owner-b")], rows)
+
     def test_count_resources_uses_complete_aggregate_and_owner_filter(self) -> None:
         resources.acquire_resources(
             "owner-a", ["port:9222"], purpose="first", ttl_seconds=60
