@@ -1514,6 +1514,47 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual([24, 48], result["retention_boundaries_unix"])
         self.assertEqual(24, result["retention_boundary_unix"])
 
+    def test_task_output_cleanup_reports_earliest_selected_deferred_boundary(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        task_id = str(record["task_id"])
+        final_attempt = 2
+        final_unit = tasks._task_unit(task_id, final_attempt)
+        record.update({
+            "attempt": final_attempt,
+            "unit": final_unit,
+            "authoritative_unit": final_unit,
+        })
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            side_effect=[48, 24],
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_now_unix",
+            side_effect=[10, 10],
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_after_archive",
+        ) as cleanup:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=12,
+            )
+
+        self.assertEqual(result["status"], "deferred")
+        self.assertEqual(result["reason"], "attempt_deferred")
+        self.assertEqual(result["eligible_at_unix"], 24)
+        self.assertEqual(result["retention_boundary_unix"], 24)
+        self.assertEqual(result["retention_boundaries_unix"], [48, 24])
+        self.assertEqual(result["counts"]["deferred"], 2)
+        cleanup.assert_not_called()
+
     def _automatic_cleanup_fixture(
         self, count: int, *, projection_sha256: str = "9" * 64
     ) -> tuple[list[dict[str, object]], dict[str, object], object]:
