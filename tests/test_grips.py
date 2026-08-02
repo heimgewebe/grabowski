@@ -6678,6 +6678,31 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         valid = self.run_captain(captain_parameters([captain_action(target_change={"from": "head-a", "to": "head-b"})]))
         self.assertEqual("ready_for_manual_captain_decision", valid["output"]["gate_decision"])
 
+    def test_scope_gate_details_are_bounded_with_visible_omission(self) -> None:
+        details = [
+            f"actions[{index}].scope."
+            + ("x" * (grip_orchestration.CAPTAIN_GATE_DETAIL_PREVIEW_LIMIT * 2))
+            for index in range(grip_orchestration.CAPTAIN_GATE_DETAIL_MAX_ITEMS + 5)
+        ]
+        with patch.object(grips, "_captain_scope_findings", return_value=details):
+            result = self.run_captain(captain_parameters())
+
+        gate = self.gate(result, "scope-bound")
+        bounded = gate["details"]
+        self.assertEqual(grip_orchestration.CAPTAIN_GATE_DETAIL_MAX_ITEMS, len(bounded))
+        self.assertTrue(
+            all(
+                len(entry) <= grip_orchestration.CAPTAIN_GATE_DETAIL_PREVIEW_LIMIT
+                for entry in bounded
+            )
+        )
+        self.assertEqual("...[truncated 6 gate details]", bounded[-1])
+        self.assertEqual(bounded, result["output"]["blocked_reasons"])
+        self.assertEqual(
+            bounded,
+            [record["message"] for record in result["output"]["errors"]],
+        )
+
     def test_scope_without_effect_boundaries_blocks(self) -> None:
         for scope in (
             {"operation": "preflight only"},
@@ -10704,6 +10729,22 @@ class CaptainStructuredErrorTests(unittest.TestCase):
             ["allow_execution_required", "base_sha does not match expected_base_sha"],
             [record["message"] for record in records],
         )
+
+    def test_structured_gate_details_remain_structured(self) -> None:
+        details = {"actions_sha256": "a" * 64}
+        gates = [
+            grips._captain_gate(
+                "evidence-digest-bound",
+                "pass",
+                "evidence is bound",
+                details,
+            )
+        ]
+
+        bounded = grip_orchestration._bounded_captain_gates(grips, gates)
+
+        self.assertEqual(details, bounded[0]["details"])
+        self.assertEqual(details, gates[0]["details"])
 
     def test_gate_errors_are_the_source_of_compatibility_reasons(self) -> None:
         gates = [

@@ -6,6 +6,38 @@ import grabowski_merge_guard
 
 CoreModule = Any
 
+CAPTAIN_GATE_DETAIL_MAX_ITEMS = 32
+CAPTAIN_GATE_DETAIL_PREVIEW_LIMIT = 256
+
+
+def _bounded_captain_gates(
+    core: CoreModule,
+    gates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    bounded_gates: list[dict[str, Any]] = []
+    for gate in gates:
+        bounded_gate = dict(gate)
+        details = bounded_gate.get("details")
+        if (
+            isinstance(details, (list, tuple))
+            and all(isinstance(entry, (str, bytes)) for entry in details)
+        ):
+            bounded_details = [
+                core._bounded_command_output(
+                    entry,
+                    limit=CAPTAIN_GATE_DETAIL_PREVIEW_LIMIT,
+                )
+                for entry in details
+            ]
+            if len(bounded_details) > CAPTAIN_GATE_DETAIL_MAX_ITEMS:
+                visible = bounded_details[: CAPTAIN_GATE_DETAIL_MAX_ITEMS - 1]
+                omitted = len(bounded_details) - len(visible)
+                visible.append(f"...[truncated {omitted} gate details]")
+                bounded_details = visible
+            bounded_gate["details"] = bounded_details
+        bounded_gates.append(bounded_gate)
+    return bounded_gates
+
 
 def run_mechanic_loop(core: CoreModule, spec: Any, parameters: dict[str, Any], receipt: dict[str, Any], runner: Any, github_runner: Any) -> dict[str, Any]:
     actions = core._mechanic_actions(parameters)
@@ -131,6 +163,7 @@ def run_captain_preflight(core: CoreModule, spec: Any, parameters: dict[str, Any
     core._mechanic_bool(parameters, "allow_execution", False)
     action_names = ", ".join(action["action"] for action in actions)
     gates, projection_info = core._captain_authority_gates(parameters, actions)
+    gates = _bounded_captain_gates(core, gates)
     blocked_reasons = core._captain_blocked_reasons(gates)
     all_gates_pass = not blocked_reasons
     autonomous_ready = core._captain_trusted_owner_autonomy_ready(parameters, actions)
@@ -190,6 +223,7 @@ def run_captain_run(core: CoreModule, spec: Any, parameters: dict[str, Any], rec
     allow_execution = core._mechanic_bool(parameters, "allow_execution", False)
     action_names = ", ".join(action["action"] for action in actions)
     gates, projection_info = core._captain_authority_gates(parameters, actions)
+    gates = _bounded_captain_gates(core, gates)
     blocked_reasons = core._captain_blocked_reasons(gates)
     if len(actions) != 1:
         blocked_reasons.append("captain_run_supports_exactly_one_action_in_v1")
