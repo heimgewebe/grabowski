@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal, cast, get_args
 
 import grabowski_fleet as fleet
 import grabowski_mcp as base
@@ -897,7 +897,14 @@ SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 # Deliberately canonical: only names emitted by _task_unit are accepted.
 # Manual or future-format units must never be adopted as authoritative by accident.
 UNIT = re.compile(r"grabowski-task-[0-9a-f]{24}-a[1-9][0-9]*\.service\Z")
-RESUME_POLICIES = {"never", "retry-safe", "verify-then-retry", "manual"}
+# Authoritative contract for static callers, runtime validation, and reflected tool schemas.
+ResumePolicy = Literal[
+    "manual",
+    "never",
+    "retry-safe",
+    "verify-then-retry",
+]
+RESUME_POLICIES: frozenset[str] = frozenset(get_args(ResumePolicy))
 CHRONIK_OPERATION_TASK_CLASS = {
     "implement": "coding",
     "review": "review",
@@ -2374,10 +2381,10 @@ def _validate_chronik_context_metadata(
 
 
 
-def _validate_resume_policy(value: str) -> str:
+def _validate_resume_policy(value: str) -> ResumePolicy:
     if value not in RESUME_POLICIES:
         raise ValueError(f"resume_policy must be one of {sorted(RESUME_POLICIES)}")
-    return value
+    return cast(ResumePolicy, value)
 
 
 def _resource_keys(values: list[str] | None) -> list[str]:
@@ -2827,7 +2834,7 @@ def _latest_matching_active_execution_record(
 def _resolve_active_execution_reuse(
     identity: dict[str, Any],
     *,
-    resume_policy: str,
+    resume_policy: ResumePolicy,
 ) -> dict[str, Any] | None:
     latest = _latest_matching_active_execution_record(identity)
     if latest is None:
@@ -5852,7 +5859,7 @@ def grabowski_task_start(
     argv: list[str],
     cwd: str | None = None,
     runtime_seconds: int = operator.DEFAULT_JOB_RUNTIME,
-    resume_policy: str = "verify-then-retry",
+    resume_policy: ResumePolicy = "verify-then-retry",
     cpu_weight: int = 100,
     io_weight: int = 100,
     memory_max_bytes: int | None = None,
@@ -8227,7 +8234,7 @@ async def _grabowski_task_start_tool(
     argv: list[str],
     cwd: str | None = None,
     runtime_seconds: int = operator.DEFAULT_JOB_RUNTIME,
-    resume_policy: str = "verify-then-retry",
+    resume_policy: ResumePolicy = "verify-then-retry",
     cpu_weight: int = 100,
     io_weight: int = 100,
     memory_max_bytes: int | None = None,
