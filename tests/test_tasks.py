@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import types
+from typing import get_args, get_type_hints
 import unittest
 from unittest.mock import patch
 
@@ -2105,6 +2106,24 @@ class TaskTests(unittest.TestCase):
                     "host": "wg-prod-1",
                     "unit": "grabowski-task-0123456789abcdef01234567-a1.service",
                 })
+
+    def test_task_start_resume_policy_schema_matches_runtime_contract(self) -> None:
+        expected = {"manual", "never", "retry-safe", "verify-then-retry"}
+
+        self.assertEqual(expected, set(tasks.RESUME_POLICIES))
+        self.assertEqual(expected, set(get_args(tasks.ResumePolicy)))
+        tool_hints = get_type_hints(tasks._grabowski_task_start_tool)
+        self.assertEqual(expected, set(get_args(tool_hints["resume_policy"])))
+
+        for policy in sorted(expected):
+            with self.subTest(policy=policy):
+                self.assertEqual(policy, tasks._validate_resume_policy(policy))
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "resume_policy must be one of",
+        ):
+            tasks._validate_resume_policy("automatic")
 
     def test_manual_resume_policy_fails_closed(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
