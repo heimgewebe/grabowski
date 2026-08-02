@@ -2108,22 +2108,38 @@ class TaskTests(unittest.TestCase):
                 })
 
     def test_task_start_resume_policy_schema_matches_runtime_contract(self) -> None:
-        expected = {"manual", "never", "retry-safe", "verify-then-retry"}
+        expected = frozenset({"manual", "never", "retry-safe", "verify-then-retry"})
 
-        self.assertEqual(expected, set(tasks.RESUME_POLICIES))
-        self.assertEqual(expected, set(get_args(tasks.ResumePolicy)))
-        tool_hints = get_type_hints(tasks._grabowski_task_start_tool)
-        self.assertEqual(expected, set(get_args(tool_hints["resume_policy"])))
+        self.assertIsInstance(tasks.RESUME_POLICIES, frozenset)
+        self.assertEqual(expected, tasks.RESUME_POLICIES)
+        self.assertEqual(expected, frozenset(get_args(tasks.ResumePolicy)))
+        for entry_point in (
+            tasks.grabowski_task_start,
+            tasks._grabowski_task_start_tool,
+        ):
+            with self.subTest(entry_point=entry_point.__name__):
+                hints = get_type_hints(entry_point)
+                self.assertEqual(
+                    expected,
+                    frozenset(get_args(hints["resume_policy"])),
+                )
+        validator_hints = get_type_hints(tasks._validate_resume_policy)
+        self.assertEqual(
+            expected,
+            frozenset(get_args(validator_hints["return"])),
+        )
 
         for policy in sorted(expected):
             with self.subTest(policy=policy):
                 self.assertEqual(policy, tasks._validate_resume_policy(policy))
 
-        with self.assertRaisesRegex(
-            ValueError,
-            "resume_policy must be one of",
-        ):
+        with self.assertRaises(ValueError) as raised:
             tasks._validate_resume_policy("automatic")
+        self.assertEqual(
+            str(raised.exception),
+            "resume_policy must be one of "
+            "['manual', 'never', 'retry-safe', 'verify-then-retry']",
+        )
 
     def test_manual_resume_policy_fails_closed(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
