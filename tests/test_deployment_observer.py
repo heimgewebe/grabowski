@@ -500,6 +500,15 @@ class DualDeployObserverActivationTests(unittest.TestCase):
                 dual._activate_runtime_deploy_observer(_marker())
         with patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(dual._activate_runtime_deploy_observer(_marker()))
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(
+                os.environ,
+                {"GRABOWSKI_JOB_DIRECTORY": temporary},
+                clear=True,
+            ):
+                self.assertIsNone(
+                    dual._activate_runtime_deploy_observer(_marker())
+                )
 
     def test_unrelated_grabowski_job_without_contract_creates_no_activation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
