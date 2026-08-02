@@ -1129,6 +1129,10 @@ def _claim_intent_rejection(payload: dict[str, Any]) -> BureauPickupError:
                 if key in payload
             }
         )
+    if payload.get("kind") == "bureau_approval_required":
+        approval = payload.get("approval")
+        if isinstance(approval, dict):
+            details["approval"] = _bounded_claim_rejection_value(approval)
     detail = payload.get("detail")
     if isinstance(detail, str):
         try:

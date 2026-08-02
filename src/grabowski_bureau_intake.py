@@ -641,6 +641,19 @@ def _invoke_bureau(
             required_readback=readback,
             retryable=False,
         )
+    if completed.returncode != 0 and not completed.stdout.strip() and completed.stderr.strip():
+        return _adapter_failure(
+            "bureau-command-rejected",
+            details={
+                "returncode": completed.returncode,
+                "stdout_sha256": _sha256(stdout),
+                "stderr_sha256": _sha256(stderr),
+            },
+            effect_started=mutation,
+            ambiguity=mutation,
+            required_readback=readback,
+            retryable=False,
+        )
     try:
         value = json.loads(completed.stdout)
     except json.JSONDecodeError:
