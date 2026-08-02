@@ -990,6 +990,7 @@ def grabowski_contract_drift() -> dict[str, Any]:
             "error": str(exc)[:512],
         }
     semantic_ready = coding_agent_catalog.get("ready") is True
+    tool_contract = base._runtime_tool_contract_summary()
     return {
         "contract_source": snapshot["source"],
         "expected_tool_count": len(expected),
@@ -998,7 +999,12 @@ def grabowski_contract_drift() -> dict[str, Any]:
         "catalog_matches_contract": structural_ready and semantic_ready,
         "drift": normalized,
         "coding_agent_catalog": coding_agent_catalog,
-        "connector_snapshot_observable": False,
+        "connector_snapshot_observable": bool(
+            tool_contract.get("client_schema_snapshot_observable")
+        ),
+        "connector_name_snapshot_observable": bool(
+            tool_contract.get("client_snapshot_observable")
+        ),
     }
 
 

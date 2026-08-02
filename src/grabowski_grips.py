@@ -287,8 +287,11 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
-        version="1.0",
-        summary="Bind one client-declared connector tool snapshot to the current server release and tool contract.",
+        version="1.1",
+        summary=(
+            "Bind one client-declared connector tool snapshot, with optional bounded "
+            "sentinel schemas, to the current server release and tool contract."
+        ),
         effect=MUTATING,
         required_parameters=(
             "client_id",

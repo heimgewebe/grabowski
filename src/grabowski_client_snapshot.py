@@ -16,6 +16,8 @@ import time
 from typing import Any, Iterator
 from urllib.parse import urlsplit
 
+import grabowski_connector_contract as connector_contract
+
 
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_KIND = "grabowski_connector_client_snapshot"
@@ -236,6 +238,39 @@ def _server_contract(parameters: dict[str, Any]) -> tuple[dict[str, Any], dict[s
     )
 
 
+def _contract_error(exc: Exception) -> ClientSnapshotError:
+    return ClientSnapshotError(str(exc))
+
+
+def _empty_schema_probe() -> dict[str, Any]:
+    return {
+        "matches": False,
+        "name_contract_matches": False,
+        "runtime_contract_matches": False,
+        "schema_contract_matches": False,
+        "schema_coverage_count": 0,
+        "required_schema_sentinels": sorted(
+            connector_contract.REQUIRED_SCHEMA_SENTINELS
+        ),
+        "missing_schema_sentinels": sorted(
+            connector_contract.REQUIRED_SCHEMA_SENTINELS
+        ),
+        "unexpected_schema_tools": [],
+        "required_schema_properties": {
+            name: sorted(properties)
+            for name, properties in sorted(
+                connector_contract.REQUIRED_SCHEMA_PROPERTIES.items()
+            )
+        },
+        "required_schema_property_mismatches": [],
+        "schema_mismatches": [],
+        "missing_from_connector": [],
+        "unexpected_in_connector": [],
+        "contract_missing_from_runtime": [],
+        "runtime_unexpected_from_contract": [],
+    }
+
+
 def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) -> dict[str, Any]:
     allowed = {
         "client_id",
@@ -244,9 +279,11 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "observed_names_sha256",
         "observed_release_id",
         "observed_agent_instructions_sha256",
+        "observed_tools",
         "_server_tool_contract",
         "_server_runtime",
         "_server_agent_instructions_sha256",
+        "_server_observed_tools",
     }
     unknown = sorted(set(parameters) - allowed)
     if unknown:
@@ -282,6 +319,49 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         mismatches.append("release_id")
     if observed_instructions_sha256 != instructions_sha256:
         mismatches.append("agent_instructions_sha256")
+
+    schema_evidence: dict[str, Any] | None = None
+    schema_probe = _empty_schema_probe()
+    observed_tools = parameters.get("observed_tools")
+    if observed_tools is not None:
+        try:
+            observed_names, observed_schemas, observed_metadata = (
+                connector_contract.parse_observed_artifact(
+                    observed_tools, label="client observed artifact"
+                )
+            )
+            server_names, server_schemas, server_metadata = (
+                connector_contract.parse_observed_artifact(
+                    parameters.get("_server_observed_tools"),
+                    label="server runtime artifact",
+                )
+            )
+        except connector_contract.ConnectorContractError as exc:
+            raise _contract_error(exc) from exc
+        if observed_metadata["name_count"] != observed_count:
+            mismatches.append("observed_artifact_tool_count")
+        if observed_metadata["names_sha256"] != observed_names_sha256:
+            mismatches.append("observed_artifact_names_sha256")
+        if server_metadata["name_count"] != contract["registered_tool_count"]:
+            mismatches.append("server_artifact_tool_count")
+        if server_metadata["names_sha256"] != contract["registered_names_sha256"]:
+            mismatches.append("server_artifact_names_sha256")
+        schema_probe = connector_contract.probe_contract(
+            observed_names,
+            observed_schemas,
+            server_names,
+            server_schemas,
+            server_names,
+        )
+        if schema_probe["matches"] is not True:
+            mismatches.append("schema_contract")
+        schema_evidence = {
+            "schema_version": 1,
+            "observed_artifact": observed_metadata,
+            "server_artifact": server_metadata,
+            "probe": schema_probe,
+        }
+
     timestamp = int(time.time()) if now_unix is None else now_unix
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
         raise ClientSnapshotError("snapshot timestamp is invalid")
@@ -293,6 +373,25 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "observed_release_id": observed_release_id,
         "observed_agent_instructions_sha256": observed_instructions_sha256,
     }
+    if schema_evidence is not None:
+        declaration.update(
+            {
+                "observed_tools_artifact_sha256": schema_evidence[
+                    "observed_artifact"
+                ]["artifact_sha256"],
+                "observed_schema_coverage_count": schema_evidence[
+                    "observed_artifact"
+                ]["schema_coverage_count"],
+                "observed_schema_tools": schema_evidence["observed_artifact"][
+                    "schema_tools"
+                ],
+            }
+        )
+    verification_model = (
+        "client-declared-server-schema-compared-v2"
+        if schema_evidence is not None
+        else "client-declared-server-compared-v1"
+    )
     receipt: dict[str, Any] = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "kind": SNAPSHOT_KIND,
@@ -307,9 +406,10 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
             "repo_head": runtime["repo_head"],
             "agent_instructions_sha256": instructions_sha256,
         },
+        "schema_evidence": schema_evidence,
         "verified": not mismatches,
         "mismatches": mismatches,
-        "verification_model": "client-declared-server-compared-v1",
+        "verification_model": verification_model,
         "does_not_establish": [
             "platform-enforced client snapshot identity",
             "that the client invoked every declared tool",
@@ -329,13 +429,14 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "expires_at_unix": receipt["expires_at_unix"],
         "client_declaration_sha256": receipt["client_declaration_sha256"],
         "receipt_sha256": receipt["receipt_sha256"],
-        "verification_model": receipt["verification_model"],
+        "verification_model": verification_model,
+        "schema_evidence_observed": schema_evidence is not None,
+        **schema_probe,
         "recommended_next_action": (
             "none" if not mismatches else "refresh the connector tool snapshot and bind it again"
         ),
         "does_not_establish": list(receipt["does_not_establish"]),
     }
-
 
 def _validate_receipt(receipt: dict[str, Any]) -> None:
     if receipt.get("schema_version") != SNAPSHOT_SCHEMA_VERSION or receipt.get("kind") != SNAPSHOT_KIND:
@@ -366,6 +467,9 @@ def snapshot_status(
     timestamp = int(time.time()) if now_unix is None else now_unix
     base = {
         "observable": False,
+        "schema_observable": False,
+        "schema_evidence_observed": False,
+        "schema_contract_matches": False,
         "fresh": False,
         "matched": False,
         "verification_model": "client-declared-server-compared-v1",
@@ -419,6 +523,20 @@ def snapshot_status(
     fresh = created_at - SNAPSHOT_CLOCK_SKEW_SECONDS <= timestamp <= expires_at
     matched = receipt.get("verified") is True and not receipt.get("mismatches") and binding_matches and declaration_matches
     observable = fresh and matched
+    schema_evidence = receipt.get("schema_evidence")
+    schema_probe = (
+        schema_evidence.get("probe")
+        if isinstance(schema_evidence, dict)
+        and isinstance(schema_evidence.get("probe"), dict)
+        else {}
+    )
+    schema_evidence_observed = bool(schema_probe)
+    schema_contract_matches = (
+        schema_evidence_observed
+        and schema_probe.get("matches") is True
+        and schema_probe.get("schema_contract_matches") is True
+    )
+    schema_observable = observable and schema_contract_matches
     if not fresh:
         state = "stale"
         next_action = "bind the current connector snapshot again"
@@ -432,6 +550,10 @@ def snapshot_status(
         **base,
         "state": state,
         "observable": observable,
+        "schema_observable": schema_observable,
+        "schema_evidence_observed": schema_evidence_observed,
+        "schema_contract_matches": schema_contract_matches,
+        "schema_probe": schema_probe,
         "fresh": fresh,
         "matched": matched,
         "created_at_unix": created_at,
@@ -445,9 +567,11 @@ def snapshot_status(
         ).hexdigest(),
         "client_declaration_sha256": receipt.get("client_declaration_sha256"),
         "receipt_sha256": receipt.get("receipt_sha256"),
+        "verification_model": receipt.get(
+            "verification_model", base["verification_model"]
+        ),
         "recommended_next_action": next_action,
     }
-
 
 def connector_session_id(pid: int, start_ticks: int) -> str:
     """Return a bounded identity for one concrete tunnel-client process lifetime."""

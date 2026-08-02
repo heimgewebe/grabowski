@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import grabowski_client_snapshot as snapshot
+import grabowski_connector_contract as connector_contract
 
 
 TOOL_HASH = "a" * 64
@@ -66,6 +67,70 @@ class ClientSnapshotTests(unittest.TestCase):
             now_unix=now_unix,
         )
 
+    def schema_artifact(self) -> dict[str, object]:
+        schemas = {
+            "grabowski_bureau_candidate_assess": {
+                "type": "object",
+                "properties": {
+                    name: {"type": "string", "default": ""}
+                    for name in sorted(
+                        connector_contract.REQUIRED_SCHEMA_PROPERTIES[
+                            "grabowski_bureau_candidate_assess"
+                        ]
+                    )
+                },
+            },
+            "grabowski_secret_reveal": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+            "grabowski_task_start": {
+                "type": "object",
+                "properties": {
+                    name: {"type": "string", "default": ""}
+                    for name in sorted(
+                        connector_contract.REQUIRED_SCHEMA_PROPERTIES[
+                            "grabowski_task_start"
+                        ]
+                    )
+                },
+            },
+        }
+        names = [
+            "alpha",
+            "grabowski_bureau_candidate_assess",
+            "grabowski_secret_reveal",
+            "grabowski_task_start",
+        ]
+        return {
+            "schema_version": 1,
+            "tools": [
+                {"name": name, "inputSchema": schemas[name]}
+                if name in schemas
+                else name
+                for name in names
+            ],
+        }
+
+    def schema_parameters(self, **overrides: object) -> dict[str, object]:
+        artifact = self.schema_artifact()
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            artifact
+        )
+        value = self.parameters(
+            observed_tool_count=len(names),
+            observed_names_sha256=metadata["names_sha256"],
+            observed_tools=artifact,
+            _server_tool_contract={
+                "registered_tool_count": len(names),
+                "registered_names_sha256": metadata["names_sha256"],
+                "runtime_matches_deployment_contract": True,
+            },
+            _server_observed_tools=artifact,
+        )
+        value.update(overrides)
+        return value
+
     def test_matching_snapshot_is_fresh_and_observable(self) -> None:
         result = snapshot.bind_snapshot(self.parameters(), now_unix=1_000)
 
@@ -74,9 +139,94 @@ class ClientSnapshotTests(unittest.TestCase):
         observed = self.status()
         self.assertEqual(observed["state"], "matched")
         self.assertTrue(observed["observable"])
+        self.assertFalse(observed["schema_observable"])
+        self.assertFalse(observed["schema_evidence_observed"])
         self.assertTrue(observed["fresh"])
         self.assertTrue(observed["matched"])
         self.assertEqual(snapshot.SNAPSHOT_PATH.stat().st_mode & 0o777, 0o600)
+
+    def test_schema_snapshot_is_independently_observable(self) -> None:
+        parameters = self.schema_parameters()
+        result = snapshot.bind_snapshot(parameters, now_unix=1_000)
+
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["matches"])
+        self.assertTrue(result["name_contract_matches"])
+        self.assertTrue(result["runtime_contract_matches"])
+        self.assertTrue(result["schema_contract_matches"])
+        self.assertEqual(result["missing_schema_sentinels"], [])
+        self.assertEqual(result["required_schema_property_mismatches"], [])
+        self.assertEqual(result["schema_mismatches"], [])
+
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            parameters["observed_tools"]
+        )
+        observed = snapshot.snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            now_unix=1_100,
+        )
+        self.assertTrue(observed["observable"])
+        self.assertTrue(observed["schema_observable"])
+        self.assertTrue(observed["schema_evidence_observed"])
+        self.assertTrue(observed["schema_contract_matches"])
+
+    def test_schema_snapshot_fails_closed_on_field_and_binding_drift(self) -> None:
+        for field in sorted(
+            connector_contract.REQUIRED_SCHEMA_PROPERTIES[
+                "grabowski_task_start"
+            ]
+        ):
+            with self.subTest(field=field):
+                parameters = self.schema_parameters()
+                artifact = parameters["observed_tools"]
+                task_start = next(
+                    item
+                    for item in artifact["tools"]
+                    if isinstance(item, dict)
+                    and item["name"] == "grabowski_task_start"
+                )
+                del task_start["inputSchema"]["properties"][field]
+                names, _schemas, metadata = (
+                    connector_contract.parse_observed_artifact(artifact)
+                )
+                parameters["observed_tool_count"] = len(names)
+                parameters["observed_names_sha256"] = metadata["names_sha256"]
+                result = snapshot.bind_snapshot(parameters, now_unix=1_000)
+                self.assertFalse(result["verified"])
+                self.assertIn("schema_contract", result["mismatches"])
+                self.assertIn(
+                    {
+                        "tool": "grabowski_task_start",
+                        "source": "connector",
+                        "missing_properties": [field],
+                    },
+                    result["required_schema_property_mismatches"],
+                )
+
+        parameters = self.schema_parameters(observed_release_id="stale-release")
+        result = snapshot.bind_snapshot(parameters, now_unix=1_000)
+        self.assertFalse(result["verified"])
+        self.assertIn("release_id", result["mismatches"])
+
+        parameters = self.schema_parameters()
+        snapshot.bind_snapshot(parameters, now_unix=1_000)
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            parameters["observed_tools"]
+        )
+        head_drift = snapshot.snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head="d" * 40,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            now_unix=1_100,
+        )
+        self.assertFalse(head_drift["observable"])
+        self.assertFalse(head_drift["schema_observable"])
 
     def test_mismatch_is_persisted_but_never_observable(self) -> None:
         result = snapshot.bind_snapshot(
