@@ -58,7 +58,7 @@ TASK_OUTPUT_CLEANUP_RECONCILE_LEASE_TTL_SECONDS = 15 * 60
 TASK_OUTPUT_CLEANUP_ATTEMPT_CURSOR_METADATA_PREFIX = (
     "task_output_cleanup_attempt_cursor_v1:"
 )
-TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE = 1
+TASK_OUTPUT_CLEANUP_ATTEMPT_BATCH_SIZE = 3
 TASK_OUTPUT_CLEANUP_TASK_LEASE_TTL_SECONDS = 15 * 60
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 AUTHORITY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,255}\Z")
@@ -1572,6 +1572,10 @@ def _canonical_task_output_cleanup_retention_boundary(
         raise TaskAttentionIntegrityError(
             "task output cleanup retention boundary is invalid"
         )
+    minimum_boundary_unix = _task_retention_boundary(
+        record,
+        minimum_age_seconds=TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+    )
     binding = _task_binding(record)
     lifecycle_receipt = record.get("lifecycle_receipt_sha256")
     if (
@@ -1584,7 +1588,7 @@ def _canonical_task_output_cleanup_retention_boundary(
     projection_binding = _task_output_cleanup_projection_binding(projection)
     intent_path, _completion_path = _task_output_cleanup_paths(binding)
     if not intent_path.exists():
-        return proposed_boundary_unix
+        return max(proposed_boundary_unix, minimum_boundary_unix)
     intent, _intent_file_sha256 = _task_output_cleanup_read_receipt(
         intent_path, kind=TASK_OUTPUT_CLEANUP_INTENT_KIND
     )
@@ -1611,6 +1615,11 @@ def _canonical_task_output_cleanup_retention_boundary(
         raise TaskAttentionIntegrityError(
             "task output cleanup intent retention boundary is invalid"
         )
+    if persisted_boundary_unix < minimum_boundary_unix:
+        raise TaskAttentionIntegrityError(
+            "task output cleanup intent shortens the fixed minimum retention"
+        )
+    # A later caller proposal must not rewrite a create-only per-attempt intent.
     return persisted_boundary_unix
 
 
@@ -2075,7 +2084,9 @@ def _task_output_cleanup_all_attempts_after_archive(
         )
         selected_attempts = list(range(start_attempt, end_attempt + 1))
         attempt_results: list[dict[str, Any]] = []
+        canonical_boundaries_unix: list[int] = []
         counts = {"deleted": 0, "deferred": 0, "not_present": 0, "errors": 0}
+        canonical_boundary_unix = retention_boundary_unix
         for attempt in selected_attempts:
             attempt_record = _task_output_attempt_record(record, attempt)
             canonical_boundary_unix = (
@@ -2086,15 +2097,17 @@ def _task_output_cleanup_all_attempts_after_archive(
                     proposed_boundary_unix=retention_boundary_unix,
                 )
             )
+            canonical_boundaries_unix.append(canonical_boundary_unix)
             observed_at_unix = _task_output_cleanup_now_unix()
             if observed_at_unix < canonical_boundary_unix:
                 attempt_results.append({
                     "attempt": attempt,
                     "status": "deferred",
                     "reason": "retention_boundary_not_reached",
-                    "retention_boundary_unix": retention_boundary_unix,
+                    "retention_boundary_unix": canonical_boundary_unix,
                     "eligible_at_unix": canonical_boundary_unix,
                     "remaining_seconds": canonical_boundary_unix - observed_at_unix,
+                    "does_not_establish": ["task_output_deleted"],
                 })
                 counts["deferred"] += 1
                 continue
@@ -2162,21 +2175,18 @@ def _task_output_cleanup_all_attempts_after_archive(
             reason = "attempt_cycle_completed"
         eligible_at_unix: int | None = None
         if status == "deferred":
-            eligible_at_unix = retention_boundary_unix
-            if reason == "attempt_batch_remaining" and attempt_results:
-                observed_at = attempt_results[-1].get(
-                    "eligibility_observed_at_unix"
-                )
-                if isinstance(observed_at, int) and not isinstance(
-                    observed_at, bool
-                ):
-                    eligible_at_unix = observed_at
-            elif reason == "attempt_deferred" and attempt_results:
-                deferred_at = attempt_results[-1].get("eligible_at_unix")
-                if isinstance(deferred_at, int) and not isinstance(
-                    deferred_at, bool
-                ):
-                    eligible_at_unix = deferred_at
+            deferred_boundaries = [
+                int(item["eligible_at_unix"])
+                for item in attempt_results
+                if item.get("status") == "deferred"
+                and isinstance(item.get("eligible_at_unix"), int)
+                and not isinstance(item.get("eligible_at_unix"), bool)
+            ]
+            eligible_at_unix = (
+                min(deferred_boundaries)
+                if deferred_boundaries
+                else _task_output_cleanup_now_unix()
+            )
         result = {
             "status": status,
             "reason": reason,
@@ -2189,7 +2199,11 @@ def _task_output_cleanup_all_attempts_after_archive(
             "attempt_cycle_completed": cycle_completed,
             "attempt_results": attempt_results,
             "counts": counts,
-            "retention_boundary_unix": canonical_boundary_unix,
+            "retention_boundary_unix": min(
+                canonical_boundaries_unix,
+                default=canonical_boundary_unix,
+            ),
+            "retention_boundaries_unix": canonical_boundaries_unix,
             "eligible_at_unix": eligible_at_unix,
             "deleted_attempts": deleted_attempts,
             "not_present_attempts": not_present_attempts,
@@ -2200,7 +2214,27 @@ def _task_output_cleanup_all_attempts_after_archive(
             and attempt_results[0].get("status")
             in {"deleted", "deferred", "not_present"}
         ):
-            result = {**attempt_results[0], **result}
+            passthrough_keys = {
+                "archive",
+                "completion_file_sha256",
+                "completion_receipt_sha256",
+                "delete_result_sha256",
+                "does_not_establish",
+                "idempotent_replay",
+                "intent_file_sha256",
+                "intent_receipt_sha256",
+                "inventory",
+                "minimum_retention_seconds",
+                "mutation_state",
+                "post_state",
+                "projection",
+                "remaining_seconds",
+            }
+            result.update({
+                key: attempt_results[0][key]
+                for key in passthrough_keys
+                if key in attempt_results[0]
+            })
     finally:
         release = _release_owned_archive_resources(owner, [resource_key])
     if release.get("status") not in {"released", "not_required"}:
@@ -2210,17 +2244,7 @@ def _task_output_cleanup_all_attempts_after_archive(
     return {**result, "attempt_traversal_resource_release": release}
 
 
-def _load_task_output_cleanup_cursor(
-    *,
-    projection_sha256: str,
-) -> str | None:
-    if (
-        not isinstance(projection_sha256, str)
-        or SHA256_RE.fullmatch(projection_sha256) is None
-    ):
-        raise TaskAttentionIntegrityError(
-            "task output cleanup projection digest is invalid"
-        )
+def _load_task_output_cleanup_cursor() -> str | None:
     with tasks._database_connection() as connection:
         row = connection.execute(
             "SELECT value FROM metadata WHERE key=?",
@@ -2246,14 +2270,16 @@ def _load_task_output_cleanup_cursor(
         raise TaskAttentionIntegrityError(
             "task output cleanup cursor schema is invalid"
         )
-    stored_projection_sha256 = value.get("projection_sha256")
+    observed_projection_sha256 = value.get("projection_sha256")
     if (
-        not isinstance(stored_projection_sha256, str)
-        or SHA256_RE.fullmatch(stored_projection_sha256) is None
+        not isinstance(observed_projection_sha256, str)
+        or SHA256_RE.fullmatch(observed_projection_sha256) is None
     ):
         raise TaskAttentionIntegrityError(
             "task output cleanup cursor projection digest is invalid"
         )
+    # The digest is retained as integrity evidence only. The stable task-ID
+    # cursor intentionally survives additive global projection changes.
     cursor = value.get("cursor")
     if cursor is not None and (
         not isinstance(cursor, str) or tasks.TASK_ID.fullmatch(cursor) is None
@@ -2345,9 +2371,7 @@ def _reconcile_archived_task_outputs_owned(
             raise TaskAttentionIntegrityError(
                 "task output cleanup projection task identity is invalid"
             )
-    cursor_before = _load_task_output_cleanup_cursor(
-        projection_sha256=projection_sha256
-    )
+    cursor_before = _load_task_output_cleanup_cursor()
     start = 0
     if cursor_before is not None:
         while start < len(task_ids) and task_ids[start] <= cursor_before:

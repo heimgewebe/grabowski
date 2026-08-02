@@ -767,8 +767,12 @@ class TaskAttentionTests(unittest.TestCase):
             "projection_sha256": "0" * 64,
         }
 
+    @staticmethod
+    def _cleanup_ready_record(record: dict[str, object]) -> dict[str, object]:
+        return {**record, "terminalized_at_unix": 0, "updated_at_unix": 0}
+
     def test_task_output_cleanup_writes_intent_completion_and_replays(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
@@ -835,7 +839,7 @@ class TaskAttentionTests(unittest.TestCase):
         )
 
     def test_task_output_cleanup_recovers_after_intent_before_completion(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
@@ -898,11 +902,11 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertTrue(completion_path.is_file())
 
     def test_task_output_cleanup_replay_uses_persisted_higher_retention_boundary(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
-        persisted_boundary_unix = 456
+        persisted_boundary_unix = attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS + 456
         calls = 0
 
         def cleanup_run(
@@ -968,7 +972,7 @@ class TaskAttentionTests(unittest.TestCase):
         )
 
     def test_task_output_cleanup_intent_survives_global_projection_digest_change(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         first_projection = self._cleanup_projection(record, record_sha256)
@@ -1071,8 +1075,92 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertFalse(intent_path.exists())
         self.assertFalse(completion_path.exists())
 
+    def test_task_output_cleanup_canonical_boundary_enforces_fixed_minimum(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        boundary = attention._canonical_task_output_cleanup_retention_boundary(
+            record,
+            archive_binding=archive_binding,
+            projection=projection,
+            proposed_boundary_unix=123,
+        )
+
+        self.assertEqual(
+            boundary,
+            attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+        )
+
+    def test_task_output_cleanup_rejects_intent_below_fixed_minimum(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        binding = attention._task_binding(record)
+        projection_binding = attention._task_output_cleanup_projection_binding(
+            projection
+        )
+        material = {
+            "schema_version": 1,
+            "task_binding": binding,
+            "lifecycle_receipt_sha256": record["lifecycle_receipt_sha256"],
+            "retention_boundary_unix": 123,
+            "archive": archive_binding,
+            "projection": projection_binding,
+            "inventory": self._cleanup_inventory(record),
+        }
+        intent_payload = {
+            "schema_version": 1,
+            "kind": attention.TASK_OUTPUT_CLEANUP_INTENT_KIND,
+            "material": material,
+            "material_sha256": attention._sha256_json(material),
+            "created_at_unix": 123,
+        }
+        intent_path, _completion_path = attention._task_output_cleanup_paths(binding)
+        attention._task_output_cleanup_publish(intent_path, intent_payload)
+
+        with self.assertRaisesRegex(
+            attention.TaskAttentionIntegrityError,
+            "fixed minimum retention",
+        ):
+            attention._canonical_task_output_cleanup_retention_boundary(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                proposed_boundary_unix=attention.TASK_OUTPUT_MINIMUM_RETENTION_SECONDS,
+            )
+
+    def test_task_output_cleanup_empty_attempt_selection_is_bounded(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+
+        with patch.object(
+            attention,
+            "_load_task_output_cleanup_attempt_cursor",
+            return_value=int(record["attempt"]),
+        ), patch.object(
+            attention,
+            "_save_task_output_cleanup_attempt_cursor",
+        ) as save_cursor:
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
+
+        self.assertEqual(result["status"], "not_present")
+        self.assertEqual(result["attempts_scanned"], 0)
+        self.assertEqual(result["retention_boundary_unix"], 123)
+        self.assertEqual(result["retention_boundaries_unix"], [])
+        save_cursor.assert_called_once()
+
     def test_task_output_cleanup_blocks_parallel_owner(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
@@ -1104,7 +1192,7 @@ class TaskAttentionTests(unittest.TestCase):
             tasks.resources.release_resources(foreign_owner, [resource_key])
 
     def test_task_output_cleanup_uses_distinct_owner_per_invocation(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
@@ -1154,7 +1242,7 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(uuid4.call_count, 2)
 
     def test_task_output_cleanup_reconciles_absent_after_effect_interruption(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
@@ -1216,7 +1304,7 @@ class TaskAttentionTests(unittest.TestCase):
         )
 
     def test_task_output_cleanup_rejects_completion_without_intent(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)
         archive_binding = self._cleanup_archive_binding(record_sha256)
         projection = self._cleanup_projection(record, record_sha256)
@@ -1250,7 +1338,7 @@ class TaskAttentionTests(unittest.TestCase):
             )
 
     def test_task_output_cleanup_covers_every_resumed_attempt(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         task_id = str(record["task_id"])
         final_attempt = 3
         final_unit = tasks._task_unit(task_id, final_attempt)
@@ -1289,32 +1377,21 @@ class TaskAttentionTests(unittest.TestCase):
             attention, "_assert_no_live_task_process",
             return_value={"active_process": False},
         ) as processes:
-            results = []
-            for _index in range(final_attempt):
-                results.append(
-                    attention._task_output_cleanup_all_attempts_after_archive(
-                        record,
-                        archive_binding=archive_binding,
-                        projection=projection,
-                        retention_boundary_unix=123,
-                    )
-                )
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=123,
+            )
 
         self.assertEqual(inspected_attempts, [1, 2, 3])
-        self.assertEqual(
-            [result["status"] for result in results],
-            ["deferred", "deferred", "not_present"],
-        )
-        self.assertEqual(
-            [result["attempt_cursor_before"] for result in results],
-            [0, 1, 2],
-        )
-        self.assertEqual(
-            [result["attempt_cursor_after"] for result in results],
-            [1, 2, 0],
-        )
-        self.assertEqual(results[-1]["attempt_count"], 3)
-        self.assertEqual(results[-1]["not_present_attempts"], [3])
+        self.assertEqual(result["status"], "not_present")
+        self.assertEqual(result["attempt_cursor_before"], 0)
+        self.assertEqual(result["attempt_cursor_after"], 0)
+        self.assertTrue(result["attempt_cycle_completed"])
+        self.assertEqual(result["attempt_count"], 3)
+        self.assertEqual(result["attempts_scanned"], 3)
+        self.assertEqual(result["not_present_attempts"], [1, 2, 3])
         self.assertEqual(leases.call_count, 3)
         self.assertEqual(
             [int(call.args[0]["attempt"]) for call in processes.call_args_list],
@@ -1322,7 +1399,7 @@ class TaskAttentionTests(unittest.TestCase):
         )
 
     def test_task_output_cleanup_refreshes_live_guard_time_per_attempt(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         task_id = str(record["task_id"])
         final_attempt = 2
         final_unit = tasks._task_unit(task_id, final_attempt)
@@ -1362,21 +1439,14 @@ class TaskAttentionTests(unittest.TestCase):
             attention, "_task_output_cleanup_after_archive",
             side_effect=cleanup_attempt,
         ) as cleanup:
-            first = attention._task_output_cleanup_all_attempts_after_archive(
-                record,
-                archive_binding=archive_binding,
-                projection=projection,
-                retention_boundary_unix=100,
-            )
-            second = attention._task_output_cleanup_all_attempts_after_archive(
+            result = attention._task_output_cleanup_all_attempts_after_archive(
                 record,
                 archive_binding=archive_binding,
                 projection=projection,
                 retention_boundary_unix=100,
             )
 
-        self.assertEqual(first["status"], "deferred")
-        self.assertEqual(second["status"], "not_present")
+        self.assertEqual(result["status"], "not_present")
         self.assertEqual(
             [call.kwargs["now_unix"] for call in leases.call_args_list],
             [101, 202],
@@ -1385,10 +1455,9 @@ class TaskAttentionTests(unittest.TestCase):
             [int(call.args[0]["attempt"]) for call in cleanup.call_args_list],
             [1, 2],
         )
-        self.assertEqual(second["status"], "not_present")
 
     def test_task_output_cleanup_canonicalizes_retention_per_attempt(self) -> None:
-        record = self._completed_task()
+        record = self._cleanup_ready_record(self._completed_task())
         task_id = str(record["task_id"])
         final_attempt = 2
         final_unit = tasks._task_unit(task_id, final_attempt)
@@ -1427,13 +1496,7 @@ class TaskAttentionTests(unittest.TestCase):
             attention, "_task_output_cleanup_after_archive",
             side_effect=cleanup_attempt,
         ) as cleanup:
-            first = attention._task_output_cleanup_all_attempts_after_archive(
-                record,
-                archive_binding=archive_binding,
-                projection=projection,
-                retention_boundary_unix=48,
-            )
-            second = attention._task_output_cleanup_all_attempts_after_archive(
+            result = attention._task_output_cleanup_all_attempts_after_archive(
                 record,
                 archive_binding=archive_binding,
                 projection=projection,
@@ -1447,8 +1510,9 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual([1, 2], [
             int(call.args[0]["attempt"]) for call in canonical.call_args_list
         ])
-        self.assertEqual("deferred", first["status"])
-        self.assertEqual("not_present", second["status"])
+        self.assertEqual("not_present", result["status"])
+        self.assertEqual([24, 48], result["retention_boundaries_unix"])
+        self.assertEqual(24, result["retention_boundary_unix"])
 
     def _automatic_cleanup_fixture(
         self, count: int, *, projection_sha256: str = "9" * 64

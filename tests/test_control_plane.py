@@ -304,6 +304,44 @@ class FleetTests(unittest.TestCase):
                         )
             run.assert_not_called()
 
+    def test_task_output_reader_rejects_secret_bearing_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "fleet.json"
+            _write(config, {
+                "schema_version": 1,
+                "hosts": {
+                    "local": {
+                        "transport": "local",
+                        "target": "local",
+                        "enabled": True,
+                        "roles": ["test"],
+                        "command_allowlist": ["hostname"],
+                    }
+                },
+            })
+            command = [
+                tasks.TASK_OUTPUT_CAPTURE_PYTHON,
+                "-c",
+                tasks.TASK_OUTPUT_REMOTE_READ_CODE,
+                str(fleet.HOME / ".grabowski-task-output-0123456789abcdef01234567-a1"),
+                "stdout.log",
+                "25",
+                "60000",
+            ]
+            with patch.object(fleet, "FLEET_CONFIG", config), patch.object(
+                fleet.operator,
+                "_redact_argv",
+                return_value=["<redacted>"],
+            ), patch.object(fleet.operator, "_run") as run:
+                with self.assertRaisesRegex(ValueError, "secret material"):
+                    fleet.run_fleet_task_output_read(
+                        "local",
+                        command,
+                        timeout_seconds=10,
+                        max_output_bytes=65536,
+                    )
+            run.assert_not_called()
+
     def test_task_output_cleanup_does_not_open_generic_python_on_production(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "fleet.json"

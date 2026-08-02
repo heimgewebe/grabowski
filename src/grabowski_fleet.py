@@ -198,7 +198,17 @@ def run_fleet_task_output_read(
     does not authorize arbitrary Python execution through ``grabowski_fleet_run``.
     """
     host = fleet_host(name)
-    command = _safe_argv(argv)
+    command = operator._validate_argv(argv, cwd=HOME)
+    if len(command) < 3:
+        raise ValueError("Invalid task-output reader argv length")
+    redaction_probe = [
+        command[0],
+        command[1],
+        "<hash-bound-task-output-read-code>",
+        *command[3:],
+    ]
+    if operator._redact_argv(redaction_probe) != redaction_probe:
+        raise ValueError("task-output reader argv appears to contain secret material")
     if len(command) != 7:
         raise ValueError("Invalid task-output reader argv length")
     if command[0] != TASK_OUTPUT_READ_PYTHON or command[1] != "-c":
