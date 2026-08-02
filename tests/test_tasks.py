@@ -2309,6 +2309,34 @@ class TaskTests(unittest.TestCase):
             "['manual', 'never', 'retry-safe', 'verify-then-retry']",
         )
 
+    def test_task_start_published_schema_matches_resume_policy_contract(self) -> None:
+        probe = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import asyncio,json,sys; "
+                    "sys.path.insert(0, sys.argv[1]); "
+                    "import mcp.server.fastmcp; "
+                    "import grabowski_tasks as tasks; "
+                    "tool=next(item for item in asyncio.run(tasks.mcp.list_tools()) "
+                    "if item.name=='grabowski_task_start'); "
+                    "print(json.dumps(tool.inputSchema['properties']['resume_policy'], "
+                    "sort_keys=True))"
+                ),
+                str(SRC),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0 and "No module named 'mcp'" in probe.stderr:
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        self.assertEqual(0, probe.returncode, probe.stderr)
+        schema = json.loads(probe.stdout)
+        self.assertEqual(list(get_args(tasks.ResumePolicy)), schema["enum"])
+        self.assertEqual("verify-then-retry", schema["default"])
+        self.assertEqual("string", schema["type"])
+
     def test_manual_resume_policy_fails_closed(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_dispatch", return_value=_launcher()
