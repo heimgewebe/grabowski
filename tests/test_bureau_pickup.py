@@ -784,6 +784,49 @@ class BureauPickupTests(unittest.TestCase):
         )
         acquire.assert_not_called()
 
+    def test_claim_intent_approval_rejection_preserves_required_level(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "kind": "bureau_approval_required",
+            "status": "approval-required",
+            "code": "approval-required",
+            "approval": {
+                "action_class": "runtime_mutation",
+                "action_classes": ["runtime_mutation"],
+                "required": True,
+                "required_level": "break_glass",
+                "allowed": False,
+                "reason": (
+                    "approval level operator is not accepted for required break_glass"
+                ),
+                "evidence": {
+                    "schema_version": 1,
+                    "approved": True,
+                    "level": "operator",
+                    "scope": ["runtime_mutation"],
+                },
+            },
+            "effect_started": False,
+            "retryable": False,
+            "ambiguity": False,
+            "required_readback": [],
+        }
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=payload),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-approval-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+
+        approval = raised.exception.details["approval"]
+        self.assertEqual(approval["action_classes"], ["runtime_mutation"])
+        self.assertEqual(approval["required_level"], "break_glass")
+        self.assertEqual(approval["evidence"]["level"], "operator")
+        acquire.assert_not_called()
+
+
     def test_claim_intent_adapter_failure_preserves_retry_contract(self) -> None:
         for code, retryable in (
             ("bureau-runtime-timeout", True),

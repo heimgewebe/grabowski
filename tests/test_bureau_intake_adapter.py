@@ -133,6 +133,50 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertFalse(result["ambiguity"])
         self.assertTrue(result["retryable"])
 
+    def test_non_json_command_rejection_is_typed_without_stderr_disclosure(self) -> None:
+        runtime = {"python_launcher": Path("/runtime/python")}
+        binding = mock.Mock()
+        stderr = (
+            "bureau: approval required for runtime_mutation: "
+            "approval level operator is not accepted for required break_glass\n"
+        )
+        completed = subprocess.CompletedProcess(["bureau"], 2, "", stderr)
+        bound_launcher = self._mock_bound_launcher()
+        with (
+            mock.patch.object(
+                intake.bureau_runtime, "_contract_runtime", return_value=runtime
+            ),
+            mock.patch.object(
+                intake.bureau_runtime, "_assert_contract_runtime_unchanged"
+            ),
+            mock.patch.object(intake, "_managed_runtime_binding", return_value=binding),
+            mock.patch.object(intake, "_assert_managed_runtime_unchanged"),
+            mock.patch.object(intake, "_bound_launcher_fd", bound_launcher),
+            mock.patch.object(
+                intake.bureau_runtime, "_safe_environment", return_value={}
+            ),
+            mock.patch.object(intake.subprocess, "run", return_value=completed),
+        ):
+            result = intake._invoke_bureau(
+                ["--json", "--json-envelope", "claim-intent"]
+            )
+
+        self.assertEqual(result["code"], "bureau-command-rejected")
+        self.assertFalse(result["effect_started"])
+        self.assertFalse(result["ambiguity"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["required_readback"], [])
+        self.assertEqual(result["details"]["returncode"], 2)
+        self.assertEqual(
+            result["details"]["stdout_sha256"], hashlib.sha256(b"").hexdigest()
+        )
+        self.assertEqual(
+            result["details"]["stderr_sha256"],
+            hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotIn(stderr.strip(), json.dumps(result))
+
+
     def test_invoke_executes_the_exact_bound_launcher_descriptor(self) -> None:
         runtime = {"python_launcher": Path("/runtime/python")}
         binding = mock.Mock()
