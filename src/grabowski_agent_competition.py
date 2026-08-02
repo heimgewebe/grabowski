@@ -413,6 +413,38 @@ def _competition_id(provider: str, mode: str, task_sha256: str, request_id: str)
     return f"gac-{provider}-{mode}-{task_sha256[:10]}-{request_digest}"
 
 
+def _competition_task_resource_keys(
+    identifier: str,
+    packet: dict[str, Any],
+) -> list[str]:
+    directory = _competition_dir(identifier)
+    repository = packet.get("repository")
+    expected_head = packet.get("expected_head")
+    task_sha256 = packet.get("task_sha256")
+    provider = packet.get("provider")
+    mode = packet.get("mode")
+    if (
+        not isinstance(repository, str)
+        or not Path(repository).is_absolute()
+        or not isinstance(expected_head, str)
+        or SHA40_RE.fullmatch(expected_head) is None
+        or not isinstance(task_sha256, str)
+        or SHA256_RE.fullmatch(task_sha256) is None
+        or provider not in PROVIDERS
+        or mode not in MODES
+    ):
+        raise AgentCompetitionError("candidate packet task resource binding is invalid")
+    return sorted(
+        [
+            f"path:{directory}",
+            (
+                f"repo:{repository}:operation:agent-competition:{identifier}:"
+                f"{expected_head}:{task_sha256}:{provider}:{mode}"
+            ),
+        ]
+    )
+
+
 def _competition_root() -> Path:
     root = COMPETITION_ROOT.expanduser()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -798,8 +830,14 @@ def _validated_start_intent(identifier: str) -> dict[str, Any]:
         "packet_sha256", "command_sha256", "created_at", "state", "start_intent_sha256",
     }
     version = intent.get("schema_version")
-    required = common if version == 1 else common | {"created_at_unix"}
-    if version not in {1, 2} or set(intent) != required:
+    required = (
+        common
+        if version == 1
+        else common | {"created_at_unix"}
+        if version == 2
+        else common | {"created_at_unix", "resource_keys"}
+    )
+    if version not in {1, 2, 3} or set(intent) != required:
         raise AgentCompetitionError("competition start intent shape is invalid")
     observed_hash = intent["start_intent_sha256"]
     unsigned = {key: value for key, value in intent.items() if key != "start_intent_sha256"}
@@ -816,12 +854,22 @@ def _validated_start_intent(identifier: str) -> dict[str, Any]:
         or not intent["created_at"].strip()
     ):
         raise AgentCompetitionError("competition start intent contract is invalid")
-    if version == 2 and (
+    if version in {2, 3} and (
         isinstance(intent["created_at_unix"], bool)
         or not isinstance(intent["created_at_unix"], int)
         or intent["created_at_unix"] <= 0
     ):
         raise AgentCompetitionError("competition start intent created_at_unix is invalid")
+    if version == 3:
+        packet = _validated_packet(identifier)
+        expected_resources = _competition_task_resource_keys(identifier, packet)
+        if (
+            intent["packet_sha256"] != packet["packet_sha256"]
+            or intent["resource_keys"] != expected_resources
+        ):
+            raise AgentCompetitionError(
+                "competition start intent task resource binding is invalid"
+            )
     for field in ("request_fingerprint", "packet_sha256", "command_sha256"):
         value = intent[field]
         if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
@@ -1024,11 +1072,16 @@ def _validated_packet(identifier: str) -> dict[str, Any]:
 
 
 def _start_reconciliation(identifier: str, intent: dict[str, Any]) -> dict[str, Any]:
-    if intent.get("schema_version") != 2:
+    version = intent.get("schema_version")
+    if version not in {2, 3}:
         return {"state": "legacy_intent_not_reconcilable", "matches": [], "task": None}
     expected_created = intent["created_at_unix"]
     directory = _competition_dir(identifier)
-    expected_resource = f"path:{directory}"
+    expected_resources = (
+        [f"path:{directory}"]
+        if version == 2
+        else intent["resource_keys"]
+    )
     matches: list[dict[str, Any]] = []
     cursor: str | None = None
     scan_complete = False
@@ -1061,7 +1114,7 @@ def _start_reconciliation(identifier: str, intent: dict[str, Any]) -> dict[str, 
                 and record.get("resume_policy") == "never"
                 and record.get("argv_sha256") == intent["command_sha256"]
                 and record.get("cwd") == str(directory)
-                and resources == [expected_resource]
+                and resources == expected_resources
                 and created <= expected_created + START_RECONCILE_WINDOW_SECONDS
                 and isinstance(record.get("task_id"), str)
                 and record["task_id"]
@@ -2375,6 +2428,7 @@ def grabowski_agent_competition_start(
             "created_at": workspace._utc(),
         }
         packet["packet_sha256"] = _sha256_json(packet)
+        task_resource_keys = _competition_task_resource_keys(identifier, packet)
         packet_path = directory / "packet.json"
         receipt_path = directory / "receipt.json"
         raw_path = directory / "raw-output.json"
@@ -2390,7 +2444,7 @@ def grabowski_agent_competition_start(
             "--max-budget-usd", format(float(max_budget_usd), "g"),
         ]
         start_intent = {
-            "schema_version": 2,
+            "schema_version": 3,
             "kind": "external_programming_competition_start_intent",
             "competition_id": identifier,
             "request_id": request_value,
@@ -2399,6 +2453,7 @@ def grabowski_agent_competition_start(
             "command_sha256": _sha256_json(command),
             "created_at": workspace._utc(),
             "created_at_unix": int(time.time()),
+            "resource_keys": task_resource_keys,
             "state": "prepared",
         }
         start_intent["start_intent_sha256"] = _sha256_json(start_intent)
@@ -2415,7 +2470,7 @@ def grabowski_agent_competition_start(
                 cpu_weight=80,
                 io_weight=80,
                 memory_max_bytes=2 * 1024 * 1024 * 1024,
-                resource_keys=[f"path:{directory}"],
+                resource_keys=task_resource_keys,
             )
         except Exception:
             reconciliation = _start_reconciliation(identifier, start_intent)
