@@ -47,15 +47,18 @@ RESOURCE_KINDS = {
     "deployment",
     "migration",
     "gate",
+    "operation",
 }
 OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
 DIRECT_OPERATOR_OWNER_RE = re.compile(r"operator:[A-Za-z0-9._:@-]{1,119}\Z")
 SERVICE_RE = re.compile(r"[A-Za-z0-9_.:@-]{1,255}\Z")
 COMPONENT_RE = re.compile(r"[A-Za-z0-9_.:@/-]{1,255}\Z")
+OPERATION_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@/-]{0,255}\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
+MAX_OPERATION_RESOURCE_VALUE_BYTES = 4096
 MAX_TERMINAL_RECEIPT_BYTES = 64 * 1024
 OBSOLETE_PATH_RELEASE_SCHEMA_VERSION = 1
 OBSOLETE_PATH_RELEASE_KIND = "grabowski_obsolete_path_lease_release"
@@ -950,6 +953,24 @@ def _ttl(value: int) -> int:
     return value
 
 
+def _normalize_operation_resource_value(value: str) -> str:
+    if len(value.encode("utf-8")) > MAX_OPERATION_RESOURCE_VALUE_BYTES:
+        raise ValueError("operation resource is too large")
+    segments = value.split(":")
+    if len(segments) < 2:
+        raise ValueError(
+            "operation resource must bind an operation and scoped identity"
+        )
+    if any(
+        OPERATION_SEGMENT_RE.fullmatch(segment) is None
+        for segment in segments
+    ):
+        raise ValueError(
+            "operation resource contains unsupported or empty segments"
+        )
+    return ":".join(segments)
+
+
 def normalize_resource_key(raw: str) -> str:
     if not isinstance(raw, str) or ":" not in raw or "\x00" in raw:
         raise ValueError("resource key must use kind:value syntax")
@@ -986,6 +1007,8 @@ def normalize_resource_key(raw: str) -> str:
     elif kind == "component":
         if COMPONENT_RE.fullmatch(value) is None:
             raise ValueError("component resource contains unsupported characters")
+    elif kind == "operation":
+        value = _normalize_operation_resource_value(value)
     elif SERVICE_RE.fullmatch(value) is None:
         raise ValueError(f"{kind} resource contains unsupported characters")
     return f"{kind}:{value}"
