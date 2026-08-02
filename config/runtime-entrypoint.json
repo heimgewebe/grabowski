@@ -188,6 +188,10 @@
       "source": "src/grabowski_operator.py"
     },
     {
+      "module": "grabowski_deployment_observer",
+      "source": "src/grabowski_deployment_observer.py"
+    },
+    {
       "module": "grabowski_mcp",
       "source": "src/grabowski_mcp.py"
     },

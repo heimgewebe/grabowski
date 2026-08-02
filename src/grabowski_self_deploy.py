@@ -12,10 +12,15 @@ import time
 import uuid
 from typing import Annotated, Any, Iterator
 
+try:
+    from mcp.server.fastmcp import Context
+except ImportError:
+    Context = Any
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 import grabowski_mcp as base
+import grabowski_deployment_observer as deployment_observer
 import grabowski_operator_core as operator
 import grabowski_read_surface as read_surface
 
@@ -523,7 +528,13 @@ def _schedule_result(
     scheduled: dict[str, Any],
     already_scheduled: bool,
     source_identity: dict[str, Any],
+    deployment_observer_capability: str | None = None,
 ) -> dict[str, Any]:
+    contract = job.get("deployment_observer_contract")
+    observer_available = (
+        isinstance(deployment_observer_capability, str)
+        and isinstance(contract, dict)
+    )
     return {
         "scheduled": True,
         "already_scheduled": already_scheduled,
@@ -540,6 +551,34 @@ def _schedule_result(
         "expected_connector_disconnect": True,
         "status_tool": "grabowski_job_status",
         "logs_tool": "grabowski_job_logs",
+        "deployment_observer": {
+            "available": observer_available,
+            "operation": deployment_observer.OPERATION,
+            "capability": (
+                deployment_observer_capability if observer_available else None
+            ),
+            "contract_sha256": (
+                contract.get("contract_sha256")
+                if isinstance(contract, dict)
+                else None
+            ),
+            "expires_at_unix": (
+                contract.get("expires_at_unix")
+                if isinstance(contract, dict)
+                else None
+            ),
+            "client_id_bound": (
+                contract.get("client_id_sha256") is not None
+                if isinstance(contract, dict)
+                else False
+            ),
+            "does_not_establish": [
+                "deployment_success",
+                "authority_for_another_job_or_operation",
+                "generic_read_only_drain_exemption",
+                "capability_recovery_after_loss_or_expiry",
+            ],
+        },
         "audit": {
             "intent": intent,
             "scheduled": scheduled,
@@ -770,6 +809,7 @@ def grabowski_runtime_deploy_schedule(
     delay_seconds: DelaySeconds = 8,
     source_repository: SourceRepository | None = None,
     source_lease_owner_id: SourceLeaseOwner | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
     operator._require_operator_mutation("durable_job")
@@ -832,6 +872,32 @@ def grabowski_runtime_deploy_schedule(
             units=index["units"],
             pending_unit=reserved_unit,
         )
+        observer_capability = (
+            deployment_observer.issue_capability() if ctx is not None else None
+        )
+        client_id: str | None = None
+        if ctx is not None:
+            try:
+                observed_client_id = ctx.client_id
+            except (AttributeError, RuntimeError, ValueError):
+                observed_client_id = None
+            if isinstance(observed_client_id, str) and observed_client_id.strip():
+                client_id = observed_client_id
+        observer_request = (
+            {
+                "capability": observer_capability,
+                "client_id": client_id,
+                "expected_head": expected_head,
+                "source_identity_sha256": source_identity["identity_sha256"],
+            }
+            if observer_capability is not None
+            else None
+        )
+        observer_keyword = (
+            {"deployment_observer_request": observer_request}
+            if observer_request is not None
+            else {}
+        )
         job = operator._start_job(
             command,
             cwd=str(repository),
@@ -839,6 +905,7 @@ def grabowski_runtime_deploy_schedule(
             finalization_expected_head=expected_head,
             reserved_unit=reserved_unit,
             allow_reserved_runtime_deploy=True,
+            **observer_keyword,
         )
         _write_deploy_index(
             jobs_root,
@@ -864,4 +931,5 @@ def grabowski_runtime_deploy_schedule(
             scheduled=scheduled,
             already_scheduled=False,
             source_identity=source_identity,
+            deployment_observer_capability=observer_capability,
         )
