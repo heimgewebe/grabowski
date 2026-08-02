@@ -264,7 +264,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
             if harness == "grok" and arguments == ["models"]:
                 return {
                     "ok": True,
-                    "stdout": "Logged in with grok.com\nAvailable models:\n* grok-4.5 default\n",
+                    "stdout": "Default model: grok-4.5\nAvailable models:\n* grok-4.5 default\n",
                     "stderr": "",
                 }
             return {"ok": False, "stdout": "", "stderr": ""}
@@ -290,6 +290,7 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         ):
             verified = cli._probe(catalog)
         self.assertIn("grok-com", verified["verified_quota_pools"])
+        self.assertTrue(verified["providers"]["grok"]["logged_in"])
         self.assertTrue(verified["providers"]["grok"]["entitlement_verified"])
         self.assertEqual(
             verified["providers"]["grok"]["subscription_tier"], "SuperGrok"

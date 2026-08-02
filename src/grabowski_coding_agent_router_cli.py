@@ -707,18 +707,19 @@ def _probe(catalog: dict[str, Any]) -> dict[str, Any]:
                 continue
             if active and clean.startswith("*"):
                 grok_models.append(clean[1:].strip().split(" ", 1)[0])
-    grok_logged_in = (
-        "logged in with grok.com" in str(grok_status.get("stdout", "")).lower()
-    )
     before_binding = grok_auth_before.get("account_binding_sha256")
     after_binding = grok_auth_after.get("account_binding_sha256")
-    grok_entitlement_verified = (
-        grok_logged_in
-        and grok_status.get("ok") is True
+    grok_logged_in = (
+        grok_status.get("ok") is True
         and grok_auth_before.get("authenticated") is True
-        and grok_auth_after.get("entitlement_verified") is True
+        and grok_auth_after.get("authenticated") is True
         and isinstance(before_binding, str)
         and before_binding == after_binding
+    )
+    grok_entitlement_verified = (
+        grok_logged_in
+        and grok_auth_before.get("entitlement_verified") is True
+        and grok_auth_after.get("entitlement_verified") is True
         and "grok-4.5" in grok_models
     )
     providers["grok"] = {
