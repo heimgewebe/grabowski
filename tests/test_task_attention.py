@@ -1159,6 +1159,54 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(result["retention_boundaries_unix"], [])
         save_cursor.assert_called_once()
 
+    def test_task_output_cleanup_single_attempt_preserves_attempt_evidence(self) -> None:
+        record = self._cleanup_ready_record(self._completed_task())
+        _archive, record_sha256, _store = attention._task_archive_source_binding(record)
+        archive_binding = self._cleanup_archive_binding(record_sha256)
+        projection = self._cleanup_projection(record, record_sha256)
+        lease_observation = {"active_lease": False}
+        process_observation = {"active_process": False}
+        cleanup_release = {"status": "released"}
+
+        with patch.object(
+            attention,
+            "_canonical_task_output_cleanup_retention_boundary",
+            return_value=0,
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_now_unix",
+            return_value=100,
+        ), patch.object(
+            attention,
+            "_assert_no_live_task_resource_leases",
+            return_value=lease_observation,
+        ), patch.object(
+            attention,
+            "_assert_no_live_task_process",
+            return_value=process_observation,
+        ), patch.object(
+            attention,
+            "_task_output_cleanup_after_archive",
+            return_value={
+                "status": "deleted",
+                "idempotent_replay": False,
+                "cleanup_resource_release": cleanup_release,
+            },
+        ):
+            result = attention._task_output_cleanup_all_attempts_after_archive(
+                record,
+                archive_binding=archive_binding,
+                projection=projection,
+                retention_boundary_unix=0,
+            )
+
+        self.assertEqual(result["attempt"], 1)
+        self.assertEqual(result["eligibility_observed_at_unix"], 100)
+        self.assertEqual(result["lease_observation"], lease_observation)
+        self.assertEqual(result["process_observation"], process_observation)
+        self.assertEqual(result["cleanup_resource_release"], cleanup_release)
+        self.assertEqual(result["attempt_traversal_resource_release"]["status"], "released")
+
     def test_task_output_cleanup_blocks_parallel_owner(self) -> None:
         record = self._cleanup_ready_record(self._completed_task())
         _archive, record_sha256, _store = attention._task_archive_source_binding(record)

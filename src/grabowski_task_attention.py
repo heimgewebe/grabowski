@@ -2216,19 +2216,24 @@ def _task_output_cleanup_all_attempts_after_archive(
         ):
             passthrough_keys = {
                 "archive",
+                "attempt",
+                "cleanup_resource_release",
                 "completion_file_sha256",
                 "completion_receipt_sha256",
                 "delete_result_sha256",
+                "eligibility_observed_at_unix",
                 "does_not_establish",
                 "idempotent_replay",
                 "intent_file_sha256",
                 "intent_receipt_sha256",
                 "inventory",
                 "minimum_retention_seconds",
+                "lease_observation",
                 "mutation_state",
                 "post_state",
                 "projection",
                 "remaining_seconds",
+                "process_observation",
             }
             result.update({
                 key: attempt_results[0][key]
