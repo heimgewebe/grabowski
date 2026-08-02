@@ -73,7 +73,7 @@ def operator_relay_protocol() -> dict[str, Any]:
                 "explicit_contrast_request",
                 "multiple_plausible_implementations_for_comparison",
             ],
-            "external_programming_modes": ["competitor", "contrast"],
+            "external_programming_modes": ["competitor", "contrast", "review"],
             "max_external_candidates": 2,
             "external_candidate_authority": "advisory_only",
             "external_primary_writer_forbidden": True,

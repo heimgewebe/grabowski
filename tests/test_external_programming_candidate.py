@@ -32,6 +32,7 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         repo: Path,
         *,
         provider: str = "antigravity",
+        mode: str = "competitor",
         runner_bytes: bytes | None = None,
         schema_version: int = 1,
         max_budget_usd: float = 2.0,
@@ -41,11 +42,11 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
         packet = {
             "schema_version": schema_version,
             "kind": "external_programming_candidate_packet",
-            "competition_id": f"gac-{provider}-competitor-{'1' * 10}-{'2' * 10}",
+            "competition_id": f"gac-{provider}-{mode}-{'1' * 10}-{'2' * 10}",
             "request_id": f"runner-{provider}",
             "request_fingerprint": "7" * 64,
             "provider": provider,
-            "mode": "competitor",
+            "mode": mode,
             "repository": str(repo),
             "expected_head": "a" * 40,
             "task": "Improve the sample",
@@ -298,6 +299,30 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
                     environment={"HOME": str(home), "PATH": ""},
                 )
 
+    def test_review_packet_and_prompt_are_explicitly_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            packet = candidate_tool.validate_packet(
+                candidate_tool.load_private_json(
+                    self._packet(
+                        root,
+                        repo,
+                        provider="grok",
+                        mode="review",
+                        schema_version=3,
+                        max_budget_usd=0,
+                    ),
+                    label="packet",
+                )
+            )
+            prompt = candidate_tool.build_prompt(packet)
+        self.assertIn("independent read-only reviewer", prompt)
+        self.assertIn("changed_paths must be []", prompt)
+        self.assertEqual(packet["mode"], "review")
+
     def test_route_bound_grok_command_is_single_turn_read_only_and_offline(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -517,6 +542,23 @@ class ExternalProgrammingCandidateTests(unittest.TestCase):
             self.assertEqual((repo / "src" / "sample.py").read_text(), "UNRELATED = 'dirty'\n")
             self.assertEqual(list(repo.glob(".candidate-index.*")), [])
             self.assertEqual(list(root.glob(".candidate-index.*")), [])
+
+    def test_review_candidate_rejects_any_patch_or_changed_path(self) -> None:
+        packet = {
+            "mode": "review",
+            "allowed_paths": ["src"],
+            "forbidden_paths": [],
+            "expected_head": "a" * 40,
+        }
+        changed = self._candidate()
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "review candidate"):
+            candidate_tool.validate_candidate(changed, packet, Path("/tmp"))
+        clean = self._candidate()
+        clean["changed_paths"] = []
+        clean["patch"] = ""
+        result = candidate_tool.validate_candidate(clean, packet, Path("/tmp"))
+        self.assertEqual(result["changed_paths"], [])
+        self.assertEqual(result["patch"], "")
 
     def test_validate_candidate_rejects_scope_escape(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

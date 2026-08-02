@@ -1920,8 +1920,16 @@ def grabowski_coding_agent_route(
                     }
                 )
                 if ranked:
-                    reviewers.append(ranked[0])
-                    review_fallbacks = ranked[1:6]
+                    executable_review_routes = [
+                        {
+                            **item,
+                            "execution_mode": "review",
+                            "start_tool": "grabowski_agent_competition_start",
+                        }
+                        for item in ranked
+                    ]
+                    reviewers.append(executable_review_routes[0])
+                    review_fallbacks = executable_review_routes[1:6]
                     review_status = "recommended"
                 else:
                     review_status = "no-independent-review-route"

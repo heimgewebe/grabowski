@@ -43,7 +43,7 @@ Frühere externe Coding-Fähigkeiten heißen nun `contrast_capabilities`. Sie er
 Der Ablauf ist:
 
 1. ChatGPT/Grabowski prüft den Livezustand und erstellt selbst Plan oder Kandidat.
-2. Höchstens zwei externe Kandidaten arbeiten isoliert als `contrast` oder `competitor`.
+2. Höchstens zwei externe Kandidaten arbeiten isoliert als `review`, `contrast` oder `competitor`.
 3. Ihre Änderungen bleiben außerhalb des autoritativen Writerpfads.
 4. ChatGPT/Grabowski vergleicht, reproduziert und übernimmt nur nach eigener Prüfung einzelne Ideen oder Patches.
 

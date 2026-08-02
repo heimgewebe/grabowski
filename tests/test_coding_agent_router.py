@@ -1091,6 +1091,17 @@ class CodingAgentRouterTests(unittest.TestCase):
         self.assertNotIn("claude-fable-5-contrast-high", all_review_routes)
         self.assertNotIn("claude-fable-5-writer-high", all_review_routes)
 
+    def test_review_recommendations_publish_an_executable_review_handoff(self) -> None:
+        result = self._route("independent-review")
+        recommendations = [*result["reviewers"], *result["review_fallbacks"]]
+        self.assertTrue(recommendations)
+        for recommendation in recommendations:
+            self.assertEqual(recommendation["execution_mode"], "review")
+            self.assertEqual(
+                recommendation["start_tool"],
+                "grabowski_agent_competition_start",
+            )
+
     def test_jules_is_a_managed_harness_not_a_ranked_model_claim(self) -> None:
         model = self.catalog["models"]["jules-managed-latest"]
         self.assertEqual(model["identity_kind"], "managed-harness-placeholder")

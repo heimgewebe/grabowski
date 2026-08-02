@@ -1369,7 +1369,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "advisory_route_execution_contract",
+                "contrast_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1404,7 +1404,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "advisory_route_execution_contract",
+                "contrast_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1443,7 +1443,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "advisory_route_execution_contract",
+                "contrast_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1484,7 +1484,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "advisory_route_execution_contract",
+                "contrast_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1523,7 +1523,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "advisory_route_execution_contract",
+                "contrast_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.object(
@@ -1557,10 +1557,45 @@ class AgentCompetitionTests(unittest.TestCase):
         self.assertEqual(receipt["budget_contract"]["requested_max_usd"], 0)
         self.assertFalse(receipt["budget_contract"]["paid_execution_authorized"])
 
-    def test_route_bound_grok_receipt_preserves_offline_single_turn_binding(self) -> None:
-        self._assert_zero_budget_route_receipt(
-            provider="grok", route_id="grok-4.5-review-high"
+    def test_route_bound_grok_review_receipt_preserves_offline_single_turn_binding(self) -> None:
+        contract = self._route_contract("grok-4.5-review-high")
+        with (
+            mock.patch.object(
+                competition.coding_router,
+                "review_route_execution_contract",
+                return_value=contract,
+            ) as resolver,
+            mock.patch.object(
+                competition.tasks,
+                "grabowski_task_start",
+                return_value=self._task_start("task-grok-review-receipt"),
+            ),
+        ):
+            started = competition.grabowski_agent_competition_start(
+                request_id="grok-review-route-receipt",
+                provider="grok",
+                mode="review",
+                repository=str(self.repo),
+                expected_head=self.head,
+                task="Review sample",
+                allowed_paths=["src", "tests"],
+                context_paths=["src/sample.py"],
+                timeout_seconds=120,
+                max_budget_usd=0,
+                route_id="grok-4.5-review-high",
+            )
+        resolver.assert_called_once_with(
+            "grok-4.5-review-high", paid_execution_authorized=False
         )
+        self._write_receipt(
+            started["competition_id"], changed_paths=[], risks=[], tests=[]
+        )
+        manifest = competition._validated_manifest(started["competition_id"])
+        receipt = competition._receipt(started["competition_id"], manifest)
+        self.assertIsNotNone(receipt)
+        assert receipt is not None
+        self.assertEqual(receipt["route_contract"], contract)
+        self.assertEqual(manifest["mode"], "review")
 
     def test_route_bound_opencode_receipt_preserves_route_and_zero_budget_binding(self) -> None:
         self._assert_zero_budget_route_receipt(
@@ -1575,7 +1610,7 @@ class AgentCompetitionTests(unittest.TestCase):
     def test_route_bound_fable_requires_paid_authorization_and_positive_policy_cap(self) -> None:
         with mock.patch.object(
             competition.coding_router,
-            "advisory_route_execution_contract",
+            "contrast_route_execution_contract",
             side_effect=competition.coding_router.CodingAgentRouterError(
                 "paid-only route requires explicit paid execution authorization"
             ),
@@ -1600,7 +1635,7 @@ class AgentCompetitionTests(unittest.TestCase):
         with (
             mock.patch.object(
                 competition.coding_router,
-                "advisory_route_execution_contract",
+                "contrast_route_execution_contract",
                 return_value=contract,
             ),
             mock.patch.dict(

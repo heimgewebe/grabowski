@@ -67,7 +67,7 @@ ROUTABLE_EXTERNAL_PROVIDERS = (
 )
 LEGACY_PROVIDERS = {"agy"}
 EXTERNAL_PROVIDER_BUDGET_CAP_ENV = "GRABOWSKI_EXTERNAL_PROVIDER_BUDGET_CAP_USD"
-MODES = {"competitor", "contrast"}
+MODES = {"competitor", "contrast", "review"}
 TASK_KINDS = {"code", "docs", "analysis", "operations"}
 NOVELTY = {"low", "medium", "high"}
 RISK_FLAGS = {
@@ -456,7 +456,7 @@ def _competition_root() -> Path:
 
 def _competition_dir(identifier: str) -> Path:
     clean = workspace._required_string(identifier, "competition_id", max_length=100)
-    if re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex|grok)-(competitor|contrast)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
+    if re.fullmatch(r"gac-(claude|antigravity|opencode|openhands|agy|codex|grok)-(competitor|contrast|review)-[0-9a-f]{10}-[0-9a-f]{10}", clean) is None:
         raise AgentCompetitionError("competition_id has an invalid format")
     return _competition_root() / clean
 
@@ -2210,7 +2210,7 @@ def grabowski_agent_competition_start(
     route_id: str = "",
     paid_execution_authorized: bool = False,
 ) -> dict[str, Any]:
-    """Start one durable advisory-only external competitor or contrast programmer."""
+    """Start one durable advisory-only external competitor, contrast programmer, or read-only reviewer."""
     operator._require_operator_capability("git_cli")
     request_value = workspace._required_string(request_id, "request_id", max_length=80)
     if REQUEST_ID_RE.fullmatch(request_value) is None:
@@ -2235,8 +2235,13 @@ def grabowski_agent_competition_start(
     route_value = route_id.strip() if isinstance(route_id, str) else ""
     route_contract: dict[str, Any] | None = None
     if route_value:
+        route_contract_resolver = {
+            "competitor": coding_router.advisory_route_execution_contract,
+            "contrast": coding_router.contrast_route_execution_contract,
+            "review": coding_router.review_route_execution_contract,
+        }[mode_value]
         try:
-            route_contract = coding_router.advisory_route_execution_contract(
+            route_contract = route_contract_resolver(
                 route_value, paid_execution_authorized=paid_authorized
             )
         except coding_router.CodingAgentRouterError as exc:

@@ -96,7 +96,7 @@ class RepositoryContractTests(unittest.TestCase):
             '"routing_roles"',
             '"execution_priority"',
             '"chatgpt_operator"',
-            '"external_programming_modes": ["competitor", "contrast"]',
+            '"external_programming_modes": ["competitor", "contrast", "review"]',
             '"external_primary_writer_forbidden": True',
             '"external_primary_reviewer_forbidden": True',
             '"capacity_fallback_to_external_writer": False',
