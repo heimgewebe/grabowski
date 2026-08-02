@@ -2644,7 +2644,7 @@ def _runtime_deploy_observer_job() -> tuple[Path, dict[str, Any]] | None:
     unit = os.environ.get("GRABOWSKI_JOB_UNIT")
     directory_text = os.environ.get("GRABOWSKI_JOB_DIRECTORY")
     metadata_text = os.environ.get("GRABOWSKI_JOB_METADATA_PATH")
-    if unit is None and directory_text is None and metadata_text is None:
+    if unit is None and metadata_text is None:
         return None
     if (
         not isinstance(unit, str)
