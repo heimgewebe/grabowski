@@ -39,6 +39,7 @@ from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
+import grabowski_connector_contract
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_system_map
 import grabowski_blockades as blockade_policy
@@ -4704,6 +4705,22 @@ def _deployment_metadata_impl() -> dict[str, Any]:
     }
 
 
+def _runtime_connector_observed_tools() -> dict[str, Any]:
+    manager = getattr(mcp, "_tool_manager", None)
+    raw_registered = getattr(manager, "_tools", {})
+    if not isinstance(raw_registered, dict) or not raw_registered:
+        raise RuntimeError("runtime tool registry is unavailable")
+    runtime_tools: list[dict[str, Any]] = []
+    for name, info in sorted(raw_registered.items()):
+        parameters = getattr(info, "parameters", None)
+        if not isinstance(parameters, dict):
+            raise RuntimeError(f"runtime schema is unavailable for {name}")
+        runtime_tools.append({"name": str(name), "inputSchema": parameters})
+    return grabowski_connector_contract.mixed_artifact_from_runtime_tools(
+        runtime_tools
+    )
+
+
 def _runtime_tool_contract_summary(
     deployment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -4789,6 +4806,9 @@ def _runtime_tool_contract_summary(
         "manifest_error": manifest_error,
         "client_snapshot": client_snapshot,
         "client_snapshot_observable": bool(client_snapshot.get("observable")),
+        "client_schema_snapshot_observable": bool(
+            client_snapshot.get("schema_observable")
+        ),
         "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
     }
@@ -5195,6 +5215,9 @@ def grabowski_status(
             ),
             "client_snapshot_observable": tool_contract.get(
                 "client_snapshot_observable"
+            ),
+            "client_schema_snapshot_observable": tool_contract.get(
+                "client_schema_snapshot_observable"
             ),
             "client_snapshot": client_snapshot,
             "refresh_required_when_client_count_or_hash_differs": tool_contract.get(
@@ -9921,6 +9944,10 @@ def grip_run(
             "_server_runtime_actor_identity",
             "_server_task_lease_delegation",
             "_server_operator_lease_delegation",
+            "_server_tool_contract",
+            "_server_runtime",
+            "_server_agent_instructions_sha256",
+            "_server_observed_tools",
         }.intersection(raw_parameters)
     )
     if reserved_server_parameters:
@@ -10038,6 +10065,9 @@ def grip_run(
         }
         dispatch_parameters["_server_agent_instructions_sha256"] = (
             AGENT_INSTRUCTIONS_SHA256
+        )
+        dispatch_parameters["_server_observed_tools"] = (
+            _runtime_connector_observed_tools()
         )
     if name == "captain-run" and allow_mutation:
         if captain_actor_identity is None:
