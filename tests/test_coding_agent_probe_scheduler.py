@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 import json
@@ -45,6 +46,8 @@ class CodingAgentProbeSchedulerTests(unittest.TestCase):
         self.failure = self.root / "failure.json"
         self.router = self.root / "agent-route"
         self.router_digest = self.root / "router.sha256"
+        self.codex_sessions = self.root / "codex-sessions"
+        self.codex_sessions.mkdir()
         self.initial = {
             "schema_version": 2,
             "updated_at": "2026-07-18T15:00:00Z",
@@ -159,11 +162,37 @@ if sys.argv[1] == "probe":
     temporary.write_text(json.dumps(state))
     os.replace(temporary, state_path)
     print(json.dumps(body))
+elif sys.argv[1] == "set-quota":
+    state = json.loads(state_path.read_text())
+    def value(name):
+        return sys.argv[sys.argv.index(name) + 1]
+    pool_id = value("--pool")
+    status = value("--status")
+    pool = state.setdefault("pools", {{}}).setdefault(pool_id, {{}})
+    if status in {{"unknown", "available"}}:
+        for field in ("blocked_reason", "cooldown_until", "remaining_ratio", "reset_at"):
+            pool.pop(field, None)
+    pool["status"] = status
+    if "--remaining-ratio" in sys.argv:
+        pool["remaining_ratio"] = float(value("--remaining-ratio"))
+    if "--reset-at" in sys.argv:
+        pool["reset_at"] = value("--reset-at")
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    if "--verified-now" in sys.argv:
+        pool["verified_at"] = now
+    pool["updated_at"] = now
+    state["updated_at"] = now
+    temporary = state_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state))
+    os.replace(temporary, state_path)
+    print(json.dumps({{"updated": True, "pool": pool_id, "pool_state": pool}}))
 elif sys.argv[1] == "status":
+    state = json.loads(state_path.read_text())
     print(json.dumps({{
         "schema_version": 2,
         "catalog_fresh": True,
         "automatic_execution_authorized": False,
+        "pools": state.get("pools", {{}}),
     }}))
 else:
     raise SystemExit(2)
@@ -188,9 +217,297 @@ else:
             str(self.receipt),
             "--failure",
             str(self.failure),
+            "--codex-sessions-root",
+            str(self.codex_sessions),
             "--timeout-seconds",
             "10",
         ]
+
+    def write_codex_quota_receipt(
+        self,
+        *,
+        observed_at: datetime,
+        used_percent: float,
+        reset_at: datetime,
+        mode: int = 0o600,
+        filename: str = "rollout-test.jsonl",
+    ) -> Path:
+        day = self.codex_sessions / observed_at.strftime("%Y/%m/%d")
+        day.mkdir(parents=True, exist_ok=True)
+        event = {
+            "timestamp": observed_at.isoformat().replace("+00:00", "Z"),
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": None,
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "limit_name": None,
+                    "plan_type": "prolite",
+                    "primary": {
+                        "used_percent": used_percent,
+                        "window_minutes": 10080,
+                        "resets_at": int(reset_at.timestamp()),
+                    },
+                    "secondary": None,
+                    "individual_limit": None,
+                    "rate_limit_reached_type": None,
+                    "spend_control_reached": None,
+                    "credits": {
+                        "balance": "0",
+                        "has_credits": False,
+                        "unlimited": False,
+                    },
+                },
+            },
+        }
+        path = day / filename
+        path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        os.chmod(path, mode)
+        return path
+
+    def test_collect_codex_quota_uses_freshest_valid_provider_receipt(self) -> None:
+        now = datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)
+        self.write_codex_quota_receipt(
+            observed_at=now - timedelta(hours=2),
+            used_percent=40,
+            reset_at=now + timedelta(days=6),
+            filename="rollout-older.jsonl",
+        )
+        self.write_codex_quota_receipt(
+            observed_at=now - timedelta(minutes=5),
+            used_percent=97,
+            reset_at=now + timedelta(days=5),
+            filename="rollout-newer.jsonl",
+        )
+        observation = SCHEDULER.collect_codex_quota_observation(
+            self.codex_sessions, now=now
+        )
+        self.assertEqual("available", observation["status"])
+        self.assertEqual(0.03, observation["remaining_ratio"])
+        self.assertEqual(97.0, observation["used_percent"])
+        self.assertEqual("prolite", observation["plan_type"])
+        self.assertFalse(observation["purchased_credits_available"])
+        self.assertFalse(observation["paid_fallback_authorized"])
+        self.assertEqual(0, observation["model_invocations"])
+        self.assertRegex(observation["observation_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_codex_quota_event_uses_most_restrictive_window(self) -> None:
+        now = datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)
+        observed_at = now - timedelta(minutes=1)
+        event = {
+            "timestamp": observed_at.isoformat().replace("+00:00", "Z"),
+            "type": "event_msg",
+            "payload": {
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 99,
+                        "window_minutes": 300,
+                        "resets_at": int((now + timedelta(hours=1)).timestamp()),
+                    },
+                    "secondary": {
+                        "used_percent": 64,
+                        "window_minutes": 10080,
+                        "resets_at": int((now + timedelta(days=5)).timestamp()),
+                    },
+                    "individual_limit": None,
+                }
+            },
+        }
+        observation = SCHEDULER._codex_quota_event(
+            event, now=now, line_sha256="c" * 64
+        )
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertEqual("primary", observation["limiting_window"])
+        self.assertEqual(0.01, observation["remaining_ratio"])
+        self.assertEqual(2, len(observation["limits"]))
+
+        event["payload"]["rate_limits"]["primary"]["used_percent"] = 100
+        event["payload"]["rate_limits"]["secondary"]["used_percent"] = 100
+        tied = SCHEDULER._codex_quota_event(
+            event, now=now, line_sha256="d" * 64
+        )
+        self.assertIsNotNone(tied)
+        assert tied is not None
+        self.assertEqual("exhausted", tied["status"])
+        self.assertEqual("secondary", tied["limiting_window"])
+        self.assertEqual(
+            (now + timedelta(days=5)).isoformat().replace("+00:00", "Z"),
+            tied["reset_at"],
+        )
+
+    def test_collect_codex_quota_marks_full_usage_exhausted(self) -> None:
+        now = datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)
+        self.write_codex_quota_receipt(
+            observed_at=now - timedelta(minutes=3),
+            used_percent=100,
+            reset_at=now + timedelta(days=5),
+        )
+        observation = SCHEDULER.collect_codex_quota_observation(
+            self.codex_sessions, now=now
+        )
+        self.assertEqual("exhausted", observation["status"])
+        self.assertEqual(0.0, observation["remaining_ratio"])
+        self.assertFalse(observation["paid_fallback_authorized"])
+
+    def test_codex_quota_event_rejects_overflow_and_implausible_reset(self) -> None:
+        now = datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)
+        base = {
+            "timestamp": (now - timedelta(minutes=1)).isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "type": "event_msg",
+            "payload": {
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": 50,
+                        "window_minutes": 10080,
+                        "resets_at": 10**30,
+                    },
+                }
+            },
+        }
+        self.assertIsNone(
+            SCHEDULER._codex_quota_event(
+                base, now=now, line_sha256="a" * 64
+            )
+        )
+        base["payload"]["rate_limits"]["primary"]["resets_at"] = int(
+            (now + timedelta(days=20)).timestamp()
+        )
+        self.assertIsNone(
+            SCHEDULER._codex_quota_event(
+                base, now=now, line_sha256="b" * 64
+            )
+        )
+
+    def test_collect_codex_quota_rejects_writable_sessions_directory(self) -> None:
+        os.chmod(self.codex_sessions, 0o777)
+        observation = SCHEDULER.collect_codex_quota_observation(
+            self.codex_sessions,
+            now=datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual("unknown", observation["status"])
+        self.assertEqual("no_fresh_provider_quota_receipt", observation["reason"])
+
+    def test_collect_codex_quota_bounds_directory_enumeration(self) -> None:
+        for name in ("a", "b", "c"):
+            (self.codex_sessions / name).write_text("x", encoding="utf-8")
+        with mock.patch.object(SCHEDULER, "MAX_CODEX_DIRECTORY_ENTRIES", 2):
+            observation = SCHEDULER.collect_codex_quota_observation(
+                self.codex_sessions,
+                now=datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc),
+            )
+        self.assertEqual("unknown", observation["status"])
+        self.assertEqual("no_fresh_provider_quota_receipt", observation["reason"])
+
+    def test_collect_codex_quota_ignores_stale_and_unsafe_receipts(self) -> None:
+        now = datetime(2026, 8, 2, 8, 0, tzinfo=timezone.utc)
+        self.write_codex_quota_receipt(
+            observed_at=now - timedelta(days=3),
+            used_percent=99,
+            reset_at=now + timedelta(days=4),
+            filename="rollout-stale.jsonl",
+        )
+        self.write_codex_quota_receipt(
+            observed_at=now - timedelta(minutes=1),
+            used_percent=1,
+            reset_at=now + timedelta(days=6),
+            mode=0o644,
+            filename="rollout-unsafe.jsonl",
+        )
+        observation = SCHEDULER.collect_codex_quota_observation(
+            self.codex_sessions, now=now
+        )
+        self.assertEqual("unknown", observation["status"])
+        self.assertEqual("no_fresh_provider_quota_receipt", observation["reason"])
+
+    def test_scheduler_applies_exact_codex_quota_without_paid_fallback(self) -> None:
+        now = datetime.now(timezone.utc)
+        reset_at = now + timedelta(days=5)
+        self.write_codex_quota_receipt(
+            observed_at=now - timedelta(minutes=2),
+            used_percent=97,
+            reset_at=reset_at,
+        )
+        self.write_router()
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(0, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        pool = after["pools"][SCHEDULER.CODEX_QUOTA_POOL]
+        self.assertEqual("available", pool["status"])
+        self.assertEqual(0.03, pool["remaining_ratio"])
+        self.assertEqual(
+            reset_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            pool["reset_at"],
+        )
+        self.assertTrue(receipt["quota_state_updated"])
+        self.assertEqual("fresh_provider_observation", receipt["quota_update_reason"])
+        self.assertEqual(0.03, receipt["quota_observation"]["remaining_ratio"])
+        self.assertFalse(
+            receipt["quota_observation"]["paid_fallback_authorized"]
+        )
+        self.assertEqual(0, receipt["model_invocations"])
+        self.assertEqual(0, receipt["paid_api_requests_authorized"])
+
+    def test_scheduler_clears_expired_quota_to_unknown(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.initial["pools"][SCHEDULER.CODEX_QUOTA_POOL] = {
+            "status": "exhausted",
+            "remaining_ratio": 0.0,
+            "reset_at": (now - timedelta(minutes=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "verified_at": (now - timedelta(days=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self.state.write_text(json.dumps(self.initial), encoding="utf-8")
+        self.write_router()
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(0, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        pool = after["pools"][SCHEDULER.CODEX_QUOTA_POOL]
+        self.assertEqual("unknown", pool["status"])
+        self.assertNotIn("remaining_ratio", pool)
+        self.assertNotIn("reset_at", pool)
+        self.assertTrue(receipt["quota_state_updated"])
+        self.assertEqual("expired_reset_to_unknown", receipt["quota_update_reason"])
+        self.assertEqual("unknown", receipt["quota_observation"]["status"])
+
+    def test_scheduler_unknown_quota_preserves_existing_pool_state(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.initial["pools"][SCHEDULER.CODEX_QUOTA_POOL] = {
+            "status": "available",
+            "remaining_ratio": 0.42,
+            "reset_at": (now + timedelta(days=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "verified_at": (now - timedelta(minutes=1))
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+        }
+        self.state.write_text(json.dumps(self.initial), encoding="utf-8")
+        self.write_router()
+        result = SCHEDULER.main(self.arguments())
+        self.assertEqual(0, result)
+        after = json.loads(self.state.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            self.initial["pools"][SCHEDULER.CODEX_QUOTA_POOL],
+            after["pools"][SCHEDULER.CODEX_QUOTA_POOL],
+        )
+        self.assertFalse(receipt["quota_state_updated"])
+        self.assertEqual("unknown", receipt["quota_observation"]["status"])
 
     def test_success_preserves_history_scrubs_keys_and_writes_readback_receipt(
         self,
