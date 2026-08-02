@@ -534,6 +534,7 @@ def apply(
         "schema_version": 1,
         "kind": "coding-agent-router-cli-install-receipt",
         "status": "installed",
+        "installed": True,
         "wrapper_sha256": digest,
         "scheduler_sha256": scheduler_digest,
         "scheduler_target": str(scheduler_target),

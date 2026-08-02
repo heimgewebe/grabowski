@@ -118,6 +118,56 @@ def _contention_result(*, decision: str = "proceed") -> dict[str, object]:
         "dispatcher": {"state": "idle"},
     }
 
+def _sidecar_apply_receipt() -> dict[str, object]:
+    return {
+        "kind": "coding-agent-router-cli-install-receipt",
+        "status": "installed",
+        "installed": True,
+        "runtime_catalog_source": "deployment_catalog",
+        "runtime_catalog_sha256": "c" * 64,
+        "wrapper_sha256": "a" * 64,
+        "scheduler_sha256": "b" * 64,
+        "automatic_execution_authorized": False,
+        "rollback_performed": False,
+        "readback": {
+            "catalog_sha256": "c" * 64,
+            "automatic_execution_authorized": False,
+        },
+    }
+
+
+def _sidecar_check_receipt() -> dict[str, object]:
+    return {
+        "kind": "coding-agent-router-cli-install-check",
+        "installed": True,
+        "runtime_catalog_source": "deployment_catalog",
+        "runtime_catalog_sha256": "c" * 64,
+        "wrapper_sha256": "a" * 64,
+        "scheduler_sha256": "b" * 64,
+        "automatic_execution_authorized": False,
+    }
+
+
+def _sidecar_reconciliation(expected: str = "f" * 40) -> dict[str, object]:
+    material = {
+        "schema_version": 1,
+        "kind": RUNNER.SIDECAR_RECONCILIATION_KIND,
+        "status": "installed",
+        "repo_head": expected,
+        "release_id": "r",
+        "wrapper_sha256": "a" * 64,
+        "scheduler_sha256": "b" * 64,
+        "runtime_catalog_sha256": "c" * 64,
+        "apply_receipt_sha256": RUNNER.canonical_json_sha256(
+            _sidecar_apply_receipt()
+        ),
+        "check_receipt_sha256": RUNNER.canonical_json_sha256(
+            _sidecar_check_receipt()
+        ),
+        "automatic_execution_authorized": False,
+    }
+    return {**material, "evidence_sha256": RUNNER.canonical_json_sha256(material)}
+
 class SelfDeployToolTests(unittest.TestCase):
     def test_annotations_and_schema_bounds(self) -> None:
         self.assertFalse(SELF_DEPLOY.DEPLOY_MUTATING.readOnlyHint)
@@ -1008,6 +1058,69 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         for name in bindings:
             self.assertNotIn(name, environment)
 
+    def test_sidecar_reconciliation_applies_checks_and_hash_binds_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            installer = repo / RUNNER.SIDECAR_INSTALLER_RELATIVE_PATH
+            installer.parent.mkdir(parents=True)
+            installer.write_text("pass\n", encoding="utf-8")
+            live = {
+                "release_id": "r",
+                "repo_head": "f" * 40,
+                "completion_status": "complete",
+            }
+            with patch.object(
+                RUNNER,
+                "_json_command",
+                side_effect=[_sidecar_apply_receipt(), _sidecar_check_receipt()],
+            ) as command:
+                result = RUNNER.reconcile_coding_agent_sidecars(repo, live)
+        self.assertEqual(result, _sidecar_reconciliation())
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual(command.call_args_list[0].args[0][-1], "--apply")
+        self.assertEqual(command.call_args_list[1].args[0][-1], "--check")
+        self.assertEqual(command.call_args_list[0].kwargs["cwd"], repo)
+        self.assertEqual(command.call_args_list[1].kwargs["cwd"], repo)
+
+    def test_sidecar_reconciliation_rejects_apply_check_digest_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            installer = repo / RUNNER.SIDECAR_INSTALLER_RELATIVE_PATH
+            installer.parent.mkdir(parents=True)
+            installer.write_text("pass\n", encoding="utf-8")
+            checked = _sidecar_check_receipt()
+            checked["scheduler_sha256"] = "d" * 64
+            with patch.object(
+                RUNNER,
+                "_json_command",
+                side_effect=[_sidecar_apply_receipt(), checked],
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "apply and check identities differ"
+                ):
+                    RUNNER.reconcile_coding_agent_sidecars(
+                        repo,
+                        {"release_id": "r", "repo_head": "f" * 40},
+                    )
+
+    def test_json_sidecar_command_strips_job_finalization_bindings(self) -> None:
+        bindings = {
+            name: "secret-binding" for name in RUNNER.FINALIZATION_ENV.values()
+        }
+        with patch.dict(os.environ, bindings, clear=False), patch.object(
+            RUNNER,
+            "run_capture",
+            return_value=json.dumps(_sidecar_check_receipt()),
+        ) as capture:
+            value = RUNNER._json_command(
+                [sys.executable, "installer", "--check"],
+                cwd=Path("/tmp"),
+            )
+        self.assertTrue(value["installed"])
+        environment = capture.call_args.kwargs["environment"]
+        for name in bindings:
+            self.assertNotIn(name, environment)
+
     def test_repoground_managed_source_guard_rejects_direct_and_symlink_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -1348,10 +1461,14 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                 "repo_head": expected,
                 "completion_status": "complete",
             },
+        ), patch.object(
+            RUNNER,
+            "reconcile_coding_agent_sidecars",
+            return_value=_sidecar_reconciliation(expected),
         ):
             self.assertEqual(RUNNER.main(), 0)
         self.assertEqual(preflight.call_count, 3)
-        self.assertEqual(verify.call_count, 4)
+        self.assertEqual(verify.call_count, 6)
         self.assertEqual(sleep.call_args_list, [call(5), call(5), call(10)])
         self.assertEqual(streamed.call_count, 2)
 
@@ -1446,11 +1563,46 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
     def test_main_validates_before_deploying(self) -> None:
         repo = Path("/tmp/repository")
         expected = "f" * 40
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}):
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=None), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository") as verify, patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed") as streamed, patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "r", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)):
             self.assertEqual(RUNNER.main(), 0)
-        self.assertEqual(verify.call_count, 2)
+        self.assertEqual(verify.call_count, 4)
         self.assertEqual(streamed.call_args_list[0].args[0], ["make", "validate"])
         self.assertEqual(streamed.call_args_list[1].args[0], ["make", "deploy-apply"])
+
+    def test_main_rejects_source_drift_before_sidecar_install(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=None
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER,
+            "verify_repository",
+            side_effect=[
+                None,
+                None,
+                RuntimeError("source drift after runtime deployment"),
+            ],
+        ) as verify, patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(RUNNER, "run_streamed") as streamed, patch.object(
+            RUNNER,
+            "verify_live_manifest",
+            return_value={
+                "release_id": "release",
+                "repo_head": expected,
+                "completion_status": "complete",
+            },
+        ), patch.object(
+            RUNNER, "reconcile_coding_agent_sidecars"
+        ) as reconcile:
+            self.assertEqual(RUNNER.main(), 1)
+        self.assertEqual(verify.call_count, 3)
+        self.assertEqual(streamed.call_count, 2)
+        reconcile.assert_not_called()
 
     def test_finalization_binding_and_atomic_receipt_are_hash_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1550,7 +1702,7 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
         repo = Path("/tmp/repository")
         expected = "f" * 40
         binding = {"expected_head": expected}
-        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "write_finalization_receipt") as write:
+        with patch.object(sys, "argv", ["runner", "--repo", str(repo), "--canonical-repo", str(repo), "--source-kind", "canonical-main", "--source-identity-sha256", "0" * 64, "--expected-head", expected, "--delay-seconds", "5"]), patch.object(RUNNER, "load_finalization_binding", return_value=binding), patch.object(RUNNER.time, "sleep"), patch.object(RUNNER, "verify_repository"), patch.object(RUNNER, "deployment_contention_preflight", return_value=_contention_result()), patch.object(RUNNER, "run_streamed"), patch.object(RUNNER, "verify_live_manifest", return_value={"release_id": "release", "repo_head": expected, "completion_status": "complete"}), patch.object(RUNNER, "reconcile_coding_agent_sidecars", return_value=_sidecar_reconciliation(expected)), patch.object(RUNNER, "write_finalization_receipt") as write:
             self.assertEqual(RUNNER.main(), 0)
         write.assert_called_once_with(
             binding,
@@ -1558,6 +1710,45 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
             repo_head=expected,
             release_id="release",
             failure_type=None,
+        )
+
+    def test_main_marks_runtime_live_sidecar_failure_as_outstanding(self) -> None:
+        repo = Path("/tmp/repository")
+        expected = "f" * 40
+        binding = {"expected_head": expected}
+        with patch.object(
+            sys, "argv", self._runner_argv(repo, expected)
+        ), patch.object(
+            RUNNER, "load_finalization_binding", return_value=binding
+        ), patch.object(RUNNER.time, "sleep"), patch.object(
+            RUNNER, "verify_repository"
+        ), patch.object(
+            RUNNER,
+            "deployment_contention_preflight",
+            return_value=_contention_result(),
+        ), patch.object(RUNNER, "run_streamed"), patch.object(
+            RUNNER,
+            "verify_live_manifest",
+            return_value={
+                "release_id": "release",
+                "repo_head": expected,
+                "completion_status": "complete",
+            },
+        ) as manifest, patch.object(
+            RUNNER,
+            "reconcile_coding_agent_sidecars",
+            side_effect=RuntimeError("sidecar mismatch"),
+        ), patch.object(
+            RUNNER, "write_finalization_receipt"
+        ) as write:
+            self.assertEqual(RUNNER.main(), 1)
+        manifest.assert_called_once_with(expected)
+        write.assert_called_once_with(
+            binding,
+            final_status="failed",
+            repo_head=None,
+            release_id=None,
+            failure_type="SidecarInstallOutstanding",
         )
 
     def test_main_writes_failed_receipt_for_runner_failure(self) -> None:
