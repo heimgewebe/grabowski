@@ -80,6 +80,7 @@ class InstallCodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(receipt["scheduler_sha256"], scheduler_digest)
         self.assertEqual(receipt["scheduler_target"], str(self.scheduler))
         self.assertEqual(receipt["status"], "installed")
+        self.assertTrue(receipt["installed"])
         self.assertEqual(receipt["readback"]["controller"], "grabowski-primary")
         self.assertFalse(receipt["automatic_execution_authorized"])
         lock = self.pin.parent / ".coding-agent-router-install.lock"

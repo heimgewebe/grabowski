@@ -27,6 +27,8 @@ MAX_CAPTURE_BYTES = 65_536
 MAX_MANIFEST_BYTES = 2_000_000
 MAX_FINALIZATION_RECEIPT_BYTES = 64 * 1024
 FINALIZATION_KIND = "grabowski_runtime_deploy_finalization"
+SIDECAR_INSTALLER_RELATIVE_PATH = Path("tools/install_coding_agent_router_cli.py")
+SIDECAR_RECONCILIATION_KIND = "grabowski_runtime_sidecar_reconciliation"
 EARLY_DISPATCHER_SAMPLE_COUNT = 2
 EARLY_DISPATCHER_SAMPLE_INTERVAL_SECONDS = 0.05
 DEPLOYMENT_CONTENTION_RETRY_DELAYS_SECONDS = (5, 10, 20)
@@ -37,6 +39,10 @@ DEPLOYMENT_CONTENTION_MAX_ATTEMPTS = (
 
 class DeploymentContentionDeferred(RuntimeError):
     """The cheap read-only preflight observed contention or uncertainty."""
+
+
+class SidecarInstallOutstanding(RuntimeError):
+    """The runtime is live but one required sidecar reconciliation did not settle."""
 
 
 REPOGROUND_MANAGED_SOURCE_ROOT = Path.home() / "repos" / ".repoground-sources"
@@ -266,8 +272,22 @@ def read_limited_process_pipes(process: subprocess.Popen[bytes], *, timeout_seco
     return stdout, stderr, timed_out, stdout_truncated, stderr_truncated
 
 
-def run_capture(argv: list[str], *, cwd: Path, timeout: int = 30) -> str:
-    process = subprocess.Popen(argv, cwd=cwd, env=git_environment(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+def run_capture(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 30,
+    environment: dict[str, str] | None = None,
+) -> str:
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=environment if environment is not None else git_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     stdout_raw, stderr_raw, timed_out, stdout_truncated, stderr_truncated = read_limited_process_pipes(process, timeout_seconds=timeout, max_output_bytes=MAX_CAPTURE_BYTES)
     stdout = stdout_raw.decode("utf-8", errors="replace")
     stderr = stderr_raw.decode("utf-8", errors="replace")
@@ -278,6 +298,115 @@ def run_capture(argv: list[str], *, cwd: Path, timeout: int = 30) -> str:
     if process.returncode != 0:
         raise RuntimeError(stderr.strip() or stdout.strip() or "command failed")
     return stdout.strip()
+
+
+def _json_command(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    raw = run_capture(
+        argv,
+        cwd=cwd,
+        timeout=timeout,
+        environment=child_environment(),
+    )
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("sidecar installer returned invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("sidecar installer JSON root is not an object")
+    return value
+
+
+def _sidecar_digest(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise RuntimeError(f"sidecar {label} digest is invalid")
+    return value
+
+
+def reconcile_coding_agent_sidecars(
+    repo: Path,
+    live: dict[str, Any],
+) -> dict[str, Any]:
+    installer = repo / SIDECAR_INSTALLER_RELATIVE_PATH
+    metadata = installer.lstat()
+    if (
+        installer.is_symlink()
+        or not installer.is_file()
+        or metadata.st_uid != os.getuid()
+        or metadata.st_nlink != 1
+    ):
+        raise RuntimeError("sidecar installer source is unsafe")
+    python = Path(sys.executable)
+    if not python.is_absolute() or not os.access(python, os.X_OK):
+        raise RuntimeError("sidecar installer Python is not executable")
+
+    applied = _json_command(
+        [str(python), str(installer), "--apply"],
+        cwd=repo,
+    )
+    if (
+        applied.get("kind") != "coding-agent-router-cli-install-receipt"
+        or applied.get("status") != "installed"
+        or applied.get("installed") is not True
+        or applied.get("runtime_catalog_source") != "deployment_catalog"
+        or applied.get("automatic_execution_authorized") is not False
+        or applied.get("rollback_performed") is not False
+    ):
+        raise RuntimeError("sidecar apply receipt is invalid")
+    readback = applied.get("readback")
+    if (
+        not isinstance(readback, dict)
+        or readback.get("automatic_execution_authorized") is not False
+        or readback.get("catalog_sha256") != applied.get("runtime_catalog_sha256")
+    ):
+        raise RuntimeError("sidecar apply readback is invalid")
+
+    checked = _json_command(
+        [str(python), str(installer), "--check"],
+        cwd=repo,
+    )
+    if (
+        checked.get("kind") != "coding-agent-router-cli-install-check"
+        or checked.get("installed") is not True
+        or checked.get("runtime_catalog_source") != "deployment_catalog"
+        or checked.get("automatic_execution_authorized") is not False
+    ):
+        raise RuntimeError("sidecar post-install check is invalid")
+
+    wrapper_sha256 = _sidecar_digest(
+        checked.get("wrapper_sha256"), label="wrapper"
+    )
+    scheduler_sha256 = _sidecar_digest(
+        checked.get("scheduler_sha256"), label="scheduler"
+    )
+    runtime_catalog_sha256 = _sidecar_digest(
+        checked.get("runtime_catalog_sha256"), label="runtime catalog"
+    )
+    if (
+        applied.get("wrapper_sha256") != wrapper_sha256
+        or applied.get("scheduler_sha256") != scheduler_sha256
+        or applied.get("runtime_catalog_sha256") != runtime_catalog_sha256
+    ):
+        raise RuntimeError("sidecar apply and check identities differ")
+
+    material = {
+        "schema_version": 1,
+        "kind": SIDECAR_RECONCILIATION_KIND,
+        "status": "installed",
+        "repo_head": live.get("repo_head"),
+        "release_id": live.get("release_id"),
+        "wrapper_sha256": wrapper_sha256,
+        "scheduler_sha256": scheduler_sha256,
+        "runtime_catalog_sha256": runtime_catalog_sha256,
+        "apply_receipt_sha256": canonical_json_sha256(applied),
+        "check_receipt_sha256": canonical_json_sha256(checked),
+        "automatic_execution_authorized": False,
+    }
+    return {**material, "evidence_sha256": canonical_json_sha256(material)}
 
 
 def _validated_repository_path(repo: Path, *, label: str) -> Path:
@@ -745,7 +874,34 @@ def main() -> int:
         )
         run_streamed(["make", "deploy-apply"], cwd=repo, timeout_seconds=1_800, phase="deploy")
         live = verify_live_manifest(args.expected_head)
-        emit("complete", **live)
+        verify_repository(
+            repo,
+            args.canonical_repo,
+            args.source_kind,
+            args.expected_head,
+        )
+        try:
+            sidecars = reconcile_coding_agent_sidecars(repo, live)
+        except Exception as sidecar_error:
+            emit(
+                "runtime-deployed-sidecar-outstanding",
+                repo_head=live["repo_head"],
+                release_id=live["release_id"],
+                sidecar_status="outstanding",
+                sidecar_error_type=type(sidecar_error).__name__,
+            )
+            raise SidecarInstallOutstanding(
+                "runtime deployed but coding-agent sidecar reconciliation is outstanding"
+            ) from sidecar_error
+        verify_repository(
+            repo,
+            args.canonical_repo,
+            args.source_kind,
+            args.expected_head,
+        )
+        live = verify_live_manifest(args.expected_head)
+        emit("coding-agent-sidecars-complete", **sidecars)
+        emit("complete", **live, coding_agent_sidecars=sidecars)
         if binding is not None:
             write_finalization_receipt(
                 binding,
