@@ -66,6 +66,62 @@ class PrReviewGateTargetIdentityTests(unittest.TestCase):
 
 
 class PrReviewGateCliTests(unittest.TestCase):
+    def test_cli_uses_evidence_directory_as_artifact_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            evidence_path = repo / "artifacts" / "external-review.json"
+            state = {
+                "repoName": "heimgewebe/grabowski",
+                "pr": {
+                    "headRefOid": "a" * 40,
+                    "baseRefOid": "b" * 40,
+                },
+            }
+            with (
+                mock.patch.object(pr_review_gate, "load_self_review"),
+                mock.patch.object(pr_review_gate, "load_claude_evidence"),
+                mock.patch.object(
+                    pr_review_gate,
+                    "load_external_review_evidence",
+                    return_value={"kind": "external_review"},
+                ) as load_external,
+                mock.patch.object(pr_review_gate, "load_policy_waiver"),
+                mock.patch.object(
+                    pr_review_gate,
+                    "load_pr_state",
+                    return_value=state,
+                ),
+                mock.patch.object(
+                    pr_review_gate,
+                    "expected_check_names_for_repo",
+                    return_value=(),
+                ),
+                mock.patch.object(
+                    pr_review_gate,
+                    "evaluate_review_gate",
+                    return_value={"verdict": "PASS"},
+                ) as evaluate,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                rc = pr_review_gate.main(
+                    [
+                        "--repo",
+                        str(repo),
+                        "--pr",
+                        "546",
+                        "--external-review-evidence",
+                        str(evidence_path),
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            resolved_evidence = evidence_path.resolve()
+            load_external.assert_called_once_with(resolved_evidence)
+            self.assertEqual(
+                evaluate.call_args.kwargs["external_review_artifact_root"],
+                resolved_evidence.parent,
+            )
+
     def test_live_pr_query_excludes_review_comments_approvals_and_decisions(self) -> None:
         self.assertNotIn("reviews", pr_review_gate.PR_FIELDS)
         self.assertNotIn("latestReviews", pr_review_gate.PR_FIELDS)

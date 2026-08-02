@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -18,6 +19,50 @@ try:
     from review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
 except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
     from tools.review_evidence_schemas import REVIEW_POLICY_VERSION, validate_evidence
+
+try:
+    from plain_llm_review_contract import (
+        PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_MAX_EVIDENCE_BYTES,
+        PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+        PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_PROMPT_NONCE_RE,
+        PLAIN_LLM_PROVIDERS,
+        PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_REVIEW_GATE_AUTHORITY,
+        PLAIN_LLM_REVIEW_INPUT_MODE,
+        PLAIN_LLM_REVIEW_SOURCE_PREFIX,
+        build_plain_llm_review_prompt,
+        plain_llm_review_payload_sha256,
+    )
+except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
+    from tools.plain_llm_review_contract import (
+        PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_ENVIRONMENT_POLICY,
+        PLAIN_LLM_MAX_EVIDENCE_BYTES,
+        PLAIN_LLM_MAX_RAW_REVIEW_BYTES,
+        PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES,
+        PLAIN_LLM_PROMPT_NONCE_RE,
+        PLAIN_LLM_PROVIDERS,
+        PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS,
+        PLAIN_LLM_REVIEW_GATE_AUTHORITY,
+        PLAIN_LLM_REVIEW_INPUT_MODE,
+        PLAIN_LLM_REVIEW_SOURCE_PREFIX,
+        build_plain_llm_review_prompt,
+        plain_llm_review_payload_sha256,
+    )
+
+try:
+    from external_review_plain import (
+        PlainReviewError,
+        parse_review_json as parse_plain_llm_review_json,
+    )
+except ModuleNotFoundError:  # importlib-based tests load this file from the repo root
+    from tools.external_review_plain import (
+        PlainReviewError,
+        parse_review_json as parse_plain_llm_review_json,
+    )
 
 TERMINAL_STATUSES = {"fixed", "accepted", "false_positive", "deferred_with_reason", "not_applicable"}
 STOP_REASONS = {"clean_pass", "diminishing_returns", "residual_only_with_reason", "small_trivial_change"}
@@ -34,6 +79,10 @@ BOOTSTRAP_EXPECTED_CHECK_NAMES_BY_REPO = {
 }
 MAX_REQUIRED_CHECK_NAMES = 64
 MAX_REQUIRED_CHECK_NAME_LENGTH = 200
+MAX_PLAIN_LLM_RAW_REVIEW_BYTES = PLAIN_LLM_MAX_RAW_REVIEW_BYTES
+MAX_PLAIN_LLM_TRANSMITTED_PROMPT_BYTES = (
+    PLAIN_LLM_MAX_TRANSMITTED_PROMPT_BYTES
+)
 PASS_CHECK_BUCKETS = {"pass"}
 DERIVED_REVIEW_STATUS_NAMES = {
     "Review evidence gate",
@@ -229,7 +278,7 @@ PR_FIELDS = (
     "files",
 )
 CHECK_FIELDS = ("bucket", "completedAt", "description", "event", "link", "name", "startedAt", "state", "workflow")
-MAX_JSON_EVIDENCE_BYTES = 1_000_000
+MAX_JSON_EVIDENCE_BYTES = PLAIN_LLM_MAX_EVIDENCE_BYTES
 
 
 class GateInputError(RuntimeError):
@@ -692,6 +741,200 @@ def load_external_review_evidence(path: Path | None) -> dict[str, Any] | None:
         validate_schema=True,
         schema_failures_fatal=False,
     )
+
+
+def _read_private_artifact_inside_root(
+    root: Path | None,
+    artifact_path: Any,
+    *,
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    if root is None:
+        raise GateInputError(f"{label} root is unavailable")
+    if (
+        not isinstance(artifact_path, str)
+        or not artifact_path.strip()
+        or "\x00" in artifact_path
+    ):
+        raise GateInputError(f"{label} path is missing or invalid")
+    try:
+        root = root.resolve(strict=True)
+    except OSError as exc:
+        raise GateInputError(f"cannot resolve {label} root: {exc}") from exc
+    candidate = Path(artifact_path)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as exc:
+            raise GateInputError(f"{label} path escapes artifact root") from exc
+    else:
+        relative = candidate
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise GateInputError(f"{label} path escapes artifact root")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    file_flags = os.O_RDONLY | os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+
+    def validate_directory(info: os.stat_result) -> None:
+        if not stat.S_ISDIR(info.st_mode):
+            raise GateInputError(f"{label} ancestry contains a non-directory")
+        if info.st_uid not in {0, os.getuid()} or info.st_mode & 0o022:
+            raise GateInputError(f"{label} ancestry is not owner-controlled")
+
+    def file_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+            info.st_nlink,
+            info.st_mode,
+        )
+
+    try:
+        descriptor = os.open(root, directory_flags)
+    except OSError as exc:
+        raise GateInputError(f"cannot open {label} root: {exc}") from exc
+    try:
+        validate_directory(os.fstat(descriptor))
+        for part in parts[:-1]:
+            child = os.open(part, directory_flags, dir_fd=descriptor)
+            try:
+                validate_directory(os.fstat(child))
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+
+        file_descriptor = os.open(parts[-1], file_flags, dir_fd=descriptor)
+        try:
+            before = os.fstat(file_descriptor)
+            linked_before = os.stat(
+                parts[-1],
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            identity_before = file_identity(before)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode) != 0o600
+                or before.st_nlink != 1
+                or file_identity(linked_before) != identity_before
+            ):
+                raise GateInputError(
+                    f"{label} is not a private single-link regular file"
+                )
+            if before.st_size > max_bytes:
+                raise GateInputError(f"{label} exceeds {max_bytes} bytes")
+            chunks: list[bytes] = []
+            total = 0
+            while total <= max_bytes:
+                chunk = os.read(
+                    file_descriptor,
+                    min(65_536, max_bytes + 1 - total),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+            if total > max_bytes:
+                raise GateInputError(f"{label} exceeds {max_bytes} bytes")
+            after = os.fstat(file_descriptor)
+            linked_after = os.stat(
+                parts[-1],
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            identity_after = file_identity(after)
+            linked_identity_after = file_identity(linked_after)
+            if (
+                identity_after != identity_before
+                or linked_identity_after != identity_before
+                or total != before.st_size
+            ):
+                raise GateInputError(f"{label} changed while it was read")
+            return b"".join(chunks)
+        finally:
+            os.close(file_descriptor)
+    except (OSError, ValueError) as exc:
+        raise GateInputError(f"cannot read {label}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def _retained_plain_llm_review(
+    review_input: dict[str, Any],
+    artifact_root: Path | None,
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    try:
+        raw = _read_private_artifact_inside_root(
+            artifact_root,
+            review_input.get("raw_review_path"),
+            label="retained raw review artifact",
+            max_bytes=MAX_PLAIN_LLM_RAW_REVIEW_BYTES,
+        )
+        text = raw.decode("utf-8")
+        parsed = parse_plain_llm_review_json(text)
+    except (GateInputError, UnicodeDecodeError, PlainReviewError) as exc:
+        return None, None, str(exc)
+    return _sha256_bytes(raw), parsed, None
+
+
+def _retained_plain_llm_prompt_failures(
+    review_input: dict[str, Any],
+    artifact_root: Path | None,
+    *,
+    expected_prompt: str | None,
+) -> list[str]:
+    try:
+        prompt = _read_private_artifact_inside_root(
+            artifact_root,
+            review_input.get("transmitted_prompt_path"),
+            label="retained transmitted prompt artifact",
+            max_bytes=MAX_PLAIN_LLM_TRANSMITTED_PROMPT_BYTES,
+        )
+    except GateInputError as exc:
+        return [str(exc)]
+
+    failures: list[str] = []
+    prompt_sha256 = review_input.get("prompt_sha256")
+    if (
+        _valid_sha256(prompt_sha256)
+        and _normalize_sha256(prompt_sha256) != _sha256_bytes(prompt)
+    ):
+        failures.append(
+            "review_input.prompt_sha256 does not match retained transmitted "
+            "prompt artifact"
+        )
+    prompt_bytes = review_input.get("transmitted_prompt_bytes")
+    if (
+        isinstance(prompt_bytes, int)
+        and not isinstance(prompt_bytes, bool)
+        and prompt_bytes != len(prompt)
+    ):
+        failures.append(
+            "review_input.transmitted_prompt_bytes does not match retained "
+            "transmitted prompt artifact"
+        )
+    if expected_prompt is None:
+        failures.append("expected transmitted prompt is unavailable")
+    elif prompt != expected_prompt.encode("utf-8"):
+        failures.append(
+            "retained transmitted prompt artifact does not match "
+            "independently reconstructed plain-LLM prompt"
+        )
+    return failures
 
 
 def load_policy_waiver(path: Path | None) -> dict[str, Any] | None:
@@ -1225,6 +1468,413 @@ def _claude_cli_review_input_failures(
     return failures
 
 
+def _plain_llm_review_input_failures(
+    external_review: dict[str, Any],
+    *,
+    repo_name: str | None,
+    pr_number: Any,
+    head_sha: Any,
+    diff_sha256: Any,
+    expected_packet_prompt_sha256: str | None,
+    expected_prompt_sha256: str | None,
+    expected_prompt_bytes: int | None,
+) -> list[str]:
+    failures: list[str] = []
+    review_input = external_review.get("review_input")
+    if not isinstance(review_input, dict):
+        return ["review_input is missing or not a JSON object"]
+
+    if review_input.get("mode") != PLAIN_LLM_REVIEW_INPUT_MODE:
+        failures.append(
+            f"review_input.mode is not {PLAIN_LLM_REVIEW_INPUT_MODE}"
+        )
+    if (
+        repo_name is not None
+        and _canonical_repo_slug(review_input.get("repo")) != repo_name
+    ):
+        failures.append("review_input.repo mismatch")
+    input_pr = review_input.get("pr")
+    if pr_number is not None and (
+        isinstance(input_pr, bool)
+        or not isinstance(input_pr, int)
+        or input_pr != pr_number
+    ):
+        failures.append("review_input.pr mismatch")
+    if (
+        not isinstance(head_sha, str)
+        or not head_sha
+        or review_input.get("head_sha") != head_sha
+    ):
+        failures.append("review_input.head_sha mismatch")
+
+    input_diff_sha256 = review_input.get("diff_sha256")
+    if not _valid_sha256(input_diff_sha256) or not _valid_sha256(
+        diff_sha256
+    ):
+        failures.append("review_input.diff_sha256 is missing or invalid")
+    elif _normalize_sha256(input_diff_sha256) != _normalize_sha256(
+        diff_sha256
+    ):
+        failures.append("review_input.diff_sha256 mismatch")
+
+    packet_prompt_sha256 = review_input.get("packet_prompt_sha256")
+    if not _valid_sha256(packet_prompt_sha256):
+        failures.append(
+            "review_input.packet_prompt_sha256 is missing or invalid"
+        )
+    elif expected_packet_prompt_sha256 is None:
+        failures.append("expected packet prompt sha256 is unavailable")
+    elif _normalize_sha256(packet_prompt_sha256) != _normalize_sha256(
+        expected_packet_prompt_sha256
+    ):
+        failures.append("review_input.packet_prompt_sha256 mismatch")
+
+    prompt_nonce = review_input.get("prompt_nonce")
+    if (
+        not isinstance(prompt_nonce, str)
+        or PLAIN_LLM_PROMPT_NONCE_RE.fullmatch(prompt_nonce) is None
+    ):
+        failures.append("review_input.prompt_nonce is missing or invalid")
+    prompt_sha256 = external_review.get("prompt_sha256")
+    input_prompt_sha256 = review_input.get("prompt_sha256")
+    if not _valid_sha256(input_prompt_sha256):
+        failures.append("review_input.prompt_sha256 is missing or invalid")
+    elif (
+        not _valid_sha256(prompt_sha256)
+        or _normalize_sha256(input_prompt_sha256)
+        != _normalize_sha256(prompt_sha256)
+    ):
+        failures.append("review_input.prompt_sha256 mismatch")
+    elif expected_prompt_sha256 is None:
+        failures.append("expected transmitted prompt sha256 is unavailable")
+    elif _normalize_sha256(input_prompt_sha256) != _normalize_sha256(
+        expected_prompt_sha256
+    ):
+        failures.append(
+            "review_input.prompt_sha256 does not match independently "
+            "reconstructed plain-LLM prompt"
+        )
+
+    provider = review_input.get("provider")
+    if provider not in PLAIN_LLM_PROVIDERS:
+        failures.append("review_input.provider is missing or unsupported")
+    else:
+        expected_transport = (
+            "prompt_file" if provider == "grok" else "argv"
+        )
+        expected_argument_exposure = provider == "gemini"
+        expected_ephemeral_prompt_file = provider == "grok"
+        if review_input.get("transport") != expected_transport:
+            failures.append("review_input.transport mismatch")
+        if (
+            review_input.get("prompt_argument_exposure")
+            != expected_argument_exposure
+        ):
+            failures.append("review_input.prompt_argument_exposure mismatch")
+        if (
+            review_input.get("ephemeral_prompt_file")
+            != expected_ephemeral_prompt_file
+        ):
+            failures.append("review_input.ephemeral_prompt_file mismatch")
+
+        expected_web_policy = (
+            "disabled_by_cli"
+            if provider == "grok"
+            else "forbidden_by_prompt_unverified"
+        )
+        expected_memory_policy = (
+            "disabled_by_cli"
+            if provider == "grok"
+            else "new_single_turn_no_resume"
+        )
+        if review_input.get("web_search_policy") != expected_web_policy:
+            failures.append("review_input.web_search_policy mismatch")
+        if review_input.get("memory_policy") != expected_memory_policy:
+            failures.append("review_input.memory_policy mismatch")
+
+    if review_input.get("account_transport") != "account_cli":
+        failures.append("review_input.account_transport is not account_cli")
+    requested_model = review_input.get("requested_model")
+    if not isinstance(requested_model, str) or not requested_model.strip():
+        failures.append("review_input.requested_model is missing")
+    if (
+        review_input.get("model_identity_attestation")
+        != "requested_not_provider_attested"
+    ):
+        failures.append(
+            "review_input.model_identity_attestation overclaims provider identity"
+        )
+    executable = review_input.get("executable")
+    if (
+        not isinstance(executable, str)
+        or not Path(executable).is_absolute()
+        or "\x00" in executable
+    ):
+        failures.append("review_input.executable is missing or not absolute")
+    requested_executable = review_input.get("requested_executable")
+    if (
+        not isinstance(requested_executable, str)
+        or not requested_executable.strip()
+        or "\x00" in requested_executable
+    ):
+        failures.append("review_input.requested_executable is missing")
+    expected_executable_identity = (
+        "canonical_native_owner_controlled"
+        if provider == "grok"
+        else "owner_regular_executable_not_group_world_writable"
+    )
+    if review_input.get("executable_identity") != expected_executable_identity:
+        failures.append("review_input.executable_identity mismatch")
+    prompt_bytes = review_input.get("transmitted_prompt_bytes")
+    if (
+        isinstance(prompt_bytes, bool)
+        or not isinstance(prompt_bytes, int)
+        or prompt_bytes <= 0
+    ):
+        failures.append("review_input.transmitted_prompt_bytes is invalid")
+    elif expected_prompt_bytes is None:
+        failures.append("expected transmitted prompt byte count is unavailable")
+    elif prompt_bytes != expected_prompt_bytes:
+        failures.append(
+            "review_input.transmitted_prompt_bytes does not match independently "
+            "reconstructed plain-LLM prompt"
+        )
+    for key in ("transmitted_prompt_path", "raw_review_path"):
+        value = review_input.get(key)
+        if not isinstance(value, str) or not value.strip():
+            failures.append(f"review_input.{key} is missing")
+    if review_input.get("isolated_working_directory") is not True:
+        failures.append("review_input.isolated_working_directory is not true")
+    if review_input.get("local_repository_context_provided") is not False:
+        failures.append(
+            "review_input.local_repository_context_provided is not false"
+        )
+    if review_input.get("quota_attestation") != "not_established_by_adapter":
+        failures.append("review_input.quota_attestation is not conservative")
+    if (
+        review_input.get("review_gate_authority")
+        != PLAIN_LLM_REVIEW_GATE_AUTHORITY
+    ):
+        failures.append("review_input.review_gate_authority is not advisory-only")
+    if review_input.get("environment_policy") != PLAIN_LLM_ENVIRONMENT_POLICY:
+        failures.append("review_input.environment_policy mismatch")
+    passed_environment = review_input.get("environment_passed_keys")
+    if (
+        not isinstance(passed_environment, list)
+        or not all(
+            isinstance(item, str) and item for item in passed_environment
+        )
+        or len(passed_environment) != len(set(passed_environment))
+    ):
+        failures.append("review_input.environment_passed_keys is invalid")
+    else:
+        passed_keys = set(passed_environment)
+        if not PLAIN_LLM_REQUIRED_ENVIRONMENT_KEYS.issubset(passed_keys):
+            failures.append(
+                "review_input.environment_passed_keys misses required keys"
+            )
+        if not passed_keys.issubset(PLAIN_LLM_ALLOWED_ENVIRONMENT_KEYS):
+            failures.append(
+                "review_input.environment_passed_keys contains forbidden keys"
+            )
+    session_removed = review_input.get("session_environment_removed")
+    if not isinstance(session_removed, list) or not all(
+        isinstance(item, str) and item for item in session_removed
+    ):
+        failures.append("review_input.session_environment_removed is invalid")
+    if review_input.get("session_bus_exposed") is not False:
+        failures.append("review_input.session_bus_exposed is not false")
+    if review_input.get("stdin_policy") != "null_device":
+        failures.append("review_input.stdin_policy is not null_device")
+    if review_input.get("process_group_isolated") is not True:
+        failures.append("review_input.process_group_isolated is not true")
+    if (
+        review_input.get("provider_output_limit_enforcement")
+        != "kill_process_group"
+    ):
+        failures.append(
+            "review_input.provider_output_limit_enforcement mismatch"
+        )
+    if review_input.get("workspace_readback") != "unchanged":
+        failures.append("review_input.workspace_readback is not unchanged")
+    for key in (
+        "billable_api_environment_removed",
+        "git_context_environment_removed",
+    ):
+        value = review_input.get(key)
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            failures.append(f"review_input.{key} is invalid")
+    if external_review.get("prompt_transmitted") is not True:
+        failures.append("prompt_transmitted must be true for plain-LLM review")
+    if external_review.get("prompt_includes_diff") is not True:
+        failures.append("prompt_includes_diff must be true for plain-LLM review")
+    return failures
+
+
+def _plain_llm_external_review_failures(
+    review: dict[str, Any],
+    review_input: dict[str, Any],
+    *,
+    retained_review_sha256: str | None,
+    retained_review: dict[str, Any] | None,
+    retained_review_failure: str | None,
+) -> list[str]:
+    failures: list[str] = []
+    provider = review_input.get("provider")
+    requested_model = review_input.get("requested_model")
+    expected_source = (
+        f"{PLAIN_LLM_REVIEW_SOURCE_PREFIX}{provider}:{requested_model}"
+    )
+    if review.get("source") != expected_source:
+        failures.append("source does not match provider and requested model")
+    if review.get("provider") != provider:
+        failures.append("provider does not match review_input.provider")
+    if review.get("model") != requested_model:
+        failures.append("model does not match review_input.requested_model")
+    if review.get("transport") != "account_cli":
+        failures.append("transport is not account_cli")
+    if review.get("execution_mode") != "single_turn":
+        failures.append("execution_mode is not single_turn")
+
+    expected_tool_policy = (
+        "empty_tools_plan_mode"
+        if provider == "grok"
+        else "sandboxed_plan_mode"
+    )
+    if (
+        provider in PLAIN_LLM_PROVIDERS
+        and review.get("tool_policy") != expected_tool_policy
+    ):
+        failures.append("tool_policy does not match provider contract")
+
+    for key in (
+        "argv_sha256",
+        "stdout_sha256",
+        "stderr_sha256",
+        "review_sha256",
+        "parsed_review_sha256",
+    ):
+        if not _valid_sha256(review.get(key)):
+            failures.append(f"{key} is missing or invalid")
+    if (
+        _valid_sha256(review.get("stdout_sha256"))
+        and _valid_sha256(review.get("review_sha256"))
+        and _normalize_sha256(review.get("stdout_sha256"))
+        != _normalize_sha256(review.get("review_sha256"))
+    ):
+        failures.append("review_sha256 does not match stdout_sha256")
+
+    verdict = review.get("verdict")
+    finding_count = review.get("finding_count")
+    findings = review.get("findings")
+    if retained_review_failure is not None:
+        failures.append(
+            "retained raw review artifact is invalid: "
+            + retained_review_failure
+        )
+    elif retained_review is not None:
+        stdout_sha256 = review.get("stdout_sha256")
+        if (
+            _valid_sha256(stdout_sha256)
+            and _normalize_sha256(stdout_sha256)
+            != retained_review_sha256
+        ):
+            failures.append(
+                "stdout_sha256 does not match retained raw review artifact"
+            )
+        structured_review = {
+            "verdict": verdict,
+            "finding_count": finding_count,
+            "findings": findings,
+        }
+        if structured_review != retained_review:
+            failures.append(
+                "structured review payload does not match retained raw "
+                "review artifact"
+            )
+    if verdict not in EXTERNAL_REVIEW_VERDICTS:
+        failures.append("verdict is invalid")
+    valid_count = (
+        isinstance(finding_count, int)
+        and not isinstance(finding_count, bool)
+        and finding_count >= 0
+    )
+    if not valid_count:
+        failures.append("finding_count must be an integer >= 0")
+    if not isinstance(findings, list):
+        failures.append("findings is not a list")
+    elif valid_count and len(findings) != finding_count:
+        failures.append("finding_count does not match findings length")
+    try:
+        expected_parsed_review_sha256 = plain_llm_review_payload_sha256(
+            verdict=verdict,
+            finding_count=finding_count,
+            findings=findings,
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        failures.append("structured review payload is not canonical JSON")
+    else:
+        parsed_review_sha256 = review.get("parsed_review_sha256")
+        if (
+            _valid_sha256(parsed_review_sha256)
+            and _normalize_sha256(parsed_review_sha256)
+            != expected_parsed_review_sha256
+        ):
+            failures.append(
+                "parsed_review_sha256 does not match canonical verdict, "
+                "finding_count, and findings payload"
+            )
+    if verdict == "PASS" and valid_count and finding_count != 0:
+        failures.append("PASS plain-LLM review must have finding_count 0")
+    if (
+        verdict in {"NEEDS_CHANGE", "BLOCK"}
+        and valid_count
+        and finding_count == 0
+    ):
+        failures.append(
+            f"{verdict} plain-LLM review must report at least one finding"
+        )
+
+    if isinstance(findings, list):
+        allowed_fields = {"severity", "summary", "file", "line", "fix"}
+        for index, finding in enumerate(findings):
+            if not isinstance(finding, dict):
+                failures.append(f"finding {index} is not a JSON object")
+                continue
+            unknown_fields = sorted(set(finding) - allowed_fields)
+            if unknown_fields:
+                failures.append(
+                    f"finding {index} has unknown fields: "
+                    + ", ".join(unknown_fields)
+                )
+            if finding.get("severity") not in {
+                "low",
+                "medium",
+                "high",
+                "critical",
+            }:
+                failures.append(f"finding {index} severity is invalid")
+            summary = finding.get("summary")
+            if not isinstance(summary, str) or not summary.strip():
+                failures.append(f"finding {index} summary is missing")
+            for key in ("file", "fix"):
+                value = finding.get(key)
+                if value is not None and (
+                    not isinstance(value, str) or not value.strip()
+                ):
+                    failures.append(f"finding {index} {key} is invalid")
+            line = finding.get("line")
+            if line is not None and (
+                isinstance(line, bool)
+                or not isinstance(line, int)
+                or line <= 0
+            ):
+                failures.append(f"finding {index} line is invalid")
+    return failures
+
+
 def _external_review_failures(
     state: dict[str, Any],
     pr: dict[str, Any],
@@ -1233,6 +1883,7 @@ def _external_review_failures(
     required: bool,
     repo_name: str | None = None,
     claude_cli_required: bool = False,
+    external_review_artifact_root: Path | None = None,
 ) -> list[str]:
     if external_review is None:
         return ["external review is required but evidence is missing"] if required else []
@@ -1285,9 +1936,55 @@ def _external_review_failures(
     if not _valid_sha256(external_review.get("prompt_sha256")):
         failures.append("prompt_sha256 is missing or invalid")
     raw_review_input = external_review.get("review_input")
-    claude_cli_input_mode = isinstance(raw_review_input, dict) and raw_review_input.get("mode") == CLAUDE_CLI_REVIEW_INPUT_MODE
+    claude_cli_input_mode = (
+        isinstance(raw_review_input, dict)
+        and raw_review_input.get("mode") == CLAUDE_CLI_REVIEW_INPUT_MODE
+    )
+    plain_llm_input_mode = (
+        isinstance(raw_review_input, dict)
+        and raw_review_input.get("mode") == PLAIN_LLM_REVIEW_INPUT_MODE
+    )
+    raw_reviews = external_review.get("reviews")
+    claude_cli_source_declared = (
+        isinstance(raw_reviews, list)
+        and any(
+            isinstance(review, dict)
+            and review.get("source") == CLAUDE_CLI_REVIEW_SOURCE
+            for review in raw_reviews
+        )
+    )
+    claude_cli_validation_required = (
+        claude_cli_required
+        or claude_cli_input_mode
+        or claude_cli_source_declared
+    )
+    plain_llm_source_declared = (
+        isinstance(raw_reviews, list)
+        and any(
+            isinstance(review, dict)
+            and isinstance(review.get("source"), str)
+            and review["source"].startswith(
+                PLAIN_LLM_REVIEW_SOURCE_PREFIX
+            )
+            for review in raw_reviews
+        )
+    )
+    plain_llm_required = plain_llm_input_mode or plain_llm_source_declared
+    retained_review_sha256: str | None = None
+    retained_review: dict[str, Any] | None = None
+    retained_review_failure: str | None = None
+    if plain_llm_required:
+        retained_review_sha256, retained_review, retained_review_failure = (
+            _retained_plain_llm_review(
+                raw_review_input if isinstance(raw_review_input, dict) else {},
+                external_review_artifact_root,
+            )
+        )
     expected_packet_prompt_sha256: str | None = None
-    expected_prompt_sha256: str | None = None
+    expected_claude_prompt_sha256: str | None = None
+    expected_plain_llm_prompt: str | None = None
+    expected_plain_llm_prompt_sha256: str | None = None
+    expected_plain_llm_prompt_bytes: int | None = None
     normalized_diff_sha256 = _normalize_sha256(diff_sha256)
     if (
         isinstance(pr_number, int)
@@ -1301,11 +1998,28 @@ def _external_review_failures(
         expected_packet_prompt_sha256 = _sha256_text(packet_prompt)
         prompt_nonce = raw_review_input.get("prompt_nonce") if isinstance(raw_review_input, dict) else None
         diff_text = state.get("pr_diff_text")
-        if isinstance(prompt_nonce, str) and PROMPT_NONCE_RE.fullmatch(prompt_nonce) and isinstance(diff_text, str):
-            expected_prompt_sha256 = _sha256_text(
-                build_claude_review_prompt(packet_prompt, diff_text, prompt_nonce)
-            )
-    if claude_cli_required or claude_cli_input_mode:
+        if isinstance(prompt_nonce, str) and isinstance(diff_text, str):
+            if PROMPT_NONCE_RE.fullmatch(prompt_nonce):
+                expected_claude_prompt_sha256 = _sha256_text(
+                    build_claude_review_prompt(
+                        packet_prompt, diff_text, prompt_nonce
+                    )
+                )
+            if PLAIN_LLM_PROMPT_NONCE_RE.fullmatch(prompt_nonce):
+                expected_plain_llm_prompt = build_plain_llm_review_prompt(
+                    packet_prompt, diff_text, prompt_nonce
+                )
+                expected_plain_llm_prompt_sha256 = _sha256_text(
+                    expected_plain_llm_prompt
+                )
+                expected_plain_llm_prompt_bytes = len(
+                    expected_plain_llm_prompt.encode("utf-8")
+                )
+    specialized_input_validation_required = (
+        claude_cli_validation_required
+        or plain_llm_required
+    )
+    if claude_cli_validation_required:
         failures.extend(
             _claude_cli_review_input_failures(
                 external_review,
@@ -1314,15 +2028,45 @@ def _external_review_failures(
                 head_sha=head,
                 diff_sha256=diff_sha256,
                 expected_packet_prompt_sha256=expected_packet_prompt_sha256,
-                expected_prompt_sha256=expected_prompt_sha256,
+                expected_prompt_sha256=expected_claude_prompt_sha256,
             )
         )
-    elif external_review.get("prompt_includes_diff") is not True:
+    if plain_llm_required:
+        failures.extend(
+            _plain_llm_review_input_failures(
+                external_review,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                head_sha=head,
+                diff_sha256=diff_sha256,
+                expected_packet_prompt_sha256=(
+                    expected_packet_prompt_sha256
+                ),
+                expected_prompt_sha256=(
+                    expected_plain_llm_prompt_sha256
+                ),
+                expected_prompt_bytes=expected_plain_llm_prompt_bytes,
+            )
+        )
+        failures.extend(
+            _retained_plain_llm_prompt_failures(
+                raw_review_input
+                if isinstance(raw_review_input, dict)
+                else {},
+                external_review_artifact_root,
+                expected_prompt=expected_plain_llm_prompt,
+            )
+        )
+    if (
+        not specialized_input_validation_required
+        and external_review.get("prompt_includes_diff") is not True
+    ):
         failures.append("prompt_includes_diff is not true")
 
-    reviews = external_review.get("reviews")
+    reviews = raw_reviews
     reported_external_findings = 0
     valid_claude_cli_reviews = 0
+    valid_plain_llm_reviews = 0
     if not isinstance(reviews, list):
         failures.append("reviews is not a list")
     elif required and not reviews:
@@ -1341,6 +2085,25 @@ def _external_review_failures(
                     failures.extend(f"review {index} Claude CLI evidence invalid: {failure}" for failure in claude_failures)
                 else:
                     valid_claude_cli_reviews += 1
+            elif (
+                plain_llm_required
+                and source.startswith(PLAIN_LLM_REVIEW_SOURCE_PREFIX)
+                and isinstance(raw_review_input, dict)
+            ):
+                plain_failures = _plain_llm_external_review_failures(
+                    review,
+                    raw_review_input,
+                    retained_review_sha256=retained_review_sha256,
+                    retained_review=retained_review,
+                    retained_review_failure=retained_review_failure,
+                )
+                if plain_failures:
+                    failures.extend(
+                        f"review {index} plain-LLM evidence invalid: {failure}"
+                        for failure in plain_failures
+                    )
+                else:
+                    valid_plain_llm_reviews += 1
             if not _valid_sha256(review.get("review_sha256")):
                 failures.append(f"review {index} review_sha256 is missing or invalid")
             verdict = review.get("verdict")
@@ -1352,8 +2115,16 @@ def _external_review_failures(
             else:
                 reported_external_findings += _reported_external_finding_count(verdict, finding_count)
 
-    if (claude_cli_required or claude_cli_input_mode) and valid_claude_cli_reviews == 0:
-        failures.append("Claude CLI packet review is required but no valid review entry was provided")
+    if claude_cli_validation_required and valid_claude_cli_reviews == 0:
+        failures.append(
+            "Claude CLI packet review evidence is declared but no valid review entry "
+            "was provided"
+        )
+    if plain_llm_required and valid_plain_llm_reviews == 0:
+        failures.append(
+            "plain-LLM review evidence is declared but no valid plain-LLM review "
+            "entry was provided"
+        )
 
     if external_review.get("external_reviews_triaged") is not True:
         failures.append("external_reviews_triaged is not true")
@@ -1431,11 +2202,235 @@ def build_external_review_prompt(state: dict[str, Any], diff_filename: str, diff
     )
 
 
+def _validate_packet_directory_ancestry(path: Path) -> None:
+    """Reject packet directories another local user could replace."""
+    trusted_owners = {0, os.getuid(), Path("/").stat().st_uid}
+    try:
+        child_metadata = path.lstat()
+        if (
+            not stat.S_ISDIR(child_metadata.st_mode)
+            or stat.S_ISLNK(child_metadata.st_mode)
+            or child_metadata.st_nlink < 1
+            or child_metadata.st_uid not in trusted_owners
+            or (
+                child_metadata.st_mode & 0o022
+                and not child_metadata.st_mode & stat.S_ISVTX
+            )
+        ):
+            raise GateInputError(
+                f"external review packet path ancestry is unsafe: {path}"
+            )
+        directory = path.parent
+        while True:
+            metadata = directory.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_nlink < 1
+                or metadata.st_uid not in trusted_owners
+                or (
+                    metadata.st_mode & 0o022
+                    and not metadata.st_mode & stat.S_ISVTX
+                )
+                or (
+                    metadata.st_mode & stat.S_ISVTX
+                    and child_metadata.st_uid not in trusted_owners
+                )
+            ):
+                raise GateInputError(
+                    f"external review packet path ancestry is unsafe: {directory}"
+                )
+            if directory.parent == directory:
+                return
+            child_metadata = metadata
+            directory = directory.parent
+    except GateInputError:
+        raise
+    except OSError as exc:
+        raise GateInputError(
+            f"external review packet path ancestry is unavailable: {exc}"
+        ) from exc
+
+
+def _open_private_packet_directory(output_dir: Path) -> tuple[Path, int]:
+    """Create/open the packet directory and pin it at exact mode 0700."""
+    output_dir = Path(os.path.abspath(output_dir))
+    descriptor = -1
+    try:
+        missing: list[Path] = []
+        cursor = output_dir
+        while True:
+            try:
+                cursor.lstat()
+                break
+            except FileNotFoundError:
+                missing.append(cursor)
+                if cursor.parent == cursor:
+                    raise GateInputError(
+                        "external review packet parent root is unavailable"
+                    )
+                cursor = cursor.parent
+        _validate_packet_directory_ancestry(cursor)
+        for directory in reversed(missing):
+            try:
+                os.mkdir(directory, 0o700)
+            except FileExistsError:
+                pass
+            created = directory.lstat()
+            if (
+                stat.S_ISLNK(created.st_mode)
+                or not stat.S_ISDIR(created.st_mode)
+                or created.st_uid != os.getuid()
+            ):
+                raise GateInputError(
+                    "external review packet directory is not owner-controlled"
+                )
+            os.chmod(directory, 0o700, follow_symlinks=False)
+        linked = output_dir.lstat()
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or linked.st_uid != os.getuid()
+        ):
+            raise GateInputError(
+                "external review packet directory is not owner-controlled"
+            )
+        os.chmod(output_dir, 0o700, follow_symlinks=False)
+        _validate_packet_directory_ancestry(output_dir)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(output_dir, flags)
+        opened = os.fstat(descriptor)
+        linked_after = output_dir.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or (opened.st_dev, opened.st_ino)
+            != (linked_after.st_dev, linked_after.st_ino)
+            or stat.S_IMODE(linked_after.st_mode) != 0o700
+        ):
+            raise GateInputError(
+                "external review packet directory identity is unsafe"
+            )
+        return output_dir, descriptor
+    except GateInputError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise GateInputError(
+            f"cannot prepare private external review packet directory: {exc}"
+        ) from exc
+
+
+def _write_private_packet_file(
+    directory_descriptor: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    """Atomically replace one packet file with an exact private 0600 inode."""
+    temporary_name = ""
+    descriptor = -1
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for _ in range(8):
+            temporary_name = f".{name}.tmp-{os.urandom(12).hex()}"
+            try:
+                descriptor = os.open(
+                    temporary_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0:
+            raise GateInputError(
+                f"cannot allocate private temporary packet file for {name}"
+            )
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            chunk_size = os.write(descriptor, view[written:])
+            if chunk_size <= 0:
+                raise GateInputError(
+                    f"private packet file write made no progress: {name}"
+                )
+            written += chunk_size
+        os.fsync(descriptor)
+        completed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(completed.st_mode)
+            or completed.st_uid != os.getuid()
+            or completed.st_nlink != 1
+            or stat.S_IMODE(completed.st_mode) != 0o600
+            or completed.st_size != len(payload)
+        ):
+            raise GateInputError(f"private packet file identity is unsafe: {name}")
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        linked = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.getuid()
+            or linked.st_nlink != 1
+            or stat.S_IMODE(linked.st_mode) != 0o600
+            or (linked.st_dev, linked.st_ino)
+            != (completed.st_dev, completed.st_ino)
+            or linked.st_size != len(payload)
+        ):
+            raise GateInputError(f"private packet file publish drifted: {name}")
+        os.fsync(directory_descriptor)
+        temporary_name = ""
+    except GateInputError:
+        raise
+    except OSError as exc:
+        raise GateInputError(f"cannot write private packet file {name}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+
+
 def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_diff: bytes) -> dict[str, Any]:
     repo_name = _canonical_repo_slug(state.get("repoName"))
     if repo_name is None:
         raise GateInputError("cannot write external review packet without valid repo name")
-    output_dir = output_dir.resolve()
     pr = state.get("pr") if isinstance(state.get("pr"), dict) else {}
     pr_number = pr.get("number")
     if isinstance(pr_number, bool) or not isinstance(pr_number, int):
@@ -1443,8 +2438,8 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     head = pr.get("headRefOid")
     if not isinstance(head, str) or not head:
         raise GateInputError("cannot write external review packet without PR head SHA")
+    output_dir = Path(os.path.abspath(output_dir))
 
-    output_dir.mkdir(parents=True, exist_ok=True)
     diff_sha256 = _sha256_bytes(pr_diff)
     diff_filename = f"pr-{pr_number}-{head[:12]}.diff"
     prompt_filename = f"pr-{pr_number}-{head[:12]}-external-review-prompt.md"
@@ -1456,9 +2451,7 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
     evidence_path = output_dir / evidence_filename
     manifest_path = output_dir / manifest_filename
 
-    diff_path.write_bytes(pr_diff)
     prompt = build_external_review_prompt(state, diff_filename, diff_sha256)
-    prompt_path.write_text(prompt, encoding="utf-8")
     prompt_sha256 = _sha256_text(prompt)
     evidence_template = {
         "schema_version": 1,
@@ -1480,7 +2473,6 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
         "external_reviews_triaged": False,
         "findings": [],
     }
-    evidence_path.write_text(json.dumps(evidence_template, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     manifest = {
         "schema_version": 1,
         "kind": "external_review_packet",
@@ -1493,8 +2485,35 @@ def write_external_review_packet(output_dir: Path, state: dict[str, Any], pr_dif
         "prompt_sha256": prompt_sha256,
         "evidence_template_path": str(evidence_path),
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return {**manifest, "manifest_path": str(manifest_path)}
+    output_dir, directory_descriptor = _open_private_packet_directory(output_dir)
+    try:
+        _write_private_packet_file(
+            directory_descriptor,
+            diff_filename,
+            pr_diff,
+        )
+        _write_private_packet_file(
+            directory_descriptor,
+            prompt_filename,
+            prompt.encode("utf-8"),
+        )
+        _write_private_packet_file(
+            directory_descriptor,
+            evidence_filename,
+            (
+                json.dumps(evidence_template, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8"),
+        )
+        _write_private_packet_file(
+            directory_descriptor,
+            manifest_filename,
+            (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+        )
+        return {**manifest, "manifest_path": str(manifest_path)}
+    finally:
+        os.close(directory_descriptor)
 
 
 def write_self_review_template(output_path: Path, state: dict[str, Any]) -> dict[str, Any]:
@@ -1912,6 +2931,7 @@ def evaluate_review_gate(
     self_review: dict[str, Any] | None = None,
     claude_evidence: dict[str, Any] | None = None,
     external_review_evidence: dict[str, Any] | None = None,
+    external_review_artifact_root: Path | None = None,
     policy_waiver: dict[str, Any] | None = None,
     expected_check_names: tuple[str, ...] = DEFAULT_EXPECTED_CHECK_NAMES,
 ) -> dict[str, Any]:
@@ -2087,6 +3107,7 @@ def evaluate_review_gate(
         required=False,
         repo_name=repo_name,
         claude_cli_required=False,
+        external_review_artifact_root=external_review_artifact_root,
     )
     for failure in external_failures:
         warnings.append(f"Optional external review evidence invalid and ignored: {failure}")
@@ -2212,7 +3233,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         self_review = load_self_review(resolve_inside_repo(repo, args.self_review, label="self-review"))
         claude_evidence = load_claude_evidence(resolve_inside_repo(repo, args.claude_evidence, label="Claude evidence"))
-        external_review_evidence = load_external_review_evidence(resolve_inside_repo(repo, args.external_review_evidence, label="external review evidence"))
+        external_review_evidence_path = resolve_inside_repo(
+            repo,
+            args.external_review_evidence,
+            label="external review evidence",
+        )
+        external_review_evidence = load_external_review_evidence(
+            external_review_evidence_path
+        )
         policy_waiver = load_policy_waiver(resolve_inside_repo(repo, args.policy_waiver, label="Claude policy waiver"))
         state = load_pr_state(repo, args.pr)
         packet = None
@@ -2232,6 +3260,11 @@ def main(argv: list[str] | None = None) -> int:
             self_review=self_review,
             claude_evidence=claude_evidence,
             external_review_evidence=external_review_evidence,
+            external_review_artifact_root=(
+                external_review_evidence_path.parent
+                if external_review_evidence_path is not None
+                else repo
+            ),
             policy_waiver=policy_waiver,
             expected_check_names=expected_check_names_for_repo(
                 repo,
