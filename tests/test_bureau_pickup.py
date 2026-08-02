@@ -358,6 +358,53 @@ class BureauPickupTests(unittest.TestCase):
             "intent_sha256": "4" * 64,
         }
 
+    def write_machine_complete_task(
+        self,
+        *,
+        state="ready",
+        acceptance_results=None,
+        include_bound_evidence=True,
+    ):
+        verified_at = "2026-08-02T19:35:34Z"
+        completion = {
+            "state": "verified",
+            "verified_at": verified_at,
+            "acceptance_results": acceptance_results or {"contract": True},
+        }
+        verification = {
+            "authority": "test-machine-evidence",
+            "task_sha256": "1" * 64,
+            "plan_sha256": "2" * 64,
+        }
+        if include_bound_evidence:
+            completion.update(
+                {
+                    "runtime_head": "3" * 40,
+                    "connector_snapshot_receipt_sha256": "4" * 64,
+                }
+            )
+            verification.update(
+                {
+                    "runtime_head": "3" * 40,
+                    "connector_snapshot_receipt_sha256": "4" * 64,
+                }
+            )
+        task = {
+            "schema_version": 1,
+            "id": "TEST-T001",
+            "state": state,
+            "acceptance": [{"id": "contract", "assertion": "done"}],
+            "metadata": {
+                "verified_at": verified_at,
+                "partial_completion": {"completion": completion},
+                "verification": verification,
+            },
+        }
+        path = self.registry_root / "registry" / "tasks" / "TEST-T001.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(task), encoding="utf-8")
+        return path
+
     @staticmethod
     def lease(key, owner, metadata="a" * 64):
         return {
@@ -676,6 +723,171 @@ class BureauPickupTests(unittest.TestCase):
                 pickup.grabowski_bureau_pickup_execute(self.request())
         invoke.assert_not_called()
         acquire.assert_not_called()
+
+    def test_machine_complete_open_task_is_latched_before_any_effect(self) -> None:
+        task_path = self.write_machine_complete_task()
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_not_called()
+        acquire.assert_not_called()
+        self.assertFalse(self.coordination_root.exists())
+        self.assertFalse(result["effect_started"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual("closeout-only", result["status"])
+        self.assertEqual(
+            pickup.bureau._read_regular_file_snapshot(
+                task_path, label="test-machine-complete-task"
+            ).sha256,
+            result["latch"]["task_document_sha256"],
+        )
+        self.assertEqual(
+            "terminalize-or-archive-through-bureau-lifecycle",
+            result["latch"]["recommended_next_action"],
+        )
+        self.assertIn(
+            "repeat_connector_probe", result["latch"]["suppressed_effects"]
+        )
+
+    def test_closeout_latch_requires_every_acceptance_result(self) -> None:
+        self.write_machine_complete_task(
+            acceptance_results={"contract": True, "runtime": False}
+        )
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "no-eligible-task"},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_closeout_latch_requires_content_bound_evidence(self) -> None:
+        self.write_machine_complete_task(include_bound_evidence=False)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "no-eligible-task"},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_closeout_latch_requires_full_acceptance_coverage(self) -> None:
+        task_path = self.write_machine_complete_task()
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["acceptance"].append({"id": "runtime", "assertion": "done"})
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "no-eligible-task"},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_closeout_latch_rejects_release_label_without_strong_identity(self) -> None:
+        task_path = self.write_machine_complete_task()
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        completion = task["metadata"]["partial_completion"]["completion"]
+        verification = task["metadata"]["verification"]
+        completion.pop("runtime_head")
+        completion.pop("connector_snapshot_receipt_sha256")
+        verification.pop("runtime_head")
+        verification.pop("connector_snapshot_receipt_sha256")
+        completion["runtime_release"] = "release-v1"
+        verification["runtime_release"] = "release-v1"
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "no-eligible-task"},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_closeout_latch_accepts_t129_style_acceptance_binding(self) -> None:
+        task_path = self.write_machine_complete_task()
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["acceptance"] = [
+            {"id": "closeout-receipt", "assertion": "bound closeout"}
+        ]
+        task["metadata"]["partial_completion"]["completion"][
+            "acceptance_results"
+        ] = {"closeout_receipt_bound": True}
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_not_called()
+        acquire.assert_not_called()
+        self.assertEqual("closeout-only", result["status"])
+        self.assertFalse(result["effect_started"])
+
+    def test_closeout_latch_rejects_unrelated_acceptance_result_names(self) -> None:
+        self.write_machine_complete_task(acceptance_results={"unrelated": True})
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "no-eligible-task"},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-no-eligible-task"
+            ):
+                pickup.grabowski_bureau_pickup_execute(self.request())
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+
+    def test_closeout_latch_identity_changes_with_task_document(self) -> None:
+        task_path = self.write_machine_complete_task()
+        normalized = pickup._normalize_request(
+            {**self.request(), "registry_root": str(self.registry_root)}
+        )
+        first = pickup._machine_completion_closeout_latch(normalized)
+        task = json.loads(task_path.read_text(encoding="utf-8"))
+        task["metadata"]["verified_at"] = "2026-08-02T20:35:34Z"
+        task["metadata"]["partial_completion"]["completion"]["verified_at"] = (
+            "2026-08-02T20:35:34Z"
+        )
+        task_path.write_text(json.dumps(task), encoding="utf-8")
+        second = pickup._machine_completion_closeout_latch(normalized)
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first["task_document_sha256"], second["task_document_sha256"])
+        self.assertNotEqual(first["latch_sha256"], second["latch_sha256"])
 
     def test_canonical_snapshot_drift_after_intent_precedes_lease_effect(self) -> None:
         intent = self.intent()

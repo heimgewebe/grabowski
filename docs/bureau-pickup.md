@@ -64,6 +64,10 @@ The adapter does not establish:
 - absence of resource conflicts outside the live Grabowski lease database;
 - validity or mutability of a caller-selected Registry root beyond the separate Bureau and operator gates.
 
+## Machine-complete closeout latch
+
+Before starting a claim, creating coordination state or acquiring a lease, the adapter reads the exact canonical task document inside the already bound Registry snapshot. A non-terminal task produces the normal terminal result `closeout-only` only when its machine completion is explicitly `verified`, every declared acceptance item has one corresponding successful result, and completion plus verification repeat the same strong commit or SHA-256 identity. The result is bound to the complete task-document digest and is invalidated by any later document change. It suppresses repeated code, deployment and connector work for that unchanged evidence, but it does not change the Bureau task state or replace Bureau lifecycle closeout.
+
 ## Claim refusal diagnostics
 
 The pickup adapter preserves the Bureau envelope runtime identity for the claim-intent read and converts refusals into stable, specific error codes such as `claim-intent-no-eligible-task` and `claim-intent-approval-required`. A typed approval refusal retains the bounded required level and submitted evidence level, but never grants or upgrades approval. Against an older Bureau launcher that exits nonzero with empty stdout and human-readable stderr, the intake adapter reports `bureau-command-rejected` with return code and output digests rather than misclassifying the response as malformed; raw stderr is not exposed. Structured rejection detail, adapter retry metadata and a bounded runtime-identity summary remain attached to the error. Any individual refusal value above 16 KiB is replaced by its type, byte size and SHA-256 digest, so oversized upstream diagnostics cannot inflate MCP error metadata. This distinguishes approval denial, task-state rejection and stale release/Registry identity without acquiring any lease or starting a workspace.

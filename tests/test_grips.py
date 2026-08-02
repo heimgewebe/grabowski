@@ -10546,6 +10546,32 @@ class BureauPickupGripTests(unittest.TestCase):
         self.assertEqual("passed", result["receipt"]["status"])
         self.assertEqual("claimed", result["output"]["status"])
 
+    def test_execute_closeout_only_is_terminal_without_run_or_journal(self) -> None:
+        output = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_closeout_latched",
+            "status": "closeout-only",
+            "effect_started": False,
+            "retryable": False,
+            "task_id": "TASK-1",
+            "latch": {"latch_sha256": "1" * 64},
+        }
+        request = {"task_id": "TASK-1", "registry_root": "/srv/bureau"}
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_execute.return_value = output
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-execute",
+                {"request": request},
+                profile="operator",
+                allow_mutation=True,
+            )
+        pickup.grabowski_bureau_pickup_execute.assert_called_once_with(request)
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("passed", result["output"]["receipt_status"])
+        self.assertEqual("closeout-only", result["output"]["status"])
+        self.assertFalse(result["output"]["effect_started"])
+
     def test_execute_incomplete_success_result_fails_closed(self) -> None:
         pickup = self.pickup()
         pickup.grabowski_bureau_pickup_execute.return_value = {
