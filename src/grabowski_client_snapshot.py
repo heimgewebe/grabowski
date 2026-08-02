@@ -746,8 +746,8 @@ def _validate_loopback_mcp_url(url: str) -> str:
     return url
 
 
-async def _list_all_tool_names(client: Any) -> list[str]:
-    names: list[str] = []
+async def _list_all_tools(client: Any) -> list[Any]:
+    observed: list[Any] = []
     cursor: str | None = None
     seen_cursors: set[str] = set()
     while True:
@@ -755,12 +755,12 @@ async def _list_all_tool_names(client: Any) -> list[str]:
         tools = getattr(page, "tools", None)
         if not isinstance(tools, list):
             raise ClientSnapshotError("tools/list returned an invalid page")
-        names.extend(getattr(tool, "name", None) for tool in tools)
-        if len(names) > 1_000:
+        observed.extend(tools)
+        if len(observed) > connector_contract.MAX_OBSERVED_TOOLS:
             raise ClientSnapshotError("observed MCP tool count exceeds the snapshot contract")
         next_cursor = getattr(page, "nextCursor", None)
         if next_cursor is None:
-            return names
+            return observed
         if (
             not isinstance(next_cursor, str)
             or not next_cursor
@@ -770,6 +770,24 @@ async def _list_all_tool_names(client: Any) -> list[str]:
             raise ClientSnapshotError("tools/list returned an invalid pagination cursor")
         seen_cursors.add(next_cursor)
         cursor = next_cursor
+
+
+def _mixed_observed_tool_artifact(tools: list[Any]) -> dict[str, Any]:
+    runtime_tools = [
+        {
+            "name": getattr(tool, "name", None),
+            "inputSchema": getattr(tool, "inputSchema", None),
+        }
+        for tool in tools
+    ]
+    try:
+        return connector_contract.mixed_artifact_from_runtime_tools(runtime_tools)
+    except connector_contract.ConnectorContractError as exc:
+        raise _contract_error(exc) from exc
+
+
+async def _list_all_tool_names(client: Any) -> list[str]:
+    return [getattr(tool, "name", None) for tool in await _list_all_tools(client)]
 
 
 async def _observe_and_bind_snapshot(
@@ -788,8 +806,15 @@ async def _observe_and_bind_snapshot(
         async with streamablehttp_client(mcp_url) as (read_stream, write_stream, _):
             async with ClientSession(read_stream, write_stream) as client:
                 await client.initialize()
-                names = await _list_all_tool_names(client)
-                names_sha256 = _tool_names_sha256(names)
+                tools = await _list_all_tools(client)
+                observed_tools = _mixed_observed_tool_artifact(tools)
+                names, _schemas, observed_metadata = (
+                    connector_contract.parse_observed_artifact(
+                        observed_tools,
+                        label="connector tools/list artifact",
+                    )
+                )
+                names_sha256 = observed_metadata["names_sha256"]
                 status_result = await client.call_tool("grabowski_status", {"view": "minimal"})
                 status = _mcp_tool_payload(status_result, label="grabowski_status")
                 runtime = status.get("runtime")
@@ -814,6 +839,7 @@ async def _observe_and_bind_snapshot(
                     "observed_names_sha256": names_sha256,
                     "observed_release_id": release_id,
                     "observed_agent_instructions_sha256": instructions_sha256,
+                    "observed_tools": observed_tools,
                 }
                 bind_result = await client.call_tool(
                     "grip_run",
@@ -831,6 +857,7 @@ async def _observe_and_bind_snapshot(
                     or not isinstance(output, dict)
                     or output.get("verified") is not True
                     or output.get("state") != "matched"
+                    or output.get("schema_contract_matches") is not True
                 ):
                     raise ClientSnapshotError("connector snapshot bind did not pass verification")
                 return {
@@ -839,6 +866,13 @@ async def _observe_and_bind_snapshot(
                     "names_sha256": names_sha256,
                     "release_id": release_id,
                     "receipt_sha256": output.get("receipt_sha256"),
+                    "schema_coverage_count": observed_metadata[
+                        "schema_coverage_count"
+                    ],
+                    "observed_tools_artifact_sha256": observed_metadata[
+                        "artifact_sha256"
+                    ],
+                    "schema_contract_matches": True,
                 }
 
     try:

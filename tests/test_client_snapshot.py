@@ -381,6 +381,206 @@ class ClientSnapshotTests(unittest.TestCase):
                 )
             )
 
+    def test_tool_observation_builds_exact_mixed_schema_artifact(self) -> None:
+        schemas = {
+            item["name"]: item["inputSchema"]
+            for item in self.schema_artifact()["tools"]
+            if isinstance(item, dict)
+        }
+
+        class Tool:
+            def __init__(self, name: str, schema: dict[str, object] | None = None) -> None:
+                self.name = name
+                self.inputSchema = schema
+
+        tools = [
+            Tool("zeta"),
+            Tool("grabowski_task_start", schemas["grabowski_task_start"]),
+            Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
+            Tool(
+                "grabowski_bureau_candidate_assess",
+                schemas["grabowski_bureau_candidate_assess"],
+            ),
+            Tool("alpha", {"type": "object", "properties": {"ignored": {}}}),
+        ]
+        artifact = snapshot._mixed_observed_tool_artifact(tools)
+        names, observed_schemas, metadata = (
+            connector_contract.parse_observed_artifact(artifact)
+        )
+
+        self.assertEqual(names, sorted(tool.name for tool in tools))
+        self.assertEqual(
+            sorted(observed_schemas),
+            sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS),
+        )
+        self.assertEqual(metadata["schema_coverage_count"], 3)
+        self.assertLessEqual(
+            metadata["artifact_bytes"],
+            connector_contract.MAX_OBSERVED_ARTIFACT_BYTES,
+        )
+        self.assertNotIn("alpha", observed_schemas)
+
+    def test_tool_observation_rejects_missing_or_duplicate_sentinel_evidence(self) -> None:
+        class Tool:
+            def __init__(self, name: str, schema: object = None) -> None:
+                self.name = name
+                self.inputSchema = schema
+
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "schema for sentinel grabowski_task_start is unavailable",
+        ):
+            snapshot._mixed_observed_tool_artifact(
+                [
+                    Tool("grabowski_task_start"),
+                    Tool("grabowski_secret_reveal", {}),
+                    Tool("grabowski_bureau_candidate_assess", {}),
+                ]
+            )
+        with self.assertRaisesRegex(
+            snapshot.ClientSnapshotError,
+            "duplicate runtime tool: alpha",
+        ):
+            snapshot._mixed_observed_tool_artifact([Tool("alpha"), Tool("alpha")])
+
+    def test_observer_binds_mixed_schema_artifact_and_requires_schema_match(
+        self,
+    ) -> None:
+        import sys
+        import types
+
+        schemas = {
+            item["name"]: item["inputSchema"]
+            for item in self.schema_artifact()["tools"]
+            if isinstance(item, dict)
+        }
+
+        class Tool:
+            def __init__(self, name: str, schema: dict[str, object] | None = None) -> None:
+                self.name = name
+                self.inputSchema = schema
+
+        tools = [
+            Tool("alpha", {"type": "object", "properties": {"ignored": {}}}),
+            Tool(
+                "grabowski_bureau_candidate_assess",
+                schemas["grabowski_bureau_candidate_assess"],
+            ),
+            Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
+            Tool("grabowski_task_start", schemas["grabowski_task_start"]),
+            Tool("zeta"),
+        ]
+        artifact = snapshot._mixed_observed_tool_artifact(tools)
+        names, _observed_schemas, metadata = (
+            connector_contract.parse_observed_artifact(artifact)
+        )
+
+        class Page:
+            def __init__(self) -> None:
+                self.tools = tools
+                self.nextCursor = None
+
+        class AsyncContext:
+            def __init__(self, value: object) -> None:
+                self.value = value
+
+            async def __aenter__(self) -> object:
+                return self.value
+
+            async def __aexit__(self, *_args: object) -> bool:
+                return False
+
+        declarations: list[dict[str, object]] = []
+
+        class Client:
+            async def initialize(self) -> None:
+                return None
+
+            async def list_tools(self, *, cursor: str | None = None) -> Page:
+                if cursor is not None:
+                    raise AssertionError("unexpected pagination cursor")
+                return Page()
+
+            async def call_tool(
+                self,
+                name: str,
+                arguments: dict[str, object],
+            ) -> object:
+                if name == "grip_run":
+                    declarations.append(arguments)
+                return object()
+
+        client = Client()
+        schema_match = True
+
+        def payload(_result: object, *, label: str) -> dict[str, object]:
+            if label == "grabowski_status":
+                return {
+                    "runtime": {"release_id": RELEASE_ID},
+                    "agent_instructions": {"sha256": INSTRUCTIONS_HASH},
+                    "tool_contract": {
+                        "registered_tool_count": len(names),
+                        "registered_names_sha256": metadata["names_sha256"],
+                        "runtime_matches_deployment_contract": True,
+                    },
+                }
+            return {
+                "status": "passed",
+                "output": {
+                    "verified": True,
+                    "state": "matched",
+                    "schema_contract_matches": schema_match,
+                    "receipt_sha256": "d" * 64,
+                },
+            }
+
+        mcp_module = types.ModuleType("mcp")
+        mcp_module.__path__ = []
+        mcp_module.ClientSession = lambda _read, _write: AsyncContext(client)
+        client_module = types.ModuleType("mcp.client")
+        client_module.__path__ = []
+        streamable_http_module = types.ModuleType("mcp.client.streamable_http")
+        streamable_http_module.streamablehttp_client = (
+            lambda _url: AsyncContext((object(), object(), None))
+        )
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "mcp": mcp_module,
+                    "mcp.client": client_module,
+                    "mcp.client.streamable_http": streamable_http_module,
+                },
+            ),
+            mock.patch.object(snapshot, "_mcp_tool_payload", side_effect=payload),
+        ):
+            result = asyncio.run(
+                snapshot._observe_and_bind_snapshot(
+                    mcp_url="http://127.0.0.1:1/mcp",
+                    session_id="session-schema",
+                    timeout_seconds=1.0,
+                )
+            )
+            self.assertTrue(result["schema_contract_matches"])
+            self.assertEqual(result["schema_coverage_count"], 3)
+            declaration = declarations[-1]["parameters"]
+            self.assertEqual(declaration["observed_tools"], artifact)
+            self.assertEqual(declaration["observed_tool_count"], len(names))
+
+            schema_match = False
+            with self.assertRaisesRegex(
+                snapshot.ClientSnapshotError,
+                "connector snapshot bind did not pass verification",
+            ):
+                asyncio.run(
+                    snapshot._observe_and_bind_snapshot(
+                        mcp_url="http://127.0.0.1:1/mcp",
+                        session_id="session-schema-failed",
+                        timeout_seconds=1.0,
+                    )
+                )
+
     def test_tool_name_hash_matches_runtime_contract_encoding(self) -> None:
         expected = snapshot.hashlib.sha256(b'["a","b"]').hexdigest()
         self.assertEqual(snapshot._tool_names_sha256(["b", "a"]), expected)
