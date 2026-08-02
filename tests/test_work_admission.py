@@ -177,6 +177,95 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertIn("foreign-live-coordination", foreign["blocker_codes"])
         self.assertIn("foreign-retained-worktree", foreign["blocker_codes"])
 
+    def test_clean_detached_source_caches_do_not_block_broad_lane(self) -> None:
+        repoground_path = self.repo.parent / ".repoground-sources" / "org__repo__main"
+        repobrief_path = self.repo.parent / ".repobrief-sources" / "org__repo__main"
+        repoground = {
+            "path": str(repoground_path),
+            "is_main": False,
+            "detached": True,
+            "branch": None,
+            "status": {"dirty": False},
+            "coordination": {
+                "blocking": False,
+                "resource_leases": [],
+                "tasks": [],
+                "processes": [],
+            },
+            "lifecycle": {
+                "retention": {
+                    "owner_id": "system:repoground-source-cache:org-repo-main",
+                },
+                "binding": None,
+                "latest_archive": None,
+            },
+            "lifecycle_state": "retained",
+        }
+        repobrief = {
+            "path": str(repobrief_path),
+            "is_main": False,
+            "detached": True,
+            "branch": None,
+            "status": {"dirty": False},
+            "coordination": {
+                "blocking": False,
+                "resource_leases": [],
+                "tasks": [],
+                "processes": [],
+            },
+            "lifecycle": {
+                "retention": {"owner_id": "operator:archive-owner"},
+                "binding": None,
+                "latest_archive": {
+                    "archive_id": "20260802T211037Z-e847e4e5d124",
+                    "owner_id": "operator:archive-owner",
+                    "cleaned_at_unix": None,
+                },
+            },
+            "lifecycle_state": "archived_retained",
+        }
+        result = self._assess([self._main(), repoground, repobrief])
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["blockers"], [])
+
+    def test_ambiguous_archived_source_cache_remains_blocked(self) -> None:
+        linked = {
+            "path": str(
+                self.repo.parent / ".repobrief-sources" / "org__repo__main"
+            ),
+            "is_main": False,
+            "detached": True,
+            "branch": None,
+            "status": {"dirty": False},
+            "coordination": {
+                "blocking": False,
+                "resource_leases": [],
+                "tasks": [],
+                "processes": [],
+            },
+            "lifecycle": {
+                "retention": {"owner_id": "retention-owner"},
+                "binding": None,
+                "latest_archive": {
+                    "archive_id": "20260802T211037Z-e847e4e5d124",
+                    "owner_id": "archive-owner",
+                    "cleaned_at_unix": None,
+                },
+            },
+            "lifecycle_state": "archived_retained",
+        }
+        result = self._assess([self._main(), linked])
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("lifecycle-owner-ambiguous", result["blocker_codes"])
+        self.assertIn("worktree-convergence-required", result["blocker_codes"])
+
+    def test_foreign_retained_writer_checkout_still_blocks(self) -> None:
+        linked = self._linked(state="retained", owner="foreign-owner")
+        linked["detached"] = False
+        result = self._assess([self._main(), linked])
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("foreign-retained-worktree", result["blocker_codes"])
+
     def test_completed_retained_blocked_requires_convergence_for_same_owner(self) -> None:
         linked = self._linked(
             state="completed_retained_blocked",

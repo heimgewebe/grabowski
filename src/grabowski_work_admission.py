@@ -44,6 +44,11 @@ HARD_BLOCK_CODES = frozenset(
         "lifecycle-owner-ambiguous",
     }
 )
+SOURCE_CACHE_ROOT_NAMES = frozenset({".repobrief-sources", ".repoground-sources"})
+SOURCE_CACHE_OWNER_PREFIXES = (
+    "system:repobrief-source-cache:",
+    "system:repoground-source-cache:",
+)
 
 
 class WorkAdmissionBlocked(RuntimeError):
@@ -118,6 +123,49 @@ def _source_binding(item: dict[str, Any]) -> tuple[str | None, str | None]:
     return (
         kind if isinstance(kind, str) and kind else None,
         identifier if isinstance(identifier, str) and identifier else None,
+    )
+
+
+def _inert_retained_source_checkout(item: dict[str, Any], *, state: str) -> bool:
+    """Return true only for clean detached source-cache evidence without live work."""
+    if item.get("detached") is not True or item.get("branch") is not None:
+        return False
+    status = item.get("status")
+    if not isinstance(status, dict) or status.get("dirty") is not False:
+        return False
+    coordination = item.get("coordination")
+    if not isinstance(coordination, dict) or coordination.get("blocking") is True:
+        return False
+    for key in ("resource_leases", "tasks", "processes"):
+        value = coordination.get(key)
+        if not isinstance(value, list) or value:
+            return False
+    path = item.get("path")
+    if not isinstance(path, str) or not SOURCE_CACHE_ROOT_NAMES.intersection(
+        Path(path).parts
+    ):
+        return False
+    lifecycle = item.get("lifecycle")
+    if not isinstance(lifecycle, dict) or isinstance(lifecycle.get("binding"), dict):
+        return False
+    if len(_lifecycle_owners(item)) > 1:
+        return False
+    if state == "archived_retained":
+        archive = lifecycle.get("latest_archive")
+        return (
+            isinstance(archive, dict)
+            and archive.get("cleaned_at_unix") is None
+            and isinstance(archive.get("archive_id"), str)
+            and bool(archive["archive_id"])
+        )
+    if state != "retained":
+        return False
+    retention = lifecycle.get("retention")
+    if not isinstance(retention, dict):
+        return False
+    owner_id = retention.get("owner_id")
+    return isinstance(owner_id, str) and owner_id.startswith(
+        SOURCE_CACHE_OWNER_PREFIXES
     )
 
 
@@ -323,42 +371,44 @@ def assess_repository_admission(
         lifecycle_owner = (
             next(iter(lifecycle_owners)) if len(lifecycle_owners) == 1 else None
         )
-        if len(lifecycle_owners) > 1:
-            blockers.append(
-                {
-                    "code": "lifecycle-owner-ambiguous",
-                    "path": path,
-                    "state": state,
-                    "owner_ids": sorted(lifecycle_owners),
-                }
-            )
-        if state == "retained":
-            if lifecycle_owner != owner_id:
+        inert_retained_source = _inert_retained_source_checkout(item, state=state)
+        if not inert_retained_source:
+            if len(lifecycle_owners) > 1:
                 blockers.append(
                     {
-                        "code": "foreign-retained-worktree",
+                        "code": "lifecycle-owner-ambiguous",
                         "path": path,
-                        "owner_id": lifecycle_owner,
+                        "state": state,
+                        "owner_ids": sorted(lifecycle_owners),
                     }
                 )
-        elif state in CONVERGENCE_STATES:
-            if lifecycle_owner is not None and lifecycle_owner != owner_id:
+            if state == "retained":
+                if lifecycle_owner != owner_id:
+                    blockers.append(
+                        {
+                            "code": "foreign-retained-worktree",
+                            "path": path,
+                            "owner_id": lifecycle_owner,
+                        }
+                    )
+            elif state in CONVERGENCE_STATES:
+                if lifecycle_owner is not None and lifecycle_owner != owner_id:
+                    blockers.append(
+                        {
+                            "code": "foreign-lifecycle-owner",
+                            "path": path,
+                            "state": state,
+                            "owner_id": lifecycle_owner,
+                        }
+                    )
                 blockers.append(
                     {
-                        "code": "foreign-lifecycle-owner",
+                        "code": "worktree-convergence-required",
                         "path": path,
                         "state": state,
                         "owner_id": lifecycle_owner,
                     }
                 )
-            blockers.append(
-                {
-                    "code": "worktree-convergence-required",
-                    "path": path,
-                    "state": state,
-                    "owner_id": lifecycle_owner,
-                }
-            )
 
         existing_source_kind, existing_source_id = _source_binding(item)
         if (
