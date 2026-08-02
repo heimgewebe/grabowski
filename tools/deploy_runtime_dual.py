@@ -7,6 +7,7 @@ import ctypes.util
 from dataclasses import dataclass
 import errno
 import hashlib
+from importlib import import_module
 import json
 import math
 import os
@@ -25,6 +26,11 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 import deploy_runtime as core
+
+SOURCE_MODULE_ROOT = Path(__file__).resolve().parents[1] / "src"
+if str(SOURCE_MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_MODULE_ROOT))
+deployment_observer = import_module("grabowski_deployment_observer")
 
 
 @dataclass(frozen=True)
@@ -2634,6 +2640,131 @@ def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
     return required
 
 
+def _runtime_deploy_observer_job() -> tuple[Path, dict[str, Any]] | None:
+    unit = os.environ.get("GRABOWSKI_JOB_UNIT")
+    directory_text = os.environ.get("GRABOWSKI_JOB_DIRECTORY")
+    metadata_text = os.environ.get("GRABOWSKI_JOB_METADATA_PATH")
+    if unit is None and directory_text is None and metadata_text is None:
+        return None
+    if (
+        not isinstance(unit, str)
+        or deployment_observer.UNIT_RE.fullmatch(unit) is None
+        or not isinstance(directory_text, str)
+        or not directory_text
+        or not isinstance(metadata_text, str)
+        or not metadata_text
+    ):
+        core.fail(
+            "Deployment-Observer-Jobbindung ist ungültig",
+            phase="operator-admission-observer",
+        )
+    directory = Path(directory_text)
+    metadata_path = Path(metadata_text)
+    if (
+        not directory.is_absolute()
+        or directory.name != unit
+        or directory.is_symlink()
+        or not metadata_path.is_absolute()
+        or metadata_path != directory / "metadata.json"
+        or metadata_path.is_symlink()
+    ):
+        core.fail(
+            "Deployment-Observer-Metadatenpfad driftete",
+            phase="operator-admission-observer",
+        )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(metadata_path, flags)
+    except OSError as exc:
+        core.fail(
+            "Deployment-Observer-Metadaten konnten nicht geöffnet werden",
+            phase="operator-admission-observer",
+            details={"error_type": type(exc).__name__},
+        )
+    try:
+        file_metadata = os.fstat(descriptor)
+        if (
+            not statmod.S_ISREG(file_metadata.st_mode)
+            or file_metadata.st_uid != os.getuid()
+            or file_metadata.st_nlink != 1
+            or statmod.S_IMODE(file_metadata.st_mode) != 0o600
+            or file_metadata.st_size > 2 * 1024 * 1024
+        ):
+            core.fail(
+                "Deployment-Observer-Metadaten sind unsicher",
+                phase="operator-admission-observer",
+            )
+        chunks: list[bytes] = []
+        remaining = 2 * 1024 * 1024 + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > 2 * 1024 * 1024:
+            core.fail(
+                "Deployment-Observer-Metadaten sind zu groß",
+                phase="operator-admission-observer",
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        metadata = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        core.fail(
+            "Deployment-Observer-Metadaten sind ungültig",
+            phase="operator-admission-observer",
+            details={"error_type": type(exc).__name__},
+        )
+    if not isinstance(metadata, dict) or metadata.get("unit") != unit:
+        core.fail(
+            "Deployment-Observer-Metadaten sind nicht jobgebunden",
+            phase="operator-admission-observer",
+        )
+    return directory, metadata
+
+
+def _activate_runtime_deploy_observer(marker: dict[str, Any]) -> dict[str, Any] | None:
+    job = _runtime_deploy_observer_job()
+    if job is None:
+        return None
+    directory, metadata = job
+    contract = metadata.get("deployment_observer_contract")
+    if contract is None:
+        return None
+    try:
+        binding = deployment_observer.build_activation_binding(
+            contract,
+            metadata=metadata,
+            marker=marker,
+        )
+        path = deployment_observer.activation_path(directory)
+        deployment_observer.create_activation(path, binding)
+        observed = deployment_observer.read_activation(path)
+        deployment_observer.validate_activation_binding(
+            observed,
+            contract_value=contract,
+            metadata=metadata,
+            marker=marker,
+        )
+    except (OSError, PermissionError, TypeError, ValueError) as exc:
+        core.fail(
+            "Deployment-Observer-Aktivierung scheiterte",
+            phase="operator-admission-observer",
+            details={"error_type": type(exc).__name__},
+        )
+    return {
+        "unit": binding["unit"],
+        "contract_sha256": binding["contract_sha256"],
+        "binding_sha256": binding["binding_sha256"],
+        "expires_at_unix": binding["expires_at_unix"],
+    }
+
+
 def engage_operator_deployment_admission(
     snapshot: core.Snapshot, *, timeout_seconds: int
 ) -> dict[str, Any]:
@@ -2658,6 +2789,11 @@ def engage_operator_deployment_admission(
         "expires_at_unix": now + lifetime,
     }
     _create_private_admission_marker(OPERATOR_ADMISSION_MARKER_PATH, marker)
+    try:
+        _activate_runtime_deploy_observer(marker)
+    except Exception:
+        release_operator_deployment_admission(marker)
+        raise
     observed = _secure_admission_marker_payload(OPERATOR_ADMISSION_MARKER_PATH)
     if observed != marker:
         core.fail(

@@ -28,13 +28,18 @@ from typing import Any
 import uuid
 from urllib.parse import urlsplit
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import Context, FastMCP
+except ImportError:
+    from mcp.server.fastmcp import FastMCP
+    Context = Any
 from mcp.types import ToolAnnotations
 
 import grabowski_mcp as base
 import grabowski_consumer_surface as consumer_surface
 import grabowski_command_identity as command_identity
 import grabowski_job_origin as job_origin
+import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 
 
@@ -402,6 +407,87 @@ def _read_deployment_admission_marker(*, now_unix: int | None = None) -> dict[st
     }
 
 
+def _deployment_observer_client_id(context: Context | None) -> str | None:
+    if context is None:
+        return None
+    try:
+        client_id = context.client_id
+    except (AttributeError, RuntimeError, ValueError):
+        return None
+    return client_id if isinstance(client_id, str) and client_id.strip() else None
+
+
+def _deployment_observer_request_evidence(
+    tool_name: Any,
+    arguments: Any,
+    context: Context | None,
+    marker: dict[str, Any],
+) -> dict[str, Any] | None:
+    if tool_name != deployment_observer.OPERATION:
+        return None
+    if not isinstance(arguments, dict) or set(arguments) != {
+        "unit",
+        "deployment_observer_capability",
+    }:
+        return None
+    unit = arguments.get("unit")
+    capability = arguments.get("deployment_observer_capability")
+    if not isinstance(unit, str) or not isinstance(capability, str):
+        return None
+    name = _validate_unit(unit, job_only=True)
+    metadata = _read_job_metadata(name)
+    contract = metadata.get("deployment_observer_contract")
+    evidence = deployment_observer.authorize_request(
+        contract,
+        metadata=metadata,
+        capability=capability,
+        client_id=_deployment_observer_client_id(context),
+    )
+    if marker.get("valid") is not True or marker.get("state") == "invalid":
+        raise ValueError("deployment admission marker is invalid")
+    if marker.get("active") is True:
+        marker_payload = {key: marker[key] for key in deployment_observer.MARKER_KEYS}
+        activation = deployment_observer.read_activation(
+            deployment_observer.activation_path(_job_directory(name))
+        )
+        if activation is None:
+            raise ValueError("deployment observer activation is missing")
+        validated_activation = deployment_observer.validate_activation_binding(
+            activation,
+            contract_value=contract,
+            metadata=metadata,
+            marker=marker_payload,
+        )
+        evidence = {
+            **evidence,
+            "marker_bound": True,
+            "activation_binding_sha256": validated_activation["binding_sha256"],
+        }
+    else:
+        evidence = {**evidence, "marker_bound": False}
+    return {
+        **evidence,
+        "drain_neutral": True,
+        "marker_state": marker.get("state"),
+        "does_not_establish": [
+            "deployment_success",
+            "mutation_authority",
+            "authority_for_another_job_or_operation",
+            "generic_read_only_drain_exemption",
+        ],
+    }
+
+
+def _deployment_observer_tool_call_parts(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> tuple[Any, Any, Context | None]:
+    tool_name = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
+    arguments = args[1] if len(args) > 1 else kwargs.get("arguments")
+    context = args[2] if len(args) > 2 else kwargs.get("context")
+    return tool_name, arguments, context
+
+
 def _deployment_admission_active_tool_calls() -> int:
     with _DEPLOYMENT_ADMISSION_LOCK:
         return _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
@@ -443,23 +529,48 @@ def _install_deployment_admission_gate() -> None:
 
     async def gated_call_tool(*args: Any, **kwargs: Any) -> Any:
         global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+        marker = _read_deployment_admission_marker()
+        tool_name, arguments, context = _deployment_observer_tool_call_parts(
+            args, kwargs
+        )
+        observer_evidence: dict[str, Any] | None = None
+        try:
+            observer_evidence = _deployment_observer_request_evidence(
+                tool_name, arguments, context, marker
+            )
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+            observer_evidence = None
+        get_tool = getattr(manager, "get_tool", None)
+        tool = (
+            get_tool(tool_name)
+            if callable(get_tool) and isinstance(tool_name, str)
+            else None
+        )
+        if (
+            observer_evidence is not None
+            and observer_evidence.get("marker_bound") is True
+        ):
+            if tool is not None and getattr(tool, "is_async", True) is False:
+                loop = asyncio.get_running_loop()
+                worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                    _run_sync_tool_call,
+                    original,
+                    args,
+                    kwargs,
+                )
+                return await asyncio.wrap_future(worker_future, loop=loop)
+            return await original(*args, **kwargs)
+
         with _DEPLOYMENT_ADMISSION_LOCK:
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS += 1
         release_in_finally = True
         try:
-            marker = _read_deployment_admission_marker()
             if marker.get("active") or marker.get("state") == "invalid":
                 raise RuntimeError(
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
                 )
-            tool_name = args[0] if args and isinstance(args[0], str) else kwargs.get("name")
-            get_tool = getattr(manager, "get_tool", None)
-            tool = get_tool(tool_name) if callable(get_tool) and isinstance(tool_name, str) else None
-            if (
-                tool is not None
-                and getattr(tool, "is_async", True) is False
-            ):
+            if tool is not None and getattr(tool, "is_async", True) is False:
                 loop = asyncio.get_running_loop()
                 worker_future = _SYNC_TOOL_EXECUTOR.submit(
                     _run_sync_tool_call,
@@ -3186,6 +3297,7 @@ def _start_job(
     finalization_expected_head: str | None = None,
     reserved_unit: str | None = None,
     allow_reserved_runtime_deploy: bool = False,
+    deployment_observer_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start an already-authorized durable job."""
     working_directory = _resolve_cwd(cwd)
@@ -3240,6 +3352,35 @@ def _start_job(
         started_at=now_iso,
         invoker_tool=invoker_tool,
     )
+    if deployment_observer_request is not None:
+        if not allow_reserved_runtime_deploy or finalization_expected_head is None:
+            raise ValueError(
+                "deployment observer request is reserved for typed runtime deploy jobs"
+            )
+        if set(deployment_observer_request) != {
+            "capability",
+            "client_id",
+            "expected_head",
+            "source_identity_sha256",
+        }:
+            raise ValueError("deployment observer request shape is invalid")
+        if deployment_observer_request["expected_head"] != finalization_expected_head:
+            raise ValueError("deployment observer expected_head drifted")
+        deployment_observer_contract = deployment_observer.build_contract(
+            unit=unit,
+            capability=deployment_observer_request["capability"],
+            client_id=deployment_observer_request["client_id"],
+            expected_head=finalization_expected_head,
+            source_identity_sha256=deployment_observer_request[
+                "source_identity_sha256"
+            ],
+            argv_sha256=argv_sha256,
+            origin_sha256=origin_sha256,
+            issued_at_unix=now_unix,
+        )
+    else:
+        deployment_observer_contract = None
+
     if finalization_expected_head is not None:
         finalization_contract = _job_finalization_contract(
             unit=unit,
@@ -3288,6 +3429,11 @@ def _start_job(
             ),
         ),
         **({"finalization_contract": finalization_contract} if finalization_contract else {}),
+        **(
+            {"deployment_observer_contract": deployment_observer_contract}
+            if deployment_observer_contract is not None
+            else {}
+        ),
         "final_status": "launch_prepared",
         "terminalization_evidence": terminalization,
         "notify_on_done": notify_metadata,
@@ -3407,11 +3553,28 @@ def grabowski_job_start(
 
 
 @mcp.tool(name="grabowski_job_status", annotations=READ_ONLY)
-def grabowski_job_status(unit: str) -> dict[str, Any]:
+def grabowski_job_status(
+    unit: str,
+    deployment_observer_capability: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Return durable metadata and current systemd status for one job."""
     _require_operator_capability("durable_job")
     name = _validate_unit(unit, job_only=True)
     metadata = _read_job_metadata(name)
+    observer_evidence: dict[str, Any] | None = None
+    if deployment_observer_capability is not None:
+        observer_evidence = _deployment_observer_request_evidence(
+            deployment_observer.OPERATION,
+            {
+                "unit": name,
+                "deployment_observer_capability": deployment_observer_capability,
+            },
+            ctx,
+            _read_deployment_admission_marker(),
+        )
+        if observer_evidence is None:
+            raise PermissionError("deployment observer capability is not authorized")
     result = _run(
         [
             "systemctl",
@@ -3449,6 +3612,7 @@ def grabowski_job_status(unit: str) -> dict[str, Any]:
         "terminalization_evidence": job_record["terminalization_evidence"],
         "finalization_receipt": job_record["finalization_receipt"],
         "notification_evidence": job_record["notification_evidence"],
+        "deployment_observer": observer_evidence,
         "systemd_visible": systemd_visible,
         "returncode": result["returncode"],
         "properties": properties,
