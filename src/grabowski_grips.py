@@ -2587,14 +2587,16 @@ def _run_bureau_pickup_execute(
     status = output.get("status")
     journal = output.get("journal")
     run_id = output.get("run_id")
+    closeout_only = status == "closeout-only"
     valid_status = status in {
         "claimed",
         "existing-assignment",
         "existing-terminal",
         "recovered",
+        "closeout-only",
     }
-    valid_journal = isinstance(journal, str) and bool(journal)
-    valid_run = isinstance(run_id, str) and bool(run_id)
+    valid_journal = closeout_only or (isinstance(journal, str) and bool(journal))
+    valid_run = closeout_only or (isinstance(run_id, str) and bool(run_id))
     _check(receipt, "registry-root-bound", "pass", "validated by typed pickup adapter")
     _check(
         receipt,

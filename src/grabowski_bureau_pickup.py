@@ -45,6 +45,21 @@ COORDINATION_ROOT = Path(
 ).expanduser()
 RUN_ID_RE = re.compile(r"^BUR-RUN-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{10}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$")
+TERMINAL_BUREAU_TASK_STATES = frozenset(
+    {"cancelled", "closed", "superseded", "verified"}
+)
+MACHINE_COMPLETION_BINDING_FIELDS = (
+    "artifact_sha256",
+    "connector_snapshot_receipt_sha256",
+    "delivery_receipt_sha256",
+    "deployment_receipt_sha256",
+    "merge_commit",
+    "receipt_sha256",
+    "runtime_head",
+    "runtime_release",
+    "source_commit",
+)
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_REGISTRY_TREE_BYTES = 16 * 1024 * 1024
 MAX_CLAIM_REJECTION_CODE_BYTES = 128
@@ -980,6 +995,182 @@ def _bound_bureau_call(binding: RegistryBinding, callback):
     return result
 
 
+def _task_document_path(request: dict[str, Any]) -> Path | None:
+    task_id = request["task_id"]
+    if TASK_ID_RE.fullmatch(task_id) is None:
+        return None
+    root = Path(request["registry_root"])
+    path = root / "registry" / "tasks" / f"{task_id}.json"
+    expected_parent = root / "registry" / "tasks"
+    if path.parent != expected_parent:
+        return None
+    return path
+
+
+def _machine_completion_closeout_latch(
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return content-bound closeout evidence without asserting Bureau terminality."""
+    path = _task_document_path(request)
+    if path is None or not os.path.lexists(path):
+        return None
+    try:
+        snapshot = bureau._read_regular_file_snapshot(
+            path,
+            label="bureau-machine-completion-task",
+            max_bytes=MAX_REQUEST_BYTES,
+        )
+    except (OSError, RuntimeError) as exc:
+        raise BureauPickupError(
+            "bureau-machine-completion-task-unreadable",
+            details=_runtime_error_details(exc, task_id=request["task_id"]),
+        ) from None
+    try:
+        task = json.loads(snapshot.raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise BureauPickupError(
+            "bureau-machine-completion-task-invalid",
+            details={"task_id": request["task_id"]},
+        ) from None
+    if not isinstance(task, dict) or task.get("id") != request["task_id"]:
+        raise BureauPickupError(
+            "bureau-machine-completion-task-binding-invalid",
+            details={"task_id": request["task_id"]},
+        )
+    task_state = task.get("state")
+    if not isinstance(task_state, str) or not task_state:
+        raise BureauPickupError(
+            "bureau-machine-completion-task-state-invalid",
+            details={"task_id": request["task_id"]},
+        )
+    if task_state in TERMINAL_BUREAU_TASK_STATES:
+        return None
+
+    metadata = task.get("metadata")
+    partial = metadata.get("partial_completion") if isinstance(metadata, dict) else None
+    completion = partial.get("completion") if isinstance(partial, dict) else None
+    verification = metadata.get("verification") if isinstance(metadata, dict) else None
+    if not isinstance(completion, dict) or not isinstance(verification, dict):
+        return None
+    if completion.get("state") != "verified":
+        return None
+    verified_at = completion.get("verified_at")
+    if (
+        not isinstance(verified_at, str)
+        or not verified_at
+        or metadata.get("verified_at") != verified_at
+    ):
+        return None
+    acceptance = task.get("acceptance")
+    if not isinstance(acceptance, list) or not acceptance:
+        return None
+    acceptance_ids: list[str] = []
+    normalized_acceptance_ids: list[str] = []
+    for item in acceptance:
+        identifier = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(identifier, str) or not identifier or identifier in acceptance_ids:
+            return None
+        normalized_identifier = re.sub(
+            r"[^a-z0-9]+", "_", identifier.lower()
+        ).strip("_")
+        if not normalized_identifier or normalized_identifier in normalized_acceptance_ids:
+            return None
+        acceptance_ids.append(identifier)
+        normalized_acceptance_ids.append(normalized_identifier)
+    acceptance_results = completion.get("acceptance_results")
+    if (
+        not isinstance(acceptance_results, dict)
+        or len(acceptance_results) != len(acceptance_ids)
+        or any(not isinstance(key, str) or not key for key in acceptance_results)
+        or any(value is not True for value in acceptance_results.values())
+    ):
+        return None
+    matched_result_keys: set[str] = set()
+    for identifier in normalized_acceptance_ids:
+        matches = [
+            key
+            for key in acceptance_results
+            if key == identifier or key.startswith(f"{identifier}_")
+        ]
+        if len(matches) != 1 or matches[0] in matched_result_keys:
+            return None
+        matched_result_keys.add(matches[0])
+    authority = verification.get("authority")
+    task_sha256 = verification.get("task_sha256")
+    plan_sha256 = verification.get("plan_sha256")
+    if (
+        not isinstance(authority, str)
+        or not authority
+        or not isinstance(task_sha256, str)
+        or SHA256_RE.fullmatch(task_sha256) is None
+        or not isinstance(plan_sha256, str)
+        or SHA256_RE.fullmatch(plan_sha256) is None
+    ):
+        return None
+
+    bound_evidence: dict[str, Any] = {}
+    for field in MACHINE_COMPLETION_BINDING_FIELDS:
+        if field not in completion or field not in verification:
+            continue
+        if completion[field] != verification[field]:
+            return None
+        value = completion[field]
+        if isinstance(value, str) and value:
+            bound_evidence[field] = value
+    if not bound_evidence:
+        return None
+    strong_identity_fields = {"merge_commit", "runtime_head", "source_commit"}
+    if not any(
+        field.endswith("sha256") or field in strong_identity_fields
+        for field in bound_evidence
+    ):
+        return None
+    for field, value in bound_evidence.items():
+        if field.endswith("sha256") and SHA256_RE.fullmatch(value) is None:
+            return None
+        if field in {"merge_commit", "runtime_head", "source_commit"} and re.fullmatch(
+            r"[0-9a-f]{40}", value
+        ) is None:
+            return None
+
+    material = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "bureau-machine-completion-closeout-latch",
+        "task_id": request["task_id"],
+        "observed_task_state": task_state,
+        "task_document_sha256": snapshot.sha256,
+        "completion_sha256": _sha256(completion),
+        "verification_sha256": _sha256(verification),
+        "verified_at": verified_at,
+        "verification_authority": authority,
+        "verification_task_sha256": task_sha256,
+        "verification_plan_sha256": plan_sha256,
+        "acceptance_result_count": len(acceptance_results),
+        "acceptance_results_sha256": _sha256(acceptance_results),
+        "bound_evidence": bound_evidence,
+        "suppressed_effects": [
+            "bureau_claim",
+            "grabowski_resource_acquisition",
+            "workspace_creation",
+            "repeat_code_probe",
+            "repeat_runtime_deployment",
+            "repeat_connector_probe",
+        ],
+        "recommended_next_action": "terminalize-or-archive-through-bureau-lifecycle",
+        "invalidates_when": [
+            "task_document_sha256 changes",
+            "completion.state is no longer verified",
+            "completion and verification bindings diverge",
+        ],
+        "does_not_establish": [
+            "a terminal Bureau task state",
+            "permission to mutate the Bureau Registry",
+            "completion independent of the bound task evidence",
+        ],
+    }
+    return {**material, "latch_sha256": _sha256(material)}
+
+
 def _normalize_request(
     request: dict[str, Any], *, allow_internal_bindings: bool = False
 ) -> dict[str, Any]:
@@ -1080,6 +1271,18 @@ def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
         arguments.extend(["--base-dir", request["base_dir"]])
     arguments.extend(["--approve", "--approval-source", request["approval_source"]])
     return bureau._invoke_bureau(arguments, include_runtime_identity=True)
+
+
+def _claim_intent_or_closeout(
+    request: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    closeout_latch = _machine_completion_closeout_latch(request)
+    if closeout_latch is not None:
+        return None, closeout_latch
+    ensured_coordination_root = _ensure_coordination_root(request["coordination_root"])
+    if ensured_coordination_root != request["coordination_root"]:
+        raise BureauPickupError("coordination-root-binding-changed")
+    return _claim_intent(request), None
 
 
 def _bounded_claim_rejection_value(value: Any) -> Any:
@@ -1629,15 +1832,34 @@ def grabowski_bureau_pickup_execute(
         "terminal_execute", path=normalized["coordination_root"]
     )
     operator._require_operator_mutation("resource_lease")
-    ensured_coordination_root = _ensure_coordination_root(
-        normalized["coordination_root"]
-    )
-    if ensured_coordination_root != normalized["coordination_root"]:
-        raise BureauPickupError("coordination-root-binding-changed")
     request_sha256 = _sha256(normalized)
-    intent_payload = _bound_bureau_call(
-        registry_binding, lambda: _claim_intent(normalized)
+    intent_payload, closeout_latch = _bound_bureau_call(
+        registry_binding,
+        lambda: _claim_intent_or_closeout(normalized),
     )
+    if closeout_latch is not None:
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_closeout_latched",
+            "status": "closeout-only",
+            "effect_started": False,
+            "retryable": False,
+            "ambiguity": False,
+            "request_sha256": request_sha256,
+            "registry_binding_sha256": registry_binding["identity"][
+                "binding_sha256"
+            ],
+            "registry_binding_kind": registry_binding["identity"]["kind"],
+            "task_id": normalized["task_id"],
+            "latch": closeout_latch,
+            "required_readback": [f"bureau_task:{normalized['task_id']}"],
+        }
+        bureau._audit(
+            "bureau-pickup-closeout-latched",
+            result,
+            task_id=normalized["task_id"],
+        )
+        return result
     intent, existing = _validate_intent_result(intent_payload, normalized)
     run_dir = _run_directory(intent["run_id"])
     if existing:
