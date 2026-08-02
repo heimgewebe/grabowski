@@ -2955,7 +2955,7 @@
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
-      "src/grabowski_agent_competition.py": "0d96931a6edceb230a68cbd54bc08e02e1085959d7add9cd3f47776740b963e2",
+      "src/grabowski_agent_competition.py": "d5a7aec2dec626b25b71e0e84e59980544cc8af1ee6ba19f011a7d413d8888d6",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
       "src/grabowski_agent_workspace.py": "4d744e17059040fbb7b234da5eca9bca605dc9d26a204d91d08af16d5b827cbe",
@@ -3014,7 +3014,7 @@
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
       "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",
-      "src/grabowski_read_surface.py": "fbb79f9634389dbaf0766d662e74e7d029eda049de8edbc620b96ba752d798fd",
+      "src/grabowski_read_surface.py": "1912f06c90f64db139efda2384a1e6fdd58fc47f0b4742da784db59671e0ba6d",
       "src/grabowski_recall.py": "b07cb23aee8bf8f08cc7fc43846854856b60cbbe21cc500de08ecd9dd8a9f44e",
       "src/grabowski_recovery.py": "b3fdbb3d47cea1723dad00646cf93a6bbfd41cac856b115610fbf1872cb88777",
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",

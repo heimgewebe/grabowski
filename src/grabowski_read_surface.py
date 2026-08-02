@@ -69,6 +69,10 @@ AUDIT_BUREAU_FAILURE_STATUSES = frozenset(
     }
 )
 REVISION_RE = re.compile(r"[A-Za-z0-9_./@{}^~:+-]+")
+GITHUB_OWNER_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+)
+GITHUB_REPOSITORY_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 OBJECT_ID_RE = re.compile(r"[0-9a-f]{40,64}")
 DEPLOYMENT_IDENTITY_FIELDS = (
     "schema_version",
@@ -177,6 +181,14 @@ def _read_environment() -> dict[str, str]:
 
 
 RepositoryPath = Annotated[str, Field(min_length=1, max_length=4096)]
+GitHubRepository = Annotated[
+    str,
+    Field(
+        min_length=3,
+        max_length=4096,
+        description="Absolute local Git worktree path or canonical GitHub owner/repository identifier.",
+    ),
+]
 RevisionInput = Annotated[
     str,
     Field(
@@ -261,6 +273,25 @@ def _resolve_repository(raw: str) -> Path:
     if probe["returncode"] != 0 or probe["stdout"].strip() != "true":
         raise ValueError(probe["stderr"].strip() or f"Not a Git worktree: {path}")
     return path
+
+
+def _resolve_github_repository(raw: str) -> tuple[Path, list[str]]:
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return _resolve_repository(raw), []
+    parts = raw.split("/")
+    valid_identifier = (
+        len(parts) == 2
+        and GITHUB_OWNER_RE.fullmatch(parts[0]) is not None
+        and GITHUB_REPOSITORY_NAME_RE.fullmatch(parts[1]) is not None
+        and parts[1] not in {".", ".."}
+    )
+    if not valid_identifier:
+        raise ValueError(
+            "repo must be an absolute local Git worktree path or a canonical "
+            "GitHub owner/repository identifier"
+        )
+    return operator.HOME, ["--repo", raw]
 
 
 def _git_command(repo: Path, *arguments: str) -> list[str]:
@@ -1184,18 +1215,19 @@ def grabowski_git_show(
 
 @mcp.tool(name="grabowski_github_pr_view", annotations=REMOTE_READ)
 def grabowski_github_pr_view(
-    repo: RepositoryPath,
+    repo: GitHubRepository,
     pr: PullRequestNumber,
 ) -> dict[str, Any]:
     """Read bounded GitHub pull-request metadata without body or comments."""
     operator._require_operator_capability("github_cli")
-    repository = _resolve_repository(repo)
+    repository, repository_args = _resolve_github_repository(repo)
     result = _run_read(
         [
             "gh",
             "pr",
             "view",
             str(_validate_pr(pr)),
+            *repository_args,
             "--json",
             ",".join(GITHUB_PR_FIELDS),
         ],
@@ -1208,18 +1240,19 @@ def grabowski_github_pr_view(
 
 @mcp.tool(name="grabowski_github_checks", annotations=REMOTE_READ)
 def grabowski_github_checks(
-    repo: RepositoryPath,
+    repo: GitHubRepository,
     pr: PullRequestNumber,
 ) -> dict[str, Any]:
     """Read bounded GitHub pull-request check results."""
     operator._require_operator_capability("github_cli")
-    repository = _resolve_repository(repo)
+    repository, repository_args = _resolve_github_repository(repo)
     result = _run_read(
         [
             "gh",
             "pr",
             "checks",
             str(_validate_pr(pr)),
+            *repository_args,
             "--json",
             ",".join(GITHUB_CHECK_FIELDS),
         ],
