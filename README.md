@@ -36,7 +36,7 @@ meldet.
 - typisiertes Inventar, Retention, Archivierung und Dry-Run-First-Cleanup für
   temporäre verlinkte Git-Checkouts
 - User-Service-, tmux-, Prozess- und Portoperationen
-- Lenskit-/repoLens-Bundle-Registry lesen
+- RepoGround-Bundle-Registry lesen
 - read-only Repo-Proof-Bundles mit Branch-/Head-Gate, Hashes und Provenance
 - live erzeugter Operator-Kontext mit Runtime-/Checkout-Drift
 - `~/repos/merges` als unveränderbare Evidence-Zone
