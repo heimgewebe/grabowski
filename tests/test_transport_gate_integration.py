@@ -162,8 +162,6 @@ class CentralTransportGateTests(unittest.TestCase):
         ), mock.patch.object(
             transport, "LOCK_PATH", root / ".lock"
         ):
-            # The real gate consumes against the runtime clock, so the setup
-            # must not inject synthetic timestamps that would already be stale.
             challenges = [
                 transport.begin(
                     client_scope=SHARED_SCOPE,
