@@ -3776,7 +3776,16 @@ class TaskTests(unittest.TestCase):
             for page in (page_one, page_two)
             for item in page["observations"]
         ]
-        expected = sorted(item["task"]["task_id"] for item in started)
+        expected = [
+            task_id
+            for _created_at, task_id in sorted(
+                (
+                    tasks._row_raw(str(item["task"]["task_id"]))["created_at_unix"],
+                    str(item["task"]["task_id"]),
+                )
+                for item in started
+            )
+        ]
         self.assertEqual(expected, observed)
         self.assertEqual(len(observed), len(set(observed)))
         self.assertTrue(page_one["pagination"]["has_more"])
@@ -3909,11 +3918,23 @@ class TaskTests(unittest.TestCase):
                 )
                 rows.append(tuple(record[column] for column in columns))
             connection.executemany(statement, rows)
-        attention_decisions = [
-            {"task_id": f"{index:024x}", "classification": "defer"}
-            for index in range(5_000)
-        ]
-        self.assertEqual(5_000, len(attention_decisions))
+        attention_decisions = self.root / "state" / "task-attention-decisions"
+        attention_decisions.mkdir(mode=0o700)
+        for index in range(5_000):
+            task_id = f"{index:024x}"
+            (attention_decisions / f"{task_id}.a1.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "grabowski_task_attention_decision",
+                        "schema_version": 1,
+                        "task_id": task_id,
+                        "decision": "deferred",
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        self.assertEqual(5_000, sum(1 for _ in attention_decisions.iterdir()))
 
         def observation(record: dict[str, object]) -> dict[str, object]:
             return {

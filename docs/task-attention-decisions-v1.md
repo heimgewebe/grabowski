@@ -33,6 +33,10 @@ Outcome and decision records are read with `O_NOFOLLOW` when available and must 
 
 A symlink, unsafe mode, owner drift, hardlink, oversized file, malformed JSON, changed inode metadata, invalid schema, bad self-hash, stale task binding, or missing receipt fails closed. The implementation never rewrites task or outcome records.
 
+## Boundary to task reconcile
+
+The global `grabowski_task_reconcile_check` observes persistent task and lease truth but does not evaluate attention-decision receipts. A large decision corpus therefore does not enlarge its pages or payload. Decision-aware filtering and its current/history semantics remain exclusive to the bounded attention-reconciliation surface below.
+
 ## Reconciliation semantics
 
 The read-only reconciliation grip opens one bounded task-database read snapshot and keyset-paginates the existing `attention` state projection. It performs no systemd or Fleet observation, no task refresh, no retry, and no mutation.
