@@ -100,6 +100,7 @@ class AgentBootstrapTests(unittest.TestCase):
         self.assertFalse(first["integrity_valid"])
         self.assertIsNone(first["friction_fingerprint_sha256"])
         self.assertEqual(first["current_cohort_sample_size"], 0)
+        self.assertEqual(first["requested_limit"], 50)
         self.assertEqual(
             first["recommended_tool"],
             "grabowski_agent_workspace_optimize",
@@ -110,6 +111,10 @@ class AgentBootstrapTests(unittest.TestCase):
             "workspace_metrics_deferred_from_synchronous_bootstrap",
         )
         self.assertEqual(
+            adaptive["workspace_metrics_report_kind"],
+            "workspace_metrics_snapshot_deferred",
+        )
+        self.assertEqual(
             adaptive["workspace_metrics_collection_mode"],
             "deferred_to_dedicated_workspace_observer",
         )
@@ -117,6 +122,12 @@ class AgentBootstrapTests(unittest.TestCase):
             adaptive["workspace_metrics_recommended_tool"],
             "grabowski_agent_workspace_optimize",
         )
+        with self.assertRaisesRegex(ValueError, "integer"):
+            module._workspace_metrics_snapshot(True)
+        for invalid_limit in (0, 51):
+            with self.subTest(invalid_limit=invalid_limit):
+                with self.assertRaisesRegex(ValueError, "between 1 and 50"):
+                    module._workspace_metrics_snapshot(invalid_limit)
 
     def test_bootstrap_fail_closed_on_invalid_governor_integrity(self) -> None:
         module = self.load_module()
