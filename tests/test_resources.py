@@ -3221,6 +3221,60 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(calls[0]["source_id"], first["leases"][0]["metadata_sha256"])
         self.assertEqual(second["reclaimed"][0]["previous_owner_id"], "owner-a")
 
+    def test_expired_same_owner_reentry_rejects_snapshot_drift(self) -> None:
+        (self.root / ".git").mkdir()
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(
+            self.root, name="expired-admission-race", path=self.root
+        )
+        metadata = {
+            "scope_manifest": scope,
+            "scope_manifest_complete": True,
+        }
+        resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="stable expired repository race",
+            ttl_seconds=60,
+            metadata=metadata,
+            admission_assessor=lambda **_kwargs: {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            },
+        )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET updated_at_unix=1, expires_at_unix=0 WHERE resource_key=?",
+                (key,),
+            )
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            with resources._database() as connection:
+                connection.execute(
+                    "UPDATE leases SET updated_at_unix=2 WHERE resource_key=?",
+                    (key,),
+                )
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "b" * 64,
+                "read_only": True,
+            }
+
+        with self.assertRaisesRegex(
+            RuntimeError, "changed before reacquisition"
+        ):
+            resources.acquire_resources(
+                "owner-a",
+                [key],
+                purpose="stable expired repository race",
+                ttl_seconds=60,
+                metadata=metadata,
+                admission_assessor=assessor,
+            )
+
     def test_work_admission_metadata_is_not_caller_controlled(self) -> None:
         with self.assertRaisesRegex(ValueError, "not a public authority surface"):
             resources.acquire_resources(

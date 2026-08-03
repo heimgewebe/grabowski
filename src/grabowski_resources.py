@@ -1065,7 +1065,7 @@ def _expired_same_owner_repository_reentry(
     purpose: str,
     metadata: dict[str, Any],
     now: int,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Bind an expired same-owner retry to its unchanged exact worktree scope."""
     with _database() as connection:
         row = connection.execute(
@@ -1096,6 +1096,7 @@ def _expired_same_owner_repository_reentry(
         "branch": scope["branch"],
         "source_kind": "expired_same_owner_lease",
         "source_id": observed_sha256,
+        "expected_lease": _release_lease_snapshot(row),
     }
 
 
@@ -3767,6 +3768,7 @@ def acquire_resources(
         sanitized_metadata["lease_mode"] = "emergency-recovery"
     now = _now()
     admission_evidence: list[dict[str, Any]] = []
+    expired_reentry_expectations: dict[str, dict[str, Any]] = {}
     if "work_admission_mode" in normalized_metadata:
         raise ValueError(
             "metadata.work_admission_mode is not a public authority surface"
@@ -3819,13 +3821,29 @@ def acquire_resources(
                     metadata=sanitized_metadata,
                     now=now,
                 )
+                if reentry_binding is not None:
+                    expired_reentry_expectations[broad_key] = reentry_binding[
+                        "expected_lease"
+                    ]
                 assessment = assessor(
                     mode=admission_mode,
                     repo=repository,
                     owner_id=owner,
                     operation="broad_repository_lease",
                     requested_scope=requested_repository_scope,
-                    **({} if reentry_binding is None else reentry_binding),
+                    **(
+                        {}
+                        if reentry_binding is None
+                        else {
+                            key: reentry_binding[key]
+                            for key in (
+                                "target_path",
+                                "branch",
+                                "source_kind",
+                                "source_id",
+                            )
+                        }
+                    ),
                 )
                 if not isinstance(assessment, dict):
                     raise RuntimeError("work admission assessor returned invalid evidence")
@@ -3870,6 +3888,14 @@ def acquire_resources(
                 ).fetchone()
                 if row is not None:
                     existing[key] = row
+                    expected_reentry = expired_reentry_expectations.get(key)
+                    if (
+                        expected_reentry is not None
+                        and _release_lease_snapshot(row) != expected_reentry
+                    ):
+                        raise RuntimeError(
+                            f"Expired same-owner lease changed before reacquisition: {key}"
+                        )
                     live = row["expires_at_unix"] > now
                     critical_reentry = live and any(
                         key.startswith(prefix)
