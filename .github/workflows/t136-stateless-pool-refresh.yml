@@ -84,8 +84,8 @@ jobs:
           path.write_text("".join(output), encoding="utf-8")
           print(f"normalized_hunks={repaired}")
           PY
-          git apply --check .github/t136-stateless-pool.patch
-          git apply .github/t136-stateless-pool.patch
+          git apply --3way --check .github/t136-stateless-pool.patch
+          git apply --3way .github/t136-stateless-pool.patch
           rm tests/test_transport_session_scope_runtime.py
 
       - name: Update stateless shared-pool documentation
