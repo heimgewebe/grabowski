@@ -49,3 +49,33 @@ codes.
 
 The phase is inferred for the merge and worktree-admin gate. A conflicting explicit phase is
 rejected. Merge and worktree-admin gates cannot be acquired together.
+
+## Runtime-refresh terminal lease release
+
+A Bureau runtime refresh owns exactly five canonical path leases: the installed `bureau` and
+`bureau-runtime-refresh` entrypoints, the immutable Bureau prefix, the canonical runtime-refresh
+state root, and the commit-bound workspace. Those leases may be released only through
+`runtime-refresh-lease-release` or the equivalent typed MCP tool
+`grabowski_runtime_refresh_lease_release`.
+
+The caller supplies only the observation target SHA-256 and the terminal result SHA-256. Grabowski
+reads the private, owner-only receipts below the compiled canonical state root
+`~/.local/state/bureau/runtime-refresh` and derives the owner, task, resources and lease snapshots
+from them. It verifies the observation, target, intent, attempt-start, terminal result, merge commit,
+source identity, installed-runtime readback, resource database identity and all five snapshots before
+opening the release transaction.
+
+Release is permitted for:
+
+- `deployed` with `effect_started=true` and a valid source/readback binding;
+- `already_current` with `effect_started=false`;
+- `failed` with `effect_started=false` and a structured pre-effect error.
+
+`unclear`, missing or ambiguous receipts, digest drift, a noncanonical state root, inconsistent
+timestamps, changed lease snapshots and foreign replacement owners fail closed. Changed or foreign
+rows remain leased and are reported as retained; no force-release path is used. Replaying a valid
+terminal receipt is idempotent because already absent rows are returned without mutation.
+
+The historical pre-approval cutover format is accepted only when its digest-bound intent has no typed
+runtime approval fields, the aggregate resource schema is version `3`, and the lease-contract field
+is absent. New typed intents require resource lease contract version `1`.

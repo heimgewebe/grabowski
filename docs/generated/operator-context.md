@@ -161,6 +161,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_bureau_pickup_status` | bureau | yes | low | Read one coordinated Bureau run and its owner-bound lease state without creating or changing coordination truth. |
 | `grabowski_bureau_pickup_release` | bureau | no | high | Release exactly the unchanged owner-bound Grabowski leases recorded for one authoritatively terminal Bureau run. |
 | `grabowski_resource_nonconflict_assess` | resource | no | medium | Assess and audit complete, attested same-repository scopes; issue a short hash-bound proof only when every conflict axis is disjoint. |
+| `grabowski_runtime_refresh_lease_release` | resource | no | high | Release one terminal Bureau runtime-refresh attempt's exact unchanged five path leases from canonical receipt-bound evidence. |
 | `grabowski_resource_reconcile_obsolete_path_leases` | resource | no | high | Release only unchanged exact path leases after an authoritative workspace-close or current successful durable-task outcome proves terminal owner work. |
 | `grabowski_resource_acquire` | resource | no | medium | Atomically acquire typed resource leases for one owner. |
 | `grabowski_resource_renew` | resource | no | medium | Renew live resource leases owned by one owner. |

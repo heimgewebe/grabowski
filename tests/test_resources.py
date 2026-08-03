@@ -3470,5 +3470,523 @@ class ResourceTests(unittest.TestCase):
         self.assertFalse(called)
         self.assertEqual(result["work_admission"], [])
 
+
+    def _runtime_refresh_fixture(
+        self,
+        *,
+        status: str = "deployed",
+        effect_started: bool | None = None,
+    ) -> dict[str, object]:
+        state_root = self.root / "runtime-refresh"
+        attempts_root = state_root / "attempts"
+        intents_root = state_root / "intents"
+        observations_root = state_root / "observations"
+        workspaces_root = state_root / "workspaces"
+        for directory in (
+            state_root,
+            attempts_root,
+            intents_root,
+            observations_root,
+            workspaces_root,
+        ):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        main_commit = "a" * 40
+        bin_dir = self.root / "bin"
+        prefix = self.root / "prefix"
+        workspace = workspaces_root / main_commit
+        bin_dir.mkdir(mode=0o700)
+        prefix.mkdir(mode=0o700)
+        resource_keys = sorted(
+            [
+                f"path:{bin_dir / 'bureau'}",
+                f"path:{bin_dir / 'bureau-runtime-refresh'}",
+                f"path:{prefix}",
+                f"path:{state_root}",
+                f"path:{workspace}",
+            ]
+        )
+        owner = "operator:test-runtime-refresh"
+        task_id = "BUREAU-RUNTIME-REFRESH-TEST"
+        acquired_at = int(time.time()) - 60
+        with patch.object(resources, "_now", return_value=acquired_at):
+            resources.acquire_resources(
+                owner,
+                resource_keys,
+                purpose="runtime refresh fixture",
+                ttl_seconds=360,
+            )
+        snapshots = [
+            {
+                field: resources.inspect_resource(key)[field]
+                for field in resources.LEASE_SNAPSHOT_KEYS
+            }
+            for key in resource_keys
+        ]
+        with sqlite3.connect(self.database) as connection:
+            metadata = dict(connection.execute("SELECT key,value FROM metadata"))
+        lease_binding = {
+            "owner_id": owner,
+            "task_id": task_id,
+            "resource_db": str(self.database),
+            "resource_db_schema_version": metadata["schema_version"],
+            "resource_lease_contract_version": metadata[
+                "resource_lease_contract_version"
+            ],
+            "resource_keys": resource_keys,
+            "min_expires_at_unix": min(item["expires_at_unix"] for item in snapshots),
+            "lease_snapshots": snapshots,
+            "observed_at_unix": acquired_at,
+            "minimum_remaining_seconds": 30,
+            "required_metadata_sha256": None,
+        }
+        lease_binding["lease_binding_sha256"] = (
+            resources._runtime_refresh_payload_digest(
+                lease_binding, "lease_binding_sha256"
+            )
+        )
+        pull_request = {
+            "number": 1,
+            "url": "https://github.com/heimgewebe/bureau/pull/1",
+            "head_commit": "c" * 40,
+            "merge_commit": main_commit,
+        }
+        observation = {
+            "schema_version": 1,
+            "kind": "bureau_runtime_refresh_observation",
+            "repository": "heimgewebe/bureau",
+            "main_commit": main_commit,
+            "pull_request": pull_request,
+            "merged_at": "2026-08-03T08:59:00Z",
+            "required_checks": ["validate (3.10)", "validate (3.12)"],
+            "check_summary": {
+                "validate (3.10)": {"state": "success", "observed_states": ["success"]},
+                "validate (3.12)": {"state": "success", "observed_states": ["success"]},
+            },
+            "deployed_source_commit": "d" * 40,
+            "deployed_manifest_sha256": "e" * 64,
+            "lag_commits": 1,
+            "status": "candidate",
+            "reason_codes": [],
+            "observed_at": "2026-08-03T09:00:00Z",
+        }
+        target_payload = {
+            key: observation.get(key)
+            for key in (
+                "repository",
+                "main_commit",
+                "pull_request",
+                "merged_at",
+                "required_checks",
+                "check_summary",
+                "deployed_source_commit",
+                "deployed_manifest_sha256",
+                "lag_commits",
+            )
+        }
+        target_sha256 = hashlib.sha256(
+            (
+                json.dumps(
+                    target_payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest()
+        observation["target_sha256"] = target_sha256
+        observation["observation_sha256"] = (
+            resources._runtime_refresh_payload_digest(
+                observation, "observation_sha256"
+            )
+        )
+        intent = {
+            "schema_version": 1,
+            "kind": resources.BUREAU_RUNTIME_REFRESH_INTENT_KIND,
+            "repository": "heimgewebe/bureau",
+            "remote_url": "git@github.com:heimgewebe/bureau.git",
+            "state_root": str(state_root),
+            "workspace": str(workspace),
+            "prefix": str(prefix),
+            "bin_dir": str(bin_dir),
+            "main_commit": main_commit,
+            "target_sha256": target_sha256,
+            "required_resource_keys": resource_keys,
+            "pull_request": pull_request,
+            "merged_at": observation["merged_at"],
+            "observation_sha256": observation["observation_sha256"],
+            "created_at": "2026-08-03T09:00:00Z",
+            "expires_at": "2026-08-03T12:00:00Z",
+            "expected_deployed_source_commit": "d" * 40,
+            "expected_manifest_sha256": "e" * 64,
+            "required_checks": ["validate (3.10)", "validate (3.12)"],
+            "does_not_establish": ["deployment_outcome"],
+        }
+        intent["intent_sha256"] = resources._runtime_refresh_payload_digest(
+            intent, "intent_sha256"
+        )
+        attempt_dir = attempts_root / target_sha256
+        attempt_dir.mkdir(mode=0o700)
+        started = {
+            "schema_version": 1,
+            "kind": resources.BUREAU_RUNTIME_REFRESH_START_KIND,
+            "intent_sha256": intent["intent_sha256"],
+            "lease_binding": lease_binding,
+            "started_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(acquired_at + 10)
+            ),
+            "effect_started": False,
+        }
+        if status != "already_current":
+            started["target_sha256"] = target_sha256
+            started["main_commit"] = main_commit
+        started["start_sha256"] = resources._runtime_refresh_payload_digest(
+            started, "start_sha256"
+        )
+        finished_at_unix = acquired_at + 30
+        result = {
+            "schema_version": 1,
+            "kind": resources.BUREAU_RUNTIME_REFRESH_RESULT_KIND,
+            "status": status,
+            "intent_sha256": intent["intent_sha256"],
+            "main_commit": main_commit,
+            "lease_binding": lease_binding,
+            "finished_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(finished_at_unix)
+            ),
+            "effect_started": (
+                status == "deployed" if effect_started is None else effect_started
+            ),
+        }
+        if status != "already_current":
+            result["target_sha256"] = target_sha256
+        if status == "deployed":
+            result.update(
+                {
+                    "source_identity": {
+                        "root": str(workspace),
+                        "head": main_commit,
+                        "origin_main": main_commit,
+                        "dirty": False,
+                        "detached": True,
+                        "remote_url": intent["remote_url"],
+                    },
+                    "install_receipt": {
+                        "schema_version": 1,
+                        "kind": "bureau_runtime_install_receipt",
+                    },
+                    "readback": {
+                        "source_commit": main_commit,
+                        "check_valid": True,
+                        "runtime_identity_valid": True,
+                    },
+                    "does_not_establish": [
+                        "future_runtime_health",
+                        "future_main_stability",
+                    ],
+                }
+            )
+        elif status == "failed":
+            result.update(
+                {
+                    "error": {
+                        "code": "runtime-approval-missing",
+                        "message": "pre-effect abort",
+                        "details": {},
+                    },
+                    "workspace_preserved": False,
+                    "does_not_establish": ["future_success"],
+                }
+            )
+        elif status == "unclear":
+            result.update(
+                {
+                    "error": {
+                        "code": "effect-timeout",
+                        "message": "ambiguous",
+                        "details": {},
+                    },
+                    "workspace_preserved": True,
+                    "does_not_establish": ["safe_retry", "deployment_outcome"],
+                }
+            )
+        result["result_sha256"] = resources._runtime_refresh_payload_digest(
+            result, "result_sha256"
+        )
+        for path, payload in (
+            (
+                observations_root
+                / (
+                    "20260803T090000.000000Z-"
+                    f"{main_commit[:12]}-{observation['observation_sha256'][:12]}.json"
+                ),
+                observation,
+            ),
+            (intents_root / f"{intent['intent_sha256']}.json", intent),
+            (attempt_dir / "started.json", started),
+            (attempt_dir / "result.json", result),
+        ):
+            path.write_text(
+                json.dumps(
+                    payload,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+        return {
+            "state_root": state_root,
+            "target_sha256": target_sha256,
+            "result_sha256": result["result_sha256"],
+            "result_path": attempt_dir / "result.json",
+            "owner": owner,
+            "resource_keys": resource_keys,
+            "snapshots": snapshots,
+        }
+
+    def test_runtime_refresh_terminal_release_deployed_and_reacquires(self) -> None:
+        fixture = self._runtime_refresh_fixture()
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            result = resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertEqual("complete", result["state"])
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in result["released"]],
+        )
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            replay = resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertEqual("no_change", replay["state"])
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in replay["retained"]],
+        )
+        self.assertTrue(
+            all(item["reason"] == "already_absent" for item in replay["retained"])
+        )
+        self.assertEqual([], replay["released"])
+        started = time.monotonic()
+        reacquired = resources.acquire_resources(
+            fixture["owner"],
+            fixture["resource_keys"],
+            purpose="next runtime refresh",
+            ttl_seconds=120,
+        )
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in reacquired["leases"]],
+        )
+
+    def test_runtime_refresh_mcp_tool_requires_operator_and_audits(self) -> None:
+        target_sha256 = "a" * 64
+        result_sha256 = "b" * 64
+        output = {
+            "state": "complete",
+            "owner_id": "operator:test-runtime-refresh",
+            "resource_keys": ["path:/tmp/runtime-refresh"],
+            "released": [{"resource_key": "path:/tmp/runtime-refresh"}],
+            "retained": [],
+            "receipt_sha256": "c" * 64,
+        }
+        with patch.object(
+            resources.operator, "_require_operator_mutation"
+        ) as require_operator, patch.object(
+            resources,
+            "release_runtime_refresh_terminal_leases",
+            return_value=output,
+        ) as release, patch.object(resources.base, "_append_audit") as append_audit:
+            result = resources.grabowski_runtime_refresh_lease_release(
+                target_sha256=target_sha256,
+                result_sha256=result_sha256,
+            )
+        self.assertEqual(output, result)
+        require_operator.assert_called_once_with("resource_lease")
+        release.assert_called_once_with(
+            target_sha256=target_sha256,
+            result_sha256=result_sha256,
+        )
+        audit = append_audit.call_args.args[0]
+        self.assertEqual("runtime-refresh-lease-release", audit["operation"])
+        self.assertEqual(target_sha256, audit["target_sha256"])
+        self.assertEqual(result_sha256, audit["result_sha256"])
+        self.assertEqual(output["receipt_sha256"], audit["receipt_sha256"])
+
+    def test_runtime_refresh_terminal_release_accepts_already_current(self) -> None:
+        fixture = self._runtime_refresh_fixture(
+            status="already_current", effect_started=False
+        )
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            result = resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertEqual("complete", result["state"])
+        self.assertEqual(
+            "already_current", result["terminal_evidence"]["status"]
+        )
+
+    def test_runtime_refresh_terminal_release_accepts_pre_effect_failure(self) -> None:
+        fixture = self._runtime_refresh_fixture(status="failed", effect_started=False)
+        source = {
+            "kind": resources.BUREAU_RUNTIME_REFRESH_RESULT_KIND,
+            "target_sha256": fixture["target_sha256"],
+            "result_sha256": fixture["result_sha256"],
+        }
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            result = resources.reconcile_obsolete_path_leases(
+                owner_id=fixture["owner"],
+                resource_keys=fixture["resource_keys"],
+                expected_leases=fixture["snapshots"],
+                terminal_source=source,
+            )
+        self.assertEqual("complete", result["state"])
+        self.assertEqual("failed", result["terminal_evidence"]["status"])
+
+    def test_runtime_refresh_terminal_release_rejects_unclear_and_missing_result(self) -> None:
+        fixture = self._runtime_refresh_fixture(status="unclear", effect_started=True)
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            with self.assertRaisesRegex(
+                resources.nonconflict.NonConflictDenied,
+                "unclear or not explicitly terminal",
+            ):
+                resources.release_runtime_refresh_terminal_leases(
+                    target_sha256=fixture["target_sha256"],
+                    result_sha256=fixture["result_sha256"],
+                )
+            Path(fixture["result_path"]).unlink()
+            with self.assertRaisesRegex(
+                resources.nonconflict.NonConflictDenied,
+                "result or start receipt is absent",
+            ):
+                resources.release_runtime_refresh_terminal_leases(
+                    target_sha256=fixture["target_sha256"],
+                    result_sha256=fixture["result_sha256"],
+                )
+        self.assertTrue(
+            all(
+                resources.inspect_resource(key) is not None
+                for key in fixture["resource_keys"]
+            )
+        )
+
+    def test_runtime_refresh_terminal_release_rejects_tamper(self) -> None:
+        fixture = self._runtime_refresh_fixture()
+        result_path = Path(fixture["result_path"])
+        payload = json.loads(result_path.read_text())
+        payload["main_commit"] = "f" * 40
+        result_path.write_text(json.dumps(payload) + "\n")
+        result_path.chmod(0o600)
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ), self.assertRaisesRegex(
+            resources.nonconflict.NonConflictDenied, "result digest is invalid"
+        ):
+            resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertTrue(
+            all(
+                resources.inspect_resource(key) is not None
+                for key in fixture["resource_keys"]
+            )
+        )
+
+    def test_runtime_refresh_terminal_release_rejects_target_tamper(self) -> None:
+        fixture = self._runtime_refresh_fixture()
+        observations = list(
+            (Path(fixture["state_root"]) / "observations").glob("*.json")
+        )
+        self.assertEqual(1, len(observations))
+        payload = json.loads(observations[0].read_text())
+        payload["lag_commits"] = 2
+        payload["observation_sha256"] = (
+            resources._runtime_refresh_payload_digest(
+                payload, "observation_sha256"
+            )
+        )
+        observations[0].write_text(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        observations[0].chmod(0o600)
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ), self.assertRaisesRegex(
+            resources.nonconflict.NonConflictDenied,
+            "observation identity changed|observation receipt is absent or ambiguous|target digest is invalid",
+        ):
+            resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertTrue(
+            all(
+                resources.inspect_resource(key) is not None
+                for key in fixture["resource_keys"]
+            )
+        )
+
+    def test_runtime_refresh_terminal_release_retains_changed_and_foreign_leases(self) -> None:
+        fixture = self._runtime_refresh_fixture()
+        changed_key, foreign_key = fixture["resource_keys"][:2]
+        resources.renew_resources(fixture["owner"], [changed_key], ttl_seconds=600)
+        resources.release_resources(fixture["owner"], [foreign_key])
+        resources.acquire_resources(
+            "operator:foreign-runtime-refresh",
+            [foreign_key],
+            purpose="foreign replacement",
+            ttl_seconds=600,
+        )
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            result = resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        retained = {item["resource_key"]: item["reason"] for item in result["retained"]}
+        self.assertEqual("lease_snapshot_changed", retained[changed_key])
+        self.assertEqual("owner_changed", retained[foreign_key])
+        self.assertEqual(
+            "operator:foreign-runtime-refresh",
+            resources.inspect_resource(foreign_key)["owner_id"],
+        )
+
 if __name__ == "__main__":
     unittest.main()

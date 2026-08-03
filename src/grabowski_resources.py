@@ -60,6 +60,16 @@ MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_OPERATION_RESOURCE_VALUE_BYTES = 4096
 MAX_TERMINAL_RECEIPT_BYTES = 64 * 1024
+MAX_RUNTIME_REFRESH_RECEIPT_BYTES = 256 * 1024
+BUREAU_RUNTIME_REFRESH_STATE_ROOT = Path(
+    "~/.local/state/bureau/runtime-refresh"
+).expanduser()
+BUREAU_RUNTIME_REFRESH_RESULT_KIND = "bureau_runtime_refresh_result"
+BUREAU_RUNTIME_REFRESH_START_KIND = "bureau_runtime_refresh_attempt_start"
+BUREAU_RUNTIME_REFRESH_INTENT_KIND = "bureau_runtime_refresh_intent"
+RUNTIME_REFRESH_RELEASABLE_STATUSES = frozenset(
+    {"deployed", "already_current", "failed"}
+)
 OBSOLETE_PATH_RELEASE_SCHEMA_VERSION = 1
 OBSOLETE_PATH_RELEASE_KIND = "grabowski_obsolete_path_lease_release"
 LEASE_SNAPSHOT_KEYS = frozenset({
@@ -1374,7 +1384,9 @@ def _normalize_mutation_lease_snapshots(
     return snapshots
 
 
-def _load_private_receipt_json(path: Path) -> dict[str, Any]:
+def _load_private_receipt_json(
+    path: Path, *, max_bytes: int = MAX_TERMINAL_RECEIPT_BYTES
+) -> dict[str, Any]:
     try:
         directory_fd = os.open(
             path.parent,
@@ -1407,11 +1419,11 @@ def _load_private_receipt_json(path: Path) -> dict[str, Any]:
             or metadata.st_nlink != 1
             or metadata.st_uid != os.getuid()
             or stat.S_IMODE(metadata.st_mode) & 0o077
-            or metadata.st_size > MAX_TERMINAL_RECEIPT_BYTES
+            or metadata.st_size > max_bytes
         ):
             raise PermissionError("terminal receipt must be one bounded private regular file")
-        raw = os.read(descriptor, MAX_TERMINAL_RECEIPT_BYTES + 1)
-        if len(raw) > MAX_TERMINAL_RECEIPT_BYTES:
+        raw = os.read(descriptor, max_bytes + 1)
+        if len(raw) > max_bytes:
             raise PermissionError("terminal receipt exceeds the byte limit")
         value = json.loads(raw.decode("utf-8"))
     finally:
@@ -1746,6 +1758,533 @@ def _verify_task_terminal_source(
     }
 
 
+
+def _runtime_refresh_payload_digest(value: Mapping[str, Any], field: str) -> str:
+    payload = dict(value)
+    payload.pop(field, None)
+    return hashlib.sha256((_canonical_json(payload) + "\n").encode("utf-8")).hexdigest()
+
+
+def _verify_runtime_refresh_digest(
+    value: Mapping[str, Any], field: str, *, label: str
+) -> str:
+    observed = value.get(field)
+    expected = _runtime_refresh_payload_digest(value, field)
+    if (
+        not isinstance(observed, str)
+        or SHA256_RE.fullmatch(observed) is None
+        or observed != expected
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", f"{label} digest is invalid"
+        )
+    return observed
+
+
+def _runtime_refresh_private_root() -> Path:
+    root = BUREAU_RUNTIME_REFRESH_STATE_ROOT.expanduser()
+    try:
+        resolved = root.resolve(strict=True)
+        info = root.lstat()
+    except OSError as exc:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-missing", "runtime-refresh state root is unavailable"
+        ) from exc
+    if (
+        resolved != root
+        or stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise PermissionError("runtime-refresh state root is not canonical and private")
+    return root
+
+
+def _runtime_refresh_terminal_material(
+    terminal_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    source = dict(terminal_source)
+    if set(source) != {"kind", "target_sha256", "result_sha256"}:
+        raise ValueError("runtime-refresh terminal_source keys are invalid")
+    if source.get("kind") != BUREAU_RUNTIME_REFRESH_RESULT_KIND:
+        raise ValueError("runtime-refresh terminal_source kind is invalid")
+    target_sha256 = source.get("target_sha256")
+    result_sha256 = source.get("result_sha256")
+    if (
+        not isinstance(target_sha256, str)
+        or SHA256_RE.fullmatch(target_sha256) is None
+        or not isinstance(result_sha256, str)
+        or SHA256_RE.fullmatch(result_sha256) is None
+    ):
+        raise ValueError("runtime-refresh terminal source digest is invalid")
+
+    root = _runtime_refresh_private_root()
+    attempts_root = root / "attempts"
+    intents_root = root / "intents"
+    observations_root = root / "observations"
+    attempt_dir = attempts_root / target_sha256
+    for directory, label in (
+        (attempts_root, "attempts"),
+        (intents_root, "intents"),
+        (observations_root, "observations"),
+        (attempt_dir, "attempt"),
+    ):
+        try:
+            info = directory.lstat()
+        except OSError as exc:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-missing",
+                f"runtime-refresh {label} directory is unavailable",
+            ) from exc
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise PermissionError(
+                f"runtime-refresh {label} directory is not private and owned"
+            )
+
+    result_path = attempt_dir / "result.json"
+    started_path = attempt_dir / "started.json"
+    try:
+        result = _load_private_receipt_json(
+            result_path, max_bytes=MAX_RUNTIME_REFRESH_RECEIPT_BYTES
+        )
+        started = _load_private_receipt_json(
+            started_path, max_bytes=MAX_RUNTIME_REFRESH_RECEIPT_BYTES
+        )
+    except FileNotFoundError as exc:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-missing", "runtime-refresh result or start receipt is absent"
+        ) from exc
+    if result.get("result_sha256") != result_sha256:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-drift", "runtime-refresh result identity changed"
+        )
+    _verify_runtime_refresh_digest(result, "result_sha256", label="result")
+    _verify_runtime_refresh_digest(started, "start_sha256", label="attempt start")
+    if (
+        result.get("schema_version") != 1
+        or result.get("kind") != BUREAU_RUNTIME_REFRESH_RESULT_KIND
+        or started.get("schema_version") != 1
+        or started.get("kind") != BUREAU_RUNTIME_REFRESH_START_KIND
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh receipt contract is invalid"
+        )
+
+    status = result.get("status")
+    effect_started = result.get("effect_started")
+    if status not in RUNTIME_REFRESH_RELEASABLE_STATUSES:
+        raise nonconflict.NonConflictDenied(
+            "owner-work-nonterminal",
+            "runtime-refresh result is unclear or not explicitly terminal",
+        )
+    if status == "deployed" and effect_started is not True:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "deployed runtime-refresh result is inconsistent"
+        )
+    if status in {"already_current", "failed"} and effect_started is not False:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "pre-effect runtime-refresh result is inconsistent",
+        )
+    if status == "failed":
+        if not isinstance(result.get("error"), dict):
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid", "failed runtime-refresh result lacks an error"
+            )
+    elif "error" in result:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "successful runtime-refresh result unexpectedly contains an error",
+        )
+
+    intent_sha256 = result.get("intent_sha256")
+    if (
+        not isinstance(intent_sha256, str)
+        or SHA256_RE.fullmatch(intent_sha256) is None
+        or started.get("intent_sha256") != intent_sha256
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh intent binding is invalid"
+        )
+    intent_path = intents_root / f"{intent_sha256}.json"
+    try:
+        intent = _load_private_receipt_json(
+            intent_path, max_bytes=MAX_RUNTIME_REFRESH_RECEIPT_BYTES
+        )
+    except FileNotFoundError as exc:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-missing", "runtime-refresh intent receipt is absent"
+        ) from exc
+    if intent.get("intent_sha256") != intent_sha256:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-drift", "runtime-refresh intent identity changed"
+        )
+    _verify_runtime_refresh_digest(intent, "intent_sha256", label="intent")
+    observation_sha256 = intent.get("observation_sha256")
+    if (
+        not isinstance(observation_sha256, str)
+        or SHA256_RE.fullmatch(observation_sha256) is None
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh observation binding is invalid",
+        )
+    observation_candidates = sorted(
+        observations_root.glob(f"*-{observation_sha256[:12]}.json")
+    )
+    if len(observation_candidates) != 1:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-missing",
+            "runtime-refresh observation receipt is absent or ambiguous",
+        )
+    observation = _load_private_receipt_json(
+        observation_candidates[0], max_bytes=MAX_RUNTIME_REFRESH_RECEIPT_BYTES
+    )
+    if observation.get("observation_sha256") != observation_sha256:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-drift",
+            "runtime-refresh observation identity changed",
+        )
+    _verify_runtime_refresh_digest(
+        observation, "observation_sha256", label="observation"
+    )
+    target_payload = {
+        key: observation.get(key)
+        for key in (
+            "repository",
+            "main_commit",
+            "pull_request",
+            "merged_at",
+            "required_checks",
+            "check_summary",
+            "deployed_source_commit",
+            "deployed_manifest_sha256",
+            "lag_commits",
+        )
+    }
+    observed_target_sha256 = hashlib.sha256(
+        (_canonical_json(target_payload) + "\n").encode("utf-8")
+    ).hexdigest()
+    if (
+        observation.get("schema_version") != 1
+        or observation.get("kind") != "bureau_runtime_refresh_observation"
+        or observation.get("target_sha256") != target_sha256
+        or observed_target_sha256 != target_sha256
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh target digest is invalid",
+        )
+    if (
+        intent.get("schema_version") != 1
+        or intent.get("kind") != BUREAU_RUNTIME_REFRESH_INTENT_KIND
+        or intent.get("target_sha256") != target_sha256
+        or intent.get("repository") != "heimgewebe/bureau"
+        or Path(str(intent.get("state_root", ""))).expanduser() != root
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh intent target is invalid"
+        )
+
+    if (
+        observation.get("repository") != intent.get("repository")
+        or observation.get("main_commit") != intent.get("main_commit")
+        or observation.get("pull_request") != intent.get("pull_request")
+        or observation.get("merged_at") != intent.get("merged_at")
+        or observation.get("required_checks") != intent.get("required_checks")
+        or observation.get("deployed_source_commit")
+        != intent.get("expected_deployed_source_commit")
+        or observation.get("deployed_manifest_sha256")
+        != intent.get("expected_manifest_sha256")
+        or observation.get("status") not in {"candidate", "alert"}
+        or type(observation.get("lag_commits")) is not int
+        or observation.get("lag_commits") < 1
+        or not isinstance(observation.get("check_summary"), dict)
+        or any(
+            observation["check_summary"].get(name, {}).get("state") != "success"
+            for name in observation.get("required_checks", [])
+        )
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh observation and intent bindings differ",
+        )
+    main_commit = intent.get("main_commit")
+    if (
+        not isinstance(main_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", main_commit) is None
+        or result.get("main_commit") != main_commit
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh main commit binding is invalid"
+        )
+    pull_request = intent.get("pull_request")
+    if (
+        not isinstance(pull_request, dict)
+        or pull_request.get("merge_commit") != main_commit
+        or not isinstance(pull_request.get("number"), int)
+        or isinstance(pull_request.get("number"), bool)
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh merge commit binding is invalid"
+        )
+
+    if status != "already_current":
+        if (
+            result.get("target_sha256") != target_sha256
+            or started.get("target_sha256") != target_sha256
+            or started.get("main_commit") != main_commit
+        ):
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid",
+                "runtime-refresh attempt target differs from its intent",
+            )
+    elif any(key in started for key in ("target_sha256", "main_commit")) and (
+        started.get("target_sha256") != target_sha256
+        or started.get("main_commit") != main_commit
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "already-current attempt has inconsistent optional target bindings",
+        )
+    if started.get("effect_started") is not False:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh start receipt is inconsistent"
+        )
+
+    result_binding = result.get("lease_binding")
+    started_binding = started.get("lease_binding")
+    if not isinstance(result_binding, dict) or result_binding != started_binding:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh result and start lease bindings differ",
+        )
+    claimed_binding_sha256 = result_binding.get("lease_binding_sha256")
+    if (
+        not isinstance(claimed_binding_sha256, str)
+        or SHA256_RE.fullmatch(claimed_binding_sha256) is None
+        or _runtime_refresh_payload_digest(
+            result_binding, "lease_binding_sha256"
+        )
+        != claimed_binding_sha256
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh lease binding digest is invalid"
+        )
+    owner_id = result_binding.get("owner_id")
+    task_id = result_binding.get("task_id")
+    resource_keys = result_binding.get("resource_keys")
+    lease_snapshots = result_binding.get("lease_snapshots")
+    if (
+        not isinstance(owner_id, str)
+        or OWNER_RE.fullmatch(owner_id) is None
+        or not isinstance(task_id, str)
+        or not task_id
+        or not isinstance(resource_keys, list)
+        or any(not isinstance(item, str) for item in resource_keys)
+        or resource_keys != sorted(set(resource_keys))
+        or not isinstance(lease_snapshots, list)
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid", "runtime-refresh lease binding shape is invalid"
+        )
+    path_fields = {
+        field: intent.get(field)
+        for field in ("state_root", "workspace", "prefix", "bin_dir")
+    }
+    if any(
+        not isinstance(value, str)
+        or not Path(value).expanduser().is_absolute()
+        or Path(value).expanduser() != Path(value).expanduser().resolve(strict=False)
+        for value in path_fields.values()
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh intent paths are not canonical absolute paths",
+        )
+    canonical_resource_keys = [
+        f"path:{Path(str(intent['bin_dir'])).expanduser() / 'bureau'}",
+        f"path:{Path(str(intent['bin_dir'])).expanduser() / 'bureau-runtime-refresh'}",
+        f"path:{Path(str(intent['prefix'])).expanduser()}",
+        f"path:{root}",
+        f"path:{Path(str(intent['workspace'])).expanduser()}",
+    ]
+    canonical_resource_keys = sorted(set(canonical_resource_keys))
+    if (
+        resource_keys != canonical_resource_keys
+        or intent.get("required_resource_keys") != canonical_resource_keys
+        or Path(str(intent.get("workspace", ""))).expanduser()
+        != root / "workspaces" / main_commit
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh resources are not the five canonical paths",
+        )
+    snapshots = _normalize_expected_lease_snapshots(
+        lease_snapshots, owner_id=owner_id, resource_keys=resource_keys
+    )
+    resource_db = result_binding.get("resource_db")
+    schema_version = result_binding.get("resource_db_schema_version")
+    contract_version = result_binding.get("resource_lease_contract_version")
+    minimum_remaining_seconds = result_binding.get("minimum_remaining_seconds")
+    observed_at_unix = result_binding.get("observed_at_unix")
+    required_metadata_sha256 = result_binding.get("required_metadata_sha256")
+    if (
+        not isinstance(resource_db, str)
+        or Path(resource_db).expanduser().resolve() != RESOURCE_DB.expanduser().resolve()
+        or not isinstance(schema_version, str)
+        or not schema_version.isdecimal()
+        or (
+            contract_version != "1"
+            and not (
+                contract_version is None
+                and "runtime_approval" not in intent
+                and "approval_task_id" not in intent
+                and schema_version == "3"
+            )
+        )
+        or type(minimum_remaining_seconds) is not int
+        or minimum_remaining_seconds < 30
+        or type(observed_at_unix) is not int
+        or result_binding.get("min_expires_at_unix")
+        != min(item["expires_at_unix"] for item in snapshots)
+        or (
+            required_metadata_sha256 is not None
+            and (
+                not isinstance(required_metadata_sha256, str)
+                or SHA256_RE.fullmatch(required_metadata_sha256) is None
+            )
+        )
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh resource database binding is invalid",
+        )
+    finished_at = result.get("finished_at")
+    try:
+        parsed_finished = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+        if parsed_finished.tzinfo is None or parsed_finished.utcoffset() is None:
+            raise ValueError("timezone missing")
+        finished_at_unix = int(parsed_finished.timestamp())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh terminal timestamp is invalid",
+        ) from exc
+    started_at = started.get("started_at")
+    try:
+        parsed_started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        if parsed_started.tzinfo is None or parsed_started.utcoffset() is None:
+            raise ValueError("timezone missing")
+        started_at_unix = int(parsed_started.timestamp())
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh start timestamp is invalid",
+        ) from exc
+    if (
+        observed_at_unix > started_at_unix
+        or started_at_unix > finished_at_unix
+        or any(
+            snapshot["acquired_at_unix"] > started_at_unix
+            or snapshot["updated_at_unix"] > started_at_unix
+            for snapshot in snapshots
+        )
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-drift",
+            "runtime-refresh lease changed at or after the terminal result",
+        )
+
+    if status == "deployed":
+        source_identity = result.get("source_identity")
+        readback = result.get("readback")
+        if (
+            not isinstance(source_identity, dict)
+            or source_identity.get("head") != main_commit
+            or source_identity.get("origin_main") != main_commit
+            or source_identity.get("dirty") is not False
+            or source_identity.get("detached") is not True
+            or source_identity.get("root") != intent.get("workspace")
+            or source_identity.get("remote_url") != intent.get("remote_url")
+            or not isinstance(readback, dict)
+            or readback.get("source_commit") != main_commit
+            or readback.get("check_valid") is not True
+            or readback.get("runtime_identity_valid") is not True
+        ):
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid",
+                "deployed runtime-refresh source or readback binding is invalid",
+            )
+
+    return {
+        "terminal_evidence": {
+            "kind": BUREAU_RUNTIME_REFRESH_RESULT_KIND,
+            "target_sha256": target_sha256,
+            "result_sha256": result_sha256,
+            "status": status,
+            "effect_started": effect_started,
+            "intent_sha256": intent_sha256,
+            "main_commit": main_commit,
+            "merge_commit": pull_request["merge_commit"],
+            "owner_id": owner_id,
+            "task_id": task_id,
+            "resource_keys": resource_keys,
+            "lease_binding_sha256": claimed_binding_sha256,
+            "resource_lease_contract_version": (
+                contract_version if contract_version is not None else "legacy-null"
+            ),
+            "started_at_unix": started_at_unix,
+            "finished_at_unix": finished_at_unix,
+        },
+        "owner_id": owner_id,
+        "resource_keys": resource_keys,
+        "lease_snapshots": snapshots,
+    }
+
+
+def _verify_runtime_refresh_terminal_source(
+    terminal_source: Mapping[str, Any],
+    *,
+    owner_id: str,
+    resource_keys: list[str],
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    material = _runtime_refresh_terminal_material(terminal_source)
+    if material["owner_id"] != owner_id:
+        raise PermissionError("runtime-refresh terminal evidence belongs to another owner")
+    if material["resource_keys"] != resource_keys:
+        raise PermissionError("runtime-refresh terminal evidence names other resources")
+    if material["lease_snapshots"] != expected_leases:
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-drift",
+            "runtime-refresh lease snapshots differ from the requested release",
+        )
+    return dict(material["terminal_evidence"])
+
+
+def release_runtime_refresh_terminal_leases(
+    *, target_sha256: str, result_sha256: str
+) -> dict[str, Any]:
+    terminal_source = {
+        "kind": BUREAU_RUNTIME_REFRESH_RESULT_KIND,
+        "target_sha256": target_sha256,
+        "result_sha256": result_sha256,
+    }
+    material = _runtime_refresh_terminal_material(terminal_source)
+    return reconcile_obsolete_path_leases(
+        owner_id=material["owner_id"],
+        resource_keys=material["resource_keys"],
+        expected_leases=material["lease_snapshots"],
+        terminal_source=terminal_source,
+    )
+
 def _verify_terminal_source(
     terminal_source: Any,
     *,
@@ -1770,9 +2309,16 @@ def _verify_terminal_source(
             resource_keys=resource_keys,
             expected_leases=expected_leases,
         )
+    if kind == BUREAU_RUNTIME_REFRESH_RESULT_KIND:
+        return _verify_runtime_refresh_terminal_source(
+            terminal_source,
+            owner_id=owner_id,
+            resource_keys=resource_keys,
+            expected_leases=expected_leases,
+        )
     raise nonconflict.NonConflictDenied(
         "unsupported-terminal-source",
-        "terminal_source kind must be agent_workspace_close or durable_task_outcome",
+        "terminal_source kind must be agent_workspace_close, durable_task_outcome, or bureau_runtime_refresh_result",
     )
 
 
@@ -4283,6 +4829,34 @@ def grabowski_resource_nonconflict_assess(
             "requested_scope_sha256": result["proof"]["requested_scope_sha256"],
             "existing_scope_sha256": result["proof"]["existing_scope_sha256"],
             "expires_at_unix": result["proof"]["expires_at_unix"],
+        }
+    )
+    return result
+
+
+@mcp.tool(name="grabowski_runtime_refresh_lease_release", annotations=MUTATING)
+def grabowski_runtime_refresh_lease_release(
+    target_sha256: str,
+    result_sha256: str,
+) -> dict[str, Any]:
+    """Release one terminal runtime-refresh attempt's exact unchanged path leases."""
+    operator._require_operator_mutation("resource_lease")
+    result = release_runtime_refresh_terminal_leases(
+        target_sha256=target_sha256,
+        result_sha256=result_sha256,
+    )
+    base._append_audit(
+        {
+            "timestamp_unix": _now(),
+            "operation": "runtime-refresh-lease-release",
+            "owner_id": result["owner_id"],
+            "resource_keys": result["resource_keys"],
+            "state": result["state"],
+            "released_count": len(result["released"]),
+            "retained_count": len(result["retained"]),
+            "target_sha256": target_sha256,
+            "result_sha256": result_sha256,
+            "receipt_sha256": result["receipt_sha256"],
         }
     )
     return result

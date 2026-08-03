@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19",
+  "capability_source_sha256": "2ac90c4367aa2f15a6ccd8ebf8391936d1e849d3f10a6021328aebc53b938eec",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "9f71da0e1467fde627099ffd5fa7c6d7daaba2a9094f5b068fe1e6f7f9987acd",
+  "contract_sha256": "c49ae84bd481ac16897003fe396c60cf0979ae61c551e6686d14b8f026992ad5",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1660,6 +1660,21 @@
       "reversibility": "proof-expiry",
       "risk_class": "medium",
       "tool": "grabowski_resource_nonconflict_assess"
+    },
+    {
+      "category": "resource",
+      "description": "Release one terminal runtime-refresh attempt's exact unchanged path leases.",
+      "effects": [
+        "lease-remove",
+        "audit-append",
+        "terminal-evidence-verify"
+      ],
+      "id": "grabowski_runtime_refresh_lease_release",
+      "purpose": "Release one terminal Bureau runtime-refresh attempt's exact unchanged five path leases from canonical receipt-bound evidence.",
+      "read_only": false,
+      "reversibility": "resource-reacquire",
+      "risk_class": "high",
+      "tool": "grabowski_runtime_refresh_lease_release"
     },
     {
       "category": "resource",
