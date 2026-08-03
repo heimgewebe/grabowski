@@ -309,6 +309,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_private_io",
             "grabowski_job_origin",
             "grabowski_job_finalizer",
+            "grabowski_alert_outbox",
             "grabowski_ntfy_dispatch",
         ):
             self.assertIn(module, supporting)
