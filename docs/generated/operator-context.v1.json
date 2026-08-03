@@ -2674,6 +2674,11 @@
         "kind": "python_module",
         "launcher_module": "grabowski_job_finalizer",
         "spawned_module": "grabowski_ntfy_dispatch"
+      },
+      {
+        "kind": "python_module",
+        "launcher_module": "grabowski_alert_outbox",
+        "spawned_module": "grabowski_ntfy_dispatch"
       }
     ],
     "supporting_sources": [
@@ -2962,6 +2967,10 @@
         "source": "src/grabowski_job_finalizer.py"
       },
       {
+        "module": "grabowski_alert_outbox",
+        "source": "src/grabowski_alert_outbox.py"
+      },
+      {
         "module": "grabowski_ntfy_dispatch",
         "source": "src/grabowski_ntfy_dispatch.py"
       },
@@ -3031,7 +3040,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "88bf52d26bc4b59f0bd2d906dd3135dee41d17d65df3e2652c935a732a38188e"
+      "sha256": "50a83e35a5635330a376c3677e9cceeaafe62196db8fa73f1befc6f0aa140f15"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3041,6 +3050,7 @@
       "src/grabowski_agent_workspace.py": "4d744e17059040fbb7b234da5eca9bca605dc9d26a204d91d08af16d5b827cbe",
       "src/grabowski_agent_workspace_observer.py": "dc308485af597c59b5e3492bc5c7c1edc7048c032f0722138bce0708e7d2725a",
       "src/grabowski_agent_writer.py": "a1d22e0eedd83dd596e75e6cdfd5ae03dcd468b6e42996be323c0ac042592a2e",
+      "src/grabowski_alert_outbox.py": "47d43bb27151032be8cd197038f358c27c52ca9066e6ed57530f71cfa793455d",
       "src/grabowski_artifacts.py": "08925585075c7e77973d70ebf836537d612bc6b111b784cfce9f3025d93fe653",
       "src/grabowski_audit_query.py": "8bbdcfb249a40643b3cb63db50af3e9663426e2d608fa9d52099b742865ab43e",
       "src/grabowski_audit_signal.py": "c19dfd2f27796add229220ccba21097abd83990e630618096afa5689fdc34089",
