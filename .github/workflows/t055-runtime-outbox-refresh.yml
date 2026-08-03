@@ -30,88 +30,23 @@ jobs:
           python-version: "3.12"
 
       - name: Apply bounded deterministic patch
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import json
-
-          root = Path.cwd()
-          manifest_path = root / "config" / "runtime-entrypoint.json"
-          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-          items = manifest["supporting_sources"]
-          modules = [item["module"] for item in items]
-          if "grabowski_alert_outbox" in modules:
-              raise SystemExit("grabowski_alert_outbox is already packaged")
-          try:
-              index = modules.index("grabowski_ntfy_dispatch")
-          except ValueError as exc:
-              raise SystemExit("grabowski_ntfy_dispatch anchor is missing") from exc
-          items.insert(index, {
-              "module": "grabowski_alert_outbox",
-              "source": "src/grabowski_alert_outbox.py",
-          })
-          manifest_path.write_text(
-              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-              encoding="utf-8",
-          )
-
-          test_path = root / "tests" / "test_repository_contract.py"
-          test_text = test_path.read_text(encoding="utf-8")
-          anchor = '            "grabowski_ntfy_dispatch",\n'
-          replacement = '            "grabowski_alert_outbox",\n' + anchor
-          if replacement in test_text:
-              raise SystemExit("repository contract already packages alert outbox")
-          if test_text.count(anchor) != 1:
-              raise SystemExit("repository-contract anchor is not unique")
-          test_path.write_text(
-              test_text.replace(anchor, replacement, 1),
-              encoding="utf-8",
-          )
-
-          doc_path = root / "docs" / "ntfy-alert-outbox-v1.md"
-          doc = doc_path.read_text(encoding="utf-8")
-          old = """The runtime-entrypoint manifest is intentionally outside this change. The
-          integration therefore loads the packaged alert module through an optional
-          boundary. If an older deployed source set does not contain the module,
-          terminal-job dispatch continues and reports `alert_outbox_unavailable` with an
-          explicit `alert_outbox_empty` non-claim; producer transitions remain primary
-          and do not fail during a staggered package rollout.
-          """
-          new = """The runtime-entrypoint manifest packages `grabowski_alert_outbox` alongside
-          the shared dispatcher and producer modules. The optional import boundary
-          remains a staggered-rollout safeguard only: an older deployed source set may
-          continue terminal-job dispatch and report `alert_outbox_unavailable`, but the
-          canonical current runtime contract includes the alert module. Producer
-          transitions remain primary and do not fail if an incomplete historical source
-          set is observed.
-          """
-          if old not in doc:
-              raise SystemExit("documentation rollout paragraph does not match expected base")
-          doc_path.write_text(doc.replace(old, new, 1), encoding="utf-8")
-          PY
+        run: python3 .github/scripts/t055_apply.py
 
       - name: Regenerate contracts
         run: make context-refresh
 
       - name: Verify exact diff scope
+        shell: bash
         run: |
-          python3 - <<'PY'
-          import subprocess
-          expected = {
-              "config/runtime-entrypoint.json",
-              "contracts/capability-catalog.v1.json",
-              "contracts/publication-profiles.v1.json",
-              "docs/generated/operator-context.v1.json",
-              "docs/ntfy-alert-outbox-v1.md",
-              "tests/test_repository_contract.py",
-          }
-          raw = subprocess.check_output(["git", "status", "--porcelain=v1", "-z"])
-          observed = {entry[3:] for entry in raw.decode().split("\0") if entry}
-          if observed != expected:
-              raise SystemExit(
-                  f"unexpected diff scope: observed={sorted(observed)} expected={sorted(expected)}"
-              )
-          PY
+          diff -u \
+            <(printf '%s\n' \
+              config/runtime-entrypoint.json \
+              contracts/capability-catalog.v1.json \
+              contracts/publication-profiles.v1.json \
+              docs/generated/operator-context.v1.json \
+              docs/ntfy-alert-outbox-v1.md \
+              tests/test_repository_contract.py | sort) \
+            <(git status --porcelain=v1 | cut -c4- | sort)
           git diff --check
           git diff --binary | sha256sum | tee /tmp/t055-diff.sha256
 
@@ -128,17 +63,14 @@ jobs:
       - name: Full validation
         run: make validate
 
-      - name: Commit generated and reviewed patch
+      - name: Commit product patch and remove helpers
+        shell: bash
         run: |
+          rm .github/scripts/t055_apply.py
+          rm .github/workflows/t055-runtime-outbox-refresh.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add \
-            config/runtime-entrypoint.json \
-            contracts/capability-catalog.v1.json \
-            contracts/publication-profiles.v1.json \
-            docs/generated/operator-context.v1.json \
-            docs/ntfy-alert-outbox-v1.md \
-            tests/test_repository_contract.py
+          git add -A
           git diff --cached --check
           git commit -m "fix(runtime): package general ntfy alert outbox"
           git push origin HEAD:${{ github.head_ref }}
