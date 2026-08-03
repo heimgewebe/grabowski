@@ -1736,6 +1736,57 @@ class ResourceTests(unittest.TestCase):
                 )
         self.assertEqual(resources.inspect_resource(key), second["leases"][0])
 
+    def test_same_owner_rebind_restores_journaled_identity_after_expiry(self) -> None:
+        key = "component:bureau-resume-rebind"
+        owner = "bureau-run:BUR-RUN-20260803T112652Z-594b4414fc"
+        original_metadata = {
+            "task_id": "WELTGEWEBE-OS-V1-T065",
+            "run_id": "BUR-RUN-20260803T112652Z-594b4414fc",
+            "claim_intent_sha256": "d" * 64,
+            "pickup_schema_version": 1,
+            "pickup_group": "other",
+        }
+        with patch.object(resources, "_now", return_value=100):
+            original = resources.acquire_resources(
+                owner,
+                [key],
+                purpose="Bureau coordinated pickup original group other",
+                ttl_seconds=30,
+                metadata=original_metadata,
+            )
+        with patch.object(resources, "_now", return_value=140):
+            drifted = resources.acquire_resources(
+                owner,
+                [key],
+                purpose="Resume existing Bureau task without claim binding",
+                ttl_seconds=120,
+                metadata={"task_id": "WELTGEWEBE-OS-V1-T065"},
+            )
+        with patch.object(resources, "_now", return_value=150):
+            rebound = resources.rebind_same_owner_resources(
+                owner,
+                [key],
+                purpose="Bureau coordinated pickup original group other",
+                ttl_seconds=180,
+                metadata=original_metadata,
+                expected_current_leases=[
+                    resources._release_lease_snapshot(drifted["leases"][0])
+                ],
+                expected_original_leases=[
+                    resources._release_lease_snapshot(original["leases"][0])
+                ],
+            )
+        self.assertEqual(
+            original["leases"][0]["metadata_sha256"],
+            rebound["leases"][0]["metadata_sha256"],
+        )
+        self.assertEqual(
+            "Bureau coordinated pickup original group other",
+            rebound["leases"][0]["purpose"],
+        )
+        self.assertEqual(140, rebound["leases"][0]["acquired_at_unix"])
+        self.assertEqual(330, rebound["leases"][0]["expires_at_unix"])
+
     def test_task_reconciliation_preserves_live_generation_and_recreates_missing(self) -> None:
         task_id = "a" * 24
         owner = f"task:{task_id}"

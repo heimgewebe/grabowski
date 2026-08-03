@@ -1819,6 +1819,116 @@ def _recover_after_commit(
     }
 
 
+def _lease_snapshot(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value[key]
+        for key in (
+            "resource_key",
+            "owner_id",
+            "acquired_at_unix",
+            "updated_at_unix",
+            "expires_at_unix",
+            "metadata_sha256",
+        )
+    }
+
+
+def _repair_existing_assignment_lease_binding(
+    coordination: dict[str, Any],
+    intent: dict[str, Any],
+    request: dict[str, Any],
+    acquisition: dict[str, Any],
+    run_dir: Path,
+) -> bool:
+    lease_state = coordination.get("lease")
+    lease_error = lease_state.get("error") if isinstance(lease_state, dict) else None
+    if not (
+        isinstance(lease_state, dict)
+        and lease_state.get("status") == "active-binding-drift"
+        and isinstance(lease_error, dict)
+        and lease_error.get("code") == "lease-metadata-binding-mismatch"
+    ):
+        return False
+    run = coordination.get("run")
+    if not isinstance(run, dict) or run.get("state") not in {
+        "assigned",
+        "running",
+        "verifying",
+    }:
+        return False
+    release = coordination.get("release")
+    if not isinstance(release, dict):
+        return False
+    expected_release = {
+        "owner_id": intent["lease_owner_id"],
+        "resource_keys": intent["required_resource_keys"],
+        "claim_intent_sha256": intent["intent_sha256"],
+    }
+    if any(release.get(key) != value for key, value in expected_release.items()):
+        return False
+    original_by_key = {
+        item["resource_key"]: item
+        for item in acquisition.get("leases", [])
+        if isinstance(item, dict) and isinstance(item.get("resource_key"), str)
+    }
+    if sorted(original_by_key) != intent["required_resource_keys"]:
+        raise BureauPickupError("existing-assignment-lease-journal-incomplete")
+    current_by_key: dict[str, dict[str, Any]] = {}
+    for key in intent["required_resource_keys"]:
+        observed = resources.inspect_resource(key)
+        if observed is None:
+            raise BureauPickupError(
+                "existing-assignment-lease-missing",
+                details={"resource_key": key},
+            )
+        if observed.get("owner_id") != intent["lease_owner_id"]:
+            raise BureauPickupError(
+                "existing-assignment-lease-foreign-owner",
+                details={"resource_key": key, "owner_id": observed.get("owner_id")},
+            )
+        current_by_key[key] = observed
+    if any(
+        current_by_key[key]["acquired_at_unix"]
+        <= original_by_key[key]["expires_at_unix"]
+        for key in intent["required_resource_keys"]
+    ):
+        return False
+    groups = _acquisition_groups(intent, request)
+    if len(groups) != 1:
+        return False
+    group = groups[0]
+    keys = group["resource_keys"]
+    purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+    original = [original_by_key[key] for key in keys]
+    if any(item.get("purpose") != purpose for item in original):
+        raise BureauPickupError(
+            "existing-assignment-lease-purpose-journal-mismatch",
+            details={"group": group["name"]},
+        )
+    result = resources.rebind_same_owner_resources(
+        intent["lease_owner_id"],
+        keys,
+        purpose=purpose,
+        ttl_seconds=group["ttl_seconds"],
+        metadata=group["metadata"],
+        expected_current_leases=[_lease_snapshot(current_by_key[key]) for key in keys],
+        expected_original_leases=[_lease_snapshot(original_by_key[key]) for key in keys],
+    )
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_lease_rebind",
+        "run_id": intent["run_id"],
+        "task_id": intent["task_id"],
+        "claim_intent_sha256": intent["intent_sha256"],
+        "group": group["name"],
+        "resource_keys": keys,
+        "metadata_sha256": result["metadata_sha256"],
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    _write_bound_json(run_dir / "lease-rebind.json", receipt)
+    return True
+
+
 @mcp.tool(name="grabowski_bureau_pickup_execute", annotations=MUTATING)
 def grabowski_bureau_pickup_execute(
     request: BureauPickupRequest,
@@ -1919,7 +2029,29 @@ def grabowski_bureau_pickup_execute(
                 coordination_root=normalized["coordination_root"],
             ),
         )
-        _validate_claim_readback(coordination, intent, acquisition)
+        try:
+            _validate_claim_readback(coordination, intent, acquisition)
+        except BureauPickupError as exc:
+            if exc.code != "claim-readback-blocking-or-incomplete":
+                raise
+            repaired = _repair_existing_assignment_lease_binding(
+                coordination,
+                intent,
+                normalized,
+                acquisition,
+                run_dir,
+            )
+            if not repaired:
+                raise
+            coordination = _bound_bureau_call(
+                registry_binding,
+                lambda: _coordination_status(
+                    intent["run_id"],
+                    registry_root=normalized["registry_root"],
+                    coordination_root=normalized["coordination_root"],
+                ),
+            )
+            _validate_claim_readback(coordination, intent, acquisition)
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup",
