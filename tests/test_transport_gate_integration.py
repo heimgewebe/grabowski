@@ -151,6 +151,53 @@ class CentralTransportGateTests(unittest.TestCase):
             arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
         )
 
+
+    def test_stateless_shared_scope_admits_two_independent_handshakes(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "state"
+        with mock.patch.object(
+            roundtrip, "STATE_ROOT", root
+        ), mock.patch.object(
+            roundtrip, "LOCK_PATH", root / ".lock"
+        ):
+            challenges = [
+                roundtrip.begin(
+                    client_scope=SHARED_SCOPE,
+                    runtime_binding=BINDING,
+                )["challenge_receipt_sha256"]
+                for _ in range(2)
+            ]
+            for challenge in challenges:
+                roundtrip.acknowledge(
+                    client_scope=SHARED_SCOPE,
+                    challenge_receipt_sha256=challenge,
+                    runtime_binding=BINDING,
+                )
+
+            operator = self.configured_operator()
+            context = types.SimpleNamespace(client_id=None)
+            first = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "write", {"sequence": 1}, context
+                )
+            )
+            second = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "write", {"sequence": 2}, context
+                )
+            )
+            self.assertTrue(first["called"])
+            self.assertTrue(second["called"])
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh single-use transport verification"
+            ):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "write", {"sequence": 3}, context
+                    )
+                )
+
     def test_handshake_grip_is_narrowly_exempt(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace(client_id="mcp-client-1")

@@ -48,6 +48,29 @@ def _consume_worker(
         output.put(("ok", receipt["consumption_receipt_sha256"]))
 
 
+def _consume_shared_worker(
+    state_root: str,
+    start: multiprocessing.synchronize.Event,
+    output: multiprocessing.queues.Queue,
+) -> None:
+    root = Path(state_root)
+    roundtrip.STATE_ROOT = root
+    roundtrip.LOCK_PATH = root / ".lock"
+    start.wait()
+    try:
+        receipt = roundtrip.consume_verified(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="grabowski_file_write",
+            arguments_sha256="e" * 64,
+            now_unix=102,
+        )
+    except Exception as exc:
+        output.put(("error", type(exc).__name__))
+    else:
+        output.put(("ok", receipt["consumption_receipt_sha256"]))
+
+
 class TransportRoundtripTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -201,6 +224,142 @@ class TransportRoundtripTests(unittest.TestCase):
         )
         self.assertEqual(results[0][1], "TransportRoundtripRequired")
 
+
+    def test_shared_unlabeled_handshakes_coexist_without_overwrite(self) -> None:
+        first = self.begin(scope=SHARED_SCOPE)
+        second = self.begin(scope=SHARED_SCOPE)
+        self.assertFalse(first["replayed"])
+        self.assertFalse(second["replayed"])
+        self.assertNotEqual(
+            first["challenge_receipt_sha256"],
+            second["challenge_receipt_sha256"],
+        )
+        self.assertEqual(second["pending_challenge_count"], 2)
+
+        second_ack = self.acknowledge(
+            second["challenge_receipt_sha256"],
+            scope=SHARED_SCOPE,
+        )
+        first_ack = self.acknowledge(
+            first["challenge_receipt_sha256"],
+            scope=SHARED_SCOPE,
+        )
+        self.assertNotEqual(
+            first_ack["verification_receipt_sha256"],
+            second_ack["verification_receipt_sha256"],
+        )
+        self.assertEqual(first_ack["verified_receipt_count"], 2)
+
+        first_consumption = roundtrip.consume_verified(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="first-write",
+            arguments_sha256="d" * 64,
+            now_unix=102,
+        )
+        second_consumption = roundtrip.consume_verified(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="second-write",
+            arguments_sha256="e" * 64,
+            now_unix=102,
+        )
+        self.assertNotEqual(
+            first_consumption["verification_receipt_sha256"],
+            second_consumption["verification_receipt_sha256"],
+        )
+        self.assertEqual(
+            second_consumption["verified_receipt_count"], 0
+        )
+        status = roundtrip.status(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            now_unix=103,
+        )
+        self.assertEqual(status["state"], "consumed")
+        self.assertFalse(status["mutation_gate_open"])
+
+    def test_shared_unlabeled_parallel_consumers_use_distinct_tokens(self) -> None:
+        for _ in range(2):
+            begin = self.begin(scope=SHARED_SCOPE)
+            self.acknowledge(
+                begin["challenge_receipt_sha256"],
+                scope=SHARED_SCOPE,
+            )
+        context = multiprocessing.get_context("fork")
+        start = context.Event()
+        output = context.Queue()
+        processes = [
+            context.Process(
+                target=_consume_shared_worker,
+                args=(str(roundtrip.STATE_ROOT), start, output),
+            )
+            for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=10)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+        results = [output.get(timeout=2) for _ in processes]
+        self.assertEqual(
+            sorted(result[0] for result in results),
+            ["ok", "ok"],
+        )
+        self.assertEqual(
+            len({result[1] for result in results}),
+            2,
+        )
+
+    def test_shared_pending_pool_is_bounded_and_prunes_stale_entries(self) -> None:
+        with mock.patch.object(
+            roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2
+        ):
+            self.begin(scope=SHARED_SCOPE, now=100)
+            self.begin(scope=SHARED_SCOPE, now=100)
+            with self.assertRaisesRegex(
+                roundtrip.TransportRoundtripRequired,
+                "pending challenge pool is full",
+            ):
+                self.begin(scope=SHARED_SCOPE, now=100)
+            refreshed = self.begin(
+                scope=SHARED_SCOPE,
+                now=100 + roundtrip.CHALLENGE_TTL_SECONDS + 1,
+            )
+        self.assertEqual(refreshed["pending_challenge_count"], 1)
+
+    def test_legacy_single_slot_state_migrates_on_next_mutation(self) -> None:
+        begin = self.begin()
+        path = roundtrip._state_path(
+            roundtrip.client_scope_sha256(META_SCOPE)
+        )
+        current = json.loads(path.read_text(encoding="utf-8"))
+        legacy = {
+            "schema_version": roundtrip.SCHEMA_VERSION,
+            "kind": roundtrip.STATE_KIND,
+            "client_scope_sha256": current["client_scope_sha256"],
+            "client_scope_kind": current["client_scope_kind"],
+            "pending_challenge": current["pending_challenges"][0],
+            "verified_receipt": None,
+            "last_consumption_receipt": None,
+        }
+        roundtrip._write_private_json(path, legacy)
+        acknowledged = self.acknowledge(
+            begin["challenge_receipt_sha256"]
+        )
+        migrated = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            migrated["schema_version"],
+            roundtrip.STATE_SCHEMA_VERSION,
+        )
+        self.assertEqual(
+            len(migrated["verified_receipts"]),
+            1,
+        )
+        self.assertEqual(acknowledged["state"], "verified")
+
     def test_different_client_scope_cannot_ack_or_consume(self) -> None:
         begin = self.begin()
         with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
@@ -258,7 +417,7 @@ class TransportRoundtripTests(unittest.TestCase):
         self.begin()
         path = roundtrip._state_path(roundtrip.client_scope_sha256(META_SCOPE))
         payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["pending_challenge"]["runtime_binding"]["release_id"] = "tampered"
+        payload["pending_challenges"][0]["runtime_binding"]["release_id"] = "tampered"
         path.write_text(json.dumps(payload), encoding="utf-8")
         os.chmod(path, 0o600)
         status = roundtrip.status(
