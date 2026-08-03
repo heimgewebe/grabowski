@@ -1896,6 +1896,55 @@ class BureauPickupTests(unittest.TestCase):
         invoke.assert_not_called()
         release.assert_not_called()
 
+    def test_release_retry_ignores_foreign_successor_lease(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _value = self.create_acquisition_journal(intent, lease)
+        prior = {"owner_id": intent["lease_owner_id"], "released": [lease]}
+        pickup._write_bound_json(run_dir / "release-result.json", prior)
+        foreign = self.lease(key, "bureau-run:foreign-successor")
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=foreign
+            ) as inspect,
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("already-released", result["status"])
+        inspect.assert_called_once_with(key)
+        invoke.assert_not_called()
+        release.assert_not_called()
+
+    def test_terminal_release_ignores_foreign_successor_lease(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        foreign = self.lease(key, "bureau-run:foreign-successor")
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, foreign],
+            ) as inspect,
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("released", result["status"])
+        self.assertEqual(2, inspect.call_count)
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
     def test_exact_retry_recovers_own_existing_assignment_after_intent_expiry(self) -> None:
         request = self.request()
         normalized = pickup._normalize_request(request)
