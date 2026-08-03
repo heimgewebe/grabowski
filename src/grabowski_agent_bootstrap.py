@@ -120,23 +120,40 @@ def call_shape_check(
 
 
 def _workspace_metrics_snapshot(limit: int) -> dict[str, Any]:
-    try:
-        import grabowski_agent_workspace_observer as workspace_observer
+    """Defer heavyweight workspace observation from the synchronous entry capsule.
 
-        return workspace_observer.workspace_metrics_snapshot(limit=limit)
-    except Exception as exc:
-        body = {
-            "schema_version": 1,
-            "report_kind": "workspace_metrics_snapshot_unavailable",
-            "integrity_valid": False,
-            "friction_fingerprint_sha256": None,
-            "friction_fingerprint_unavailable_reason": "workspace_metrics_observation_failed",
-            "error_type": type(exc).__name__,
-            "error": str(exc)[:500],
-            "execution_authorized": False,
-            "automatic_live_routing_enabled": False,
-        }
-        return {**body, "snapshot_sha256": _stable_sha256(body)}
+    Workspace observation refreshes durable task state and can therefore contend with
+    the global task-mutation lock. Agent bootstrap is a frequent, read-only entry
+    point and must not amplify that contention or hold deployment admission open.
+    Detailed workspace evidence remains available through the dedicated observer.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError("workspace metrics limit must be an integer")
+    if not 1 <= limit <= 50:
+        raise ValueError("workspace metrics limit must be between 1 and 50")
+    body = {
+        "schema_version": 1,
+        "report_kind": "workspace_metrics_snapshot_deferred",
+        "collection_mode": "deferred_to_dedicated_workspace_observer",
+        "integrity_valid": False,
+        "friction_fingerprint_sha256": None,
+        "friction_fingerprint_unavailable_reason": (
+            "workspace_metrics_deferred_from_synchronous_bootstrap"
+        ),
+        "requested_limit": limit,
+        "current_cohort": None,
+        "current_cohort_sample_size": 0,
+        "execution_authorized": False,
+        "automatic_live_routing_enabled": False,
+        "recommended_tool": "grabowski_agent_workspace_optimize",
+        "does_not_establish": [
+            "workspace_metrics_integrity",
+            "workspace_task_freshness",
+            "workspace_cohort_completeness",
+            "permission_to_execute",
+        ],
+    }
+    return {**body, "snapshot_sha256": _stable_sha256(body)}
 
 
 def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> dict[str, Any]:
@@ -169,6 +186,18 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
         if workspace_metrics_integrity_valid
         else None
     )
+    workspace_fingerprint_unavailable_reason = workspace_metrics.get(
+        "friction_fingerprint_unavailable_reason"
+    )
+    if (
+        not isinstance(workspace_fingerprint_unavailable_reason, str)
+        or not workspace_fingerprint_unavailable_reason
+    ):
+        workspace_fingerprint_unavailable_reason = (
+            None
+            if workspace_metrics_integrity_valid
+            else "workspace_metrics_integrity_invalid"
+        )
     friction_fingerprint = friction.get("fingerprint_sha256") or workspace_fingerprint
 
     capsule = {
@@ -227,9 +256,14 @@ def agent_bootstrap(*, friction_limit: int = 100, outcome_limit: int = 200) -> d
                 "current_cohort_sample_size", 0
             ),
             "workspace_fingerprint_unavailable_reason": (
-                workspace_metrics.get("friction_fingerprint_unavailable_reason")
-                if workspace_metrics_integrity_valid
-                else "workspace_metrics_integrity_invalid"
+                workspace_fingerprint_unavailable_reason
+            ),
+            "workspace_metrics_report_kind": workspace_metrics.get("report_kind"),
+            "workspace_metrics_collection_mode": workspace_metrics.get(
+                "collection_mode"
+            ),
+            "workspace_metrics_recommended_tool": workspace_metrics.get(
+                "recommended_tool"
             ),
             "governor_summary_sha256": governor.get("summary_sha256"),
             "minimum_evidence": governor.get("minimum_evidence"),
