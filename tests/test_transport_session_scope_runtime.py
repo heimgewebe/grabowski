@@ -30,6 +30,28 @@ class TransportSessionScopeRuntimeTests(unittest.TestCase):
                         settings=types.SimpleNamespace(stateless_http=stateless)
                     )
 
+            assert runtime.grabowski_operator_core.base.HTTP_STATELESS_MODE is False
+            manager = types.SimpleNamespace(
+                stateless=False,
+                session_idle_timeout=None,
+            )
+            runtime._configure_runtime_http_session_manager(manager)
+            assert (
+                manager.session_idle_timeout
+                == runtime.HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+            )
+            try:
+                runtime._configure_runtime_http_session_manager(
+                    types.SimpleNamespace(
+                        stateless=True,
+                        session_idle_timeout=None,
+                    )
+                )
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("stateless manager was accepted")
+
             first_session = Session()
             second_session = Session()
             first = runtime._runtime_transport_client_scope(Context(first_session))
