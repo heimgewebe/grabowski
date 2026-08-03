@@ -138,7 +138,17 @@ Admission-Vertrag wie das Runtime-Deployment:
    Marker werden fail-closed abgewiesen.
 2. Neue Toolaufrufe werden vor ihrem Werkzeugeffekt gesperrt. Bereits
    angenommene Aufrufe dürfen enden. Zwei stabile Messungen müssen
-   `active_tool_calls == 0` bestätigen.
+   `active_tool_calls == 0` bestätigen. Die Statusroute zählt dabei aus einem
+   identitätsgebundenen, sperrgeschützten Registry-Register; ein laufender
+   Aufruf bleibt bis zum tatsächlichen Abschluss seines Workers registriert.
+   Bleibt `active_tool_calls` über die Wartezeit konstant ungleich null,
+   unterstützen `oldest_active_tool_call_age_seconds`, gruppierte Zählungen
+   (`active_tool_calls_by_kind`, die begrenzte und als solche markierte
+   `active_tool_calls_by_tool_name`-Projektion) und die begrenzte
+   Stichprobe die Korrelation wiederholter Beobachtungen, ohne
+   Argumente oder Inhalte offenzulegen. Die Metadaten allein beweisen nicht,
+   ob eine Identität noch real läuft oder nicht freigegeben wurde; in beiden
+   Fällen steigt ihr Alter bis zur identitätsgebundenen Freigabe weiter.
 3. Der Tunnel muss dreimal stabil `queue == 0` sowie
    `polled == enqueued == final_responses` melden. Fehlt die
    Final-Response-Histogrammserie (kalt/idle, noch kein Traffic), zählt

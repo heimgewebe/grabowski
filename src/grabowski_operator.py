@@ -68,7 +68,14 @@ DEPLOYMENT_ADMISSION_MARKER_KEYS = frozenset(
 DEPLOYMENT_ADMISSION_TOKEN_RE = re.compile(r"[0-9a-f]{64}\Z")
 DEPLOYMENT_ADMISSION_HEAD_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 _DEPLOYMENT_ADMISSION_LOCK = threading.Lock()
-_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY: dict[str, dict[str, Any]] = {}
+_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX = 4096
+_DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX = 8
+_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX = 16
+_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX = 32
+_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS = 128
+_DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC = "sync"
+_DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC = "async"
 _DEPLOYMENT_ADMISSION_GATE_INSTALLED = False
 SYNC_TOOL_EXECUTOR_MAX_WORKERS = 8
 _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -490,22 +497,135 @@ def _deployment_observer_tool_call_parts(
 
 def _deployment_admission_active_tool_calls() -> int:
     with _DEPLOYMENT_ADMISSION_LOCK:
-        return _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+        return len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
 
 
-def _deployment_admission_release_tool_call(_completed: Any = None) -> None:
-    global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
+def _deployment_admission_register_tool_call(
+    tool_name: Any,
+    kind: str,
+) -> str:
+    if kind not in {
+        _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+        _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
+    }:
+        raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
+    name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
+    name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
-        _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS -= 1
-        if _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS < 0:
-            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS = 0
+        if (
+            len(_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY)
+            >= _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+        ):
+            raise RuntimeError(
+                "Grabowski deployment admission active-call registry is full"
+            )
+        identity: str | None = None
+        for _attempt in range(_DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX):
+            candidate = uuid.uuid4().hex
+            if candidate not in _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY:
+                identity = candidate
+                break
+        if identity is None:
+            raise RuntimeError(
+                "Grabowski deployment admission could not allocate a unique "
+                "active-call identity"
+            )
+        _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY[identity] = {
+            "identity": identity,
+            "tool_name": name,
+            "kind": kind,
+            "started_at_unix": time.time(),
+            "started_monotonic": time.monotonic(),
+        }
+    return identity
+
+
+def _deployment_admission_release_tool_call(identity: Any) -> bool:
+    if not isinstance(identity, str) or not identity:
+        return False
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        return (
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.pop(identity, None) is not None
+        )
+
+
+def _deployment_admission_active_registry_snapshot() -> dict[str, dict[str, Any]]:
+    with _DEPLOYMENT_ADMISSION_LOCK:
+        return {
+            identity: dict(entry)
+            for identity, entry in _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY.items()
+        }
 
 
 def _deployment_admission_snapshot() -> dict[str, Any]:
+    registry = _deployment_admission_active_registry_snapshot()
+    now_monotonic = time.monotonic()
+    by_kind: dict[str, int] = {}
+    by_tool_name: dict[str, int] = {}
+    sample: list[dict[str, Any]] = []
+    oldest_age_seconds: float | None = None
+    for entry in registry.values():
+        by_kind[entry["kind"]] = by_kind.get(entry["kind"], 0) + 1
+        by_tool_name[entry["tool_name"]] = (
+            by_tool_name.get(entry["tool_name"], 0) + 1
+        )
+        age_seconds = max(0.0, now_monotonic - entry["started_monotonic"])
+        sample.append(
+            {
+                "identity": entry["identity"],
+                "tool_name": entry["tool_name"],
+                "kind": entry["kind"],
+                "started_at_unix": entry["started_at_unix"],
+                "age_seconds": age_seconds,
+            }
+        )
+        if oldest_age_seconds is None or age_seconds > oldest_age_seconds:
+            oldest_age_seconds = age_seconds
+    sample.sort(
+        key=lambda item: registry[item["identity"]]["started_monotonic"]
+    )
+    by_kind = dict(sorted(by_kind.items()))
+    tool_name_groups = sorted(
+        by_tool_name.items(), key=lambda item: (-item[1], item[0])
+    )
+    tool_name_groups_truncated = (
+        len(tool_name_groups) > _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX
+    )
+    omitted_tool_name_call_count = sum(
+        count
+        for _name, count in tool_name_groups[
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX :
+        ]
+    )
+    by_tool_name = dict(
+        tool_name_groups[:_DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX]
+    )
+    truncated = len(sample) > _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX
+    sample = sample[: _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX]
     return {
         **_read_deployment_admission_marker(),
-        "active_tool_calls": _deployment_admission_active_tool_calls(),
+        "active_tool_calls": len(registry),
+        "active_tool_call_registry_max": (
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
+        ),
         "admission_gate_installed": _DEPLOYMENT_ADMISSION_GATE_INSTALLED,
+        "oldest_active_tool_call_age_seconds": oldest_age_seconds,
+        "active_tool_calls_by_kind": by_kind,
+        "active_tool_calls_by_tool_name": by_tool_name,
+        "active_tool_calls_by_tool_name_truncated": (
+            tool_name_groups_truncated
+        ),
+        "active_tool_calls_by_tool_name_max": (
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX
+        ),
+        "active_tool_calls_by_tool_name_omitted_call_count": (
+            omitted_tool_name_call_count
+        ),
+        "active_tool_calls_sample": sample,
+        "active_tool_calls_sample_truncated": truncated,
+        "active_tool_calls_sample_max": (
+            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX
+        ),
     }
 
 
@@ -528,15 +648,14 @@ def _install_deployment_admission_gate() -> None:
         return
 
     async def gated_call_tool(*args: Any, **kwargs: Any) -> Any:
-        global _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS
-        marker = _read_deployment_admission_marker()
+        observer_marker = _read_deployment_admission_marker()
         tool_name, arguments, context = _deployment_observer_tool_call_parts(
             args, kwargs
         )
         observer_evidence: dict[str, Any] | None = None
         try:
             observer_evidence = _deployment_observer_request_evidence(
-                tool_name, arguments, context, marker
+                tool_name, arguments, context, observer_marker
             )
         except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
             observer_evidence = None
@@ -550,27 +669,43 @@ def _install_deployment_admission_gate() -> None:
             observer_evidence is not None
             and observer_evidence.get("marker_bound") is True
         ):
-            if tool is not None and getattr(tool, "is_async", True) is False:
-                loop = asyncio.get_running_loop()
-                worker_future = _SYNC_TOOL_EXECUTOR.submit(
-                    _run_sync_tool_call,
-                    original,
-                    args,
-                    kwargs,
+            current_observer_marker = _read_deployment_admission_marker()
+            try:
+                current_observer_evidence = _deployment_observer_request_evidence(
+                    tool_name, arguments, context, current_observer_marker
                 )
-                return await asyncio.wrap_future(worker_future, loop=loop)
-            return await original(*args, **kwargs)
+            except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+                current_observer_evidence = None
+            if (
+                current_observer_evidence is not None
+                and current_observer_evidence.get("marker_bound") is True
+            ):
+                if tool is not None and getattr(tool, "is_async", True) is False:
+                    loop = asyncio.get_running_loop()
+                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                        _run_sync_tool_call,
+                        original,
+                        args,
+                        kwargs,
+                    )
+                    return await asyncio.wrap_future(worker_future, loop=loop)
+                return await original(*args, **kwargs)
 
-        with _DEPLOYMENT_ADMISSION_LOCK:
-            _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALLS += 1
+        kind = (
+            _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
+            if tool is not None and getattr(tool, "is_async", True) is False
+            else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+        )
+        identity = _deployment_admission_register_tool_call(tool_name, kind)
         release_in_finally = True
         try:
+            marker = _read_deployment_admission_marker()
             if marker.get("active") or marker.get("state") == "invalid":
                 raise RuntimeError(
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
                 )
-            if tool is not None and getattr(tool, "is_async", True) is False:
+            if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
                 worker_future = _SYNC_TOOL_EXECUTOR.submit(
                     _run_sync_tool_call,
@@ -578,15 +713,17 @@ def _install_deployment_admission_gate() -> None:
                     args,
                     kwargs,
                 )
-                worker_future.add_done_callback(
-                    _deployment_admission_release_tool_call
-                )
+
+                def _release_when_worker_finishes(_completed: Any) -> None:
+                    _deployment_admission_release_tool_call(identity)
+
+                worker_future.add_done_callback(_release_when_worker_finishes)
                 release_in_finally = False
                 return await asyncio.wrap_future(worker_future, loop=loop)
             return await original(*args, **kwargs)
         finally:
             if release_in_finally:
-                _deployment_admission_release_tool_call()
+                _deployment_admission_release_tool_call(identity)
 
     gated_call_tool._grabowski_deployment_admission_gate = True
     manager.call_tool = gated_call_tool
