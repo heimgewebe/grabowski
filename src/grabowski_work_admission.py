@@ -376,8 +376,21 @@ def assess_repository_admission(
         lifecycle_owner = (
             next(iter(lifecycle_owners)) if len(lifecycle_owners) == 1 else None
         )
+        requested_target_checkout = (
+            source_kind == "expired_same_owner_lease"
+            and isinstance(source_id, str)
+            and len(source_id) == 64
+            and target_path is not None
+            and path == target_path
+            and isinstance(requested_scope, dict)
+            and requested_scope.get("repository") == repository
+            and requested_scope.get("worktree") == path
+            and requested_scope.get("branch") == branch
+            and item.get("branch") == branch
+            and requested_scope.get("head") == item.get("head")
+        )
         inert_checkout = _inert_checkout_for_admission(item, state=state)
-        if not inert_checkout:
+        if not inert_checkout and not requested_target_checkout:
             if len(lifecycle_owners) > 1:
                 blockers.append(
                     {
