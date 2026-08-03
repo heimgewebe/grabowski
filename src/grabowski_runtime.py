@@ -47,10 +47,14 @@ _ORIGINAL_TRANSPORT_SCOPE_VALIDATOR = _TRANSPORT_ROUNDTRIP.validate_client_scope
 _ORIGINAL_TRANSPORT_SCOPE_RESOLVER = (
     grabowski_operator_core.base._transport_roundtrip_client_scope
 )
+_ORIGINAL_CONFIGURE_HTTP_RUNTIME = (
+    grabowski_operator_core.base._configure_http_runtime
+)
 _TRANSPORT_SESSION_SCOPE_LOCK = threading.Lock()
 _TRANSPORT_SESSION_SCOPES: weakref.WeakKeyDictionary[object, str] = (
     weakref.WeakKeyDictionary()
 )
+HTTP_SESSION_IDLE_TIMEOUT_SECONDS = 1800.0
 
 
 def _validate_runtime_transport_client_scope(value: Any) -> dict[str, str]:
@@ -108,13 +112,32 @@ def _runtime_transport_client_scope(ctx: Any) -> dict[str, str]:
     )
 
 
+def _configure_runtime_http_session_manager(manager: Any) -> None:
+    """Bound stateful MCP sessions so scope isolation does not leak resources."""
+    if getattr(manager, "stateless", None) is not False:
+        raise RuntimeError("stateful FastMCP session management is required")
+    manager.session_idle_timeout = HTTP_SESSION_IDLE_TIMEOUT_SECONDS
+    if manager.session_idle_timeout != HTTP_SESSION_IDLE_TIMEOUT_SECONDS:
+        raise RuntimeError("FastMCP session idle timeout could not be configured")
+
+
+def _configure_runtime_http() -> None:
+    """Configure the stock HTTP runtime, then enforce bounded stateful sessions."""
+    _ORIGINAL_CONFIGURE_HTTP_RUNTIME()
+    _configure_runtime_http_session_manager(
+        grabowski_operator_core.mcp.session_manager
+    )
+
+
 # The central gate and the roundtrip grip both resolve through these module
-# functions at request time. Install the extension before the HTTP runtime is
-# configured so one stateful session owns its single-use challenge and receipt.
+# functions at request time. Stateful Streamable HTTP preserves one SDK session
+# across begin, acknowledge, and mutation calls; idle cleanup bounds retention.
 _TRANSPORT_ROUNDTRIP.validate_client_scope = _validate_runtime_transport_client_scope
 grabowski_operator_core.base._transport_roundtrip_client_scope = (
     _runtime_transport_client_scope
 )
+grabowski_operator_core.base.HTTP_STATELESS_MODE = False
+grabowski_operator_core.base._configure_http_runtime = _configure_runtime_http
 
 
 mcp = grabowski_operator_core.mcp
