@@ -52,6 +52,8 @@ for old, new, expected in (
     ('            roundtrip, "LOCK_PATH", root / ".lock"\n', '            transport, "LOCK_PATH", root / ".lock"\n', 1),
     ("                roundtrip.begin(\n", "                transport.begin(\n", 1),
     ("                roundtrip.acknowledge(\n", "                transport.acknowledge(\n", 1),
+    ("                    now_unix=100,\n", "", 1),
+    ("                    now_unix=101,\n", "", 1),
 ):
     if block.count(old) != expected:
         raise SystemExit(f"integration binding marker mismatch: {old!r}")
