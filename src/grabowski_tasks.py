@@ -7458,12 +7458,19 @@ def _reconcile_check_candidate_page(
     limit: int,
     cursor: str | None,
 ) -> dict[str, Any]:
+    page_started_ns = time.perf_counter_ns()
     bounded_limit = _validate_reconcile_check_limit(limit)
     candidate_states = _reconcile_candidate_states()
     placeholders = ",".join("?" for _ in candidate_states)
     with _task_read_snapshot() as connection:
         connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        snapshot_started_ns = time.perf_counter_ns()
         snapshot = _reconcile_check_store_snapshot(connection)
+        snapshot_ms = round(
+            (time.perf_counter_ns() - snapshot_started_ns) / 1_000_000,
+            3,
+        )
+        query_started_ns = time.perf_counter_ns()
         snapshot_scope = TASK_RECONCILE_CHECK_CURSOR_SCOPE
         scope = f"{snapshot_scope}:{snapshot['snapshot_sha256']}"
         position = consumer_surface.decode_cursor(
@@ -7505,6 +7512,10 @@ def _reconcile_check_candidate_page(
                 candidate_states,
             ).fetchone()[0]
         )
+        cursor_and_query_ms = round(
+            (time.perf_counter_ns() - query_started_ns) / 1_000_000,
+            3,
+        )
     has_more = len(rows) > bounded_limit
     page_rows = [dict(row) for row in rows[:bounded_limit]]
     next_cursor = None
@@ -7524,6 +7535,14 @@ def _reconcile_check_candidate_page(
         "next_cursor": next_cursor,
         "snapshot": snapshot,
         "total_candidates": total_candidates,
+        "timings_ms": {
+            "snapshot": snapshot_ms,
+            "cursor_and_query": cursor_and_query_ms,
+            "page_setup_total": round(
+                (time.perf_counter_ns() - page_started_ns) / 1_000_000,
+                3,
+            ),
+        },
     }
 
 
@@ -7533,6 +7552,7 @@ def reconcile_tasks_check(
     limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
     cursor: str | None = None,
 ) -> dict[str, Any]:
+    check_started_ns = time.perf_counter_ns()
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
     if task_id:
@@ -7556,6 +7576,7 @@ def reconcile_tasks_check(
     would_resume: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     compact = not bool(task_id)
+    observation_started_ns = time.perf_counter_ns()
     for record in rows:
         try:
             observation = _reconcile_observation(record)
@@ -7596,6 +7617,10 @@ def reconcile_tasks_check(
             blocked.append(blocker)
         elif observation["state"] != "running":
             would_resume.append(item)
+    observation_ms = round(
+        (time.perf_counter_ns() - observation_started_ns) / 1_000_000,
+        3,
+    )
     result: dict[str, Any] = {
         "mode": "check",
         "task_id": task_id,
@@ -7624,8 +7649,28 @@ def reconcile_tasks_check(
             "total_candidates": page["total_candidates"],
             "max_payload_bytes": TASK_RECONCILE_CHECK_MAX_BYTES,
             "payload_bytes": 0,
+            "timings_ms": {
+                **page["timings_ms"],
+                "observation": observation_ms,
+                "serialization": 0.0,
+                "total": 0.0,
+            },
         }
-        for _ in range(3):
+        serialization_started_ns = time.perf_counter_ns()
+        for _ in range(4):
+            payload_bytes = len(_canonical_json(result).encode("utf-8"))
+            if result["pagination"]["payload_bytes"] == payload_bytes:
+                break
+            result["pagination"]["payload_bytes"] = payload_bytes
+        result["pagination"]["timings_ms"]["serialization"] = round(
+            (time.perf_counter_ns() - serialization_started_ns) / 1_000_000,
+            3,
+        )
+        result["pagination"]["timings_ms"]["total"] = round(
+            (time.perf_counter_ns() - check_started_ns) / 1_000_000,
+            3,
+        )
+        for _ in range(4):
             payload_bytes = len(_canonical_json(result).encode("utf-8"))
             if result["pagination"]["payload_bytes"] == payload_bytes:
                 break

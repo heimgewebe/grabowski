@@ -39,6 +39,8 @@ Die Seitenauswahl stammt aus einem eingefrorenen SQLite-Lesesnapshot. Unabhängi
 
 Der globale Reconcile-Readback liest keine Attention-Entscheidungsdateien. Deren vollständige aktuelle und historische Projektion bleibt Aufgabe des getrennten, ebenfalls begrenzten Attention-Reconciliation-Vertrags. Dadurch wachsen 5.000 vorhandene Entscheidungsreceipts nicht in Laufzeit oder Payload des Task-Reconcile-Readbacks ein.
 
+Jede globale Seite meldet zusätzlich Zeitanteile für Snapshot-Digest, Cursor/Query, Seitenauswahl, Live-Beobachtung, Serialisierung und Gesamtlauf. Das macht erneute Skalierungsengpässe sichtbar, ohne einen zweiten Snapshot nach der Live-Beobachtung zu erzwingen.
+
 ## Ressourcenbindung
 
 Laufende und unbekannte Tasks erneuern ihre Ressourcen-Leases bei Status- und Reconcile-Beobachtungen. Für `outcome_unknown` gilt höchstens die globale Grenze von sieben Tagen. Ein abgelaufener Lease wird nur neu erworben, wenn die Ressource weiterhin frei ist; fremder Besitz bleibt ein harter, sichtbarer Konflikt.

@@ -3885,30 +3885,61 @@ class TaskTests(unittest.TestCase):
         self.assertNotIn("resource_key_count", result["observations"][0])
 
     def test_reconcile_check_large_store_first_page_is_bounded(self) -> None:
-        started = self._start(resource_keys=["service:reconcile-large.service"])
-        base = tasks._row_raw(str(started["task"]["task_id"]))
-        states = ("running", "failed", "timed_out", "signalled")
+        self._start(resource_keys=["service:reconcile-large.service"])
+        for index in range(8):
+            self._prepare_pending_terminalization(prepared_at_unix=10_000 + index)
+        for index in range(8):
+            terminal = self._start()["task"]
+            tasks._set_state(
+                str(terminal["task_id"]),
+                "failed",
+                observation={
+                    "state": "failed",
+                    "source": f"reconcile-projected-fixture-{index}",
+                },
+            )
+
+        candidate_states = tasks._reconcile_candidate_states()
+        state_placeholders = ",".join("?" for _ in candidate_states)
         with tasks._database_connection() as connection:
             columns = [
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
             ]
-            placeholders = ",".join("?" for _ in columns)
+            base = dict(connection.execute("SELECT * FROM tasks LIMIT 1").fetchone())
+            existing_ids = {
+                str(row[0])
+                for row in connection.execute("SELECT task_id FROM tasks").fetchall()
+            }
+            existing_candidates = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM tasks WHERE state IN ({state_placeholders})",
+                    candidate_states,
+                ).fetchone()[0]
+            )
+            insert_count = 30_000 - existing_candidates
+            self.assertGreater(insert_count, 0)
+            row_placeholders = ",".join("?" for _ in columns)
             statement = (
-                f"INSERT INTO tasks({','.join(columns)}) VALUES({placeholders})"
+                f"INSERT INTO tasks({','.join(columns)}) VALUES({row_placeholders})"
             )
             rows = []
-            for index in range(1, 30_000):
+            sequence = 1
+            states = ("running", "failed", "timed_out", "signalled")
+            while len(rows) < insert_count:
+                task_id = f"{sequence:024x}"
+                sequence += 1
+                if task_id in existing_ids:
+                    continue
                 record = dict(base)
-                task_id = f"{index:024x}"
                 record.update(
                     {
                         "task_id": task_id,
                         "unit": f"grabowski-task-{task_id}-a1.service",
                         "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
-                        "state": states[index % len(states)],
-                        "created_at_unix": 100_000 + index,
-                        "updated_at_unix": 100_000 + index,
+                        "state": states[sequence % len(states)],
+                        "created_at_unix": 100_000 + sequence,
+                        "updated_at_unix": 100_000 + sequence,
                         "resource_keys_json": "[]",
                         "lease_owner_id": f"task:{task_id}",
                         "terminalization_sha256": None,
@@ -3918,23 +3949,73 @@ class TaskTests(unittest.TestCase):
                 )
                 rows.append(tuple(record[column] for column in columns))
             connection.executemany(statement, rows)
-        attention_decisions = self.root / "state" / "task-attention-decisions"
-        attention_decisions.mkdir(mode=0o700)
-        for index in range(5_000):
-            task_id = f"{index:024x}"
-            (attention_decisions / f"{task_id}.a1.json").write_text(
-                json.dumps(
-                    {
-                        "kind": "grabowski_task_attention_decision",
-                        "schema_version": 1,
-                        "task_id": task_id,
-                        "decision": "deferred",
-                    },
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
+            candidate_count = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM tasks WHERE state IN ({state_placeholders})",
+                    candidate_states,
+                ).fetchone()[0]
             )
-        self.assertEqual(5_000, sum(1 for _ in attention_decisions.iterdir()))
+            decision_records = [
+                dict(row)
+                for row in connection.execute(
+                    f"SELECT * FROM tasks WHERE state IN ({state_placeholders}) "
+                    "ORDER BY task_id LIMIT 5000",
+                    candidate_states,
+                ).fetchall()
+            ]
+        del rows
+        self.assertEqual(30_000, candidate_count)
+
+        attention_root = self.root / "state" / "task-attention-decisions"
+        attention_root.mkdir(parents=True, mode=0o700)
+        outcome_receipt_sha256 = "a" * 64
+        outcome_file_sha256 = "b" * 64
+        for record in decision_records:
+            binding = task_attention._task_binding(record)
+            material = {
+                "kind": task_attention.DECISION_KIND,
+                "schema_version": task_attention.SCHEMA_VERSION,
+                "task_binding": binding,
+                "decision": "deferred",
+                "authority": "test:reconcile-stress",
+                "evidence_ref": "fixture:reconcile-stress",
+                "outcome_receipt_sha256": outcome_receipt_sha256,
+                "outcome_file_sha256": outcome_file_sha256,
+            }
+            decision = {
+                **material,
+                "created_at_unix": 123,
+                "material_sha256": task_attention._sha256_json(material),
+            }
+            decision["receipt_sha256"] = task_attention._sha256_json(decision)
+            task_attention._validate_decision_record(
+                decision,
+                binding=binding,
+                outcome_receipt_sha256=outcome_receipt_sha256,
+                outcome_file_sha256=outcome_file_sha256,
+            )
+            target = attention_root / f"{binding['task_id']}.a{binding['attempt']}.json"
+            target.write_bytes(task_attention._canonical_bytes(decision))
+            os.chmod(target, 0o600)
+        decision_paths = [
+            path
+            for path in attention_root.iterdir()
+            if task_attention.DECISION_FILE_RE.fullmatch(path.name) is not None
+        ]
+        self.assertEqual(5_000, len(decision_paths))
+
+        with sqlite3.connect(self.resource_database) as connection:
+            phase_counts = {
+                str(phase): int(count)
+                for phase, count in connection.execute(
+                    "SELECT phase, COUNT(*) FROM task_terminalizations GROUP BY phase"
+                ).fetchall()
+            }
+        self.assertGreater(phase_counts.get("projected", 0), 0)
+        self.assertGreater(
+            sum(count for phase, count in phase_counts.items() if phase != "projected"),
+            0,
+        )
 
         def observation(record: dict[str, object]) -> dict[str, object]:
             return {
@@ -3948,7 +4029,10 @@ class TaskTests(unittest.TestCase):
         tracemalloc.start()
         started_at = time.perf_counter()
         try:
-            with patch.object(
+            with patch.dict(
+                os.environ,
+                {"GRABOWSKI_TASK_ATTENTION_ROOT": str(attention_root)},
+            ), patch.object(
                 tasks, "_reconcile_observation", side_effect=observation
             ), patch.object(
                 tasks, "_terminal_convergence_evidence", return_value=(False, False)
@@ -3959,8 +4043,21 @@ class TaskTests(unittest.TestCase):
         finally:
             tracemalloc.stop()
         self.assertEqual(200, result["pagination"]["examined"])
+        self.assertEqual(30_000, result["pagination"]["total_candidates"])
         self.assertTrue(result["pagination"]["has_more"])
         self.assertLess(elapsed, 10.0)
+        self.assertLess(result["pagination"]["timings_ms"]["total"], 10_000.0)
+        self.assertEqual(
+            {
+                "snapshot",
+                "cursor_and_query",
+                "page_setup_total",
+                "observation",
+                "serialization",
+                "total",
+            },
+            set(result["pagination"]["timings_ms"]),
+        )
         self.assertLess(peak, 256 * 1024 * 1024)
         self.assertLessEqual(
             result["pagination"]["payload_bytes"],
