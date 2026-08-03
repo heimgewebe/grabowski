@@ -132,6 +132,7 @@
     "grabowski_bureau_pickup_status",
     "grabowski_bureau_pickup_release",
     "grabowski_resource_nonconflict_assess",
+    "grabowski_runtime_refresh_lease_release",
     "grabowski_resource_reconcile_obsolete_path_leases",
     "grabowski_resource_acquire",
     "grabowski_resource_renew",

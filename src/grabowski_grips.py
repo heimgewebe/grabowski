@@ -179,6 +179,20 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("registered-adapter", "expected-head-bound", "deploy-preflight-readonly"),
         runner="runtime_deploy_check",
     ),
+    "runtime-refresh-lease-release": GripSpec(
+        name="runtime-refresh-lease-release",
+        version="1.0",
+        summary="Release one terminal Bureau runtime-refresh attempt's exact unchanged path leases.",
+        effect=MUTATING,
+        required_parameters=("target_sha256", "result_sha256"),
+        acceptance_ids=(
+            "canonical-terminal-receipt",
+            "exact-five-path-binding",
+            "unchanged-owner-release",
+            "idempotent-reacquire-ready",
+        ),
+        runner="runtime_refresh_lease_release",
+    ),
     "task-attention-decision": GripSpec(
         name="task-attention-decision",
         version="1.0",
@@ -476,6 +490,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "situation",
         "scout",
         "runtime-deploy-check",
+        "runtime-refresh-lease-release",
         "task-attention-decision",
         "task-attention-reconciliation",
         "task-closeout-archive",
@@ -510,6 +525,7 @@ GRIP_SURFACE_TARGETS = {
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
+    "runtime-refresh-lease-release": "one terminal Bureau runtime-refresh lease release",
     "task-attention-decision": "one create-only current-attempt attention decision",
     "task-attention-reconciliation": "bounded attention-task evidence classification",
     "task-closeout-archive": "one retention-eligible terminal task archive and current projection switch",
@@ -538,6 +554,10 @@ GRIP_SURFACE_RECOVERY_PATHS = {
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
+    "runtime-refresh-lease-release": (
+        "re-read the exact runtime-refresh result and inspect retained rows; "
+        "never substitute generic or forced lease release"
+    ),
     "bureau-pickup-execute": (
         "read bureau-pickup-status for the exact run; retain owner-bound leases on ambiguity; "
         "retry only after a named status change or use bureau-pickup-release after terminal readback"
@@ -7085,6 +7105,114 @@ def _run_captain_runtime_deploy(
     return execution_result
 
 
+
+def _run_runtime_refresh_lease_release(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_resources as resources
+
+    target_sha256 = parameters.get("target_sha256")
+    result_sha256 = parameters.get("result_sha256")
+    if (
+        not isinstance(target_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", target_sha256) is None
+        or not isinstance(result_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
+    ):
+        _check(
+            receipt,
+            "canonical-terminal-receipt",
+            "fail",
+            "target_sha256 and result_sha256 must be lowercase SHA-256 values",
+        )
+        raise GripPreflightError("runtime-refresh receipt digests are invalid")
+    try:
+        output = resources.grabowski_runtime_refresh_lease_release(
+            target_sha256=target_sha256,
+            result_sha256=result_sha256,
+        )
+    except (ValueError, PermissionError, resources.nonconflict.NonConflictDenied) as exc:
+        _check(receipt, "canonical-terminal-receipt", "fail", str(exc))
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["runtime_refresh_lease_release_rejected"],
+            "error": str(exc),
+        }
+    terminal = output.get("terminal_evidence")
+    resources_bound = output.get("resource_keys")
+    exact_five = (
+        isinstance(resources_bound, list)
+        and len(resources_bound) == 5
+        and resources_bound == sorted(set(resources_bound))
+        and all(
+            isinstance(item, str) and item.startswith("path:")
+            for item in resources_bound
+        )
+    )
+    retained = output.get("retained", [])
+    absent_count = (
+        sum(
+            1
+            for item in retained
+            if isinstance(item, dict) and item.get("reason") == "already_absent"
+        )
+        if isinstance(retained, list)
+        else 0
+    )
+    harmful_retained = (
+        [
+            item
+            for item in retained
+            if not isinstance(item, dict) or item.get("reason") != "already_absent"
+        ]
+        if isinstance(retained, list)
+        else [retained]
+    )
+    complete = (
+        output.get("state") == "complete"
+        and not retained
+        or output.get("state") == "no_change"
+        and absent_count == 5
+        and not harmful_retained
+    )
+    replay_ready = complete and len(output.get("released", [])) + absent_count == 5
+    _check(
+        receipt,
+        "canonical-terminal-receipt",
+        "pass" if isinstance(terminal, dict) else "fail",
+        str(terminal.get("result_sha256") if isinstance(terminal, dict) else "missing"),
+    )
+    _check(
+        receipt,
+        "exact-five-path-binding",
+        "pass" if exact_five else "fail",
+        f"resources={len(resources_bound) if isinstance(resources_bound, list) else 'invalid'}",
+    )
+    _check(
+        receipt,
+        "unchanged-owner-release",
+        "pass" if complete else "fail",
+        f"released={len(output.get('released', []))}; harmful_retained={len(harmful_retained)}",
+    )
+    _check(
+        receipt,
+        "idempotent-reacquire-ready",
+        "pass" if replay_ready else "fail",
+        f"released_or_absent={len(output.get('released', [])) + len(output.get('already_absent', []))}",
+    )
+    if not (isinstance(terminal, dict) and exact_five and complete and replay_ready):
+        return {
+            **output,
+            "receipt_status": "failed",
+            "error": "runtime-refresh lease release returned an incomplete post-state",
+        }
+    return {**output, "receipt_status": "passed"}
+
 def _run_task_attention_decision(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -7930,6 +8058,7 @@ _RUNNERS = {
     "situation": _run_situation,
     "scout": _run_scout,
     "runtime_deploy_check": _run_runtime_deploy_check,
+    "runtime_refresh_lease_release": _run_runtime_refresh_lease_release,
     "task_attention_decision": _run_task_attention_decision,
     "task_attention_reconciliation": _run_task_attention_reconciliation,
     "task_closeout_archive": _run_task_closeout_archive,

@@ -889,6 +889,7 @@ class GripFoundationTests(unittest.TestCase):
                 "pr-create-or-update",
                 "repo-orient",
                 "runtime-deploy-check",
+                "runtime-refresh-lease-release",
                 "task-attention-decision",
                 "task-attention-reconciliation",
                 "task-closeout-archive",
@@ -10696,6 +10697,100 @@ class BureauPickupGripTests(unittest.TestCase):
             )
         self.assertEqual("blocked", blocked["receipt"]["status"])
         self.assertEqual("run-still-active", blocked["output"]["error"])
+
+
+class RuntimeRefreshLeaseReleaseGripTests(unittest.TestCase):
+    TARGET = "a" * 64
+    RESULT = "b" * 64
+    KEYS = [
+        "path:/home/alex/.local/bin/bureau",
+        "path:/home/alex/.local/bin/bureau-runtime-refresh",
+        "path:/home/alex/.local/share/bureau",
+        "path:/home/alex/.local/state/bureau/runtime-refresh",
+        "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,
+    ]
+
+    def success_output(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski_obsolete_path_lease_release",
+            "state": "complete",
+            "owner_id": "operator:test-runtime-refresh",
+            "resource_keys": self.KEYS,
+            "released": [{"resource_key": key} for key in self.KEYS],
+            "already_absent": [],
+            "retained": [],
+            "terminal_evidence": {
+                "kind": "bureau_runtime_refresh_result",
+                "target_sha256": self.TARGET,
+                "result_sha256": self.RESULT,
+                "status": "deployed",
+            },
+            "receipt_sha256": "d" * 64,
+        }
+
+    def test_grip_releases_exact_terminal_runtime_refresh_leases(self) -> None:
+        with patch.object(
+            resources,
+            "grabowski_runtime_refresh_lease_release",
+            return_value=self.success_output(),
+        ) as release:
+            result = grips.grip_run(
+                "runtime-refresh-lease-release",
+                {
+                    "target_sha256": self.TARGET,
+                    "result_sha256": self.RESULT,
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["receipt"]["status"])
+        release.assert_called_once_with(
+            target_sha256=self.TARGET,
+            result_sha256=self.RESULT,
+        )
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["canonical-terminal-receipt"])
+        self.assertEqual("pass", checks["exact-five-path-binding"])
+        self.assertEqual("pass", checks["unchanged-owner-release"])
+        self.assertEqual("pass", checks["idempotent-reacquire-ready"])
+
+    def test_grip_blocks_rejected_terminal_evidence(self) -> None:
+        with patch.object(
+            resources,
+            "grabowski_runtime_refresh_lease_release",
+            side_effect=resources.nonconflict.NonConflictDenied(
+                "owner-work-nonterminal", "runtime refresh is unclear"
+            ),
+        ):
+            result = grips.grip_run(
+                "runtime-refresh-lease-release",
+                {
+                    "target_sha256": self.TARGET,
+                    "result_sha256": self.RESULT,
+                },
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["runtime_refresh_lease_release_rejected"],
+            result["output"]["blocked_reasons"],
+        )
+
+    def test_grip_rejects_malformed_digest_before_effect(self) -> None:
+        with patch.object(
+            resources, "release_runtime_refresh_terminal_leases"
+        ) as release:
+            result = grips.grip_run(
+                "runtime-refresh-lease-release",
+                {"target_sha256": "bad", "result_sha256": self.RESULT},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        release.assert_not_called()
+
 
 
 class CaptainTypedEnvelopeTests(unittest.TestCase):
