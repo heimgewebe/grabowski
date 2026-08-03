@@ -31,6 +31,16 @@ Die aktuellen Übergabeskripte benötigen Hostwartungsrechte. Daher sind `NoNewP
 
 Auch eine frisch als `completed` beobachtete Unit darf nicht durch direkten Resume erneut gestartet werden. Bereits terminal gespeicherte Datensätze werden vor jeder Beobachtung und jedem Launch abgewiesen. Damit entsteht aus Statusverzögerungen kein Doppelstart. Scheitern Broker-Bereitschaft, Referenzerzeugung oder der lokale Client bereits vor einem belegten Dispatch, wird der Versuch terminal als fehlgeschlagen gespeichert und sein Lease freigegeben; erst Fehler nach möglicher Brokerannahme bleiben `outcome_unknown`.
 
+## Begrenzter globaler Reconcile-Readback
+
+`grabowski_task_reconcile_check` bleibt für ein exaktes `task_id` abwärtskompatibel und liefert dessen vollständige Ressourcenliste ohne Pagination. Der globale Aufruf ist dagegen auf 50 Einträge voreingestellt und akzeptiert höchstens 200 Einträge je Seite. Er ordnet stabil nach `created_at_unix` und `task_id`, gibt Ressourcen global nur als Anzahl und SHA-256 aus und begrenzt das serialisierte Ergebnis auf ein MiB.
+
+Die Seitenauswahl stammt aus einem eingefrorenen SQLite-Lesesnapshot. Unabhängige Task- oder Lease-Änderungen während der anschließenden Live-Beobachtung verwerfen diese bereits ausgewählte Seite nicht. Ein Fortsetzungscursor bindet jedoch Task- und taskbezogene Ressourcenwahrheit; vor der nächsten Seite wird der Snapshot neu berechnet und Drift mit `cursor_snapshot_changed` fail-closed abgewiesen. Der Cursor ist damit eine exakte Fortsetzungsberechtigung für unveränderte Wahrheit, kein Anspruch auf eine historische Datenbankansicht.
+
+Der globale Reconcile-Readback liest keine Attention-Entscheidungsdateien. Deren vollständige aktuelle und historische Projektion bleibt Aufgabe des getrennten, ebenfalls begrenzten Attention-Reconciliation-Vertrags. Dadurch wachsen 5.000 vorhandene Entscheidungsreceipts nicht in Laufzeit oder Payload des Task-Reconcile-Readbacks ein.
+
+Jede globale Seite meldet zusätzlich Zeitanteile für Snapshot-Digest, Cursor/Query, Seitenauswahl, Live-Beobachtung, Serialisierung und Gesamtlauf. Das macht erneute Skalierungsengpässe sichtbar, ohne einen zweiten Snapshot nach der Live-Beobachtung zu erzwingen.
+
 ## Ressourcenbindung
 
 Laufende und unbekannte Tasks erneuern ihre Ressourcen-Leases bei Status- und Reconcile-Beobachtungen. Für `outcome_unknown` gilt höchstens die globale Grenze von sieben Tagen. Ein abgelaufener Lease wird nur neu erworben, wenn die Ressource weiterhin frei ist; fremder Besitz bleibt ein harter, sichtbarer Konflikt.

@@ -1314,7 +1314,7 @@
     },
     {
       "category": "task",
-      "description": "Read-only reconcile preview for persistent tasks.",
+      "description": "Read one bounded, resumable reconcile preview for persistent tasks.",
       "effects": [],
       "id": "grabowski_task_reconcile_check",
       "purpose": "Preview reconcile effects for persistent task records without mutating state.",
