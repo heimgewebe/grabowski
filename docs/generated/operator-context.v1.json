@@ -1302,7 +1302,7 @@
     },
     {
       "category": "task",
-      "description": "Read-only reconcile preview for persistent tasks.",
+      "description": "Read one bounded, resumable reconcile preview for persistent tasks.",
       "effects": [],
       "id": "grabowski_task_reconcile_check",
       "purpose": "Preview reconcile effects for persistent task records without mutating state.",
@@ -3038,7 +3038,7 @@
       "src/grabowski_system_map.py": "16dda15f49bf6e0993510455313c24172625dcddba1123eaad096e393b78908c",
       "src/grabowski_task_attention.py": "f8d55b3b490810ab78a6e33d34f37ab255393be93736c7848c14169b77d23a61",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "7383e6b8a643838fdd2135b6216dd41907f4ca2dadd9b2e2b66cdffad8f3285f",
+      "src/grabowski_tasks.py": "666f282d67049f981b9e92e9bc894bb72d30c0e09a3073173a6729a56a2c5a11",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_work_admission.py": "6fd0bdd8d32b3f0dedf508d7b881cd88b15c22b56e1daac6f27cb7c24d9557e6",
