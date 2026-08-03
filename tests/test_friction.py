@@ -538,6 +538,8 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(probe["window_state"], "errors_without_later_activity")
         self.assertEqual(probe["post_error_activity_counts"], {})
         self.assertEqual(diagnostics["transport_window_state"], "errors_without_later_activity")
+        self.assertEqual(diagnostics["transport_health_state"], "unavailable_suspected")
+        self.assertTrue(diagnostics["transport_degraded"])
         self.assertEqual(diagnostics["planned_lifecycle_issue_count"], 0)
         self.assertIn("command_success_or_failure", diagnostics["does_not_establish"])
         self.assertIn("target state is re-read", diagnostics["recommended_next_policy"]["mutation_rule"])
@@ -683,6 +685,159 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(probe["transport_error_count"], 0)
         self.assertEqual(probe["http_status_counts"], {})
         self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
+        self.assertEqual(probe["transport_health_state"], "healthy")
+
+    def test_connector_transport_probe_correlates_ttl_with_late_response(self) -> None:
+        module = self._load_module()
+        request_id = "wfr_sensitive_request/abcd"
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "MESSAGE": json.dumps({
+                    "time": "2026-08-03T07:00:00+02:00",
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "MCP connection TTL reached; stopping response forwarding",
+                    "cmd_request_id": request_id,
+                    "rpc_request_id": 7,
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE": json.dumps({
+                    "time": "2026-08-03T07:00:01+02:00",
+                    "level": "WARN",
+                    "component": "controlplane",
+                    "msg": "response already fulfilled or unknown request",
+                    "cmd_request_id": request_id,
+                    "rpc_request_id": 7,
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "120",
+                "MESSAGE": json.dumps({
+                    "time": "2026-08-03T07:00:02+02:00",
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "dispatcher forwarded command to MCP server",
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 2)
+        self.assertEqual(probe["window_state"], "errors_followed_by_activity")
+        self.assertEqual(probe["transport_health_state"], "degraded")
+        self.assertEqual(
+            probe["response_lifecycle"]["classification_counts"],
+            {"late_response_after_ttl": 1, "response_ttl_expired": 1},
+        )
+        self.assertEqual(probe["response_lifecycle"]["affected_request_identity_count"], 1)
+        self.assertEqual(probe["response_lifecycle"]["paired_late_response_count"], 1)
+        self.assertEqual(probe["response_lifecycle"]["unpaired_response_rejection_count"], 0)
+        self.assertIn("response_ttl_expired", probe["error_domain_counts"])
+        self.assertIn("late_response_after_ttl", probe["error_domain_counts"])
+        rendered = json.dumps(probe, sort_keys=True)
+        self.assertNotIn(request_id, rendered)
+
+    def test_connector_transport_probe_keeps_unpaired_response_rejection_ambiguous(self) -> None:
+        module = self._load_module()
+        record = {
+            "__REALTIME_TIMESTAMP": "100",
+            "MESSAGE": json.dumps({
+                "time": "2026-08-03T07:00:00+02:00",
+                "level": "WARN",
+                "component": "controlplane",
+                "msg": "response already fulfilled or unknown request",
+                "cmd_request_id": "wfr_unpaired/abcd",
+                "rpc_request_id": "3",
+            }),
+        }
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": json.dumps(record) + "\n",
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(probe["transport_error_count"], 1)
+        self.assertEqual(probe["transport_health_state"], "unavailable_suspected")
+        self.assertEqual(
+            probe["response_lifecycle"]["classification_counts"],
+            {"duplicate_or_unknown_response": 1},
+        )
+        self.assertEqual(probe["response_lifecycle"]["paired_late_response_count"], 0)
+        self.assertEqual(probe["response_lifecycle"]["unpaired_response_rejection_count"], 1)
+        self.assertIn("duplicate_response_proof", probe["response_lifecycle"]["does_not_establish"])
+
+    def test_connector_transport_live_diagnostics_projects_response_lifecycle_health(self) -> None:
+        module = self._load_module()
+        module.FRICTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+        module.FRICTION_LOG.write_text("", encoding="utf-8")
+
+        def fake_run(argv, *, timeout_seconds=30, max_output_bytes=131_072):
+            if argv[0] == "systemctl":
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                    "stderr_truncated": False,
+                }
+            self.assertEqual(
+                max_output_bytes,
+                module.CONNECTOR_DIAGNOSTIC_JOURNAL_BYTES,
+            )
+            unit = argv[argv.index("--unit") + 1]
+            records = []
+            if unit == "tunnel-client-grabowski.service":
+                records = [{
+                    "__REALTIME_TIMESTAMP": "100",
+                    "MESSAGE": json.dumps({
+                        "level": "INFO",
+                        "component": "dispatcher",
+                        "msg": "MCP connection TTL reached; stopping response forwarding",
+                        "cmd_request_id": "wfr_projected/abcd",
+                        "rpc_request_id": 1,
+                    }),
+                }]
+            return {
+                "returncode": 0,
+                "timed_out": False,
+                "stdout": "".join(json.dumps(record) + "\n" for record in records),
+                "stderr": "",
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+            }
+
+        module._run_diagnostic_command = fake_run
+        diagnostics = module.connector_transport_live_diagnostics(limit=1, max_log_lines=25)
+
+        self.assertTrue(diagnostics["live_transport_errors_observed"])
+        self.assertEqual(diagnostics["transport_health_state"], "unavailable_suspected")
+        self.assertTrue(diagnostics["transport_degraded"])
+        self.assertEqual(
+            diagnostics["response_lifecycle"]["classification_counts"],
+            {"response_ttl_expired": 1},
+        )
+        self.assertEqual(
+            diagnostics["response_lifecycle"]["units_with_signals"],
+            ["tunnel-client-grabowski.service"],
+        )
 
     def test_connector_transport_probe_separates_completed_stop_lifecycle_issues(self) -> None:
         module = self._load_module()
@@ -1100,6 +1255,7 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
 
         self.assertFalse(probe["journal_window_complete"])
         self.assertEqual(probe["window_state"], "indeterminate_truncated")
+        self.assertEqual(probe["transport_health_state"], "indeterminate")
 
     def test_connector_transport_live_diagnostics_bounds_log_lines(self) -> None:
         module = self._load_module()

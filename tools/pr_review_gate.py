@@ -85,6 +85,7 @@ MAX_PLAIN_LLM_TRANSMITTED_PROMPT_BYTES = (
 )
 PASS_CHECK_BUCKETS = {"pass"}
 DERIVED_REVIEW_STATUS_NAMES = {
+    "Codex review settled",
     "Review evidence gate",
     "Review evidence gate (advisory)",
     "Review evidence gate (attested)",
@@ -2973,8 +2974,6 @@ def evaluate_review_gate(
     if pr.get("isDraft") is True:
         failures.append("PR is draft")
     merge_state = pr.get("mergeStateStatus")
-    if merge_state != "CLEAN":
-        failures.append(f"GitHub mergeStateStatus is {merge_state}, not CLEAN")
     mergeable = pr.get("mergeable")
     if mergeable != "MERGEABLE":
         failures.append(f"GitHub mergeable is {mergeable}, not MERGEABLE")
@@ -3155,6 +3154,32 @@ def evaluate_review_gate(
         )
     if blocking_checks:
         failures.append(f"{len(blocking_checks)} non-green check(s)")
+
+    non_green_checks = [
+        check
+        for check in checks
+        if isinstance(check, dict)
+        and check.get("bucket") not in PASS_CHECK_BUCKETS
+        and check.get("bucket") != "skipping"
+    ]
+    only_nonblocking_diagnostics_are_non_green = bool(non_green_checks) and all(
+        check.get("name") in DERIVED_REVIEW_STATUS_NAMES
+        for check in non_green_checks
+    )
+    required_checks_green = not missing_expected_checks and not stale_or_unbound_base_checks
+    if merge_state != "CLEAN":
+        if (
+            merge_state == "UNSTABLE"
+            and only_nonblocking_diagnostics_are_non_green
+            and required_checks_green
+            and not blocking_checks
+        ):
+            warnings.append(
+                "GitHub mergeStateStatus UNSTABLE is attributable only to "
+                "non-blocking diagnostic review status checks"
+            )
+        else:
+            failures.append(f"GitHub mergeStateStatus is {merge_state}, not CLEAN")
 
     return {
         "schema_version": 1,

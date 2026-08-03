@@ -97,7 +97,15 @@ Retry policy:
 - The public live diagnostic receipt remains top-level `schema_version: 3`.
 - Its nested `friction_log.connector_transport_diagnostics` guidance object is `schema_version: 2`; this object adds bounded friction-event status counts and conditional pre-runtime `404` guidance.
 
-The tool reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and JSON journal records from bounded recent samples. A cleanup issue is classified as planned lifecycle only when its exact known shutdown message, expected component, complete, timestamp-ordered `OnStop hook executing`/`executed` sequence and process invocation are bound to the same later successful systemd stop record through `MESSAGE_ID`, `USER_UNIT`, `USER_INVOCATION_ID`, `JOB_TYPE=stop` and `JOB_RESULT=done`. Missing, mismatched or failed stop evidence remains a transport error.
+The tool reads recent friction events, `grabowski_status`, fixed user-service status for `grabowski-operator.service` and `tunnel-client-grabowski.service`, and JSON journal records from bounded recent samples. The exact tunnel messages `MCP connection TTL reached; stopping response forwarding` and `response already fulfilled or unknown request` are first-class response-lifecycle failures even though the former is logged at INFO level. Their `cmd_request_id` and `rpc_request_id` are correlated through a SHA-256 identity that is never returned in raw form:
+
+- a TTL event is `response_ttl_expired`;
+- a later rejection for the same identity is `late_response_after_ttl`;
+- an unpaired rejection remains `duplicate_or_unknown_response`, because that message alone cannot prove duplication.
+
+The journal capture is internally bounded to 500 records and 1 MiB so verbose JSON cannot silently hide the newest lifecycle evidence behind the former 128-KiB ceiling; the public receipt remains compact and sample-bounded. Each unit exposes nested `response_lifecycle.schema_version: 1`, classification counts, bounded redacted samples and explicit non-claims. `transport_health_state` is `healthy`, `indeterminate`, `degraded` or `unavailable_suspected`; ordinary successful forwarding after a lifecycle failure proves continued activity but leaves the window degraded. The top-level receipt projects the strictest unit state and `transport_degraded` without claiming a current outage or vendor repair.
+
+A cleanup issue is classified as planned lifecycle only when its exact known shutdown message, expected component, complete, timestamp-ordered `OnStop hook executing`/`executed` sequence and process invocation are bound to the same later successful systemd stop record through `MESSAGE_ID`, `USER_UNIT`, `USER_INVOCATION_ID`, `JOB_TYPE=stop` and `JOB_RESULT=done`. Missing, mismatched or failed stop evidence remains a transport error.
 
 `historical_http_status_counts` is not a time series or lifetime counter. It summarizes the supplied bounded friction-event window and counts each distinct status at most once per event. Statuses from `100` through `599` are retained because the field describes observed HTTP status history, not only failures.
 

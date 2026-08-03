@@ -429,6 +429,7 @@ SUPERSEDED_TERMS = frozenset({
 MAX_TEXT_BYTES = 2000
 MAX_NOTE_COUNT = 20
 MAX_CONNECTOR_DIAGNOSTIC_LOG_LINES = 500
+CONNECTOR_DIAGNOSTIC_JOURNAL_BYTES = 1_048_576
 CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT = 10
 CONNECTOR_DIAGNOSTIC_UNITS = (
     "grabowski-operator.service",
@@ -450,6 +451,10 @@ CONNECTOR_HTTP_STATUS_KEYS = (
 CONNECTOR_ACTIVITY_MESSAGES = {
     "dispatcher forwarded command to MCP server": "forwarded_to_mcp",
     "dispatcher acknowledged notification with control plane": "control_plane_ack",
+}
+CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES = {
+    "MCP connection TTL reached; stopping response forwarding": "response_ttl_expired",
+    "response already fulfilled or unknown request": "response_already_fulfilled_or_unknown",
 }
 CONNECTOR_ERROR_MESSAGE_TERMS = {
     "received exception from stream": "stream_exception",
@@ -938,6 +943,37 @@ def _stop_invocation_context(
     return completed, qualified
 
 
+def _connector_request_identity_sha256(payload: dict[str, Any]) -> str | None:
+    cmd_request_id = payload.get("cmd_request_id")
+    rpc_request_id = payload.get("rpc_request_id")
+    if (
+        not isinstance(cmd_request_id, str)
+        or not cmd_request_id
+        or len(cmd_request_id) > 512
+        or isinstance(rpc_request_id, bool)
+    ):
+        return None
+    if isinstance(rpc_request_id, int) and rpc_request_id >= 0:
+        normalized_rpc_request_id = rpc_request_id
+    elif (
+        isinstance(rpc_request_id, str)
+        and rpc_request_id.isdigit()
+        and len(rpc_request_id) <= 20
+    ):
+        normalized_rpc_request_id = int(rpc_request_id)
+    else:
+        return None
+    canonical = json.dumps(
+        {
+            "cmd_request_id": cmd_request_id,
+            "rpc_request_id": normalized_rpc_request_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _journal_transport_event(
     record: dict[str, Any],
     *,
@@ -993,6 +1029,8 @@ def _journal_transport_event(
         and realtime_microseconds <= completed_stop_at
     )
     activity = CONNECTOR_ACTIVITY_MESSAGES.get(message)
+    response_lifecycle_signal = CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES.get(message)
+    request_identity_sha256 = _connector_request_identity_sha256(payload)
     return {
         "timestamp": str(payload.get("time") or record.get("__REALTIME_TIMESTAMP") or "")[:80],
         "realtime_microseconds": realtime_microseconds,
@@ -1003,6 +1041,8 @@ def _journal_transport_event(
         "error_domains": sorted(domains),
         "activity": activity,
         "planned_lifecycle_issue": planned_lifecycle_issue,
+        "response_lifecycle_signal": response_lifecycle_signal,
+        "request_identity_sha256": request_identity_sha256,
     }
 
 
@@ -1020,7 +1060,7 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
             str(max_lines),
         ],
         timeout_seconds=30,
-        max_output_bytes=131_072,
+        max_output_bytes=CONNECTOR_DIAGNOSTIC_JOURNAL_BYTES,
     )
     parsed: list[dict[str, Any]] = []
     invalid_json_records = 0
@@ -1047,16 +1087,75 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
     post_error_activity_counts: Counter[str] = Counter()
     samples: list[dict[str, Any]] = []
     planned_lifecycle_samples: list[dict[str, Any]] = []
+    response_lifecycle_samples: list[dict[str, Any]] = []
+    response_lifecycle_counts: Counter[str] = Counter()
+    response_request_identities: set[str] = set()
     transport_error_count = 0
     planned_lifecycle_issue_count = 0
     last_transport_error_microseconds: int | None = None
     activity_events: list[tuple[int | None, str]] = []
 
-    for record in parsed:
-        event = _journal_transport_event(
+    events = [
+        _journal_transport_event(
             record,
             completed_stop_invocations=qualified_stop_invocations,
         )
+        for record in parsed
+    ]
+    ttl_by_request: dict[str, int | None] = {}
+    for event in events:
+        if event["response_lifecycle_signal"] != "response_ttl_expired":
+            continue
+        request_identity = event["request_identity_sha256"]
+        if not request_identity:
+            continue
+        event_microseconds = event["realtime_microseconds"]
+        current = ttl_by_request.get(request_identity)
+        if (
+            request_identity not in ttl_by_request
+            or (
+                event_microseconds is not None
+                and (current is None or event_microseconds < current)
+            )
+        ):
+            ttl_by_request[request_identity] = event_microseconds
+
+    for event in events:
+        domains = set(event["error_domains"])
+        lifecycle_class: str | None = None
+        lifecycle_signal = event["response_lifecycle_signal"]
+        request_identity = event["request_identity_sha256"]
+        if lifecycle_signal == "response_ttl_expired":
+            lifecycle_class = "response_ttl_expired"
+        elif lifecycle_signal == "response_already_fulfilled_or_unknown":
+            ttl_at = ttl_by_request.get(request_identity) if request_identity else None
+            event_at = event["realtime_microseconds"]
+            paired_with_ttl = bool(
+                request_identity
+                and request_identity in ttl_by_request
+                and ttl_at is not None
+                and event_at is not None
+                and event_at >= ttl_at
+            )
+            lifecycle_class = (
+                "late_response_after_ttl"
+                if paired_with_ttl
+                else "duplicate_or_unknown_response"
+            )
+        if lifecycle_class is not None:
+            domains.add(lifecycle_class)
+            response_lifecycle_counts[lifecycle_class] += 1
+            if request_identity:
+                response_request_identities.add(request_identity)
+            if len(response_lifecycle_samples) < CONNECTOR_DIAGNOSTIC_SAMPLE_LIMIT:
+                response_lifecycle_samples.append({
+                    "timestamp": event["timestamp"],
+                    "invocation_id": event["invocation_id"],
+                    "component": event["component"],
+                    "classification": lifecycle_class,
+                    "request_identity_sha256": request_identity,
+                })
+        event["error_domains"] = sorted(domains)
         if event["activity"]:
             activity_counts[event["activity"]] += 1
             activity_events.append((event["realtime_microseconds"], event["activity"]))
@@ -1123,6 +1222,15 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
     else:
         window_state = "errors_without_later_activity"
 
+    if window_state == "errors_without_later_activity":
+        transport_health_state = "unavailable_suspected"
+    elif transport_error_count > 0:
+        transport_health_state = "degraded"
+    elif window_state.startswith("indeterminate_"):
+        transport_health_state = "indeterminate"
+    else:
+        transport_health_state = "healthy"
+
     return {
         "unit": name,
         "max_lines": max_lines,
@@ -1135,6 +1243,7 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         "transport_error_count": transport_error_count,
         "journal_window_complete": journal_window_complete,
         "window_state": window_state,
+        "transport_health_state": transport_health_state,
         "post_error_activity_counts": dict(sorted(post_error_activity_counts.items())),
         "error_domain_counts": dict(sorted(error_domains.items())),
         "http_status_counts": dict(sorted(http_statuses.items())),
@@ -1154,6 +1263,26 @@ def _journal_transport_probe(unit: str, max_lines: int) -> dict[str, Any]:
         "planned_lifecycle_samples_truncated": (
             planned_lifecycle_issue_count > len(planned_lifecycle_samples)
         ),
+        "response_lifecycle": {
+            "schema_version": 1,
+            "classification_counts": dict(sorted(response_lifecycle_counts.items())),
+            "affected_request_identity_count": len(response_request_identities),
+            "paired_late_response_count": response_lifecycle_counts[
+                "late_response_after_ttl"
+            ],
+            "unpaired_response_rejection_count": response_lifecycle_counts[
+                "duplicate_or_unknown_response"
+            ],
+            "samples": response_lifecycle_samples,
+            "samples_truncated": (
+                sum(response_lifecycle_counts.values()) > len(response_lifecycle_samples)
+            ),
+            "does_not_establish": [
+                "duplicate_response_proof",
+                "late_response_root_cause",
+                "connector_vendor_fix",
+            ],
+        },
         "stderr_preview": _bounded_summary_text(result.get("stderr"), max_chars=240),
     }
 
@@ -1228,6 +1357,17 @@ def connector_transport_live_diagnostics(
     planned_lifecycle_issue_count = sum(
         probe["planned_lifecycle_issue_count"] for probe in journal_probes.values()
     )
+    transport_health_states = {
+        unit: probe["transport_health_state"]
+        for unit, probe in journal_probes.items()
+    }
+    response_lifecycle_counts: Counter[str] = Counter()
+    response_lifecycle_units: list[str] = []
+    for unit, probe in journal_probes.items():
+        counts = probe["response_lifecycle"]["classification_counts"]
+        response_lifecycle_counts.update(counts)
+        if sum(counts.values()) > 0:
+            response_lifecycle_units.append(unit)
     post_error_activity_counts: Counter[str] = Counter()
     for probe in journal_probes.values():
         post_error_activity_counts.update(probe["post_error_activity_counts"])
@@ -1242,6 +1382,14 @@ def connector_transport_live_diagnostics(
         transport_window_state = "indeterminate_incomplete"
     else:
         transport_window_state = "no_errors"
+    if "unavailable_suspected" in transport_health_states.values():
+        transport_health_state = "unavailable_suspected"
+    elif "degraded" in transport_health_states.values():
+        transport_health_state = "degraded"
+    elif "indeterminate" in transport_health_states.values():
+        transport_health_state = "indeterminate"
+    else:
+        transport_health_state = "healthy"
     return {
         "schema_version": 3,
         "authority": "read_only_transport_diagnostic_receipt",
@@ -1267,9 +1415,25 @@ def connector_transport_live_diagnostics(
         ),
         "transport_error_count": transport_error_count,
         "transport_window_state": transport_window_state,
+        "transport_health_state": transport_health_state,
+        "transport_health_state_by_unit": transport_health_states,
+        "transport_degraded": transport_health_state in {
+            "degraded",
+            "unavailable_suspected",
+        },
         "transport_window_state_by_unit": window_states,
         "post_error_activity_counts": dict(sorted(post_error_activity_counts.items())),
         "planned_lifecycle_issue_count": planned_lifecycle_issue_count,
+        "response_lifecycle": {
+            "schema_version": 1,
+            "classification_counts": dict(sorted(response_lifecycle_counts.items())),
+            "units_with_signals": sorted(response_lifecycle_units),
+            "does_not_establish": [
+                "duplicate_response_proof",
+                "late_response_root_cause",
+                "transport_reliability_proof",
+            ],
+        },
         "recommended_next_policy": history["split_retry_policy"],
         "does_not_establish": list(CONNECTOR_TRANSPORT_DOES_NOT_ESTABLISH),
     }
