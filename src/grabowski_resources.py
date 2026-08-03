@@ -4595,6 +4595,113 @@ def acquire_resources(
     }
 
 
+def rebind_same_owner_resources(
+    owner_id: str,
+    resource_keys: Iterable[str],
+    *,
+    purpose: str,
+    ttl_seconds: int,
+    metadata: dict[str, Any],
+    expected_current_leases: list[dict[str, Any]],
+    expected_original_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Restore an exact journaled lease identity without changing ownership."""
+    owner = _owner(owner_id)
+    keys = normalize_resource_keys(resource_keys)
+    lease_purpose = _purpose(purpose)
+    ttl = _ttl(ttl_seconds)
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object")
+    normalized_metadata = dict(metadata)
+    if "lease_mode" in normalized_metadata:
+        raise ValueError("metadata.lease_mode is not an authority surface")
+    if "work_admission" in normalized_metadata:
+        raise ValueError("metadata.work_admission is not a public authority surface")
+    if "work_admission_mode" in normalized_metadata:
+        raise ValueError(
+            "metadata.work_admission_mode is not a public authority surface"
+        )
+    if "scope_manifest" in normalized_metadata:
+        normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
+            normalized_metadata["scope_manifest"]
+        )
+    bureau_leases.enforce_bureau_lease_contract(
+        keys, ttl_seconds=ttl, metadata=normalized_metadata
+    )
+    sanitized_value = bureau_leases.sanitize_bureau_metadata(
+        keys, normalized_metadata
+    )
+    persisted_metadata = {} if sanitized_value is None else sanitized_value
+    metadata_json, metadata_sha256 = _metadata(persisted_metadata)
+    current = _normalize_mutation_lease_snapshots(
+        expected_current_leases,
+        expected_owner_id=owner,
+        resource_keys=keys,
+    )
+    original = _normalize_mutation_lease_snapshots(
+        expected_original_leases,
+        expected_owner_id=owner,
+        resource_keys=keys,
+    )
+    if any(item["metadata_sha256"] != metadata_sha256 for item in original):
+        raise RuntimeError("Journaled lease metadata does not match requested rebind")
+    current_by_key = {item["resource_key"]: item for item in current}
+    now = _now()
+    requested_expires = now + ttl
+    with _database() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for key in keys:
+                row = connection.execute(
+                    "SELECT * FROM leases WHERE resource_key=?", (key,)
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(f"Resource lease disappeared before rebind: {key}")
+                if row["owner_id"] != owner:
+                    raise ResourceConflict(key, row["owner_id"], row["expires_at_unix"])
+                if _release_lease_snapshot(row) != current_by_key[key]:
+                    raise RuntimeError(f"Resource lease changed before rebind: {key}")
+                observed_metadata = _row_metadata(row)
+                _, observed_metadata_sha256 = _metadata(observed_metadata)
+                if row["metadata_sha256"] != observed_metadata_sha256:
+                    raise RuntimeError(
+                        f"Resource lease metadata integrity mismatch: {key}"
+                    )
+                lease_expires = max(int(row["expires_at_unix"]), requested_expires)
+                connection.execute(
+                    """
+                    UPDATE leases
+                    SET purpose=?, updated_at_unix=?, expires_at_unix=?,
+                        metadata_sha256=?, metadata_json=?
+                    WHERE resource_key=? AND owner_id=?
+                    """,
+                    (
+                        lease_purpose,
+                        now,
+                        lease_expires,
+                        metadata_sha256,
+                        metadata_json,
+                        key,
+                        owner,
+                    ),
+                )
+            rows = connection.execute(
+                f"SELECT * FROM leases WHERE resource_key IN ({','.join('?' for _ in keys)}) "
+                "ORDER BY resource_key",
+                keys,
+            ).fetchall()
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return {
+        "owner_id": owner,
+        "resource_keys": keys,
+        "metadata_sha256": metadata_sha256,
+        "leases": [_public(row) for row in rows],
+    }
+
+
 def renew_resources(
     owner_id: str,
     resource_keys: Iterable[str],

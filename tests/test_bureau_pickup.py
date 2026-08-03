@@ -2031,6 +2031,64 @@ class BureauPickupTests(unittest.TestCase):
         acquire.assert_not_called()
         release.assert_not_called()
 
+    def test_existing_assignment_repairs_same_owner_lease_binding_drift(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        original = self.lease(key, intent["lease_owner_id"])
+        original["purpose"] = (
+            f"Bureau coordinated pickup {intent['run_id']} group other"
+        )
+        run_dir, acquisition = self.create_acquisition_journal(intent, original)
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        blocking = self.coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {"code": "lease-metadata-binding-mismatch"},
+        }
+        reacquired_at = original["expires_at_unix"] + 1
+        drifted = {
+            **original,
+            "purpose": "Resume existing Bureau task without claim binding",
+            "acquired_at_unix": reacquired_at,
+            "updated_at_unix": reacquired_at,
+            "expires_at_unix": reacquired_at + 300,
+            "metadata_sha256": "9" * 64,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[existing, blocking, self.coordinated_status(intent)],
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=drifted
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "rebind_same_owner_resources",
+                return_value={
+                    "metadata_sha256": original["metadata_sha256"],
+                    "leases": [original],
+                },
+            ) as rebind,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-assignment", result["status"])
+        self.assertEqual(acquisition["acquisition_sha256"], result["acquisition_sha256"])
+        rebind.assert_called_once()
+        acquire.assert_not_called()
+        release.assert_not_called()
+
     def test_existing_assignment_without_own_journal_fails_closed(self) -> None:
         intent = self.intent()
         existing = {
