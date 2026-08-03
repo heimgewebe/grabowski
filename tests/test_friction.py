@@ -687,6 +687,28 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(probe["activity_counts"], {"forwarded_to_mcp": 1})
         self.assertEqual(probe["transport_health_state"], "healthy")
 
+    def test_connector_transport_event_hashes_identity_only_for_lifecycle_signals(self) -> None:
+        module = self._load_module()
+        module._connector_request_identity_sha256 = lambda payload: self.fail(
+            "non-lifecycle journal record must not hash request identity"
+        )
+        record = {
+            "__REALTIME_TIMESTAMP": "100",
+            "MESSAGE": json.dumps({
+                "level": "INFO",
+                "component": "dispatcher",
+                "msg": "dispatcher forwarded command to MCP server",
+                "cmd_request_id": "wfr_unrelated/abcd",
+                "rpc_request_id": 4,
+            }),
+        }
+
+        event = module._journal_transport_event(record)
+
+        self.assertEqual(event["activity"], "forwarded_to_mcp")
+        self.assertIsNone(event["response_lifecycle_signal"])
+        self.assertIsNone(event["request_identity_sha256"])
+
     def test_connector_transport_probe_correlates_ttl_with_late_response(self) -> None:
         module = self._load_module()
         request_id = "wfr_sensitive_request/abcd"
@@ -748,6 +770,50 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertIn("late_response_after_ttl", probe["error_domain_counts"])
         rendered = json.dumps(probe, sort_keys=True)
         self.assertNotIn(request_id, rendered)
+
+    def test_connector_transport_probe_keeps_response_before_ttl_unpaired(self) -> None:
+        module = self._load_module()
+        request_id = "wfr_response_before_ttl/abcd"
+        records = [
+            {
+                "__REALTIME_TIMESTAMP": "100",
+                "MESSAGE": json.dumps({
+                    "level": "WARN",
+                    "component": "controlplane",
+                    "msg": "response already fulfilled or unknown request",
+                    "cmd_request_id": request_id,
+                    "rpc_request_id": 9,
+                }),
+            },
+            {
+                "__REALTIME_TIMESTAMP": "110",
+                "MESSAGE": json.dumps({
+                    "level": "INFO",
+                    "component": "dispatcher",
+                    "msg": "MCP connection TTL reached; stopping response forwarding",
+                    "cmd_request_id": request_id,
+                    "rpc_request_id": 9,
+                }),
+            },
+        ]
+        module._run_diagnostic_command = lambda *args, **kwargs: {
+            "returncode": 0,
+            "timed_out": False,
+            "stdout": "".join(json.dumps(record) + "\n" for record in records),
+            "stderr": "",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+
+        probe = module._journal_transport_probe("tunnel-client-grabowski.service", 25)
+
+        self.assertEqual(
+            probe["response_lifecycle"]["classification_counts"],
+            {"duplicate_or_unknown_response": 1, "response_ttl_expired": 1},
+        )
+        self.assertEqual(probe["response_lifecycle"]["paired_late_response_count"], 0)
+        self.assertEqual(probe["response_lifecycle"]["unpaired_response_rejection_count"], 1)
+        self.assertEqual(probe["response_lifecycle"]["affected_request_identity_count"], 1)
 
     def test_connector_transport_probe_keeps_unpaired_response_rejection_ambiguous(self) -> None:
         module = self._load_module()
@@ -838,6 +904,17 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             diagnostics["response_lifecycle"]["units_with_signals"],
             ["tunnel-client-grabowski.service"],
         )
+        unit_lifecycle = diagnostics["journal_transport_probes"][
+            "tunnel-client-grabowski.service"
+        ]["response_lifecycle"]
+        self.assertEqual(unit_lifecycle["affected_request_identity_count"], 1)
+        self.assertEqual(unit_lifecycle["paired_late_response_count"], 0)
+        self.assertEqual(
+            unit_lifecycle["samples"][0]["classification"],
+            "response_ttl_expired",
+        )
+        self.assertFalse(unit_lifecycle["samples_truncated"])
+        self.assertNotIn("wfr_projected/abcd", json.dumps(diagnostics, sort_keys=True))
 
     def test_connector_transport_probe_separates_completed_stop_lifecycle_issues(self) -> None:
         module = self._load_module()
