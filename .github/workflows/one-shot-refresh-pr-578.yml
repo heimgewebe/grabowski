@@ -1,0 +1,34 @@
+name: One-shot operator context refresh PR 578
+
+on:
+  push:
+    branches:
+      - fix/agent-bootstrap-task-lock-drain-v1
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Refresh deterministic generated contracts
+        run: |
+          python tools/build_operator_context.py --write
+          python tools/build_publication_profiles.py --write
+      - name: Commit generated contracts and remove one-shot workflow
+        run: |
+          git config user.name 'grabowski-context-refresh'
+          git config user.email 'actions@users.noreply.github.com'
+          git rm -- .github/workflows/one-shot-refresh-pr-578.yml
+          git add -- docs/generated/operator-context.v1.json contracts/publication-profiles.v1.json
+          git diff --cached --check
+          git commit -m 'Refresh operator context for bootstrap lock fix'
+          git push origin HEAD:${GITHUB_REF_NAME}
