@@ -2,7 +2,7 @@
   "capability_source": "src/grabowski_capabilities.py",
   "capability_source_sha256": "5958704029f164e43d069badcda04d2f4094803e261041b5cfba30cd840edd19",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "9f71da0e1467fde627099ffd5fa7c6d7daaba2a9094f5b068fe1e6f7f9987acd",
+  "contract_sha256": "b29e7d35a2d5fc77e0baf023c5f9d4de8d21094343d64e522c0beed1436d7a91",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],

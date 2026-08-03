@@ -39,6 +39,7 @@ from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
+import grabowski_transport_roundtrip
 import grabowski_connector_contract
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_system_map
@@ -76,6 +77,10 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     (
         "state-check-before-retry",
         "After a transport, platform-filter, or policy failure, verify target state; do not repeat an unchanged call without state evidence.",
+    ),
+    (
+        "transport-roundtrip-before-mutation",
+        "Before every mutating MCP call, ensure grip_run transport-roundtrip reports a fresh single-use verification; run action begin and, only when challenge_pending is returned, ack the exact challenge receipt. A later ambiguous mutation still requires target readback before retry.",
     ),
     (
         "typed-operation-preference",
@@ -4721,6 +4726,95 @@ def _runtime_connector_observed_tools() -> dict[str, Any]:
     )
 
 
+def _transport_roundtrip_runtime_binding() -> dict[str, str]:
+    deployment = _deployment_metadata()
+    if (
+        deployment.get("completion_status") != "complete"
+        or deployment.get("runtime_binding_valid") is not True
+        or deployment.get("artifact_integrity_valid") is not True
+        or deployment.get("agent_instructions_identity_valid") is not True
+    ):
+        raise RuntimeError(
+            "transport roundtrip requires a complete integrity-valid runtime"
+        )
+    release_id = deployment.get("release_id")
+    repo_head = deployment.get("repo_head")
+    if not isinstance(release_id, str) or not release_id:
+        raise RuntimeError("transport runtime release id is unavailable")
+    if (
+        not isinstance(repo_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None
+    ):
+        raise RuntimeError("transport runtime repository head is unavailable")
+    manager = getattr(mcp, "_tool_manager", None)
+    raw_registered = getattr(manager, "_tools", {})
+    if not isinstance(raw_registered, dict) or not raw_registered:
+        raise RuntimeError("transport runtime tool registry is unavailable")
+    registered = sorted(str(name) for name in raw_registered)
+    registered_names_sha256 = hashlib.sha256(
+        json.dumps(
+            registered,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return grabowski_transport_roundtrip.validate_runtime_binding(
+        {
+            "release_id": release_id,
+            "repo_head": repo_head,
+            "registered_names_sha256": registered_names_sha256,
+            "agent_instructions_sha256": AGENT_INSTRUCTIONS_SHA256,
+        }
+    )
+
+
+def _transport_roundtrip_client_scope(
+    ctx: Context | None,
+) -> dict[str, str]:
+    client_label: str | None = None
+    if ctx is not None:
+        try:
+            raw_label = ctx.client_id
+        except (AttributeError, RuntimeError, ValueError):
+            raw_label = None
+        if isinstance(raw_label, str) and raw_label.strip() == raw_label and raw_label:
+            client_label = raw_label
+    if client_label is None:
+        return grabowski_transport_roundtrip.validate_client_scope(
+            {
+                "kind": "shared_unlabeled",
+                "label": grabowski_transport_roundtrip.SHARED_UNLABELED_SCOPE,
+            }
+        )
+    return grabowski_transport_roundtrip.validate_client_scope(
+        {"kind": "client_declared_meta", "label": client_label}
+    )
+
+
+def _transport_roundtrip_status(ctx: Context | None) -> dict[str, Any]:
+    client_scope = _transport_roundtrip_client_scope(ctx)
+    try:
+        runtime_binding = _transport_roundtrip_runtime_binding()
+    except (RuntimeError, ValueError) as exc:
+        return {
+            "schema_version": 1,
+            "state": "runtime_invalid",
+            "mutation_gate_open": False,
+            "error": type(exc).__name__,
+            "recommended_next_action": (
+                "repair runtime integrity before transport verification"
+            ),
+            "does_not_establish": [
+                "application-level success of any mutating tool",
+                "absence of response loss after a later mutation",
+            ],
+        }
+    return grabowski_transport_roundtrip.status(
+        client_scope=client_scope,
+        runtime_binding=runtime_binding,
+    )
+
+
 def _runtime_tool_contract_summary(
     deployment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -5077,6 +5171,7 @@ def _operator_system_overview(
 def grabowski_status(
     view: str = "minimal",
     fields: list[str] | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Return a consumer-shaped Grabowski status with opt-in evidence detail."""
     selected_view = _normalize_status_view(view)
@@ -5142,6 +5237,7 @@ def grabowski_status(
     if not bool(deployment.get("agent_instructions_identity_valid")):
         warnings.append({"code": "agent_instructions_drift"})
     client_snapshot = tool_contract.get("client_snapshot", {})
+    transport_roundtrip = _transport_roundtrip_status(ctx)
     if not bool(tool_contract.get("client_snapshot_observable")):
         snapshot_state = str(client_snapshot.get("state", "unavailable"))
         warnings.append(
@@ -5151,6 +5247,20 @@ def grabowski_status(
                 "detail": client_snapshot.get(
                     "recommended_next_action",
                     "bind the connector client snapshot to the current server contract",
+                ),
+            }
+        )
+    if (
+        transport_roundtrip.get("state") != "unavailable"
+        and transport_roundtrip.get("mutation_gate_open") is not True
+    ):
+        warnings.append(
+            {
+                "code": "transport_roundtrip_required",
+                "state": transport_roundtrip.get("state"),
+                "detail": transport_roundtrip.get(
+                    "recommended_next_action",
+                    "complete a fresh transport roundtrip before mutation",
                 ),
             }
         )
@@ -5182,6 +5292,16 @@ def grabowski_status(
             client_snapshot.get(
                 "recommended_next_action",
                 "bind the current connector client snapshot",
+            )
+        )
+    elif (
+        transport_roundtrip.get("state") != "unavailable"
+        and transport_roundtrip.get("mutation_gate_open") is not True
+    ):
+        recommended_next_action = str(
+            transport_roundtrip.get(
+                "recommended_next_action",
+                "complete a fresh transport roundtrip before mutation",
             )
         )
     elif system_overview is not None:
@@ -5225,6 +5345,7 @@ def grabowski_status(
             ),
         },
         "coding_agent_catalog": coding_agent_catalog,
+        "transport_roundtrip": transport_roundtrip,
         "agent_instructions": {
             **_agent_instructions_metadata(),
             "runtime_matches_deployment_manifest": deployment.get(
@@ -5245,6 +5366,7 @@ def grabowski_status(
             "client_instruction_compliance",
             "resistance to compromised same-uid code",
             "individual_tool_behavior_correctness",
+            "absence_of_response_loss_after_a_later_mutation",
             "future_action_authority",
         ],
     }
@@ -9948,6 +10070,8 @@ def grip_run(
             "_server_runtime",
             "_server_agent_instructions_sha256",
             "_server_observed_tools",
+            "_server_transport_client_scope",
+            "_server_transport_runtime_binding",
         }.intersection(raw_parameters)
     )
     if reserved_server_parameters:
@@ -10049,6 +10173,20 @@ def grip_run(
                 raw_parameters,
                 f"server runtime lease identity failed: {type(exc).__name__}",
             )
+    if name == "transport-roundtrip":
+        try:
+            client_scope = _transport_roundtrip_client_scope(ctx)
+            runtime_binding = _transport_roundtrip_runtime_binding()
+        except (RuntimeError, ValueError) as exc:
+            return grabowski_grips._blocked_surface_receipt(
+                name,
+                raw_parameters,
+                f"transport binding unavailable: {type(exc).__name__}",
+            )
+        dispatch_parameters["_server_transport_client_scope"] = client_scope
+        dispatch_parameters["_server_transport_runtime_binding"] = (
+            runtime_binding
+        )
     if name == "connector-snapshot-bind":
         deployment = _deployment_metadata()
         tool_contract = _runtime_tool_contract_summary(deployment)

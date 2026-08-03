@@ -39,7 +39,11 @@ class _FakeFastMCP:
             stateless=False,
         )
         self._registered_tools = {
-            name: types.SimpleNamespace(is_async=False, context_kwarg=None)
+            name: types.SimpleNamespace(
+                is_async=False,
+                context_kwarg=None,
+                annotations=types.SimpleNamespace(readOnlyHint=True),
+            )
             for name in ("read", "write")
         }
 
@@ -72,6 +76,7 @@ class _FakeFastMCP:
 class _FakeToolAnnotations:
     def __init__(self, **kwargs):
         self.values = kwargs
+        self.readOnlyHint = kwargs.get("readOnlyHint")
 
 
 def _load_operator_module():
@@ -309,6 +314,7 @@ class OperatorContractTests(unittest.TestCase):
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=False,
             context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=True),
         )
         operator._configure_http_runtime()
         result = operator.asyncio.run(
@@ -333,6 +339,7 @@ class OperatorContractTests(unittest.TestCase):
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=False,
             context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=True),
         )
         operator._configure_http_runtime()
 
@@ -375,6 +382,7 @@ class OperatorContractTests(unittest.TestCase):
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=False,
             context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=True),
         )
         operator._configure_http_runtime()
 
@@ -414,6 +422,7 @@ class OperatorContractTests(unittest.TestCase):
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=True,
             context_kwarg=None,
+            annotations=types.SimpleNamespace(readOnlyHint=True),
         )
         operator._configure_http_runtime()
         result = operator.asyncio.run(

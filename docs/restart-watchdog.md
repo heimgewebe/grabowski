@@ -235,6 +235,13 @@ deployten Runtime. Nicht belegt bleiben jeder einzelne Schritt einer bereits
 bestehenden produktiven MCP-Sitzung, der vollständige Roundtrip durch die
 OpenAI-Control-Plane und die korrekte Zuordnung einer konkreten ChatGPT-Sitzung.
 
+Der zentrale Mutationspfad verlangt zusätzlich einen frischen, client- und
+runtimegebundenen Transport-Rundlauf gemäß
+`docs/transport-roundtrip-gate-v1.md`. Ein fehlender, abgelaufener oder
+formwidriger Rundlauf ist jedoch **keine** Restart-Autorität: Er kann schlicht
+bedeuten, dass zuletzt kein mutierender Client aktiv war. Der Zustand sperrt
+Mutationen, ohne selbst Tunnel- oder Operator-Neustarts auszulösen.
+
 Connection-Generation, das Verwerfen veralteter Antworten und die
 Neuerkennung des Tool-Katalogs durch den Client liegen außerhalb dieses
 Repositories. Der Probe selbst führt keine Zielmutation aus. Der produktive
