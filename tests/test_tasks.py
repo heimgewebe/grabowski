@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import types
 from typing import get_args, get_type_hints
 import unittest
@@ -3744,6 +3745,206 @@ class TaskTests(unittest.TestCase):
         listed = tasks.grabowski_task_list()
         self.assertEqual(listed["tasks"][0]["state"], "running")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:preview.service"))
+
+    def test_reconcile_check_global_pages_without_duplicates(self) -> None:
+        started = [
+            self._start(resource_keys=[f"service:reconcile-page-{index}.service"])
+            for index in range(3)
+        ]
+
+        def observation(record: dict[str, object]) -> dict[str, object]:
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active", "SubState": "running"},
+                "probe": None,
+                "observer": {"kind": "test"},
+                "observed_at_unix": 200,
+            }
+
+        with patch.object(
+            tasks, "_reconcile_observation", side_effect=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page_one = tasks.reconcile_tasks_check(limit=2)
+            page_two = tasks.reconcile_tasks_check(
+                limit=2,
+                cursor=page_one["pagination"]["next_cursor"],
+            )
+        observed = [
+            item["task_id"]
+            for page in (page_one, page_two)
+            for item in page["observations"]
+        ]
+        expected = sorted(item["task"]["task_id"] for item in started)
+        self.assertEqual(expected, observed)
+        self.assertEqual(len(observed), len(set(observed)))
+        self.assertTrue(page_one["pagination"]["has_more"])
+        self.assertFalse(page_two["pagination"]["has_more"])
+        self.assertLessEqual(
+            page_one["pagination"]["payload_bytes"],
+            tasks.TASK_RECONCILE_CHECK_MAX_BYTES,
+        )
+
+    def test_reconcile_check_cursor_fails_closed_after_store_change(self) -> None:
+        self._start(resource_keys=["service:reconcile-cursor-a.service"])
+        self._start(resource_keys=["service:reconcile-cursor-b.service"])
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 201,
+        }
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1)
+        self._start(resource_keys=["service:reconcile-cursor-c.service"])
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ), self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.reconcile_tasks_check(
+                limit=1,
+                cursor=page["pagination"]["next_cursor"],
+            )
+
+    def test_reconcile_check_returns_frozen_page_when_store_changes_during_observation(
+        self,
+    ) -> None:
+        self._start(resource_keys=["service:reconcile-live-a.service"])
+        self._start(resource_keys=["service:reconcile-live-b.service"])
+        mutated = False
+
+        def observation(record: dict[str, object]) -> dict[str, object]:
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                self._start(resource_keys=["service:reconcile-live-c.service"])
+            return {
+                "state": "running",
+                "properties": {"ActiveState": "active", "SubState": "running"},
+                "probe": None,
+                "observer": {"kind": "test"},
+                "observed_at_unix": 202,
+            }
+
+        with patch.object(
+            tasks, "_reconcile_observation", side_effect=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            page = tasks.reconcile_tasks_check(limit=1)
+        self.assertTrue(mutated)
+        self.assertEqual(1, page["scanned"])
+        self.assertTrue(page["pagination"]["has_more"])
+        self.assertIsNotNone(page["pagination"]["next_cursor"])
+
+        with patch.object(
+            tasks, "_reconcile_observation", side_effect=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ), self.assertRaisesRegex(ValueError, "cursor_snapshot_changed"):
+            tasks.reconcile_tasks_check(
+                limit=1,
+                cursor=page["pagination"]["next_cursor"],
+            )
+
+    def test_reconcile_check_task_specific_shape_remains_unpaged(self) -> None:
+        started = self._start(resource_keys=["service:reconcile-exact.service"])
+        task_id = str(started["task"]["task_id"])
+        observation = {
+            "state": "running",
+            "properties": {"ActiveState": "active", "SubState": "running"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 202,
+        }
+        with patch.object(
+            tasks, "_reconcile_observation", return_value=observation
+        ), patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(False, False)
+        ):
+            result = tasks.reconcile_tasks_check(task_id=task_id)
+        self.assertEqual(1, result["scanned"])
+        self.assertNotIn("pagination", result)
+        self.assertIn("resource_keys", result["observations"][0])
+        self.assertNotIn("resource_key_count", result["observations"][0])
+
+    def test_reconcile_check_large_store_first_page_is_bounded(self) -> None:
+        started = self._start(resource_keys=["service:reconcile-large.service"])
+        base = tasks._row_raw(str(started["task"]["task_id"]))
+        states = ("running", "failed", "timed_out", "signalled")
+        with tasks._database_connection() as connection:
+            columns = [
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+            ]
+            placeholders = ",".join("?" for _ in columns)
+            statement = (
+                f"INSERT INTO tasks({','.join(columns)}) VALUES({placeholders})"
+            )
+            rows = []
+            for index in range(1, 30_000):
+                record = dict(base)
+                task_id = f"{index:024x}"
+                record.update(
+                    {
+                        "task_id": task_id,
+                        "unit": f"grabowski-task-{task_id}-a1.service",
+                        "authoritative_unit": f"grabowski-task-{task_id}-a1.service",
+                        "state": states[index % len(states)],
+                        "created_at_unix": 100_000 + index,
+                        "updated_at_unix": 100_000 + index,
+                        "resource_keys_json": "[]",
+                        "lease_owner_id": f"task:{task_id}",
+                        "terminalization_sha256": None,
+                        "terminalized_at_unix": None,
+                        "lifecycle_receipt_sha256": None,
+                    }
+                )
+                rows.append(tuple(record[column] for column in columns))
+            connection.executemany(statement, rows)
+        attention_decisions = [
+            {"task_id": f"{index:024x}", "classification": "defer"}
+            for index in range(5_000)
+        ]
+        self.assertEqual(5_000, len(attention_decisions))
+
+        def observation(record: dict[str, object]) -> dict[str, object]:
+            return {
+                "state": record["state"],
+                "properties": {},
+                "probe": None,
+                "observer": {"kind": "fixture"},
+                "observed_at_unix": 203,
+            }
+
+        tracemalloc.start()
+        started_at = time.perf_counter()
+        try:
+            with patch.object(
+                tasks, "_reconcile_observation", side_effect=observation
+            ), patch.object(
+                tasks, "_terminal_convergence_evidence", return_value=(False, False)
+            ):
+                result = tasks.reconcile_tasks_check(limit=200)
+            elapsed = time.perf_counter() - started_at
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(200, result["pagination"]["examined"])
+        self.assertTrue(result["pagination"]["has_more"])
+        self.assertLess(elapsed, 10.0)
+        self.assertLess(peak, 256 * 1024 * 1024)
+        self.assertLessEqual(
+            result["pagination"]["payload_bytes"],
+            tasks.TASK_RECONCILE_CHECK_MAX_BYTES,
+        )
 
     def test_reconcile_refresh_does_not_resume_processes(self) -> None:
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
