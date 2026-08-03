@@ -473,6 +473,10 @@
       "source": "src/grabowski_job_finalizer.py"
     },
     {
+      "module": "grabowski_alert_outbox",
+      "source": "src/grabowski_alert_outbox.py"
+    },
+    {
       "module": "grabowski_ntfy_dispatch",
       "source": "src/grabowski_ntfy_dispatch.py"
     },
@@ -563,6 +567,11 @@
     {
       "kind": "python_module",
       "launcher_module": "grabowski_job_finalizer",
+      "spawned_module": "grabowski_ntfy_dispatch"
+    },
+    {
+      "kind": "python_module",
+      "launcher_module": "grabowski_alert_outbox",
       "spawned_module": "grabowski_ntfy_dispatch"
     }
   ]
