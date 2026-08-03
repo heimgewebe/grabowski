@@ -31,6 +31,7 @@ import grabowski_blockade_runtime
 import grabowski_friction
 import grabowski_agent_bootstrap
 import grabowski_recall
+import grabowski_context_fabric
 import grabowski_resources
 import grabowski_bureau_intake
 import grabowski_bureau_pickup

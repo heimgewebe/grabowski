@@ -178,7 +178,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 178)
+        self.assertEqual(len(tools), 182)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -237,6 +237,14 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("grabowski_operator_optimization_report", tools)
         self.assertIn("grabowski_connector_transport_diagnostics", tools)
         self.assertIn("grabowski_operator_recall_export", tools)
+        self.assertTrue(
+            {
+                "grabowski_context_fabric_plan",
+                "grabowski_context_fabric_compose",
+                "grabowski_context_fabric_explain",
+                "grabowski_context_fabric_compare",
+            }.issubset(tools)
+        )
         self.assertIn("grabowski_reposkop_context", tools)
         self.assertTrue(
             {
@@ -296,6 +304,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_friction",
             "grabowski_agent_bootstrap",
             "grabowski_recall",
+            "grabowski_context_fabric",
             "grabowski_consumer_surface",
             "grabowski_private_io",
             "grabowski_job_origin",
