@@ -224,9 +224,95 @@ class WorkAdmissionTests(unittest.TestCase):
             },
             "lifecycle_state": "archived_retained",
         }
-        result = self._assess([self._main(), repoground, repobrief])
+        unclassified = {
+            "path": str(
+                self.repo.parent / ".repoground-sources" / "org__other__main"
+            ),
+            "is_main": False,
+            "detached": True,
+            "branch": None,
+            "status": {"dirty": False},
+            "coordination": {
+                "blocking": False,
+                "resource_leases": [],
+                "tasks": [],
+                "processes": [],
+            },
+            "lifecycle": {
+                "retention": None,
+                "binding": None,
+                "latest_archive": None,
+            },
+            "lifecycle_state": "unclassified_clean",
+        }
+        result = self._assess(
+            [self._main(), repoground, repobrief, unclassified]
+        )
         self.assertEqual(result["decision"], "allow")
         self.assertEqual(result["blockers"], [])
+
+    def test_clean_archived_writer_checkout_does_not_block_broad_lane(self) -> None:
+        linked = {
+            "path": str(self.repo.parent / "worktrees" / "merged-pr"),
+            "is_main": False,
+            "detached": False,
+            "branch": "feat/merged-pr",
+            "status": {"dirty": False},
+            "coordination": {
+                "blocking": False,
+                "resource_leases": [],
+                "tasks": [],
+                "processes": [],
+            },
+            "lifecycle": {
+                "retention": {"owner_id": "archive-owner"},
+                "binding": None,
+                "latest_archive": {
+                    "archive_id": "20260802T234748Z-1f159521375b",
+                    "owner_id": "archive-owner",
+                    "cleaned_at_unix": None,
+                },
+            },
+            "lifecycle_state": "archived_retained",
+        }
+        result = self._assess([self._main(), linked])
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["blockers"], [])
+
+    def test_archived_checkout_with_live_coordination_still_blocks(self) -> None:
+        linked = {
+            "path": str(self.repo.parent / "worktrees" / "active-pr"),
+            "is_main": False,
+            "detached": False,
+            "branch": "feat/active-pr",
+            "status": {"dirty": False},
+            "coordination": {
+                "blocking": True,
+                "resource_leases": [
+                    {
+                        "blocking": True,
+                        "resource_key": "path:/foreign",
+                        "owner_id": "foreign-owner",
+                    }
+                ],
+                "tasks": [],
+                "processes": [],
+            },
+            "lifecycle": {
+                "retention": {"owner_id": "archive-owner"},
+                "binding": None,
+                "latest_archive": {
+                    "archive_id": "20260802T234748Z-1f159521375b",
+                    "owner_id": "archive-owner",
+                    "cleaned_at_unix": None,
+                },
+            },
+            "lifecycle_state": "archived_retained",
+        }
+        result = self._assess([self._main(), linked])
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("foreign-live-coordination", result["blocker_codes"])
+        self.assertIn("worktree-convergence-required", result["blocker_codes"])
 
     def test_ambiguous_archived_source_cache_remains_blocked(self) -> None:
         linked = {

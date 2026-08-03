@@ -126,10 +126,8 @@ def _source_binding(item: dict[str, Any]) -> tuple[str | None, str | None]:
     )
 
 
-def _inert_retained_source_checkout(item: dict[str, Any], *, state: str) -> bool:
-    """Return true only for clean detached source-cache evidence without live work."""
-    if item.get("detached") is not True or item.get("branch") is not None:
-        return False
+def _inert_checkout_for_admission(item: dict[str, Any], *, state: str) -> bool:
+    """Ignore only clean checkouts whose lifecycle cannot represent live work."""
     status = item.get("status")
     if not isinstance(status, dict) or status.get("dirty") is not False:
         return False
@@ -140,34 +138,41 @@ def _inert_retained_source_checkout(item: dict[str, Any], *, state: str) -> bool
         value = coordination.get(key)
         if not isinstance(value, list) or value:
             return False
-    path = item.get("path")
-    if not isinstance(path, str) or not SOURCE_CACHE_ROOT_NAMES.intersection(
-        Path(path).parts
-    ):
-        return False
     lifecycle = item.get("lifecycle")
     if not isinstance(lifecycle, dict) or isinstance(lifecycle.get("binding"), dict):
         return False
-    if len(_lifecycle_owners(item)) > 1:
+    owners = _lifecycle_owners(item)
+    if len(owners) > 1:
         return False
-    if state == "archived_retained":
-        archive = lifecycle.get("latest_archive")
-        return (
-            isinstance(archive, dict)
-            and archive.get("cleaned_at_unix") is None
-            and isinstance(archive.get("archive_id"), str)
-            and bool(archive["archive_id"])
-        )
+
+    archive = lifecycle.get("latest_archive")
+    archive_open = (
+        isinstance(archive, dict)
+        and archive.get("cleaned_at_unix") is None
+        and isinstance(archive.get("archive_id"), str)
+        and bool(archive["archive_id"])
+    )
+    if state in {"archived_grace", "archived_retained"}:
+        return archive_open
+
+    path = item.get("path")
+    source_cache = (
+        item.get("detached") is True
+        and item.get("branch") is None
+        and isinstance(path, str)
+        and bool(SOURCE_CACHE_ROOT_NAMES.intersection(Path(path).parts))
+    )
+    if not source_cache:
+        return False
+    if state == "unclassified_clean":
+        return not owners
     if state != "retained":
         return False
     retention = lifecycle.get("retention")
-    if not isinstance(retention, dict):
-        return False
-    owner_id = retention.get("owner_id")
+    owner_id = retention.get("owner_id") if isinstance(retention, dict) else None
     return isinstance(owner_id, str) and owner_id.startswith(
         SOURCE_CACHE_OWNER_PREFIXES
     )
-
 
 def _foreign_coordination(item: dict[str, Any], owner_id: str) -> list[dict[str, Any]]:
     coordination = item.get("coordination")
@@ -371,8 +376,8 @@ def assess_repository_admission(
         lifecycle_owner = (
             next(iter(lifecycle_owners)) if len(lifecycle_owners) == 1 else None
         )
-        inert_retained_source = _inert_retained_source_checkout(item, state=state)
-        if not inert_retained_source:
+        inert_checkout = _inert_checkout_for_admission(item, state=state)
+        if not inert_checkout:
             if len(lifecycle_owners) > 1:
                 blockers.append(
                     {
