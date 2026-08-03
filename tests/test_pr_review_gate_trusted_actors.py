@@ -88,6 +88,47 @@ class PrReviewGateTrustedActorsTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "BLOCK")
         self.assertIn("GitHub mergeable is UNKNOWN, not MERGEABLE", result["failures"])
 
+    def test_unstable_merge_state_passes_when_only_codex_diagnostic_is_non_green(self) -> None:
+        state = _state(merge_state="UNSTABLE")
+        state["checks"].extend(
+            [
+                {"bucket": "cancel", "name": "Codex review settled"},
+                {"bucket": "pending", "name": "Codex review settled"},
+            ]
+        )
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertNotIn("2 non-green check(s)", result["failures"])
+        self.assertIn(
+            "GitHub mergeStateStatus UNSTABLE is attributable only to non-blocking diagnostic review status checks",
+            result["warnings"],
+        )
+
+    def test_unstable_merge_state_without_non_green_diagnostic_still_blocks(self) -> None:
+        result = pr_review_gate.evaluate_review_gate(
+            _state(merge_state="UNSTABLE"),
+            self_review=_self_review(),
+        )
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("GitHub mergeStateStatus is UNSTABLE, not CLEAN", result["failures"])
+
+    def test_unstable_merge_state_with_other_non_green_check_still_blocks(self) -> None:
+        state = _state(merge_state="UNSTABLE")
+        state["checks"].extend(
+            [
+                {"bucket": "pending", "name": "Codex review settled"},
+                {"bucket": "fail", "name": "claude"},
+            ]
+        )
+
+        result = pr_review_gate.evaluate_review_gate(state, self_review=_self_review())
+
+        self.assertEqual(result["verdict"], "BLOCK")
+        self.assertIn("1 non-green check(s)", result["failures"])
+        self.assertIn("GitHub mergeStateStatus is UNSTABLE, not CLEAN", result["failures"])
 
     def test_optional_skipped_check_does_not_block_when_expected_checks_pass(self) -> None:
         state = _state()
