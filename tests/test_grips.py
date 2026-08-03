@@ -875,6 +875,7 @@ class GripFoundationTests(unittest.TestCase):
                 "captain-preflight",
                 "captain-run",
                 "connector-snapshot-bind",
+                "transport-roundtrip",
                 "convergence-assess",
                 "convergence-state-classify",
                 "gate-evidence-preflight",

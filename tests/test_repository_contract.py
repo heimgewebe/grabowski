@@ -11,6 +11,7 @@ class RepositoryContractTests(unittest.TestCase):
     def test_live_server_snapshot_exists(self) -> None:
         self.assertTrue((ROOT / "src" / "grabowski_mcp.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_client_snapshot.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_transport_roundtrip.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_operator.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_runtime_extensions.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_audit_query.py").is_file())

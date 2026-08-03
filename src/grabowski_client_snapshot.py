@@ -815,7 +815,12 @@ async def _observe_and_bind_snapshot(
                     )
                 )
                 names_sha256 = observed_metadata["names_sha256"]
-                status_result = await client.call_tool("grabowski_status", {"view": "minimal"})
+                request_meta = {"client_id": AUTO_REFRESH_CLIENT_ID}
+                status_result = await client.call_tool(
+                    "grabowski_status",
+                    {"view": "minimal"},
+                    meta=request_meta,
+                )
                 status = _mcp_tool_payload(status_result, label="grabowski_status")
                 runtime = status.get("runtime")
                 instructions = status.get("agent_instructions")
@@ -832,6 +837,109 @@ async def _observe_and_bind_snapshot(
                     or contract.get("runtime_matches_deployment_contract") is not True
                 ):
                     raise ClientSnapshotError("observed MCP tool list disagrees with the runtime contract")
+                transport_begin_result = await client.call_tool(
+                    "grip_run",
+                    {
+                        "name": "transport-roundtrip",
+                        "parameters": {"action": "begin"},
+                        "profile": "operator",
+                        "allow_mutation": True,
+                    },
+                    meta=request_meta,
+                )
+                transport_begin = _mcp_tool_payload(
+                    transport_begin_result,
+                    label="transport roundtrip begin grip",
+                )
+                transport_begin_output = transport_begin.get("output")
+                if (
+                    transport_begin.get("status") != "passed"
+                    or not isinstance(transport_begin_output, dict)
+                ):
+                    raise ClientSnapshotError(
+                        "transport roundtrip begin did not return a valid receipt"
+                    )
+                transport_verification_receipt_sha256 = (
+                    transport_begin_output.get(
+                        "verification_receipt_sha256"
+                    )
+                )
+                if (
+                    transport_begin_output.get("state") == "verified"
+                    and transport_begin_output.get("mutation_gate_open") is True
+                    and isinstance(
+                        transport_verification_receipt_sha256, str
+                    )
+                    and _SHA256_RE.fullmatch(
+                        transport_verification_receipt_sha256
+                    )
+                    is not None
+                ):
+                    pass
+                else:
+                    challenge_receipt_sha256 = (
+                        transport_begin_output.get(
+                            "challenge_receipt_sha256"
+                        )
+                    )
+                    if (
+                        transport_begin_output.get("state")
+                        != "challenge_pending"
+                        or not isinstance(challenge_receipt_sha256, str)
+                        or _SHA256_RE.fullmatch(
+                            challenge_receipt_sha256
+                        )
+                        is None
+                    ):
+                        raise ClientSnapshotError(
+                            "transport roundtrip begin did not return a valid challenge"
+                        )
+                    transport_ack_result = await client.call_tool(
+                        "grip_run",
+                        {
+                            "name": "transport-roundtrip",
+                            "parameters": {
+                                "action": "ack",
+                                "challenge_receipt_sha256": (
+                                    challenge_receipt_sha256
+                                ),
+                            },
+                            "profile": "operator",
+                            "allow_mutation": True,
+                        },
+                        meta=request_meta,
+                    )
+                    transport_ack = _mcp_tool_payload(
+                        transport_ack_result,
+                        label="transport roundtrip ack grip",
+                    )
+                    transport_ack_output = transport_ack.get("output")
+                    transport_verification_receipt_sha256 = (
+                        transport_ack_output.get(
+                            "verification_receipt_sha256"
+                        )
+                        if isinstance(transport_ack_output, dict)
+                        else None
+                    )
+                    if (
+                        transport_ack.get("status") != "passed"
+                        or not isinstance(transport_ack_output, dict)
+                        or transport_ack_output.get("state") != "verified"
+                        or transport_ack_output.get(
+                            "mutation_gate_open"
+                        )
+                        is not True
+                        or not isinstance(
+                            transport_verification_receipt_sha256, str
+                        )
+                        or _SHA256_RE.fullmatch(
+                            transport_verification_receipt_sha256
+                        )
+                        is None
+                    ):
+                        raise ClientSnapshotError(
+                            "transport roundtrip acknowledgement did not verify"
+                        )
                 declaration = {
                     "client_id": AUTO_REFRESH_CLIENT_ID,
                     "session_id": session_id,
@@ -849,6 +957,7 @@ async def _observe_and_bind_snapshot(
                         "profile": "operator",
                         "allow_mutation": True,
                     },
+                    meta=request_meta,
                 )
                 grip = _mcp_tool_payload(bind_result, label="connector-snapshot-bind grip")
                 output = grip.get("output")
@@ -866,6 +975,9 @@ async def _observe_and_bind_snapshot(
                     "names_sha256": names_sha256,
                     "release_id": release_id,
                     "receipt_sha256": output.get("receipt_sha256"),
+                    "transport_verification_receipt_sha256": (
+                        transport_verification_receipt_sha256
+                    ),
                     "schema_coverage_count": observed_metadata[
                         "schema_coverage_count"
                     ],

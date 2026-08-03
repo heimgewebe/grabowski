@@ -491,6 +491,7 @@ class ClientSnapshotTests(unittest.TestCase):
                 return False
 
         declarations: list[dict[str, object]] = []
+        request_metas: list[dict[str, object] | None] = []
 
         class Client:
             async def initialize(self) -> None:
@@ -505,7 +506,10 @@ class ClientSnapshotTests(unittest.TestCase):
                 self,
                 name: str,
                 arguments: dict[str, object],
+                *,
+                meta: dict[str, object] | None = None,
             ) -> object:
+                request_metas.append(meta)
                 if name == "grip_run":
                     declarations.append(arguments)
                 return object()
@@ -522,6 +526,24 @@ class ClientSnapshotTests(unittest.TestCase):
                         "registered_tool_count": len(names),
                         "registered_names_sha256": metadata["names_sha256"],
                         "runtime_matches_deployment_contract": True,
+                    },
+                }
+            if label == "transport roundtrip begin grip":
+                return {
+                    "status": "passed",
+                    "output": {
+                        "state": "challenge_pending",
+                        "mutation_gate_open": False,
+                        "challenge_receipt_sha256": "e" * 64,
+                    },
+                }
+            if label == "transport roundtrip ack grip":
+                return {
+                    "status": "passed",
+                    "output": {
+                        "state": "verified",
+                        "mutation_gate_open": True,
+                        "verification_receipt_sha256": "f" * 64,
                     },
                 }
             return {
@@ -564,6 +586,29 @@ class ClientSnapshotTests(unittest.TestCase):
             )
             self.assertTrue(result["schema_contract_matches"])
             self.assertEqual(result["schema_coverage_count"], 3)
+            self.assertEqual(
+                result["transport_verification_receipt_sha256"],
+                "f" * 64,
+            )
+            self.assertEqual(
+                request_metas[:4],
+                [{"client_id": snapshot.AUTO_REFRESH_CLIENT_ID}] * 4,
+            )
+            self.assertEqual(
+                [entry["name"] for entry in declarations[-3:]],
+                [
+                    "transport-roundtrip",
+                    "transport-roundtrip",
+                    "connector-snapshot-bind",
+                ],
+            )
+            self.assertEqual(
+                declarations[-2]["parameters"],
+                {
+                    "action": "ack",
+                    "challenge_receipt_sha256": "e" * 64,
+                },
+            )
             declaration = declarations[-1]["parameters"]
             self.assertEqual(declaration["observed_tools"], artifact)
             self.assertEqual(declaration["observed_tool_count"], len(names))

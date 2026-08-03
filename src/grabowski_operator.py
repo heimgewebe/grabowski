@@ -41,6 +41,7 @@ import grabowski_command_identity as command_identity
 import grabowski_job_origin as job_origin
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
+import grabowski_transport_roundtrip
 
 
 HOME = Path.home().resolve()
@@ -424,6 +425,61 @@ def _deployment_observer_client_id(context: Context | None) -> str | None:
     return client_id if isinstance(client_id, str) and client_id.strip() else None
 
 
+def _tool_read_only_hint(tool: Any) -> bool | None:
+    annotations = getattr(tool, "annotations", None)
+    hint = getattr(annotations, "readOnlyHint", None)
+    if hint is None:
+        values = getattr(annotations, "values", None)
+        if isinstance(values, dict):
+            hint = values.get("readOnlyHint")
+    return hint if isinstance(hint, bool) else None
+
+
+def _transport_roundtrip_exempt_call(
+    tool_name: Any, arguments: Any
+) -> bool:
+    return bool(
+        tool_name == "grip_run"
+        and isinstance(arguments, dict)
+        and arguments.get("name") == "transport-roundtrip"
+    )
+
+
+def _require_transport_roundtrip_for_tool(
+    *,
+    tool_name: Any,
+    arguments: Any,
+    context: Context | None,
+    tool: Any,
+) -> None:
+    if _transport_roundtrip_exempt_call(tool_name, arguments):
+        return
+    read_only_hint = _tool_read_only_hint(tool)
+    if read_only_hint is True:
+        return
+    if read_only_hint is None:
+        raise RuntimeError(
+            "MCP call rejected because the tool does not declare an explicit "
+            "readOnlyHint annotation"
+        )
+    client_scope = base._transport_roundtrip_client_scope(context)
+    runtime_binding = base._transport_roundtrip_runtime_binding()
+    try:
+        arguments_sha256 = (
+            grabowski_transport_roundtrip.canonical_arguments_sha256(
+                arguments if arguments is not None else {}
+            )
+        )
+        grabowski_transport_roundtrip.consume_verified(
+            client_scope=client_scope,
+            runtime_binding=runtime_binding,
+            tool_name=str(tool_name),
+            arguments_sha256=arguments_sha256,
+        )
+    except grabowski_transport_roundtrip.TransportRoundtripError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def _deployment_observer_request_evidence(
     tool_name: Any,
     arguments: Any,
@@ -705,6 +761,12 @@ def _install_deployment_admission_gate() -> None:
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
                 )
+            _require_transport_roundtrip_for_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                context=context,
+                tool=tool,
+            )
             if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
                 worker_future = _SYNC_TOOL_EXECUTOR.submit(

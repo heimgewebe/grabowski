@@ -15,11 +15,19 @@ from tests.test_operator_contract import _load_operator_module
 
 
 def _sync_tool() -> types.SimpleNamespace:
-    return types.SimpleNamespace(is_async=False, context_kwarg=None)
+    return types.SimpleNamespace(
+        is_async=False,
+        context_kwarg=None,
+        annotations=types.SimpleNamespace(readOnlyHint=True),
+    )
 
 
 def _async_tool() -> types.SimpleNamespace:
-    return types.SimpleNamespace(is_async=True, context_kwarg=None)
+    return types.SimpleNamespace(
+        is_async=True,
+        context_kwarg=None,
+        annotations=types.SimpleNamespace(readOnlyHint=True),
+    )
 
 
 SAMPLE_ENTRY_KEYS = {
