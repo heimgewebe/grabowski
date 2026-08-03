@@ -96,12 +96,13 @@ returns HTTP 2xx. Transport exceptions and non-2xx responses leave the alert
 queued. Invalid alert receipts block alert dispatch fail-closed. This does not
 change the existing terminal notification acknowledgement contract.
 
-The runtime-entrypoint manifest is intentionally outside this change. The
-integration therefore loads the packaged alert module through an optional
-boundary. If an older deployed source set does not contain the module,
-terminal-job dispatch continues and reports `alert_outbox_unavailable` with an
-explicit `alert_outbox_empty` non-claim; producer transitions remain primary
-and do not fail during a staggered package rollout.
+The runtime-entrypoint manifest packages `grabowski_alert_outbox` alongside
+the shared dispatcher and producer modules. The optional import boundary
+remains a staggered-rollout safeguard only: an older deployed source set may
+continue terminal-job dispatch and report `alert_outbox_unavailable`, but the
+canonical current runtime contract includes the alert module. Producer
+transitions remain primary and do not fail if an incomplete historical source
+set is observed.
 
 ## Producer adapters
 
