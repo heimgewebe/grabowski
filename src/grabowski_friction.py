@@ -1030,7 +1030,11 @@ def _journal_transport_event(
     )
     activity = CONNECTOR_ACTIVITY_MESSAGES.get(message)
     response_lifecycle_signal = CONNECTOR_RESPONSE_LIFECYCLE_MESSAGES.get(message)
-    request_identity_sha256 = _connector_request_identity_sha256(payload)
+    request_identity_sha256 = (
+        _connector_request_identity_sha256(payload)
+        if response_lifecycle_signal is not None
+        else None
+    )
     return {
         "timestamp": str(payload.get("time") or record.get("__REALTIME_TIMESTAMP") or "")[:80],
         "realtime_microseconds": realtime_microseconds,
