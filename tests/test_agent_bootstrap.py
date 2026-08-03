@@ -71,6 +71,64 @@ class AgentBootstrapTests(unittest.TestCase):
             module.call_shape_check(**kwargs)["shape_sha256"],
         )
 
+    def test_bootstrap_defers_workspace_metrics_from_synchronous_entry(self) -> None:
+        module = self.load_module()
+        module.grabowski_friction.friction_summary = lambda **_: {
+            "event_log_integrity": {"integrity_valid": True},
+            "decision_log": {"integrity_valid": True},
+            "fingerprint_sha256": "a" * 64,
+        }
+        module.grabowski_friction.execution_governor_summary = lambda **_: {
+            "ledger_integrity_valid": True,
+            "candidates": [],
+            "minimum_evidence": 5,
+            "decay_seconds": 604800,
+            "live_promotions": [],
+            "summary_sha256": "b" * 64,
+        }
+
+        first = module._workspace_metrics_snapshot(50)
+        second = module._workspace_metrics_snapshot(50)
+        adaptive = module.agent_bootstrap()["adaptive_evidence"]
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["report_kind"], "workspace_metrics_snapshot_deferred")
+        self.assertEqual(
+            first["collection_mode"],
+            "deferred_to_dedicated_workspace_observer",
+        )
+        self.assertFalse(first["integrity_valid"])
+        self.assertIsNone(first["friction_fingerprint_sha256"])
+        self.assertEqual(first["current_cohort_sample_size"], 0)
+        self.assertEqual(first["requested_limit"], 50)
+        self.assertEqual(
+            first["recommended_tool"],
+            "grabowski_agent_workspace_optimize",
+        )
+        self.assertFalse(first["execution_authorized"])
+        self.assertEqual(
+            adaptive["workspace_fingerprint_unavailable_reason"],
+            "workspace_metrics_deferred_from_synchronous_bootstrap",
+        )
+        self.assertEqual(
+            adaptive["workspace_metrics_report_kind"],
+            "workspace_metrics_snapshot_deferred",
+        )
+        self.assertEqual(
+            adaptive["workspace_metrics_collection_mode"],
+            "deferred_to_dedicated_workspace_observer",
+        )
+        self.assertEqual(
+            adaptive["workspace_metrics_recommended_tool"],
+            "grabowski_agent_workspace_optimize",
+        )
+        with self.assertRaisesRegex(ValueError, "integer"):
+            module._workspace_metrics_snapshot(True)
+        for invalid_limit in (0, 51):
+            with self.subTest(invalid_limit=invalid_limit):
+                with self.assertRaisesRegex(ValueError, "between 1 and 50"):
+                    module._workspace_metrics_snapshot(invalid_limit)
+
     def test_bootstrap_fail_closed_on_invalid_governor_integrity(self) -> None:
         module = self.load_module()
         module.grabowski_friction.friction_summary = lambda **_: {

@@ -2982,7 +2982,7 @@
       "sha256": "df17ca84141d0e35917daf987490a549c44fbe37756c7f9f46f81d8a5033473c"
     },
     "runtime_sources": {
-      "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
+      "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
       "src/grabowski_agent_competition.py": "d5a7aec2dec626b25b71e0e84e59980544cc8af1ee6ba19f011a7d413d8888d6",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
