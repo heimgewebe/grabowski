@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "kind": "grabowski.convergence_closure_surface_coverage",
-  "observed_at": "2026-07-26",
+  "observed_at": "2026-08-03",
   "source": {
-    "grabowski_commit": "d2097c909bd60be7f947b5c50cc9fa6d56ba907c",
+    "grabowski_commit": "3a022f303ffc7e8c610295f071729c5d391a3288",
     "protocol_commit": "fae4c26faa22d62d148d39e1995fe5492211cb43",
     "capability_catalog": "contracts/capability-catalog.v1.json",
     "grip_source": "src/grabowski_grips.py"
@@ -223,6 +223,20 @@
       "classification": "mechanical_only",
       "convergence_requirement": "must_not_claim_system_closeout",
       "reason": "Attention classification closes operator bookkeeping only."
+    },
+    {
+      "surface_kind": "grip",
+      "surface_id": "runtime-refresh-lease-release",
+      "classification": "mechanical_only",
+      "convergence_requirement": "not_a_semantic_closeout",
+      "reason": "The grip releases only unchanged receipt-bound runtime-refresh leases after explicit terminal evidence."
+    },
+    {
+      "surface_kind": "tool",
+      "surface_id": "grabowski_runtime_refresh_lease_release",
+      "classification": "mechanical_only",
+      "convergence_requirement": "not_a_semantic_closeout",
+      "reason": "The tool verifies canonical Bureau terminal receipts and releases exact unchanged path leases without claiming system completion."
     }
   ],
   "follow_up_required": true,

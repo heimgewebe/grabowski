@@ -36,6 +36,7 @@ Der Consumer funktioniert, ist aber derzeit kein zentraler technischer Vorgänge
 | `grabowski_agent_workspace_cleanup` | archiviert und entfernt einen bereits geschlossenen Writer-Checkout | besitzt Recovery- und Workspace-Evidenz, bewertet aber nicht selbst die Systemwirkung | **Upstream-Bindung nötig** |
 | `grabowski_checkout_cleanup` | entfernt einen archivierten Linked Checkout | Hygieneoperation mit Dry-Run und Recovery-Refs | **kein eigener Assessment-Fall** |
 | `bureau-pickup-release` | gibt unveränderte Leases eines terminalen Bureau-Laufs frei | rein mechanischer Release nach Bureau-Readback | **außerhalb des Scopes** |
+| `runtime-refresh-lease-release`, `grabowski_runtime_refresh_lease_release` | geben exakt fünf unveränderte Runtime-Refresh-Pfadleasing-Zeilen frei | prüfen private Observation-, Intent-, Start- und Result-Receipts; behaupten keinen Systemabschluss | **außerhalb des Scopes** |
 | `task-attention-decision` | klassifiziert einen terminalen Taskausgang | darf keinen systemischen Abschluss behaupten | **außerhalb des Scopes** |
 | `grabowski_runtime_deploy_schedule` | startet einen Deployment-Effekt | erzeugt erst Evidenz für eine spätere Verifikation | **vor dem Abschluss** |
 | `grabowski_git` mit Push, `branch-publish`, `pr-create-or-update`, `grabowski_bureau_task_publish` | erzeugen Branch- oder PR-Veröffentlichungseffekte | Wirkung noch nicht verifiziert | **vor dem Abschluss** |

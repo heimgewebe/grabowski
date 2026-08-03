@@ -819,6 +819,34 @@
         "tool": "grabowski_reposkop_context"
       }
     },
+    "grabowski_runtime_refresh_lease_release": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T134",
+        "tests:tests/test_resources.py",
+        "tests:tests/test_grips.py",
+        "docs:docs/bureau-lease-contract-v2.md"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only terminal Bureau runtime-refresh lease release and cannot select arbitrary owners, paths or snapshots.",
+        "evidence": "Canonical private observation, intent, start and result receipts derive exactly five path leases; tamper, unclear state, drift and foreign ownership fail closed."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "A typed generic operation was rejected because reusing the caller-parameterized resource reconciler would expose owner, resource and snapshot selection instead of enforcing the fixed Bureau runtime-refresh receipt contract.",
+      "rationale": "Runtime-refresh cleanup requires a narrower authority boundary that accepts only two receipt digests and derives the exact owner, five paths and lease snapshots from private Bureau evidence.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "resource",
+        "effects": [
+          "audit-append",
+          "lease-remove",
+          "terminal-evidence-verify"
+        ],
+        "read_only": false,
+        "reversibility": "resource-reacquire",
+        "risk_class": "high",
+        "tool": "grabowski_runtime_refresh_lease_release"
+      }
+    },
     "grabowski_task_archive_list": {
       "evidence_refs": [
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T071",
