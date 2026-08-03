@@ -51,8 +51,17 @@ jobs:
           git diff --binary | sha256sum | tee /tmp/t055-diff.sha256
 
       - name: Focused regression tests
+        shell: bash
         run: |
-          python3 -m unittest \
+          set -euo pipefail
+          install -d -m 700 "$PWD/build"
+          test_home="$(mktemp -d "$PWD/build/test-home.XXXXXX")"
+          trap 'rm -rf "$test_home"' EXIT
+          install -d -m 700 "$test_home/.config/grabowski"
+          install -m 600 \
+            config/access.home-wide-operator.example.json \
+            "$test_home/.config/grabowski/access.json"
+          HOME="$test_home" python3 -m unittest \
             tests.test_repository_contract \
             tests.test_alert_outbox \
             tests.test_ntfy_dispatch \
