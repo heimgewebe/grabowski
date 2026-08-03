@@ -14,6 +14,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 STATE_KIND = "grabowski_transport_roundtrip_state"
 CHALLENGE_KIND = "grabowski_transport_roundtrip_challenge"
 VERIFICATION_KIND = "grabowski_transport_roundtrip_verification"
@@ -21,7 +22,9 @@ CONSUMPTION_KIND = "grabowski_transport_roundtrip_consumption"
 CHALLENGE_TTL_SECONDS = 300
 VERIFICATION_TTL_SECONDS = 900
 CLOCK_SKEW_SECONDS = 30
-MAX_STATE_BYTES = 32 * 1024
+MAX_STATE_BYTES = 128 * 1024
+MAX_SHARED_PENDING_CHALLENGES = 32
+MAX_SHARED_VERIFIED_RECEIPTS = 32
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-roundtrip"
 LOCK_PATH = STATE_ROOT / ".lock"
 SHARED_UNLABELED_SCOPE = "shared-unlabeled-transport-v1"
@@ -37,7 +40,7 @@ _RUNTIME_BINDING_KEYS = frozenset(
 )
 _CLIENT_SCOPE_KEYS = frozenset({"kind", "label"})
 _CLIENT_SCOPE_KINDS = frozenset({"client_declared_meta", "shared_unlabeled"})
-_STATE_KEYS = frozenset(
+_LEGACY_STATE_KEYS = frozenset(
     {
         "schema_version",
         "kind",
@@ -45,6 +48,17 @@ _STATE_KEYS = frozenset(
         "client_scope_kind",
         "pending_challenge",
         "verified_receipt",
+        "last_consumption_receipt",
+    }
+)
+_STATE_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "client_scope_sha256",
+        "client_scope_kind",
+        "pending_challenges",
+        "verified_receipts",
         "last_consumption_receipt",
     }
 )
@@ -374,24 +388,28 @@ def _validate_receipt(
     return receipt
 
 
+def _is_shared_pool(scope: dict[str, str]) -> bool:
+    return scope["kind"] == "shared_unlabeled"
+
+
 def _empty_state(scope: dict[str, str]) -> dict[str, Any]:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": STATE_SCHEMA_VERSION,
         "kind": STATE_KIND,
         "client_scope_sha256": _sha256_json(scope),
         "client_scope_kind": scope["kind"],
-        "pending_challenge": None,
-        "verified_receipt": None,
+        "pending_challenges": [],
+        "verified_receipts": [],
         "last_consumption_receipt": None,
     }
 
 
-def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
+def _validate_state_identity(
+    state: dict[str, Any], *, scope: dict[str, str], schema_version: int
+) -> None:
     scope_hash = _sha256_json(scope)
     if (
-        not isinstance(state, dict)
-        or set(state) != _STATE_KEYS
-        or state.get("schema_version") != SCHEMA_VERSION
+        state.get("schema_version") != schema_version
         or state.get("kind") != STATE_KIND
         or state.get("client_scope_sha256") != scope_hash
         or state.get("client_scope_kind") != scope["kind"]
@@ -399,42 +417,146 @@ def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
         raise TransportRoundtripError(
             "transport roundtrip state contract mismatch"
         )
+
+
+def _validate_receipt_sequence(
+    value: Any,
+    *,
+    expected_kind: str,
+    scope: dict[str, str],
+    maximum: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise TransportRoundtripError(
+            "transport roundtrip receipt pool contract mismatch"
+        )
+    receipts: list[dict[str, Any]] = []
+    receipt_hashes: set[str] = set()
+    challenge_hashes: set[str] = set()
+    for receipt in value:
+        validated = _validate_receipt(
+            receipt, expected_kind=expected_kind, scope=scope
+        )
+        receipt_hash = str(validated["receipt_sha256"])
+        if receipt_hash in receipt_hashes:
+            raise TransportRoundtripError(
+                "transport roundtrip receipt pool contains duplicates"
+            )
+        receipt_hashes.add(receipt_hash)
+        if expected_kind == CHALLENGE_KIND:
+            _validate_sha256(
+                validated.get("challenge_nonce_sha256"),
+                label="transport challenge nonce hash",
+            )
+        elif expected_kind == VERIFICATION_KIND:
+            challenge_hash = _validate_sha256(
+                validated.get("challenge_receipt_sha256"),
+                label="transport challenge receipt hash",
+            )
+            if challenge_hash in challenge_hashes:
+                raise TransportRoundtripError(
+                    "transport verification pool reuses one challenge"
+                )
+            challenge_hashes.add(challenge_hash)
+        receipts.append(validated)
+    return receipts
+
+
+def _legacy_state_to_current(
+    state: dict[str, Any], *, scope: dict[str, str]
+) -> dict[str, Any]:
+    _validate_state_identity(state, scope=scope, schema_version=SCHEMA_VERSION)
     pending = state.get("pending_challenge")
     verified = state.get("verified_receipt")
     consumption = state.get("last_consumption_receipt")
-    if pending is not None:
-        _validate_receipt(pending, expected_kind=CHALLENGE_KIND, scope=scope)
-        _validate_sha256(
-            pending.get("challenge_nonce_sha256"),
-            label="transport challenge nonce hash",
-        )
-    if verified is not None:
-        _validate_receipt(
-            verified, expected_kind=VERIFICATION_KIND, scope=scope
-        )
-        _validate_sha256(
-            verified.get("challenge_receipt_sha256"),
-            label="transport challenge receipt hash",
-        )
+    pending_values = [] if pending is None else [pending]
+    verified_values = [] if verified is None else [verified]
+    _validate_receipt_sequence(
+        pending_values,
+        expected_kind=CHALLENGE_KIND,
+        scope=scope,
+        maximum=1,
+    )
+    _validate_receipt_sequence(
+        verified_values,
+        expected_kind=VERIFICATION_KIND,
+        scope=scope,
+        maximum=1,
+    )
     if consumption is not None:
-        _validate_receipt(
-            consumption, expected_kind=CONSUMPTION_KIND, scope=scope
-        )
-        _validate_sha256(
-            consumption.get("verification_receipt_sha256"),
-            label="transport verification receipt hash",
-        )
-        _validate_sha256(
-            consumption.get("arguments_sha256"),
-            label="transport mutation arguments hash",
-        )
-        _validate_text(
-            consumption.get("tool_name"),
-            label="transport mutation tool name",
-            maximum_bytes=256,
-        )
-    return state
+        _validate_consumption_receipt(consumption, scope=scope)
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "kind": STATE_KIND,
+        "client_scope_sha256": state["client_scope_sha256"],
+        "client_scope_kind": state["client_scope_kind"],
+        "pending_challenges": pending_values,
+        "verified_receipts": verified_values,
+        "last_consumption_receipt": consumption,
+    }
 
+
+def _validate_consumption_receipt(
+    receipt: Any, *, scope: dict[str, str]
+) -> dict[str, Any]:
+    validated = _validate_receipt(
+        receipt, expected_kind=CONSUMPTION_KIND, scope=scope
+    )
+    _validate_sha256(
+        validated.get("verification_receipt_sha256"),
+        label="transport verification receipt hash",
+    )
+    _validate_sha256(
+        validated.get("arguments_sha256"),
+        label="transport mutation arguments hash",
+    )
+    _validate_text(
+        validated.get("tool_name"),
+        label="transport mutation tool name",
+        maximum_bytes=256,
+    )
+    return validated
+
+
+def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
+    if not isinstance(state, dict):
+        raise TransportRoundtripError(
+            "transport roundtrip state must be an object"
+        )
+    if (
+        state.get("schema_version") == SCHEMA_VERSION
+        and set(state) == _LEGACY_STATE_KEYS
+    ):
+        return _legacy_state_to_current(state, scope=scope)
+    if set(state) != _STATE_KEYS:
+        raise TransportRoundtripError(
+            "transport roundtrip state contract mismatch"
+        )
+    _validate_state_identity(
+        state, scope=scope, schema_version=STATE_SCHEMA_VERSION
+    )
+    shared = _is_shared_pool(scope)
+    pending = _validate_receipt_sequence(
+        state.get("pending_challenges"),
+        expected_kind=CHALLENGE_KIND,
+        scope=scope,
+        maximum=MAX_SHARED_PENDING_CHALLENGES if shared else 1,
+    )
+    verified = _validate_receipt_sequence(
+        state.get("verified_receipts"),
+        expected_kind=VERIFICATION_KIND,
+        scope=scope,
+        maximum=MAX_SHARED_VERIFIED_RECEIPTS if shared else 1,
+    )
+    consumption = state.get("last_consumption_receipt")
+    if consumption is not None:
+        _validate_consumption_receipt(consumption, scope=scope)
+    return {
+        **state,
+        "pending_challenges": pending,
+        "verified_receipts": verified,
+        "last_consumption_receipt": consumption,
+    }
 
 def _load_state(scope: dict[str, str]) -> dict[str, Any]:
     path = _state_path(_sha256_json(scope))
@@ -460,6 +582,137 @@ def _receipt_is_current(
     )
 
 
+def _current_receipts(
+    receipts: list[dict[str, Any]],
+    *,
+    runtime_binding: dict[str, str],
+    now_unix: int,
+) -> list[dict[str, Any]]:
+    return [
+        receipt
+        for receipt in receipts
+        if _receipt_is_current(
+            receipt,
+            runtime_binding=runtime_binding,
+            now_unix=now_unix,
+        )
+    ]
+
+
+def _receipt_order(receipt: dict[str, Any]) -> tuple[int, str]:
+    return (
+        int(receipt["created_at_unix"]),
+        str(receipt["receipt_sha256"]),
+    )
+
+
+def _prune_state(
+    state: dict[str, Any],
+    *,
+    runtime_binding: dict[str, str],
+    now_unix: int,
+) -> dict[str, Any]:
+    return {
+        **state,
+        "pending_challenges": _current_receipts(
+            state["pending_challenges"],
+            runtime_binding=runtime_binding,
+            now_unix=now_unix,
+        ),
+        "verified_receipts": _current_receipts(
+            state["verified_receipts"],
+            runtime_binding=runtime_binding,
+            now_unix=now_unix,
+        ),
+    }
+
+
+def _receipt_for_hash(
+    receipts: list[dict[str, Any]], receipt_sha256: str
+) -> dict[str, Any] | None:
+    return next(
+        (
+            receipt
+            for receipt in receipts
+            if receipt.get("receipt_sha256") == receipt_sha256
+        ),
+        None,
+    )
+
+
+def _verification_for_challenge(
+    receipts: list[dict[str, Any]], challenge_sha256: str
+) -> dict[str, Any] | None:
+    return next(
+        (
+            receipt
+            for receipt in receipts
+            if receipt.get("challenge_receipt_sha256")
+            == challenge_sha256
+        ),
+        None,
+    )
+
+
+def _new_challenge(
+    *,
+    scope: dict[str, str],
+    runtime_binding: dict[str, str],
+    timestamp: int,
+    previous_verification: dict[str, Any] | None,
+) -> dict[str, Any]:
+    challenge = _receipt_base(
+        kind=CHALLENGE_KIND,
+        scope=scope,
+        runtime_binding=runtime_binding,
+        created_at_unix=timestamp,
+        expires_at_unix=timestamp + CHALLENGE_TTL_SECONDS,
+    )
+    challenge.update(
+        {
+            "challenge_nonce_sha256": hashlib.sha256(
+                secrets.token_bytes(32)
+            ).hexdigest(),
+            "previous_verification_receipt_sha256": (
+                previous_verification.get("receipt_sha256")
+                if isinstance(previous_verification, dict)
+                else None
+            ),
+        }
+    )
+    challenge["receipt_sha256"] = _receipt_sha256(challenge)
+    return challenge
+
+
+def _new_verification(
+    *,
+    scope: dict[str, str],
+    runtime_binding: dict[str, str],
+    timestamp: int,
+    challenge_sha256: str,
+    previous_verification: dict[str, Any] | None,
+) -> dict[str, Any]:
+    verification = _receipt_base(
+        kind=VERIFICATION_KIND,
+        scope=scope,
+        runtime_binding=runtime_binding,
+        created_at_unix=timestamp,
+        expires_at_unix=timestamp + VERIFICATION_TTL_SECONDS,
+    )
+    verification.update(
+        {
+            "challenge_receipt_sha256": challenge_sha256,
+            "previous_verification_receipt_sha256": (
+                previous_verification.get("receipt_sha256")
+                if isinstance(previous_verification, dict)
+                else None
+            ),
+        }
+    )
+    verification["receipt_sha256"] = _receipt_sha256(verification)
+    return verification
+
+
 def _projection(
     *,
     state: dict[str, Any],
@@ -468,64 +721,164 @@ def _projection(
     now_unix: int,
     action: str,
     replayed: bool,
+    selected_pending: dict[str, Any] | None = None,
+    selected_verified: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    pending = state.get("pending_challenge")
-    verified = state.get("verified_receipt")
+    pending_current = sorted(
+        _current_receipts(
+            state["pending_challenges"],
+            runtime_binding=runtime_binding,
+            now_unix=now_unix,
+        ),
+        key=_receipt_order,
+    )
+    verified_current = sorted(
+        _current_receipts(
+            state["verified_receipts"],
+            runtime_binding=runtime_binding,
+            now_unix=now_unix,
+        ),
+        key=_receipt_order,
+    )
     consumption = state.get("last_consumption_receipt")
-    pending_current = _receipt_is_current(
-        pending, runtime_binding=runtime_binding, now_unix=now_unix
+    selected_pending_current = (
+        selected_pending
+        if selected_pending in pending_current
+        else None
     )
-    verified_current = _receipt_is_current(
-        verified, runtime_binding=runtime_binding, now_unix=now_unix
+    selected_verified_current = (
+        selected_verified
+        if selected_verified in verified_current
+        else None
     )
-    if verified_current:
+    if selected_verified_current is not None:
+        projected_pending = None
+        projected_verified = selected_verified_current
         state_name = "verified"
+        gate_open = True
         next_action = "invoke exactly one mutating tool"
-    elif pending_current:
+    elif selected_pending_current is not None:
+        projected_pending = selected_pending_current
+        projected_verified = None
         state_name = "challenge_pending"
+        gate_open = False
         next_action = (
             "call grip_run for transport-roundtrip with action=ack and the "
             "exact challenge_receipt_sha256"
         )
-    elif verified is not None:
+    elif verified_current:
+        projected_pending = pending_current[0] if pending_current else None
+        projected_verified = verified_current[0]
+        state_name = "verified"
+        gate_open = True
+        next_action = "invoke exactly one mutating tool"
+    elif pending_current:
+        projected_pending = pending_current[0]
+        projected_verified = None
+        state_name = "challenge_pending"
+        gate_open = False
+        next_action = (
+            "call grip_run for transport-roundtrip with action=ack and the "
+            "exact challenge_receipt_sha256"
+        )
+    elif state["verified_receipts"] or state["pending_challenges"]:
+        projected_pending = None
+        projected_verified = None
         state_name = (
             "binding_mismatch"
-            if verified.get("runtime_binding") != runtime_binding
+            if any(
+                receipt.get("runtime_binding") != runtime_binding
+                for receipt in (
+                    state["verified_receipts"]
+                    + state["pending_challenges"]
+                )
+            )
             else "stale"
         )
+        gate_open = False
         next_action = "start a new transport handshake"
     elif consumption is not None:
+        projected_pending = None
+        projected_verified = None
         state_name = "consumed"
-        next_action = "start a new transport handshake before another mutation"
+        gate_open = False
+        next_action = (
+            "start a new transport handshake before another mutation"
+        )
     else:
+        projected_pending = None
+        projected_verified = None
         state_name = "missing"
+        gate_open = False
         next_action = "start a new transport handshake"
+
+    shared = _is_shared_pool(scope)
+    does_not_establish = [
+        "authenticated client identity",
+        "application-level success of a mutating tool",
+        "absence of response loss after a mutation",
+        "client instruction compliance",
+        "resistance to compromised same-uid code",
+    ]
+    if shared:
+        does_not_establish.append(
+            "which unlabeled caller owns a pooled verification"
+        )
     return {
         "schema_version": SCHEMA_VERSION,
+        "state_schema_version": STATE_SCHEMA_VERSION,
         "state": state_name,
         "action": action,
         "replayed": replayed,
-        "mutation_gate_open": verified_current,
+        "mutation_gate_open": gate_open,
         "single_use": True,
+        "pool_mode": (
+            "bounded-shared-token-pool" if shared else "single-slot"
+        ),
+        "pending_challenge_count": len(pending_current),
+        "verified_receipt_count": len(verified_current),
+        "pool_limits": (
+            {
+                "pending_challenges": MAX_SHARED_PENDING_CHALLENGES,
+                "verified_receipts": MAX_SHARED_VERIFIED_RECEIPTS,
+            }
+            if shared
+            else {
+                "pending_challenges": 1,
+                "verified_receipts": 1,
+            }
+        ),
         "client_scope_kind": scope["kind"],
         "client_scope_sha256": _sha256_json(scope),
         "challenge_receipt_sha256": (
-            pending.get("receipt_sha256") if pending_current else None
+            projected_pending.get("receipt_sha256")
+            if projected_pending is not None
+            else None
         ),
         "challenge_created_at_unix": (
-            pending.get("created_at_unix") if pending_current else None
+            projected_pending.get("created_at_unix")
+            if projected_pending is not None
+            else None
         ),
         "challenge_expires_at_unix": (
-            pending.get("expires_at_unix") if pending_current else None
+            projected_pending.get("expires_at_unix")
+            if projected_pending is not None
+            else None
         ),
         "verification_receipt_sha256": (
-            verified.get("receipt_sha256") if verified_current else None
+            projected_verified.get("receipt_sha256")
+            if projected_verified is not None
+            else None
         ),
         "verified_at_unix": (
-            verified.get("created_at_unix") if verified_current else None
+            projected_verified.get("created_at_unix")
+            if projected_verified is not None
+            else None
         ),
         "verification_expires_at_unix": (
-            verified.get("expires_at_unix") if verified_current else None
+            projected_verified.get("expires_at_unix")
+            if projected_verified is not None
+            else None
         ),
         "last_consumption_receipt_sha256": (
             consumption.get("receipt_sha256")
@@ -539,13 +892,7 @@ def _projection(
         ),
         "runtime_binding_sha256": _sha256_json(runtime_binding),
         "recommended_next_action": next_action,
-        "does_not_establish": [
-            "authenticated client identity",
-            "application-level success of a mutating tool",
-            "absence of response loss after a mutation",
-            "client instruction compliance",
-            "resistance to compromised same-uid code",
-        ],
+        "does_not_establish": does_not_establish,
     }
 
 
@@ -559,54 +906,66 @@ def begin(
     binding = validate_runtime_binding(runtime_binding)
     timestamp = _timestamp(now_unix)
     with _state_lock():
-        state = _load_state(scope)
-        verified = state.get("verified_receipt")
-        if _receipt_is_current(
-            verified, runtime_binding=binding, now_unix=timestamp
+        state = _prune_state(
+            _load_state(scope),
+            runtime_binding=binding,
+            now_unix=timestamp,
+        )
+        verified = sorted(
+            state["verified_receipts"], key=_receipt_order
+        )
+        pending = sorted(
+            state["pending_challenges"], key=_receipt_order
+        )
+        if not _is_shared_pool(scope):
+            if verified:
+                return _projection(
+                    state=state,
+                    scope=scope,
+                    runtime_binding=binding,
+                    now_unix=timestamp,
+                    action="begin",
+                    replayed=True,
+                    selected_verified=verified[0],
+                )
+            if pending:
+                return _projection(
+                    state=state,
+                    scope=scope,
+                    runtime_binding=binding,
+                    now_unix=timestamp,
+                    action="begin",
+                    replayed=True,
+                    selected_pending=pending[0],
+                )
+        if (
+            _is_shared_pool(scope)
+            and len(pending) >= MAX_SHARED_PENDING_CHALLENGES
         ):
-            return _projection(
-                state=state,
-                scope=scope,
-                runtime_binding=binding,
-                now_unix=timestamp,
-                action="begin",
-                replayed=True,
+            raise TransportRoundtripRequired(
+                "shared transport pending challenge pool is full"
             )
-        pending = state.get("pending_challenge")
-        if _receipt_is_current(
-            pending, runtime_binding=binding, now_unix=timestamp
-        ):
-            return _projection(
-                state=state,
-                scope=scope,
-                runtime_binding=binding,
-                now_unix=timestamp,
-                action="begin",
-                replayed=True,
-            )
-        previous_verified = state.get("verified_receipt")
-        challenge = _receipt_base(
-            kind=CHALLENGE_KIND,
+        previous = verified[-1] if verified else None
+        challenge = _new_challenge(
             scope=scope,
             runtime_binding=binding,
-            created_at_unix=timestamp,
-            expires_at_unix=timestamp + CHALLENGE_TTL_SECONDS,
+            timestamp=timestamp,
+            previous_verification=previous,
         )
-        challenge.update(
-            {
-                "challenge_nonce_sha256": hashlib.sha256(
-                    secrets.token_bytes(32)
-                ).hexdigest(),
-                "previous_verification_receipt_sha256": (
-                    previous_verified.get("receipt_sha256")
-                    if isinstance(previous_verified, dict)
-                    else None
-                ),
-            }
+        state = {
+            **state,
+            "pending_challenges": (
+                [*pending, challenge]
+                if _is_shared_pool(scope)
+                else [challenge]
+            ),
+            "verified_receipts": (
+                verified if _is_shared_pool(scope) else []
+            ),
+        }
+        _write_private_json(
+            _state_path(_sha256_json(scope)), state
         )
-        challenge["receipt_sha256"] = _receipt_sha256(challenge)
-        state = {**state, "pending_challenge": challenge}
-        _write_private_json(_state_path(_sha256_json(scope)), state)
         return _projection(
             state=state,
             scope=scope,
@@ -614,6 +973,7 @@ def begin(
             now_unix=timestamp,
             action="begin",
             replayed=False,
+            selected_pending=challenge,
         )
 
 
@@ -626,71 +986,105 @@ def acknowledge(
 ) -> dict[str, Any]:
     scope = validate_client_scope(client_scope)
     challenge_hash = _validate_sha256(
-        challenge_receipt_sha256, label="challenge_receipt_sha256"
+        challenge_receipt_sha256,
+        label="challenge_receipt_sha256",
     )
     binding = validate_runtime_binding(runtime_binding)
     timestamp = _timestamp(now_unix)
     with _state_lock():
-        state = _load_state(scope)
-        verified = state.get("verified_receipt")
-        if (
-            isinstance(verified, dict)
-            and verified.get("challenge_receipt_sha256") == challenge_hash
-            and _receipt_is_current(
-                verified, runtime_binding=binding, now_unix=timestamp
-            )
+        loaded = _load_state(scope)
+        existing = _verification_for_challenge(
+            loaded["verified_receipts"], challenge_hash
+        )
+        if existing is not None and _receipt_is_current(
+            existing,
+            runtime_binding=binding,
+            now_unix=timestamp,
         ):
             return _projection(
-                state=state,
+                state=loaded,
                 scope=scope,
                 runtime_binding=binding,
                 now_unix=timestamp,
                 action="ack",
                 replayed=True,
+                selected_verified=existing,
             )
-        pending = state.get("pending_challenge")
-        if not isinstance(pending, dict):
+        pending = _receipt_for_hash(
+            loaded["pending_challenges"], challenge_hash
+        )
+        if pending is None:
+            if existing is not None:
+                if existing.get("runtime_binding") != binding:
+                    raise TransportRoundtripError(
+                        "transport verification is bound to a different runtime"
+                    )
+                raise TransportRoundtripError(
+                    "transport verification is stale; begin a new handshake"
+                )
             raise TransportRoundtripError(
                 "transport challenge is missing; begin a new handshake"
-            )
-        if pending.get("receipt_sha256") != challenge_hash:
-            raise TransportRoundtripError(
-                "transport challenge receipt does not match the pending challenge"
             )
         if pending.get("runtime_binding") != binding:
             raise TransportRoundtripError(
                 "transport challenge is bound to a different runtime"
             )
         if not _receipt_is_current(
-            pending, runtime_binding=binding, now_unix=timestamp
+            pending,
+            runtime_binding=binding,
+            now_unix=timestamp,
         ):
             raise TransportRoundtripError(
                 "transport challenge is stale; begin a new handshake"
             )
-        verification = _receipt_base(
-            kind=VERIFICATION_KIND,
+
+        state = _prune_state(
+            loaded,
+            runtime_binding=binding,
+            now_unix=timestamp,
+        )
+        current_verified = sorted(
+            state["verified_receipts"], key=_receipt_order
+        )
+        if (
+            _is_shared_pool(scope)
+            and len(current_verified)
+            >= MAX_SHARED_VERIFIED_RECEIPTS
+        ):
+            raise TransportRoundtripRequired(
+                "shared transport verified receipt pool is full"
+            )
+        previous = (
+            current_verified[-1] if current_verified else None
+        )
+        verification = _new_verification(
             scope=scope,
             runtime_binding=binding,
-            created_at_unix=timestamp,
-            expires_at_unix=timestamp + VERIFICATION_TTL_SECONDS,
+            timestamp=timestamp,
+            challenge_sha256=challenge_hash,
+            previous_verification=previous,
         )
-        verification.update(
-            {
-                "challenge_receipt_sha256": challenge_hash,
-                "previous_verification_receipt_sha256": (
-                    verified.get("receipt_sha256")
-                    if isinstance(verified, dict)
-                    else None
-                ),
-            }
-        )
-        verification["receipt_sha256"] = _receipt_sha256(verification)
+        remaining_pending = [
+            item
+            for item in state["pending_challenges"]
+            if item.get("receipt_sha256") != challenge_hash
+        ]
         state = {
             **state,
-            "pending_challenge": None,
-            "verified_receipt": verification,
+            "pending_challenges": (
+                remaining_pending
+                if _is_shared_pool(scope)
+                else []
+            ),
+            "verified_receipts": (
+                [*current_verified, verification]
+                if _is_shared_pool(scope)
+                else [verification]
+            ),
         }
-        _write_private_json(_state_path(_sha256_json(scope)), state)
+        _write_private_json(
+            _state_path(_sha256_json(scope)), state
+        )
         return _projection(
             state=state,
             scope=scope,
@@ -698,8 +1092,8 @@ def acknowledge(
             now_unix=timestamp,
             action="ack",
             replayed=False,
+            selected_verified=verification,
         )
-
 
 def status(
     *,
@@ -777,22 +1171,30 @@ def consume_verified(
     scope = validate_client_scope(client_scope)
     binding = validate_runtime_binding(runtime_binding)
     name = _validate_text(
-        tool_name, label="transport mutation tool name", maximum_bytes=256
+        tool_name,
+        label="transport mutation tool name",
+        maximum_bytes=256,
     )
     arguments_hash = _validate_sha256(
-        arguments_sha256, label="transport mutation arguments hash"
+        arguments_sha256,
+        label="transport mutation arguments hash",
     )
     timestamp = _timestamp(now_unix)
     with _state_lock():
-        state = _load_state(scope)
-        verified = state.get("verified_receipt")
-        if not _receipt_is_current(
-            verified, runtime_binding=binding, now_unix=timestamp
-        ):
+        state = _prune_state(
+            _load_state(scope),
+            runtime_binding=binding,
+            now_unix=timestamp,
+        )
+        verified_receipts = sorted(
+            state["verified_receipts"], key=_receipt_order
+        )
+        if not verified_receipts:
             raise TransportRoundtripRequired(
-                "mutating MCP calls require a fresh single-use transport verification"
+                "mutating MCP calls require a fresh single-use "
+                "transport verification"
             )
-        assert isinstance(verified, dict)
+        verified = verified_receipts[0]
         consumption = _receipt_base(
             kind=CONSUMPTION_KIND,
             scope=scope,
@@ -802,33 +1204,71 @@ def consume_verified(
         )
         consumption.update(
             {
-                "verification_receipt_sha256": verified["receipt_sha256"],
+                "verification_receipt_sha256": verified[
+                    "receipt_sha256"
+                ],
                 "tool_name": name,
                 "arguments_sha256": arguments_hash,
             }
         )
-        consumption["receipt_sha256"] = _receipt_sha256(consumption)
+        consumption["receipt_sha256"] = _receipt_sha256(
+            consumption
+        )
+        if _is_shared_pool(scope):
+            remaining_verified = [
+                receipt
+                for receipt in verified_receipts
+                if receipt.get("receipt_sha256")
+                != verified["receipt_sha256"]
+            ]
+            remaining_pending = state["pending_challenges"]
+        else:
+            remaining_verified = []
+            remaining_pending = []
         state = {
             **state,
-            "pending_challenge": None,
-            "verified_receipt": None,
+            "pending_challenges": remaining_pending,
+            "verified_receipts": remaining_verified,
             "last_consumption_receipt": consumption,
         }
-        _write_private_json(_state_path(_sha256_json(scope)), state)
+        _write_private_json(
+            _state_path(_sha256_json(scope)), state
+        )
+        does_not_establish = [
+            "authenticated client identity",
+            "application-level success of the admitted mutation",
+            "absence of response loss after the admitted mutation",
+        ]
+        if _is_shared_pool(scope):
+            does_not_establish.append(
+                "which unlabeled caller supplied the consumed verification"
+            )
         return {
             "schema_version": SCHEMA_VERSION,
+            "state_schema_version": STATE_SCHEMA_VERSION,
             "state": "consumed",
             "single_use": True,
+            "pool_mode": (
+                "bounded-shared-token-pool"
+                if _is_shared_pool(scope)
+                else "single-slot"
+            ),
+            "pending_challenge_count": len(
+                remaining_pending
+            ),
+            "verified_receipt_count": len(
+                remaining_verified
+            ),
             "client_scope_kind": scope["kind"],
             "client_scope_sha256": _sha256_json(scope),
             "runtime_binding_sha256": _sha256_json(binding),
-            "verification_receipt_sha256": verified["receipt_sha256"],
-            "consumption_receipt_sha256": consumption["receipt_sha256"],
+            "verification_receipt_sha256": verified[
+                "receipt_sha256"
+            ],
+            "consumption_receipt_sha256": consumption[
+                "receipt_sha256"
+            ],
             "tool_name": name,
             "arguments_sha256": arguments_hash,
-            "does_not_establish": [
-                "authenticated client identity",
-                "application-level success of the admitted mutation",
-                "absence of response loss after the admitted mutation",
-            ],
+            "does_not_establish": does_not_establish,
         }
