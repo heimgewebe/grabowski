@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   t136-refresh:
-    if: github.event_name == 'push' && github.ref_name == 'fix/transport-session-scope-ci-v1' && github.actor != 'github-actions[bot]'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'fix/transport-session-scope-ci-v1' && github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
