@@ -27,6 +27,26 @@ def update_runtime_manifest() -> None:
             "source": "src/grabowski_alert_outbox.py",
         },
     )
+
+    dependency = {
+        "kind": "python_module",
+        "launcher_module": "grabowski_alert_outbox",
+        "spawned_module": "grabowski_ntfy_dispatch",
+    }
+    dependencies = payload["spawn_dependencies"]
+    if dependency in dependencies:
+        raise SystemExit("alert-outbox spawn dependency is already declared")
+    anchor = {
+        "kind": "python_module",
+        "launcher_module": "grabowski_job_finalizer",
+        "spawned_module": "grabowski_ntfy_dispatch",
+    }
+    try:
+        dependency_index = dependencies.index(anchor)
+    except ValueError as exc:
+        raise SystemExit("job-finalizer spawn dependency anchor is missing") from exc
+    dependencies.insert(dependency_index + 1, dependency)
+
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
