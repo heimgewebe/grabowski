@@ -2444,7 +2444,9 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         remaining_existing: dict[str, dict[str, Any]] = {}
         for key in acquisition["resource_keys"]:
             observed = resources.inspect_resource(key)
-            if observed is not None:
+            if observed is not None and observed.get("owner_id") == acquisition[
+                "owner_id"
+            ]:
                 remaining_existing[key] = observed
         if not remaining_existing:
             return {
@@ -2477,7 +2479,7 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     remaining: dict[str, dict[str, Any]] = {}
     for key in keys:
         observed = resources.inspect_resource(key)
-        if observed is not None:
+        if observed is not None and observed.get("owner_id") == owner_id:
             remaining[key] = observed
     if remaining:
         raise BureauPickupError(
