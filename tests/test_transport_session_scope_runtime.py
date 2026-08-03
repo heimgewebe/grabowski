@@ -14,10 +14,74 @@ class TransportSessionScopeRuntimeTests(unittest.TestCase):
         script = textwrap.dedent(
             """
             from pathlib import Path
+            import ast
+            import secrets
             import tempfile
+            import threading
             import types
+            from typing import Any
+            import weakref
 
-            import grabowski_runtime as runtime
+            import grabowski_transport_roundtrip as transport
+
+            repository = Path.cwd()
+            source = repository / "src" / "grabowski_runtime.py"
+            tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+            selected = []
+            state_names = {
+                "_TRANSPORT_SESSION_SCOPE_LOCK",
+                "_TRANSPORT_SESSION_SCOPES",
+            }
+            function_names = {
+                "_validate_runtime_transport_client_scope",
+                "_runtime_transport_client_scope",
+            }
+            for node in tree.body:
+                if isinstance(node, ast.Assign):
+                    names = {
+                        target.id
+                        for target in node.targets
+                        if isinstance(target, ast.Name)
+                    }
+                    if names & state_names:
+                        selected.append(node)
+                elif isinstance(node, ast.AnnAssign):
+                    if isinstance(node.target, ast.Name) and node.target.id in state_names:
+                        selected.append(node)
+                elif isinstance(node, ast.FunctionDef) and node.name in function_names:
+                    selected.append(node)
+
+            def original_scope(context):
+                client_id = getattr(context, "client_id", None)
+                if isinstance(client_id, str) and client_id:
+                    return {"kind": "client_declared_meta", "label": client_id}
+                return {
+                    "kind": "shared_unlabeled",
+                    "label": transport.SHARED_UNLABELED_SCOPE,
+                }
+
+            namespace = {
+                "Any": Any,
+                "secrets": secrets,
+                "threading": threading,
+                "weakref": weakref,
+                "_TRANSPORT_ROUNDTRIP": transport,
+                "_ORIGINAL_TRANSPORT_SCOPE_VALIDATOR": transport.validate_client_scope,
+                "_ORIGINAL_TRANSPORT_SCOPE_RESOLVER": original_scope,
+            }
+            exec(
+                compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec"),
+                namespace,
+            )
+            transport.validate_client_scope = namespace[
+                "_validate_runtime_transport_client_scope"
+            ]
+            runtime = types.SimpleNamespace(
+                _runtime_transport_client_scope=namespace[
+                    "_runtime_transport_client_scope"
+                ],
+                _TRANSPORT_ROUNDTRIP=transport,
+            )
 
             class Session:
                 pass
