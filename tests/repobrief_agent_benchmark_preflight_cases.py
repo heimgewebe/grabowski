@@ -233,7 +233,7 @@ def fake_claude(root: Path, baseline: dict, treatment: dict, *, treatment_uses_m
         "    raise SystemExit(0)\n"
         f"baseline = {baseline_stream!r}\n"
         f"treatment = {treatment_stream!r}\n"
-        "sys.stdout.write(treatment if '--mcp-config' in sys.argv else baseline)\n",
+        "sys.stdout.write(baseline if '--disallowedTools' in sys.argv else treatment)\n",
         encoding="utf-8",
     )
     script.chmod(0o755)
@@ -290,6 +290,9 @@ def fixture_environment(root: Path, *, freshness: str = "fresh") -> dict:
         encoding="utf-8",
     )
     _script, validator_command = validator(root)
+    credential = root / "claude-credential.json"
+    credential.write_text('{"fixture": true}\n', encoding="utf-8")
+    credential.chmod(0o600)
     return {
         "source": source,
         "baseline": baseline,
@@ -298,6 +301,16 @@ def fixture_environment(root: Path, *, freshness: str = "fresh") -> dict:
         "repository_map": repository_map,
         "validator_command": validator_command,
         "claude": fake_claude(root, baseline, treatment),
+        "claude_credential_file": credential,
+    }
+
+
+def live_provider_bindings(environment: dict) -> dict:
+    return {
+        "claude_credential_file": environment["claude_credential_file"],
+        "claude_command_sha256": preflight._sha256_bytes(
+            environment["claude"].read_bytes()
+        ),
     }
 
 
@@ -359,6 +372,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     claude=str(env["claude"]),
                     max_cost_usd=Decimal("1.00"),
                     validator_command=[sys.executable, str(root / "validator.py")],
+                    **live_provider_bindings(env),
                     baseline_fixture=None,
                     treatment_fixture=None,
                 )
@@ -377,6 +391,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     claude=str(env["claude"]),
                     max_cost_usd=Decimal("1.00"),
                     validator_command=[sys.executable, str(root / "validator.py")],
+                    **live_provider_bindings(env),
                 )
 
     def test_source_integrity_detects_mutation(self) -> None:
@@ -440,11 +455,12 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                 claude=str(env["claude"]),
                 max_cost_usd=Decimal("1.00"),
                 validator_command=[sys.executable, str(root / "validator.py")],
+                **live_provider_bindings(env),
             )
             self.assertEqual(report["kind"], preflight.REPORT_KIND)
             self.assertEqual(report["status"], "valid")
             self.assertIsNotNone(report["environment"]["claude"]["sha256"])
-            self.assertIsNotNone(report["runs"]["baseline"]["lenskit_validation_sha256"])
+            self.assertIsNotNone(report["runs"]["baseline"]["repoground_validation_sha256"])
             self.assertEqual(report["cost"]["total_observed_usd"], "0.02")
             self.assertEqual(report["source_before"], report["source_after"])
             self.assertFalse(report["default_promoted"])
@@ -470,6 +486,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     claude=str(env["claude"]),
                     max_cost_usd=Decimal("1.00"),
                     validator_command=[sys.executable, str(root / "validator.py")],
+                    **live_provider_bindings(env),
                 )
 
     def test_preflight_rejects_cost_above_registered_limit(self) -> None:
@@ -487,6 +504,7 @@ class RepoBriefAgentBenchmarkPreflightTests(unittest.TestCase):
                     claude=str(env["claude"]),
                     max_cost_usd=Decimal("1.01"),
                     validator_command=[sys.executable, str(root / "validator.py")],
+                    **live_provider_bindings(env),
                 )
 
     def test_mcp_environment_excludes_provider_credentials(self) -> None:
