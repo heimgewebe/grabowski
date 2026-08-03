@@ -288,6 +288,7 @@ class DeploymentObserverGateTests(unittest.TestCase):
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=True,
             context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=True),
         )
         context = types.SimpleNamespace(client_id=CLIENT_ID)
         with patch.object(operator, "_read_job_metadata", return_value=metadata), patch.object(

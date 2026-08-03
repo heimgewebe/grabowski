@@ -438,8 +438,6 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
-    if tool_name == deployment_observer.OPERATION:
-        return True
     return bool(
         tool_name == "grip_run"
         and isinstance(arguments, dict)

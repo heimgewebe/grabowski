@@ -173,6 +173,28 @@ class CentralTransportGateTests(unittest.TestCase):
         self.assertTrue(result["called"])
         consume_verified.assert_not_called()
 
+    def test_non_marker_deployment_status_is_not_broadly_exempt(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+        ) as consume_verified:
+            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        operator.deployment_observer.OPERATION, {}, context
+                    )
+                )
+        consume_verified.assert_called_once_with(
+            client_scope=META_SCOPE,
+            runtime_binding=BINDING,
+            tool_name=operator.deployment_observer.OPERATION,
+            arguments_sha256=roundtrip.canonical_arguments_sha256({}),
+        )
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
     def test_unknown_tool_annotation_fails_closed_before_effect(self) -> None:
         operator = _load_operator_module()
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
