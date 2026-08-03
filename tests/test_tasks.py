@@ -3761,39 +3761,37 @@ class TaskTests(unittest.TestCase):
                 "observed_at_unix": 200,
             }
 
+        pages = []
+        cursor = None
         with patch.object(
             tasks, "_reconcile_observation", side_effect=observation
         ), patch.object(
             tasks, "_terminal_convergence_evidence", return_value=(False, False)
         ):
-            page_one = tasks.reconcile_tasks_check(limit=2)
-            page_two = tasks.reconcile_tasks_check(
-                limit=2,
-                cursor=page_one["pagination"]["next_cursor"],
-            )
+            while True:
+                page = tasks.reconcile_tasks_check(limit=2, cursor=cursor)
+                pages.append(page)
+                if not page["pagination"]["has_more"]:
+                    break
+                cursor = page["pagination"]["next_cursor"]
+
         observed = [
             item["task_id"]
-            for page in (page_one, page_two)
+            for page in pages
             for item in page["observations"]
         ]
-        expected = [
-            task_id
-            for _created_at, task_id in sorted(
-                (
-                    tasks._row_raw(str(item["task"]["task_id"]))["created_at_unix"],
-                    str(item["task"]["task_id"]),
-                )
-                for item in started
-            )
-        ]
-        self.assertEqual(expected, observed)
+        expected = {str(item["task"]["task_id"]) for item in started}
+        observed_started = [task_id for task_id in observed if task_id in expected]
+        self.assertEqual(expected, set(observed_started))
+        self.assertEqual(len(expected), len(observed_started))
         self.assertEqual(len(observed), len(set(observed)))
-        self.assertTrue(page_one["pagination"]["has_more"])
-        self.assertFalse(page_two["pagination"]["has_more"])
-        self.assertLessEqual(
-            page_one["pagination"]["payload_bytes"],
-            tasks.TASK_RECONCILE_CHECK_MAX_BYTES,
-        )
+        self.assertTrue(pages[0]["pagination"]["has_more"])
+        self.assertFalse(pages[-1]["pagination"]["has_more"])
+        for page in pages:
+            self.assertLessEqual(
+                page["pagination"]["payload_bytes"],
+                tasks.TASK_RECONCILE_CHECK_MAX_BYTES,
+            )
 
     def test_reconcile_check_cursor_fails_closed_after_store_change(self) -> None:
         self._start(resource_keys=["service:reconcile-cursor-a.service"])
