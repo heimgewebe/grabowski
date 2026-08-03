@@ -122,6 +122,10 @@
     "grabowski_execution_governor_summary",
     "grabowski_connector_transport_diagnostics",
     "grabowski_operator_recall_export",
+    "grabowski_context_fabric_plan",
+    "grabowski_context_fabric_compose",
+    "grabowski_context_fabric_explain",
+    "grabowski_context_fabric_compare",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",
     "grabowski_bureau_task_propose",
@@ -375,6 +379,10 @@
     {
       "module": "grabowski_recall",
       "source": "src/grabowski_recall.py"
+    },
+    {
+      "module": "grabowski_context_fabric",
+      "source": "src/grabowski_context_fabric.py"
     },
     {
       "module": "grabowski_bureau_leases",

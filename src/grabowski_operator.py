@@ -724,6 +724,7 @@ def _install_deployment_admission_gate() -> None:
         if (
             observer_evidence is not None
             and observer_evidence.get("marker_bound") is True
+            and _tool_read_only_hint(tool) is True
         ):
             current_observer_marker = _read_deployment_admission_marker()
             try:

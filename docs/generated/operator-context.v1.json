@@ -1516,6 +1516,50 @@
       "tool": "grabowski_operator_recall_export"
     },
     {
+      "category": "context-fabric",
+      "description": "Plan one evidence-bound operator context read for pr, bureau or deployment.",
+      "effects": [],
+      "id": "grabowski_context_fabric_plan",
+      "purpose": "Plan one evidence-bound operator context read for the pr, bureau or deployment profile without composing claims.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_plan"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Compose and pack one fail-closed, authority-bound operator context.",
+      "effects": [],
+      "id": "grabowski_context_fabric_compose",
+      "purpose": "Compose and pack one fail-closed operator context that binds caller-supplied observations to their owning authority without copying lifecycle truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_compose"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Explain claim inclusion, authority and freshness for one bound context.",
+      "effects": [],
+      "id": "grabowski_context_fabric_explain",
+      "purpose": "Explain claim inclusion, authority, freshness and preserved contradictions for one digest-bound operator context.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_explain"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Compare two digest-bound contexts for one target without ranking them.",
+      "effects": [],
+      "id": "grabowski_context_fabric_compare",
+      "purpose": "Compare two digest-bound operator contexts for one target without ranking, resolving or approving either.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_compare"
+    },
+    {
       "category": "bureau",
       "description": "Record one source-bound Bureau candidate through the canonical typed intake contract.",
       "effects": [
@@ -2542,6 +2586,10 @@
       "grabowski_execution_governor_summary",
       "grabowski_connector_transport_diagnostics",
       "grabowski_operator_recall_export",
+      "grabowski_context_fabric_plan",
+      "grabowski_context_fabric_compose",
+      "grabowski_context_fabric_explain",
+      "grabowski_context_fabric_compare",
       "grabowski_bureau_candidate_record",
       "grabowski_bureau_candidate_assess",
       "grabowski_bureau_task_propose",
@@ -2822,6 +2870,10 @@
         "source": "src/grabowski_recall.py"
       },
       {
+        "module": "grabowski_context_fabric",
+        "source": "src/grabowski_context_fabric.py"
+      },
+      {
         "module": "grabowski_bureau_leases",
         "source": "src/grabowski_bureau_leases.py"
       },
@@ -2971,7 +3023,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "2ac90c4367aa2f15a6ccd8ebf8391936d1e849d3f10a6021328aebc53b938eec"
+      "sha256": "06c6f68b3046e9fd6d5a752203c3170e4400d2f2b253d9fe7693e2abfbfc7483"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -2979,10 +3031,10 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "df17ca84141d0e35917daf987490a549c44fbe37756c7f9f46f81d8a5033473c"
+      "sha256": "88bf52d26bc4b59f0bd2d906dd3135dee41d17d65df3e2652c935a732a38188e"
     },
     "runtime_sources": {
-      "src/grabowski_agent_bootstrap.py": "2d63ccd228198388033b116049dcc00ab3a07a52f1e62e933e6a5cda81e1d888",
+      "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
       "src/grabowski_agent_competition.py": "d5a7aec2dec626b25b71e0e84e59980544cc8af1ee6ba19f011a7d413d8888d6",
       "src/grabowski_agent_role.py": "de2ab92d1ef5d6cf89d3dd9db507a22dede801b22e4cd810d9bfd4c3ebd9497a",
       "src/grabowski_agent_sandbox.py": "e0dc499977a3e01acb8c0d8b96897e5c9bac987aa66489fd7fa92be9519dcbf7",
@@ -2999,7 +3051,7 @@
       "src/grabowski_bureau_intake.py": "43eb055d3904508128fa86b02f5a94980ee5d648f8f40cd6f95da3d801f69a3f",
       "src/grabowski_bureau_leases.py": "cce8133d87db6a517ca0226537030f64c30054b862b7c95fb4a5a045a3566cb3",
       "src/grabowski_bureau_pickup.py": "be3aa4d95a26e12521d982c8472d86583e30410ed548fa34979430d2faa0338a",
-      "src/grabowski_capabilities.py": "2ac90c4367aa2f15a6ccd8ebf8391936d1e849d3f10a6021328aebc53b938eec",
+      "src/grabowski_capabilities.py": "06c6f68b3046e9fd6d5a752203c3170e4400d2f2b253d9fe7693e2abfbfc7483",
       "src/grabowski_checkout_binding_reconciler.py": "6198f9614b41f67412fec575410fa2b2fa63ff0fcc0db349cce55c4c29950733",
       "src/grabowski_checkouts.py": "7153fadf2934c6b8bb2722354a66557c88bfdc078db8534b015ab9e7cf7c3123",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
@@ -3010,6 +3062,7 @@
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_connector_contract.py": "c981886d8864e9d8ecb6845369ff06ab25dffcee8552d6f94e05ec86e2bd9627",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
+      "src/grabowski_context_fabric.py": "38f3d83511a8e0e6f8b8faaf43230df1466693f265f9bef70dadfe1ea3a97b95",
       "src/grabowski_convergence.py": "34499a7982324e24563a393712067248a4c570a0111b29c3ac4647bdba172eb6",
       "src/grabowski_current_work.py": "387c3c15e70b0593d1964588d89156ed6cc324a74764d9bc5e3e717af5866441",
       "src/grabowski_current_work_surface.py": "baaa3c56b971e52abeec8c70af2c5f846962f0a5970c81a28a1c76726c0af8a1",
@@ -3029,14 +3082,14 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "f3dae0b3a03db613217c997a4b430afb943e8ee419fdfae81e1631230c3425be",
+      "src/grabowski_mcp.py": "173c721fd24b1e8dd8e3c3ae76859b1c29704077338d61bc35e313b2993a5da7",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "2bdde504493d793c9db8c6830b6c30e70d173761023d17932ee03e019fce7321",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "982bc06d4e4be7823fcc7613df01d39294ebb2b76d2ed378f412e762191dfbc5",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
-      "src/grabowski_operator.py": "e545f38db52a7b4f07fff2fc020aa64a3594f633816ce2e722a06cb5fd66d4ad",
+      "src/grabowski_operator.py": "5d767bc0e09bcb48d0607df2290e52492a31dab703be3ac51913f25c2e9a391d",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
       "src/grabowski_operator_relay.py": "3f314d82bb6c3c7b91eff774b487088e25ec44372512d50936eb18f199eaa02c",
@@ -3051,7 +3104,7 @@
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "c1e46bd5b921834a89325fdffe4edba8f716369e6edca3401d230d736f3cfdae",
       "src/grabowski_resources.py": "c17bf781f106072368753589bfac855bc216c2147c2978e748f70449a12f3c9a",
-      "src/grabowski_runtime.py": "a8c3cbbea0f017e73a5123f077d07b8bd680aae9015097f2ec91b2d830b94be6",
+      "src/grabowski_runtime.py": "d278ab9435258e8050f7f9acd98f320ea361f6043870626ab18d1d46ff7d51e8",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "3db37b414aab89418132c722423c0a38c103ed745d62c17036f62e0ef5ad42ff",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
