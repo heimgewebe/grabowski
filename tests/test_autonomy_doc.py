@@ -21,7 +21,7 @@ class AutonomyDoctrineDocTests(unittest.TestCase):
             self.assertIn(phrase, self.text)
 
     def test_organs_are_helpers_not_universal_gates(self) -> None:
-        for organ in ("Bureau", "Cabinet", "Chronik", "Plexer", "Lenskit", "Vibe-Lab"):
+        for organ in ("Bureau", "Cabinet", "Chronik", "Plexer", "RepoGround", "Vibe-Lab"):
             self.assertIn(organ, self.text)
         for phrase in (
             "Hilfsorgane mit",

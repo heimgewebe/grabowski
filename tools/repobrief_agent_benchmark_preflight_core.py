@@ -1063,17 +1063,17 @@ def _validate_receipt_external(
             env=_unprivileged_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        raise PreflightError("Lenskit receipt validator could not run") from exc
+        raise PreflightError("RepoGround receipt validator could not run") from exc
     if len(completed.stdout) > MAX_VALIDATOR_OUTPUT_BYTES or len(completed.stderr) > MAX_VALIDATOR_OUTPUT_BYTES:
-        raise PreflightError("Lenskit receipt validator output is oversized")
+        raise PreflightError("RepoGround receipt validator output is oversized")
     if completed.returncode != 0:
-        raise PreflightError("Lenskit receipt validation failed")
+        raise PreflightError("RepoGround receipt validation failed")
     try:
         value = json.loads(completed.stdout.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PreflightError("Lenskit receipt validator returned invalid JSON") from exc
+        raise PreflightError("RepoGround receipt validator returned invalid JSON") from exc
     if not isinstance(value, dict) or value.get("status") != "valid":
-        raise PreflightError("Lenskit receipt validator did not confirm validity")
+        raise PreflightError("RepoGround receipt validator did not confirm validity")
     return value
 
 
@@ -1424,7 +1424,7 @@ def execute_preflight(
                     "receipt": str(receipt_paths[condition]),
                     "receipt_sha256": _sha256_json(receipts[condition]),
                     "transcript": receipts[condition]["transcript"],
-                    "lenskit_validation_sha256": (
+                    "repoground_validation_sha256": (
                         None
                         if synthetic
                         else _sha256_json(validations[condition])
