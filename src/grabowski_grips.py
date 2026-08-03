@@ -18,6 +18,7 @@ import grabowski_repobrief
 import grabowski_grip_orchestration
 import grabowski_convergence
 import grabowski_client_snapshot
+import grabowski_transport_roundtrip
 import grabowski_operator_obligation
 import grabowski_worktree_ensure
 import grabowski_merge_guard
@@ -323,6 +324,23 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="connector_snapshot_bind",
     ),
+    "transport-roundtrip": GripSpec(
+        name="transport-roundtrip",
+        version="1.0",
+        summary=(
+            "Issue or acknowledge one client-scope- and runtime-bound challenge so the "
+            "central operator gate can require a fresh response roundtrip before mutation."
+        ),
+        effect=MUTATING,
+        required_parameters=("action",),
+        acceptance_ids=(
+            "client-scope-bound",
+            "runtime-contract-bound",
+            "response-roundtrip",
+            "private-receipt-persisted",
+        ),
+        runner="transport_roundtrip",
+    ),
     "convergence-assess": GripSpec(
         name="convergence-assess",
         version="1.0",
@@ -498,6 +516,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "bureau-pickup-status",
         "bureau-pickup-release",
         "connector-snapshot-bind",
+        "transport-roundtrip",
         "convergence-assess",
         "gate-evidence-preflight",
         "convergence-state-classify",
@@ -533,6 +552,7 @@ GRIP_SURFACE_TARGETS = {
     "bureau-pickup-status": "one coordinated Bureau pickup status and lease projection",
     "bureau-pickup-release": "one terminal coordinated pickup lease release",
     "connector-snapshot-bind": "one connector client snapshot receipt",
+    "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
     "convergence-state-classify": "bounded historical convergence state records",
@@ -566,6 +586,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
     "bureau-pickup-release": (
         "read bureau-pickup-status for the exact run and inspect the release receipt; "
         "never substitute generic resource release or force-release"
+    ),
+    "transport-roundtrip": (
+        "run action=begin and acknowledge the exact challenge when one is returned; each "
+        "verification is consumed by one mutation, changes no product target, and grants no retry "
+        "authority after a later ambiguous mutation"
     ),
 }
 MECHANIC_NORMAL_GRIPS = frozenset(
@@ -2792,6 +2817,102 @@ def _run_connector_snapshot_bind(
         output["receipt_status"] = "blocked"
         output["decision"] = "blocked"
         output["blocked_reasons"] = ["connector_snapshot_mismatch"]
+    return output
+
+
+def _run_transport_roundtrip(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    allowed = {
+        "action",
+        "challenge_receipt_sha256",
+        "_server_transport_client_scope",
+        "_server_transport_runtime_binding",
+    }
+    unknown = sorted(set(parameters) - allowed)
+    if unknown:
+        raise GripPreflightError(
+            "unknown transport roundtrip field(s): " + ", ".join(unknown)
+        )
+    action = parameters.get("action")
+    client_scope = parameters.get("_server_transport_client_scope")
+    runtime_binding = parameters.get("_server_transport_runtime_binding")
+    if action not in {"begin", "ack"}:
+        raise GripPreflightError("action must be begin or ack")
+    try:
+        scope = grabowski_transport_roundtrip.validate_client_scope(
+            client_scope
+        )
+        binding = grabowski_transport_roundtrip.validate_runtime_binding(
+            runtime_binding
+        )
+        if action == "begin":
+            if parameters.get("challenge_receipt_sha256") is not None:
+                raise GripPreflightError(
+                    "action=begin must not include challenge_receipt_sha256"
+                )
+            output = grabowski_transport_roundtrip.begin(
+                client_scope=scope,
+                runtime_binding=binding,
+            )
+        else:
+            challenge_receipt_sha256 = parameters.get(
+                "challenge_receipt_sha256"
+            )
+            if not isinstance(challenge_receipt_sha256, str):
+                raise GripPreflightError(
+                    "action=ack requires challenge_receipt_sha256"
+                )
+            output = grabowski_transport_roundtrip.acknowledge(
+                client_scope=scope,
+                challenge_receipt_sha256=challenge_receipt_sha256,
+                runtime_binding=binding,
+            )
+    except grabowski_transport_roundtrip.TransportRoundtripError as exc:
+        _check(receipt, "response-roundtrip", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except OSError as exc:
+        _check(
+            receipt,
+            "response-roundtrip",
+            "fail",
+            f"state-operation-error:{type(exc).__name__}",
+        )
+        raise GripActionError(
+            "transport roundtrip state operation failed"
+        ) from exc
+    _check(
+        receipt,
+        "client-scope-bound",
+        "pass",
+        f"{output['client_scope_kind']}:{output['client_scope_sha256']}",
+    )
+    _check(
+        receipt,
+        "runtime-contract-bound",
+        "pass",
+        output["runtime_binding_sha256"],
+    )
+    _check(
+        receipt,
+        "response-roundtrip",
+        "pass" if output["mutation_gate_open"] else "skip",
+        output["state"],
+    )
+    receipt_hash = (
+        output.get("verification_receipt_sha256")
+        or output.get("challenge_receipt_sha256")
+    )
+    _check(
+        receipt,
+        "private-receipt-persisted",
+        "pass",
+        str(receipt_hash),
+    )
     return output
 
 
@@ -8066,6 +8187,7 @@ _RUNNERS = {
     "bureau_pickup_status": _run_bureau_pickup_status,
     "bureau_pickup_release": _run_bureau_pickup_release,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
+    "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
     "gate_evidence_preflight": _run_gate_evidence_preflight,
     "convergence_state_classify": _run_convergence_state_classify,
