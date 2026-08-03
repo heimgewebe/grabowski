@@ -75,10 +75,17 @@ def _validate_runtime_transport_client_scope(value: Any) -> dict[str, str]:
 
 
 def _runtime_transport_client_scope(ctx: Any) -> dict[str, str]:
-    """Prefer declared client metadata, then isolate unlabeled live MCP sessions."""
+    """Prefer declared client metadata, then isolate unlabeled stateful sessions."""
     declared_scope = _ORIGINAL_TRANSPORT_SCOPE_RESOLVER(ctx)
     if declared_scope["kind"] != "shared_unlabeled" or ctx is None:
         return declared_scope
+    try:
+        if bool(ctx.fastmcp.settings.stateless_http):
+            return declared_scope
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        # Older or synthetic contexts without transport settings are treated as
+        # stateful only when they still expose a stable weak-referenceable session.
+        pass
     try:
         session = ctx.session
     except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -102,7 +109,7 @@ def _runtime_transport_client_scope(ctx: Any) -> dict[str, str]:
 
 # The central gate and the roundtrip grip both resolve through these module
 # functions at request time. Install the extension before the HTTP runtime is
-# configured so one session owns its own single-use challenge and receipt.
+# configured so one stateful session owns its single-use challenge and receipt.
 _TRANSPORT_ROUNDTRIP.validate_client_scope = _validate_runtime_transport_client_scope
 grabowski_operator_core.base._transport_roundtrip_client_scope = (
     _runtime_transport_client_scope
