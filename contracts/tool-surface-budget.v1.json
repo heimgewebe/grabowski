@@ -521,6 +521,98 @@
         "tool": "grabowski_coding_agent_route"
       }
     },
+    "grabowski_context_fabric_compare": {
+      "evidence_refs": [
+        "candidate:candidate-9c4007c1d488fb9bd0c04226",
+        "docs:operator-context-fabric-v1.md",
+        "tests:tests/test_context_fabric.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only a digest-bound difference report between two contexts for one identical target binding and asserts neither progress, regression nor approval.",
+        "evidence": "Mandatory digest verification of both inputs, fail-closed profile and binding mismatch codes, no ranking field, preserved contradiction counts and explicit does_not_establish entries."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Returning the difference from the compose surface was rejected because compose would then accept a prior result as input and blur the boundary between composing bound claims and judging change across two sealed contexts.",
+      "rationale": "Context drift comparison is a distinct read authority over two already sealed contexts. Keeping it separate prevents the composition surface from ever consuming its own output as a truth source.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "context-fabric",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_context_fabric_compare"
+      }
+    },
+    "grabowski_context_fabric_compose": {
+      "evidence_refs": [
+        "candidate:candidate-9c4007c1d488fb9bd0c04226",
+        "docs:operator-context-fabric-v1.md",
+        "tests:tests/test_context_fabric.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool binds and labels caller-supplied observations from declared authorities and never reads, derives or persists pull-request, Bureau or deployment lifecycle truth itself.",
+        "evidence": "Pure in-process composition, fixed three-profile registry, per-source claim-type allowlists, fail-closed missing-binding and missing-authority codes, preserved contradictions, secret-key rejection and a sealed context digest."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Extending grabowski_operator_recall_export was rejected because recall builds unbound derived memories from unverified caller records, whereas this surface must fail closed on an incomplete target binding and refuse claim types the declared authority does not own.",
+      "rationale": "Composing an operator context requires a target-bound, fail-closed authority boundary that no existing read tool expresses; the existing recall and repoground pack surfaces neither bind a target nor preserve cross-authority contradictions.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "context-fabric",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_context_fabric_compose"
+      }
+    },
+    "grabowski_context_fabric_explain": {
+      "evidence_refs": [
+        "candidate:candidate-9c4007c1d488fb9bd0c04226",
+        "docs:operator-context-fabric-v1.md",
+        "tests:tests/test_context_fabric.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool explains an existing sealed context and adds no claim, no status and no authority beyond what the composed context already carries.",
+        "evidence": "Mandatory digest verification, per-claim inclusion reason bound to the profile source registry, re-read pointers to the owning authority tool and full does_not_establish passthrough."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Embedding the explanation inside every composed context was rejected because it would enlarge each context payload and mix the packed evidence surface with an operator-facing rationale shape.",
+      "rationale": "Explanation has a materially distinct per-claim response shape that keeps composed contexts compact while making authority, freshness and contradiction reasoning inspectable.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "context-fabric",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_context_fabric_explain"
+      }
+    },
+    "grabowski_context_fabric_plan": {
+      "evidence_refs": [
+        "candidate:candidate-9c4007c1d488fb9bd0c04226",
+        "docs:operator-context-fabric-v1.md",
+        "tests:tests/test_context_fabric.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool returns only the declared preconditions of one profile and composes nothing, so it can be called before any authoritative source has been read.",
+        "evidence": "No observation input, explicit missing-binding-field list, required and optional source separation, declared freshness bands and enumerated fail-closed conditions."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Letting callers discover the requirements from a failed compose call was rejected because it forces a fail-closed result to double as documentation and hides optional sources that were never supplied.",
+      "rationale": "Planning must answer which bindings and which authorities are required before any source is read; that question has no observation input and therefore a materially different call shape from composition.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "context-fabric",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_context_fabric_plan"
+      }
+    },
     "grabowski_current_work": {
       "evidence_refs": [
         "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T068",
