@@ -369,6 +369,54 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertIn("worktree-convergence-required", result["blocker_codes"])
         self.assertNotIn("foreign-live-coordination", result["blocker_codes"])
 
+    def test_exact_expired_owner_target_checkout_does_not_self_block(self) -> None:
+        linked = self._linked(state="unclassified_clean")
+        linked["head"] = "a" * 40
+        target_path = str(linked["path"])
+        branch = str(linked["branch"])
+        scope = {
+            "repository": str(self.repo),
+            "worktree": target_path,
+            "branch": branch,
+            "head": "a" * 40,
+        }
+
+        result = self._assess(
+            [self._main(), linked],
+            requested_scope=scope,
+            target_path=target_path,
+            branch=branch,
+            source_kind="expired_same_owner_lease",
+            source_id="f" * 64,
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["blockers"], [])
+
+    def test_expired_owner_target_binding_mismatch_still_requires_convergence(self) -> None:
+        linked = self._linked(state="unclassified_clean")
+        linked["head"] = "a" * 40
+        target_path = str(linked["path"])
+        branch = str(linked["branch"])
+        scope = {
+            "repository": str(self.repo),
+            "worktree": target_path,
+            "branch": branch,
+            "head": "b" * 40,
+        }
+
+        result = self._assess(
+            [self._main(), linked],
+            requested_scope=scope,
+            target_path=target_path,
+            branch=branch,
+            source_kind="expired_same_owner_lease",
+            source_id="f" * 64,
+        )
+
+        self.assertEqual(result["decision"], "converge_first")
+        self.assertIn("worktree-convergence-required", result["blocker_codes"])
+
     def test_clean_terminal_or_orphaned_state_requires_convergence_first(self) -> None:
         terminal = self._assess(
             [self._main(), self._linked(state="cleanup_candidate")]

@@ -1058,6 +1058,47 @@ def _lease_identity_metadata(
     return {key: value for key, value in metadata.items() if key not in ignored}
 
 
+def _expired_same_owner_repository_reentry(
+    resource_key: str,
+    *,
+    owner_id: str,
+    purpose: str,
+    metadata: dict[str, Any],
+    now: int,
+) -> dict[str, str] | None:
+    """Bind an expired same-owner retry to its unchanged exact worktree scope."""
+    with _database() as connection:
+        row = connection.execute(
+            "SELECT * FROM leases WHERE resource_key=?", (resource_key,)
+        ).fetchone()
+    if (
+        row is None
+        or row["owner_id"] != owner_id
+        or int(row["expires_at_unix"]) > now
+        or row["purpose"] != purpose
+    ):
+        return None
+    observed_metadata = _row_metadata(row)
+    _, observed_sha256 = _metadata(observed_metadata)
+    if row["metadata_sha256"] != observed_sha256:
+        raise RuntimeError(
+            f"Resource lease metadata integrity mismatch: {resource_key}"
+        )
+    if _lease_identity_metadata(
+        observed_metadata, preserve_task_attempt=False
+    ) != _lease_identity_metadata(metadata, preserve_task_attempt=False):
+        return None
+    scope = _scope_manifest_from_metadata(metadata, required=True)
+    if resource_key != f"repo:{scope['repository']}":
+        return None
+    return {
+        "target_path": scope["worktree"],
+        "branch": scope["branch"],
+        "source_kind": "expired_same_owner_lease",
+        "source_id": observed_sha256,
+    }
+
+
 def _scope_manifest_from_metadata(metadata: dict[str, Any], *, required: bool) -> dict[str, Any] | None:
     value = metadata.get("scope_manifest")
     if value is None and not required:
@@ -3765,17 +3806,26 @@ def acquire_resources(
                 and existing.get("owner_id") != owner
             ):
                 assessor = admission_assessor or work_admission.require_repository_admission
+                requested_repository_scope = (
+                    scope
+                    if isinstance(scope, dict)
+                    and f"repo:{scope.get('repository')}" == broad_key
+                    else None
+                )
+                reentry_binding = _expired_same_owner_repository_reentry(
+                    broad_key,
+                    owner_id=owner,
+                    purpose=lease_purpose,
+                    metadata=sanitized_metadata,
+                    now=now,
+                )
                 assessment = assessor(
                     mode=admission_mode,
                     repo=repository,
                     owner_id=owner,
                     operation="broad_repository_lease",
-                    requested_scope=(
-                        scope
-                        if isinstance(scope, dict)
-                        and f"repo:{scope.get('repository')}" == broad_key
-                        else None
-                    ),
+                    requested_scope=requested_repository_scope,
+                    **({} if reentry_binding is None else reentry_binding),
                 )
                 if not isinstance(assessment, dict):
                     raise RuntimeError("work admission assessor returned invalid evidence")

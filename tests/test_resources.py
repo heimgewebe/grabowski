@@ -3162,6 +3162,65 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(current["metadata_json"], original["metadata_json"])
         self.assertEqual(current["metadata_sha256"], original["metadata_sha256"])
 
+    def test_expired_same_owner_repository_reentry_binds_exact_target(self) -> None:
+        (self.root / ".git").mkdir()
+        key = f"repo:{self.root}"
+        scope = self.scope_manifest(
+            self.root, name="expired-admission-reentry", path=self.root
+        )
+        metadata = {
+            "scope_manifest": scope,
+            "scope_manifest_complete": True,
+        }
+
+        first = resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="stable expired repository work",
+            ttl_seconds=60,
+            metadata=metadata,
+            admission_assessor=lambda **_kwargs: {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "a" * 64,
+                "read_only": True,
+            },
+        )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=0 WHERE resource_key=?",
+                (key,),
+            )
+
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "decision": "allow",
+                "assessment_sha256": "b" * 64,
+                "read_only": True,
+            }
+
+        second = resources.acquire_resources(
+            "owner-a",
+            [key],
+            purpose="stable expired repository work",
+            ttl_seconds=60,
+            metadata=metadata,
+            admission_assessor=assessor,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["target_path"], scope["worktree"])
+        self.assertEqual(calls[0]["branch"], scope["branch"])
+        self.assertEqual(
+            calls[0]["source_kind"], "expired_same_owner_lease"
+        )
+        self.assertEqual(calls[0]["source_id"], first["leases"][0]["metadata_sha256"])
+        self.assertEqual(second["reclaimed"][0]["previous_owner_id"], "owner-a")
+
     def test_work_admission_metadata_is_not_caller_controlled(self) -> None:
         with self.assertRaisesRegex(ValueError, "not a public authority surface"):
             resources.acquire_resources(
