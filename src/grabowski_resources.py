@@ -1058,6 +1058,17 @@ def _lease_identity_metadata(
     return {key: value for key, value in metadata.items() if key not in ignored}
 
 
+def _expired_same_owner_reentry_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+    """Capture only persisted lease identity relevant to safe reacquisition."""
+    return {
+        "resource_key": row["resource_key"],
+        "owner_id": row["owner_id"],
+        "purpose": row["purpose"],
+        "expires_at_unix": int(row["expires_at_unix"]),
+        "metadata_sha256": row["metadata_sha256"],
+    }
+
+
 def _expired_same_owner_repository_reentry(
     resource_key: str,
     *,
@@ -1096,7 +1107,7 @@ def _expired_same_owner_repository_reentry(
         "branch": scope["branch"],
         "source_kind": "expired_same_owner_lease",
         "source_id": observed_sha256,
-        "expected_lease": _release_lease_snapshot(row),
+        "expected_lease": _expired_same_owner_reentry_snapshot(row),
     }
 
 
@@ -3891,7 +3902,8 @@ def acquire_resources(
                     expected_reentry = expired_reentry_expectations.get(key)
                     if (
                         expected_reentry is not None
-                        and _release_lease_snapshot(row) != expected_reentry
+                        and _expired_same_owner_reentry_snapshot(row)
+                        != expected_reentry
                     ):
                         raise RuntimeError(
                             f"Expired same-owner lease changed before reacquisition: {key}"

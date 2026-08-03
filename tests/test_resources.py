@@ -3253,8 +3253,8 @@ class ResourceTests(unittest.TestCase):
         def assessor(**_kwargs: object) -> dict[str, object]:
             with resources._database() as connection:
                 connection.execute(
-                    "UPDATE leases SET updated_at_unix=2 WHERE resource_key=?",
-                    (key,),
+                    "UPDATE leases SET metadata_sha256=? WHERE resource_key=?",
+                    ("f" * 64, key),
                 )
             return {
                 "schema_version": 1,

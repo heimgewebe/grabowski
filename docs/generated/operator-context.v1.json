@@ -3030,7 +3030,7 @@
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "c1e46bd5b921834a89325fdffe4edba8f716369e6edca3401d230d736f3cfdae",
-      "src/grabowski_resources.py": "52c761a8d07339997964a3696d9cb65845b11aacde9aeb4704adb8736b9faaa3",
+      "src/grabowski_resources.py": "7fc5b83c8d3e36b300feaf1c1cb422d8e0d087500abb8fd6e4a02e8115b0028f",
       "src/grabowski_runtime.py": "a8c3cbbea0f017e73a5123f077d07b8bd680aae9015097f2ec91b2d830b94be6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "3db37b414aab89418132c722423c0a38c103ed745d62c17036f62e0ef5ad42ff",
@@ -3041,7 +3041,7 @@
       "src/grabowski_tasks.py": "7383e6b8a643838fdd2135b6216dd41907f4ca2dadd9b2e2b66cdffad8f3285f",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
-      "src/grabowski_work_admission.py": "104de31440c6b752164f51aad45f973d5a9c9e3b8b8dd48f1d725a87a89e2f32",
+      "src/grabowski_work_admission.py": "6fd0bdd8d32b3f0dedf508d7b881cd88b15c22b56e1daac6f27cb7c24d9557e6",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "815914a20a0972210bdfd4ceb5774e2ca0d409c03858322a2fcdf8bf9219be3f",
       "src/grabowski_worktree_ensure.py": "7a344edca97ef5342bed109f91f3e9a2778bb652217b104ff7b88f0cfabcb1e4"
