@@ -242,6 +242,7 @@ class DeploymentObserverGateTests(unittest.TestCase):
             operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
                 is_async=False,
                 context_kwarg="ctx",
+                annotations=types.SimpleNamespace(readOnlyHint=True),
             )
             with patch.object(operator, "_read_job_metadata", return_value=metadata), patch.object(
                 operator, "_job_directory", return_value=directory
@@ -261,6 +262,67 @@ class DeploymentObserverGateTests(unittest.TestCase):
                 self.assertEqual(0, operator._deployment_admission_active_tool_calls())
         finally:
             temporary.cleanup()
+
+    def test_marker_bound_observer_requires_explicit_read_only_annotation(self) -> None:
+        cases = (
+            ("missing", False, None),
+            ("false", True, types.SimpleNamespace(readOnlyHint=False)),
+        )
+        for label, is_async, annotations in cases:
+            with self.subTest(label=label):
+                (
+                    operator,
+                    capability,
+                    metadata,
+                    marker,
+                    directory,
+                    context,
+                    temporary,
+                ) = self._active_observer_fixture()
+                calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+                async def original(*args, **kwargs):
+                    calls.append((args, kwargs))
+                    return {"called": True}
+
+                try:
+                    operator.mcp._tool_manager.call_tool = original
+                    tool_values = {
+                        "is_async": is_async,
+                        "context_kwarg": "ctx",
+                    }
+                    if annotations is not None:
+                        tool_values["annotations"] = annotations
+                    operator.mcp._tool_manager.get_tool = (
+                        lambda _name, values=tool_values: types.SimpleNamespace(**values)
+                    )
+                    with patch.object(
+                        operator, "_read_job_metadata", return_value=metadata
+                    ), patch.object(
+                        operator, "_job_directory", return_value=directory
+                    ), patch.object(
+                        operator, "_read_deployment_admission_marker", return_value=marker
+                    ):
+                        operator._configure_http_runtime()
+                        with self.assertRaisesRegex(
+                            RuntimeError, "rejects new tool calls"
+                        ):
+                            asyncio.run(
+                                operator.mcp._tool_manager.call_tool(
+                                    observer.OPERATION,
+                                    {
+                                        "unit": UNIT,
+                                        "deployment_observer_capability": capability,
+                                    },
+                                    context,
+                                )
+                            )
+                    self.assertEqual([], calls)
+                    self.assertEqual(
+                        0, operator._deployment_admission_active_tool_calls()
+                    )
+                finally:
+                    temporary.cleanup()
 
     def test_pre_marker_observer_remains_a_normal_counted_read(self) -> None:
         operator = _load_operator_module()
