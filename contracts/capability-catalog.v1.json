@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "2ac90c4367aa2f15a6ccd8ebf8391936d1e849d3f10a6021328aebc53b938eec",
+  "capability_source_sha256": "06c6f68b3046e9fd6d5a752203c3170e4400d2f2b253d9fe7693e2abfbfc7483",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "df17ca84141d0e35917daf987490a549c44fbe37756c7f9f46f81d8a5033473c",
+  "contract_sha256": "88bf52d26bc4b59f0bd2d906dd3135dee41d17d65df3e2652c935a732a38188e",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1526,6 +1526,50 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_operator_recall_export"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Plan one evidence-bound operator context read for pr, bureau or deployment.",
+      "effects": [],
+      "id": "grabowski_context_fabric_plan",
+      "purpose": "Plan one evidence-bound operator context read for the pr, bureau or deployment profile without composing claims.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_plan"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Compose and pack one fail-closed, authority-bound operator context.",
+      "effects": [],
+      "id": "grabowski_context_fabric_compose",
+      "purpose": "Compose and pack one fail-closed operator context that binds caller-supplied observations to their owning authority without copying lifecycle truth.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_compose"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Explain claim inclusion, authority and freshness for one bound context.",
+      "effects": [],
+      "id": "grabowski_context_fabric_explain",
+      "purpose": "Explain claim inclusion, authority, freshness and preserved contradictions for one digest-bound operator context.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_explain"
+    },
+    {
+      "category": "context-fabric",
+      "description": "Compare two digest-bound contexts for one target without ranking them.",
+      "effects": [],
+      "id": "grabowski_context_fabric_compare",
+      "purpose": "Compare two digest-bound operator contexts for one target without ranking, resolving or approving either.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_context_fabric_compare"
     },
     {
       "category": "bureau",
