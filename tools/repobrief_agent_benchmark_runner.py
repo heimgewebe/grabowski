@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Read-only Claude runner for RepoBrief Agent Benchmark v1.
 
-The runner consumes one Lenskit benchmark request from stdin and emits one
-Lenskit-compatible receipt to stdout. It is intentionally not an MCP tool and
+The runner consumes one RepoGround benchmark request from stdin and emits one
+RepoGround-compatible receipt to stdout. It is intentionally not an MCP tool and
 has no apply, commit, merge, deploy, resume, or retry authority.
 """
 from __future__ import annotations

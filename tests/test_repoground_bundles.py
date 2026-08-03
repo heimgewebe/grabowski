@@ -3175,7 +3175,7 @@ class RepoGroundAgentHandoffTests(unittest.TestCase):
         self.assertIn("global_repoground_routing_authority", result["does_not_establish"])
 
     def test_agent_handoff_paired_baseline_preserves_evidence_for_two_repositories(self) -> None:
-        for repo in ("lenskit", "bureau"):
+        for repo in ("repoground", "bureau"):
             with self.subTest(repo=repo):
                 evidence = {
                     "kind": "grabowski.repoground_context_compose",
