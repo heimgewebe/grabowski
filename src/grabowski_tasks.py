@@ -52,6 +52,10 @@ TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
 TASK_LIST_SCAN_BATCH = 100
 TASK_RECONCILE_BATCH_LIMIT = 500
 DEFAULT_TASK_RECONCILE_BATCH_SIZE = 100
+DEFAULT_TASK_RECONCILE_CHECK_LIMIT = 50
+TASK_RECONCILE_CHECK_LIMIT = 200
+TASK_RECONCILE_CHECK_MAX_BYTES = 1024 * 1024
+TASK_RECONCILE_CHECK_CURSOR_SCOPE = "task-reconcile-check-v1"
 TASK_RECONCILE_CURSOR_METADATA_KEY = "task_reconcile_refresh_cursor_v1"
 TASK_RECONCILE_CYCLE_VERSION = 2
 TASK_RECONCILE_CYCLE_PHASE = "scan_to_high_water"
@@ -7347,17 +7351,232 @@ def _reconcile_observe_denial(record: dict[str, Any], exc: PermissionError) -> d
     }
 
 
-def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
+def _reconcile_candidate_states() -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            {
+                "launching",
+                "running",
+                "outcome_unknown",
+                "interrupted",
+                "failed",
+                "timed_out",
+                "signalled",
+            }
+        )
+    )
+
+
+def _sqlite_rows_revision(
+    connection: sqlite3.Connection,
+    query: str,
+    parameters: tuple[Any, ...] = (),
+) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    count = 0
+    for row in connection.execute(query, parameters):
+        encoded = _canonical_json(dict(row)).encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        count += 1
+    return {"row_count": count, "rows_sha256": digest.hexdigest()}
+
+
+def _reconcile_resource_store_revision() -> dict[str, Any]:
+    version = resources._preflight_resource_store()
+    if version is None:
+        return {"present": False, "schema_version": None, "tables": {}}
+    with resources._resource_readonly_sqlite(resources.RESOURCE_DB) as connection:
+        connection.execute("BEGIN")
+        table_names = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        tables: dict[str, Any] = {}
+        table_queries = {
+            "leases": (
+                "SELECT * FROM leases WHERE owner_id LIKE 'task:%' "
+                "ORDER BY resource_key"
+            ),
+            "task_terminalizations": (
+                "SELECT * FROM task_terminalizations ORDER BY task_id"
+            ),
+            "task_authority_adoptions": (
+                "SELECT * FROM task_authority_adoptions ORDER BY task_id"
+            ),
+        }
+        for table, query in table_queries.items():
+            tables[table] = (
+                _sqlite_rows_revision(connection, query)
+                if table in table_names
+                else {"absent": True}
+            )
+    return {
+        "present": True,
+        "schema_version": version,
+        "tables": tables,
+    }
+
+
+def _reconcile_check_store_snapshot(
+    task_connection: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    if task_connection is None:
+        with _task_read_snapshot() as connection:
+            return _reconcile_check_store_snapshot(connection)
+    candidate_states = _reconcile_candidate_states()
+    placeholders = ",".join("?" for _ in candidate_states)
+    material = {
+        "schema_version": 1,
+        "task_store": _sqlite_rows_revision(
+            task_connection,
+            f"SELECT * FROM tasks WHERE state IN ({placeholders}) "
+            "ORDER BY task_id",
+            candidate_states,
+        ),
+        "resource_store": _reconcile_resource_store_revision(),
+    }
+    return {**material, "snapshot_sha256": _sha256_json(material)}
+
+
+def _validate_reconcile_check_limit(limit: int) -> int:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= TASK_RECONCILE_CHECK_LIMIT
+    ):
+        raise ValueError(
+            f"limit must be between 1 and {TASK_RECONCILE_CHECK_LIMIT}"
+        )
+    return limit
+
+
+def _reconcile_check_candidate_page(
+    *,
+    limit: int,
+    cursor: str | None,
+) -> dict[str, Any]:
+    page_started_ns = time.perf_counter_ns()
+    bounded_limit = _validate_reconcile_check_limit(limit)
+    candidate_states = _reconcile_candidate_states()
+    placeholders = ",".join("?" for _ in candidate_states)
+    with _task_read_snapshot() as connection:
+        connection.execute("SELECT 1 FROM tasks LIMIT 1").fetchone()
+        snapshot_started_ns = time.perf_counter_ns()
+        snapshot = _reconcile_check_store_snapshot(connection)
+        snapshot_ms = round(
+            (time.perf_counter_ns() - snapshot_started_ns) / 1_000_000,
+            3,
+        )
+        query_started_ns = time.perf_counter_ns()
+        snapshot_scope = TASK_RECONCILE_CHECK_CURSOR_SCOPE
+        scope = f"{snapshot_scope}:{snapshot['snapshot_sha256']}"
+        position = consumer_surface.decode_cursor(
+            cursor,
+            scope,
+            snapshot_scope=snapshot_scope,
+        )
+        cursor_created_at: int | None = None
+        cursor_task_id: str | None = None
+        if position is not None:
+            cursor_created_at = position.get("created_at_unix")
+            cursor_task_id = position.get("task_id")
+            if (
+                isinstance(cursor_created_at, bool)
+                or not isinstance(cursor_created_at, int)
+                or cursor_created_at < 0
+                or not isinstance(cursor_task_id, str)
+                or TASK_ID.fullmatch(cursor_task_id) is None
+            ):
+                raise ValueError("cursor position is invalid")
+        where = f"state IN ({placeholders})"
+        parameters: list[Any] = list(candidate_states)
+        if cursor_created_at is not None and cursor_task_id is not None:
+            where += (
+                " AND (created_at_unix > ? OR "
+                "(created_at_unix = ? AND task_id > ?))"
+            )
+            parameters.extend(
+                (cursor_created_at, cursor_created_at, cursor_task_id)
+            )
+        rows = connection.execute(
+            f"SELECT * FROM tasks WHERE {where} "
+            "ORDER BY created_at_unix, task_id LIMIT ?",
+            (*parameters, bounded_limit + 1),
+        ).fetchall()
+        total_candidates = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE state IN ({placeholders})",
+                candidate_states,
+            ).fetchone()[0]
+        )
+        cursor_and_query_ms = round(
+            (time.perf_counter_ns() - query_started_ns) / 1_000_000,
+            3,
+        )
+    has_more = len(rows) > bounded_limit
+    page_rows = [dict(row) for row in rows[:bounded_limit]]
+    next_cursor = None
+    if has_more and page_rows:
+        last = page_rows[-1]
+        next_cursor = consumer_surface.encode_cursor(
+            scope,
+            {
+                "created_at_unix": int(last["created_at_unix"]),
+                "task_id": str(last["task_id"]),
+            },
+        )
+    return {
+        "rows": page_rows,
+        "limit": bounded_limit,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "snapshot": snapshot,
+        "total_candidates": total_candidates,
+        "timings_ms": {
+            "snapshot": snapshot_ms,
+            "cursor_and_query": cursor_and_query_ms,
+            "page_setup_total": round(
+                (time.perf_counter_ns() - page_started_ns) / 1_000_000,
+                3,
+            ),
+        },
+    }
+
+
+def reconcile_tasks_check(
+    *,
+    task_id: str = "",
+    limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    check_started_ns = time.perf_counter_ns()
     if not isinstance(task_id, str):
         raise ValueError("task_id must be a string")
     if task_id:
         _validate_task_id(task_id)
-    rows = _reconcile_candidate_rows(task_id)
+        if limit != DEFAULT_TASK_RECONCILE_CHECK_LIMIT or cursor is not None:
+            raise ValueError("task-specific reconcile check cannot use limit or cursor")
+        rows = _reconcile_candidate_rows(task_id)
+        page = None
+    else:
+        page = _reconcile_check_candidate_page(limit=limit, cursor=cursor)
+        rows = []
+        for record in page["rows"]:
+            if _is_terminal_state(str(record["state"])):
+                terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+                if terminal_valid and lease_valid:
+                    continue
+            rows.append(record)
     observations: list[dict[str, Any]] = []
     would_refresh: list[dict[str, Any]] = []
     would_release: list[str] = []
     would_resume: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
+    compact = not bool(task_id)
+    observation_started_ns = time.perf_counter_ns()
     for record in rows:
         try:
             observation = _reconcile_observation(record)
@@ -7370,6 +7589,7 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
             blocked.append(_reconcile_unknown_host(record, exc))
             continue
         classification = _terminal_convergence_classification(record, observation)
+        resource_keys = _record_resource_keys(record)
         item = {
             "task_id": record["task_id"],
             "current_state": record["state"],
@@ -7377,7 +7597,14 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
             "resume_policy": record["resume_policy"],
             "execution_backend": _execution_backend(record),
             "systemd_scope": _systemd_scope(record),
-            "resource_keys": _record_resource_keys(record),
+            **(
+                {
+                    "resource_key_count": len(resource_keys),
+                    "resource_keys_sha256": _sha256_json(resource_keys),
+                }
+                if compact
+                else {"resource_keys": resource_keys}
+            ),
             "convergence": classification,
         }
         observations.append(item)
@@ -7390,7 +7617,11 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
             blocked.append(blocker)
         elif observation["state"] != "running":
             would_resume.append(item)
-    return {
+    observation_ms = round(
+        (time.perf_counter_ns() - observation_started_ns) / 1_000_000,
+        3,
+    )
+    result: dict[str, Any] = {
         "mode": "check",
         "task_id": task_id,
         "scanned": len(rows),
@@ -7401,7 +7632,54 @@ def reconcile_tasks_check(*, task_id: str = "") -> dict[str, Any]:
         "blocked": blocked,
         "checked_at_unix": _now(),
     }
-
+    if page is not None:
+        # The selected rows already come from one pinned SQLite read snapshot.
+        # Re-hashing both stores after live unit observation made a read-only page
+        # fail whenever unrelated task state changed during the observation phase.
+        # The cursor remains fail-closed: the next page recomputes the snapshot
+        # before decoding the cursor and rejects any intervening store mutation.
+        result["pagination"] = {
+            "limit": page["limit"],
+            "examined": len(page["rows"]),
+            "returned": len(rows),
+            "has_more": page["has_more"],
+            "next_cursor": page["next_cursor"],
+            "ordering": "created_at_unix_asc_task_id_asc",
+            "snapshot_sha256": page["snapshot"]["snapshot_sha256"],
+            "total_candidates": page["total_candidates"],
+            "max_payload_bytes": TASK_RECONCILE_CHECK_MAX_BYTES,
+            "payload_bytes": 0,
+            "timings_ms": {
+                **page["timings_ms"],
+                "observation": observation_ms,
+                "serialization": 0.0,
+                "total": 0.0,
+            },
+        }
+        serialization_started_ns = time.perf_counter_ns()
+        for _ in range(4):
+            payload_bytes = len(_canonical_json(result).encode("utf-8"))
+            if result["pagination"]["payload_bytes"] == payload_bytes:
+                break
+            result["pagination"]["payload_bytes"] = payload_bytes
+        result["pagination"]["timings_ms"]["serialization"] = round(
+            (time.perf_counter_ns() - serialization_started_ns) / 1_000_000,
+            3,
+        )
+        result["pagination"]["timings_ms"]["total"] = round(
+            (time.perf_counter_ns() - check_started_ns) / 1_000_000,
+            3,
+        )
+        for _ in range(4):
+            payload_bytes = len(_canonical_json(result).encode("utf-8"))
+            if result["pagination"]["payload_bytes"] == payload_bytes:
+                break
+            result["pagination"]["payload_bytes"] = payload_bytes
+        payload_bytes = len(_canonical_json(result).encode("utf-8"))
+        result["pagination"]["payload_bytes"] = payload_bytes
+        if payload_bytes > TASK_RECONCILE_CHECK_MAX_BYTES:
+            raise RuntimeError("reconcile check page exceeds payload byte limit")
+    return result
 
 def _reconcile_tasks_refresh_locked(
     *,
@@ -7791,23 +8069,40 @@ def reconcile_tasks(*, auto_resume: bool = False) -> dict[str, Any]:
     return result
 
 
-def _task_reconcile_check_after_guard(task_id: str) -> dict[str, Any]:
+def _task_reconcile_check_after_guard(
+    task_id: str,
+    limit: int,
+    cursor: str | None,
+) -> dict[str, Any]:
     with TASK_RECONCILE_LOCK:
         operator._require_operator_capability("durable_job")
-        return reconcile_tasks_check(task_id=task_id)
+        return reconcile_tasks_check(task_id=task_id, limit=limit, cursor=cursor)
 
 
-def grabowski_task_reconcile_check(task_id: str = "") -> dict[str, Any]:
-    """Read-only reconcile preview for persistent tasks."""
+def grabowski_task_reconcile_check(
+    task_id: str = "",
+    limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Read one bounded, resumable reconcile preview for persistent tasks."""
     operator._require_operator_capability("durable_job")
-    return _task_reconcile_check_after_guard(task_id)
+    return _task_reconcile_check_after_guard(task_id, limit, cursor)
 
 
 @mcp.tool(name="grabowski_task_reconcile_check", annotations=READ_ONLY)
-async def _grabowski_task_reconcile_check_tool(task_id: str = "") -> dict[str, Any]:
-    """Read-only reconcile preview for persistent tasks."""
+async def _grabowski_task_reconcile_check_tool(
+    task_id: str = "",
+    limit: int = DEFAULT_TASK_RECONCILE_CHECK_LIMIT,
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """Read one bounded, resumable reconcile preview for persistent tasks."""
     operator._require_operator_capability("durable_job")
-    return await asyncio.to_thread(_task_reconcile_check_after_guard, task_id)
+    return await asyncio.to_thread(
+        _task_reconcile_check_after_guard,
+        task_id,
+        limit,
+        cursor,
+    )
 
 
 def _task_reconcile_refresh_after_guard(task_id: str) -> dict[str, Any]:
