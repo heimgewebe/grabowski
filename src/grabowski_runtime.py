@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+import secrets
+import threading
+from typing import Annotated, Any
+import weakref
 
 from pydantic import Field
 
@@ -36,6 +39,74 @@ import grabowski_agent_competition
 import grabowski_coding_agent_router
 import grabowski_workers
 import grabowski_reposkop_context  # noqa: F401
+
+
+_TRANSPORT_ROUNDTRIP = grabowski_operator_core.base.grabowski_transport_roundtrip
+_ORIGINAL_TRANSPORT_SCOPE_VALIDATOR = _TRANSPORT_ROUNDTRIP.validate_client_scope
+_ORIGINAL_TRANSPORT_SCOPE_RESOLVER = (
+    grabowski_operator_core.base._transport_roundtrip_client_scope
+)
+_TRANSPORT_SESSION_SCOPE_LOCK = threading.Lock()
+_TRANSPORT_SESSION_SCOPES: weakref.WeakKeyDictionary[object, str] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _validate_runtime_transport_client_scope(value: Any) -> dict[str, str]:
+    """Extend the transport contract with one non-authenticating server-session scope."""
+    if (
+        isinstance(value, dict)
+        and set(value) == {"kind", "label"}
+        and value.get("kind") == "server_session"
+    ):
+        label = value.get("label")
+        if (
+            not isinstance(label, str)
+            or not label
+            or label.strip() != label
+            or "\x00" in label
+            or len(label.encode("utf-8")) > 512
+        ):
+            raise _TRANSPORT_ROUNDTRIP.TransportRoundtripError(
+                "transport client scope label is invalid"
+            )
+        return {"kind": "server_session", "label": label}
+    return _ORIGINAL_TRANSPORT_SCOPE_VALIDATOR(value)
+
+
+def _runtime_transport_client_scope(ctx: Any) -> dict[str, str]:
+    """Prefer declared client metadata, then isolate unlabeled live MCP sessions."""
+    declared_scope = _ORIGINAL_TRANSPORT_SCOPE_RESOLVER(ctx)
+    if declared_scope["kind"] != "shared_unlabeled" or ctx is None:
+        return declared_scope
+    try:
+        session = ctx.session
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return declared_scope
+    if session is None:
+        return declared_scope
+    try:
+        with _TRANSPORT_SESSION_SCOPE_LOCK:
+            label = _TRANSPORT_SESSION_SCOPES.get(session)
+            if label is None:
+                label = f"server-session-{secrets.token_hex(32)}"
+                _TRANSPORT_SESSION_SCOPES[session] = label
+    except TypeError:
+        # Unknown or non-weak-referenceable SDK sessions remain fail-closed in
+        # the explicit shared scope rather than gaining an unstable identity.
+        return declared_scope
+    return _validate_runtime_transport_client_scope(
+        {"kind": "server_session", "label": label}
+    )
+
+
+# The central gate and the roundtrip grip both resolve through these module
+# functions at request time. Install the extension before the HTTP runtime is
+# configured so one session owns its own single-use challenge and receipt.
+_TRANSPORT_ROUNDTRIP.validate_client_scope = _validate_runtime_transport_client_scope
+grabowski_operator_core.base._transport_roundtrip_client_scope = (
+    _runtime_transport_client_scope
+)
 
 
 mcp = grabowski_operator_core.mcp
