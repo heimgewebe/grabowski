@@ -151,6 +151,10 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_execution_governor_summary` | operations-observability | yes | low | Summarize evidence thresholds, time decay and circuit-breaker state without enabling live routing. |
 | `grabowski_connector_transport_diagnostics` | operations-observability | yes | low | Run bounded read-only diagnostics for connector transport failures. |
 | `grabowski_operator_recall_export` | operations-observability | yes | low | Export evidence-ref-bound operator recall items from caller-supplied receipt, PR, Bureau task and friction records without verifying source truth. |
+| `grabowski_context_fabric_plan` | context-fabric | yes | low | Plan one evidence-bound operator context read for the pr, bureau or deployment profile without composing claims. |
+| `grabowski_context_fabric_compose` | context-fabric | yes | low | Compose and pack one fail-closed operator context that binds caller-supplied observations to their owning authority without copying lifecycle truth. |
+| `grabowski_context_fabric_explain` | context-fabric | yes | low | Explain claim inclusion, authority, freshness and preserved contradictions for one digest-bound operator context. |
+| `grabowski_context_fabric_compare` | context-fabric | yes | low | Compare two digest-bound operator contexts for one target without ranking, resolving or approving either. |
 | `grabowski_bureau_candidate_record` | bureau | no | medium | Record one source-bound candidate through Bureau's canonical append-only operator intake contract. |
 | `grabowski_bureau_candidate_assess` | bureau | yes | low | Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors. |
 | `grabowski_bureau_task_propose` | bureau | no | medium | Create one immutable reviewed Bureau task proposal artifact without Registry or Queue mutation. |
