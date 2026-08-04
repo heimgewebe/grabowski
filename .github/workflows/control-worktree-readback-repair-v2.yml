@@ -1,0 +1,59 @@
+name: Control checkout and readback repair v2
+
+on:
+  pull_request:
+    types: [synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.ref == 'fix/control-worktree-recreate-git-show-readback-v1'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/control-worktree-recreate-git-show-readback-v1
+          fetch-depth: 0
+
+      - name: Apply revisions-bound repair script
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          source = Path('.github/workflows/control-worktree-readback-repair.yml')
+          text = source.read_text(encoding='utf-8')
+          marker = "          python3 - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          if text.count(marker) != 1:
+              raise SystemExit('repair script start marker mismatch')
+          body = text.split(marker, 1)[1]
+          if body.count(end_marker) != 1:
+              raise SystemExit('repair script end marker mismatch')
+          script = dedent(body.split(end_marker, 1)[0])
+          namespace = {'__name__': '__main__'}
+          exec(compile(script, str(source), 'exec'), namespace)
+          PY
+
+      - name: Refresh generated contracts
+        run: make context-refresh
+
+      - name: Run focused tests with source path
+        run: PYTHONPATH=src python3 -m unittest tests.test_bureau_control_checkout tests.test_read_surface -v
+
+      - name: Commit repair without bootstrap workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/workflows/control-worktree-readback-repair-v2.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: recover Bureau control checkout and bind Git ref reads"
+          git push origin HEAD:fix/control-worktree-recreate-git-show-readback-v1
