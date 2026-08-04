@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 import grabowski_grips as grips
+import grabowski_mcp as base_mcp
 import grabowski_transport_roundtrip as roundtrip
 from tests.test_operator_contract import _load_operator_module
 
@@ -18,10 +19,10 @@ BINDING = {
     "registered_names_sha256": "b" * 64,
     "agent_instructions_sha256": "c" * 64,
 }
-META_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-1"}
+META_SCOPE = {"kind": "caller_session", "label": "mcp-client-1-session-1"}
 SHARED_SCOPE = {
-    "kind": "shared_unlabeled",
-    "label": roundtrip.SHARED_UNLABELED_SCOPE,
+    "kind": "caller_session",
+    "label": "mcp-client-2-session-2",
 }
 
 
@@ -39,12 +40,16 @@ class TransportGripIntegrationTests(unittest.TestCase):
 
     @staticmethod
     def parameters(action: str, **extra: object) -> dict[str, object]:
-        return {
+        parameters = {
             "action": action,
             "_server_transport_client_scope": META_SCOPE,
             "_server_transport_runtime_binding": BINDING,
             **extra,
         }
+        if action == "begin" and "target_tool_name" not in extra:
+            parameters["target_tool_name"] = "write"
+            parameters["target_arguments"] = {}
+        return parameters
 
     def test_begin_and_ack_are_receipt_bound_through_existing_grip_surface(self) -> None:
         begin = grips.grip_run(
@@ -65,7 +70,7 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertEqual(ack["status"], "passed")
         self.assertEqual(ack["output"]["state"], "verified")
         self.assertTrue(ack["output"]["mutation_gate_open"])
-        self.assertEqual(ack["output"]["client_scope_kind"], "client_declared_meta")
+        self.assertEqual(ack["output"]["client_scope_kind"], "caller_session")
         self.assertEqual(
             [item["status"] for item in ack["receipt"]["checks"][-4:]],
             ["pass", "pass", "pass", "pass"],
@@ -120,6 +125,23 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertEqual(extra["status"], "blocked")
         self.assertIn("unknown transport roundtrip field", extra["output"]["error"])
 
+    def test_begin_without_exact_target_is_rejected(self) -> None:
+        result = grips.grip_run(
+            "transport-roundtrip",
+            {
+                "action": "begin",
+                "_server_transport_client_scope": META_SCOPE,
+                "_server_transport_runtime_binding": BINDING,
+            },
+            profile="operator",
+            allow_mutation=True,
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn(
+            "requires exact target_tool_name",
+            result["output"]["error"],
+        )
+
 
 class CentralTransportGateTests(unittest.TestCase):
     @staticmethod
@@ -135,9 +157,7 @@ class CentralTransportGateTests(unittest.TestCase):
         operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
         operator.base._transport_roundtrip_client_scope = (
             lambda context: (
-                META_SCOPE
-                if getattr(context, "client_id", None)
-                else SHARED_SCOPE
+                META_SCOPE if getattr(context, "session_id", None) == "session-1" else SHARED_SCOPE
             )
         )
         operator.mcp._tool_manager.get_tool = lambda _name: self.mutating_tool()
@@ -146,7 +166,9 @@ class CentralTransportGateTests(unittest.TestCase):
 
     def test_mutating_call_is_rejected_before_effect_without_verification(self) -> None:
         operator = self.configured_operator()
-        context = types.SimpleNamespace(client_id="mcp-client-1")
+        context = types.SimpleNamespace(
+            client_id="mcp-client-1", session_id="session-1"
+        )
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
             "consume_verified",
@@ -164,7 +186,9 @@ class CentralTransportGateTests(unittest.TestCase):
 
     def test_verified_mutation_consumes_receipt_and_runs(self) -> None:
         operator = self.configured_operator()
-        context = types.SimpleNamespace(client_id="mcp-client-1")
+        context = types.SimpleNamespace(
+            client_id="mcp-client-1", session_id="session-1"
+        )
         arguments = {"path": "/tmp/example"}
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
@@ -193,13 +217,18 @@ class CentralTransportGateTests(unittest.TestCase):
         ), mock.patch.object(
             transport, "LOCK_PATH", root / ".lock"
         ):
-            challenges = [
-                transport.begin(
+            challenges = []
+            for sequence in (1, 2):
+                arguments = {"sequence": sequence}
+                started = transport.begin(
                     client_scope=SHARED_SCOPE,
                     runtime_binding=BINDING,
-                )["challenge_receipt_sha256"]
-                for _ in range(2)
-            ]
+                    mutation_intent={
+                        "tool_name": "write",
+                        "arguments_sha256": transport.canonical_arguments_sha256(arguments),
+                    },
+                )
+                challenges.append(started["challenge_receipt_sha256"])
             for challenge in challenges:
                 transport.acknowledge(
                     client_scope=SHARED_SCOPE,
@@ -207,7 +236,7 @@ class CentralTransportGateTests(unittest.TestCase):
                     runtime_binding=BINDING,
                 )
 
-            context = types.SimpleNamespace(client_id=None)
+            context = types.SimpleNamespace(client_id=None, session_id="session-2")
             first = asyncio.run(
                 operator.mcp._tool_manager.call_tool(
                     "write", {"sequence": 1}, context
@@ -237,7 +266,7 @@ class CentralTransportGateTests(unittest.TestCase):
         root = Path(temporary.name) / "state"
         operator = self.configured_operator()
         transport = operator.grabowski_transport_roundtrip
-        context = types.SimpleNamespace(client_id=None)
+        context = types.SimpleNamespace(client_id=None, session_id="session-1")
         arguments = {"sequence": 1}
         arguments_sha256 = transport.canonical_arguments_sha256(arguments)
         with (
@@ -245,7 +274,7 @@ class CentralTransportGateTests(unittest.TestCase):
             mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
         ):
             begin = transport.begin(
-                client_scope=SHARED_SCOPE,
+                client_scope=META_SCOPE,
                 runtime_binding=BINDING,
                 mutation_intent={
                     "tool_name": "write",
@@ -253,7 +282,7 @@ class CentralTransportGateTests(unittest.TestCase):
                 },
             )
             transport.acknowledge(
-                client_scope=SHARED_SCOPE,
+                client_scope=META_SCOPE,
                 challenge_receipt_sha256=begin["challenge_receipt_sha256"],
                 runtime_binding=BINDING,
             )
@@ -281,7 +310,7 @@ class CentralTransportGateTests(unittest.TestCase):
                 "challenge_receipt_sha256=", 1
             )[1].split()[0]
             self.assertEqual(replayed_challenge, challenge)
-            state = transport._load_state(SHARED_SCOPE)
+            state = transport._load_state(META_SCOPE)
             self.assertEqual(len(state["verified_receipts"]), 1)
             self.assertEqual(len(state["pending_challenges"]), 1)
             pending = state["pending_challenges"][0]
@@ -290,7 +319,7 @@ class CentralTransportGateTests(unittest.TestCase):
             self.assertEqual(pending["arguments_sha256"], arguments_sha256)
 
             transport.acknowledge(
-                client_scope=SHARED_SCOPE,
+                client_scope=META_SCOPE,
                 challenge_receipt_sha256=challenge,
                 runtime_binding=BINDING,
             )
@@ -299,7 +328,7 @@ class CentralTransportGateTests(unittest.TestCase):
                     "other-write", arguments, context
                 )
             )
-            state = transport._load_state(SHARED_SCOPE)
+            state = transport._load_state(META_SCOPE)
             self.assertEqual(len(state["verified_receipts"]), 1)
             result = asyncio.run(
                 operator.mcp._tool_manager.call_tool("write", arguments, context)
@@ -309,7 +338,9 @@ class CentralTransportGateTests(unittest.TestCase):
 
     def test_handshake_grip_is_narrowly_exempt(self) -> None:
         operator = self.configured_operator()
-        context = types.SimpleNamespace(client_id="mcp-client-1")
+        context = types.SimpleNamespace(
+            client_id="mcp-client-1", session_id="session-1"
+        )
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
             "consume_verified",
@@ -331,7 +362,9 @@ class CentralTransportGateTests(unittest.TestCase):
 
     def test_non_marker_deployment_status_is_not_broadly_exempt(self) -> None:
         operator = self.configured_operator()
-        context = types.SimpleNamespace(client_id="mcp-client-1")
+        context = types.SimpleNamespace(
+            client_id="mcp-client-1", session_id="session-1"
+        )
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
             "consume_verified",
@@ -351,6 +384,90 @@ class CentralTransportGateTests(unittest.TestCase):
         )
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
+    def test_read_only_tool_never_requires_or_consumes_mutation_verification(self) -> None:
+        operator = _load_operator_module()
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=True),
+        )
+        operator._configure_http_runtime()
+        context = types.SimpleNamespace(
+            client_id="mcp-client-1", session_id="session-1"
+        )
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=AssertionError("read-only call reached mutation gate"),
+        ) as consume_verified:
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool("read", {}, context)
+            )
+        self.assertTrue(result["called"])
+        consume_verified.assert_not_called()
+
+    def test_effect_failure_keeps_consumed_token_closed_for_retry(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "state"
+        operator = _load_operator_module()
+        operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
+        operator.base._transport_roundtrip_client_scope = lambda _context: META_SCOPE
+        operator.mcp._tool_manager.get_tool = lambda _name: self.mutating_tool()
+
+        async def failing_effect(
+            _name: str, _arguments: dict[str, object], _context: object
+        ) -> object:
+            raise RuntimeError("effect failed after admission")
+
+        operator.mcp._tool_manager.call_tool = failing_effect
+        operator._configure_http_runtime()
+        transport = operator.grabowski_transport_roundtrip
+        arguments = {"sequence": 1}
+        with (
+            mock.patch.object(transport, "STATE_ROOT", root),
+            mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
+        ):
+            started = transport.begin(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+                mutation_intent={
+                    "tool_name": "write",
+                    "arguments_sha256": transport.canonical_arguments_sha256(
+                        arguments
+                    ),
+                },
+            )
+            transport.acknowledge(
+                client_scope=META_SCOPE,
+                challenge_receipt_sha256=started["challenge_receipt_sha256"],
+                runtime_binding=BINDING,
+            )
+            context = types.SimpleNamespace(
+                client_id="mcp-client-1", session_id="session-1"
+            )
+            with self.assertRaisesRegex(
+                RuntimeError, "effect failed after admission"
+            ):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "write", arguments, context
+                    )
+                )
+            status = transport.status(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+            )
+            self.assertEqual(status["state"], "consumed")
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh single-use transport verification"
+            ):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "write", arguments, context
+                    )
+                )
+
     def test_unknown_tool_annotation_fails_closed_before_effect(self) -> None:
         operator = _load_operator_module()
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
@@ -359,7 +476,9 @@ class CentralTransportGateTests(unittest.TestCase):
             annotations=None,
         )
         operator._configure_http_runtime()
-        context = types.SimpleNamespace(client_id="mcp-client-1")
+        context = types.SimpleNamespace(
+            client_id="mcp-client-1", session_id="session-1"
+        )
         with self.assertRaisesRegex(RuntimeError, "explicit readOnlyHint"):
             asyncio.run(
                 operator.mcp._tool_manager.call_tool(
@@ -367,9 +486,9 @@ class CentralTransportGateTests(unittest.TestCase):
                 )
             )
 
-    def test_missing_meta_uses_explicit_shared_unlabeled_scope(self) -> None:
+    def test_missing_client_id_still_uses_bound_session_scope(self) -> None:
         operator = self.configured_operator()
-        context = types.SimpleNamespace(client_id=None)
+        context = types.SimpleNamespace(client_id=None, session_id="session-1")
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
             "consume_verified",
@@ -380,11 +499,99 @@ class CentralTransportGateTests(unittest.TestCase):
             )
         self.assertTrue(result["called"])
         consume_verified.assert_called_once_with(
-            client_scope=SHARED_SCOPE,
+            client_scope=META_SCOPE,
             runtime_binding=BINDING,
             tool_name="write",
             arguments_sha256=roundtrip.canonical_arguments_sha256({}),
         )
+
+    def test_runtime_scope_binds_client_and_session(self) -> None:
+        first = roundtrip.derive_caller_session_scope(
+            client_id="client-1",
+            session_id="session-1",
+            server_instance_id="server-1",
+        )
+        other_session = roundtrip.derive_caller_session_scope(
+            client_id="client-1",
+            session_id="session-2",
+            server_instance_id="server-1",
+        )
+        other_client = roundtrip.derive_caller_session_scope(
+            client_id="client-2",
+            session_id="session-1",
+            server_instance_id="server-1",
+        )
+        self.assertEqual(first["kind"], "caller_session")
+        self.assertNotEqual(first["label"], other_session["label"])
+        self.assertNotEqual(first["label"], other_client["label"])
+
+    def test_runtime_scope_fails_closed_without_session_identity(self) -> None:
+        with self.assertRaisesRegex(
+            roundtrip.TransportRoundtripError, "session id"
+        ):
+            roundtrip.derive_caller_session_scope(
+                client_id="client-1",
+                session_id="",
+                server_instance_id="server-1",
+            )
+
+    def test_runtime_scope_accepts_process_local_stdio_session(self) -> None:
+        first = roundtrip.derive_caller_session_scope(
+            client_id=None,
+            session_id="local-session-object:1",
+            server_instance_id="server-1",
+        )
+        replay = roundtrip.derive_caller_session_scope(
+            client_id=None,
+            session_id="local-session-object:1",
+            server_instance_id="server-1",
+        )
+        restarted = roundtrip.derive_caller_session_scope(
+            client_id=None,
+            session_id="local-session-object:1",
+            server_instance_id="server-2",
+        )
+        self.assertEqual(first, replay)
+        self.assertNotEqual(first, restarted)
+
+    def test_runtime_scope_uses_opaque_token_for_fastmcp_session_object(self) -> None:
+        class Session:
+            pass
+
+        session = Session()
+        first = base_mcp._transport_roundtrip_client_scope(
+            types.SimpleNamespace(client_id=None, session=session)
+        )
+        replay = base_mcp._transport_roundtrip_client_scope(
+            types.SimpleNamespace(client_id=None, session=session)
+        )
+        other = base_mcp._transport_roundtrip_client_scope(
+            types.SimpleNamespace(client_id=None, session=Session())
+        )
+        self.assertEqual(first, replay)
+        self.assertNotEqual(first, other)
+        self.assertEqual(first["kind"], "caller_session")
+
+    def test_session_token_registry_rejects_object_id_reuse(self) -> None:
+        class Session:
+            pass
+
+        first_session = Session()
+        second_session = Session()
+        first_token = base_mcp._transport_session_scope_token(first_session)
+        first_entry = base_mcp._TRANSPORT_SESSION_SCOPE_TOKENS[
+            id(first_session)
+        ]
+        with base_mcp._TRANSPORT_SESSION_SCOPE_LOCK:
+            base_mcp._TRANSPORT_SESSION_SCOPE_TOKENS[id(second_session)] = (
+                first_entry
+            )
+        second_token = base_mcp._transport_session_scope_token(second_session)
+        self.assertNotEqual(first_token, second_token)
+
+    def test_non_weak_referenceable_session_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "not weak-referenceable"):
+            base_mcp._transport_session_scope_token(object())
 
 
 if __name__ == "__main__":

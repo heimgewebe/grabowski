@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 STATE_KIND = "grabowski_transport_roundtrip_state"
 CHALLENGE_KIND = "grabowski_transport_roundtrip_challenge"
 VERIFICATION_KIND = "grabowski_transport_roundtrip_verification"
@@ -28,6 +28,7 @@ MAX_SHARED_VERIFIED_RECEIPTS = 32
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-roundtrip"
 LOCK_PATH = STATE_ROOT / ".lock"
 SHARED_UNLABELED_SCOPE = "shared-unlabeled-transport-v1"
+# Kept only so legacy state can be recognized and rejected during migration.
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
 _RUNTIME_BINDING_KEYS = frozenset(
@@ -39,7 +40,7 @@ _RUNTIME_BINDING_KEYS = frozenset(
     }
 )
 _CLIENT_SCOPE_KEYS = frozenset({"kind", "label"})
-_CLIENT_SCOPE_KINDS = frozenset({"client_declared_meta", "shared_unlabeled"})
+_CLIENT_SCOPE_KINDS = frozenset({"caller_session"})
 _MUTATION_INTENT_KEYS = frozenset({"tool_name", "arguments_sha256"})
 _LEGACY_STATE_KEYS = frozenset(
     {
@@ -154,14 +155,46 @@ def validate_client_scope(value: Any) -> dict[str, str]:
     kind = value.get("kind")
     label = _validate_text(value.get("label"), label="transport client scope label")
     if kind not in _CLIENT_SCOPE_KINDS:
-        raise TransportRoundtripError("transport client scope kind is invalid")
-    if kind == "shared_unlabeled" and label != SHARED_UNLABELED_SCOPE:
-        raise TransportRoundtripError("shared transport client scope is invalid")
+        raise TransportRoundtripError(
+            "transport caller-session scope is required"
+        )
     return {"kind": str(kind), "label": label}
 
 
 def client_scope_sha256(value: Any) -> str:
     return _sha256_json(validate_client_scope(value))
+
+
+def derive_caller_session_scope(
+    *,
+    client_id: str | None,
+    session_id: str,
+    server_instance_id: str,
+) -> dict[str, str]:
+    normalized_client_id = (
+        None
+        if client_id is None
+        else _validate_text(client_id, label="transport caller client id")
+    )
+    normalized_session_id = _validate_text(
+        session_id, label="transport caller session id"
+    )
+    normalized_server_instance_id = _validate_text(
+        server_instance_id,
+        label="transport server instance id",
+    )
+    return validate_client_scope(
+        {
+            "kind": "caller_session",
+            "label": _sha256_json(
+                {
+                    "client_id": normalized_client_id,
+                    "server_instance_id": normalized_server_instance_id,
+                    "session_id": normalized_session_id,
+                }
+            ),
+        }
+    )
 
 
 def validate_runtime_binding(value: Any) -> dict[str, str]:
@@ -422,7 +455,8 @@ def _validate_receipt(
 
 
 def _is_shared_pool(scope: dict[str, str]) -> bool:
-    return scope["kind"] == "shared_unlabeled"
+    # Pools are private to one caller-session scope; there is no global pool.
+    return scope["kind"] == "caller_session"
 
 
 def _empty_state(scope: dict[str, str]) -> dict[str, Any]:
@@ -555,11 +589,13 @@ def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
         raise TransportRoundtripError(
             "transport roundtrip state must be an object"
         )
-    if (
-        state.get("schema_version") == SCHEMA_VERSION
-        and set(state) == _LEGACY_STATE_KEYS
-    ):
-        return _legacy_state_to_current(state, scope=scope)
+    if state.get("kind") == STATE_KIND and state.get("schema_version") in {
+        SCHEMA_VERSION,
+        2,
+    }:
+        # Legacy state may contain unbound or globally pooled authorization.
+        # It is intentionally discarded rather than migrated as authority.
+        return _empty_state(scope)
     if set(state) != _STATE_KEYS:
         raise TransportRoundtripError(
             "transport roundtrip state contract mismatch"
@@ -849,6 +885,12 @@ def _projection(
         if projected_receipt is not None
         else None
     )
+    if projected_verified is not None and projected_intent is None:
+        state_name = "legacy_unbound"
+        gate_open = False
+        next_action = (
+            "start a new transport handshake bound to the exact mutation"
+        )
     if projected_intent is not None and gate_open:
         next_action = (
             "invoke exactly one bound mutating tool: " + projected_intent["tool_name"]
@@ -861,8 +903,6 @@ def _projection(
         "client instruction compliance",
         "resistance to compromised same-uid code",
     ]
-    if shared:
-        does_not_establish.append("which unlabeled caller owns a pooled verification")
     return {
         "schema_version": SCHEMA_VERSION,
         "state_schema_version": STATE_SCHEMA_VERSION,
@@ -871,7 +911,7 @@ def _projection(
         "replayed": replayed,
         "mutation_gate_open": gate_open,
         "single_use": True,
-        "pool_mode": ("bounded-shared-token-pool" if shared else "single-slot"),
+        "pool_mode": ("caller-session-token-pool" if shared else "single-slot"),
         "pending_challenge_count": len(pending_current),
         "verified_receipt_count": len(verified_current),
         "pool_limits": (
@@ -1226,14 +1266,11 @@ def consume_verified(
             for r in verified_receipts
             if _receipt_mutation_intent(r) == requested_intent
         ]
-        unbound = [r for r in verified_receipts if _receipt_mutation_intent(r) is None]
         if exact:
             verified = exact[0]
-        elif unbound:
-            verified = unbound[0]
         else:
             raise TransportMutationIntentMismatch(
-                "available transport verifications are bound to a different mutation"
+                "no transport verification is bound to this exact mutation"
             )
         verification_intent = _receipt_mutation_intent(verified)
         consumption = _receipt_base(
@@ -1273,17 +1310,13 @@ def consume_verified(
             "application-level success of the admitted mutation",
             "absence of response loss after the admitted mutation",
         ]
-        if _is_shared_pool(scope):
-            does_not_establish.append(
-                "which unlabeled caller supplied the consumed verification"
-            )
         return {
             "schema_version": SCHEMA_VERSION,
             "state_schema_version": STATE_SCHEMA_VERSION,
             "state": "consumed",
             "single_use": True,
             "pool_mode": (
-                "bounded-shared-token-pool" if _is_shared_pool(scope) else "single-slot"
+                "caller-session-token-pool" if _is_shared_pool(scope) else "single-slot"
             ),
             "pending_challenge_count": len(remaining_pending),
             "verified_receipt_count": len(remaining_verified),

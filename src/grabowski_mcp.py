@@ -25,6 +25,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import weakref
 
 from mcp.server.fastmcp import FastMCP
 
@@ -52,6 +53,11 @@ import grabowski_merge_guard
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
+_TRANSPORT_SERVER_INSTANCE_ID = uuid.uuid4().hex
+_TRANSPORT_SESSION_SCOPE_LOCK = threading.Lock()
+_TRANSPORT_SESSION_SCOPE_TOKENS: dict[
+    int, tuple[weakref.ReferenceType[Any], str]
+] = {}
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
 RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS = frozenset({
     "runtime-entrypoint.json",
@@ -4782,26 +4788,75 @@ def _transport_roundtrip_runtime_binding() -> dict[str, str]:
     )
 
 
+def _transport_session_scope_token(session: object) -> str:
+    session_key = id(session)
+    with _TRANSPORT_SESSION_SCOPE_LOCK:
+        existing = _TRANSPORT_SESSION_SCOPE_TOKENS.get(session_key)
+        if existing is not None and existing[0]() is session:
+            return existing[1]
+
+        def discard_session_token(
+            reference: weakref.ReferenceType[Any],
+            *,
+            expected_key: int = session_key,
+        ) -> None:
+            with _TRANSPORT_SESSION_SCOPE_LOCK:
+                current = _TRANSPORT_SESSION_SCOPE_TOKENS.get(expected_key)
+                if current is not None and current[0] is reference:
+                    _TRANSPORT_SESSION_SCOPE_TOKENS.pop(expected_key, None)
+
+        try:
+            reference = weakref.ref(session, discard_session_token)
+        except TypeError as exc:
+            raise RuntimeError(
+                "transport caller session identity is not weak-referenceable"
+            ) from exc
+        token = uuid.uuid4().hex
+        _TRANSPORT_SESSION_SCOPE_TOKENS[session_key] = (reference, token)
+        return token
+
+
 def _transport_roundtrip_client_scope(
     ctx: Context | None,
 ) -> dict[str, str]:
-    client_label: str | None = None
-    if ctx is not None:
+    if ctx is None:
+        raise RuntimeError("transport caller session identity is unavailable")
+
+    def context_text(name: str) -> str | None:
         try:
-            raw_label = ctx.client_id
+            raw = getattr(ctx, name)
         except (AttributeError, RuntimeError, ValueError):
-            raw_label = None
-        if isinstance(raw_label, str) and raw_label.strip() == raw_label and raw_label:
-            client_label = raw_label
-    if client_label is None:
-        return grabowski_transport_roundtrip.validate_client_scope(
-            {
-                "kind": "shared_unlabeled",
-                "label": grabowski_transport_roundtrip.SHARED_UNLABELED_SCOPE,
-            }
-        )
-    return grabowski_transport_roundtrip.validate_client_scope(
-        {"kind": "client_declared_meta", "label": client_label}
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, str):
+            rendered = raw
+        elif isinstance(raw, uuid.UUID):
+            rendered = str(raw)
+        else:
+            return None
+        if not rendered or rendered.strip() != rendered:
+            return None
+        return rendered
+
+    client_id = context_text("client_id")
+    session_id = context_text("session_id")
+    if session_id is None:
+        try:
+            session = getattr(ctx, "session")
+        except (AttributeError, RuntimeError, ValueError):
+            session = None
+        if session is not None:
+            session_id = (
+                "local-session-token:" + _transport_session_scope_token(session)
+            )
+    if session_id is None:
+        raise RuntimeError("transport caller session identity is unavailable")
+
+    return grabowski_transport_roundtrip.derive_caller_session_scope(
+        client_id=client_id,
+        session_id=session_id,
+        server_instance_id=_TRANSPORT_SERVER_INSTANCE_ID,
     )
 
 
