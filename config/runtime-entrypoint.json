@@ -215,6 +215,10 @@
       "source": "src/grabowski_transport_roundtrip.py"
     },
     {
+      "module": "grabowski_serving_process",
+      "source": "src/grabowski_serving_process.py"
+    },
+    {
       "module": "grabowski_connector_contract",
       "source": "src/grabowski_connector_contract.py"
     },

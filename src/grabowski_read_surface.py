@@ -959,6 +959,7 @@ def grabowski_deployment_identity() -> dict[str, Any]:
             key: bool(deployment.get(key))
             for key in DEPLOYMENT_INTEGRITY_FIELDS
         },
+        "serving_process": base.serving_process_identity(),
         "source_identity_by_module": deployment.get("source_identity_by_module", {}),
         "source_snapshot_identity_by_module": deployment.get(
             "source_snapshot_identity_by_module", {}

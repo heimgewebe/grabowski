@@ -9,6 +9,7 @@ from unittest import mock
 
 import grabowski_grips as grips
 import grabowski_transport_roundtrip as roundtrip
+import grabowski_serving_process as serving
 from tests.test_operator_contract import _load_operator_module
 
 
@@ -384,6 +385,88 @@ class CentralTransportGateTests(unittest.TestCase):
             runtime_binding=BINDING,
             tool_name="write",
             arguments_sha256=roundtrip.canonical_arguments_sha256({}),
+        )
+
+
+class StaleServingProcessGateTests(unittest.TestCase):
+    """A process older than the deployed release must not mutate."""
+
+    PROCESS_RELEASE = "process-release-1"
+    PROCESS_HEAD = "d" * 40
+    DEPLOYED_RELEASE = "deployed-release-2"
+    DEPLOYED_HEAD = "e" * 40
+
+    def setUp(self) -> None:
+        serving.reset_for_tests()
+        self.addCleanup(serving.reset_for_tests)
+
+    def configured_operator(self, deployed_release, deployed_head):
+        operator = _load_operator_module()
+        operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
+        operator.base._transport_roundtrip_client_scope = lambda context: META_SCOPE
+        operator.base._deployment_metadata = lambda: {
+            "release_id": deployed_release,
+            "repo_head": deployed_head,
+        }
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._configure_http_runtime()
+        return operator
+
+    def test_stale_process_is_refused_before_the_transport_handshake(self) -> None:
+        serving.freeze(self.PROCESS_RELEASE, self.PROCESS_HEAD)
+        operator = self.configured_operator(self.DEPLOYED_RELEASE, self.DEPLOYED_HEAD)
+        context = types.SimpleNamespace(client_id="c", session_id="session-1")
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip, "consume_verified"
+        ) as consume_verified:
+            with self.assertRaisesRegex(RuntimeError, "Reconnect the MCP connector"):
+                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
+        consume_verified.assert_not_called()
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
+    def test_current_process_still_reaches_the_transport_handshake(self) -> None:
+        serving.freeze(self.DEPLOYED_RELEASE, self.DEPLOYED_HEAD)
+        operator = self.configured_operator(self.DEPLOYED_RELEASE, self.DEPLOYED_HEAD)
+        context = types.SimpleNamespace(client_id="c", session_id="session-1")
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+        ) as consume_verified:
+            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
+        consume_verified.assert_called_once()
+
+    def test_unknown_deployed_identity_does_not_block(self) -> None:
+        serving.freeze(self.PROCESS_RELEASE, self.PROCESS_HEAD)
+        operator = self.configured_operator(None, None)
+        context = types.SimpleNamespace(client_id="c", session_id="session-1")
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+        ) as consume_verified:
+            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
+        consume_verified.assert_called_once()
+
+    def test_read_only_tools_are_unaffected_by_a_stale_process(self) -> None:
+        serving.freeze(self.PROCESS_RELEASE, self.PROCESS_HEAD)
+        operator = self.configured_operator(self.DEPLOYED_RELEASE, self.DEPLOYED_HEAD)
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=True),
+        )
+        operator._require_transport_roundtrip_for_tool(
+            tool_name="read",
+            arguments={},
+            context=types.SimpleNamespace(client_id="c", session_id="session-1"),
+            tool=operator.mcp._tool_manager.get_tool("read"),
         )
 
 
