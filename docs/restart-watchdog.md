@@ -114,16 +114,20 @@ beschrieben, wird kein weiteres Diagnosesignal gesendet und der
 Recovery-Neustart läuft ohne frischen Dump weiter. Die Stackaufnahme ist
 Diagnoseevidenz und darf einen notwendigen Neustart nicht blockieren.
 
-Der HTTP-Transport läuft im von FastMCP bereitgestellten Stateless-Modus.
-Dadurch bleibt nach einem Request keine serverseitige Sitzung bis zu einem
-gemeinsamen Ablaufzeitpunkt liegen; gebündelte Session-Cleanup-Wellen können
-die Eventloop und die Deployment-Admission-Route nicht mehr blockieren. Die
-drei transportinternen MCP-Logger und der HTTP-Server laufen auf `WARNING`,
-damit reguläre Request-, Access- und Cleanup-Meldungen nicht selbst synchrones
-Journal-Backpressure erzeugen; Warnungen und Fehler bleiben sichtbar. Weil die Härtung an die
+Der HTTP-Transport läuft zustandsbehaftet, damit die von T139 geforderte
+Caller-Session-Identität über Challenge, Bestätigung und genau einen gebundenen
+Werkzeugeffekt stabil bleibt. Ein Idle-Timeout ist absichtlich nicht gesetzt:
+Die frühere feste 1.800-Sekunden-Frist erzeugte gebündelte Cleanup-Wellen, die
+Eventloop und Deployment-Admission blockieren konnten. Verwaiste Sitzungen
+enden deshalb erst mit einem Operator-Neustart; die Zahl aktiver Sitzungen ist
+Betriebsevidenz und muss separat beobachtet werden. Die drei transportinternen
+MCP-Logger und der HTTP-Server laufen auf `WARNING`, damit reguläre Request-,
+Access- und Cleanup-Meldungen nicht selbst synchrones Journal-Backpressure
+erzeugen; Warnungen und Fehler bleiben sichtbar. Weil die Härtung an die
 aktuell gepinnte FastMCP-Implementierung gebunden ist, verweigert der Operator
-den HTTP-Start, falls `custom_route`, Stateless-Modus oder der
-Session-Erzeugungslock nicht verfügbar sind. Die vom Tunnel
+den HTTP-Start, falls `custom_route`, der zustandsbehaftete Sitzungsmodus oder
+der Session-Erzeugungslock nicht verfügbar sind.
+Die vom Tunnel
 abgefragten Pfade `/.well-known/oauth-protected-resource` und
 `/.well-known/oauth-protected-resource/mcp` liefern deterministisches JSON für
 den auth-freien Loopback-Betrieb statt einer nicht parsebaren 404-Antwort.
