@@ -5767,16 +5767,19 @@ def _captain_codex_review_gate(
             "Codex review evidence and exception are mutually exclusive",
             ["codex_review_evidence_exception_ambiguous"],
         )
-    if not required and evidence is None and exception is None:
+    if not required and exception is None:
+        diagnostic_present = evidence is not None
         return _captain_gate(
             "codex-review-settled",
             "pass",
-            "Codex review settlement is not required by the canonical external-review policy",
+            "Codex review is optional; any supplied Codex evidence remains advisory and grants no merge authority",
             {
                 "review_tier": review_tier,
                 "external_review_required": policy_required,
                 "explicitly_required": explicit_required is True,
                 "required": False,
+                "diagnostic_evidence_present": diagnostic_present,
+                "diagnostic_evidence_ignored_for_authority": diagnostic_present,
             },
         )
     target = targets[0]
