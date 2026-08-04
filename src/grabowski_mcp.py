@@ -4861,7 +4861,23 @@ def _transport_roundtrip_client_scope(
 
 
 def _transport_roundtrip_status(ctx: Context | None) -> dict[str, Any]:
-    client_scope = _transport_roundtrip_client_scope(ctx)
+    try:
+        client_scope = _transport_roundtrip_client_scope(ctx)
+    except RuntimeError as exc:
+        return {
+            "schema_version": 1,
+            "state": "unavailable",
+            "mutation_gate_open": False,
+            "error": type(exc).__name__,
+            "recommended_next_action": (
+                "invoke through a live MCP caller session before transport verification"
+            ),
+            "does_not_establish": [
+                "caller-session identity outside a live MCP invocation",
+                "application-level success of any mutating tool",
+                "absence of response loss after a later mutation",
+            ],
+        }
     try:
         runtime_binding = _transport_roundtrip_runtime_binding()
     except (RuntimeError, ValueError) as exc:

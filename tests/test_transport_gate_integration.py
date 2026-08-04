@@ -535,6 +535,16 @@ class CentralTransportGateTests(unittest.TestCase):
                 server_instance_id="server-1",
             )
 
+    def test_read_only_status_without_live_session_reports_unavailable(self) -> None:
+        status = base_mcp._transport_roundtrip_status(None)
+        self.assertEqual(status["state"], "unavailable")
+        self.assertFalse(status["mutation_gate_open"])
+        self.assertEqual(status["error"], "RuntimeError")
+        self.assertIn(
+            "live MCP caller session",
+            status["recommended_next_action"],
+        )
+
     def test_runtime_scope_accepts_process_local_stdio_session(self) -> None:
         first = roundtrip.derive_caller_session_scope(
             client_id=None,
