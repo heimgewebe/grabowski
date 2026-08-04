@@ -3352,6 +3352,7 @@ def _run_worktree_ensure(
             grabowski_resources.inspect_resource,
             record_friction=grabowski_friction.record_friction_event,
             resolve_friction=grabowski_friction.resolve_friction,
+            reposkop_required=True,
         )
     except grabowski_worktree_ensure.WorktreeEnsurePreflight as exc:
         _check(receipt, "worktree_ensure_preflight", "fail", str(exc))

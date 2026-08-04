@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any, Callable
@@ -13,6 +14,7 @@ MAX_RECONCILIATIONS = 100
 
 InventoryLoader = Callable[[str], dict[str, Any]]
 ReconciliationLoader = Callable[[str], dict[str, Any]]
+ReposkopContextLoader = Callable[[str, str], dict[str, Any]]
 
 CONVERGENCE_STATES = frozenset(
     {
@@ -42,6 +44,7 @@ HARD_BLOCK_CODES = frozenset(
         "bounded-inventory-exceeded",
         "bounded-reconciliation-exceeded",
         "lifecycle-owner-ambiguous",
+        "reposkop-context-unavailable",
     }
 )
 SOURCE_CACHE_ROOT_NAMES = frozenset({".repobrief-sources", ".repoground-sources"})
@@ -98,6 +101,229 @@ def _default_reconciliation(repo: str) -> dict[str, Any]:
         repository_filters=[repo],
         limit=MAX_RECONCILIATIONS,
     )
+
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _reposkop_purpose(operation: str) -> str:
+    operation_sha256 = hashlib.sha256(operation.encode("utf-8")).hexdigest()
+    readable = re.sub(
+        r"[^a-z0-9._-]+",
+        "-",
+        operation.strip().lower(),
+    ).strip("-._")
+    return (
+        f"grabowski-work-admission:{(readable or 'operation')[:32]}:"
+        f"{operation_sha256[:8]}"
+    )
+
+
+def _default_reposkop_context(repo: str, purpose: str) -> dict[str, Any]:
+    import grabowski_reposkop_context
+
+    return grabowski_reposkop_context.grabowski_reposkop_context(repo, purpose)
+
+
+def _reposkop_context_evidence(
+    result: Any,
+    *,
+    repository: str,
+    purpose: str,
+) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        raise ValueError("Reposkop context result must be an object")
+    if (
+        result.get("schema_version") != 2
+        or result.get("kind") != "grabowski_reposkop_context"
+        or result.get("effect_authorized") is not False
+    ):
+        raise ValueError("Reposkop context result contract mismatch")
+
+    target = result.get("target")
+    if not isinstance(target, dict) or target != {
+        "path": repository,
+        "purpose": purpose,
+    }:
+        raise ValueError("Reposkop context target binding mismatch")
+
+    executable = result.get("reposkop")
+    report = result.get("report")
+    usage_receipt = result.get("usage_receipt")
+    if not isinstance(executable, dict) or not _is_sha256(executable.get("sha256")):
+        raise ValueError("Reposkop executable identity is missing")
+    if (
+        not isinstance(report, dict)
+        or report.get("kind") != "reposkop_coherence_report"
+        or report.get("schema_version") != 2
+        or report.get("effect_authorized") is not False
+        or not _is_sha256(report.get("report_sha256"))
+    ):
+        raise ValueError("Reposkop report contract mismatch")
+
+    observation = report.get("observation")
+    projection = report.get("projection")
+    identities = observation.get("identities") if isinstance(observation, dict) else None
+    if (
+        not isinstance(observation, dict)
+        or observation.get("observation_complete") is not True
+        or not _is_sha256(observation.get("observation_sha256"))
+        or not isinstance(identities, dict)
+        or identities.get("path") != repository
+        or identities.get("purpose") != purpose
+        or not _is_sha256(identities.get("repository_identity_sha256"))
+        or not _is_sha256(identities.get("checkout_identity_sha256"))
+    ):
+        raise ValueError("Reposkop observation identity mismatch")
+    if (
+        not isinstance(projection, dict)
+        or projection.get("effect_authorized") is not False
+        or not _is_sha256(projection.get("projection_sha256"))
+    ):
+        raise ValueError("Reposkop projection contract mismatch")
+    if (
+        not isinstance(usage_receipt, dict)
+        or not isinstance(usage_receipt.get("path"), str)
+        or not usage_receipt["path"]
+        or not _is_sha256(usage_receipt.get("sha256"))
+        or not _is_sha256(usage_receipt.get("usage_key_sha256"))
+        or not isinstance(usage_receipt.get("audit_ref"), str)
+        or not usage_receipt["audit_ref"]
+    ):
+        raise ValueError("Reposkop usage receipt contract mismatch")
+
+    return {
+        "required": True,
+        "status": "verified",
+        "purpose": purpose,
+        "reposkop_executable_sha256": executable["sha256"],
+        "report_sha256": report["report_sha256"],
+        "observation_sha256": observation["observation_sha256"],
+        "projection_sha256": projection["projection_sha256"],
+        "repository_identity_sha256": identities["repository_identity_sha256"],
+        "checkout_identity_sha256": identities["checkout_identity_sha256"],
+        "usage_receipt_path": usage_receipt["path"],
+        "usage_receipt_sha256": usage_receipt["sha256"],
+        "usage_key_sha256": usage_receipt["usage_key_sha256"],
+        "audit_ref": usage_receipt["audit_ref"],
+        "effect_authorized": False,
+    }
+
+
+def _with_reposkop_context(
+    assessment: dict[str, Any],
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    material = {
+        key: value
+        for key, value in assessment.items()
+        if key != "assessment_sha256"
+    }
+    material.update(
+        {
+            "read_only": False,
+            "evidence_mutation_only": True,
+            "reposkop_context": evidence,
+            "next_action": "admission preflight and Reposkop evidence binding passed",
+        }
+    )
+    return {**material, "assessment_sha256": _digest(material)}
+
+
+def _bounded_upstream_admission(assessment: Any) -> dict[str, Any]:
+    if not isinstance(assessment, dict):
+        return {"assessment_present": False}
+    evidence: dict[str, Any] = {"assessment_present": True}
+    for key, limit in (
+        ("kind", 128),
+        ("repository", 1024),
+        ("operation", 256),
+        ("decision", 64),
+    ):
+        value = assessment.get(key)
+        if isinstance(value, str) and value:
+            evidence[key] = value[:limit]
+    schema_version = assessment.get("schema_version")
+    if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+        evidence["schema_version"] = schema_version
+    assessment_sha256 = assessment.get("assessment_sha256")
+    if _is_sha256(assessment_sha256):
+        evidence["assessment_sha256"] = assessment_sha256
+    blocker_codes = assessment.get("blocker_codes")
+    if isinstance(blocker_codes, list):
+        evidence["blocker_codes"] = [
+            value[:128]
+            for value in blocker_codes[:16]
+            if isinstance(value, str) and value
+        ]
+    blockers: list[dict[str, str]] = []
+    raw_blockers = assessment.get("blockers")
+    if isinstance(raw_blockers, list):
+        for raw in raw_blockers[:8]:
+            if not isinstance(raw, dict):
+                continue
+            bounded: dict[str, str] = {}
+            for key, limit in (
+                ("code", 128),
+                ("detail", 1024),
+                ("path", 1024),
+                ("state", 128),
+                ("checkout_key", 256),
+            ):
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    bounded[key] = value[:limit]
+            if bounded:
+                blockers.append(bounded)
+    if blockers:
+        evidence["blockers"] = blockers
+    return evidence
+
+
+def _reposkop_blocked_assessment(
+    assessment: dict[str, Any],
+    *,
+    purpose: str,
+    error: BaseException,
+    upstream_admission: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    material = {
+        key: value
+        for key, value in assessment.items()
+        if key != "assessment_sha256"
+    }
+    blocker = {
+        "code": "reposkop-context-unavailable",
+        "detail": f"{type(error).__name__}: {error}"[:2048],
+    }
+    reposkop_context: dict[str, Any] = {
+        "required": True,
+        "status": "blocked",
+        "purpose": purpose,
+        "effect_authorized": False,
+    }
+    if upstream_admission is not None:
+        reposkop_context["upstream_admission"] = upstream_admission
+    material.update(
+        {
+            "decision": "blocked",
+            "blocker_codes": sorted(
+                set(material.get("blocker_codes", [])) | {blocker["code"]}
+            ),
+            "blockers": [*material.get("blockers", []), blocker],
+            "read_only": False,
+            "evidence_mutation_only": True,
+            "reposkop_context": reposkop_context,
+            "next_action": "restore a valid target-bound Reposkop context before retry",
+        }
+    )
+    return {**material, "assessment_sha256": _digest(material)}
 
 
 def _lifecycle_owners(item: dict[str, Any]) -> set[str]:
@@ -507,12 +733,47 @@ def assess_repository_admission(
 def require_repository_admission(
     *,
     mode: str = "normal",
+    reposkop_required: bool = False,
+    reposkop_context_loader: ReposkopContextLoader | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     if mode not in {"normal", "convergence"}:
         raise ValueError("work admission mode must be normal or convergence")
+    if not isinstance(reposkop_required, bool):
+        raise ValueError("reposkop_required must be a boolean")
     assessment = assess_repository_admission(**kwargs)
     decision = assessment["decision"]
-    if decision == "blocked" or (decision == "converge_first" and mode != "convergence"):
+    if decision == "blocked" or (
+        decision == "converge_first" and mode != "convergence"
+    ):
         raise WorkAdmissionBlocked(assessment)
-    return assessment
+    if not reposkop_required:
+        return assessment
+
+    purpose = _reposkop_purpose(str(assessment["operation"]))
+    try:
+        result = (reposkop_context_loader or _default_reposkop_context)(
+            str(assessment["repository"]),
+            purpose,
+        )
+        evidence = _reposkop_context_evidence(
+            result,
+            repository=str(assessment["repository"]),
+            purpose=purpose,
+        )
+    except WorkAdmissionBlocked as exc:
+        blocked = _reposkop_blocked_assessment(
+            assessment,
+            purpose=purpose,
+            error=exc,
+            upstream_admission=_bounded_upstream_admission(exc.assessment),
+        )
+        raise WorkAdmissionBlocked(blocked) from exc
+    except Exception as exc:
+        blocked = _reposkop_blocked_assessment(
+            assessment,
+            purpose=purpose,
+            error=exc,
+        )
+        raise WorkAdmissionBlocked(blocked) from exc
+    return _with_reposkop_context(assessment, evidence)
