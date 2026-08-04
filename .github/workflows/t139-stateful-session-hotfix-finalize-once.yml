@@ -45,6 +45,14 @@ jobs:
                   raise SystemExit(f"unexpected transformer indentation: {line!r}")
               payload.append(line[10:])
           exec(compile("\n".join(payload) + "\n", str(source), "exec"), {})
+          docs_path = Path("docs/restart-watchdog.md")
+          docs_path.write_text(
+              docs_path.read_text(encoding="utf-8").replace(
+                  "der Session-Erzeugungslock nicht verfügbar sind. \n",
+                  "der Session-Erzeugungslock nicht verfügbar sind.\n",
+              ),
+              encoding="utf-8",
+          )
           PY
       - name: Refresh generated contracts
         run: make context-refresh
