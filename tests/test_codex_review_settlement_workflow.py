@@ -89,70 +89,60 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("if ! jq -e '", evaluate_section)
         self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
         self.assertIn("codex-review-settlement.invalid.json", evaluate_section)
-        self.assertIn('has("status_code")', evaluate_section)
-        self.assertIn("legacy_default_branch_evaluator", evaluate_section)
-        self.assertIn("synthesized_status_code", evaluate_section)
+        self.assertIn("status_code", evaluate_section)
+        self.assertIn("exit_code", evaluate_section)
+        self.assertIn("github_state", evaluate_section)
+        self.assertIn("description", evaluate_section)
         self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
-        self.assertIn('status_code:"evaluator_error"', evaluate_section)
         self.assertIn("rc=2", evaluate_section)
         self.assertLess(
             evaluate_section.index("trusted_evaluator_output_invalid"),
             evaluate_section.index('echo "github_state=$github_state"'),
         )
 
-    def test_legacy_default_branch_evaluator_is_terminal_but_non_authoritative(self) -> None:
+    def test_current_evaluator_contract_is_required_without_legacy_translation(self) -> None:
         evaluate_section = self.text.split(
             "      - name: Evaluate current-head settlement\n", 1
         )[1].split("      - name: Publish settlement status\n", 1)[0]
-        self.assertIn("elif ! jq -e 'has(\"status_code\")'", evaluate_section)
-        self.assertIn('pass:true) compatibility_code="review_settled"', evaluate_section)
-        self.assertIn('pass:false) compatibility_code="legacy_evaluator_pass"', evaluate_section)
-        self.assertIn('pending:*) compatibility_code="legacy_evaluator_pending"', evaluate_section)
-        self.assertIn('*) compatibility_code="legacy_evaluator_blocked"', evaluate_section)
-        self.assertIn("codex_review_performed", evaluate_section)
-        self.assertIn("codex_review_pass", evaluate_section)
-        self.assertIn("merge_authority", evaluate_section)
-        self.assertIn("Legacy evaluator pending; diagnostic only", evaluate_section)
-        self.assertIn('expected_status="pass"', evaluate_section)
-        self.assertIn('expected_status="pending"', evaluate_section)
-        self.assertIn("expected_rc=0", evaluate_section)
-        self.assertIn("legacy_evaluator_blocked", evaluate_section)
+        self.assertNotIn("legacy_default_branch_evaluator", evaluate_section)
+        self.assertNotIn("synthesized_status_code", evaluate_section)
+        self.assertNotIn("compatibility_code", evaluate_section)
+        self.assertIn('--argjson rc "$rc"', evaluate_section)
+        self.assertIn('.exit_code == $rc', evaluate_section)
+        self.assertIn(
+            '.status == "pass" and .exit_code == 0 and .github_state == "success"',
+            evaluate_section,
+        )
+        self.assertIn(
+            '.status == "pending" and .exit_code == 3 and .github_state == "pending"',
+            evaluate_section,
+        )
+        self.assertIn(
+            '.status == "block" and .exit_code == 2 and .github_state == "failure"',
+            evaluate_section,
+        )
+        self.assertIn(
+            "trusted_evaluator_status_exit_mismatch", evaluate_section
+        )
         self.assertNotIn("github.event.pull_request.head", evaluate_section)
 
-    def test_status_and_process_exit_are_checked_together(self) -> None:
+    def test_status_publication_uses_evaluator_owned_state_and_description(self) -> None:
+        self.assertGreaterEqual(self.text.count('context="Codex review settled"'), 2)
+        self.assertIn("-f state=pending", self.text)
         evaluate_section = self.text.split(
             "      - name: Evaluate current-head settlement\n", 1
         )[1].split("      - name: Publish settlement status\n", 1)[0]
-        self.assertIn('status="$(jq -r', evaluate_section)
-        self.assertIn('expected_status="pass"', evaluate_section)
-        self.assertIn('expected_status="pending"', evaluate_section)
-        self.assertIn('expected_status="block"', evaluate_section)
-        self.assertIn("expected_rc=0", evaluate_section)
-        self.assertIn("expected_rc=2", evaluate_section)
-        self.assertIn('[ "$rc" -ne "$expected_rc" ]', evaluate_section)
-        self.assertIn("contract_mismatch=true", evaluate_section)
-        self.assertIn("Evaluator status/exit contract mismatch", evaluate_section)
-        self.assertIn('[ "$contract_mismatch" != "true" ]', evaluate_section)
-
-    def test_status_is_diagnostic_and_exactly_named(self) -> None:
-        self.assertGreaterEqual(self.text.count('context="Codex review settled"'), 2)
-        self.assertIn("-f state=pending", self.text)
-        self.assertIn('github_state="success"', self.text)
-        self.assertIn('github_state="pending"', self.text)
-        self.assertIn('github_state="failure"', self.text)
-        self.assertIn("status_code", self.text)
-        self.assertIn("Current-head Codex review settled", self.text)
         self.assertIn(
-            "Optional Codex review unavailable; merge gate unaffected",
-            self.text,
+            "github_state=\"$(jq -r '.github_state' "
+            "codex-review-settlement.json)\"",
+            evaluate_section,
         )
-        self.assertIn("Optional Codex review not requested", self.text)
         self.assertIn(
-            "Optional Codex review pending; merge gate unaffected",
-            self.text,
+            "description=\"$(jq -r '.description' "
+            "codex-review-settlement.json | cut -c1-140)\"",
+            evaluate_section,
         )
-        self.assertIn("Current-head Codex review request required", self.text)
-        self.assertIn("Required Codex review is unavailable", self.text)
+        self.assertNotIn('case "$status_code"', evaluate_section)
         self.assertNotIn("usage limit reached", self.text)
 
     def test_manual_dispatch_can_recheck_after_thread_resolution(self) -> None:

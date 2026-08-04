@@ -145,46 +145,38 @@ External providers default to a `0 USD` request and a `0 USD` runtime policy cap
 
 ## Codex-Nichtverfügbarkeit
 
-Eine vertrauenswürdige Codex-Meldung über ausgeschöpftes Code-Review-Kontingent
-ist eine Providerdiagnose, niemals eine ausgeführte Review, ein Codex-PASS oder
-ein Settlement. Der Evaluator akzeptiert dafür nur vollständig übereinstimmende,
-allowlistgebundene Meldungstexte eines vertrauenswürdigen Codex-Akteurs nach
-genau einem kanonischen Request für den aktuellen Head und Diff. Freie
-Textvarianten, Zusätze, mehrdeutige Requests, fremde Akteure und abgeschnittene
-GitHub-Sichten bleiben fail-closed.
+Vertrauenswürdige Codex-Meldungen über ausgeschöpftes Code-Review-Kontingent,
+eine fehlende GitHub-Verbindung des Codex-Kontos oder eine fehlende
+Repository-Ausführungsumgebung sind Providerdiagnosen. Sie sind niemals eine
+ausgeführte Review, ein Codex-PASS oder ein Settlement. Der Evaluator akzeptiert
+nur vollständig übereinstimmende, allowlistgebundene Meldungstexte eines
+vertrauenswürdigen Codex-Akteurs nach genau einem kanonischen Request für den
+aktuellen Head und Diff. Freie Textvarianten, Zusätze, mehrdeutige Requests,
+fremde Akteure, Meldungen vor dem Request und abgeschnittene GitHub-Sichten
+bleiben fail-closed.
+
+Die Allowlist enthält ausschließlich live beobachtete Signaturen: die aktuelle
+Cloud-Settings-Quota-Meldung mit einem Zeilenumbruch, die bereits unterstützten
+Quota-Altvarianten, die Aufforderung zum Verbinden eines Codex-Kontos mit GitHub
+und die Aufforderung zum Einrichten einer Repository-Umgebung. Jede inhaltliche
+Abweichung benötigt eine neue geprüfte Signatur.
 
 Ist externes Review nach der kanonischen Review-Policy optional, erreicht eine
 solche gebundene Providerdiagnose den terminalen Status
-`optional_provider_unavailable`: Der veröffentlichte Diagnosecheck ist grün,
-`settled` und `review_performed` bleiben jedoch `false`. Ist externes Review
-explizit erforderlich, bleibt derselbe Befund mit
-`required_provider_unavailable` ausstehend. Fehlender Request, laufender Review,
-Provider-Unverfügbarkeit, Sichtbarkeitsfehler, echte Codex-Findings und ein
-wirklich revisionsgebundener Abschluss besitzen getrennte Statuscodes und
-Beschreibungen.
+`optional_provider_unavailable`: `settled` und `review_performed` bleiben jedoch
+`false`. Ist externes Review explizit erforderlich, bleibt derselbe Befund mit
+`required_provider_unavailable` ausstehend. Providerdiagnosen ersetzen weder
+revisionsgebundenen Self-Review noch CI, Diffbindung, offene-Thread-Prüfung oder
+tatsächlich vorgeschriebene Gates und erzeugen keine Review-, Merge-,
+Branchschutz-, Kontingentkauf- oder Providerautorität.
 
-Providerdiagnosen ersetzen weder revisionsgebundenen Self-Review noch CI,
-Diffbindung, offene-Thread-Prüfung oder tatsächlich vorgeschriebene Gates. Sie
-erzeugen keine Review-, Merge-, Branchschutz-, Kontingentkauf- oder
-Providerautorität. Die derzeit bekannte Cloud-Settings-Meldung und ihre ältere
-exakte URL-Variante werden aus Kompatibilitätsgründen getrennt erkannt; jede
-inhaltliche Abweichung benötigt eine neue geprüfte Signatur.
-
-Während der einmaligen Einführung kann der vertrauenswürdige Default-Branch-
-Evaluator noch das ältere Ergebnisformat ohne `status_code` liefern. Der Workflow
-übersetzt dann ausschließlich die bereits vorhandenen Zustände in
-`legacy_evaluator_pass`, `legacy_evaluator_pending` oder
-`legacy_evaluator_blocked`. Ein Legacy-`pending` ist als nicht autoritative
-Diagnose terminal grün, behauptet aber weder Review, PASS noch Settlement; ein
-Legacy-`block` bleibt rot. PR-Code wird unter `pull_request_target` weiterhin
-niemals als vertrauenswürdiger Evaluator ausgeführt. Nach dem Merge liefert der
-Default-Branch-Evaluator die feinere kanonische Taxonomie direkt.
-
-Evaluatorausgabe und Workflow bilden einen gemeinsamen fail-closed Vertrag:
-Jeder kanonische `status_code` gehört genau zu einer Statusklasse und einem
-erwarteten Prozess-Exitcode. Der Workflow veröffentlicht nur dann den daraus
-abgeleiteten GitHub-Status, wenn `status`, `status_code` und der tatsächlich
-beobachtete Exitcode übereinstimmen. Auch die einmalige Legacy-Übersetzung wird
-gegen ihren ursprünglichen Status und Exitcode geprüft; Widersprüche werden rot
-veröffentlicht und können nicht durch einen optionalen Diagnosecode überstimmt
-werden.
+Evaluator, CLI und GitHub-Status verwenden eine gemeinsame kanonische Tabelle.
+`pass` bedeutet Prozess-Exitcode `0` und GitHub `success`; `pending` bedeutet
+Exitcode `3` und GitHub `pending`; `block` bedeutet Exitcode `2` und GitHub
+`failure`. Der Workflow publiziert die vom vertrauenswürdigen Default-Branch-
+Evaluator gelieferten Zustands- und Beschreibungsfelder nur, wenn Status,
+Exitcode und GitHub-Zustand untereinander sowie mit dem tatsächlichen
+Prozess-Exitcode übereinstimmen. Malforme Ergebnisse oder Widersprüche werden
+als eigener fail-closed Fehler terminal rot. PR-Code wird unter
+`pull_request_target` weiterhin niemals als vertrauenswürdiger Evaluator
+ausgeführt.

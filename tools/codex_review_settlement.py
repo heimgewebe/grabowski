@@ -61,6 +61,14 @@ PROVIDER_UNAVAILABLE_BODIES = {
         (
             "You have reached your Codex usage limits for code reviews. "
             "You can see your limits in the "
+            "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n"
+            "To continue using code reviews, you can upgrade your account or add "
+            "credits to your account and enable them for code reviews in your "
+            "[settings](https://chatgpt.com/codex/cloud/settings/code-review)."
+        ),
+        (
+            "You have reached your Codex usage limits for code reviews. "
+            "You can see your limits in the "
             "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n\n"
             "To continue using code reviews, you can upgrade your account or add "
             "credits to your account and enable them for code reviews in your "
@@ -75,22 +83,95 @@ PROVIDER_UNAVAILABLE_BODIES = {
             "[settings](https://chatgpt.com/codex/settings)."
         ),
     ),
+    "account_not_connected": (
+        "To use Codex here, [create a Codex account and connect to github]"
+        "(https://chatgpt.com/codex/cloud/settings/connectors).",
+    ),
+    "repository_environment_missing": (
+        "To use Codex here, [create an environment for this repo]"
+        "(https://chatgpt.com/codex/cloud/settings/environments).",
+    ),
 }
 
-STATUS_BY_CODE = {
-    "review_settled": "pass",
-    "optional_provider_unavailable": "pass",
-    "optional_not_requested": "pass",
-    "optional_review_pending": "pass",
-    "optional_review_findings": "pass",
-    "required_request_missing": "pending",
-    "required_review_pending": "pending",
-    "required_provider_unavailable": "pending",
-    "required_review_blocked": "block",
-    "visibility_blocked": "block",
-    "evaluator_error": "block",
+SETTLEMENT_STATUS_CONTRACT = {
+    "review_settled": {
+        "status": "pass",
+        "exit_code": 0,
+        "github_state": "success",
+        "description": "Current-head Codex review settled",
+    },
+    "optional_provider_unavailable": {
+        "status": "pass",
+        "exit_code": 0,
+        "github_state": "success",
+        "description": "Optional Codex review unavailable; merge gate unaffected",
+    },
+    "optional_not_requested": {
+        "status": "pass",
+        "exit_code": 0,
+        "github_state": "success",
+        "description": "Optional Codex review not requested",
+    },
+    "optional_review_pending": {
+        "status": "pass",
+        "exit_code": 0,
+        "github_state": "success",
+        "description": "Optional Codex review pending; merge gate unaffected",
+    },
+    "optional_review_findings": {
+        "status": "pass",
+        "exit_code": 0,
+        "github_state": "success",
+        "description": "Optional Codex findings remain advisory",
+    },
+    "required_request_missing": {
+        "status": "pending",
+        "exit_code": 3,
+        "github_state": "pending",
+        "description": "Current-head Codex review request required",
+    },
+    "required_review_pending": {
+        "status": "pending",
+        "exit_code": 3,
+        "github_state": "pending",
+        "description": "Required current-head Codex review is pending",
+    },
+    "required_provider_unavailable": {
+        "status": "pending",
+        "exit_code": 3,
+        "github_state": "pending",
+        "description": "Required Codex review is unavailable",
+    },
+    "visibility_blocked": {
+        "status": "block",
+        "exit_code": 2,
+        "github_state": "failure",
+        "description": "Codex review visibility is incomplete",
+    },
+    "required_review_blocked": {
+        "status": "block",
+        "exit_code": 2,
+        "github_state": "failure",
+        "description": "Required Codex review remains blocked",
+    },
+    "evaluator_exception": {
+        "status": "block",
+        "exit_code": 2,
+        "github_state": "failure",
+        "description": "Trusted Codex settlement evaluator failed",
+    },
 }
-EXIT_CODE_BY_STATUS = {"pass": 0, "pending": 0, "block": 2}
+
+
+def _settlement_status_contract(status: str, status_code: str) -> dict[str, Any]:
+    contract = SETTLEMENT_STATUS_CONTRACT.get(status_code)
+    if contract is None or contract.get("status") != status:
+        raise SettlementError(
+            f"settlement status contract mismatch: status={status!r}, "
+            f"status_code={status_code!r}"
+        )
+    return dict(contract)
+
 
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
@@ -974,6 +1055,11 @@ def evaluate(
             else ("pass", "optional_review_pending")
         )
 
+    status_contract = _settlement_status_contract(status, status_code)
+    exit_code = status_contract["exit_code"]
+    github_state = status_contract["github_state"]
+    description = status_contract["description"]
+
     settled = (
         status == "pass"
         and completion is not None
@@ -1032,6 +1118,9 @@ def evaluate(
         "settled": settled,
         "status": status,
         "status_code": status_code,
+        "exit_code": exit_code,
+        "github_state": github_state,
+        "description": description,
         "errors": errors,
         "does_not_establish": does_not_establish,
     }
@@ -1041,6 +1130,9 @@ def evaluate(
         "kind": "github_codex_review_settlement_result",
         "status": status,
         "status_code": status_code,
+        "exit_code": exit_code,
+        "github_state": github_state,
+        "description": description,
         "required": required,
         "settled": settled,
         "head_sha": head_sha,
@@ -1158,15 +1250,6 @@ def ensure_request(
     }
 
 
-def _evaluation_exit_code(result: dict[str, Any]) -> int:
-    status = result.get("status")
-    status_code = result.get("status_code")
-    expected_status = STATUS_BY_CODE.get(status_code)
-    if expected_status is None or status != expected_status:
-        raise SettlementError("evaluation status and status_code are inconsistent")
-    return EXIT_CODE_BY_STATUS[expected_status]
-
-
 def _write_create_only(path: Path, payload: dict[str, Any]) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1207,7 +1290,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.pr,
                 explicitly_required=args.require,
             )
-            exit_code = _evaluation_exit_code(result)
+            exit_code = result["exit_code"]
             if args.write_evidence:
                 evidence_path = Path(args.write_evidence)
                 if not evidence_path.is_absolute():
@@ -1215,16 +1298,20 @@ def main(argv: list[str] | None = None) -> int:
                 _write_create_only(evidence_path, result["evidence"])
                 result["evidence_path"] = str(evidence_path.resolve())
     except Exception as exc:
+        contract = _settlement_status_contract("block", "evaluator_exception")
         result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "github_codex_review_settlement_result",
             "status": "block",
-            "status_code": "evaluator_error",
+            "status_code": "evaluator_exception",
+            "exit_code": contract["exit_code"],
+            "github_state": contract["github_state"],
+            "description": contract["description"],
             "required": True,
             "settled": False,
             "errors": [str(exc)],
         }
-        exit_code = 2
+        exit_code = contract["exit_code"]
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:

@@ -37,7 +37,7 @@ COMPLETION_TIME = "2026-07-27T08:01:00Z"
 QUOTA_BODY = (
     "You have reached your Codex usage limits for code reviews. "
     "You can see your limits in the "
-    "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n\n"
+    "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n"
     "To continue using code reviews, you can upgrade your account or add "
     "credits to your account and enable them for code reviews in your "
     "[settings](https://chatgpt.com/codex/cloud/settings/code-review)."
