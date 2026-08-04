@@ -1381,6 +1381,66 @@ def _claim_intent_rejection(payload: dict[str, Any]) -> BureauPickupError:
     return BureauPickupError(error_code, details=details)
 
 
+def _validate_claim_intent_resource_keys(value: Any) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(key, str) for key in value):
+        raise BureauPickupError(
+            "claim-intent-resource-set-invalid",
+            details={
+                "effect_started": False,
+                "required_readback": ["claim-intent"],
+                "resource_lease_contract_version": (
+                    resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+                ),
+            },
+        )
+    if value != sorted(set(value)):
+        raise BureauPickupError(
+            "claim-intent-resource-set-invalid",
+            details={
+                "effect_started": False,
+                "required_readback": ["claim-intent"],
+                "resource_lease_contract_version": (
+                    resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+                ),
+            },
+        )
+    for index, key in enumerate(value):
+        key_sha256 = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        try:
+            normalized = resources.normalize_resource_key(key)
+        except ValueError as exc:
+            raise BureauPickupError(
+                "claim-intent-resource-key-invalid",
+                details={
+                    "effect_started": False,
+                    "required_readback": ["claim-intent"],
+                    "resource_key_index": index,
+                    "resource_key_sha256": key_sha256,
+                    "error_type": type(exc).__name__,
+                    "resource_lease_contract_version": (
+                        resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+                    ),
+                },
+            ) from None
+        if normalized != key:
+            raise BureauPickupError(
+                "claim-intent-resource-key-noncanonical",
+                details={
+                    "effect_started": False,
+                    "required_readback": ["claim-intent"],
+                    "resource_key_index": index,
+                    "resource_key_sha256": key_sha256,
+                    "normalized_resource_key_sha256": hashlib.sha256(
+                        normalized.encode("utf-8")
+                    ).hexdigest(),
+                    "resource_lease_contract_version": (
+                        resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+                    ),
+                },
+            )
+    return value
+
+
 def _validate_intent_result(
     payload: dict[str, Any], request: dict[str, Any]
 ) -> tuple[dict[str, Any], bool]:
@@ -1404,9 +1464,7 @@ def _validate_intent_result(
     digest = intent.get("intent_sha256")
     if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
         raise BureauPickupError("claim-intent-digest-invalid")
-    keys = intent.get("required_resource_keys")
-    if not isinstance(keys, list) or keys != sorted(set(keys)):
-        raise BureauPickupError("claim-intent-resource-set-invalid")
+    _validate_claim_intent_resource_keys(intent.get("required_resource_keys"))
     if intent.get("lease_owner_id") != f"bureau-run:{intent['run_id']}":
         raise BureauPickupError("claim-intent-owner-invalid")
     expires_at = intent.get("expires_at_unix")
@@ -1424,6 +1482,9 @@ def _lease_metadata(intent: dict[str, Any], *, group: str) -> dict[str, Any]:
         "claim_intent_sha256": intent["intent_sha256"],
         "pickup_schema_version": SCHEMA_VERSION,
         "pickup_group": group,
+        "resource_lease_contract_version": (
+            resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+        ),
     }
 
 
@@ -1568,6 +1629,9 @@ def _acquire_groups(
         "task_id": intent["task_id"],
         "run_id": intent["run_id"],
         "claim_intent_sha256": intent["intent_sha256"],
+        "resource_lease_contract_version": (
+            resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+        ),
         "resource_keys": intent["required_resource_keys"],
         "leases": flattened,
         "groups": acquired,
@@ -2559,6 +2623,12 @@ def _validate_acquisition(acquisition: dict[str, Any]) -> None:
     payload.pop("acquisition_sha256", None)
     if _sha256(payload) != claimed:
         raise BureauPickupError("acquisition-digest-mismatch")
+    contract_version = acquisition.get("resource_lease_contract_version")
+    if (
+        contract_version is not None
+        and contract_version != resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION
+    ):
+        raise BureauPickupError("acquisition-resource-lease-contract-unsupported")
     keys = acquisition.get("resource_keys")
     if not isinstance(keys, list) or keys != sorted(set(keys)):
         raise BureauPickupError("acquisition-resource-set-invalid")

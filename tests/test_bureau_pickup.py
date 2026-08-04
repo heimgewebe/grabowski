@@ -507,6 +507,164 @@ class BureauPickupTests(unittest.TestCase):
         )
         self.assertEqual((run_dir / "intent.json").stat().st_mode & 0o777, 0o600)
 
+    def test_t017_host_path_service_claim_is_contract_bound(self) -> None:
+        keys = [
+            "host:heim-pc",
+            "path:/tmp/t141-exact-target",
+            "service:bureau-halfhour-operator.service",
+        ]
+        intent = self.intent(keys)
+        leases = [
+            self.lease(key, intent["lease_owner_id"])
+            for key in intent["required_resource_keys"]
+        ]
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    self.coordinated_status(intent),
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={
+                    "leases": leases,
+                    "owner_id": intent["lease_owner_id"],
+                },
+            ) as acquire,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(self.request())
+
+        self.assertEqual("claimed", result["status"])
+        self.assertEqual(intent["required_resource_keys"], result["resource_keys"])
+        acquire.assert_called_once()
+        self.assertEqual(
+            intent["required_resource_keys"],
+            acquire.call_args.args[1],
+        )
+        metadata = acquire.call_args.kwargs["metadata"]
+        self.assertEqual("other", metadata["pickup_group"])
+        self.assertEqual(
+            pickup.resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION,
+            metadata["resource_lease_contract_version"],
+        )
+        acquisition = json.loads(
+            (Path(result["journal"]) / "acquisition.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            pickup.resources.RESOURCE_LEASE_CONTRACT_CURRENT_VERSION,
+            acquisition["resource_lease_contract_version"],
+        )
+        self.assertEqual(intent["required_resource_keys"], acquisition["resource_keys"])
+        self.assertIn("host:heim-pc", acquisition["resource_keys"])
+
+    def test_unknown_claim_intent_resource_kind_fails_before_effect(self) -> None:
+        intent = self.intent(
+            ["path:/tmp/t141-never-leased", "unknown-kind:heim-pc"]
+        )
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "claim-intent-resource-key-invalid",
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+        self.assertFalse(
+            (pickup.STATE_ROOT / "runs" / intent["run_id"]).exists()
+        )
+        self.assertFalse(raised.exception.details["effect_started"])
+        self.assertEqual(
+            ["claim-intent"], raised.exception.details["required_readback"]
+        )
+        self.assertEqual(1, raised.exception.details["resource_key_index"])
+        self.assertEqual("ValueError", raised.exception.details["error_type"])
+        self.assertRegex(
+            raised.exception.details["resource_key_sha256"], r"^[0-9a-f]{64}$"
+        )
+
+    def test_noncanonical_claim_intent_resource_key_fails_before_effect(self) -> None:
+        intent = self.intent(["path:/tmp/t141/../t141-target"])
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "claim-intent-resource-key-noncanonical",
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+        self.assertFalse(raised.exception.details["effect_started"])
+        self.assertRegex(
+            raised.exception.details["normalized_resource_key_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_empty_claim_intent_resource_set_remains_compatible(self) -> None:
+        intent = self.intent()
+        intent["required_resource_keys"] = []
+        payload = {"status": "claim-intent", "intent": intent}
+        request = pickup._normalize_request(self.request())
+        observed, existing = pickup._validate_intent_result(payload, request)
+        self.assertFalse(existing)
+        self.assertEqual([], observed["required_resource_keys"])
+
+    def test_acquisition_rejects_unknown_resource_lease_contract_version(self) -> None:
+        intent = self.intent()
+        acquisition = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_lease_contract_version": "999",
+            "resource_keys": intent["required_resource_keys"],
+            "leases": [],
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError,
+            "acquisition-resource-lease-contract-unsupported",
+        ):
+            pickup._validate_acquisition(acquisition)
+
+    def test_legacy_acquisition_without_contract_version_remains_readable(self) -> None:
+        intent = self.intent([])
+        acquisition = {
+            "schema_version": pickup.SCHEMA_VERSION,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": [],
+            "leases": [],
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        pickup._validate_acquisition(acquisition)
+
     def managed_registry_fixture(self):
         source_commit = "a" * 40
         relative = "registry/queue.json"
