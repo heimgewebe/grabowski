@@ -3060,7 +3060,7 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "43eb055d3904508128fa86b02f5a94980ee5d648f8f40cd6f95da3d801f69a3f",
       "src/grabowski_bureau_leases.py": "cce8133d87db6a517ca0226537030f64c30054b862b7c95fb4a5a045a3566cb3",
-      "src/grabowski_bureau_pickup.py": "956b16a8598cf9667baddfcd78e6115eb4c065d24a0ca0b223886091640cc978",
+      "src/grabowski_bureau_pickup.py": "70edb903af69e07b5cac22012fd6c9a1034da1c7aa35db0df724d51d875c52d2",
       "src/grabowski_capabilities.py": "06c6f68b3046e9fd6d5a752203c3170e4400d2f2b253d9fe7693e2abfbfc7483",
       "src/grabowski_checkout_binding_reconciler.py": "6198f9614b41f67412fec575410fa2b2fa63ff0fcc0db349cce55c4c29950733",
       "src/grabowski_checkouts.py": "7153fadf2934c6b8bb2722354a66557c88bfdc078db8534b015ab9e7cf7c3123",

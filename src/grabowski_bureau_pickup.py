@@ -2154,7 +2154,10 @@ def grabowski_bureau_pickup_execute(
     try:
         intent, existing = _validate_intent_result(intent_payload, normalized)
     except BureauPickupError as exc:
-        if exc.code != "claim-intent-runtime-drift-blocked":
+        if exc.code not in {
+            "claim-intent-runtime-drift-blocked",
+            "claim-intent-stale-runtime-blocked",
+        }:
             raise
         replay = _journaled_existing_assignment_after_runtime_drift(
             normalized, registry_binding

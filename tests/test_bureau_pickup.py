@@ -1988,8 +1988,8 @@ class BureauPickupTests(unittest.TestCase):
         self.write_registry_bound_request(run_dir, normalized)
         pickup._write_bound_json(run_dir / "intent.json", intent)
         runtime_drift = {
-            "status": "runtime-drift-blocked",
-            "code": "runtime-drift-blocked",
+            "status": "stale-runtime-blocked",
+            "code": "stale-runtime-blocked",
             "runtime_identity": {
                 "compatibility": {
                     "status": "incompatible",
