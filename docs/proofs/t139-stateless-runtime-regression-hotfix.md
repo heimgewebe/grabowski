@@ -23,6 +23,13 @@ client-deklarierte Ersatzidentität wieder ein. Exakte Tool-/Argumentbindung,
 Runtime-Bindung, Ablaufzeit, Einmalverbrauch und Trennung verschiedener
 FastMCP-Sitzungen bleiben unverändert.
 
+## Verifikation
+
+Der materialisierte Stand bestand 102 Operator-Vertragstests, 31
+Transport-Roundtrip-Tests und 21 zentrale Transport-Gate-Integrationstests.
+`git diff --check` blieb ohne Befund. Die Hilfsworkflows wurden vor dem finalen
+Commit vollständig entfernt.
+
 ## Restrisiko
 
 Verwaiste Sitzungen bleiben bis zum Operator-Neustart im Session-Manager. Eine
