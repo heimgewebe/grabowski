@@ -1,9 +1,11 @@
 name: PR 589 contract repair
 
 on:
-  push:
+  pull_request:
+    types:
+      - synchronize
     branches:
-      - fix/bureau-control-root-transport-intent-20260804
+      - main
     paths:
       - .github/workflows/pr589-contract-repair.yml
 
@@ -12,6 +14,7 @@ permissions:
 
 jobs:
   repair:
+    if: github.event.pull_request.number == 589 && github.event.pull_request.head.ref == 'fix/bureau-control-root-transport-intent-20260804'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout exact PR branch
