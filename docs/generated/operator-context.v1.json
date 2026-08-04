@@ -3114,7 +3114,7 @@
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "c1e46bd5b921834a89325fdffe4edba8f716369e6edca3401d230d736f3cfdae",
       "src/grabowski_resources.py": "c17bf781f106072368753589bfac855bc216c2147c2978e748f70449a12f3c9a",
-      "src/grabowski_runtime.py": "ad399fa26a922a5520ce5e55f0b4fe0b9ad02cbcead50777410245b2ad61fabf",
+      "src/grabowski_runtime.py": "d278ab9435258e8050f7f9acd98f320ea361f6043870626ab18d1d46ff7d51e8",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "3db37b414aab89418132c722423c0a38c103ed745d62c17036f62e0ef5ad42ff",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
