@@ -58,6 +58,11 @@ class BureauControlCheckoutTests(unittest.TestCase):
                 "BUREAU_CANONICAL_REMOTE_URL",
                 str(self.remote),
             ),
+            mock.patch.object(
+                bureau,
+                "_control_git_environment",
+                return_value=self._control_environment(),
+            ),
         ]
         for patcher in self.patches:
             patcher.start()
@@ -74,6 +79,19 @@ class BureauControlCheckoutTests(unittest.TestCase):
             "GIT_AUTHOR_EMAIL": "grabowski@example.invalid",
             "GIT_COMMITTER_NAME": "Grabowski Test",
             "GIT_COMMITTER_EMAIL": "grabowski@example.invalid",
+        }
+
+    @staticmethod
+    def _control_environment() -> dict[str, str]:
+        return {
+            "HOME": str(Path.home()),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ALLOW_PROTOCOL": "file",
         }
 
     @classmethod
