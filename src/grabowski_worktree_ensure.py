@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -51,6 +52,23 @@ def _bounded_text(value: Any, limit: int = 2048) -> str:
     if len(encoded) <= limit:
         return text
     return encoded[:limit].decode("utf-8", errors="ignore") + "…"
+
+
+def _accepts_keyword_argument(function: Callable[..., Any], name: str) -> bool:
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return False
+    parameter = signature.parameters.get(name)
+    if parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }:
+        return True
+    return any(
+        candidate.kind is inspect.Parameter.VAR_KEYWORD
+        for candidate in signature.parameters.values()
+    )
 
 
 def _receipt_root() -> Path:
@@ -675,8 +693,21 @@ def ensure_worktree(
     record_friction: FrictionRecorder | None = None,
     resolve_friction: FrictionResolver | None = None,
     assess_admission: Callable[..., dict[str, Any]] | None = None,
+    reposkop_required: bool = False,
 ) -> dict[str, Any]:
+    if not isinstance(reposkop_required, bool):
+        raise WorktreeEnsurePreflight("reposkop_required must be a boolean")
+    if (
+        reposkop_required
+        and assess_admission is not None
+        and not _accepts_keyword_argument(assess_admission, "reposkop_required")
+    ):
+        raise WorktreeEnsurePreflight(
+            "assess_admission must accept reposkop_required when Reposkop enforcement is enabled"
+        )
     inputs = _normalize_inputs(parameters)
+    if reposkop_required:
+        inputs = {**inputs, "reposkop_required": True}
     parameters_sha256 = _sha256_json(inputs)
     idempotency_key = inputs["idempotency_key"]
 
@@ -866,20 +897,23 @@ def ensure_worktree(
         admission: dict[str, Any] | None = None
         try:
             assessor = assess_admission or work_admission.require_repository_admission
-            admission = assessor(
-                mode="normal",
-                repo=inputs["repo"],
-                owner_id=inputs["lease_owner_id"],
-                operation="worktree_create",
-                requested_scope={
+            admission_parameters: dict[str, Any] = {
+                "mode": "normal",
+                "repo": inputs["repo"],
+                "owner_id": inputs["lease_owner_id"],
+                "operation": "worktree_create",
+                "requested_scope": {
                     "paths": [inputs["target_path"]],
                     "branch": inputs["branch"],
                 },
-                target_path=inputs["target_path"],
-                branch=inputs["branch"],
-                source_kind=inputs["source_kind"],
-                source_id=inputs["source_id"],
-            )
+                "target_path": inputs["target_path"],
+                "branch": inputs["branch"],
+                "source_kind": inputs["source_kind"],
+                "source_id": inputs["source_id"],
+            }
+            if reposkop_required:
+                admission_parameters["reposkop_required"] = True
+            admission = assessor(**admission_parameters)
         except work_admission.WorkAdmissionBlocked as exc:
             admission = exc.assessment
             friction = recovery_friction or _record_friction(
