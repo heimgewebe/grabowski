@@ -56,6 +56,42 @@ CLEAN_RESULT_RE = re.compile(
     + _CODEX_CLEAN_FOOTER_PATTERN
     + r"\Z"
 )
+PROVIDER_UNAVAILABLE_BODIES = {
+    "quota_exhausted": (
+        (
+            "You have reached your Codex usage limits for code reviews. "
+            "You can see your limits in the "
+            "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n\n"
+            "To continue using code reviews, you can upgrade your account or add "
+            "credits to your account and enable them for code reviews in your "
+            "[settings](https://chatgpt.com/codex/cloud/settings/code-review)."
+        ),
+        (
+            "You have reached your Codex usage limits for code reviews. "
+            "You can see your limits in the "
+            "[Codex usage dashboard](https://chatgpt.com/codex/usage).\n\n"
+            "To continue using code reviews, you can upgrade your account or add "
+            "credits to your account and enable them for code reviews in your "
+            "[settings](https://chatgpt.com/codex/settings)."
+        ),
+    ),
+}
+
+STATUS_BY_CODE = {
+    "review_settled": "pass",
+    "optional_provider_unavailable": "pass",
+    "optional_not_requested": "pass",
+    "optional_review_pending": "pass",
+    "optional_review_findings": "pass",
+    "required_request_missing": "pending",
+    "required_review_pending": "pending",
+    "required_provider_unavailable": "pending",
+    "required_review_blocked": "block",
+    "visibility_blocked": "block",
+    "evaluator_error": "block",
+}
+EXIT_CODE_BY_STATUS = {"pass": 0, "pending": 0, "block": 2}
+
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -531,13 +567,22 @@ def _policy(pr: dict[str, Any], repository: str, *, explicitly_required: bool) -
         "files": [{"path": item.get("path")} for item in files],
     }
     complexity = pr_review_gate.classify_complexity(view, None, repo_name=repository)
-    required = explicitly_required or complexity.get("review_tier") == "high_critical"
-    reasons = list(complexity.get("high_critical_reasons") or [])
+    policy_required = complexity.get("external_review_required") is True
+    required = explicitly_required or policy_required
+    reasons: list[str] = []
+    if policy_required:
+        reasons.append("pr_review_gate requires external review")
     if explicitly_required:
         reasons.insert(0, "explicitly required")
     return {
         "required": required,
+        "external_review_required": policy_required,
+        "self_review_required": complexity.get("self_review_required") is True,
+        "minimum_self_review_iterations": complexity.get(
+            "minimum_self_review_iterations"
+        ),
         "review_tier": complexity.get("review_tier"),
+        "complexity_reasons": list(complexity.get("reasons") or []),
         "reasons": list(dict.fromkeys(reasons)),
     }
 
@@ -749,6 +794,77 @@ def _review_completion(
     return None
 
 
+def _provider_unavailable_diagnostic(
+    pr: dict[str, Any],
+    *,
+    requests: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    # Provider notices are diagnostics, never Codex review completions. One
+    # exact canonical request prevents attribution to an ambiguous attempt.
+    if len(requests) != 1:
+        return None
+    request = requests[0]
+    request_time = request["_created"]
+    candidates: list[dict[str, Any]] = []
+    for comment in _list_nodes(pr.get("comments"), label="comments"):
+        actor = _actor_login(comment.get("author"))
+        body = comment.get("body")
+        created = _parse_time(comment.get("createdAt"))
+        comment_id = comment.get("databaseId")
+        if (
+            actor not in TRUSTED_CODEX_ACTORS
+            or not isinstance(body, str)
+            or created is None
+            or created < request_time
+            or isinstance(comment_id, bool)
+            or not isinstance(comment_id, int)
+        ):
+            continue
+        normalized = _normalize_codex_comment_body(body)
+        reason_code = next(
+            (
+                reason
+                for reason, expected_bodies in PROVIDER_UNAVAILABLE_BODIES.items()
+                if normalized in expected_bodies
+            ),
+            None,
+        )
+        if reason_code is None:
+            continue
+        candidates.append(
+            {
+                **comment,
+                "_actor": actor,
+                "_created": created,
+                "_normalized_body": normalized,
+                "_reason_code": reason_code,
+            }
+        )
+    if not candidates:
+        return None
+    selected = min(
+        candidates,
+        key=lambda item: (item["_created"], item["databaseId"]),
+    )
+    return {
+        "mode": "provider_diagnostic",
+        "comment_id": selected["databaseId"],
+        "actor": selected["_actor"],
+        "state": "UNAVAILABLE",
+        "reason_code": selected["_reason_code"],
+        "observed_at": selected["createdAt"],
+        "body_sha256": _sha256_text(selected["_normalized_body"]),
+        "url": selected.get("url"),
+        "request_id": request["_request"]["request_id"],
+        "request_comment_id": request["databaseId"],
+        "does_not_establish": [
+            "codex_review_performed",
+            "codex_review_pass",
+            "codex_review_settled",
+            "provider_outage_root_cause",
+        ],
+    }
+
 def _codex_threads(
     pr: dict[str, Any],
     *,
@@ -795,7 +911,8 @@ def evaluate(
 ) -> dict[str, Any]:
     repository, _, _ = _normalize_repo(repository)
     pr = _live_state(repo, repository, pr_number)
-    errors = _truncation_errors(pr)
+    visibility_errors = _truncation_errors(pr)
+    errors = list(visibility_errors)
     head_sha = _current_head(pr)
     base_sha = _current_base(pr)
     diff_sha256 = _current_diff(pr)
@@ -809,19 +926,16 @@ def evaluate(
     ]
     request = requests[0] if requests else None
     completion = (
-        _review_completion(
-            pr,
-            requests=requests,
-            head_sha=head_sha,
-        )
+        _review_completion(pr, requests=requests, head_sha=head_sha)
         if request is not None
         else None
     )
-    threads = (
-        _codex_threads(pr, head_sha=head_sha)
-        if request is not None
-        else []
+    provider_outcome = (
+        _provider_unavailable_diagnostic(pr, requests=requests)
+        if request is not None and completion is None
+        else None
     )
+    threads = _codex_threads(pr, head_sha=head_sha) if request is not None else []
     unresolved = [item["thread_id"] for item in threads if not item["is_resolved"]]
     if completion is not None and completion["blocking_state"]:
         errors.append(f"Codex review state is blocking: {completion['state']}")
@@ -831,21 +945,54 @@ def evaluate(
         errors.append(f"{len(unresolved)} Codex review thread(s) remain unresolved")
 
     required = policy["required"]
-    if not required:
-        status = "pass"
+    if visibility_errors:
+        status, status_code = "block", "visibility_blocked"
     elif errors:
-        status = "block"
-    elif request is None or completion is None:
-        status = "pending"
+        status, status_code = (
+            ("block", "required_review_blocked")
+            if required
+            else ("pass", "optional_review_findings")
+        )
+    elif completion is not None:
+        status, status_code = "pass", "review_settled"
+    elif provider_outcome is not None:
+        status, status_code = (
+            ("pending", "required_provider_unavailable")
+            if required
+            else ("pass", "optional_provider_unavailable")
+        )
+    elif request is None:
+        status, status_code = (
+            ("pending", "required_request_missing")
+            if required
+            else ("pass", "optional_not_requested")
+        )
     else:
-        status = "pass"
-    settled = status == "pass" and request is not None and completion is not None and not errors
+        status, status_code = (
+            ("pending", "required_review_pending")
+            if required
+            else ("pass", "optional_review_pending")
+        )
+
+    settled = (
+        status == "pass"
+        and completion is not None
+        and request is not None
+        and not errors
+    )
     review_performed = completion is not None
     does_not_establish = [
         "semantic_correctness_of_codex_findings",
         "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
         "merge_authority",
     ]
+    if provider_outcome is not None:
+        does_not_establish.extend(
+            [
+                "provider_unavailability_is_codex_review_completion",
+                "provider_unavailability_is_codex_review_pass",
+            ]
+        )
     generated_at = datetime.now(timezone.utc).isoformat()
     request_evidence = None
     if request is not None:
@@ -871,8 +1018,10 @@ def evaluate(
         "required": required,
         "required_reason": policy["reasons"],
         "review_tier": policy["review_tier"],
+        "policy": policy,
         "request": request_evidence,
         "completion": completion,
+        "provider_outcome": provider_outcome,
         "review_performed": review_performed,
         "finding_count": len(threads),
         "thread_ids": thread_ids,
@@ -882,6 +1031,7 @@ def evaluate(
         "all_findings_triaged": not unresolved,
         "settled": settled,
         "status": status,
+        "status_code": status_code,
         "errors": errors,
         "does_not_establish": does_not_establish,
     }
@@ -890,16 +1040,19 @@ def evaluate(
         "schema_version": SCHEMA_VERSION,
         "kind": "github_codex_review_settlement_result",
         "status": status,
+        "status_code": status_code,
         "required": required,
         "settled": settled,
         "head_sha": head_sha,
         "diff_sha256": diff_sha256,
         "request_present": request is not None,
         "completion_present": completion is not None,
+        "provider_outcome_present": provider_outcome is not None,
         "review_performed": review_performed,
         "finding_count": len(threads),
         "unresolved_thread_count": len(unresolved),
         "errors": errors,
+        "policy": policy,
         "evidence": evidence,
     }
 
@@ -1005,6 +1158,15 @@ def ensure_request(
     }
 
 
+def _evaluation_exit_code(result: dict[str, Any]) -> int:
+    status = result.get("status")
+    status_code = result.get("status_code")
+    expected_status = STATUS_BY_CODE.get(status_code)
+    if expected_status is None or status != expected_status:
+        raise SettlementError("evaluation status and status_code are inconsistent")
+    return EXIT_CODE_BY_STATUS[expected_status]
+
+
 def _write_create_only(path: Path, payload: dict[str, Any]) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1028,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("request", "evaluate"))
     args = parser.parse_args(argv)
     repo = args.repo_path.resolve()
+    exit_code = 0
     try:
         if args.command == "request":
             result = ensure_request(
@@ -1044,6 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.pr,
                 explicitly_required=args.require,
             )
+            exit_code = _evaluation_exit_code(result)
             if args.write_evidence:
                 evidence_path = Path(args.write_evidence)
                 if not evidence_path.is_absolute():
@@ -1055,15 +1219,17 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": SCHEMA_VERSION,
             "kind": "github_codex_review_settlement_result",
             "status": "block",
+            "status_code": "evaluator_error",
             "required": True,
             "settled": False,
             "errors": [str(exc)],
         }
+        exit_code = 2
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(result.get("status") or result.get("reason") or result.get("requested"))
-    return 0 if not result.get("errors") else 2
+    return exit_code
 
 
 if __name__ == "__main__":

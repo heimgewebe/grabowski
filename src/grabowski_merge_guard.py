@@ -1409,16 +1409,20 @@ class CaptainMergeGuardRunner:
             if isinstance(review_evidence, dict)
             else None
         )
-        required = (
-            review_tier == "high_critical"
-            or self.parameters.get("codex_review_required") is True
+        explicit_required = self.parameters.get("codex_review_required")
+        policy_required = (
+            isinstance(review_evidence, dict)
+            and review_evidence.get("external_review_required") is True
         )
+        required = policy_required or explicit_required is True
         evidence = self.parameters.get("codex_review_evidence")
         exception = self.parameters.get("codex_review_exception")
         receipt_key = f"{phase}_codex_review_revalidation"
         receipt: dict[str, Any] = {
             "required": required,
             "review_tier": review_tier,
+            "external_review_required": policy_required,
+            "explicitly_required": explicit_required is True,
             "evidence_sha256": (
                 _sha256_json(evidence) if isinstance(evidence, dict) else None
             ),
@@ -1429,9 +1433,19 @@ class CaptainMergeGuardRunner:
             "errors": errors,
         }
         self.receipt[receipt_key] = receipt
+        if explicit_required is not None and not isinstance(explicit_required, bool):
+            errors.append("merge_guard_codex_required_invalid")
+            receipt["status"] = "blocked"
+            return errors
         if evidence is not None and exception is not None:
             errors.append("merge_guard_codex_evidence_exception_ambiguous")
             receipt["status"] = "blocked"
+            return errors
+        if not required and exception is None:
+            diagnostic_present = evidence is not None
+            receipt["status"] = "not_required"
+            receipt["diagnostic_evidence_present"] = diagnostic_present
+            receipt["diagnostic_evidence_ignored_for_authority"] = diagnostic_present
             return errors
         if exception is not None:
             if not isinstance(exception, dict):

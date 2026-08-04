@@ -4,6 +4,12 @@
 
 Root Task Lifetime v1 definiert den Lebensdauer- und Wahrheitsvertrag für lokale, privilegierte Langläufer im bestehenden Grabowski-Taskmodell. Der unprivilegierte MCP-Prozess stößt ausschließlich eine root-eigene systemd-Unit über den Privileged Broker an; anschließend besitzt die System-Unit den Nutzprozess unabhängig vom aufrufenden Prozess.
 
+## Allgemeiner Laufzeitstandard
+
+Allgemeine persistente Grabowski-Tasks und dauerhafte Jobs erhalten ohne explizite Angabe `21.600` Sekunden, also sechs Stunden. Ein ausdrücklich gesetztes `runtime_seconds` bleibt unverändert maßgeblich; der jeweilige Launcher bindet diesen Wert exakt als `RuntimeMaxSec` an systemd. Die Änderung erzeugt keine Endloslaufzeit und erhöht weder `MAX_JOB_RUNTIME` noch `TRUSTED_MAX_JOB_RUNTIME`. Browser- und GUI-Helfer behalten ihre getrennten kürzeren Standards.
+
+Die privilegierte Root-Task-Grenze bleibt ebenfalls endlich: höchstens sieben Tage abzüglich 300 Sekunden Lease- und Stop-Puffer. Die sechs Stunden sind daher ein Standardwert, keine Sicherheitsobergrenze und keine Aussage über die Lebensdauer der aufrufenden ChatGPT-Sitzung.
+
 ## Ausführungsmodell
 
 - Gewöhnliche lokale und entfernte Tasks behalten das Backend `systemd-user` im Scope `user`.

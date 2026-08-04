@@ -907,7 +907,7 @@ class OperatorContractTests(unittest.TestCase):
 
     def test_background_jobs_have_a_separate_runtime_budget(self) -> None:
         source = SOURCE.read_text(encoding="utf-8")
-        self.assertIn("DEFAULT_JOB_RUNTIME = 7_200", source)
+        self.assertIn("DEFAULT_JOB_RUNTIME = 21_600", source)
         self.assertIn("MAX_JOB_RUNTIME = 86_400", source)
         self.assertIn("--property=RuntimeMaxSec=", source)
 
