@@ -259,6 +259,24 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
                     reconciliation.CONFIRMATION,
                 )
 
+    def test_broken_symlink_at_bound_path_blocks_without_mutation(self) -> None:
+        binding = self._missing_binding()
+        self.checkout.symlink_to(
+            self.root / "missing-target",
+            target_is_directory=True,
+        )
+        preview = self._preview(binding)
+        self.assertFalse(preview["safe_to_apply"])
+        self.assertIn("checkout-path-symlink", preview["blockers"])
+        self.assertTrue(preview["checkout_observation"]["checkout_exists"])
+        with self.assertRaisesRegex(RuntimeError, "checkout-path-symlink"):
+            self._apply(binding, preview)
+        after = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", after["phase"])
+        self.assertIsNone(reconciliation._record(str(binding["checkout_key"])))
+
     def test_binding_revision_drift_invalidates_preview(self) -> None:
         binding = self._missing_binding()
         preview = self._preview(binding)
