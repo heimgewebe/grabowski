@@ -952,11 +952,7 @@ def begin(
         verified = sorted(state["verified_receipts"], key=_receipt_order)
         pending = sorted(state["pending_challenges"], key=_receipt_order)
         if not _is_shared_pool(scope):
-            if verified:
-                if _receipt_mutation_intent(verified[0]) != intent:
-                    raise TransportRoundtripRequired(
-                        "fresh transport verification is bound to a different mutation"
-                    )
+            if verified and _receipt_mutation_intent(verified[0]) == intent:
                 return _projection(
                     state=state,
                     scope=scope,
@@ -966,11 +962,7 @@ def begin(
                     replayed=True,
                     selected_verified=verified[0],
                 )
-            if pending:
-                if _receipt_mutation_intent(pending[0]) != intent:
-                    raise TransportRoundtripRequired(
-                        "pending transport challenge is bound to a different mutation"
-                    )
+            if pending and _receipt_mutation_intent(pending[0]) == intent:
                 return _projection(
                     state=state,
                     scope=scope,

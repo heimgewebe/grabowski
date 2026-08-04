@@ -380,21 +380,49 @@ class TransportRoundtripTests(unittest.TestCase):
             first_ack["verification_receipt_sha256"],
         )
 
-    def test_single_scope_rejects_reuse_for_different_intent(self) -> None:
-        self.begin()
-        with self.assertRaisesRegex(
-            roundtrip.TransportRoundtripRequired,
-            "bound to a different mutation",
-        ):
-            roundtrip.begin(
+    def test_single_scope_replaces_pending_challenge_for_different_intent(self) -> None:
+        first = self.begin()
+        replacement = roundtrip.begin(
+            client_scope=META_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent={
+                "tool_name": "write",
+                "arguments_sha256": "d" * 64,
+            },
+            now_unix=101,
+        )
+        self.assertFalse(replacement["replayed"])
+        self.assertEqual(replacement["state"], "challenge_pending")
+        self.assertNotEqual(replacement["challenge_receipt_sha256"], first["challenge_receipt_sha256"])
+        self.assertEqual(replacement["pending_challenge_count"], 1)
+        self.assertEqual(replacement["target_tool_name"], "write")
+        with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
+            self.acknowledge(first["challenge_receipt_sha256"], now=102)
+
+    def test_single_scope_replaces_verified_receipt_for_different_intent(self) -> None:
+        verified = self.verify()
+        replacement = roundtrip.begin(
+            client_scope=META_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent={
+                "tool_name": "write",
+                "arguments_sha256": "d" * 64,
+            },
+            now_unix=102,
+        )
+        self.assertFalse(replacement["replayed"])
+        self.assertEqual(replacement["state"], "challenge_pending")
+        self.assertEqual(replacement["verified_receipt_count"], 0)
+        self.assertEqual(replacement["target_arguments_sha256"], "d" * 64)
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
                 client_scope=META_SCOPE,
                 runtime_binding=BINDING,
-                mutation_intent={
-                    "tool_name": "write",
-                    "arguments_sha256": "d" * 64,
-                },
-                now_unix=101,
+                tool_name="other-write",
+                arguments_sha256="e" * 64,
+                now_unix=103,
             )
+        self.assertNotEqual(replacement["challenge_receipt_sha256"], verified["verification_receipt_sha256"])
 
     def test_shared_pending_pool_is_bounded_and_prunes_stale_entries(self) -> None:
         with mock.patch.object(roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2):
