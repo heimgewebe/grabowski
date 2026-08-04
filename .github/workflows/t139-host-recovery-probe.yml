@@ -8,6 +8,9 @@ permissions:
   push:
     branches:
       - ops/t139-host-recovery-probe
+  pull_request:
+    branches:
+      - main
 
 jobs:
   probe:
