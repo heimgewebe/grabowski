@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Any
 import uuid
 
@@ -107,12 +108,38 @@ def _snapshot(checkout_key: str) -> dict[str, Any]:
     }
 
 
+def _lexical_checkout_path_observation(
+    raw_path: str,
+) -> tuple[Path, bool, list[str]]:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError("checkout binding path is not absolute")
+    current = Path(path.anchor)
+    parts = path.parts[1:]
+    for index, part in enumerate(parts):
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return path, False, []
+        except OSError:
+            return path, True, ["checkout-path-unobservable"]
+        if stat.S_ISLNK(metadata.st_mode):
+            return path, True, ["checkout-path-symlink"]
+        if index < len(parts) - 1 and not stat.S_ISDIR(metadata.st_mode):
+            return path, True, ["checkout-path-parent-not-directory"]
+    return path, True, []
+
+
 def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     repo = checkouts._resolve_repo(binding["repo_path"])
     common_dir = checkouts._git_common_dir(repo)
     top_level, observed_common, records = checkouts._worktree_records(repo)
-    checkout_path = checkouts._safe_path(binding["checkout_path"], must_exist=False)
-    blockers: list[str] = []
+    bound_checkout_path, checkout_exists, path_blockers = (
+        _lexical_checkout_path_observation(binding["checkout_path"])
+    )
+    checkout_path = checkouts._safe_path(bound_checkout_path, must_exist=False)
+    blockers: list[str] = list(path_blockers)
     if str(top_level) != binding["repo_path"]:
         blockers.append("repository-path-drift")
     if common_dir != observed_common or str(common_dir) != binding["repo_common_dir"]:
@@ -125,7 +152,7 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     if len(matches) > 1:
         blockers.append("checkout-record-ambiguous")
     record = matches[0] if len(matches) == 1 else None
-    if checkout_path.exists():
+    if checkout_exists:
         blockers.append("checkout-path-present")
     if record is not None:
         if not record.get("prunable"):
@@ -148,8 +175,8 @@ def _missing_checkout_observation(binding: dict[str, Any]) -> dict[str, Any]:
     return {
         "repository": str(top_level),
         "repo_common_dir": str(common_dir),
-        "checkout_path": str(checkout_path),
-        "checkout_exists": checkout_path.exists(),
+        "checkout_path": str(bound_checkout_path),
+        "checkout_exists": checkout_exists,
         "worktree_record_present": record is not None,
         "worktree_record": record,
         "branch_ref": branch_ref,
