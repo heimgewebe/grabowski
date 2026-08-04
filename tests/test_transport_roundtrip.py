@@ -304,6 +304,48 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertEqual(sorted(result[0] for result in results), ["ok", "ok"])
         self.assertEqual(len({result[1] for result in results}), 2)
 
+    def test_shared_intent_begin_replays_exact_pending_and_verified(self) -> None:
+        arguments_sha256 = roundtrip.canonical_arguments_sha256({"sequence": 1})
+        intent = {
+            "tool_name": "write",
+            "arguments_sha256": arguments_sha256,
+        }
+        first = roundtrip.begin(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+            now_unix=100,
+        )
+        pending_replay = roundtrip.begin(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+            now_unix=101,
+        )
+        self.assertTrue(pending_replay["replayed"])
+        self.assertEqual(pending_replay["pending_challenge_count"], 1)
+        self.assertEqual(
+            pending_replay["challenge_receipt_sha256"],
+            first["challenge_receipt_sha256"],
+        )
+        verified = self.acknowledge(
+            first["challenge_receipt_sha256"],
+            scope=SHARED_SCOPE,
+            now=102,
+        )
+        verified_replay = roundtrip.begin(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+            now_unix=103,
+        )
+        self.assertTrue(verified_replay["replayed"])
+        self.assertEqual(verified_replay["verified_receipt_count"], 1)
+        self.assertEqual(
+            verified_replay["verification_receipt_sha256"],
+            verified["verification_receipt_sha256"],
+        )
+
     def test_intent_bound_shared_verifications_select_exact_mutation(self) -> None:
         first_arguments = roundtrip.canonical_arguments_sha256({"sequence": 1})
         second_arguments = roundtrip.canonical_arguments_sha256({"sequence": 2})
@@ -339,7 +381,7 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertEqual(first_ack["target_tool_name"], "first-write")
         self.assertEqual(second_ack["target_arguments_sha256"], second_arguments)
         with self.assertRaisesRegex(
-            roundtrip.TransportRoundtripRequired,
+            roundtrip.TransportMutationIntentMismatch,
             "bound to a different mutation",
         ):
             roundtrip.consume_verified(

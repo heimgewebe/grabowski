@@ -73,6 +73,10 @@ class TransportRoundtripRequired(TransportRoundtripError):
     """Raised when a mutating call lacks a fresh roundtrip verification."""
 
 
+class TransportMutationIntentMismatch(TransportRoundtripRequired):
+    """Raised when only verifications for other mutation intents are available."""
+
+
 def _canonical_bytes(value: Any) -> bytes:
     try:
         return json.dumps(
@@ -951,8 +955,14 @@ def begin(
         )
         verified = sorted(state["verified_receipts"], key=_receipt_order)
         pending = sorted(state["pending_challenges"], key=_receipt_order)
-        if not _is_shared_pool(scope):
-            if verified and _receipt_mutation_intent(verified[0]) == intent:
+        shared = _is_shared_pool(scope)
+        if not shared or intent is not None:
+            matching_verified = [
+                receipt
+                for receipt in verified
+                if _receipt_mutation_intent(receipt) == intent
+            ]
+            if matching_verified:
                 return _projection(
                     state=state,
                     scope=scope,
@@ -960,9 +970,14 @@ def begin(
                     now_unix=timestamp,
                     action="begin",
                     replayed=True,
-                    selected_verified=verified[0],
+                    selected_verified=matching_verified[0],
                 )
-            if pending and _receipt_mutation_intent(pending[0]) == intent:
+            matching_pending = [
+                receipt
+                for receipt in pending
+                if _receipt_mutation_intent(receipt) == intent
+            ]
+            if matching_pending:
                 return _projection(
                     state=state,
                     scope=scope,
@@ -970,7 +985,7 @@ def begin(
                     now_unix=timestamp,
                     action="begin",
                     replayed=True,
-                    selected_pending=pending[0],
+                    selected_pending=matching_pending[0],
                 )
         if _is_shared_pool(scope) and len(pending) >= MAX_SHARED_PENDING_CHALLENGES:
             raise TransportRoundtripRequired(
@@ -1217,7 +1232,7 @@ def consume_verified(
         elif unbound:
             verified = unbound[0]
         else:
-            raise TransportRoundtripRequired(
+            raise TransportMutationIntentMismatch(
                 "available transport verifications are bound to a different mutation"
             )
         verification_intent = _receipt_mutation_intent(verified)

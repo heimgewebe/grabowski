@@ -470,12 +470,48 @@ def _require_transport_roundtrip_for_tool(
                 arguments if arguments is not None else {}
             )
         )
+        tool_name_text = str(tool_name)
         grabowski_transport_roundtrip.consume_verified(
             client_scope=client_scope,
             runtime_binding=runtime_binding,
-            tool_name=str(tool_name),
+            tool_name=tool_name_text,
             arguments_sha256=arguments_sha256,
         )
+    except (
+        grabowski_transport_roundtrip.TransportMutationIntentMismatch
+    ) as exc:
+        try:
+            handshake = grabowski_transport_roundtrip.begin(
+                client_scope=client_scope,
+                runtime_binding=runtime_binding,
+                mutation_intent={
+                    "tool_name": tool_name_text,
+                    "arguments_sha256": arguments_sha256,
+                },
+            )
+            if handshake.get("state") == "verified":
+                grabowski_transport_roundtrip.consume_verified(
+                    client_scope=client_scope,
+                    runtime_binding=runtime_binding,
+                    tool_name=tool_name_text,
+                    arguments_sha256=arguments_sha256,
+                )
+                return
+        except grabowski_transport_roundtrip.TransportRoundtripError as begin_exc:
+            raise RuntimeError(str(begin_exc)) from begin_exc
+        challenge = handshake.get("challenge_receipt_sha256")
+        if (
+            handshake.get("state") != "challenge_pending"
+            or not isinstance(challenge, str)
+        ):
+            raise RuntimeError(
+                "transport handshake did not yield an exact pending challenge"
+            ) from exc
+        raise RuntimeError(
+            "fresh intent-bound transport verification required; call grip_run "
+            "for transport-roundtrip with action=ack and "
+            f"challenge_receipt_sha256={challenge} then retry the exact mutation"
+        ) from exc
     except grabowski_transport_roundtrip.TransportRoundtripError as exc:
         raise RuntimeError(str(exc)) from exc
 
