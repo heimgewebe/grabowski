@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -439,6 +440,59 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("block", result["status"])
         self.assertEqual("visibility_blocked", result["status_code"])
         self.assertFalse(result["settled"])
+
+    def test_evaluation_exit_code_is_bound_to_status_class(self) -> None:
+        cases = [
+            ("pass", "optional_review_findings", 0),
+            ("pending", "required_review_pending", 0),
+            ("block", "visibility_blocked", 2),
+        ]
+        for status, status_code, expected in cases:
+            with self.subTest(status_code=status_code):
+                self.assertEqual(
+                    expected,
+                    settlement._evaluation_exit_code(
+                        {"status": status, "status_code": status_code}
+                    ),
+                )
+
+    def test_evaluation_exit_code_rejects_status_code_mismatch(self) -> None:
+        with self.assertRaisesRegex(
+            settlement.SettlementError,
+            "status and status_code are inconsistent",
+        ):
+            settlement._evaluation_exit_code(
+                {"status": "pass", "status_code": "required_review_pending"}
+            )
+
+    def test_main_returns_success_for_optional_visible_findings(self) -> None:
+        result = {
+            "status": "pass",
+            "status_code": "optional_review_findings",
+            "errors": ["advisory finding remains visible"],
+            "settled": False,
+        }
+        with (
+            mock.patch.object(settlement, "evaluate", return_value=result),
+            mock.patch("builtins.print"),
+        ):
+            return_code = settlement.main(
+                ["--repository", REPOSITORY, "--pr", str(PR), "--json", "evaluate"]
+            )
+        self.assertEqual(0, return_code)
+
+    def test_main_exception_has_stable_status_code(self) -> None:
+        with (
+            mock.patch.object(settlement, "evaluate", side_effect=RuntimeError("boom")),
+            mock.patch("builtins.print") as output,
+        ):
+            return_code = settlement.main(
+                ["--repository", REPOSITORY, "--pr", str(PR), "--json", "evaluate"]
+            )
+        self.assertEqual(2, return_code)
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual("block", payload["status"])
+        self.assertEqual("evaluator_error", payload["status_code"])
 
     def test_usage_limit_comment_after_older_head_request_remains_pending(self) -> None:
         state = base_state()

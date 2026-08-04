@@ -179,3 +179,12 @@ Diagnose terminal grün, behauptet aber weder Review, PASS noch Settlement; ein
 Legacy-`block` bleibt rot. PR-Code wird unter `pull_request_target` weiterhin
 niemals als vertrauenswürdiger Evaluator ausgeführt. Nach dem Merge liefert der
 Default-Branch-Evaluator die feinere kanonische Taxonomie direkt.
+
+Evaluatorausgabe und Workflow bilden einen gemeinsamen fail-closed Vertrag:
+Jeder kanonische `status_code` gehört genau zu einer Statusklasse und einem
+erwarteten Prozess-Exitcode. Der Workflow veröffentlicht nur dann den daraus
+abgeleiteten GitHub-Status, wenn `status`, `status_code` und der tatsächlich
+beobachtete Exitcode übereinstimmen. Auch die einmalige Legacy-Übersetzung wird
+gegen ihren ursprünglichen Status und Exitcode geprüft; Widersprüche werden rot
+veröffentlicht und können nicht durch einen optionalen Diagnosecode überstimmt
+werden.

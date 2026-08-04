@@ -77,6 +77,21 @@ PROVIDER_UNAVAILABLE_BODIES = {
     ),
 }
 
+STATUS_BY_CODE = {
+    "review_settled": "pass",
+    "optional_provider_unavailable": "pass",
+    "optional_not_requested": "pass",
+    "optional_review_pending": "pass",
+    "optional_review_findings": "pass",
+    "required_request_missing": "pending",
+    "required_review_pending": "pending",
+    "required_provider_unavailable": "pending",
+    "required_review_blocked": "block",
+    "visibility_blocked": "block",
+    "evaluator_error": "block",
+}
+EXIT_CODE_BY_STATUS = {"pass": 0, "pending": 0, "block": 2}
+
 GRAPHQL_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -1143,6 +1158,15 @@ def ensure_request(
     }
 
 
+def _evaluation_exit_code(result: dict[str, Any]) -> int:
+    status = result.get("status")
+    status_code = result.get("status_code")
+    expected_status = STATUS_BY_CODE.get(status_code)
+    if expected_status is None or status != expected_status:
+        raise SettlementError("evaluation status and status_code are inconsistent")
+    return EXIT_CODE_BY_STATUS[expected_status]
+
+
 def _write_create_only(path: Path, payload: dict[str, Any]) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1166,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("request", "evaluate"))
     args = parser.parse_args(argv)
     repo = args.repo_path.resolve()
+    exit_code = 0
     try:
         if args.command == "request":
             result = ensure_request(
@@ -1182,6 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.pr,
                 explicitly_required=args.require,
             )
+            exit_code = _evaluation_exit_code(result)
             if args.write_evidence:
                 evidence_path = Path(args.write_evidence)
                 if not evidence_path.is_absolute():
@@ -1193,15 +1219,17 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": SCHEMA_VERSION,
             "kind": "github_codex_review_settlement_result",
             "status": "block",
+            "status_code": "evaluator_error",
             "required": True,
             "settled": False,
             "errors": [str(exc)],
         }
+        exit_code = 2
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(result.get("status") or result.get("reason") or result.get("requested"))
-    return 0 if not result.get("errors") else 2
+    return exit_code
 
 
 if __name__ == "__main__":
