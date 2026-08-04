@@ -731,12 +731,71 @@ def _managed_package_paths(release_root: Path) -> dict[str, Path]:
     return paths
 
 
+def _managed_bureau_cycle_package_paths(release_root: Path) -> dict[str, Path]:
+    pyproject = release_root / "pyproject.toml"
+    package_roots = (release_root / "src/bureau", release_root / "src/bureau_cycle")
+    systemd_root = release_root / "ops/systemd"
+    required_paths = (pyproject, *package_roots, systemd_root)
+    if (
+        release_root.is_symlink()
+        or not release_root.is_dir()
+        or pyproject.is_symlink()
+        or not pyproject.is_file()
+        or any(path.is_symlink() or not path.is_dir() for path in package_roots)
+        or systemd_root.is_symlink()
+        or not systemd_root.is_dir()
+    ):
+        raise BureauLeaseContractError("contract-managed-package-layout-invalid")
+    for required in required_paths:
+        try:
+            resolved = required.resolve(strict=True)
+        except OSError as exc:
+            raise BureauLeaseContractError(
+                "contract-managed-package-file-unavailable",
+                details={"error_type": type(exc).__name__},
+            ) from None
+        if resolved != required or not _path_is_within(resolved, release_root):
+            raise BureauLeaseContractError("contract-managed-package-file-invalid")
+    candidates = [pyproject]
+    for package_root in package_roots:
+        candidates.extend(sorted(package_root.rglob("*.py")))
+    candidates.extend(
+        entry for entry in sorted(systemd_root.rglob("*")) if entry.is_file()
+    )
+    paths: dict[str, Path] = {}
+    for candidate in candidates:
+        try:
+            linked = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
+            raise BureauLeaseContractError(
+                "contract-managed-package-file-unavailable",
+                details={"error_type": type(exc).__name__},
+            ) from None
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or resolved != candidate
+            or not _path_is_within(resolved, release_root)
+        ):
+            raise BureauLeaseContractError(
+                "contract-managed-package-file-invalid",
+                details={"relative_path": candidate.relative_to(release_root).as_posix()},
+            )
+        paths[candidate.relative_to(release_root).as_posix()] = resolved
+    return paths
+
+
 def _managed_package_snapshot(
     paths: dict[str, Path],
+    *,
+    include_executable_marker: bool = False,
+    preserve_order: bool = False,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     digest = hashlib.sha256()
     identities: dict[str, dict[str, Any]] = {}
-    for relative in sorted(paths):
+    relatives = paths if preserve_order else sorted(paths)
+    for relative in relatives:
         identity, content = _regular_file_snapshot(
             paths[relative], label="contract-package-file"
         )
@@ -744,14 +803,50 @@ def _managed_package_snapshot(
         raw_relative = relative.encode("utf-8")
         digest.update(len(raw_relative).to_bytes(4, "big"))
         digest.update(raw_relative)
+        if include_executable_marker:
+            digest.update(b"x" if identity["mode"] & 0o111 else b"-")
         digest.update(len(content).to_bytes(8, "big"))
         digest.update(content)
     return digest.hexdigest(), identities
 
 
-def _managed_package_tree_sha256(paths: dict[str, Path]) -> str:
-    digest, _identities = _managed_package_snapshot(paths)
+def _managed_package_tree_sha256(
+    paths: dict[str, Path], *, include_executable_marker: bool = False
+) -> str:
+    digest, _identities = _managed_package_snapshot(
+        paths, include_executable_marker=include_executable_marker
+    )
     return digest
+
+
+def _managed_package_contract(
+    release_root: Path, expected_sha256: str
+) -> tuple[str, bool, dict[str, Path], dict[str, dict[str, Any]]]:
+    legacy_error: BureauLeaseContractError | None = None
+    try:
+        legacy_paths = _managed_package_paths(release_root)
+        legacy_sha256, legacy_identities = _managed_package_snapshot(legacy_paths)
+    except BureauLeaseContractError as exc:
+        legacy_error = exc
+        legacy_paths = {}
+        legacy_sha256 = ""
+        legacy_identities = {}
+    if legacy_sha256 == expected_sha256:
+        return "legacy-python-package-v1", False, legacy_paths, legacy_identities
+    try:
+        cycle_paths = _managed_bureau_cycle_package_paths(release_root)
+        cycle_sha256, cycle_identities = _managed_package_snapshot(
+            cycle_paths,
+            include_executable_marker=True,
+            preserve_order=True,
+        )
+    except BureauLeaseContractError:
+        if legacy_error is not None:
+            raise legacy_error from None
+        raise BureauLeaseContractError("contract-managed-package-digest-invalid") from None
+    if cycle_sha256 != expected_sha256:
+        raise BureauLeaseContractError("contract-managed-package-digest-invalid")
+    return "bureau-cycle-systemd-v2", True, cycle_paths, cycle_identities
 
 
 def _literal_launcher_assignment(tree: ast.Module, name: str) -> ast.expr:
@@ -914,16 +1009,15 @@ def _managed_contract_runtime() -> dict[str, Any]:
             "contract-managed-launcher-binding-invalid",
             details={"reason": "manifest-binding-mismatch"},
         )
-    package_paths = _managed_package_paths(release_root)
-    observed_package_tree_sha256, package_identities = _managed_package_snapshot(
-        package_paths
-    )
     package_tree_sha256 = manifest.get("package_tree_sha256")
-    if (
-        not isinstance(package_tree_sha256, str)
-        or observed_package_tree_sha256 != package_tree_sha256
-    ):
+    if not isinstance(package_tree_sha256, str):
         raise BureauLeaseContractError("contract-managed-package-digest-invalid")
+    (
+        managed_package_contract,
+        managed_package_executable_marker,
+        package_paths,
+        package_identities,
+    ) = _managed_package_contract(release_root, package_tree_sha256)
     component_paths = {
         "contract_executable": executable,
         "runtime_manifest": manifest_path,
@@ -956,6 +1050,8 @@ def _managed_contract_runtime() -> dict[str, Any]:
         "package_paths": package_paths,
         "package_identities": package_identities,
         "managed_package_tree_sha256": package_tree_sha256,
+        "managed_package_contract": managed_package_contract,
+        "managed_package_executable_marker": managed_package_executable_marker,
     }
 
 
@@ -1120,13 +1216,25 @@ def _assert_contract_runtime_unchanged(runtime: dict[str, Any]) -> None:
                 "contract-component-changed-during-check", details={"component": name}
             )
     if runtime["runtime_kind"] == "managed-manifest":
-        observed_paths = _managed_package_paths(runtime["release_root"])
+        managed_package_contract = runtime["managed_package_contract"]
+        if managed_package_contract == "legacy-python-package-v1":
+            observed_paths = _managed_package_paths(runtime["release_root"])
+        elif managed_package_contract == "bureau-cycle-systemd-v2":
+            observed_paths = _managed_bureau_cycle_package_paths(
+                runtime["release_root"]
+            )
+        else:
+            raise BureauLeaseContractError("contract-managed-package-contract-invalid")
         if set(observed_paths) != set(runtime["package_paths"]):
             raise BureauLeaseContractError(
                 "contract-package-set-changed-during-check"
             )
         observed_digest, observed_identities = _managed_package_snapshot(
-            observed_paths
+            observed_paths,
+            include_executable_marker=runtime["managed_package_executable_marker"],
+            preserve_order=(
+                managed_package_contract == "bureau-cycle-systemd-v2"
+            ),
         )
         if observed_digest != runtime["managed_package_tree_sha256"]:
             raise BureauLeaseContractError(
