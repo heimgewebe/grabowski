@@ -14,7 +14,7 @@ BINDING = {
     "registered_names_sha256": "b" * 64,
     "agent_instructions_sha256": "c" * 64,
 }
-META_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-1"}
+META_SCOPE = {"kind": "caller_session", "label": "mcp-client-1-session-1"}
 FIRST_INTENT = {
     "tool_name": "first-write",
     "arguments_sha256": "d" * 64,
@@ -81,31 +81,24 @@ class IntentReplacementRoundtripTests(unittest.TestCase):
             now_unix=now,
         )
 
-    def test_pending_replacement_is_idempotent_and_consumable(self) -> None:
-        original = self.begin(None, now=100)
-        replacement = self.begin(FIRST_INTENT, now=101)
-        replay = self.begin(FIRST_INTENT, now=102)
+    def test_pending_exact_intent_is_idempotent_and_consumable(self) -> None:
+        pending = self.begin(FIRST_INTENT, now=100)
+        replay = self.begin(FIRST_INTENT, now=101)
 
-        self.assertFalse(replacement["replayed"])
+        self.assertFalse(pending["replayed"])
         self.assertTrue(replay["replayed"])
         self.assertEqual(
             replay["challenge_receipt_sha256"],
-            replacement["challenge_receipt_sha256"],
+            pending["challenge_receipt_sha256"],
         )
-        self.assertEqual(replacement["pending_challenge_count"], 1)
-        self.assertEqual(replacement["verified_receipt_count"], 0)
-
-        with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
-            self.acknowledge(
-                str(original["challenge_receipt_sha256"]),
-                now=103,
-            )
+        self.assertEqual(pending["pending_challenge_count"], 1)
+        self.assertEqual(pending["verified_receipt_count"], 0)
 
         verified = self.acknowledge(
-            str(replacement["challenge_receipt_sha256"]),
-            now=104,
+            str(pending["challenge_receipt_sha256"]),
+            now=102,
         )
-        consumed = self.consume(FIRST_INTENT, now=105)
+        consumed = self.consume(FIRST_INTENT, now=103)
 
         self.assertEqual(consumed["state"], "consumed")
         self.assertTrue(consumed["verification_was_intent_bound"])
@@ -137,24 +130,24 @@ class IntentReplacementRoundtripTests(unittest.TestCase):
             verified["verification_receipt_sha256"],
         )
 
-    def test_verified_replacement_invalidates_only_the_old_intent(self) -> None:
+    def test_verified_second_intent_preserves_the_first_exact_intent(self) -> None:
         first = self.begin(FIRST_INTENT, now=100)
         first_verified = self.acknowledge(
             str(first["challenge_receipt_sha256"]),
             now=101,
         )
-        replacement = self.begin(SECOND_INTENT, now=102)
+        second = self.begin(SECOND_INTENT, now=102)
 
-        self.assertEqual(replacement["state"], "challenge_pending")
-        self.assertEqual(replacement["verified_receipt_count"], 0)
-        with self.assertRaisesRegex(
-            roundtrip.TransportRoundtripRequired,
-            "fresh single-use transport verification",
-        ):
-            self.consume(FIRST_INTENT, now=103)
+        self.assertEqual(second["state"], "challenge_pending")
+        self.assertEqual(second["verified_receipt_count"], 1)
+        first_consumed = self.consume(FIRST_INTENT, now=103)
+        self.assertEqual(
+            first_consumed["verification_receipt_sha256"],
+            first_verified["verification_receipt_sha256"],
+        )
 
         second_verified = self.acknowledge(
-            str(replacement["challenge_receipt_sha256"]),
+            str(second["challenge_receipt_sha256"]),
             now=104,
         )
         consumed = self.consume(SECOND_INTENT, now=105)
