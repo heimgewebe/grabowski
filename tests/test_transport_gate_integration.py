@@ -229,7 +229,9 @@ class CentralTransportGateTests(unittest.TestCase):
                     )
                 )
 
-    def test_bound_shared_verification_cannot_be_stolen_by_other_tool(self) -> None:
+    def test_bound_shared_verification_bootstraps_exact_handshake_without_theft(
+        self,
+    ) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name) / "state"
@@ -237,6 +239,7 @@ class CentralTransportGateTests(unittest.TestCase):
         transport = operator.grabowski_transport_roundtrip
         context = types.SimpleNamespace(client_id=None)
         arguments = {"sequence": 1}
+        arguments_sha256 = transport.canonical_arguments_sha256(arguments)
         with (
             mock.patch.object(transport, "STATE_ROOT", root),
             mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
@@ -246,7 +249,7 @@ class CentralTransportGateTests(unittest.TestCase):
                 runtime_binding=BINDING,
                 mutation_intent={
                     "tool_name": "write",
-                    "arguments_sha256": transport.canonical_arguments_sha256(arguments),
+                    "arguments_sha256": arguments_sha256,
                 },
             )
             transport.acknowledge(
@@ -254,20 +257,54 @@ class CentralTransportGateTests(unittest.TestCase):
                 challenge_receipt_sha256=begin["challenge_receipt_sha256"],
                 runtime_binding=BINDING,
             )
-            with self.assertRaisesRegex(RuntimeError, "bound to a different mutation"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "fresh intent-bound transport verification required",
+            ) as blocked:
                 asyncio.run(
                     operator.mcp._tool_manager.call_tool(
                         "other-write", arguments, context
                     )
                 )
-            status = transport.status(
+            message = str(blocked.exception)
+            challenge = message.split("challenge_receipt_sha256=", 1)[1].split()[0]
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "fresh intent-bound transport verification required",
+            ) as replayed:
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "other-write", arguments, context
+                    )
+                )
+            replayed_challenge = str(replayed.exception).split(
+                "challenge_receipt_sha256=", 1
+            )[1].split()[0]
+            self.assertEqual(replayed_challenge, challenge)
+            state = transport._load_state(SHARED_SCOPE)
+            self.assertEqual(len(state["verified_receipts"]), 1)
+            self.assertEqual(len(state["pending_challenges"]), 1)
+            pending = state["pending_challenges"][0]
+            self.assertEqual(pending["receipt_sha256"], challenge)
+            self.assertEqual(pending["tool_name"], "other-write")
+            self.assertEqual(pending["arguments_sha256"], arguments_sha256)
+
+            transport.acknowledge(
                 client_scope=SHARED_SCOPE,
+                challenge_receipt_sha256=challenge,
                 runtime_binding=BINDING,
             )
-            self.assertEqual(status["verified_receipt_count"], 1)
+            other_result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "other-write", arguments, context
+                )
+            )
+            state = transport._load_state(SHARED_SCOPE)
+            self.assertEqual(len(state["verified_receipts"]), 1)
             result = asyncio.run(
                 operator.mcp._tool_manager.call_tool("write", arguments, context)
             )
+        self.assertTrue(other_result["called"])
         self.assertTrue(result["called"])
 
     def test_handshake_grip_is_narrowly_exempt(self) -> None:
