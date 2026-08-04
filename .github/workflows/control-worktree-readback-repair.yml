@@ -1,0 +1,426 @@
+name: Control checkout and readback repair
+
+on:
+  pull_request:
+    types: [synchronize, reopened]
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.head.ref == 'fix/control-worktree-recreate-git-show-readback-v1'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/control-worktree-recreate-git-show-readback-v1
+          fetch-depth: 0
+
+      - name: Apply focused repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent, indent
+
+          bureau_path = Path("src/grabowski_bureau_leases.py")
+          bureau = bureau_path.read_text(encoding="utf-8")
+          inspect_marker = "def inspect_bureau_control_checkout(*, require_current: bool = True) -> dict[str, Any]:"
+          helpers = dedent('''
+          def _validated_bureau_repository_root() -> Path:
+              try:
+                  repository_root = BUREAU_REPOSITORY_ROOT.resolve(strict=True)
+              except OSError as exc:
+                  raise BureauLeaseContractError(
+                      "bureau-repository-unavailable",
+                      details={"error_type": type(exc).__name__},
+                  ) from None
+              if not repository_root.is_dir():
+                  raise BureauLeaseContractError("bureau-repository-path-invalid")
+              remote_url = _run_control_git(
+                  repository_root, ["remote", "get-url", "origin"]
+              )
+              if remote_url != BUREAU_CANONICAL_REMOTE_URL:
+                  raise BureauLeaseContractError("control-checkout-remote-mismatch")
+              return repository_root
+
+
+          def _control_checkout_missing() -> bool:
+              if not os.path.lexists(BUREAU_CONTROL_ROOT):
+                  return True
+              metadata = BUREAU_CONTROL_ROOT.lstat()
+              if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                  raise BureauLeaseContractError("control-checkout-path-occupied")
+              return False
+
+
+          def _prepare_bureau_worktree_root() -> Path:
+              BUREAU_WORKTREE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+              metadata = BUREAU_WORKTREE_ROOT.lstat()
+              if (
+                  not stat.S_ISDIR(metadata.st_mode)
+                  or stat.S_ISLNK(metadata.st_mode)
+                  or metadata.st_uid != os.getuid()
+                  or stat.S_IMODE(metadata.st_mode) & 0o022
+              ):
+                  raise BureauLeaseContractError("control-worktree-root-unsafe")
+              resolved = BUREAU_WORKTREE_ROOT.resolve(strict=True)
+              if resolved != BUREAU_WORKTREE_ROOT:
+                  raise BureauLeaseContractError("control-worktree-root-path-mismatch")
+              return resolved
+
+
+          def _recreate_bureau_control_checkout(repository_root: Path) -> dict[str, Any]:
+              if not _control_checkout_missing():
+                  raise BureauLeaseContractError("control-checkout-already-present")
+              _prepare_bureau_worktree_root()
+              _run_control_git(
+                  repository_root,
+                  [
+                      "worktree",
+                      "add",
+                      "--force",
+                      "--force",
+                      "-B",
+                      BUREAU_CONTROL_BRANCH,
+                      str(BUREAU_CONTROL_ROOT),
+                      BUREAU_CONTROL_UPSTREAM,
+                  ],
+                  timeout_seconds=120,
+              )
+              _run_control_git(
+                  BUREAU_CONTROL_ROOT,
+                  [
+                      "branch",
+                      "--set-upstream-to",
+                      BUREAU_CONTROL_UPSTREAM,
+                      BUREAU_CONTROL_BRANCH,
+                  ],
+              )
+              return inspect_bureau_control_checkout(require_current=True)
+          ''').strip()
+          if bureau.count(inspect_marker) != 1:
+              raise SystemExit("inspect marker mismatch")
+          bureau = bureau.replace(inspect_marker, helpers + "\n\n\n" + inspect_marker, 1)
+
+          old_refresh = dedent('''
+          def refresh_bureau_control_checkout() -> dict[str, Any]:
+              with _bureau_control_lock():
+                  before = inspect_bureau_control_checkout(require_current=False)
+                  _run_control_git(
+                      BUREAU_REPOSITORY_ROOT,
+                      [
+                          "fetch",
+                          "--no-tags",
+                          "origin",
+                          "+refs/heads/main:refs/remotes/origin/main",
+                      ],
+                      timeout_seconds=120,
+                  )
+                  _run_control_git(
+                      BUREAU_CONTROL_ROOT,
+                      ["merge", "--ff-only", "--no-edit", "origin/main"],
+                      timeout_seconds=60,
+                  )
+                  after = inspect_bureau_control_checkout(require_current=True)
+              return {
+                  **after,
+                  "updated": before["head"] != after["head"],
+                  "previous_head": before["head"],
+              }
+          ''').strip()
+          new_refresh = dedent('''
+          def refresh_bureau_control_checkout() -> dict[str, Any]:
+              with _bureau_control_lock():
+                  repository_root = _validated_bureau_repository_root()
+                  missing = _control_checkout_missing()
+                  before = (
+                      None
+                      if missing
+                      else inspect_bureau_control_checkout(require_current=False)
+                  )
+                  _run_control_git(
+                      repository_root,
+                      [
+                          "fetch",
+                          "--no-tags",
+                          "origin",
+                          "+refs/heads/main:refs/remotes/origin/main",
+                      ],
+                      timeout_seconds=120,
+                  )
+                  if missing:
+                      after = _recreate_bureau_control_checkout(repository_root)
+                  else:
+                      _run_control_git(
+                          BUREAU_CONTROL_ROOT,
+                          ["merge", "--ff-only", "--no-edit", "origin/main"],
+                          timeout_seconds=60,
+                      )
+                      after = inspect_bureau_control_checkout(require_current=True)
+              previous_head = None if before is None else before["head"]
+              return {
+                  **after,
+                  "updated": missing or previous_head != after["head"],
+                  "previous_head": previous_head,
+                  "recreated": missing,
+              }
+          ''').strip()
+          if bureau.count(old_refresh) != 1:
+              raise SystemExit("refresh marker mismatch")
+          bureau_path.write_text(bureau.replace(old_refresh, new_refresh, 1), encoding="utf-8")
+
+          read_path = Path("src/grabowski_read_surface.py")
+          read = read_path.read_text(encoding="utf-8")
+          old_show = dedent('''
+          @mcp.tool(name="grabowski_git_show", annotations=LOCAL_READ)
+          def grabowski_git_show(
+              repo: RepositoryPath,
+              revision: RevisionInput = "HEAD",
+              max_output_bytes: OutputBytes = DEFAULT_OUTPUT_BYTES,
+          ) -> dict[str, Any]:
+              """Read one bounded Git revision without external diff or textconv helpers."""
+              repository = _resolve_repository(repo)
+              selected = _resolve_revision(repository, revision)
+              return _run_read(
+                  _git_command(
+                      repository,
+                      "show",
+                      "--no-ext-diff",
+                      "--no-textconv",
+                      "--no-renames",
+                      "--no-show-signature",
+                      "--date=iso-strict",
+                      "--format=fuller",
+                      selected,
+                      "--",
+                  ),
+                  cwd=repository,
+                  max_output_bytes=max_output_bytes,
+              )
+          ''').strip()
+          new_show = dedent('''
+          @mcp.tool(name="grabowski_git_show", annotations=LOCAL_READ)
+          def grabowski_git_show(
+              repo: RepositoryPath,
+              revision: RevisionInput = "HEAD",
+              max_output_bytes: OutputBytes = DEFAULT_OUTPUT_BYTES,
+          ) -> dict[str, Any]:
+              """Read one bounded Git revision without external diff or textconv helpers."""
+              repository = _resolve_repository(repo)
+              requested = _validate_revision(revision)
+              selected = _resolve_revision(repository, requested)
+              result = _run_read(
+                  _git_command(
+                      repository,
+                      "show",
+                      "--no-ext-diff",
+                      "--no-textconv",
+                      "--no-renames",
+                      "--no-show-signature",
+                      "--date=iso-strict",
+                      "--format=fuller",
+                      selected,
+                      "--",
+                  ),
+                  cwd=repository,
+                  max_output_bytes=max_output_bytes,
+              )
+              try:
+                  readback = _resolve_revision(repository, requested)
+              except ValueError:
+                  readback = None
+              stable = readback == selected
+              return {
+                  **result,
+                  "revision_binding": {
+                      "requested_revision": requested,
+                      "output_object_id": selected,
+                      "readback_object_id": readback,
+                      "readback_status": (
+                          "stable"
+                          if stable
+                          else "unresolvable"
+                          if readback is None
+                          else "moved"
+                      ),
+                      "stable": stable,
+                  },
+              }
+          ''').strip()
+          if read.count(old_show) != 1:
+              raise SystemExit("git-show marker mismatch")
+          read_path.write_text(read.replace(old_show, new_show, 1), encoding="utf-8")
+
+          bureau_test_path = Path("tests/test_bureau_control_checkout.py")
+          bureau_test = bureau_test_path.read_text(encoding="utf-8")
+          if "import shutil\n" not in bureau_test:
+              bureau_test = bureau_test.replace("import os\n", "import os\nimport shutil\n", 1)
+          dirty_marker = "    def test_dirty_control_checkout_fails_closed_before_fetch(self) -> None:"
+          new_bureau_methods = indent(
+              dedent('''
+              def test_refresh_recreates_externally_deleted_control_checkout(self) -> None:
+                  shared_head = self._git(self.shared, "rev-parse", "HEAD")
+                  (self.shared / "workbench-only.txt").write_text(
+                      "foreign work\\n", encoding="utf-8"
+                  )
+                  import shutil
+                  shutil.rmtree(self.control)
+                  expected = self._advance_remote()
+
+                  result = bureau.refresh_bureau_control_checkout()
+
+                  self.assertTrue(result["recreated"])
+                  self.assertTrue(result["updated"])
+                  self.assertIsNone(result["previous_head"])
+                  self.assertEqual(result["head"], expected)
+                  self.assertEqual(result["origin_main"], expected)
+                  self.assertEqual(result["branch"], bureau.BUREAU_CONTROL_BRANCH)
+                  self.assertEqual(result["upstream"], bureau.BUREAU_CONTROL_UPSTREAM)
+                  self.assertFalse(result["dirty"])
+                  self.assertEqual(self._git(self.shared, "rev-parse", "HEAD"), shared_head)
+                  self.assertIn(
+                      "?? workbench-only.txt",
+                      self._git(self.shared, "status", "--short"),
+                  )
+                  inspected = bureau.inspect_bureau_control_checkout()
+                  self.assertEqual(inspected["head"], expected)
+
+              def test_non_worktree_path_at_control_location_fails_closed(self) -> None:
+                  import shutil
+                  shutil.rmtree(self.control)
+                  self.control.symlink_to(self.seed, target_is_directory=True)
+
+                  with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                      bureau.refresh_bureau_control_checkout()
+
+                  self.assertEqual(raised.exception.code, "control-checkout-path-occupied")
+              ''').strip(),
+              "    ",
+          )
+          if bureau_test.count(dirty_marker) != 1:
+              raise SystemExit("bureau test marker mismatch")
+          bureau_test_path.write_text(
+              bureau_test.replace(dirty_marker, new_bureau_methods + "\n\n" + dirty_marker, 1),
+              encoding="utf-8",
+          )
+
+          read_test_path = Path("tests/test_read_surface.py")
+          read_test = read_test_path.read_text(encoding="utf-8")
+          start_marker = "    def test_git_show_uses_resolved_object_before_path_separator(self) -> None:"
+          end_marker = "    def test_service_status_uses_property_allowlist(self) -> None:"
+          start = read_test.index(start_marker)
+          end = read_test.index(end_marker, start)
+          new_read_methods = indent(
+              dedent('''
+              def test_git_show_uses_resolved_object_before_path_separator(self) -> None:
+                  repo = Path("/tmp/repository")
+                  object_id = "c" * 40
+                  with patch.object(
+                      read_surface, "_resolve_repository", return_value=repo
+                  ), patch.object(
+                      read_surface, "_resolve_revision", return_value=object_id
+                  ) as resolver, patch.object(
+                      read_surface, "_run_read", return_value={"returncode": 0}
+                  ) as runner:
+                      result = read_surface.grabowski_git_show(
+                          str(repo), revision="HEAD~1"
+                      )
+                  self.assertEqual(resolver.call_count, 2)
+                  resolver.assert_any_call(repo, "HEAD~1")
+                  argv = runner.call_args.args[0]
+                  self.assertEqual(argv[-2:], [object_id, "--"])
+                  self.assertIn("--no-ext-diff", argv)
+                  self.assertIn("--no-textconv", argv)
+                  self.assertEqual(
+                      result["revision_binding"],
+                      {
+                          "requested_revision": "HEAD~1",
+                          "output_object_id": object_id,
+                          "readback_object_id": object_id,
+                          "readback_status": "stable",
+                          "stable": True,
+                      },
+                  )
+
+              def test_git_show_reports_ref_movement_after_immutable_read(self) -> None:
+                  repo = Path("/tmp/repository")
+                  output_object = "c" * 40
+                  moved_object = "d" * 40
+                  with patch.object(
+                      read_surface, "_resolve_repository", return_value=repo
+                  ), patch.object(
+                      read_surface,
+                      "_resolve_revision",
+                      side_effect=[output_object, moved_object],
+                  ), patch.object(
+                      read_surface,
+                      "_run_read",
+                      return_value={"returncode": 0},
+                  ):
+                      result = read_surface.grabowski_git_show(
+                          str(repo), revision="refs/heads/main"
+                      )
+                  self.assertEqual(
+                      result["revision_binding"],
+                      {
+                          "requested_revision": "refs/heads/main",
+                          "output_object_id": output_object,
+                          "readback_object_id": moved_object,
+                          "readback_status": "moved",
+                          "stable": False,
+                      },
+                  )
+
+              def test_git_show_reports_unresolvable_post_read_ref(self) -> None:
+                  repo = Path("/tmp/repository")
+                  output_object = "e" * 40
+                  with patch.object(
+                      read_surface, "_resolve_repository", return_value=repo
+                  ), patch.object(
+                      read_surface,
+                      "_resolve_revision",
+                      side_effect=[output_object, ValueError("gone")],
+                  ), patch.object(
+                      read_surface,
+                      "_run_read",
+                      return_value={"returncode": 0},
+                  ):
+                      result = read_surface.grabowski_git_show(
+                          str(repo), revision="refs/heads/topic"
+                      )
+                  binding = result["revision_binding"]
+                  self.assertEqual(binding["output_object_id"], output_object)
+                  self.assertIsNone(binding["readback_object_id"])
+                  self.assertEqual(binding["readback_status"], "unresolvable")
+                  self.assertFalse(binding["stable"])
+              ''').strip(),
+              "    ",
+          )
+          read_test_path.write_text(
+              read_test[:start] + new_read_methods + "\n\n" + read_test[end:],
+              encoding="utf-8",
+          )
+
+          Path(".github/workflows/control-worktree-readback-repair.yml").unlink()
+          PY
+
+      - name: Refresh generated contracts
+        run: make context-refresh
+
+      - name: Run focused tests
+        run: python3 -m unittest tests.test_bureau_control_checkout tests.test_read_surface -v
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: recover Bureau control checkout and bind Git ref reads"
+          git push origin HEAD:fix/control-worktree-recreate-git-show-readback-v1
