@@ -2616,6 +2616,62 @@ def _verify_release_binding(
     return owner_id, keys
 
 
+def _terminal_release_lease_projection(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    error = value.get("error")
+    if not isinstance(error, dict):
+        stable_error = error
+    else:
+        details = error.get("details")
+        stable_details = (
+            {
+                key: item
+                for key, item in details.items()
+                if key != "required_after_unix"
+            }
+            if isinstance(details, dict)
+            else details
+        )
+        stable_error = {
+            "code": error.get("code"),
+            "message": error.get("message"),
+            "details": stable_details,
+        }
+    return {"status": value.get("status"), "error": stable_error}
+
+
+def _terminal_release_readback_projection(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": status.get("status"),
+        "blocking": status.get("blocking"),
+        "claim_intent_sha256": status.get("claim_intent_sha256"),
+        "run": status.get("run"),
+        "release": status.get("release"),
+        "stored_lease_binding": status.get("stored_lease_binding"),
+        "lease": _terminal_release_lease_projection(status.get("lease")),
+    }
+
+
+def _write_or_reuse_terminal_readback(
+    path: Path, current: dict[str, Any]
+) -> dict[str, Any]:
+    try:
+        existing = _read_bound_json(path, label="terminal-readback")
+    except BureauPickupError as exc:
+        if exc.code != "terminal-readback-missing":
+            raise
+        _write_bound_json(path, current)
+        return current
+    if _terminal_release_readback_projection(
+        existing
+    ) != _terminal_release_readback_projection(current):
+        raise BureauPickupError(
+            "terminal-readback-drift", details={"path": str(path)}
+        )
+    return existing
+
+
 @mcp.tool(name="grabowski_bureau_pickup_release", annotations=MUTATING)
 def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     """Release exactly one terminal coordinated run's unchanged Grabowski leases."""
@@ -2668,9 +2724,11 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     status, effective_binding = _coordination_status_for_binding(
         normalized_run_id, binding
     )
-    _write_bound_json(run_dir / "terminal-readback.json", status)
     owner_id, keys = _verify_release_binding(
         normalized_run_id, status, acquisition
+    )
+    terminal_readback = _write_or_reuse_terminal_readback(
+        run_dir / "terminal-readback.json", status
     )
     result = resources.release_resources(owner_id, keys)
     _write_bound_json(run_dir / "release-result.json", result)
@@ -2697,7 +2755,7 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
         "owner_id": owner_id,
         "resource_keys": keys,
         "release": result,
-        "terminal_readback_sha256": _sha256(status),
+        "terminal_readback_sha256": _sha256(terminal_readback),
         "journal": str(run_dir),
         "does_not_establish": [
             "workspace cleanup authority",
