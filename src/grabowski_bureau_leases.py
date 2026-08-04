@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
-import fcntl
 import hashlib
 import json
 import os
@@ -12,6 +11,11 @@ import stat
 import subprocess
 import sys
 from typing import Any, Iterable, Iterator
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows only
+    _fcntl = None
 
 BUREAU_REPOSITORY_ROOT = Path("/home/alex/repos/bureau")
 BUREAU_WORKTREE_ROOT = Path("/home/alex/repos/.bureau-worktrees")
@@ -155,6 +159,16 @@ def _run_control_git(
 
 @contextmanager
 def _bureau_control_lock() -> Iterator[None]:
+    lock_api = _fcntl
+    if (
+        lock_api is None
+        or not hasattr(os, "getuid")
+        or not hasattr(os, "O_CLOEXEC")
+    ):
+        raise BureauLeaseContractError(
+            "control-checkout-lock-unavailable",
+            details={"platform": sys.platform},
+        )
     parent = BUREAU_CONTROL_LOCK_PATH.parent
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     metadata = parent.lstat()
@@ -178,11 +192,11 @@ def _bureau_control_lock() -> Iterator[None]:
             or lock_metadata.st_nlink != 1
         ):
             raise BureauLeaseContractError("control-checkout-lock-unsafe")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        lock_api.flock(descriptor, lock_api.LOCK_EX)
         yield
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            lock_api.flock(descriptor, lock_api.LOCK_UN)
         finally:
             os.close(descriptor)
 
