@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -18,6 +19,13 @@ BINDING = {
     "agent_instructions_sha256": "c" * 64,
 }
 META_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-1"}
+# The gate only ever admits an exactly intent-bound verification, so the shared
+# helpers hand out a real intent. Tests that need an unbound handshake pass
+# mutation_intent=None explicitly and assert that it authorizes nothing.
+DEFAULT_INTENT = {
+    "tool_name": "grabowski_file_write",
+    "arguments_sha256": "e" * 64,
+}
 OTHER_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-2"}
 SHARED_SCOPE = {
     "kind": "shared_unlabeled",
@@ -71,7 +79,9 @@ def _consume_shared_worker(
         output.put(("ok", receipt["consumption_receipt_sha256"]))
 
 
-class TransportRoundtripTests(unittest.TestCase):
+class _TransportHarness(unittest.TestCase):
+    """Shared state isolation and handshake helpers, no tests of its own."""
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -85,10 +95,17 @@ class TransportRoundtripTests(unittest.TestCase):
         self.addCleanup(self.state_root_patch.stop)
         self.addCleanup(self.lock_path_patch.stop)
 
-    def begin(self, *, scope: dict[str, str] = META_SCOPE, now: int = 100):
+    def begin(
+        self,
+        *,
+        scope: dict[str, str] = META_SCOPE,
+        now: int = 100,
+        mutation_intent: dict[str, str] | None = DEFAULT_INTENT,
+    ):
         return roundtrip.begin(
             client_scope=scope,
             runtime_binding=BINDING,
+            mutation_intent=mutation_intent,
             now_unix=now,
         )
 
@@ -106,12 +123,29 @@ class TransportRoundtripTests(unittest.TestCase):
             now_unix=now,
         )
 
-    def verify(self, *, scope: dict[str, str] = META_SCOPE):
-        begin = self.begin(scope=scope)
+    def verify(
+        self,
+        *,
+        scope: dict[str, str] = META_SCOPE,
+        mutation_intent: dict[str, str] | None = DEFAULT_INTENT,
+    ):
+        begin = self.begin(scope=scope, mutation_intent=mutation_intent)
         return self.acknowledge(
             begin["challenge_receipt_sha256"], scope=scope
         )
 
+    @staticmethod
+    def intent(tool_name: str, digest_seed: str) -> dict[str, str]:
+        """Build a distinct exact intent so pooled handshakes stay separable."""
+        return {
+            "tool_name": tool_name,
+            "arguments_sha256": hashlib.sha256(
+                digest_seed.encode("utf-8")
+            ).hexdigest(),
+        }
+
+
+class TransportRoundtripTests(_TransportHarness):
     def test_begin_is_idempotent_until_ack_or_expiry(self) -> None:
         first = self.begin()
         second = self.begin(now=101)
@@ -131,12 +165,16 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertTrue(ack["mutation_gate_open"])
         self.assertTrue(ack["single_use"])
         self.assertEqual(ack["client_scope_kind"], "client_declared_meta")
-        status = roundtrip.require_verified(
+        # There is no generic "is the gate open" API any more: admission is
+        # only ever proven by naming the exact target.
+        self.assertFalse(hasattr(roundtrip, "require_verified"))
+        consumed = roundtrip.consume_verified(
             client_scope=META_SCOPE,
             runtime_binding=BINDING,
             now_unix=102,
+            **DEFAULT_INTENT,
         )
-        self.assertTrue(status["mutation_gate_open"])
+        self.assertEqual(consumed["state"], "consumed")
 
     def test_begin_reuses_fresh_verification(self) -> None:
         acknowledged = self.verify()
@@ -164,9 +202,14 @@ class TransportRoundtripTests(unittest.TestCase):
         )
 
     def test_consumption_binds_one_mutation_and_closes_gate(self) -> None:
-        verification = self.verify()
         arguments_sha256 = roundtrip.canonical_arguments_sha256(
             {"path": "/tmp/example", "content": "x"}
+        )
+        verification = self.verify(
+            mutation_intent={
+                "tool_name": "grabowski_file_write",
+                "arguments_sha256": arguments_sha256,
+            }
         )
         consumed = roundtrip.consume_verified(
             client_scope=META_SCOPE,
@@ -199,7 +242,12 @@ class TransportRoundtripTests(unittest.TestCase):
             )
 
     def test_concurrent_consumers_admit_exactly_one_mutation(self) -> None:
-        self.verify()
+        self.verify(
+            mutation_intent={
+                "tool_name": "grabowski_file_write",
+                "arguments_sha256": "d" * 64,
+            }
+        )
         context = multiprocessing.get_context("fork")
         start = context.Event()
         output = context.Queue()
@@ -225,8 +273,14 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertEqual(results[0][1], "TransportRoundtripRequired")
 
     def test_shared_unlabeled_handshakes_coexist_without_overwrite(self) -> None:
-        first = self.begin(scope=SHARED_SCOPE)
-        second = self.begin(scope=SHARED_SCOPE)
+        first = self.begin(
+            scope=SHARED_SCOPE,
+            mutation_intent={"tool_name": "first-write", "arguments_sha256": "d" * 64},
+        )
+        second = self.begin(
+            scope=SHARED_SCOPE,
+            mutation_intent={"tool_name": "second-write", "arguments_sha256": "e" * 64},
+        )
         self.assertFalse(first["replayed"])
         self.assertFalse(second["replayed"])
         self.assertNotEqual(
@@ -276,13 +330,19 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertEqual(status["state"], "consumed")
         self.assertFalse(status["mutation_gate_open"])
 
-    def test_shared_unlabeled_parallel_consumers_use_distinct_tokens(self) -> None:
-        for _ in range(2):
-            begin = self.begin(scope=SHARED_SCOPE)
-            self.acknowledge(
-                begin["challenge_receipt_sha256"],
-                scope=SHARED_SCOPE,
-            )
+    def test_shared_parallel_consumers_of_one_intent_admit_exactly_one(self) -> None:
+        """Two callers racing for the same exact mutation admit one, not two.
+
+        Under exact-intent binding an identical intent is the identical
+        mutation, so `begin` collapses it to one handshake and single use
+        admits it once. A second caller must fail closed rather than ride
+        along on the first caller's verification.
+        """
+        begin = self.begin(scope=SHARED_SCOPE)
+        self.acknowledge(
+            begin["challenge_receipt_sha256"],
+            scope=SHARED_SCOPE,
+        )
         context = multiprocessing.get_context("fork")
         start = context.Event()
         output = context.Queue()
@@ -300,9 +360,11 @@ class TransportRoundtripTests(unittest.TestCase):
             process.join(timeout=10)
             self.assertFalse(process.is_alive())
             self.assertEqual(process.exitcode, 0)
-        results = [output.get(timeout=2) for _ in processes]
-        self.assertEqual(sorted(result[0] for result in results), ["ok", "ok"])
-        self.assertEqual(len({result[1] for result in results}), 2)
+        results = sorted(output.get(timeout=2) for _ in processes)
+        self.assertEqual([result[0] for result in results], ["error", "ok"])
+        # The loser finds an empty pool once the winner consumed the single
+        # verification, so it fails closed as "no verification at all".
+        self.assertEqual(results[0][1], "TransportRoundtripRequired")
 
     def test_shared_intent_begin_replays_exact_pending_and_verified(self) -> None:
         arguments_sha256 = roundtrip.canonical_arguments_sha256({"sequence": 1})
@@ -382,7 +444,7 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertEqual(second_ack["target_arguments_sha256"], second_arguments)
         with self.assertRaisesRegex(
             roundtrip.TransportMutationIntentMismatch,
-            "bound to a different mutation",
+            "no transport verification is bound to this exact mutation",
         ):
             roundtrip.consume_verified(
                 client_scope=SHARED_SCOPE,
@@ -468,23 +530,34 @@ class TransportRoundtripTests(unittest.TestCase):
 
     def test_shared_pending_pool_is_bounded_and_prunes_stale_entries(self) -> None:
         with mock.patch.object(roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2):
-            self.begin(scope=SHARED_SCOPE, now=100)
-            self.begin(scope=SHARED_SCOPE, now=100)
+            self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "1")
+            )
+            self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "2")
+            )
             with self.assertRaisesRegex(
                 roundtrip.TransportRoundtripRequired,
                 "pending challenge pool is full",
             ):
-                self.begin(scope=SHARED_SCOPE, now=100)
+                self.begin(
+                    scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "3")
+                )
             refreshed = self.begin(
                 scope=SHARED_SCOPE,
                 now=100 + roundtrip.CHALLENGE_TTL_SECONDS + 1,
+                mutation_intent=self.intent("w", "4"),
             )
         self.assertEqual(refreshed["pending_challenge_count"], 1)
 
     def test_shared_verified_pool_is_bounded_and_preserves_pending_challenge(self) -> None:
         with mock.patch.object(roundtrip, "MAX_SHARED_VERIFIED_RECEIPTS", 1):
-            first = self.begin(scope=SHARED_SCOPE, now=100)
-            second = self.begin(scope=SHARED_SCOPE, now=100)
+            first = self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "1")
+            )
+            second = self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "2")
+            )
             self.acknowledge(
                 first["challenge_receipt_sha256"],
                 scope=SHARED_SCOPE,
@@ -675,6 +748,131 @@ class TransportRoundtripTests(unittest.TestCase):
                 now_unix=102,
             )["mutation_gate_open"]
         )
+
+
+class UnboundVerificationAuthorizesNothingTests(_TransportHarness):
+    """T139: an unbound handshake must never exist, let alone admit anything."""
+
+    def test_unbound_begin_is_refused_fail_closed(self) -> None:
+        with self.assertRaises(roundtrip.TransportMutationIntentRequired) as caught:
+            self.begin(mutation_intent=None)
+        self.assertIn("requires an exact mutation intent", str(caught.exception))
+
+    def test_unbound_begin_cannot_occupy_the_bounded_pool(self) -> None:
+        """Pool DoS: unbound handshakes must not crowd out exact ones."""
+        with mock.patch.object(roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2):
+            for _ in range(5):
+                with self.assertRaises(roundtrip.TransportMutationIntentRequired):
+                    self.begin(scope=SHARED_SCOPE, mutation_intent=None)
+            # The pool is untouched, so exact handshakes still fit.
+            first = self.begin(
+                scope=SHARED_SCOPE, mutation_intent=self.intent("w", "1")
+            )
+            second = self.begin(
+                scope=SHARED_SCOPE, mutation_intent=self.intent("w", "2")
+            )
+        self.assertEqual(first["pending_challenge_count"], 1)
+        self.assertEqual(second["pending_challenge_count"], 2)
+
+    def test_legacy_unbound_entries_are_discarded_on_sight_not_at_ttl(self) -> None:
+        """Pre-existing unbound state must never occupy the pool or authorize."""
+        self.begin(scope=SHARED_SCOPE, mutation_intent=self.intent("w", "keep"))
+        path = roundtrip._state_path(roundtrip._sha256_json(SHARED_SCOPE))
+        state = json.loads(path.read_text(encoding="utf-8"))
+        legacy = dict(state["pending_challenges"][0])
+        for key in ("tool_name", "arguments_sha256"):
+            legacy.pop(key, None)
+        legacy["challenge_nonce_sha256"] = "a" * 64
+        legacy["receipt_sha256"] = roundtrip._receipt_sha256(legacy)
+        state["pending_challenges"] = [*state["pending_challenges"], legacy]
+        path.write_text(json.dumps(state), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+        projected = roundtrip.status(
+            client_scope=SHARED_SCOPE, runtime_binding=BINDING, now_unix=101
+        )
+        # The unbound entry is invisible immediately, well inside its TTL.
+        self.assertEqual(projected["pending_challenge_count"], 1)
+        with self.assertRaises(roundtrip.TransportMutationIntentRequired):
+            self.acknowledge(
+                legacy["receipt_sha256"], scope=SHARED_SCOPE, now=101
+            )
+
+    def test_legacy_unbound_verified_replay_is_refused(self) -> None:
+        """The ack replay path reads unpruned state and must still fail closed."""
+        begun = self.begin(scope=SHARED_SCOPE, mutation_intent=self.intent("w", "x"))
+        self.acknowledge(begun["challenge_receipt_sha256"], scope=SHARED_SCOPE)
+        path = roundtrip._state_path(roundtrip._sha256_json(SHARED_SCOPE))
+        state = json.loads(path.read_text(encoding="utf-8"))
+        legacy = dict(state["verified_receipts"][0])
+        for key in ("tool_name", "arguments_sha256"):
+            legacy.pop(key, None)
+        legacy["receipt_sha256"] = roundtrip._receipt_sha256(legacy)
+        state["verified_receipts"] = [legacy]
+        path.write_text(json.dumps(state), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+        with self.assertRaises(roundtrip.TransportMutationIntentRequired):
+            self.acknowledge(
+                str(legacy["challenge_receipt_sha256"]),
+                scope=SHARED_SCOPE,
+                now=102,
+            )
+        # It is also invisible to the projection rather than merely unusable.
+        projected = roundtrip.status(
+            client_scope=SHARED_SCOPE, runtime_binding=BINDING, now_unix=102
+        )
+        self.assertEqual(projected["verified_receipt_count"], 0)
+        self.assertFalse(projected["mutation_gate_open"])
+
+    def test_error_names_the_caller_scope_and_the_exact_requested_target(self) -> None:
+        self.verify(mutation_intent=self.intent("intended-write", "1"))
+        with self.assertRaises(roundtrip.TransportMutationIntentMismatch) as caught:
+            roundtrip.consume_verified(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+                tool_name="foreign-write",
+                arguments_sha256="f" * 64,
+                now_unix=102,
+            )
+        message = str(caught.exception)
+        self.assertIn("client_scope_sha256=", message)
+        self.assertIn("tool_name=foreign-write", message)
+        self.assertIn("arguments_sha256=" + "f" * 64, message)
+        self.assertIn("intent_bound_verifications=1", message)
+
+    def test_verification_for_one_target_does_not_admit_another(self) -> None:
+        self.verify(mutation_intent=self.intent("write-a", "a"))
+        with self.assertRaises(roundtrip.TransportMutationIntentMismatch):
+            roundtrip.consume_verified(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+                now_unix=102,
+                **self.intent("write-b", "b"),
+            )
+        # The rejected attempt must not have consumed the intended verification.
+        admitted = roundtrip.consume_verified(
+            client_scope=META_SCOPE,
+            runtime_binding=BINDING,
+            now_unix=102,
+            **self.intent("write-a", "a"),
+        )
+        self.assertEqual(admitted["state"], "consumed")
+        self.assertTrue(admitted["verification_was_intent_bound"])
+
+    def test_same_arguments_under_a_different_tool_are_refused(self) -> None:
+        digest = roundtrip.canonical_arguments_sha256({"path": "/tmp/x"})
+        self.verify(
+            mutation_intent={"tool_name": "write", "arguments_sha256": digest}
+        )
+        with self.assertRaises(roundtrip.TransportMutationIntentMismatch):
+            roundtrip.consume_verified(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+                tool_name="delete",
+                arguments_sha256=digest,
+                now_unix=102,
+            )
 
 
 if __name__ == "__main__":

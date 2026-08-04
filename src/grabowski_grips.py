@@ -326,10 +326,12 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
-        version="1.0",
+        version="1.1",
         summary=(
-            "Issue or acknowledge one client-scope- and runtime-bound challenge so the "
-            "central operator gate can require a fresh response roundtrip before mutation."
+            "Issue or acknowledge one challenge bound to the exact target tool and "
+            "canonical argument digest, so the central operator gate admits that one "
+            "mutation and nothing else. action=begin requires target_tool_name and "
+            "target_arguments; action=ack requires the exact challenge_receipt_sha256."
         ),
         effect=MUTATING,
         required_parameters=("action",),
@@ -337,6 +339,7 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "client-scope-bound",
             "runtime-contract-bound",
             "response-roundtrip",
+            "exact-target-bound",
             "private-receipt-persisted",
         ),
         runner="transport_roundtrip",
@@ -588,9 +591,21 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "never substitute generic resource release or force-release"
     ),
     "transport-roundtrip": (
-        "run action=begin and acknowledge the exact challenge when one is returned; each "
-        "verification is consumed by one mutation, changes no product target, and grants no retry "
-        "authority after a later ambiguous mutation"
+        "run action=begin with the exact target_tool_name and target_arguments, then "
+        "action=ack with the returned challenge_receipt_sha256, then invoke that exact "
+        "unchanged call once; a verification admits only that target, is consumed before "
+        "the effect runs, changes no product target, and grants no retry authority after "
+        "a later ambiguous mutation"
+    ),
+}
+# Conditional requirements cannot be expressed as static required_parameters,
+# so the published contract carries them explicitly per action.
+GRIP_CONDITIONAL_PRECONDITIONS = {
+    "transport-roundtrip": (
+        "action=begin requires target_tool_name and target_arguments together; "
+        "an unbound begin is refused fail-closed",
+        "action=ack requires challenge_receipt_sha256 and must not carry "
+        "target_tool_name or target_arguments",
     ),
 }
 MECHANIC_NORMAL_GRIPS = frozenset(
@@ -2857,24 +2872,24 @@ def _run_transport_roundtrip(
                 )
             target_tool_present = "target_tool_name" in parameters
             target_arguments_present = "target_arguments" in parameters
-            if target_tool_present != target_arguments_present:
+            if not (target_tool_present and target_arguments_present):
+                # Conditional requirement: an unbound begin would authorize
+                # nothing and would only occupy the bounded pool.
                 raise GripPreflightError(
                     "action=begin requires target_tool_name and target_arguments together"
                 )
-            mutation_intent = None
-            if target_tool_present:
-                target_tool_name = parameters.get("target_tool_name")
-                target_arguments = parameters.get("target_arguments")
-                if not isinstance(target_tool_name, str):
-                    raise GripPreflightError("target_tool_name must be text")
-                if not isinstance(target_arguments, dict):
-                    raise GripPreflightError("target_arguments must be an object")
-                mutation_intent = {
-                    "tool_name": target_tool_name,
-                    "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
-                        target_arguments
-                    ),
-                }
+            target_tool_name = parameters.get("target_tool_name")
+            target_arguments = parameters.get("target_arguments")
+            if not isinstance(target_tool_name, str):
+                raise GripPreflightError("target_tool_name must be text")
+            if not isinstance(target_arguments, dict):
+                raise GripPreflightError("target_arguments must be an object")
+            mutation_intent = {
+                "tool_name": target_tool_name,
+                "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
+                    target_arguments
+                ),
+            }
             output = grabowski_transport_roundtrip.begin(
                 client_scope=scope,
                 runtime_binding=binding,
@@ -2921,6 +2936,12 @@ def _run_transport_roundtrip(
         "response-roundtrip",
         "pass" if output["mutation_gate_open"] else "skip",
         output["state"],
+    )
+    _check(
+        receipt,
+        "exact-target-bound",
+        "pass" if output.get("mutation_intent_bound") else "fail",
+        f"{output.get('target_tool_name')}:{output.get('target_arguments_sha256')}",
     )
     receipt_hash = output.get("verification_receipt_sha256") or output.get(
         "challenge_receipt_sha256"
@@ -8344,6 +8365,7 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
         ),
         "preconditions": [
             f"required parameters: {required}",
+            *GRIP_CONDITIONAL_PRECONDITIONS.get(spec.name, ()),
             "grip name is present in GRIP_SURFACE_ALLOWLIST",
             "mutating grips require allow_mutation=true and an eligible profile",
         ],

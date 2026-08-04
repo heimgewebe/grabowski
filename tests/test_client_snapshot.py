@@ -609,6 +609,15 @@ class ClientSnapshotTests(unittest.TestCase):
                     "challenge_receipt_sha256": "e" * 64,
                 },
             )
+            # The handshake must be bound to the exact bind call it precedes,
+            # otherwise the verification admits nothing and the bind fails.
+            begin_parameters = declarations[-3]["parameters"]
+            self.assertEqual(begin_parameters["action"], "begin")
+            self.assertEqual(begin_parameters["target_tool_name"], "grip_run")
+            self.assertEqual(begin_parameters["target_arguments"], declarations[-1])
+            self.assertEqual(
+                declarations[-1]["name"], "connector-snapshot-bind"
+            )
             declaration = declarations[-1]["parameters"]
             self.assertEqual(declaration["observed_tools"], artifact)
             self.assertEqual(declaration["observed_tool_count"], len(names))

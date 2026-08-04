@@ -837,11 +837,33 @@ async def _observe_and_bind_snapshot(
                     or contract.get("runtime_matches_deployment_contract") is not True
                 ):
                     raise ClientSnapshotError("observed MCP tool list disagrees with the runtime contract")
+                # The exact bind call has to exist before the handshake, because
+                # the verification is bound to this tool name and this argument
+                # digest and admits nothing else.
+                declaration = {
+                    "client_id": AUTO_REFRESH_CLIENT_ID,
+                    "session_id": session_id,
+                    "observed_tool_count": len(names),
+                    "observed_names_sha256": names_sha256,
+                    "observed_release_id": release_id,
+                    "observed_agent_instructions_sha256": instructions_sha256,
+                    "observed_tools": observed_tools,
+                }
+                bind_arguments = {
+                    "name": "connector-snapshot-bind",
+                    "parameters": declaration,
+                    "profile": "operator",
+                    "allow_mutation": True,
+                }
                 transport_begin_result = await client.call_tool(
                     "grip_run",
                     {
                         "name": "transport-roundtrip",
-                        "parameters": {"action": "begin"},
+                        "parameters": {
+                            "action": "begin",
+                            "target_tool_name": "grip_run",
+                            "target_arguments": bind_arguments,
+                        },
                         "profile": "operator",
                         "allow_mutation": True,
                     },
@@ -940,23 +962,11 @@ async def _observe_and_bind_snapshot(
                         raise ClientSnapshotError(
                             "transport roundtrip acknowledgement did not verify"
                         )
-                declaration = {
-                    "client_id": AUTO_REFRESH_CLIENT_ID,
-                    "session_id": session_id,
-                    "observed_tool_count": len(names),
-                    "observed_names_sha256": names_sha256,
-                    "observed_release_id": release_id,
-                    "observed_agent_instructions_sha256": instructions_sha256,
-                    "observed_tools": observed_tools,
-                }
+                # Exactly the arguments the verification was bound to; any
+                # deviation would be refused by the gate.
                 bind_result = await client.call_tool(
                     "grip_run",
-                    {
-                        "name": "connector-snapshot-bind",
-                        "parameters": declaration,
-                        "profile": "operator",
-                        "allow_mutation": True,
-                    },
+                    bind_arguments,
                     meta=request_meta,
                 )
                 grip = _mcp_tool_payload(bind_result, label="connector-snapshot-bind grip")

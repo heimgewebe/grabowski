@@ -40,12 +40,18 @@ class TransportGripIntegrationTests(unittest.TestCase):
 
     @staticmethod
     def parameters(action: str, **extra: object) -> dict[str, object]:
-        return {
+        parameters = {
             "action": action,
             "_server_transport_client_scope": META_SCOPE,
             "_server_transport_runtime_binding": BINDING,
             **extra,
         }
+        # Only an exactly bound handshake can open the gate, so begin carries a
+        # target unless a test deliberately exercises the unbound path.
+        if action == "begin" and "target_tool_name" not in extra:
+            parameters["target_tool_name"] = "write"
+            parameters["target_arguments"] = {}
+        return parameters
 
     def test_begin_and_ack_are_receipt_bound_through_existing_grip_surface(self) -> None:
         begin = grips.grip_run(
@@ -103,6 +109,74 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertTrue(ack["output"]["mutation_intent_bound"])
         self.assertEqual(ack["output"]["target_tool_name"], "write")
 
+    def test_published_contract_states_the_conditional_target_binding(self) -> None:
+        contract = next(
+            item
+            for item in grips.list_grips(profile="operator")
+            if item["name"] == "transport-roundtrip"
+        )
+        self.assertEqual(contract["version"], "1.1")
+        self.assertIn("exact-target-bound", contract["acceptance_ids"])
+        for fragment in ("target_tool_name", "target_arguments"):
+            self.assertIn(fragment, contract["summary"])
+            self.assertIn(fragment, contract["recovery_path"])
+        preconditions = " | ".join(contract["preconditions"])
+        self.assertIn(
+            "action=begin requires target_tool_name and target_arguments together",
+            preconditions,
+        )
+        self.assertIn("action=ack requires challenge_receipt_sha256", preconditions)
+        # The conditional fields must not become statically required, or ack
+        # would be forced to carry begin-only fields.
+        self.assertEqual(contract["required_parameters"], ["action"])
+
+    def test_unbound_begin_is_refused_by_the_grip_preflight(self) -> None:
+        blocked = grips.grip_run(
+            "transport-roundtrip",
+            {
+                "action": "begin",
+                "_server_transport_client_scope": META_SCOPE,
+                "_server_transport_runtime_binding": BINDING,
+            },
+            profile="operator",
+            allow_mutation=True,
+        )
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn(
+            "target_tool_name and target_arguments together",
+            blocked["output"]["error"],
+        )
+
+    def test_bound_begin_emits_the_exact_target_check(self) -> None:
+        begun = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters("begin"),
+            profile="operator",
+            allow_mutation=True,
+        )
+        checks = {item["id"]: item for item in begun["receipt"]["checks"]}
+        self.assertEqual(checks["exact-target-bound"]["status"], "pass")
+        self.assertIn("write:", checks["exact-target-bound"]["detail"])
+
+    def test_ack_is_not_forced_to_carry_begin_fields(self) -> None:
+        begun = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters("begin"),
+            profile="operator",
+            allow_mutation=True,
+        )
+        acked = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters(
+                "ack",
+                challenge_receipt_sha256=begun["output"]["challenge_receipt_sha256"],
+            ),
+            profile="operator",
+            allow_mutation=True,
+        )
+        self.assertEqual(acked["status"], "passed")
+        self.assertEqual(acked["output"]["state"], "verified")
+
     def test_grip_requires_mutation_permission_and_rejects_extra_fields(self) -> None:
         denied = grips.grip_run(
             "transport-roundtrip",
@@ -153,7 +227,9 @@ class CentralTransportGateTests(unittest.TestCase):
             "consume_verified",
             side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
         ) as consume_verified:
-            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh intent-bound transport verification required"
+            ):
                 asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
         consume_verified.assert_called_once_with(
             client_scope=META_SCOPE,
@@ -198,8 +274,14 @@ class CentralTransportGateTests(unittest.TestCase):
                 transport.begin(
                     client_scope=SHARED_SCOPE,
                     runtime_binding=BINDING,
+                    mutation_intent={
+                        "tool_name": "write",
+                        "arguments_sha256": transport.canonical_arguments_sha256(
+                            {"sequence": sequence}
+                        ),
+                    },
                 )["challenge_receipt_sha256"]
-                for _ in range(2)
+                for sequence in (1, 2)
             ]
             for challenge in challenges:
                 transport.acknowledge(
@@ -222,7 +304,7 @@ class CentralTransportGateTests(unittest.TestCase):
             self.assertTrue(first["called"])
             self.assertTrue(second["called"])
             with self.assertRaisesRegex(
-                RuntimeError, "fresh single-use transport verification"
+                RuntimeError, "fresh intent-bound transport verification required"
             ):
                 asyncio.run(
                     operator.mcp._tool_manager.call_tool(
@@ -338,7 +420,9 @@ class CentralTransportGateTests(unittest.TestCase):
             "consume_verified",
             side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
         ) as consume_verified:
-            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh intent-bound transport verification required"
+            ):
                 asyncio.run(
                     operator.mcp._tool_manager.call_tool(
                         operator.deployment_observer.OPERATION, {}, context
@@ -437,7 +521,9 @@ class StaleServingProcessGateTests(unittest.TestCase):
             "consume_verified",
             side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
         ) as consume_verified:
-            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh intent-bound transport verification required"
+            ):
                 asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
         consume_verified.assert_called_once()
 
@@ -450,7 +536,9 @@ class StaleServingProcessGateTests(unittest.TestCase):
             "consume_verified",
             side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
         ) as consume_verified:
-            with self.assertRaisesRegex(RuntimeError, "handshake required"):
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh intent-bound transport verification required"
+            ):
                 asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
         consume_verified.assert_called_once()
 
@@ -468,6 +556,138 @@ class StaleServingProcessGateTests(unittest.TestCase):
             context=types.SimpleNamespace(client_id="c", session_id="session-1"),
             tool=operator.mcp._tool_manager.get_tool("read"),
         )
+
+
+class SharedPartitionEffectBoundaryTests(unittest.TestCase):
+    """The declared boundary of a shared, unlabeled storage partition.
+
+    shared_unlabeled is a storage partition, never a caller identity. Two
+    unlabeled callers of the same exact intent are indistinguishable by
+    construction. What the contract must still guarantee for them is
+    at-most-once admission of the effect, a distinct consumption receipt per
+    admission, and no reusable proof once an admission was spent.
+    """
+
+    INTENT_ARGUMENTS = {"path": "/tmp/shared-target"}
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "state"
+        self.root_patch = mock.patch.object(roundtrip, "STATE_ROOT", self.root)
+        self.lock_patch = mock.patch.object(
+            roundtrip, "LOCK_PATH", self.root / ".lock"
+        )
+        self.root_patch.start()
+        self.lock_patch.start()
+        self.addCleanup(self.root_patch.stop)
+        self.addCleanup(self.lock_patch.stop)
+
+    def bind(self, arguments: dict[str, object]) -> None:
+        begun = roundtrip.begin(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent={
+                "tool_name": "write",
+                "arguments_sha256": roundtrip.canonical_arguments_sha256(arguments),
+            },
+        )
+        roundtrip.acknowledge(
+            client_scope=SHARED_SCOPE,
+            challenge_receipt_sha256=begun["challenge_receipt_sha256"],
+            runtime_binding=BINDING,
+        )
+
+    def consume(self, arguments: dict[str, object]) -> dict[str, object]:
+        return roundtrip.consume_verified(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="write",
+            arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+        )
+
+    def test_shared_scope_is_declared_a_partition_not_an_identity(self) -> None:
+        self.bind(self.INTENT_ARGUMENTS)
+        consumed = self.consume(self.INTENT_ARGUMENTS)
+        self.assertIn(
+            "caller identity: shared_unlabeled is a shared storage partition, "
+            "not an identity",
+            consumed["does_not_establish"],
+        )
+        status = roundtrip.status(
+            client_scope=SHARED_SCOPE, runtime_binding=BINDING
+        )
+        self.assertIn(
+            "that two unlabeled callers of the same exact intent are "
+            "distinguishable",
+            status["does_not_establish"],
+        )
+
+    def test_second_unlabeled_caller_of_one_intent_is_refused(self) -> None:
+        """One admission per handshake, even though the callers are alike."""
+        self.bind(self.INTENT_ARGUMENTS)
+        self.consume(self.INTENT_ARGUMENTS)
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            self.consume(self.INTENT_ARGUMENTS)
+
+    def test_each_admission_carries_a_distinct_consumption_receipt(self) -> None:
+        self.bind(self.INTENT_ARGUMENTS)
+        first = self.consume(self.INTENT_ARGUMENTS)
+        self.bind(self.INTENT_ARGUMENTS)
+        second = self.consume(self.INTENT_ARGUMENTS)
+        self.assertNotEqual(
+            first["consumption_receipt_sha256"],
+            second["consumption_receipt_sha256"],
+        )
+        self.assertNotEqual(
+            first["verification_receipt_sha256"],
+            second["verification_receipt_sha256"],
+        )
+
+    def test_a_failed_effect_leaves_no_reusable_proof(self) -> None:
+        """Admission is consumed before the effect, so failure cannot replay.
+
+        This is the ambiguity contract: a lost response and a failed effect are
+        indistinguishable to the gate, and both must leave the caller without a
+        spendable proof.
+        """
+        operator = _load_operator_module()
+        operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
+        operator.base._transport_roundtrip_client_scope = lambda context: SHARED_SCOPE
+
+        async def exploding_effect(*_args: object, **_kwargs: object):
+            raise RuntimeError("effect failed after admission")
+
+        # Replace the underlying effect before the gate wraps it, so the
+        # admission is genuinely spent and only then does the effect fail.
+        operator.mcp._tool_manager.call_tool = exploding_effect
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._configure_http_runtime()
+        gated = operator.mcp._tool_manager.call_tool
+
+        self.bind(self.INTENT_ARGUMENTS)
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip, "STATE_ROOT", self.root
+        ), mock.patch.object(
+            operator.grabowski_transport_roundtrip, "LOCK_PATH", self.root / ".lock"
+        ):
+            with self.assertRaisesRegex(RuntimeError, "effect failed after admission"):
+                asyncio.run(
+                    gated(
+                        "write",
+                        dict(self.INTENT_ARGUMENTS),
+                        types.SimpleNamespace(client_id=None),
+                    )
+                )
+            # The verification was spent before the effect ran, so no proof
+            # survives the failure.
+            with self.assertRaises(roundtrip.TransportRoundtripRequired):
+                self.consume(self.INTENT_ARGUMENTS)
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
 
 if __name__ == "__main__":
