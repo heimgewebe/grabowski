@@ -1757,6 +1757,147 @@ class BureauPickupTests(unittest.TestCase):
         self.assertTrue((run_dir / "release-result.json").is_file())
         release.assert_called_once_with(intent["lease_owner_id"], [key])
 
+    def test_release_reuses_terminal_readback_after_owner_leases_become_missing(
+        self,
+    ) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _value = self.create_acquisition_journal(intent, lease)
+        stored = self.terminal_status(intent)
+        stored["lease"] = {
+            "status": "terminal-released-or-expired",
+            "error": {
+                "code": "lease-expired",
+                "details": {
+                    "resource_key": key,
+                    "expires_at_unix": 10,
+                    "required_after_unix": 20,
+                },
+            },
+        }
+        current = json.loads(json.dumps(stored))
+        current["lease"]["error"] = {
+            "code": "lease-resources-missing",
+            "details": {"missing": [key]},
+        }
+        pickup._write_bound_json(run_dir / "terminal-readback.json", stored)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=current,
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[None, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={
+                    "owner_id": intent["lease_owner_id"],
+                    "released": [],
+                },
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("released", result["status"])
+        self.assertEqual(
+            pickup._sha256(stored), result["terminal_readback_sha256"]
+        )
+        self.assertEqual(
+            stored,
+            pickup._read_bound_json(
+                run_dir / "terminal-readback.json", label="terminal-readback"
+            ),
+        )
+        self.assertTrue((run_dir / "release-result.json").is_file())
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
+    def test_release_rejects_missing_terminal_resource_outside_release_set(
+        self,
+    ) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _value = self.create_acquisition_journal(intent, lease)
+        stored = self.terminal_status(intent)
+        stored["lease"] = {
+            "status": "terminal-released-or-expired",
+            "error": {
+                "code": "lease-expired",
+                "details": {
+                    "resource_key": key,
+                    "expires_at_unix": 10,
+                    "required_after_unix": 20,
+                },
+            },
+        }
+        current = json.loads(json.dumps(stored))
+        current["lease"]["error"] = {
+            "code": "lease-resources-missing",
+            "details": {"missing": ["component:foreign"]},
+        }
+        pickup._write_bound_json(run_dir / "terminal-readback.json", stored)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=current,
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=None
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "terminal-readback-drift"
+            ):
+                pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        release.assert_not_called()
+
+    def test_release_rejects_nontext_missing_terminal_resource(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _value = self.create_acquisition_journal(intent, lease)
+        stored = self.terminal_status(intent)
+        stored["lease"] = {
+            "status": "terminal-released-or-expired",
+            "error": {
+                "code": "lease-expired",
+                "details": {
+                    "resource_key": key,
+                    "expires_at_unix": 10,
+                    "required_after_unix": 20,
+                },
+            },
+        }
+        current = json.loads(json.dumps(stored))
+        current["lease"]["error"] = {
+            "code": "lease-resources-missing",
+            "details": {"missing": [{"resource_key": key}]},
+        }
+        pickup._write_bound_json(run_dir / "terminal-readback.json", stored)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=current,
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=None
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "terminal-readback-drift"
+            ):
+                pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        release.assert_not_called()
+
     def test_release_rejects_terminal_lease_error_drift(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
