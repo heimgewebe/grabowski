@@ -1,0 +1,67 @@
+name: T139 stateful session hotfix finalize once
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: t139-stateful-session-hotfix-finalize-once
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: >-
+      github.event.pull_request.head.ref == 'fix/t139-stateful-session-hotfix-20260804' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/t139-stateful-session-hotfix-20260804
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Materialize patch from validated direct script
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/t139-stateful-session-hotfix-pr-once.yml')
+          lines = source.read_text(encoding='utf-8').splitlines()
+          start = lines.index("          from pathlib import Path")
+          end = lines.index("          PY", start)
+          payload = []
+          for line in lines[start:end]:
+              if line == "":
+                  payload.append("")
+                  continue
+              if not line.startswith("          "):
+                  raise SystemExit(f"unexpected transformer indentation: {line!r}")
+              payload.append(line[10:])
+          exec(compile("\n".join(payload) + "\n", str(source), "exec"), {})
+          PY
+      - name: Refresh generated contracts
+        run: make context-refresh
+      - name: Run focused regression suite
+        env:
+          PYTHONPATH: src
+        run: |
+          python -m unittest discover -s tests -p 'test_operator_contract.py' -v
+          python -m unittest discover -s tests -p 'test_transport_roundtrip.py' -v
+          python -m unittest discover -s tests -p 'test_transport_gate_integration.py' -v
+          git diff --check
+      - name: Commit materialized hotfix
+        run: |
+          set -euo pipefail
+          rm .github/workflows/t139-stateful-session-hotfix-once.yml
+          rm .github/workflows/t139-stateful-session-hotfix-pr-once.yml
+          rm .github/workflows/t139-stateful-session-hotfix-finalize-once.yml
+          git config user.name "alex-bot"
+          git config user.email "alexdermohr+bot@users.noreply.github.com"
+          git add -A
+          git commit -m "fix(transport): preserve T139 sessions in HTTP runtime [t139-stateful-applied]"
+          git push origin HEAD:fix/t139-stateful-session-hotfix-20260804
