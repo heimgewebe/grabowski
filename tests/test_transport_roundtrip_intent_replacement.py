@@ -82,7 +82,9 @@ class IntentReplacementRoundtripTests(unittest.TestCase):
         )
 
     def test_pending_replacement_is_idempotent_and_consumable(self) -> None:
-        original = self.begin(None, now=100)
+        # A handshake for another exact target is the only kind that can be
+        # displaced; an unbound one can no longer be created at all.
+        original = self.begin(SECOND_INTENT, now=100)
         replacement = self.begin(FIRST_INTENT, now=101)
         replay = self.begin(FIRST_INTENT, now=102)
 

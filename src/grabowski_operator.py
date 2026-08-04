@@ -505,7 +505,10 @@ def _require_transport_roundtrip_for_tool(
             arguments_sha256=arguments_sha256,
         )
     except (
-        grabowski_transport_roundtrip.TransportMutationIntentMismatch
+        # TransportMutationIntentMismatch is a TransportRoundtripRequired, so the
+        # wider class also covers the first call of a scope that holds no receipt
+        # at all. Both cases need the same answer: an exact challenge to ack.
+        grabowski_transport_roundtrip.TransportRoundtripRequired
     ) as exc:
         try:
             handshake = grabowski_transport_roundtrip.begin(

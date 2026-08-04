@@ -77,6 +77,10 @@ class TransportMutationIntentMismatch(TransportRoundtripRequired):
     """Raised when only verifications for other mutation intents are available."""
 
 
+class TransportMutationIntentRequired(TransportRoundtripError):
+    """Raised when a handshake is attempted without an exact target intent."""
+
+
 def _canonical_bytes(value: Any) -> bytes:
     try:
         return json.dumps(
@@ -620,10 +624,17 @@ def _current_receipts(
     runtime_binding: dict[str, str],
     now_unix: int,
 ) -> list[dict[str, Any]]:
+    """Keep only receipts that are current *and* bound to an exact target.
+
+    An unbound receipt authorizes nothing, so keeping it would only let stale
+    legacy entries occupy the bounded pool and crowd out exact handshakes.
+    They are discarded on sight rather than at TTL.
+    """
     return [
         receipt
         for receipt in receipts
-        if _receipt_is_current(
+        if _receipt_mutation_intent(receipt) is not None
+        and _receipt_is_current(
             receipt,
             runtime_binding=runtime_binding,
             now_unix=now_unix,
@@ -751,6 +762,30 @@ def _new_verification(
     return verification
 
 
+def _verified_projection(receipt: dict[str, Any]) -> tuple[str, bool, str]:
+    """Project one verification: only an intent-bound one opens the gate.
+
+    This is the single place where "may the gate open" is decided, and it
+    re-derives the answer from the receipt on every call. Four upstream guards
+    already make an unbound receipt impossible here -- begin() and
+    acknowledge() refuse one, _current_receipts() drops stored ones on sight,
+    and consume_verified() admits only an exact match -- so the closed branch
+    is a deliberate second line rather than a reachable state. It is kept
+    because the cost is one comparison and the failure mode it covers is a
+    gate that opens for an unbound receipt.
+    """
+    if _receipt_mutation_intent(receipt) is not None:
+        return "verified", True, "invoke exactly one mutating tool"
+    return (
+        "unbound_verification",
+        False,
+        (
+            "start a new transport handshake bound to the exact "
+            "target_tool_name and target_arguments"
+        ),
+    )
+
+
 def _projection(
     *,
     state: dict[str, Any],
@@ -788,9 +823,9 @@ def _projection(
     if selected_verified_current is not None:
         projected_pending = None
         projected_verified = selected_verified_current
-        state_name = "verified"
-        gate_open = True
-        next_action = "invoke exactly one mutating tool"
+        state_name, gate_open, next_action = _verified_projection(
+            selected_verified_current
+        )
     elif selected_pending_current is not None:
         projected_pending = selected_pending_current
         projected_verified = None
@@ -801,11 +836,11 @@ def _projection(
             "exact challenge_receipt_sha256"
         )
     elif verified_current:
+        # _current_receipts already dropped every unbound receipt, so no second
+        # filter is needed here.
         projected_pending = pending_current[0] if pending_current else None
         projected_verified = verified_current[0]
-        state_name = "verified"
-        gate_open = True
-        next_action = "invoke exactly one mutating tool"
+        state_name, gate_open, next_action = _verified_projection(projected_verified)
     elif pending_current:
         projected_pending = pending_current[0]
         projected_verified = None
@@ -862,7 +897,15 @@ def _projection(
         "resistance to compromised same-uid code",
     ]
     if shared:
-        does_not_establish.append("which unlabeled caller owns a pooled verification")
+        does_not_establish.extend(
+            [
+                "which unlabeled caller owns a pooled verification",
+                "caller identity: shared_unlabeled is a shared storage "
+                "partition, not an identity",
+                "that two unlabeled callers of the same exact intent are "
+                "distinguishable",
+            ]
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "state_schema_version": STATE_SCHEMA_VERSION,
@@ -946,6 +989,12 @@ def begin(
     scope = validate_client_scope(client_scope)
     binding = validate_runtime_binding(runtime_binding)
     intent = validate_mutation_intent(mutation_intent)
+    if intent is None:
+        raise TransportMutationIntentRequired(
+            "transport handshake requires an exact mutation intent: supply "
+            "target_tool_name and target_arguments; an unbound handshake "
+            "authorizes nothing and would only occupy the bounded pool"
+        )
     timestamp = _timestamp(now_unix)
     with _state_lock():
         state = _prune_state(
@@ -1037,6 +1086,14 @@ def acknowledge(
         existing = _verification_for_challenge(
             loaded["verified_receipts"], challenge_hash
         )
+        if existing is not None and _receipt_mutation_intent(existing) is None:
+            # This replay path reads unpruned state, so a legacy unbound
+            # verification would otherwise be handed back instead of discarded.
+            raise TransportMutationIntentRequired(
+                "stored transport verification carries no exact mutation "
+                "intent and cannot be replayed; begin a new handshake with "
+                "target_tool_name and target_arguments"
+            )
         if existing is not None and _receipt_is_current(
             existing,
             runtime_binding=binding,
@@ -1063,6 +1120,12 @@ def acknowledge(
                 )
             raise TransportRoundtripError(
                 "transport challenge is missing; begin a new handshake"
+            )
+        if _receipt_mutation_intent(pending) is None:
+            raise TransportMutationIntentRequired(
+                "transport challenge carries no exact mutation intent and "
+                "cannot be acknowledged; begin a new handshake with "
+                "target_tool_name and target_arguments"
             )
         if pending.get("runtime_binding") != binding:
             raise TransportRoundtripError(
@@ -1169,24 +1232,11 @@ def status(
     )
 
 
-def require_verified(
-    *,
-    client_scope: dict[str, Any],
-    runtime_binding: dict[str, Any],
-    now_unix: int | None = None,
-) -> dict[str, Any]:
-    result = status(
-        client_scope=client_scope,
-        runtime_binding=runtime_binding,
-        now_unix=now_unix,
-    )
-    if result.get("mutation_gate_open") is not True:
-        raise TransportRoundtripRequired(
-            "mutating MCP calls require a fresh single-use transport verification; "
-            "call grip_run for transport-roundtrip with action=begin and, when it "
-            "returns challenge_pending, action=ack using the exact receipt"
-        )
-    return result
+# require_verified() was removed on purpose. It asserted only that *some*
+# bound verification existed, not that one existed for the requested target,
+# so any future caller reaching for it would have re-introduced exactly the
+# target confusion this module exists to prevent. Admission has one entry
+# point: consume_verified(), which names the exact tool and arguments digest.
 
 
 def consume_verified(
@@ -1226,15 +1276,23 @@ def consume_verified(
             for r in verified_receipts
             if _receipt_mutation_intent(r) == requested_intent
         ]
-        unbound = [r for r in verified_receipts if _receipt_mutation_intent(r) is None]
-        if exact:
-            verified = exact[0]
-        elif unbound:
-            verified = unbound[0]
-        else:
-            raise TransportMutationIntentMismatch(
-                "available transport verifications are bound to a different mutation"
+        if not exact:
+            # An unbound verification must never authorize a mutation. Selecting
+            # one would let any handshake admit any target, which is the whole
+            # defect this gate exists to prevent.
+            bound_count = sum(
+                1 for r in verified_receipts if _receipt_mutation_intent(r) is not None
             )
+            unbound_count = len(verified_receipts) - bound_count
+            raise TransportMutationIntentMismatch(
+                "no transport verification is bound to this exact mutation: "
+                f"client_scope_sha256={_sha256_json(scope)} "
+                f"tool_name={name} arguments_sha256={arguments_hash}; "
+                f"intent_bound_verifications={bound_count} "
+                f"unbound_verifications={unbound_count}; "
+                "unbound verifications cannot authorize any mutation"
+            )
+        verified = exact[0]
         verification_intent = _receipt_mutation_intent(verified)
         consumption = _receipt_base(
             kind=CONSUMPTION_KIND,
@@ -1272,10 +1330,17 @@ def consume_verified(
             "authenticated client identity",
             "application-level success of the admitted mutation",
             "absence of response loss after the admitted mutation",
+            "that the admitted effect completed: admission is consumed before "
+            "the effect runs, so a failed or lost effect leaves no reusable "
+            "proof and requires a new handshake plus target readback",
         ]
         if _is_shared_pool(scope):
-            does_not_establish.append(
-                "which unlabeled caller supplied the consumed verification"
+            does_not_establish.extend(
+                [
+                    "which unlabeled caller supplied the consumed verification",
+                    "caller identity: shared_unlabeled is a shared storage "
+                    "partition, not an identity",
+                ]
             )
         return {
             "schema_version": SCHEMA_VERSION,
