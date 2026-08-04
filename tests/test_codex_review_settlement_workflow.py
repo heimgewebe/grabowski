@@ -90,6 +90,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
         self.assertIn("codex-review-settlement.invalid.json", evaluate_section)
         self.assertIn("status_code", evaluate_section)
+        self.assertIn('status_code:"evaluator_error"', evaluate_section)
         self.assertIn("rc=2", evaluate_section)
         self.assertLess(
             evaluate_section.index("trusted_evaluator_output_invalid"),
@@ -116,6 +117,17 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("Current-head Codex review request required", self.text)
         self.assertIn("Required Codex review is unavailable", self.text)
         self.assertNotIn("usage limit reached", self.text)
+
+    def test_status_and_process_exit_are_checked_together(self) -> None:
+        evaluate_section = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        self.assertIn('status="$(jq -r', evaluate_section)
+        self.assertIn('expected_status="pass"', evaluate_section)
+        self.assertIn("expected_rc=0", evaluate_section)
+        self.assertIn("expected_rc=2", evaluate_section)
+        self.assertIn('[ "$rc" -ne "$expected_rc" ]', evaluate_section)
+        self.assertIn("Evaluator status/exit contract mismatch", evaluate_section)
 
     def test_manual_dispatch_can_recheck_after_thread_resolution(self) -> None:
         self.assertIn("description: Pull request number", self.text)

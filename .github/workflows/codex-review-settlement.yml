@@ -97,7 +97,7 @@ jobs:
           if [ ! -f tools/codex_review_settlement.py ]; then
             jq -nc \
               --arg error trusted_evaluator_missing_on_default_branch \
-              '{status:"block",settled:false,errors:[$error]}' \
+              '{status:"block",status_code:"evaluator_error",settled:false,errors:[$error]}' \
               > codex-review-settlement.json
             rc=2
           else
@@ -118,51 +118,86 @@ jobs:
           ' codex-review-settlement.json > /dev/null 2>&1; then
             jq -nc \
               --arg error trusted_evaluator_output_invalid \
-              '{status:"block",settled:false,errors:[$error]}' \
+              '{status:"block",status_code:"evaluator_error",settled:false,errors:[$error]}' \
               > codex-review-settlement.invalid.json
             mv codex-review-settlement.invalid.json codex-review-settlement.json
             rc=2
           fi
           cat codex-review-settlement.json
-          status_code="$(jq -r '.status_code // "visibility_blocked"' codex-review-settlement.json)"
+          status="$(jq -r '.status // "block"' codex-review-settlement.json)"
+          status_code="$(jq -r '.status_code // "evaluator_error"' codex-review-settlement.json)"
           case "$status_code" in
             review_settled)
+              expected_status="pass"
+              expected_rc=0
               github_state="success"
               description="Current-head Codex review settled"
               ;;
             optional_provider_unavailable)
+              expected_status="pass"
+              expected_rc=0
               github_state="success"
               description="Optional Codex review unavailable; merge gate unaffected"
               ;;
             optional_not_requested)
+              expected_status="pass"
+              expected_rc=0
               github_state="success"
               description="Optional Codex review not requested"
               ;;
             optional_review_pending)
+              expected_status="pass"
+              expected_rc=0
               github_state="success"
               description="Optional Codex review pending; merge gate unaffected"
               ;;
             optional_review_findings)
+              expected_status="pass"
+              expected_rc=0
               github_state="success"
               description="Optional Codex findings remain advisory"
               ;;
             required_request_missing)
+              expected_status="pending"
+              expected_rc=0
               github_state="pending"
               description="Current-head Codex review request required"
               ;;
             required_review_pending)
+              expected_status="pending"
+              expected_rc=0
               github_state="pending"
               description="Required current-head Codex review is pending"
               ;;
             required_provider_unavailable)
+              expected_status="pending"
+              expected_rc=0
               github_state="pending"
               description="Required Codex review is unavailable"
               ;;
-            *)
+            required_review_blocked)
+              expected_status="block"
+              expected_rc=2
+              github_state="failure"
+              description="Required Codex findings remain blocking"
+              ;;
+            visibility_blocked|evaluator_error)
+              expected_status="block"
+              expected_rc=2
               github_state="failure"
               description="Codex review settlement is blocked"
               ;;
+            *)
+              expected_status="block"
+              expected_rc=2
+              github_state="failure"
+              description="Unsupported Codex settlement status code"
+              ;;
           esac
+          if [ "$status" != "$expected_status" ] || [ "$rc" -ne "$expected_rc" ]; then
+            github_state="failure"
+            description="Evaluator status/exit contract mismatch"
+          fi
           first_error="$(jq -r '.errors[0] // empty' codex-review-settlement.json)"
           if [ "$github_state" = "failure" ] && [ -n "$first_error" ]; then
             description="$first_error"
