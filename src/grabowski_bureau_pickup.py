@@ -66,6 +66,7 @@ MAX_CLAIM_REJECTION_CODE_BYTES = 128
 MAX_CLAIM_REJECTION_VALUE_BYTES = 16 * 1024
 MIN_LEASE_TTL_SECONDS = 120
 MAX_LEASE_TTL_SECONDS = 3600
+MAX_JOURNAL_REPLAY_RUNS = 4096
 
 
 class _RequiredBureauPickupRequest(TypedDict):
@@ -1833,6 +1834,153 @@ def _lease_snapshot(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _journal_run_ids() -> list[str]:
+    root = _absolute_path(STATE_ROOT)
+    parent_descriptor = _open_existing_directory_chain(
+        root.parent, label="pickup-state-parent"
+    )
+    root_descriptor = runs_descriptor = -1
+    try:
+        try:
+            root_path, root_descriptor = _open_or_create_private_child(
+                parent_descriptor,
+                root.parent,
+                root.name,
+                label="pickup-root",
+                create=False,
+            )
+            runs_path, runs_descriptor = _open_or_create_private_child(
+                root_descriptor,
+                root_path,
+                "runs",
+                label="pickup-runs",
+                create=False,
+            )
+        except BureauPickupError as exc:
+            if exc.code in {
+                "pickup-root-directory-missing",
+                "pickup-runs-directory-missing",
+            }:
+                return []
+            raise
+        _assert_private_directory_binding(root_descriptor, root_path, label="pickup-root")
+        _assert_private_directory_binding(runs_descriptor, runs_path, label="pickup-runs")
+        names = os.listdir(runs_descriptor)
+        if len(names) > MAX_JOURNAL_REPLAY_RUNS:
+            raise BureauPickupError(
+                "existing-assignment-journal-scan-too-large",
+                details={"limit": MAX_JOURNAL_REPLAY_RUNS, "observed": len(names)},
+            )
+        return sorted(
+            (name for name in names if RUN_ID_RE.fullmatch(name) is not None),
+            reverse=True,
+        )
+    finally:
+        os.close(parent_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        if runs_descriptor >= 0:
+            os.close(runs_descriptor)
+
+
+def _journaled_existing_assignment_after_runtime_drift(
+    request: dict[str, Any],
+    registry_binding: RegistryBinding,
+) -> tuple[dict[str, Any], RegistryBinding, dict[str, Any], dict[str, Any]] | None:
+    if not registry_binding["explicit"]:
+        return None
+    candidates: list[
+        tuple[dict[str, Any], RegistryBinding, dict[str, Any], dict[str, Any], Path]
+    ] = []
+    for run_id in _journal_run_ids():
+        run_dir = _absolute_path(STATE_ROOT) / "runs" / run_id
+        try:
+            stored_payload = _read_bound_json(run_dir / "request.json", label="request")
+        except BureauPickupError as exc:
+            if exc.code.startswith("request-"):
+                continue
+            raise
+        stored_payload = dict(stored_payload)
+        binding_marker = _normalize_registry_binding_marker(
+            stored_payload.pop("registry_binding_sha256", None)
+        )
+        if "coordination_root" not in stored_payload:
+            if Path(request["coordination_root"]) != _legacy_coordination_root():
+                continue
+            stored_payload["coordination_root"] = request["coordination_root"]
+        stored_request = _normalize_request(
+            stored_payload, allow_internal_bindings=True
+        )
+        if stored_request != request:
+            continue
+        stored_binding = _read_journal_registry_binding(
+            run_dir,
+            stored_request["registry_root"],
+            expected_sha256=binding_marker,
+        )
+        if stored_binding["identity"] != registry_binding["identity"]:
+            raise BureauPickupError(
+                "existing-assignment-registry-binding-mismatch",
+                details={"run_id": run_id},
+            )
+        intent = _read_bound_json(run_dir / "intent.json", label="intent")
+        synthetic = {
+            "status": "existing-assignment",
+            "run": {"run_id": run_id, "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        validated_intent, _existing = _validate_intent_result(
+            synthetic, stored_request
+        )
+        if validated_intent["run_id"] != run_id:
+            raise BureauPickupError("existing-assignment-journal-run-mismatch")
+        acquisition = _read_bound_json(
+            run_dir / "acquisition.json", label="acquisition"
+        )
+        _validate_acquisition(acquisition)
+        if acquisition.get("claim_intent_sha256") != intent["intent_sha256"]:
+            raise BureauPickupError("existing-assignment-acquisition-mismatch")
+        candidates.append(
+            (synthetic, stored_binding, stored_request, acquisition, run_dir)
+        )
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise BureauPickupError(
+            "existing-assignment-journal-ambiguous",
+            details={
+                "task_id": request["task_id"],
+                "worker_id": request["worker_id"],
+                "candidate_run_ids": [item[0]["run"]["run_id"] for item in candidates],
+            },
+        )
+    synthetic, stored_binding, stored_request, acquisition, _run_dir = candidates[0]
+    intent = synthetic["envelope"]["claim_intent"]
+    coordination = _bound_bureau_call(
+        stored_binding,
+        lambda: _coordination_status(
+            intent["run_id"],
+            registry_root=stored_request["registry_root"],
+            coordination_root=stored_request["coordination_root"],
+        ),
+    )
+    try:
+        _validate_claim_readback(coordination, intent, acquisition)
+    except BureauPickupError as exc:
+        if exc.code != "claim-readback-blocking-or-incomplete":
+            raise
+    run = coordination.get("run")
+    if not isinstance(run, dict):
+        raise BureauPickupError("claim-readback-run-missing")
+    synthetic["status"] = (
+        "existing-assignment"
+        if run.get("state") in {"assigned", "running", "verifying"}
+        else "existing-terminal"
+    )
+    synthetic["run"] = run
+    return synthetic, stored_binding, stored_request, coordination
+
+
 def _repair_existing_assignment_lease_binding(
     coordination: dict[str, Any],
     intent: dict[str, Any],
@@ -1842,11 +1990,12 @@ def _repair_existing_assignment_lease_binding(
 ) -> bool:
     lease_state = coordination.get("lease")
     lease_error = lease_state.get("error") if isinstance(lease_state, dict) else None
+    error_code = lease_error.get("code") if isinstance(lease_error, dict) else None
     if not (
         isinstance(lease_state, dict)
         and lease_state.get("status") == "active-binding-drift"
-        and isinstance(lease_error, dict)
-        and lease_error.get("code") == "lease-metadata-binding-mismatch"
+        and error_code
+        in {"lease-metadata-binding-mismatch", "lease-resources-missing"}
     ):
         return False
     run = coordination.get("run")
@@ -1873,8 +2022,51 @@ def _repair_existing_assignment_lease_binding(
     }
     if sorted(original_by_key) != intent["required_resource_keys"]:
         raise BureauPickupError("existing-assignment-lease-journal-incomplete")
+    groups = _acquisition_groups(intent, request)
+    if len(groups) != 1:
+        return False
+    group = groups[0]
+    keys = group["resource_keys"]
+    purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+    original = [original_by_key[key] for key in keys]
+    if any(item.get("purpose") != purpose for item in original):
+        raise BureauPickupError(
+            "existing-assignment-lease-purpose-journal-mismatch",
+            details={"group": group["name"]},
+        )
+    if error_code == "lease-resources-missing":
+        result = resources.acquire_resources(
+            intent["lease_owner_id"],
+            keys,
+            purpose=purpose,
+            ttl_seconds=group["ttl_seconds"],
+            metadata=group["metadata"],
+            nonconflict_proof=group["nonconflict_proof"],
+        )
+        _validate_acquired_group(intent["lease_owner_id"], group, result)
+        leases = result["leases"]
+        if any(
+            item.get("purpose") != purpose
+            or item.get("metadata_sha256")
+            != original_by_key[item["resource_key"]].get("metadata_sha256")
+            for item in leases
+        ):
+            raise BureauPickupError("existing-assignment-lease-reacquire-mismatch")
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_lease_reacquire",
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "group": group["name"],
+            "resource_keys": keys,
+            "metadata_sha256": original[0]["metadata_sha256"],
+        }
+        receipt["receipt_sha256"] = _sha256(receipt)
+        _write_bound_json(run_dir / "lease-reacquire.json", receipt)
+        return True
     current_by_key: dict[str, dict[str, Any]] = {}
-    for key in intent["required_resource_keys"]:
+    for key in keys:
         observed = resources.inspect_resource(key)
         if observed is None:
             raise BureauPickupError(
@@ -1890,21 +2082,9 @@ def _repair_existing_assignment_lease_binding(
     if any(
         current_by_key[key]["acquired_at_unix"]
         <= original_by_key[key]["expires_at_unix"]
-        for key in intent["required_resource_keys"]
+        for key in keys
     ):
         return False
-    groups = _acquisition_groups(intent, request)
-    if len(groups) != 1:
-        return False
-    group = groups[0]
-    keys = group["resource_keys"]
-    purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
-    original = [original_by_key[key] for key in keys]
-    if any(item.get("purpose") != purpose for item in original):
-        raise BureauPickupError(
-            "existing-assignment-lease-purpose-journal-mismatch",
-            details={"group": group["name"]},
-        )
     result = resources.rebind_same_owner_resources(
         intent["lease_owner_id"],
         keys,
@@ -1970,7 +2150,23 @@ def grabowski_bureau_pickup_execute(
             task_id=normalized["task_id"],
         )
         return result
-    intent, existing = _validate_intent_result(intent_payload, normalized)
+    cached_coordination: dict[str, Any] | None = None
+    try:
+        intent, existing = _validate_intent_result(intent_payload, normalized)
+    except BureauPickupError as exc:
+        if exc.code not in {
+            "claim-intent-runtime-drift-blocked",
+            "claim-intent-stale-runtime-blocked",
+        }:
+            raise
+        replay = _journaled_existing_assignment_after_runtime_drift(
+            normalized, registry_binding
+        )
+        if replay is None:
+            raise
+        intent_payload, registry_binding, normalized, cached_coordination = replay
+        request_sha256 = _sha256(normalized)
+        intent, existing = _validate_intent_result(intent_payload, normalized)
     run_dir = _run_directory(intent["run_id"])
     if existing:
         stored_request_payload = _read_bound_json(
@@ -2021,14 +2217,16 @@ def grabowski_bureau_pickup_execute(
         _validate_acquisition(acquisition)
         if acquisition.get("claim_intent_sha256") != intent["intent_sha256"]:
             raise BureauPickupError("existing-assignment-acquisition-mismatch")
-        coordination = _bound_bureau_call(
-            registry_binding,
-            lambda: _coordination_status(
-                intent["run_id"],
-                registry_root=normalized["registry_root"],
-                coordination_root=normalized["coordination_root"],
-            ),
-        )
+        coordination = cached_coordination
+        if coordination is None:
+            coordination = _bound_bureau_call(
+                registry_binding,
+                lambda: _coordination_status(
+                    intent["run_id"],
+                    registry_root=normalized["registry_root"],
+                    coordination_root=normalized["coordination_root"],
+                ),
+            )
         try:
             _validate_claim_readback(coordination, intent, acquisition)
         except BureauPickupError as exc:
