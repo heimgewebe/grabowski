@@ -870,8 +870,12 @@ def grabowski_bureau_task_propose(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Create an immutable Bureau task proposal artifact without changing Registry or Queue truth."""
+    operator._require_operator_mutation(
+        "terminal_execute",
+        path=str(Path(registry_root).expanduser().resolve()),
+    )
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=True
+        registry_root, refresh=True, mutation=False
     )
     if bool(candidate_id) == bool(event_id):
         raise ValueError("provide exactly one of candidate_id or event_id")
@@ -977,8 +981,12 @@ def grabowski_bureau_task_review(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
+    operator._require_operator_mutation(
+        "terminal_execute",
+        path=str(Path(registry_root).expanduser().resolve()),
+    )
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=True
+        registry_root, refresh=True, mutation=False
     )
     if not reviewer.strip():
         raise ValueError("reviewer must not be empty")
@@ -1047,8 +1055,12 @@ def grabowski_bureau_task_publish(
     lease_ttl_seconds: int = 240,
 ) -> dict[str, Any]:
     """Acquire exact short Bureau leases, publish one reviewed task branch and PR, then release on a clear outcome."""
+    operator._require_operator_mutation(
+        "terminal_execute",
+        path=str(Path(registry_root).expanduser().resolve()),
+    )
     resolved_root = _prepare_registry_root(
-        registry_root, refresh=True, mutation=True
+        registry_root, refresh=True, mutation=False
     )
     operator._require_operator_mutation("resource_lease")
     if lease_ttl_seconds < 90 or lease_ttl_seconds > 300:
