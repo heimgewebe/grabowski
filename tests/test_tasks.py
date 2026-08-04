@@ -4,6 +4,7 @@ import ast
 import asyncio
 from contextlib import closing, contextmanager
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -312,7 +313,43 @@ class TaskTests(unittest.TestCase):
             ],
         )
         self.assertEqual(capture[-2:], ["/bin/echo", command_argument])
+        self.assertEqual(result["task"]["runtime_seconds"], 60)
+        self.assertIn("--property=RuntimeMaxSec=60s", launch)
         return result
+
+    def test_persistent_task_and_job_defaults_are_six_hours(self) -> None:
+        self.assertEqual(tasks.operator.DEFAULT_JOB_RUNTIME, 21_600)
+        for function in (
+            tasks.grabowski_task_start,
+            tasks._grabowski_task_start_tool,
+            tasks.operator._start_job,
+            tasks.operator.grabowski_job_start,
+        ):
+            self.assertEqual(
+                inspect.signature(function).parameters["runtime_seconds"].default,
+                21_600,
+            )
+
+        with (
+            patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST),
+            patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch,
+            patch.object(tasks.base, "_append_audit"),
+            patch.object(
+                tasks,
+                "_require_recovery_gate",
+                return_value={"checked_at_unix": 123},
+            ),
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                ["/bin/echo", "default-runtime"],
+                cwd=str(self.root),
+                resume_policy="never",
+            )
+
+        launch = dispatch.call_args.args[1]
+        self.assertEqual(result["task"]["runtime_seconds"], 21_600)
+        self.assertIn("--property=RuntimeMaxSec=21600s", launch)
 
     def _write_task_output(
         self,
