@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -146,6 +147,43 @@ class BureauControlCheckoutTests(unittest.TestCase):
             "?? workbench-only.txt",
             self._git(self.shared, "status", "--short"),
         )
+
+    def test_refresh_recreates_externally_deleted_control_checkout(self) -> None:
+        shared_head = self._git(self.shared, "rev-parse", "HEAD")
+        (self.shared / "workbench-only.txt").write_text(
+            "foreign work\n", encoding="utf-8"
+        )
+        import shutil
+        shutil.rmtree(self.control)
+        expected = self._advance_remote()
+
+        result = bureau.refresh_bureau_control_checkout()
+
+        self.assertTrue(result["recreated"])
+        self.assertTrue(result["updated"])
+        self.assertIsNone(result["previous_head"])
+        self.assertEqual(result["head"], expected)
+        self.assertEqual(result["origin_main"], expected)
+        self.assertEqual(result["branch"], bureau.BUREAU_CONTROL_BRANCH)
+        self.assertEqual(result["upstream"], bureau.BUREAU_CONTROL_UPSTREAM)
+        self.assertFalse(result["dirty"])
+        self.assertEqual(self._git(self.shared, "rev-parse", "HEAD"), shared_head)
+        self.assertIn(
+            "?? workbench-only.txt",
+            self._git(self.shared, "status", "--short"),
+        )
+        inspected = bureau.inspect_bureau_control_checkout()
+        self.assertEqual(inspected["head"], expected)
+
+    def test_non_worktree_path_at_control_location_fails_closed(self) -> None:
+        import shutil
+        shutil.rmtree(self.control)
+        self.control.symlink_to(self.seed, target_is_directory=True)
+
+        with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+            bureau.refresh_bureau_control_checkout()
+
+        self.assertEqual(raised.exception.code, "control-checkout-path-occupied")
 
     def test_dirty_control_checkout_fails_closed_before_fetch(self) -> None:
         (self.control / "control-only.txt").write_text("unexpected\n", encoding="utf-8")

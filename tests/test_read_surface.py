@@ -289,13 +289,84 @@ class ReadSurfaceTests(unittest.TestCase):
     def test_git_show_uses_resolved_object_before_path_separator(self) -> None:
         repo = Path("/tmp/repository")
         object_id = "c" * 40
-        with patch.object(read_surface, "_resolve_repository", return_value=repo), patch.object(read_surface, "_resolve_revision", return_value=object_id) as resolver, patch.object(read_surface, "_run_read", return_value={"returncode": 0}) as runner:
-            read_surface.grabowski_git_show(str(repo), revision="HEAD~1")
-        resolver.assert_called_once_with(repo, "HEAD~1")
+        with patch.object(
+            read_surface, "_resolve_repository", return_value=repo
+        ), patch.object(
+            read_surface, "_resolve_revision", return_value=object_id
+        ) as resolver, patch.object(
+            read_surface, "_run_read", return_value={"returncode": 0}
+        ) as runner:
+            result = read_surface.grabowski_git_show(
+                str(repo), revision="HEAD~1"
+            )
+        self.assertEqual(resolver.call_count, 2)
+        resolver.assert_any_call(repo, "HEAD~1")
         argv = runner.call_args.args[0]
         self.assertEqual(argv[-2:], [object_id, "--"])
         self.assertIn("--no-ext-diff", argv)
         self.assertIn("--no-textconv", argv)
+        self.assertEqual(
+            result["revision_binding"],
+            {
+                "requested_revision": "HEAD~1",
+                "output_object_id": object_id,
+                "readback_object_id": object_id,
+                "readback_status": "stable",
+                "stable": True,
+            },
+        )
+
+    def test_git_show_reports_ref_movement_after_immutable_read(self) -> None:
+        repo = Path("/tmp/repository")
+        output_object = "c" * 40
+        moved_object = "d" * 40
+        with patch.object(
+            read_surface, "_resolve_repository", return_value=repo
+        ), patch.object(
+            read_surface,
+            "_resolve_revision",
+            side_effect=[output_object, moved_object],
+        ), patch.object(
+            read_surface,
+            "_run_read",
+            return_value={"returncode": 0},
+        ):
+            result = read_surface.grabowski_git_show(
+                str(repo), revision="refs/heads/main"
+            )
+        self.assertEqual(
+            result["revision_binding"],
+            {
+                "requested_revision": "refs/heads/main",
+                "output_object_id": output_object,
+                "readback_object_id": moved_object,
+                "readback_status": "moved",
+                "stable": False,
+            },
+        )
+
+    def test_git_show_reports_unresolvable_post_read_ref(self) -> None:
+        repo = Path("/tmp/repository")
+        output_object = "e" * 40
+        with patch.object(
+            read_surface, "_resolve_repository", return_value=repo
+        ), patch.object(
+            read_surface,
+            "_resolve_revision",
+            side_effect=[output_object, ValueError("gone")],
+        ), patch.object(
+            read_surface,
+            "_run_read",
+            return_value={"returncode": 0},
+        ):
+            result = read_surface.grabowski_git_show(
+                str(repo), revision="refs/heads/topic"
+            )
+        binding = result["revision_binding"]
+        self.assertEqual(binding["output_object_id"], output_object)
+        self.assertIsNone(binding["readback_object_id"])
+        self.assertEqual(binding["readback_status"], "unresolvable")
+        self.assertFalse(binding["stable"])
 
     def test_service_status_uses_property_allowlist(self) -> None:
         result = {"returncode": 0, "stdout": "LoadState=loaded\nActiveState=active\n", "stderr": ""}
