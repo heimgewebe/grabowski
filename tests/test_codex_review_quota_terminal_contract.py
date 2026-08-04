@@ -37,10 +37,10 @@ COMPLETION_TIME = "2026-07-27T08:01:00Z"
 QUOTA_BODY = (
     "You have reached your Codex usage limits for code reviews. "
     "You can see your limits in the "
-    "[Codex usage dashboard](https://chatgpt.com/codex/usage).\n\n"
+    "[Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\n\n"
     "To continue using code reviews, you can upgrade your account or add "
     "credits to your account and enable them for code reviews in your "
-    "[settings](https://chatgpt.com/codex/settings)."
+    "[settings](https://chatgpt.com/codex/cloud/settings/code-review)."
 )
 
 
@@ -206,7 +206,10 @@ def fabricated_unavailable_evidence() -> dict:
 def runner_for(evidence: dict, live: dict) -> merge_guard.CaptainMergeGuardRunner:
     runner = object.__new__(merge_guard.CaptainMergeGuardRunner)
     runner.parameters = {
-        "review_evidence": {"review_tier": "high_critical"},
+        "review_evidence": {
+            "review_tier": "high_critical",
+            "external_review_required": True,
+        },
         "codex_review_evidence": evidence,
     }
     runner.receipt = {}
@@ -250,9 +253,11 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
     def test_unbound_usage_limit_remains_pending(self) -> None:
         result = evaluate(state())
         self.assertEqual("pending", result["status"])
+        self.assertEqual("required_provider_unavailable", result["status_code"])
         self.assertFalse(result["settled"])
         self.assertFalse(result["completion_present"])
         self.assertFalse(result["review_performed"])
+        self.assertTrue(result["provider_outcome_present"])
 
     def test_captain_schema_rejects_unbound_terminalization(self) -> None:
         evidence = fabricated_unavailable_evidence()
@@ -278,6 +283,22 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
             phase="test",
         )
         self.assertIn("merge_guard_codex_unavailable_comment_unbound", errors)
+
+    def test_merge_guard_rejects_non_boolean_explicit_requirement(self) -> None:
+        evidence, live = valid_review_evidence_and_live()
+        runner = runner_for(evidence, live)
+        runner.parameters["codex_review_required"] = "yes"
+
+        errors = merge_guard.CaptainMergeGuardRunner._revalidate_codex_review(
+            runner,
+            bindings(),
+            phase="test",
+        )
+
+        self.assertEqual(["merge_guard_codex_required_invalid"], errors)
+        receipt = runner.receipt["test_codex_review_revalidation"]
+        self.assertEqual("blocked", receipt["status"])
+        self.assertEqual([], receipt["observations"])
 
     def test_merge_guard_revalidates_performed_review(self) -> None:
         evidence, live = valid_review_evidence_and_live()

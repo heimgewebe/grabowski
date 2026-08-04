@@ -146,15 +146,36 @@ External providers default to a `0 USD` request and a `0 USD` runtime policy cap
 ## Codex-Nichtverfügbarkeit
 
 Eine vertrauenswürdige Codex-Meldung über ausgeschöpftes Code-Review-Kontingent
-ist diagnostisch, aber keine terminale Review-Evidenz. GitHub liefert für einen
-freien Issue-Kommentar keine unveränderliche Beziehung zum auslösenden
-Head-/Diff-Request. Weder Zeitnähe noch die aktuell sichtbare Marker-Menge
-belegen diese Kausalität, weil ältere Requests noch laufen und Marker später
-gelöscht werden können.
+ist eine Providerdiagnose, niemals eine ausgeführte Review, ein Codex-PASS oder
+ein Settlement. Der Evaluator akzeptiert dafür nur vollständig übereinstimmende,
+allowlistgebundene Meldungstexte eines vertrauenswürdigen Codex-Akteurs nach
+genau einem kanonischen Request für den aktuellen Head und Diff. Freie
+Textvarianten, Zusätze, mehrdeutige Requests, fremde Akteure und abgeschnittene
+GitHub-Sichten bleiben fail-closed.
 
-Daher bleibt ein ungebundener Quota-Kommentar stets `pending`. Er darf weder
-einen aktuellen Review ersetzen noch einen blockierenden Reviewzustand oder
-offene Threads überstimmen. Erst eine künftige Antwortoberfläche mit einer
-unveränderlichen, live revalidierbaren Bindung an Repository, PR, Head, Diff und
-Request-ID dürfte einen separaten Terminalvertrag begründen. Self-Review, CI,
-Interne vollständige Diffbindung und sämtliche Captain-Gates bleiben unabhängig erforderlich; eine benutzerseitige Diff-Auslieferung ist optional.
+Ist externes Review nach der kanonischen Review-Policy optional, erreicht eine
+solche gebundene Providerdiagnose den terminalen Status
+`optional_provider_unavailable`: Der veröffentlichte Diagnosecheck ist grün,
+`settled` und `review_performed` bleiben jedoch `false`. Ist externes Review
+explizit erforderlich, bleibt derselbe Befund mit
+`required_provider_unavailable` ausstehend. Fehlender Request, laufender Review,
+Provider-Unverfügbarkeit, Sichtbarkeitsfehler, echte Codex-Findings und ein
+wirklich revisionsgebundener Abschluss besitzen getrennte Statuscodes und
+Beschreibungen.
+
+Providerdiagnosen ersetzen weder revisionsgebundenen Self-Review noch CI,
+Diffbindung, offene-Thread-Prüfung oder tatsächlich vorgeschriebene Gates. Sie
+erzeugen keine Review-, Merge-, Branchschutz-, Kontingentkauf- oder
+Providerautorität. Die derzeit bekannte Cloud-Settings-Meldung und ihre ältere
+exakte URL-Variante werden aus Kompatibilitätsgründen getrennt erkannt; jede
+inhaltliche Abweichung benötigt eine neue geprüfte Signatur.
+
+Während der einmaligen Einführung kann der vertrauenswürdige Default-Branch-
+Evaluator noch das ältere Ergebnisformat ohne `status_code` liefern. Der Workflow
+übersetzt dann ausschließlich die bereits vorhandenen Zustände in
+`legacy_evaluator_pass`, `legacy_evaluator_pending` oder
+`legacy_evaluator_blocked`. Ein Legacy-`pending` ist als nicht autoritative
+Diagnose terminal grün, behauptet aber weder Review, PASS noch Settlement; ein
+Legacy-`block` bleibt rot. PR-Code wird unter `pull_request_target` weiterhin
+niemals als vertrauenswürdiger Evaluator ausgeführt. Nach dem Merge liefert der
+Default-Branch-Evaluator die feinere kanonische Taxonomie direkt.

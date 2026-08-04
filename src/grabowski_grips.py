@@ -4996,7 +4996,7 @@ def _captain_action_evidence_schema(action_name: str, target: dict[str, Any], ri
                     "codex_review_exception",
                 ],
                 "required_when": (
-                    "review_evidence.review_tier_is_high_critical_or_"
+                    "review_evidence.external_review_required_is_true_or_"
                     "codex_review_required_is_true"
                 ),
             }
@@ -5734,7 +5734,11 @@ def _captain_codex_review_gate(
             "codex_review_required must be a bool when provided",
             ["codex_review_required_invalid"],
         )
-    required = review_tier == "high_critical" or explicit_required is True
+    policy_required = (
+        isinstance(review_evidence, dict)
+        and review_evidence.get("external_review_required") is True
+    )
+    required = policy_required or explicit_required is True
     targets = [
         action.get("target")
         for action in actions
@@ -5763,12 +5767,20 @@ def _captain_codex_review_gate(
             "Codex review evidence and exception are mutually exclusive",
             ["codex_review_evidence_exception_ambiguous"],
         )
-    if not required and evidence is None and exception is None:
+    if not required and exception is None:
+        diagnostic_present = evidence is not None
         return _captain_gate(
             "codex-review-settled",
             "pass",
-            "Codex review settlement is not required for this review tier",
-            {"review_tier": review_tier, "required": False},
+            "Codex review is optional; any supplied Codex evidence remains advisory and grants no merge authority",
+            {
+                "review_tier": review_tier,
+                "external_review_required": policy_required,
+                "explicitly_required": explicit_required is True,
+                "required": False,
+                "diagnostic_evidence_present": diagnostic_present,
+                "diagnostic_evidence_ignored_for_authority": diagnostic_present,
+            },
         )
     target = targets[0]
     expected_repo = target.get("repo")

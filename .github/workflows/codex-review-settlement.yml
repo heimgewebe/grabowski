@@ -104,7 +104,6 @@ jobs:
             python3 tools/codex_review_settlement.py \
               --repository "$GITHUB_REPOSITORY" \
               --pr "$PR_NUMBER" \
-              --require \
               --json \
               evaluate > codex-review-settlement.json
             rc=$?
@@ -115,24 +114,83 @@ jobs:
             and (.status | type == "string")
             and (.settled | type == "boolean")
             and (.errors | type == "array")
+            and ((has("status_code") | not) or (.status_code | type == "string"))
           ' codex-review-settlement.json > /dev/null 2>&1; then
             jq -nc \
               --arg error trusted_evaluator_output_invalid \
-              '{status:"block",settled:false,errors:[$error]}' \
+              '{status:"block",status_code:"visibility_blocked",settled:false,errors:[$error]}' \
               > codex-review-settlement.invalid.json
             mv codex-review-settlement.invalid.json codex-review-settlement.json
             rc=2
+          elif ! jq -e 'has("status_code")' codex-review-settlement.json > /dev/null; then
+            legacy_status="$(jq -r '.status' codex-review-settlement.json)"
+            legacy_settled="$(jq -r '.settled' codex-review-settlement.json)"
+            case "$legacy_status:$legacy_settled" in
+              pass:true) compatibility_code="review_settled" ;;
+              pass:false) compatibility_code="legacy_evaluator_pass" ;;
+              pending:*) compatibility_code="legacy_evaluator_pending" ;;
+              *) compatibility_code="legacy_evaluator_blocked" ;;
+            esac
+            jq \
+              --arg status_code "$compatibility_code" \
+              '. + {
+                status_code: $status_code,
+                compatibility: {
+                  kind: "legacy_default_branch_evaluator",
+                  synthesized_status_code: true,
+                  does_not_establish: [
+                    "codex_review_performed",
+                    "codex_review_pass",
+                    "codex_review_settled",
+                    "merge_authority"
+                  ]
+                }
+              }' codex-review-settlement.json \
+              > codex-review-settlement.compatible.json
+            mv codex-review-settlement.compatible.json codex-review-settlement.json
           fi
           cat codex-review-settlement.json
-          status="$(jq -r '.status // "block"' codex-review-settlement.json)"
-          case "$status" in
-            pass)
+          status_code="$(jq -r '.status_code // "visibility_blocked"' codex-review-settlement.json)"
+          case "$status_code" in
+            review_settled)
               github_state="success"
-              description="Current-head Codex review requirement satisfied"
+              description="Current-head Codex review settled"
               ;;
-            pending)
+            optional_provider_unavailable)
+              github_state="success"
+              description="Optional Codex review unavailable; merge gate unaffected"
+              ;;
+            optional_not_requested)
+              github_state="success"
+              description="Optional Codex review not requested"
+              ;;
+            optional_review_pending)
+              github_state="success"
+              description="Optional Codex review pending; merge gate unaffected"
+              ;;
+            optional_review_findings)
+              github_state="success"
+              description="Optional Codex findings remain advisory"
+              ;;
+            legacy_evaluator_pass)
+              github_state="success"
+              description="Legacy evaluator reports diagnostic pass"
+              ;;
+            legacy_evaluator_pending)
+              github_state="success"
+              description="Legacy evaluator pending; diagnostic only"
+              ;;
+            required_request_missing)
               github_state="pending"
-              description="Connected user must request current-head Codex review"
+              description="Current-head Codex review request required"
+              ;;
+            required_review_pending)
+              github_state="pending"
+              description="Required current-head Codex review is pending"
+              ;;
+            required_provider_unavailable)
+              github_state="pending"
+              description="Required Codex review is unavailable"
               ;;
             *)
               github_state="failure"
@@ -140,7 +198,7 @@ jobs:
               ;;
           esac
           first_error="$(jq -r '.errors[0] // empty' codex-review-settlement.json)"
-          if [ -n "$first_error" ]; then
+          if [ "$github_state" = "failure" ] && [ -n "$first_error" ]; then
             description="$first_error"
           fi
           description="$(printf '%s' "$description" | cut -c1-140)"

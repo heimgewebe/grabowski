@@ -4023,6 +4023,9 @@ def authorized_captain_run_parameters(**overrides) -> dict[str, object]:
         allow_execution=True,
         **overrides,
     )
+    review_evidence = parameters.get("review_evidence")
+    if isinstance(review_evidence, dict):
+        review_evidence.setdefault("external_review_required", True)
     parameters.pop("human_authorization")
     parameters.pop("execution_authority")
     parameters["execution_intent"] = captain_execution_intent(parameters)
@@ -4599,8 +4602,39 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_merge_blocks_missing_codex_review_evidence(self) -> None:
+    def test_high_critical_merge_uses_self_review_policy_without_codex(self) -> None:
         parameters = captain_parameters()
+        parameters.pop("codex_review_evidence")
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "codex-review-settled")
+        self.assertEqual("pass", gate["status"])
+        self.assertFalse(gate["details"]["external_review_required"])
+        self.assertFalse(gate["details"]["required"])
+
+    def test_optional_codex_evidence_is_advisory_even_when_stale(self) -> None:
+        parameters = captain_parameters()
+        evidence = captain_codex_review_evidence(head="d" * 40)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "codex-review-settled")
+        self.assertEqual("pass", gate["status"])
+        self.assertFalse(gate["details"]["required"])
+        self.assertTrue(gate["details"]["diagnostic_evidence_present"])
+        self.assertTrue(
+            gate["details"]["diagnostic_evidence_ignored_for_authority"]
+        )
+        self.assertNotIn(
+            "head_sha does not match expected value",
+            result["output"]["blocked_reasons"],
+        )
+
+    def test_review_policy_can_explicitly_require_codex_evidence(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["external_review_required"] = True
         parameters.pop("codex_review_evidence")
         result = self.run_captain(parameters)
 
@@ -4643,6 +4677,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_codex_review_evidence_for_other_head_blocks(self) -> None:
         parameters = captain_parameters()
+        parameters["review_evidence"]["external_review_required"] = True
         evidence = captain_codex_review_evidence(head="d" * 40)
         parameters["codex_review_evidence"] = evidence
         parameters["execution_intent"] = captain_execution_intent(parameters)
@@ -4653,6 +4688,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
     def test_codex_review_unresolved_thread_blocks(self) -> None:
         parameters = captain_parameters()
+        parameters["review_evidence"]["external_review_required"] = True
         evidence = captain_codex_review_evidence()
         evidence["finding_count"] = 1
         evidence["thread_ids"] = ["PRRT_test"]
@@ -6844,7 +6880,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                         "codex_review_exception",
                     ],
                     "required_when": (
-                        "review_evidence.review_tier_is_high_critical_or_"
+                        "review_evidence.external_review_required_is_true_or_"
                         "codex_review_required_is_true"
                     ),
                 }
@@ -7125,6 +7161,47 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             "settled", guard["dispatch_codex_review_revalidation"]["status"]
         )
         self.assertEqual([], resources.list_resources())
+
+    def test_atomic_merge_guard_skips_codex_when_external_review_is_optional(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        codex_evidence = parameters["codex_review_evidence"]
+        assert isinstance(codex_evidence, dict)
+        codex_evidence["head_sha"] = "d" * 40
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(view={
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": "e" * 40,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }, diff_text=CAPTAIN_DIFF_TEXT)
+
+        result = grips.grip_run(
+            "captain-run", parameters, profile="captain", allow_mutation=True,
+            command_runner=FakeGit(), github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        for phase in ("initial", "dispatch"):
+            receipt = guard[f"{phase}_codex_review_revalidation"]
+            self.assertEqual("not_required", receipt["status"])
+            self.assertFalse(receipt["required"])
+            self.assertFalse(receipt["external_review_required"])
+            self.assertFalse(receipt["explicitly_required"])
+            self.assertTrue(receipt["diagnostic_evidence_present"])
+            self.assertTrue(
+                receipt["diagnostic_evidence_ignored_for_authority"]
+            )
+            self.assertEqual([], receipt["observations"])
+            self.assertEqual([], receipt["errors"])
 
     def test_atomic_merge_guard_rejects_later_duplicate_request_as_canonical(self) -> None:
         parameters = authorized_captain_run_parameters()
