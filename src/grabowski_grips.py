@@ -2857,22 +2857,24 @@ def _run_transport_roundtrip(
                 )
             target_tool_present = "target_tool_name" in parameters
             target_arguments_present = "target_arguments" in parameters
-            if not target_tool_present or not target_arguments_present:
+            if target_tool_present != target_arguments_present:
                 raise GripPreflightError(
-                    "action=begin requires exact target_tool_name and target_arguments"
+                    "action=begin requires target_tool_name and target_arguments together"
                 )
-            target_tool_name = parameters.get("target_tool_name")
-            target_arguments = parameters.get("target_arguments")
-            if not isinstance(target_tool_name, str):
-                raise GripPreflightError("target_tool_name must be text")
-            if not isinstance(target_arguments, dict):
-                raise GripPreflightError("target_arguments must be an object")
-            mutation_intent = {
-                "tool_name": target_tool_name,
-                "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
-                    target_arguments
-                ),
-            }
+            mutation_intent = None
+            if target_tool_present:
+                target_tool_name = parameters.get("target_tool_name")
+                target_arguments = parameters.get("target_arguments")
+                if not isinstance(target_tool_name, str):
+                    raise GripPreflightError("target_tool_name must be text")
+                if not isinstance(target_arguments, dict):
+                    raise GripPreflightError("target_arguments must be an object")
+                mutation_intent = {
+                    "tool_name": target_tool_name,
+                    "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
+                        target_arguments
+                    ),
+                }
             output = grabowski_transport_roundtrip.begin(
                 client_scope=scope,
                 runtime_binding=binding,
