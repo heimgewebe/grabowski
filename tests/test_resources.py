@@ -477,6 +477,7 @@ class ResourceTests(unittest.TestCase):
     def test_normalizes_typed_resource_keys(self) -> None:
         self.assertEqual(resources.normalize_resource_key("port:09222"), "port:9222")
         self.assertEqual(resources.normalize_resource_key("display::17"), "display:17")
+        self.assertEqual(resources.normalize_resource_key("host:heim-pc"), "host:heim-pc")
         self.assertEqual(
             resources.normalize_resource_key(
                 "component:github-branch:heimgewebe-grabowski:feat/captain"
@@ -493,6 +494,18 @@ class ResourceTests(unittest.TestCase):
             resources.normalize_resource_key("path:relative")
         with self.assertRaises(ValueError):
             resources.normalize_resource_key("port:70000")
+
+    def test_host_resource_lease_is_exclusive(self) -> None:
+        key = "host:heim-pc"
+        acquired = resources.acquire_resources(
+            "owner-a", [key], purpose="exclusive host work", ttl_seconds=60
+        )
+        self.assertEqual(key, acquired["leases"][0]["resource_key"])
+        self.assertEqual("owner-a", resources.inspect_resource(key)["owner_id"])
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "owner-b", [key], purpose="conflicting host work", ttl_seconds=60
+            )
 
     def test_normalizes_top_level_operation_resource_keys(self) -> None:
         key = (
