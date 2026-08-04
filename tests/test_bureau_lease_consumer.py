@@ -628,22 +628,59 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         if package_contract == "legacy-python-package-v1":
             package_paths = bureau._managed_package_paths(release)
             package_digest = bureau._managed_package_tree_sha256(package_paths)
-        elif package_contract == "bureau-cycle-systemd-v2":
+        elif package_contract in {
+            "bureau-cycle-systemd-v2",
+            "bureau-scheduler-fragments-v3",
+        }:
             cycle_package = release / "src/bureau_cycle"
             cycle_package.mkdir(parents=True)
             (cycle_package / "__init__.py").write_text("", encoding="utf-8")
             systemd = release / "ops/systemd"
             systemd.mkdir(parents=True)
-            service = systemd / "bureau-cycle.service"
-            service.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
-            runner = systemd / "bureau-cycle-run"
-            runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            runner.chmod(0o755)
+            if package_contract == "bureau-cycle-systemd-v2":
+                service = systemd / "bureau-cycle.service"
+                service.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
+                runner = systemd / "bureau-cycle-run"
+                runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                runner.chmod(0o755)
+                scheduler_paths = [
+                    path for path in sorted(systemd.rglob("*")) if path.is_file()
+                ]
+            else:
+                scheduler_names = (
+                    "bureau-halfhour-operator",
+                    "bureau-curator",
+                    "bureau-operator-control",
+                    "bureau-verifier-control",
+                    "bureau-closure-planner",
+                )
+                module.write_text(
+                    "SCHEMA_VERSION = 1\n"
+                    f"SCHEDULER_NAMES = {scheduler_names!r}\n",
+                    encoding="utf-8",
+                )
+                libexec = systemd / "libexec"
+                libexec.mkdir()
+                for name in scheduler_names:
+                    (systemd / f"{name}.service").write_text(
+                        "[Service]\nType=oneshot\n", encoding="utf-8"
+                    )
+                    (systemd / f"{name}.timer").write_text(
+                        f"[Timer]\nUnit={name}.service\n", encoding="utf-8"
+                    )
+                    runner = libexec / name
+                    runner.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    runner.chmod(0o755)
+                scheduler_paths = [
+                    *(systemd / f"{name}.service" for name in scheduler_names),
+                    *(systemd / f"{name}.timer" for name in scheduler_names),
+                    *(libexec / name for name in scheduler_names),
+                ]
             selected_paths = [
                 pyproject,
                 *sorted(package.rglob("*.py")),
                 *sorted(cycle_package.rglob("*.py")),
-                *(path for path in sorted(systemd.rglob("*")) if path.is_file()),
+                *scheduler_paths,
             ]
             digest = hashlib.sha256()
             for selected in selected_paths:
@@ -757,6 +794,43 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         self.assertTrue(runtime["managed_package_executable_marker"])
         self.assertIn("src/bureau_cycle/__init__.py", runtime["package_paths"])
         self.assertIn("ops/systemd/bureau-cycle-run", runtime["package_paths"])
+        self.assertEqual(
+            result["bureau_contract"]["contract_release_commit"], source_commit
+        )
+        self.assertEqual(
+            result["bureau_contract"]["contract_executable_sha256"],
+            hashlib.sha256(launcher.read_bytes()).hexdigest(),
+        )
+
+    def test_managed_runtime_accepts_scheduler_fragment_package_tree(self) -> None:
+        launcher, source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-fragments-v3"
+        )
+        with (
+            patches[0],
+            patches[1],
+            patch.object(
+                bureau.subprocess,
+                "run",
+                side_effect=lambda argv, **kwargs: self._response(argv),
+            ),
+        ):
+            runtime = bureau._managed_contract_runtime()
+            result = resources.acquire_resources(
+                "owner-a",
+                ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                purpose="task",
+                ttl_seconds=60,
+            )
+        self.assertEqual(
+            runtime["managed_package_contract"],
+            "bureau-scheduler-fragments-v3",
+        )
+        self.assertTrue(runtime["managed_package_executable_marker"])
+        self.assertIn("src/bureau_cycle/__init__.py", runtime["package_paths"])
+        self.assertIn(
+            "ops/systemd/libexec/bureau-curator", runtime["package_paths"]
+        )
         self.assertEqual(
             result["bureau_contract"]["contract_release_commit"], source_commit
         )
