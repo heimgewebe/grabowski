@@ -2830,6 +2830,8 @@ def _run_transport_roundtrip(
     allowed = {
         "action",
         "challenge_receipt_sha256",
+        "target_tool_name",
+        "target_arguments",
         "_server_transport_client_scope",
         "_server_transport_runtime_binding",
     }
@@ -2844,9 +2846,7 @@ def _run_transport_roundtrip(
     if action not in {"begin", "ack"}:
         raise GripPreflightError("action must be begin or ack")
     try:
-        scope = grabowski_transport_roundtrip.validate_client_scope(
-            client_scope
-        )
+        scope = grabowski_transport_roundtrip.validate_client_scope(client_scope)
         binding = grabowski_transport_roundtrip.validate_runtime_binding(
             runtime_binding
         )
@@ -2855,18 +2855,39 @@ def _run_transport_roundtrip(
                 raise GripPreflightError(
                     "action=begin must not include challenge_receipt_sha256"
                 )
+            target_tool_present = "target_tool_name" in parameters
+            target_arguments_present = "target_arguments" in parameters
+            if target_tool_present != target_arguments_present:
+                raise GripPreflightError(
+                    "action=begin requires target_tool_name and target_arguments together"
+                )
+            mutation_intent = None
+            if target_tool_present:
+                target_tool_name = parameters.get("target_tool_name")
+                target_arguments = parameters.get("target_arguments")
+                if not isinstance(target_tool_name, str):
+                    raise GripPreflightError("target_tool_name must be text")
+                if not isinstance(target_arguments, dict):
+                    raise GripPreflightError("target_arguments must be an object")
+                mutation_intent = {
+                    "tool_name": target_tool_name,
+                    "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
+                        target_arguments
+                    ),
+                }
             output = grabowski_transport_roundtrip.begin(
                 client_scope=scope,
                 runtime_binding=binding,
+                mutation_intent=mutation_intent,
             )
         else:
-            challenge_receipt_sha256 = parameters.get(
-                "challenge_receipt_sha256"
-            )
-            if not isinstance(challenge_receipt_sha256, str):
+            if "target_tool_name" in parameters or "target_arguments" in parameters:
                 raise GripPreflightError(
-                    "action=ack requires challenge_receipt_sha256"
+                    "action=ack must not include target_tool_name or target_arguments"
                 )
+            challenge_receipt_sha256 = parameters.get("challenge_receipt_sha256")
+            if not isinstance(challenge_receipt_sha256, str):
+                raise GripPreflightError("action=ack requires challenge_receipt_sha256")
             output = grabowski_transport_roundtrip.acknowledge(
                 client_scope=scope,
                 challenge_receipt_sha256=challenge_receipt_sha256,
@@ -2882,9 +2903,7 @@ def _run_transport_roundtrip(
             "fail",
             f"state-operation-error:{type(exc).__name__}",
         )
-        raise GripActionError(
-            "transport roundtrip state operation failed"
-        ) from exc
+        raise GripActionError("transport roundtrip state operation failed") from exc
     _check(
         receipt,
         "client-scope-bound",
@@ -2903,9 +2922,8 @@ def _run_transport_roundtrip(
         "pass" if output["mutation_gate_open"] else "skip",
         output["state"],
     )
-    receipt_hash = (
-        output.get("verification_receipt_sha256")
-        or output.get("challenge_receipt_sha256")
+    receipt_hash = output.get("verification_receipt_sha256") or output.get(
+        "challenge_receipt_sha256"
     )
     _check(
         receipt,

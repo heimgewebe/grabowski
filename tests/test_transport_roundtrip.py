@@ -304,6 +304,98 @@ class TransportRoundtripTests(unittest.TestCase):
         self.assertEqual(sorted(result[0] for result in results), ["ok", "ok"])
         self.assertEqual(len({result[1] for result in results}), 2)
 
+    def test_intent_bound_shared_verifications_select_exact_mutation(self) -> None:
+        first_arguments = roundtrip.canonical_arguments_sha256({"sequence": 1})
+        second_arguments = roundtrip.canonical_arguments_sha256({"sequence": 2})
+        first_begin = roundtrip.begin(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent={
+                "tool_name": "first-write",
+                "arguments_sha256": first_arguments,
+            },
+            now_unix=100,
+        )
+        second_begin = roundtrip.begin(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            mutation_intent={
+                "tool_name": "second-write",
+                "arguments_sha256": second_arguments,
+            },
+            now_unix=101,
+        )
+        first_ack = self.acknowledge(
+            first_begin["challenge_receipt_sha256"],
+            scope=SHARED_SCOPE,
+            now=102,
+        )
+        second_ack = self.acknowledge(
+            second_begin["challenge_receipt_sha256"],
+            scope=SHARED_SCOPE,
+            now=103,
+        )
+        self.assertTrue(first_ack["mutation_intent_bound"])
+        self.assertEqual(first_ack["target_tool_name"], "first-write")
+        self.assertEqual(second_ack["target_arguments_sha256"], second_arguments)
+        with self.assertRaisesRegex(
+            roundtrip.TransportRoundtripRequired,
+            "bound to a different mutation",
+        ):
+            roundtrip.consume_verified(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                tool_name="other-write",
+                arguments_sha256="f" * 64,
+                now_unix=104,
+            )
+        status = roundtrip.status(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            now_unix=104,
+        )
+        self.assertEqual(status["verified_receipt_count"], 2)
+        second = roundtrip.consume_verified(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="second-write",
+            arguments_sha256=second_arguments,
+            now_unix=105,
+        )
+        first = roundtrip.consume_verified(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="first-write",
+            arguments_sha256=first_arguments,
+            now_unix=106,
+        )
+        self.assertTrue(second["verification_was_intent_bound"])
+        self.assertTrue(first["verification_was_intent_bound"])
+        self.assertEqual(
+            second["verification_receipt_sha256"],
+            second_ack["verification_receipt_sha256"],
+        )
+        self.assertEqual(
+            first["verification_receipt_sha256"],
+            first_ack["verification_receipt_sha256"],
+        )
+
+    def test_single_scope_rejects_reuse_for_different_intent(self) -> None:
+        self.begin()
+        with self.assertRaisesRegex(
+            roundtrip.TransportRoundtripRequired,
+            "bound to a different mutation",
+        ):
+            roundtrip.begin(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+                mutation_intent={
+                    "tool_name": "write",
+                    "arguments_sha256": "d" * 64,
+                },
+                now_unix=101,
+            )
+
     def test_shared_pending_pool_is_bounded_and_prunes_stale_entries(self) -> None:
         with mock.patch.object(roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2):
             self.begin(scope=SHARED_SCOPE, now=100)

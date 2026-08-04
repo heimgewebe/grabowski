@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -9,10 +11,17 @@ import re
 import stat
 import subprocess
 import sys
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 BUREAU_REPOSITORY_ROOT = Path("/home/alex/repos/bureau")
 BUREAU_WORKTREE_ROOT = Path("/home/alex/repos/.bureau-worktrees")
+BUREAU_CONTROL_ROOT = BUREAU_WORKTREE_ROOT / "control-main"
+BUREAU_CONTROL_BRANCH = "ops/bureau-control-main"
+BUREAU_CONTROL_UPSTREAM = "origin/main"
+BUREAU_CANONICAL_REMOTE_URL = "git@github.com:heimgewebe/bureau.git"
+BUREAU_CONTROL_LOCK_PATH = (
+    Path.home() / ".local/state/grabowski/bureau-control-refresh.lock"
+)
 BUREAU_RUNTIME_ROOT = Path("/home/alex/.local/share/bureau")
 BUREAU_MANAGED_LAUNCHER = Path("/home/alex/.local/bin/bureau")
 BUREAU_CONTRACT_PYTHON = Path(sys.executable)
@@ -76,6 +85,207 @@ class BureauLeaseContractError(RuntimeError):
         super().__init__(f"Bureau lease contract rejected acquisition: {code}")
         self.code = code
         self.details = details or {}
+
+
+def _control_git_environment() -> dict[str, str]:
+    environment = {
+        "HOME": str(Path.home()),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    for key in ("SSH_AUTH_SOCK", "GIT_SSH_COMMAND"):
+        value = os.environ.get(key)
+        if value:
+            environment[key] = value
+    return environment
+
+
+def _run_control_git(
+    repository: Path,
+    arguments: list[str],
+    *,
+    timeout_seconds: int = 60,
+) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-C",
+                str(repository),
+                *arguments,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=_control_git_environment(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise BureauLeaseContractError(
+            "control-checkout-git-timeout",
+            details={"operation": arguments[0] if arguments else "unknown"},
+        ) from exc
+    except OSError as exc:
+        raise BureauLeaseContractError(
+            "control-checkout-git-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if completed.returncode != 0:
+        raise BureauLeaseContractError(
+            "control-checkout-git-rejected",
+            details={
+                "operation": arguments[0] if arguments else "unknown",
+                "returncode": completed.returncode,
+                "stdout_sha256": hashlib.sha256(
+                    completed.stdout.encode("utf-8")
+                ).hexdigest(),
+                "stderr_sha256": hashlib.sha256(
+                    completed.stderr.encode("utf-8")
+                ).hexdigest(),
+            },
+        )
+    return completed.stdout.strip()
+
+
+@contextmanager
+def _bureau_control_lock() -> Iterator[None]:
+    parent = BUREAU_CONTROL_LOCK_PATH.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = parent.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise BureauLeaseContractError("control-checkout-lock-root-unsafe")
+    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(BUREAU_CONTROL_LOCK_PATH, flags, 0o600)
+    try:
+        lock_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(lock_metadata.st_mode) != 0o600
+            or lock_metadata.st_nlink != 1
+        ):
+            raise BureauLeaseContractError("control-checkout-lock-unsafe")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def inspect_bureau_control_checkout(*, require_current: bool = True) -> dict[str, Any]:
+    try:
+        control_root = BUREAU_CONTROL_ROOT.resolve(strict=True)
+        repository_root = BUREAU_REPOSITORY_ROOT.resolve(strict=True)
+        expected_common_dir = (repository_root / ".git").resolve(strict=True)
+    except OSError as exc:
+        raise BureauLeaseContractError(
+            "control-checkout-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if control_root != BUREAU_CONTROL_ROOT or not control_root.is_dir():
+        raise BureauLeaseContractError("control-checkout-path-invalid")
+    common_dir = Path(
+        _run_control_git(
+            control_root,
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+    ).resolve(strict=True)
+    if common_dir != expected_common_dir:
+        raise BureauLeaseContractError("control-checkout-common-dir-mismatch")
+    remote_url = _run_control_git(control_root, ["remote", "get-url", "origin"])
+    if remote_url != BUREAU_CANONICAL_REMOTE_URL:
+        raise BureauLeaseContractError("control-checkout-remote-mismatch")
+    branch = _run_control_git(control_root, ["symbolic-ref", "--short", "HEAD"])
+    if branch != BUREAU_CONTROL_BRANCH:
+        raise BureauLeaseContractError(
+            "control-checkout-branch-mismatch",
+            details={"observed_branch": branch},
+        )
+    upstream = _run_control_git(
+        control_root,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    )
+    if upstream != BUREAU_CONTROL_UPSTREAM:
+        raise BureauLeaseContractError(
+            "control-checkout-upstream-mismatch",
+            details={"observed_upstream": upstream},
+        )
+    status = _run_control_git(
+        control_root,
+        ["status", "--porcelain=v1", "--untracked-files=normal"],
+    )
+    if status:
+        raise BureauLeaseContractError(
+            "control-checkout-dirty",
+            details={"status_sha256": hashlib.sha256(status.encode()).hexdigest()},
+        )
+    head = _run_control_git(control_root, ["rev-parse", "HEAD"])
+    remote_head = _run_control_git(
+        control_root, ["rev-parse", "refs/remotes/origin/main"]
+    )
+    if (
+        _EXPECTED_HEAD_RE.fullmatch(head) is None
+        or _EXPECTED_HEAD_RE.fullmatch(remote_head) is None
+    ):
+        raise BureauLeaseContractError("control-checkout-head-invalid")
+    if require_current and head != remote_head:
+        raise BureauLeaseContractError(
+            "control-checkout-stale",
+            details={"head": head, "origin_main": remote_head},
+        )
+    return {
+        "schema_version": 1,
+        "kind": "bureau_control_checkout",
+        "status": "current" if head == remote_head else "stale",
+        "repository_root": str(repository_root),
+        "control_root": str(control_root),
+        "branch": branch,
+        "upstream": upstream,
+        "head": head,
+        "origin_main": remote_head,
+        "dirty": False,
+    }
+
+
+def refresh_bureau_control_checkout() -> dict[str, Any]:
+    with _bureau_control_lock():
+        before = inspect_bureau_control_checkout(require_current=False)
+        _run_control_git(
+            BUREAU_REPOSITORY_ROOT,
+            [
+                "fetch",
+                "--no-tags",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ],
+            timeout_seconds=120,
+        )
+        _run_control_git(
+            BUREAU_CONTROL_ROOT,
+            ["merge", "--ff-only", "--no-edit", "origin/main"],
+            timeout_seconds=60,
+        )
+        after = inspect_bureau_control_checkout(require_current=True)
+    return {
+        **after,
+        "updated": before["head"] != after["head"],
+        "previous_head": before["head"],
+    }
 
 
 def _path_is_within(path: Path, root: Path) -> bool:

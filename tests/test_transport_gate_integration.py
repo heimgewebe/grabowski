@@ -71,6 +71,37 @@ class TransportGripIntegrationTests(unittest.TestCase):
             ["pass", "pass", "pass", "pass"],
         )
 
+    def test_grip_binds_exact_target_mutation(self) -> None:
+        arguments = {"path": "/tmp/example", "content": "x"}
+        begin = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters(
+                "begin",
+                target_tool_name="write",
+                target_arguments=arguments,
+            ),
+            profile="operator",
+            allow_mutation=True,
+        )
+        self.assertEqual(begin["status"], "passed")
+        self.assertTrue(begin["output"]["mutation_intent_bound"])
+        self.assertEqual(begin["output"]["target_tool_name"], "write")
+        self.assertEqual(
+            begin["output"]["target_arguments_sha256"],
+            roundtrip.canonical_arguments_sha256(arguments),
+        )
+        ack = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters(
+                "ack",
+                challenge_receipt_sha256=begin["output"]["challenge_receipt_sha256"],
+            ),
+            profile="operator",
+            allow_mutation=True,
+        )
+        self.assertTrue(ack["output"]["mutation_intent_bound"])
+        self.assertEqual(ack["output"]["target_tool_name"], "write")
+
     def test_grip_requires_mutation_permission_and_rejects_extra_fields(self) -> None:
         denied = grips.grip_run(
             "transport-roundtrip",
@@ -197,6 +228,47 @@ class CentralTransportGateTests(unittest.TestCase):
                         "write", {"sequence": 3}, context
                     )
                 )
+
+    def test_bound_shared_verification_cannot_be_stolen_by_other_tool(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "state"
+        operator = self.configured_operator()
+        transport = operator.grabowski_transport_roundtrip
+        context = types.SimpleNamespace(client_id=None)
+        arguments = {"sequence": 1}
+        with (
+            mock.patch.object(transport, "STATE_ROOT", root),
+            mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
+        ):
+            begin = transport.begin(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                mutation_intent={
+                    "tool_name": "write",
+                    "arguments_sha256": transport.canonical_arguments_sha256(arguments),
+                },
+            )
+            transport.acknowledge(
+                client_scope=SHARED_SCOPE,
+                challenge_receipt_sha256=begin["challenge_receipt_sha256"],
+                runtime_binding=BINDING,
+            )
+            with self.assertRaisesRegex(RuntimeError, "bound to a different mutation"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "other-write", arguments, context
+                    )
+                )
+            status = transport.status(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+            )
+            self.assertEqual(status["verified_receipt_count"], 1)
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool("write", arguments, context)
+            )
+        self.assertTrue(result["called"])
 
     def test_handshake_grip_is_narrowly_exempt(self) -> None:
         operator = self.configured_operator()
