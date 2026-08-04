@@ -201,6 +201,99 @@ def _bureau_control_lock() -> Iterator[None]:
             os.close(descriptor)
 
 
+def _validated_bureau_repository_root() -> Path:
+    try:
+        repository_root = BUREAU_REPOSITORY_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise BureauLeaseContractError(
+            "bureau-repository-unavailable",
+            details={"error_type": type(exc).__name__},
+        ) from None
+    if not repository_root.is_dir():
+        raise BureauLeaseContractError("bureau-repository-path-invalid")
+    remote_url = _run_control_git(
+        repository_root, ["remote", "get-url", "origin"]
+    )
+    if remote_url != BUREAU_CANONICAL_REMOTE_URL:
+        raise BureauLeaseContractError("control-checkout-remote-mismatch")
+    return repository_root
+
+
+def _control_checkout_missing() -> bool:
+    if not os.path.lexists(BUREAU_CONTROL_ROOT):
+        return True
+    metadata = BUREAU_CONTROL_ROOT.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise BureauLeaseContractError("control-checkout-path-occupied")
+    return False
+
+
+def _control_worktree_registered(repository_root: Path) -> bool:
+    listing = _run_control_git(
+        repository_root, ["worktree", "list", "--porcelain"]
+    )
+    expected = f"worktree {BUREAU_CONTROL_ROOT}"
+    return any(line == expected for line in listing.splitlines())
+
+
+def _prepare_bureau_worktree_root() -> Path:
+    BUREAU_WORKTREE_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = BUREAU_WORKTREE_ROOT.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise BureauLeaseContractError("control-worktree-root-unsafe")
+    resolved = BUREAU_WORKTREE_ROOT.resolve(strict=True)
+    if resolved != BUREAU_WORKTREE_ROOT:
+        raise BureauLeaseContractError("control-worktree-root-path-mismatch")
+    return resolved
+
+
+def _recreate_bureau_control_checkout(repository_root: Path) -> dict[str, Any]:
+    if not _control_checkout_missing():
+        raise BureauLeaseContractError("control-checkout-already-present")
+    _prepare_bureau_worktree_root()
+    if _control_worktree_registered(repository_root):
+        _run_control_git(
+            repository_root,
+            [
+                "worktree",
+                "remove",
+                "--force",
+                "--force",
+                str(BUREAU_CONTROL_ROOT),
+            ],
+            timeout_seconds=60,
+        )
+    _run_control_git(
+        repository_root,
+        [
+            "worktree",
+            "add",
+            "--force",
+            "--force",
+            "-B",
+            BUREAU_CONTROL_BRANCH,
+            str(BUREAU_CONTROL_ROOT),
+            BUREAU_CONTROL_UPSTREAM,
+        ],
+        timeout_seconds=120,
+    )
+    _run_control_git(
+        BUREAU_CONTROL_ROOT,
+        [
+            "branch",
+            "--set-upstream-to",
+            BUREAU_CONTROL_UPSTREAM,
+            BUREAU_CONTROL_BRANCH,
+        ],
+    )
+    return inspect_bureau_control_checkout(require_current=True)
+
+
 def inspect_bureau_control_checkout(*, require_current: bool = True) -> dict[str, Any]:
     try:
         control_root = BUREAU_CONTROL_ROOT.resolve(strict=True)
@@ -278,9 +371,15 @@ def inspect_bureau_control_checkout(*, require_current: bool = True) -> dict[str
 
 def refresh_bureau_control_checkout() -> dict[str, Any]:
     with _bureau_control_lock():
-        before = inspect_bureau_control_checkout(require_current=False)
+        repository_root = _validated_bureau_repository_root()
+        missing = _control_checkout_missing()
+        before = (
+            None
+            if missing
+            else inspect_bureau_control_checkout(require_current=False)
+        )
         _run_control_git(
-            BUREAU_REPOSITORY_ROOT,
+            repository_root,
             [
                 "fetch",
                 "--no-tags",
@@ -289,16 +388,21 @@ def refresh_bureau_control_checkout() -> dict[str, Any]:
             ],
             timeout_seconds=120,
         )
-        _run_control_git(
-            BUREAU_CONTROL_ROOT,
-            ["merge", "--ff-only", "--no-edit", "origin/main"],
-            timeout_seconds=60,
-        )
-        after = inspect_bureau_control_checkout(require_current=True)
+        if missing:
+            after = _recreate_bureau_control_checkout(repository_root)
+        else:
+            _run_control_git(
+                BUREAU_CONTROL_ROOT,
+                ["merge", "--ff-only", "--no-edit", "origin/main"],
+                timeout_seconds=60,
+            )
+            after = inspect_bureau_control_checkout(require_current=True)
+    previous_head = None if before is None else before["head"]
     return {
         **after,
-        "updated": before["head"] != after["head"],
-        "previous_head": before["head"],
+        "updated": missing or previous_head != after["head"],
+        "previous_head": previous_head,
+        "recreated": missing,
     }
 
 

@@ -1200,8 +1200,9 @@ def grabowski_git_show(
 ) -> dict[str, Any]:
     """Read one bounded Git revision without external diff or textconv helpers."""
     repository = _resolve_repository(repo)
-    selected = _resolve_revision(repository, revision)
-    return _run_read(
+    requested = _validate_revision(revision)
+    selected = _resolve_revision(repository, requested)
+    result = _run_read(
         _git_command(
             repository,
             "show",
@@ -1217,6 +1218,27 @@ def grabowski_git_show(
         cwd=repository,
         max_output_bytes=max_output_bytes,
     )
+    try:
+        readback = _resolve_revision(repository, requested)
+    except ValueError:
+        readback = None
+    stable = readback == selected
+    return {
+        **result,
+        "revision_binding": {
+            "requested_revision": requested,
+            "output_object_id": selected,
+            "readback_object_id": readback,
+            "readback_status": (
+                "stable"
+                if stable
+                else "unresolvable"
+                if readback is None
+                else "moved"
+            ),
+            "stable": stable,
+        },
+    }
 
 
 @mcp.tool(name="grabowski_github_pr_view", annotations=REMOTE_READ)
