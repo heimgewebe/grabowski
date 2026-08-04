@@ -36,6 +36,9 @@ jobs:
           end = lines.index("          PY", start)
           payload = []
           for line in lines[start:end]:
+              if line == "":
+                  payload.append("")
+                  continue
               if not line.startswith("          "):
                   raise SystemExit(f"unexpected transformer indentation: {line!r}")
               payload.append(line[10:])
