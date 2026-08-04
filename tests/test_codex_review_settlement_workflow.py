@@ -89,12 +89,30 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("if ! jq -e '", evaluate_section)
         self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
         self.assertIn("codex-review-settlement.invalid.json", evaluate_section)
-        self.assertIn("status_code", evaluate_section)
+        self.assertIn('has("status_code")', evaluate_section)
+        self.assertIn("legacy_default_branch_evaluator", evaluate_section)
+        self.assertIn("synthesized_status_code", evaluate_section)
+        self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
         self.assertIn("rc=2", evaluate_section)
         self.assertLess(
             evaluate_section.index("trusted_evaluator_output_invalid"),
             evaluate_section.index('echo "github_state=$github_state"'),
         )
+
+    def test_legacy_default_branch_evaluator_is_terminal_but_non_authoritative(self) -> None:
+        evaluate_section = self.text.split(
+            "      - name: Evaluate current-head settlement\n", 1
+        )[1].split("      - name: Publish settlement status\n", 1)[0]
+        self.assertIn("elif ! jq -e 'has(\"status_code\")'", evaluate_section)
+        self.assertIn('pass:true) compatibility_code="review_settled"', evaluate_section)
+        self.assertIn('pass:false) compatibility_code="legacy_evaluator_pass"', evaluate_section)
+        self.assertIn('pending:*) compatibility_code="legacy_evaluator_pending"', evaluate_section)
+        self.assertIn('*) compatibility_code="legacy_evaluator_blocked"', evaluate_section)
+        self.assertIn("codex_review_performed", evaluate_section)
+        self.assertIn("codex_review_pass", evaluate_section)
+        self.assertIn("merge_authority", evaluate_section)
+        self.assertIn("Legacy evaluator pending; diagnostic only", evaluate_section)
+        self.assertNotIn("github.event.pull_request.head", evaluate_section)
 
     def test_status_is_diagnostic_and_exactly_named(self) -> None:
         self.assertGreaterEqual(self.text.count('context="Codex review settled"'), 2)

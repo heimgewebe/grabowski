@@ -169,3 +169,13 @@ erzeugen keine Review-, Merge-, Branchschutz-, Kontingentkauf- oder
 Providerautorität. Die derzeit bekannte Cloud-Settings-Meldung und ihre ältere
 exakte URL-Variante werden aus Kompatibilitätsgründen getrennt erkannt; jede
 inhaltliche Abweichung benötigt eine neue geprüfte Signatur.
+
+Während der einmaligen Einführung kann der vertrauenswürdige Default-Branch-
+Evaluator noch das ältere Ergebnisformat ohne `status_code` liefern. Der Workflow
+übersetzt dann ausschließlich die bereits vorhandenen Zustände in
+`legacy_evaluator_pass`, `legacy_evaluator_pending` oder
+`legacy_evaluator_blocked`. Ein Legacy-`pending` ist als nicht autoritative
+Diagnose terminal grün, behauptet aber weder Review, PASS noch Settlement; ein
+Legacy-`block` bleibt rot. PR-Code wird unter `pull_request_target` weiterhin
+niemals als vertrauenswürdiger Evaluator ausgeführt. Nach dem Merge liefert der
+Default-Branch-Evaluator die feinere kanonische Taxonomie direkt.
