@@ -168,7 +168,7 @@ CONSUMER_VIEWS = consumer_surface.CONSUMER_VIEWS
 CONSUMER_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
-HTTP_STATELESS_MODE = True
+HTTP_STATELESS_MODE = False
 HTTP_LOG_LEVEL = "WARNING"
 HTTP_TRANSPORT_VERBOSE_LOGGERS = (
     "mcp.server.lowlevel.server",
@@ -949,10 +949,10 @@ def _configure_http_runtime() -> None:
     if getattr(manager, "_session_creation_lock", None) is None:
         raise RuntimeError("FastMCP session creation lock is unavailable")
     if getattr(manager, "stateless", None) is not HTTP_STATELESS_MODE:
-        raise RuntimeError("FastMCP stateless HTTP mode is unavailable")
+        raise RuntimeError("FastMCP configured an unexpected HTTP session mode")
     _install_deployment_admission_gate()
     if manager.session_idle_timeout is not None:
-        raise RuntimeError("FastMCP stateless HTTP mode retained an idle timeout")
+        raise RuntimeError("FastMCP operator HTTP transport retained an idle timeout")
 
 
 

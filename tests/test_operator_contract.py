@@ -213,14 +213,14 @@ class OperatorContractTests(unittest.TestCase):
             "DEPLOYMENT_ADMISSION_STATUS_PATH", decorators[0].args[0].id
         )
 
-    def test_http_transport_is_stateless_and_liveness_lock_is_bounded(self) -> None:
+    def test_http_transport_is_stateful_without_cleanup_deadline_and_liveness_lock_is_bounded(self) -> None:
         operator = _load_operator_module()
         operator._configure_http_runtime()
-        self.assertTrue(operator.HTTP_STATELESS_MODE)
-        self.assertTrue(operator.mcp.settings.stateless_http)
+        self.assertFalse(operator.HTTP_STATELESS_MODE)
+        self.assertFalse(operator.mcp.settings.stateless_http)
         self.assertEqual("WARNING", operator.HTTP_LOG_LEVEL)
         self.assertEqual(operator.HTTP_LOG_LEVEL, operator.mcp.settings.log_level)
-        self.assertTrue(operator.mcp.session_manager.stateless)
+        self.assertFalse(operator.mcp.session_manager.stateless)
         self.assertIsNone(operator.mcp.session_manager.session_idle_timeout)
         self.assertEqual(
             {
