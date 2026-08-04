@@ -97,8 +97,15 @@ jobs:
           if [ ! -f tools/codex_review_settlement.py ]; then
             jq -nc \
               --arg error trusted_evaluator_missing_on_default_branch \
-              '{status:"block",status_code:"evaluator_error",settled:false,errors:[$error]}' \
-              > codex-review-settlement.json
+              '{
+                status:"block",
+                status_code:"trusted_evaluator_missing",
+                exit_code:2,
+                github_state:"failure",
+                description:"Trusted evaluator missing on default branch",
+                settled:false,
+                errors:[$error]
+              }' > codex-review-settlement.json
             rc=2
           else
             python3 tools/codex_review_settlement.py \
@@ -112,137 +119,57 @@ jobs:
           if ! jq -e '
             type == "object"
             and (.status | type == "string")
+            and (.status_code | type == "string" and length > 0)
+            and (.exit_code | type == "number")
+            and ((.exit_code | floor) == .exit_code)
+            and (.github_state | type == "string")
+            and (.description | type == "string" and length > 0 and length <= 140)
             and (.settled | type == "boolean")
             and (.errors | type == "array")
-            and ((has("status_code") | not) or (.status_code | type == "string"))
+            and all(.errors[]; type == "string")
           ' codex-review-settlement.json > /dev/null 2>&1; then
             jq -nc \
               --arg error trusted_evaluator_output_invalid \
-              '{status:"block",status_code:"evaluator_error",settled:false,errors:[$error]}' \
-              > codex-review-settlement.invalid.json
+              '{
+                status:"block",
+                status_code:"trusted_evaluator_output_invalid",
+                exit_code:2,
+                github_state:"failure",
+                description:"Trusted evaluator output is invalid",
+                settled:false,
+                errors:[$error]
+              }' > codex-review-settlement.invalid.json
             mv codex-review-settlement.invalid.json codex-review-settlement.json
             rc=2
-          elif ! jq -e 'has("status_code")' codex-review-settlement.json > /dev/null; then
-            legacy_status="$(jq -r '.status' codex-review-settlement.json)"
-            legacy_settled="$(jq -r '.settled' codex-review-settlement.json)"
-            case "$legacy_status:$legacy_settled" in
-              pass:true) compatibility_code="review_settled" ;;
-              pass:false) compatibility_code="legacy_evaluator_pass" ;;
-              pending:*) compatibility_code="legacy_evaluator_pending" ;;
-              *) compatibility_code="legacy_evaluator_blocked" ;;
-            esac
-            jq \
-              --arg status_code "$compatibility_code" \
-              '. + {
-                status_code: $status_code,
-                compatibility: {
-                  kind: "legacy_default_branch_evaluator",
-                  synthesized_status_code: true,
-                  does_not_establish: [
-                    "codex_review_performed",
-                    "codex_review_pass",
-                    "codex_review_settled",
-                    "merge_authority"
-                  ]
-                }
-              }' codex-review-settlement.json \
-              > codex-review-settlement.compatible.json
-            mv codex-review-settlement.compatible.json codex-review-settlement.json
+          elif ! jq -e --argjson rc "$rc" '
+            .exit_code == $rc
+            and (
+              (.status == "pass" and .exit_code == 0 and .github_state == "success")
+              or (.status == "pending" and .exit_code == 3 and .github_state == "pending")
+              or (.status == "block" and .exit_code == 2 and .github_state == "failure")
+            )
+          ' codex-review-settlement.json > /dev/null 2>&1; then
+            observed_status="$(jq -r '.status // "missing"' codex-review-settlement.json)"
+            observed_code="$(jq -r '.status_code // "missing"' codex-review-settlement.json)"
+            observed_exit="$(jq -r '.exit_code // "missing"' codex-review-settlement.json)"
+            error="trusted evaluator status/exit mismatch: status=$observed_status code=$observed_code result_exit=$observed_exit process_exit=$rc"
+            jq -nc \
+              --arg error "$error" \
+              '{
+                status:"block",
+                status_code:"trusted_evaluator_status_exit_mismatch",
+                exit_code:2,
+                github_state:"failure",
+                description:"Trusted evaluator status and exit code disagree",
+                settled:false,
+                errors:[$error]
+              }' > codex-review-settlement.invalid.json
+            mv codex-review-settlement.invalid.json codex-review-settlement.json
+            rc=2
           fi
           cat codex-review-settlement.json
-          status="$(jq -r '.status // "block"' codex-review-settlement.json)"
-          status_code="$(jq -r '.status_code // "evaluator_error"' codex-review-settlement.json)"
-          contract_mismatch=false
-          case "$status_code" in
-            review_settled)
-              expected_status="pass"
-              expected_rc=0
-              github_state="success"
-              description="Current-head Codex review settled"
-              ;;
-            optional_provider_unavailable)
-              expected_status="pass"
-              expected_rc=0
-              github_state="success"
-              description="Optional Codex review unavailable; merge gate unaffected"
-              ;;
-            optional_not_requested)
-              expected_status="pass"
-              expected_rc=0
-              github_state="success"
-              description="Optional Codex review not requested"
-              ;;
-            optional_review_pending)
-              expected_status="pass"
-              expected_rc=0
-              github_state="success"
-              description="Optional Codex review pending; merge gate unaffected"
-              ;;
-            optional_review_findings)
-              expected_status="pass"
-              expected_rc=0
-              github_state="success"
-              description="Optional Codex findings remain advisory"
-              ;;
-            legacy_evaluator_pass)
-              expected_status="pass"
-              expected_rc=0
-              github_state="success"
-              description="Legacy evaluator reports diagnostic pass"
-              ;;
-            legacy_evaluator_pending)
-              expected_status="pending"
-              expected_rc=0
-              github_state="success"
-              description="Legacy evaluator pending; diagnostic only"
-              ;;
-            required_request_missing)
-              expected_status="pending"
-              expected_rc=0
-              github_state="pending"
-              description="Current-head Codex review request required"
-              ;;
-            required_review_pending)
-              expected_status="pending"
-              expected_rc=0
-              github_state="pending"
-              description="Required current-head Codex review is pending"
-              ;;
-            required_provider_unavailable)
-              expected_status="pending"
-              expected_rc=0
-              github_state="pending"
-              description="Required Codex review is unavailable"
-              ;;
-            required_review_blocked)
-              expected_status="block"
-              expected_rc=2
-              github_state="failure"
-              description="Required Codex findings remain blocking"
-              ;;
-            visibility_blocked|evaluator_error|legacy_evaluator_blocked)
-              expected_status="block"
-              expected_rc=2
-              github_state="failure"
-              description="Codex review settlement is blocked"
-              ;;
-            *)
-              expected_status="block"
-              expected_rc=2
-              github_state="failure"
-              description="Unsupported Codex settlement status code"
-              ;;
-          esac
-          if [ "$status" != "$expected_status" ] || [ "$rc" -ne "$expected_rc" ]; then
-            contract_mismatch=true
-            github_state="failure"
-            description="Evaluator status/exit contract mismatch"
-          fi
-          first_error="$(jq -r '.errors[0] // empty' codex-review-settlement.json)"
-          if [ "$contract_mismatch" != "true" ] && [ "$github_state" = "failure" ] && [ -n "$first_error" ]; then
-            description="$first_error"
-          fi
-          description="$(printf '%s' "$description" | cut -c1-140)"
+          github_state="$(jq -r '.github_state' codex-review-settlement.json)"
+          description="$(jq -r '.description' codex-review-settlement.json | cut -c1-140)"
           echo "tool_returncode=$rc" >> "$GITHUB_OUTPUT"
           echo "github_state=$github_state" >> "$GITHUB_OUTPUT"
           echo "description=$description" >> "$GITHUB_OUTPUT"

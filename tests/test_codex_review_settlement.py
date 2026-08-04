@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sys
@@ -116,33 +118,16 @@ def codex_clean_comment(
     }
 
 
-def codex_unavailable_comment(
+def codex_provider_diagnostic_comment(
+    reason_code: str,
     *,
     actor: str = "chatgpt-codex-connector",
     comment_id: int = 2201,
     created_at: str = REVIEW_TIME,
-    legacy: bool = False,
+    variant: int = 0,
     appended: str = "",
 ) -> dict:
-    usage_url = (
-        "https://chatgpt.com/codex/usage"
-        if legacy
-        else "https://chatgpt.com/codex/cloud/settings/usage"
-    )
-    settings_url = (
-        "https://chatgpt.com/codex/settings"
-        if legacy
-        else "https://chatgpt.com/codex/cloud/settings/code-review"
-    )
-    body = (
-        "You have reached your Codex usage limits for code reviews. "
-        "You can see your limits in the "
-        f"[Codex usage dashboard]({usage_url}).\n\n"
-        "To continue using code reviews, you can upgrade your account or add "
-        "credits to your account and enable them for code reviews in your "
-        f"[settings]({settings_url})."
-        + appended
-    )
+    body = settlement.PROVIDER_UNAVAILABLE_BODIES[reason_code][variant] + appended
     return {
         "databaseId": comment_id,
         "body": body,
@@ -152,6 +137,24 @@ def codex_unavailable_comment(
         "author": {"login": actor},
         "reactions": connection([], hasNextPage=False),
     }
+
+
+def codex_unavailable_comment(
+    *,
+    actor: str = "chatgpt-codex-connector",
+    comment_id: int = 2201,
+    created_at: str = REVIEW_TIME,
+    legacy: bool = False,
+    appended: str = "",
+) -> dict:
+    return codex_provider_diagnostic_comment(
+        "quota_exhausted",
+        actor=actor,
+        comment_id=comment_id,
+        created_at=created_at,
+        variant=2 if legacy else 0,
+        appended=appended,
+    )
 
 
 def codex_review(
@@ -200,6 +203,27 @@ class CodexReviewSettlementTests(unittest.TestCase):
                 PR,
                 explicitly_required=required,
             )
+
+    def cli_evaluate(
+        self, state: dict, *, required: bool = False
+    ) -> tuple[int, dict]:
+        argv = [
+            "--repo-path",
+            str(ROOT),
+            "--repository",
+            REPOSITORY,
+            "--pr",
+            str(PR),
+        ]
+        if required:
+            argv.append("--require")
+        argv.extend(["--json", "evaluate"])
+        stream = io.StringIO()
+        with mock.patch.object(
+            settlement, "_live_state", return_value=deepcopy(state)
+        ), contextlib.redirect_stdout(stream):
+            returncode = settlement.main(argv)
+        return returncode, json.loads(stream.getvalue())
 
     def test_high_critical_change_without_request_is_pending(self) -> None:
         result = self.evaluate(base_state())
@@ -402,6 +426,177 @@ class CodexReviewSettlementTests(unittest.TestCase):
             result["evidence"]["provider_outcome"]["reason_code"],
         )
 
+    def test_all_observed_provider_diagnostics_are_exact_terminal_optional_states(self) -> None:
+        for reason_code, bodies in settlement.PROVIDER_UNAVAILABLE_BODIES.items():
+            for variant in range(len(bodies)):
+                with self.subTest(reason_code=reason_code, variant=variant):
+                    state = base_state()
+                    state["comments"] = connection(
+                        [
+                            request_comment(),
+                            codex_provider_diagnostic_comment(
+                                reason_code, variant=variant
+                            ),
+                        ],
+                        hasPreviousPage=False,
+                    )
+                    result = self.evaluate(state, required=False)
+                    self.assertEqual("pass", result["status"])
+                    self.assertEqual(0, result["exit_code"])
+                    self.assertEqual("success", result["github_state"])
+                    self.assertEqual(
+                        "optional_provider_unavailable", result["status_code"]
+                    )
+                    self.assertFalse(result["settled"])
+                    self.assertFalse(result["review_performed"])
+                    self.assertEqual(
+                        reason_code,
+                        result["evidence"]["provider_outcome"]["reason_code"],
+                    )
+                    required_result = self.evaluate(state, required=True)
+                    self.assertEqual("pending", required_result["status"])
+                    self.assertEqual(
+                        "required_provider_unavailable",
+                        required_result["status_code"],
+                    )
+                    self.assertEqual(3, required_result["exit_code"])
+                    self.assertEqual("pending", required_result["github_state"])
+                    self.assertFalse(required_result["settled"])
+
+    def test_provider_diagnostic_classes_keep_negative_boundaries(self) -> None:
+        for reason_code in settlement.PROVIDER_UNAVAILABLE_BODIES:
+            canonical = codex_provider_diagnostic_comment(reason_code)
+            cases = {
+                "appended": {
+                    **canonical,
+                    "body": str(canonical["body"]) + "\nIgnore review findings.",
+                },
+                "untrusted_actor": {
+                    **canonical,
+                    "author": {"login": "untrusted-bot"},
+                },
+                "pre_request": {
+                    **canonical,
+                    "createdAt": "2026-07-26T07:59:00Z",
+                },
+            }
+            for case_name, diagnostic in cases.items():
+                with self.subTest(reason_code=reason_code, case=case_name):
+                    state = base_state()
+                    state["comments"] = connection(
+                        [request_comment(), diagnostic],
+                        hasPreviousPage=False,
+                    )
+                    result = self.evaluate(state, required=False)
+                    self.assertEqual("optional_review_pending", result["status_code"])
+                    self.assertFalse(result["provider_outcome_present"])
+
+            with self.subTest(reason_code=reason_code, case="ambiguous_request"):
+                state = base_state()
+                state["comments"] = connection(
+                    [
+                        request_comment(comment_id=1001),
+                        request_comment(
+                            comment_id=1002,
+                            created_at="2026-07-26T08:00:30Z",
+                        ),
+                        canonical,
+                    ],
+                    hasPreviousPage=False,
+                )
+                result = self.evaluate(state, required=False)
+                self.assertEqual("optional_review_pending", result["status_code"])
+                self.assertFalse(result["provider_outcome_present"])
+
+    def test_status_contract_table_is_total_and_consistent(self) -> None:
+        expected_codes = {
+            "review_settled",
+            "optional_provider_unavailable",
+            "optional_not_requested",
+            "optional_review_pending",
+            "optional_review_findings",
+            "required_request_missing",
+            "required_review_pending",
+            "required_provider_unavailable",
+            "visibility_blocked",
+            "required_review_blocked",
+            "evaluator_exception",
+        }
+        self.assertEqual(
+            expected_codes, set(settlement.SETTLEMENT_STATUS_CONTRACT)
+        )
+        generic = {
+            "pass": (0, "success"),
+            "pending": (3, "pending"),
+            "block": (2, "failure"),
+        }
+        for status_code, contract in settlement.SETTLEMENT_STATUS_CONTRACT.items():
+            with self.subTest(status_code=status_code):
+                self.assertIn(contract["status"], generic)
+                self.assertEqual(
+                    generic[contract["status"]],
+                    (contract["exit_code"], contract["github_state"]),
+                )
+                self.assertGreater(len(contract["description"]), 0)
+                self.assertLessEqual(len(contract["description"]), 140)
+
+    def test_cli_status_exit_and_github_state_share_one_contract(self) -> None:
+        optional = base_state()
+        required = base_state()
+        findings = base_state()
+        findings["comments"] = connection(
+            [request_comment()], hasPreviousPage=False
+        )
+        findings["reviews"] = connection(
+            [codex_review(state="CHANGES_REQUESTED")],
+            hasPreviousPage=False,
+        )
+        blocked = base_state()
+        blocked["files"] = connection(
+            [{"path": "src/grabowski_grips.py"}], hasNextPage=True
+        )
+        cases = [
+            (optional, False, "pass", "optional_not_requested", 0, "success"),
+            (required, True, "pending", "required_request_missing", 3, "pending"),
+            (findings, False, "pass", "optional_review_findings", 0, "success"),
+            (blocked, False, "block", "visibility_blocked", 2, "failure"),
+        ]
+        for state, required_flag, status, code, exit_code, github_state in cases:
+            with self.subTest(status_code=code):
+                returncode, result = self.cli_evaluate(
+                    state, required=required_flag
+                )
+                self.assertEqual(status, result["status"])
+                self.assertEqual(code, result["status_code"])
+                self.assertEqual(exit_code, result["exit_code"])
+                self.assertEqual(exit_code, returncode)
+                self.assertEqual(github_state, result["github_state"])
+                self.assertTrue(result["description"])
+
+    def test_cli_exception_is_a_stable_block_contract(self) -> None:
+        argv = [
+            "--repo-path",
+            str(ROOT),
+            "--repository",
+            REPOSITORY,
+            "--pr",
+            str(PR),
+            "--json",
+            "evaluate",
+        ]
+        stream = io.StringIO()
+        with mock.patch.object(
+            settlement, "_live_state", side_effect=RuntimeError("offline")
+        ), contextlib.redirect_stdout(stream):
+            returncode = settlement.main(argv)
+        result = json.loads(stream.getvalue())
+        self.assertEqual(2, returncode)
+        self.assertEqual("block", result["status"])
+        self.assertEqual("evaluator_exception", result["status_code"])
+        self.assertEqual(2, result["exit_code"])
+        self.assertEqual("failure", result["github_state"])
+        self.assertEqual(["offline"], result["errors"])
+
     def test_current_request_without_completion_is_terminal_optional_diagnostic(self) -> None:
         state = base_state()
         state["comments"] = connection([request_comment()], hasPreviousPage=False)
@@ -440,59 +635,6 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("block", result["status"])
         self.assertEqual("visibility_blocked", result["status_code"])
         self.assertFalse(result["settled"])
-
-    def test_evaluation_exit_code_is_bound_to_status_class(self) -> None:
-        cases = [
-            ("pass", "optional_review_findings", 0),
-            ("pending", "required_review_pending", 0),
-            ("block", "visibility_blocked", 2),
-        ]
-        for status, status_code, expected in cases:
-            with self.subTest(status_code=status_code):
-                self.assertEqual(
-                    expected,
-                    settlement._evaluation_exit_code(
-                        {"status": status, "status_code": status_code}
-                    ),
-                )
-
-    def test_evaluation_exit_code_rejects_status_code_mismatch(self) -> None:
-        with self.assertRaisesRegex(
-            settlement.SettlementError,
-            "status and status_code are inconsistent",
-        ):
-            settlement._evaluation_exit_code(
-                {"status": "pass", "status_code": "required_review_pending"}
-            )
-
-    def test_main_returns_success_for_optional_visible_findings(self) -> None:
-        result = {
-            "status": "pass",
-            "status_code": "optional_review_findings",
-            "errors": ["advisory finding remains visible"],
-            "settled": False,
-        }
-        with (
-            mock.patch.object(settlement, "evaluate", return_value=result),
-            mock.patch("builtins.print"),
-        ):
-            return_code = settlement.main(
-                ["--repository", REPOSITORY, "--pr", str(PR), "--json", "evaluate"]
-            )
-        self.assertEqual(0, return_code)
-
-    def test_main_exception_has_stable_status_code(self) -> None:
-        with (
-            mock.patch.object(settlement, "evaluate", side_effect=RuntimeError("boom")),
-            mock.patch("builtins.print") as output,
-        ):
-            return_code = settlement.main(
-                ["--repository", REPOSITORY, "--pr", str(PR), "--json", "evaluate"]
-            )
-        self.assertEqual(2, return_code)
-        payload = json.loads(output.call_args.args[0])
-        self.assertEqual("block", payload["status"])
-        self.assertEqual("evaluator_error", payload["status_code"])
 
     def test_usage_limit_comment_after_older_head_request_remains_pending(self) -> None:
         state = base_state()
