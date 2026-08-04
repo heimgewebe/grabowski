@@ -1,0 +1,72 @@
+name: PR 589 contract repair
+
+on:
+  push:
+    branches:
+      - fix/bureau-control-root-transport-intent-20260804
+    paths:
+      - .github/workflows/pr589-contract-repair.yml
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact PR branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/bureau-control-root-transport-intent-20260804
+          fetch-depth: 0
+
+      - name: Restore direct capability guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("src/grabowski_bureau_intake.py")
+          text = source.read_text(encoding="utf-8")
+          needle = '''    resolved_root = _prepare_registry_root(
+                  registry_root, refresh=True, mutation=True
+              )'''
+          replacement = '''    operator._require_operator_mutation(
+                  "terminal_execute",
+                  path=str(Path(registry_root).expanduser().resolve()),
+              )
+              resolved_root = _prepare_registry_root(
+                  registry_root, refresh=True, mutation=False
+              )'''
+          count = text.count(needle)
+          if count != 3:
+              raise SystemExit(f"expected exactly 3 mutating registry-root call sites, found {count}")
+          source.write_text(text.replace(needle, replacement), encoding="utf-8")
+
+          workflow = Path(".github/workflows/pr589-contract-repair.yml")
+          workflow.unlink()
+          PY
+
+      - name: Regenerate bound context
+        run: make context-refresh
+
+      - name: Verify focused contracts
+        run: |
+          python3 -m unittest \
+            tests.test_operator_v2_runtime.OperatorV2RuntimeTests.test_tool_capability_requirements_match_static_tool_guards \
+            tests.test_bureau_intake_adapter.BureauIntakeAdapterTests.test_registry_defaults_use_isolated_control_checkout \
+            tests.test_bureau_intake_adapter.BureauIntakeAdapterTests.test_shared_workbench_registry_root_is_rejected \
+            tests.test_bureau_intake_adapter.BureauIntakeAdapterTests.test_control_registry_root_refreshes_before_mutation \
+            -v
+
+      - name: Commit exact repair and remove bootstrap workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: expose Bureau capability guards"
+          git push origin HEAD:fix/bureau-control-root-transport-intent-20260804
