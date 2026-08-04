@@ -80,7 +80,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Before every mutating MCP call, ensure grip_run transport-roundtrip reports a fresh single-use verification; run action begin and, only when challenge_pending is returned, ack the exact challenge receipt. A later ambiguous mutation still requires target readback before retry.",
+        "Before every mutating MCP call, run grip_run transport-roundtrip action begin with the exact target_tool_name and target_arguments, ack the exact returned challenge when required, then invoke that unchanged target once. A later ambiguous mutation still requires target readback before retry.",
     ),
     (
         "typed-operation-preference",

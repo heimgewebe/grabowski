@@ -42,7 +42,7 @@ ARTIFACT_ROOT = Path(
         str(operator.STATE_DIR / "bureau-intake"),
     )
 ).expanduser()
-BUREAU_ROOT = bureau_runtime.BUREAU_REPOSITORY_ROOT
+BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
@@ -51,6 +51,32 @@ MANAGED_LAUNCHER_MARKER = b"# managed-by: heimgewebe-bureau-runtime-v1\n"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_RUNTIME_BINDING_BYTES = 4 * 1024 * 1024
+
+
+def _prepare_registry_root(
+    registry_root: str,
+    *,
+    refresh: bool,
+    mutation: bool,
+) -> str:
+    resolved = Path(registry_root).expanduser().resolve()
+    shared_root = bureau_runtime.BUREAU_REPOSITORY_ROOT.resolve()
+    control_root = bureau_runtime.BUREAU_CONTROL_ROOT.resolve()
+    if resolved == shared_root:
+        raise bureau_runtime.BureauLeaseContractError(
+            "shared-workbench-registry-root-forbidden",
+            details={"required_root": str(control_root)},
+        )
+    if mutation:
+        operator._require_operator_mutation(
+            "terminal_execute", path=str(resolved)
+        )
+    if resolved == control_root:
+        if refresh:
+            bureau_runtime.refresh_bureau_control_checkout()
+        else:
+            bureau_runtime.inspect_bureau_control_checkout(require_current=True)
+    return str(resolved)
 
 
 class BureauCandidateIdSelector(TypedDict):
@@ -844,7 +870,9 @@ def grabowski_bureau_task_propose(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Create an immutable Bureau task proposal artifact without changing Registry or Queue truth."""
-    operator._require_operator_mutation("terminal_execute", path=registry_root)
+    resolved_root = _prepare_registry_root(
+        registry_root, refresh=True, mutation=True
+    )
     if bool(candidate_id) == bool(event_id):
         raise ValueError("provide exactly one of candidate_id or event_id")
     if not isinstance(task_json, dict):
@@ -856,7 +884,7 @@ def grabowski_bureau_task_propose(
         "event_id": event_id,
         "unresolved_fields": sorted(set(unresolved_fields or [])),
         "placeholder_justification": placeholder_justification,
-        "registry_root": str(Path(registry_root).expanduser().resolve()),
+        "registry_root": resolved_root,
     }
     proposal_id = _sha256(_canonical_json(request))
     directory = _proposal_directory(proposal_id)
@@ -949,8 +977,9 @@ def grabowski_bureau_task_review(
     registry_root: str = str(BUREAU_ROOT),
 ) -> dict[str, Any]:
     """Review one exact Bureau proposal digest without changing Registry, Queue or publication truth."""
-    resolved_root = str(Path(registry_root).expanduser().resolve())
-    operator._require_operator_mutation("terminal_execute", path=resolved_root)
+    resolved_root = _prepare_registry_root(
+        registry_root, refresh=True, mutation=True
+    )
     if not reviewer.strip():
         raise ValueError("reviewer must not be empty")
     if not SHA256_RE.fullmatch(proposal_sha256):
@@ -994,10 +1023,13 @@ def grabowski_bureau_task_publish_preview(
     plan_path = _proposal_directory(proposal_id) / "plan.json"
     if not plan_path.is_file() or plan_path.is_symlink():
         raise FileNotFoundError(f"unknown proposal: {proposal_id}")
+    resolved_root = _prepare_registry_root(
+        registry_root, refresh=False, mutation=False
+    )
     return _invoke_bureau(
         [
             "--root",
-            str(Path(registry_root).expanduser().resolve()),
+            resolved_root,
             "--json",
             "--json-envelope",
             "operator-task-publish",
@@ -1015,8 +1047,9 @@ def grabowski_bureau_task_publish(
     lease_ttl_seconds: int = 240,
 ) -> dict[str, Any]:
     """Acquire exact short Bureau leases, publish one reviewed task branch and PR, then release on a clear outcome."""
-    resolved_root = str(Path(registry_root).expanduser().resolve())
-    operator._require_operator_mutation("terminal_execute", path=resolved_root)
+    resolved_root = _prepare_registry_root(
+        registry_root, refresh=True, mutation=True
+    )
     operator._require_operator_mutation("resource_lease")
     if lease_ttl_seconds < 90 or lease_ttl_seconds > 300:
         raise ValueError("lease_ttl_seconds must be between 90 and 300")

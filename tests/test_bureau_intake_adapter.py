@@ -680,6 +680,66 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_registry_defaults_use_isolated_control_checkout(self) -> None:
+        expected = str(intake.bureau_runtime.BUREAU_CONTROL_ROOT)
+        functions = (
+            intake.grabowski_bureau_task_propose,
+            intake.grabowski_bureau_task_review,
+            intake.grabowski_bureau_task_publish_preview,
+            intake.grabowski_bureau_task_publish,
+        )
+        for function in functions:
+            with self.subTest(function=function.__name__):
+                self.assertEqual(
+                    inspect.signature(function).parameters["registry_root"].default,
+                    expected,
+                )
+
+    def test_shared_workbench_registry_root_is_rejected(self) -> None:
+        shared = self.root / "shared-workbench"
+        control = self.root / "control"
+        shared.mkdir()
+        control.mkdir()
+        with (
+            mock.patch.object(intake.bureau_runtime, "BUREAU_REPOSITORY_ROOT", shared),
+            mock.patch.object(intake.bureau_runtime, "BUREAU_CONTROL_ROOT", control),
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "shared-workbench-registry-root-forbidden",
+            ):
+                intake._prepare_registry_root(
+                    str(shared), refresh=True, mutation=True
+                )
+
+    def test_control_registry_root_refreshes_before_mutation(self) -> None:
+        shared = self.root / "shared-workbench"
+        control = self.root / "control"
+        shared.mkdir()
+        control.mkdir()
+        order: list[str] = []
+        with (
+            mock.patch.object(intake.bureau_runtime, "BUREAU_REPOSITORY_ROOT", shared),
+            mock.patch.object(intake.bureau_runtime, "BUREAU_CONTROL_ROOT", control),
+            mock.patch.object(
+                intake.operator,
+                "_require_operator_mutation",
+                side_effect=lambda *_args, **_kwargs: order.append("policy"),
+            ) as policy,
+            mock.patch.object(
+                intake.bureau_runtime,
+                "refresh_bureau_control_checkout",
+                side_effect=lambda: order.append("refresh") or {"status": "current"},
+            ) as refresh,
+        ):
+            resolved = intake._prepare_registry_root(
+                str(control), refresh=True, mutation=True
+            )
+        self.assertEqual(resolved, str(control.resolve()))
+        self.assertEqual(order, ["policy", "refresh"])
+        policy.assert_called_once_with("terminal_execute", path=str(control.resolve()))
+        refresh.assert_called_once_with()
+
     def test_task_propose_is_adapter_idempotent(self) -> None:
         task = {"schema_version": 1, "id": "INIT-T099"}
 
