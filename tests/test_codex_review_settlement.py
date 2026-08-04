@@ -142,6 +142,32 @@ def codex_unavailable_comment(
     }
 
 
+def codex_current_unavailable_comment(
+    *,
+    actor: str = "chatgpt-codex-connector",
+    comment_id: int = 2202,
+    created_at: str = REVIEW_TIME,
+) -> dict:
+    body = (
+        "You have reached your Codex usage limits for code reviews. "
+        "You can see your limits in the "
+        "[Codex usage dashboard]"
+        "(https://chatgpt.com/codex/cloud/settings/usage).\n"
+        "To continue using code reviews, you can upgrade your account or add "
+        "credits to your account and enable them for code reviews in your "
+        "[settings](https://chatgpt.com/codex/cloud/settings/code-review)."
+    )
+    return {
+        "databaseId": comment_id,
+        "body": body,
+        "createdAt": created_at,
+        "url": f"https://github.com/example/comment/{comment_id}",
+        "authorAssociation": "NONE",
+        "author": {"login": actor},
+        "reactions": connection([], hasNextPage=False),
+    }
+
+
 def codex_review(
     *,
     head: str = HEAD,
@@ -371,6 +397,24 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("provider_diagnostic", outcome["mode"])
         self.assertEqual("quota_exhausted", outcome["reason_code"])
         self.assertIn("codex_review_pass", outcome["does_not_establish"])
+
+    def test_current_cloud_usage_limit_variant_is_typed_quota_diagnostic(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [request_comment(), codex_current_unavailable_comment()],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_provider_unavailable", result["status_code"])
+        self.assertFalse(result["settled"])
+        self.assertTrue(result["provider_outcome_present"])
+        self.assertEqual(
+            "quota_exhausted",
+            result["evidence"]["provider_outcome"]["reason_code"],
+        )
 
     def test_current_request_without_completion_is_terminal_optional_diagnostic(self) -> None:
         state = base_state()

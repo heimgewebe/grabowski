@@ -58,12 +58,23 @@ CLEAN_RESULT_RE = re.compile(
 )
 PROVIDER_UNAVAILABLE_BODIES = {
     "quota_exhausted": (
-        "You have reached your Codex usage limits for code reviews. "
-        "You can see your limits in the "
-        "[Codex usage dashboard](https://chatgpt.com/codex/usage).\n\n"
-        "To continue using code reviews, you can upgrade your account or add "
-        "credits to your account and enable them for code reviews in your "
-        "[settings](https://chatgpt.com/codex/settings)."
+        (
+            "You have reached your Codex usage limits for code reviews. "
+            "You can see your limits in the "
+            "[Codex usage dashboard](https://chatgpt.com/codex/usage).\n\n"
+            "To continue using code reviews, you can upgrade your account or add "
+            "credits to your account and enable them for code reviews in your "
+            "[settings](https://chatgpt.com/codex/settings)."
+        ),
+        (
+            "You have reached your Codex usage limits for code reviews. "
+            "You can see your limits in the "
+            "[Codex usage dashboard]"
+            "(https://chatgpt.com/codex/cloud/settings/usage).\n"
+            "To continue using code reviews, you can upgrade your account or add "
+            "credits to your account and enable them for code reviews in your "
+            "[settings](https://chatgpt.com/codex/cloud/settings/code-review)."
+        ),
     ),
 }
 
@@ -799,8 +810,8 @@ def _provider_unavailable_diagnostic(
         reason_code = next(
             (
                 reason
-                for reason, expected_body in PROVIDER_UNAVAILABLE_BODIES.items()
-                if normalized == expected_body
+                for reason, expected_bodies in PROVIDER_UNAVAILABLE_BODIES.items()
+                if normalized in expected_bodies
             ),
             None,
         )
