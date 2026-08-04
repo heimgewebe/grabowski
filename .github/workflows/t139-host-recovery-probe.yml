@@ -1,0 +1,38 @@
+---
+name: T139 host recovery probe
+
+permissions:
+  contents: read
+
+"on":
+  push:
+    branches:
+      - ops/t139-host-recovery-probe
+
+jobs:
+  probe:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - name: Prove exact Heim-PC identity without mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOST="$(hostname -s)"
+          USER_NAME="$(id -un)"
+          printf 'hostname=%s\nuser=%s\n' "$HOST" "$USER_NAME"
+          test "$HOST" = "heim-pc"
+          test "$USER_NAME" = "alex"
+          test -d /home/alex/repos/grabowski/.git
+          printf 'local_head=%s\n' "$(git -C /home/alex/repos/grabowski rev-parse HEAD)"
+          printf 'local_origin_main=%s\n' "$(git -C /home/alex/repos/grabowski rev-parse origin/main)"
+          systemctl --user is-active tunnel-client-grabowski.service
+          test -f /home/alex/.local/share/grabowski-mcp/deployment-manifest.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('/home/alex/.local/share/grabowski-mcp/deployment-manifest.json')
+          data = json.loads(p.read_text(encoding='utf-8'))
+          print('deployed_repo_head=' + str(data.get('repo_head')))
+          print('deployment_complete=' + str(data.get('completion_status')))
+          PY
