@@ -40,6 +40,7 @@ from mcp.types import ToolAnnotations
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
+import grabowski_serving_process
 import grabowski_connector_contract
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
 import grabowski_system_map
@@ -10429,6 +10430,29 @@ def latest_complete_bundles() -> dict[str, Any]:
             "runtime_correctness",
         ],
     }
+
+
+def _freeze_serving_process_identity() -> None:
+    """Bind this process to the release it loaded its code under."""
+    try:
+        deployment = _deployment_metadata()
+    except Exception:  # pragma: no cover - import must never fail on this
+        return
+    grabowski_serving_process.freeze(
+        deployment.get("release_id"), deployment.get("repo_head")
+    )
+
+
+def serving_process_identity() -> dict[str, Any]:
+    """Return the serving-process identity against the deployed manifest."""
+    deployment = _deployment_metadata()
+    return grabowski_serving_process.identity(
+        current_release_id=deployment.get("release_id"),
+        current_repo_head=deployment.get("repo_head"),
+    )
+
+
+_freeze_serving_process_identity()
 
 
 if __name__ == "__main__":

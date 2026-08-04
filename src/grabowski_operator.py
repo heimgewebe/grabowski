@@ -42,6 +42,7 @@ import grabowski_job_origin as job_origin
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_transport_roundtrip
+import grabowski_serving_process
 
 
 HOME = Path.home().resolve()
@@ -445,6 +446,31 @@ def _transport_roundtrip_exempt_call(
     )
 
 
+def _require_current_serving_process() -> None:
+    """Refuse mutations from a process older than the deployed release.
+
+    Such a process keeps the tool surface and gates of its own code, so a
+    fail-closed boundary introduced by a later release is simply absent here.
+    Only a positively observed mismatch blocks; an unreadable manifest leaves
+    the existing gates in charge.
+    """
+    try:
+        deployment = base._deployment_metadata()
+    except Exception:  # pragma: no cover - defensive read boundary
+        return
+    release_id = deployment.get("release_id")
+    repo_head = deployment.get("repo_head")
+    if not grabowski_serving_process.is_stale(
+        current_release_id=release_id, current_repo_head=repo_head
+    ):
+        return
+    raise RuntimeError(
+        grabowski_serving_process.mutation_rejection_message(
+            current_release_id=release_id, current_repo_head=repo_head
+        )
+    )
+
+
 def _require_transport_roundtrip_for_tool(
     *,
     tool_name: Any,
@@ -462,6 +488,7 @@ def _require_transport_roundtrip_for_tool(
             "MCP call rejected because the tool does not declare an explicit "
             "readOnlyHint annotation"
         )
+    _require_current_serving_process()
     client_scope = base._transport_roundtrip_client_scope(context)
     runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
