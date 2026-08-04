@@ -426,6 +426,57 @@
         "tool": "grabowski_checkout_binding_reconciliation"
       }
     },
+    "grabowski_checkout_binding_terminal_apply": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T140",
+        "docs:checkout-lifecycle.md",
+        "tests:test_checkout_terminal_reconciliation.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the exact transition from active or completed-retained to externally_terminal_missing for one already absent managed checkout.",
+        "evidence": "Fresh timestamp-bound preview, exact owner, source and checkout identity, source-terminal revalidation, path and branch leases, immediate conflict reread, SQLite compare-and-swap, immutable receipt, audit append and post-state readback."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Archive and cleanup tools were rejected because they create recovery or removal authority; generic state or terminal tools cannot bind source-specific terminal receipts, checkout identity, leases and lifecycle CAS as one fail-closed transition.",
+      "rationale": "External terminal reconciliation is a distinct evidence-only mutation boundary. It changes lifecycle phase and terminal time while explicitly preserving binding, retention, branch, refs, archive state and filesystem contents.",
+      "tool_contract": {
+        "tool": "grabowski_checkout_binding_terminal_apply",
+        "category": "checkout-lifecycle",
+        "effects": [
+          "audit-append",
+          "receipt-create",
+          "resource-lease",
+          "state-change"
+        ],
+        "read_only": false,
+        "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
+        "risk_class": "medium",
+        "authority_class": "mutation"
+      }
+    },
+    "grabowski_checkout_binding_terminal_preview": {
+      "evidence_refs": [
+        "bureau:GRABOWSKI-OPERATOR-SURFACE-V1-T140",
+        "docs:checkout-lifecycle.md",
+        "tests:test_checkout_terminal_reconciliation.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the read-only, time-bounded evidence shape required before one missing-checkout terminal reconciliation.",
+        "evidence": "Exact checkout, repository, common-dir, path, owner, branch, head, source identity, source-terminal receipt, archive absence and live lease/task/process blockers are hash-bound with explicit nonclaims."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Extending generic checkout inventory or binding reconciliation was rejected because neither call shape binds a fresh source-terminal receipt and exact apply preimage with an expiry contract.",
+      "rationale": "A dedicated preview keeps source-specific terminal evidence and the exact compare-and-swap preimage inspectable without granting mutation, archive or cleanup authority.",
+      "tool_contract": {
+        "tool": "grabowski_checkout_binding_terminal_preview",
+        "category": "checkout-lifecycle",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "authority_class": "read"
+      }
+    },
     "grabowski_chronik_history": {
       "evidence_refs": [
         "bureau:CCM-V1-T002",

@@ -116,6 +116,31 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
         self.assertTrue(result["blocking"])
         self.assertIn("checkout_absence_as_cleanup_proof", result["does_not_establish"])
 
+    def test_external_terminal_missing_is_terminal_nonblocking(self) -> None:
+        result = reconcile_binding(
+            binding(phase="externally_terminal_missing"),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "externally_terminal_missing")
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["reasons"], [])
+        self.assertEqual(
+            result["recommended_next_step"],
+            "use_external_terminal_evidence_projection_without_cleanup",
+        )
+        self.assertIn("permission_to_cleanup", result["does_not_establish"])
+
+    def test_external_terminal_missing_with_live_worktree_is_blocking_drift(self) -> None:
+        result = reconcile_binding(
+            binding(phase="externally_terminal_missing"),
+            worktree(),
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertTrue(result["blocking"])
+        self.assertIn("external-terminal-worktree-still-present", result["reasons"])
+
     def test_cleaned_archived_binding_is_terminal_nonblocking(self) -> None:
         result = reconcile_binding(
             binding(

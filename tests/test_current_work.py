@@ -1257,6 +1257,54 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         self.assertEqual(result["count"], 0)
 
+    def test_external_terminal_reconciliation_does_not_project_work(self) -> None:
+        result = project(
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-external-terminal",
+                        "state": "externally_terminal_missing",
+                        "blocking": False,
+                        "reasons": [],
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        self.assertEqual(result["count"], 0)
+
+    def test_external_terminal_checkout_is_not_closed_not_cleaned(self) -> None:
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "key-external-terminal",
+                            "/tmp/external-terminal",
+                            lifecycle_state="externally_terminal_missing",
+                            binding_owner="operator:test",
+                            binding_phase="externally_terminal_missing",
+                            binding_consistent=True,
+                        )
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(result["count"], 1)
+        row = result["work"][0]
+        self.assertEqual(row["projection_state"], "terminal_archived")
+        self.assertNotIn("closed-not-cleaned", row["action_reasons"])
+        self.assertFalse(row["action_required"])
+        self.assertEqual(
+            result["convergence_summary"]["primary_stage"],
+            "terminal_archived",
+        )
+        self.assertEqual(
+            result["convergence_summary"]["closed_not_cleaned_count"],
+            0,
+        )
+
     def test_orphaned_binding_projects_one_blocking_current_work_group(self) -> None:
         result = project(
             reconciliation_payload={
