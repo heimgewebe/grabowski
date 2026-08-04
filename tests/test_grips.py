@@ -4599,8 +4599,19 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertIn("review_evidence_missing", result["output"]["blocked_reasons"])
 
-    def test_high_critical_merge_blocks_missing_codex_review_evidence(self) -> None:
+    def test_high_critical_merge_uses_self_review_policy_without_codex(self) -> None:
         parameters = captain_parameters()
+        parameters.pop("codex_review_evidence")
+        result = self.run_captain(parameters)
+
+        gate = self.gate(result, "codex-review-settled")
+        self.assertEqual("pass", gate["status"])
+        self.assertFalse(gate["details"]["external_review_required"])
+        self.assertFalse(gate["details"]["required"])
+
+    def test_review_policy_can_explicitly_require_codex_evidence(self) -> None:
+        parameters = captain_parameters()
+        parameters["review_evidence"]["external_review_required"] = True
         parameters.pop("codex_review_evidence")
         result = self.run_captain(parameters)
 
@@ -6844,7 +6855,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                         "codex_review_exception",
                     ],
                     "required_when": (
-                        "review_evidence.review_tier_is_high_critical_or_"
+                        "review_evidence.external_review_required_is_true_or_"
                         "codex_review_required_is_true"
                     ),
                 }

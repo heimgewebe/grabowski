@@ -250,9 +250,11 @@ class CodexQuotaTerminalContractTests(unittest.TestCase):
     def test_unbound_usage_limit_remains_pending(self) -> None:
         result = evaluate(state())
         self.assertEqual("pending", result["status"])
+        self.assertEqual("required_provider_unavailable", result["status_code"])
         self.assertFalse(result["settled"])
         self.assertFalse(result["completion_present"])
         self.assertFalse(result["review_performed"])
+        self.assertTrue(result["provider_outcome_present"])
 
     def test_captain_schema_rejects_unbound_terminalization(self) -> None:
         evidence = fabricated_unavailable_evidence()

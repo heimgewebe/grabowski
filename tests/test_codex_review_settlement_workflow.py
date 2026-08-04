@@ -52,7 +52,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
             "      - name: Evaluate current-head settlement\n", 1
         )[1].split("      - name: Publish settlement status\n", 1)[0]
         self.assertIn("tools/codex_review_settlement.py", evaluate_section)
-        self.assertIn("--require", evaluate_section)
+        self.assertNotIn("--require", evaluate_section)
         self.assertIn("evaluate > codex-review-settlement.json", evaluate_section)
 
     def test_github_actions_issue_comments_do_not_retrigger_settlement(self) -> None:
@@ -89,6 +89,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn("if ! jq -e '", evaluate_section)
         self.assertIn("trusted_evaluator_output_invalid", evaluate_section)
         self.assertIn("codex-review-settlement.invalid.json", evaluate_section)
+        self.assertIn("status_code", evaluate_section)
         self.assertIn("rc=2", evaluate_section)
         self.assertLess(
             evaluate_section.index("trusted_evaluator_output_invalid"),
@@ -101,14 +102,19 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         self.assertIn('github_state="success"', self.text)
         self.assertIn('github_state="pending"', self.text)
         self.assertIn('github_state="failure"', self.text)
+        self.assertIn("status_code", self.text)
+        self.assertIn("Current-head Codex review settled", self.text)
         self.assertIn(
-            "Current-head Codex review requirement satisfied",
+            "Optional Codex review unavailable; merge gate unaffected",
             self.text,
         )
+        self.assertIn("Optional Codex review not requested", self.text)
         self.assertIn(
-            "Connected user must request current-head Codex review",
+            "Optional Codex review pending; merge gate unaffected",
             self.text,
         )
+        self.assertIn("Current-head Codex review request required", self.text)
+        self.assertIn("Required Codex review is unavailable", self.text)
         self.assertNotIn("usage limit reached", self.text)
 
     def test_manual_dispatch_can_recheck_after_thread_resolution(self) -> None:
@@ -118,7 +124,7 @@ class CodexReviewSettlementWorkflowTests(unittest.TestCase):
         evaluate_section = self.text.split(
             "      - name: Evaluate current-head settlement\n", 1
         )[1].split("      - name: Publish settlement status\n", 1)[0]
-        self.assertIn("--require", evaluate_section)
+        self.assertNotIn("--require", evaluate_section)
         self.assertIn("evaluate > codex-review-settlement.json", evaluate_section)
 
 

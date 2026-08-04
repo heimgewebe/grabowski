@@ -104,7 +104,6 @@ jobs:
             python3 tools/codex_review_settlement.py \
               --repository "$GITHUB_REPOSITORY" \
               --pr "$PR_NUMBER" \
-              --require \
               --json \
               evaluate > codex-review-settlement.json
             rc=$?
@@ -113,6 +112,7 @@ jobs:
           if ! jq -e '
             type == "object"
             and (.status | type == "string")
+            and (.status_code | type == "string")
             and (.settled | type == "boolean")
             and (.errors | type == "array")
           ' codex-review-settlement.json > /dev/null 2>&1; then
@@ -124,15 +124,39 @@ jobs:
             rc=2
           fi
           cat codex-review-settlement.json
-          status="$(jq -r '.status // "block"' codex-review-settlement.json)"
-          case "$status" in
-            pass)
+          status_code="$(jq -r '.status_code // "visibility_blocked"' codex-review-settlement.json)"
+          case "$status_code" in
+            review_settled)
               github_state="success"
-              description="Current-head Codex review requirement satisfied"
+              description="Current-head Codex review settled"
               ;;
-            pending)
+            optional_provider_unavailable)
+              github_state="success"
+              description="Optional Codex review unavailable; merge gate unaffected"
+              ;;
+            optional_not_requested)
+              github_state="success"
+              description="Optional Codex review not requested"
+              ;;
+            optional_review_pending)
+              github_state="success"
+              description="Optional Codex review pending; merge gate unaffected"
+              ;;
+            optional_review_findings)
+              github_state="success"
+              description="Optional Codex findings remain advisory"
+              ;;
+            required_request_missing)
               github_state="pending"
-              description="Connected user must request current-head Codex review"
+              description="Current-head Codex review request required"
+              ;;
+            required_review_pending)
+              github_state="pending"
+              description="Required current-head Codex review is pending"
+              ;;
+            required_provider_unavailable)
+              github_state="pending"
+              description="Required Codex review is unavailable"
               ;;
             *)
               github_state="failure"
@@ -140,7 +164,7 @@ jobs:
               ;;
           esac
           first_error="$(jq -r '.errors[0] // empty' codex-review-settlement.json)"
-          if [ -n "$first_error" ]; then
+          if [ "$github_state" = "failure" ] && [ -n "$first_error" ]; then
             description="$first_error"
           fi
           description="$(printf '%s' "$description" | cut -c1-140)"

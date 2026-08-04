@@ -180,7 +180,7 @@ def codex_thread(*, resolved: bool, created_at: str = REVIEW_TIME) -> dict:
 
 
 class CodexReviewSettlementTests(unittest.TestCase):
-    def evaluate(self, state: dict, *, required: bool = False) -> dict:
+    def evaluate(self, state: dict, *, required: bool = True) -> dict:
         with mock.patch.object(settlement, "_live_state", return_value=deepcopy(state)):
             return settlement.evaluate(
                 ROOT,
@@ -195,8 +195,20 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual(result["status"], "pending")
         self.assertFalse(result["settled"])
 
+    def test_high_critical_change_without_explicit_requirement_is_optional(self) -> None:
+        result = self.evaluate(base_state(), required=False)
+        self.assertFalse(result["required"])
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_not_requested", result["status_code"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["policy"]["external_review_required"])
+        self.assertTrue(result["policy"]["self_review_required"])
+        self.assertEqual("high_critical", result["policy"]["review_tier"])
+
     def test_documentation_change_without_request_passes_as_not_required(self) -> None:
-        result = self.evaluate(base_state(path="docs/example.md"))
+        result = self.evaluate(
+            base_state(path="docs/example.md"), required=False
+        )
         self.assertFalse(result["required"])
         self.assertEqual(result["status"], "pass")
         self.assertFalse(result["settled"])
@@ -339,6 +351,65 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertFalse(result["settled"])
         self.assertFalse(result["completion_present"])
         self.assertFalse(result["review_performed"])
+
+    def test_usage_limit_is_terminal_diagnostic_when_review_is_optional(self) -> None:
+        state = base_state()
+        state["comments"] = connection(
+            [request_comment(), codex_unavailable_comment()],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_provider_unavailable", result["status_code"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["completion_present"])
+        self.assertFalse(result["review_performed"])
+        self.assertTrue(result["provider_outcome_present"])
+        outcome = result["evidence"]["provider_outcome"]
+        self.assertEqual("provider_diagnostic", outcome["mode"])
+        self.assertEqual("quota_exhausted", outcome["reason_code"])
+        self.assertIn("codex_review_pass", outcome["does_not_establish"])
+
+    def test_current_request_without_completion_is_terminal_optional_diagnostic(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_review_pending", result["status_code"])
+        self.assertFalse(result["settled"])
+        self.assertTrue(result["request_present"])
+        self.assertFalse(result["completion_present"])
+
+    def test_optional_blocking_review_remains_visible_without_merge_block(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [codex_review(state="CHANGES_REQUESTED")],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertFalse(result["settled"])
+        self.assertIn("Codex review state is blocking", result["errors"][0])
+
+    def test_visibility_gap_blocks_even_when_external_review_is_optional(self) -> None:
+        state = base_state()
+        state["files"] = connection(
+            [{"path": "src/grabowski_grips.py"}], hasNextPage=True
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual("visibility_blocked", result["status_code"])
+        self.assertFalse(result["settled"])
 
     def test_usage_limit_comment_after_older_head_request_remains_pending(self) -> None:
         state = base_state()
@@ -874,7 +945,7 @@ class CodexReviewSettlementTests(unittest.TestCase):
         with mock.patch.object(settlement, "_live_state", return_value=state), mock.patch.object(
             settlement, "_run_json"
         ) as run_json:
-            result = settlement.ensure_request(ROOT, REPOSITORY, PR)
+            result = settlement.ensure_request(ROOT, REPOSITORY, PR, force=True)
         self.assertFalse(result["requested"])
         self.assertEqual(result["comment_id"], 1001)
         run_json.assert_not_called()
@@ -939,7 +1010,7 @@ class CodexReviewSettlementTests(unittest.TestCase):
             "_run_json",
             return_value={"id": 4001},
         ) as run_json:
-            result = settlement.ensure_request(ROOT, REPOSITORY, PR)
+            result = settlement.ensure_request(ROOT, REPOSITORY, PR, force=True)
         self.assertTrue(result["requested"])
         args = run_json.call_args.args[1]
         body_arg = next(item for item in args if item.startswith("body="))
