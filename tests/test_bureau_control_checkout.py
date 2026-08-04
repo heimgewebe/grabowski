@@ -10,6 +10,19 @@ from unittest import mock
 import grabowski_bureau_leases as bureau
 
 
+class BureauControlLockPortabilityTests(unittest.TestCase):
+    def test_missing_posix_lock_api_fails_closed(self) -> None:
+        with mock.patch.object(bureau, "_fcntl", None):
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                with bureau._bureau_control_lock():
+                    self.fail("unavailable lock unexpectedly entered")
+
+        self.assertEqual(
+            raised.exception.code,
+            "control-checkout-lock-unavailable",
+        )
+
+
 class BureauControlCheckoutTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
