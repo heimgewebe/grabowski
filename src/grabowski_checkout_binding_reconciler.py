@@ -31,6 +31,7 @@ RECONCILER_STATES = frozenset(
     {
         "bound_present",
         "archived_cleaned",
+        "externally_terminal_missing",
         "orphaned_binding",
         "repository_unobservable",
         "binding_identity_drift",
@@ -40,7 +41,7 @@ MAX_EVIDENCE = 32
 MAX_PAGE_LIMIT = 100
 MAX_BINDINGS = 10_000
 MAX_REPOSITORY_ERRORS = 100
-LIFECYCLE_PHASES = frozenset({"active", "completed_retained", "archived"})
+LIFECYCLE_PHASES = checkouts.LIFECYCLE_PHASES
 REQUIRED_BINDING_FIELDS = (
     "checkout_key",
     "repo_common_dir",
@@ -248,6 +249,8 @@ def reconcile_binding(
     elif worktree is None:
         if cleaned_archive:
             state = "archived_cleaned"
+        elif phase == "externally_terminal_missing":
+            state = "externally_terminal_missing"
         else:
             state = "orphaned_binding"
             reasons.append("binding-has-no-current-git-worktree-record")
@@ -268,7 +271,9 @@ def reconcile_binding(
                 reasons.append(f"{field.replace('_', '-')}-mismatch")
         if cleaned_archive:
             reasons.append("cleaned-archive-worktree-still-present")
-        if phase in {"completed_retained", "archived"}:
+        if phase == "externally_terminal_missing":
+            reasons.append("external-terminal-worktree-still-present")
+        if phase in {"completed_retained", "archived", "externally_terminal_missing"}:
             expected_head = _text(binding.get("expected_head"))
             current_head = _text(worktree.get("head"))
             if expected_head is None:
@@ -277,7 +282,7 @@ def reconcile_binding(
                 reasons.append("terminal-head-mismatch")
         state = "binding_identity_drift" if reasons else "bound_present"
 
-    blocking = state not in {"bound_present", "archived_cleaned"}
+    blocking = state not in {"bound_present", "archived_cleaned", "externally_terminal_missing"}
     return {
         "schema_version": RECONCILER_SCHEMA_VERSION,
         "checkout_key": binding_identity["checkout_key"],
@@ -290,6 +295,7 @@ def reconcile_binding(
         "recommended_next_step": {
             "bound_present": "use_existing_checkout_lifecycle_projection",
             "archived_cleaned": "use_cleaned_archive_lifecycle_projection",
+            "externally_terminal_missing": "use_external_terminal_evidence_projection_without_cleanup",
             "orphaned_binding": "inspect_git_and_binding_history_without_mutation",
             "repository_unobservable": "restore_repository_observability_before_decision",
             "binding_identity_drift": "reconcile_binding_identity_before_lifecycle_action",

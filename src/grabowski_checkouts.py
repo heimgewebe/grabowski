@@ -55,7 +55,12 @@ CLEANUP_PLAN_SCHEMA_VERSION = 2
 CLEANUP_PLAN_HASH_EXCLUDED_FIELDS = ("archive_age_seconds",)
 MAX_ACTIVE_CHECKOUTS_PER_REPO = 8
 MAX_COMPLETED_RETAINED_CHECKOUTS_PER_REPO = 4
-LIFECYCLE_PHASES = frozenset({"active", "completed_retained", "archived"})
+LIFECYCLE_PHASES = frozenset(
+    {"active", "completed_retained", "archived", "externally_terminal_missing"}
+)
+TERMINAL_RECONCILIATION_SCHEMA_VERSION = 1
+TERMINAL_RECONCILIATION_PREVIEW_TTL_SECONDS = 15 * 60
+TERMINAL_RECONCILIATION_CONFIRMATION = "record-external-terminal-missing"
 ARTIFACT_CLASS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 SOURCE_KIND_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
 SOURCE_ID_RE = re.compile(r"[^\x00-\x1f\x7f]{1,256}\Z")
@@ -360,6 +365,23 @@ def _database() -> sqlite3.Connection:
             created_at_unix INTEGER NOT NULL,
             expires_at_unix INTEGER NOT NULL,
             applied_at_unix INTEGER
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS terminal_reconciliations (
+            checkout_key TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            binding_before_sha256 TEXT NOT NULL,
+            retention_sha256 TEXT NOT NULL,
+            source_evidence_json TEXT NOT NULL,
+            source_evidence_sha256 TEXT NOT NULL,
+            preview_sha256 TEXT NOT NULL,
+            preview_created_at_unix INTEGER NOT NULL,
+            applied_at_unix INTEGER NOT NULL,
+            receipt_json TEXT NOT NULL,
+            receipt_sha256 TEXT NOT NULL
         )
         """
     )
@@ -1409,7 +1431,7 @@ def _binding_consistency(
 
     reasons: list[str] = []
     phase = binding.get("phase")
-    if phase not in {"active", "completed_retained", "archived"}:
+    if phase not in LIFECYCLE_PHASES:
         reasons.append("binding-phase-unsupported")
     expected_identity = {
         "checkout_key": record.get("checkout_key"),
@@ -1421,7 +1443,7 @@ def _binding_consistency(
     for field, expected in expected_identity.items():
         if binding.get(field) != expected:
             reasons.append(f"binding-{field.replace('_', '-')}-mismatch")
-    if record.get("prunable") or not exists:
+    if (record.get("prunable") or not exists) and phase != "externally_terminal_missing":
         reasons.append("bound-checkout-missing-or-prunable")
 
     if not isinstance(retention, dict):
@@ -1467,6 +1489,17 @@ def _binding_consistency(
             reasons.append("archived-binding-without-matching-open-archive")
         elif archive.get("owner_id") != binding.get("owner_id"):
             reasons.append("binding-archive-owner-mismatch")
+    elif phase == "externally_terminal_missing":
+        if not isinstance(binding.get("expected_head"), str):
+            reasons.append("external-terminal-head-missing")
+        if not isinstance(binding.get("terminal_at_unix"), int):
+            reasons.append("external-terminal-timestamp-missing")
+        if binding.get("archived_at_unix") is not None:
+            reasons.append("external-terminal-has-archive-timestamp")
+        if exists and not record.get("prunable"):
+            reasons.append("external-terminal-checkout-reappeared")
+        if isinstance(archive, dict) and archive.get("cleaned_at_unix") is None:
+            reasons.append("external-terminal-has-open-archive")
 
     return {
         "present": True,
@@ -1521,10 +1554,18 @@ def _checkout_lifecycle_decision(
         next_step = "inspect_bare_worktree_before_lifecycle_action"
         reasons.append("bare worktree cannot be classified as a normal linked checkout")
     elif record["prunable"] or not exists:
-        state = "prunable_or_missing"
-        hygiene_mark = "obsolete"
-        next_step = "review_git_worktree_prune_separately"
-        reasons.append("git reports the worktree as prunable or the path is missing")
+        if binding_phase == "externally_terminal_missing" and binding_consistent:
+            state = "externally_terminal_missing"
+            hygiene_mark = "terminal"
+            next_step = "no_archive_or_cleanup_without_separate_recovery_contract"
+            reasons.append(
+                "missing managed checkout is terminal only by a receipt-bound external source decision"
+            )
+        else:
+            state = "prunable_or_missing"
+            hygiene_mark = "obsolete"
+            next_step = "review_git_worktree_prune_separately"
+            reasons.append("git reports the worktree as prunable or the path is missing")
     elif status["dirty"] is True:
         state = "dirty"
         hygiene_mark = "dirty"
@@ -1846,6 +1887,39 @@ def _verify_recovery_refs(repo: Path, recovery_refs: list[dict[str, str]]) -> li
             }
         )
     return verified
+
+
+@mcp.tool(name="grabowski_checkout_binding_terminal_preview", annotations=READ_ONLY)
+def grabowski_checkout_binding_terminal_preview(checkout_key: str) -> dict[str, Any]:
+    """Preview an evidence-only terminal transition for one missing managed checkout."""
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("github_cli")
+    from grabowski_checkout_terminal_reconciliation import preview
+
+    return preview(checkout_key)
+
+
+@mcp.tool(name="grabowski_checkout_binding_terminal_apply", annotations=MUTATING)
+def grabowski_checkout_binding_terminal_apply(
+    checkout_key: str,
+    owner_id: str,
+    expected_preview_sha256: str,
+    preview_created_at_unix: int,
+    confirmation: str,
+) -> dict[str, Any]:
+    """CAS-apply one source-bound terminal state without archive or cleanup effects."""
+    operator._require_operator_mutation("resource_lease")
+    operator._require_operator_capability("git_cli")
+    operator._require_operator_capability("github_cli")
+    from grabowski_checkout_terminal_reconciliation import apply
+
+    return apply(
+        checkout_key,
+        owner_id,
+        expected_preview_sha256,
+        preview_created_at_unix,
+        confirmation,
+    )
 
 
 @mcp.tool(name="grabowski_checkout_inventory", annotations=READ_ONLY)

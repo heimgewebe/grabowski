@@ -30,6 +30,12 @@ TERMINAL_TASK_STATES = {
     "timed_out",
 }
 ACTIVE_WORKER_STATES = {"launching", "running"}
+CHECKOUT_LIFECYCLE_PHASES = {
+    "active",
+    "completed_retained",
+    "archived",
+    "externally_terminal_missing",
+}
 CURRENT_WORK_VIEWS = {"current", "history"}
 PROJECTION_STATES = {"active", "blocking", "resumable", "terminal_archived", "unknown"}
 ATTENTION_BLOCKING_CLASSIFICATIONS = {"actionable", "outcome_unknown", "invalid_evidence"}
@@ -437,11 +443,7 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
             raise CurrentWorkProjectionError(
                 "checkout binding phase disagrees with lifecycle binding"
             )
-        if binding_consistent and stored_phase not in {
-            "active",
-            "completed_retained",
-            "archived",
-        }:
+        if binding_consistent and stored_phase not in CHECKOUT_LIFECYCLE_PHASES:
             raise CurrentWorkProjectionError(
                 "consistent checkout binding phase is unsupported"
             )
@@ -960,6 +962,15 @@ def _add_checkouts(
         elif (
             item["binding_present"]
             and item["binding_consistent"]
+            and item["binding_phase"] == "externally_terminal_missing"
+        ):
+            if item["coordination_blocking"] or item["processes"]:
+                _blocking(group, "external-terminal-checkout-with-live-coordination")
+            else:
+                _set_projection_state(group, "terminal_archived")
+        elif (
+            item["binding_present"]
+            and item["binding_consistent"]
             and item["binding_phase"] in {"completed_retained", "archived"}
         ):
             if item["coordination_blocking"] or item["processes"]:
@@ -990,6 +1001,7 @@ def _add_binding_reconciliation(
     supported_states = {
         "bound_present",
         "archived_cleaned",
+        "externally_terminal_missing",
         "orphaned_binding",
         "repository_unobservable",
         "binding_identity_drift",
@@ -1020,7 +1032,7 @@ def _add_binding_reconciliation(
             raise CurrentWorkProjectionError(
                 "checkout binding reconciliation reasons are invalid"
             )
-        if state in {"bound_present", "archived_cleaned"}:
+        if state in {"bound_present", "archived_cleaned", "externally_terminal_missing"}:
             if blocking or reasons_raw:
                 raise CurrentWorkProjectionError(
                     f"{state} reconciliation must be non-blocking and drift-free"
@@ -1318,15 +1330,25 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     projection_state = group.get("projection_state", "unknown")
     checkout_refs = group.get("checkout_refs", [])
     has_cleanup_candidate = any(c.get("cleanup_candidate") for c in checkout_refs)
+    external_terminal_checkout_refs = [
+        c
+        for c in checkout_refs
+        if c.get("binding_present") is True
+        and c.get("binding_consistent") is True
+        and c.get("binding_phase") == "externally_terminal_missing"
+    ]
+    actionable_checkout_refs = [
+        c for c in checkout_refs if c not in external_terminal_checkout_refs
+    ]
     has_terminal_checkout_binding = any(
         c.get("binding_present") is True
         and c.get("binding_consistent") is True
         and c.get("binding_phase") in {"completed_retained", "archived"}
-        for c in checkout_refs
+        for c in actionable_checkout_refs
     )
     has_live_surfaces = bool(
         group.get("lease_summary", {}).get("count", 0)
-        or checkout_refs
+        or actionable_checkout_refs
         or group.get("worker_refs")
         or group.get("physical_refs", {}).get("tmux_sessions")
         or group.get("physical_refs", {}).get("processes")

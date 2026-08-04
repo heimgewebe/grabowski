@@ -34,6 +34,7 @@ CONVERGENCE_STATES = frozenset(
         "unobservable",
     }
 )
+TERMINAL_NONBLOCKING_STATES = frozenset({"externally_terminal_missing"})
 HARD_BLOCK_CODES = frozenset(
     {
         "dirty-worktree",
@@ -635,6 +636,11 @@ def assess_repository_admission(
                             "owner_id": lifecycle_owner,
                         }
                     )
+            elif state in TERMINAL_NONBLOCKING_STATES:
+                # Source- and CAS-bound terminal evidence is not live work and
+                # creates no cleanup authority. Dirty state, ambiguous ownership
+                # and live coordination remain independently blocking above.
+                pass
             elif state in CONVERGENCE_STATES:
                 if lifecycle_owner is not None and lifecycle_owner != owner_id:
                     blockers.append(
@@ -660,6 +666,7 @@ def assess_repository_admission(
             and existing_source_id == source_id
             and (source_kind is None or existing_source_kind == source_kind)
             and (target_path is None or path != target_path)
+            and state not in TERMINAL_NONBLOCKING_STATES
         ):
             blockers.append(
                 {

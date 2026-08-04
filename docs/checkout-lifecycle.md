@@ -18,6 +18,13 @@ trennt Inventar, Archivierung und Cleanup.
 - `grabowski_checkout_cleanup`: erzeugt zuerst einen persistierten Dry-Run-Plan
   und führt erst danach, mit Plan-ID und Plan-Hash, `git worktree remove` ohne
   Force-Option aus.
+- `grabowski_checkout_binding_terminal_preview`: prüft read-only, ob ein bereits
+  verschwundener managed Checkout durch unveränderliche Quellterminalität, exakte
+  Binding-Identität und fehlende Koordination als Evidenzzustand abschließbar ist.
+- `grabowski_checkout_binding_terminal_apply`: übernimmt ausschließlich einen
+  frischen, zeitgebundenen Preview-Digest per Compare-and-Swap in
+  `externally_terminal_missing`. Der Aufruf archiviert oder löscht nichts und
+  verändert weder Retention noch Branch oder Ref.
 
 ## Inventar-Markierungen
 
@@ -32,6 +39,7 @@ Branch-Löschung.
 | `dirty` | `dirty` | Änderungen oder untracked Dateien vorhanden; erst reviewen oder retainen. |
 | `retained` | `retained`, `completed_retained`, `completed_retained_blocked` | Aktive managed Arbeit ist wirksam retained; terminale managed Arbeit bleibt bis zur Archivierung explizit sichtbar. |
 | `archived` | `archived_blocked` | Eine konsistente `phase=archived`-Bindung besitzt ein passendes offenes Recovery-Archiv; nur aktive Koordination blockiert die Erstellung des Cleanup-Dry-Runs. |
+| `terminal` | `externally_terminal_missing` | Der Checkout fehlt bereits und seine externe Quelle ist revisions- und receiptgebunden terminal. Das ist weder Archiv noch Cleanup-Kandidat. |
 | `obsolete` | `cleanup_candidate`, `prunable_or_missing` | Nur lokal gemeint: ein sauberer Checkout hat ein passendes offenes Recovery-Archiv und braucht vor Apply trotzdem einen Dry-Run; oder Git meldet den Worktree als prunable/missing. |
 | `unknown` | `unclassified_clean`, `managed_active_attention`, `managed_lifecycle_drift`, `archive_drifted`, `archive_closed`, `blocked_unarchived`, `unobservable` | Lokale Evidenz reicht nicht für eine sichere Lifecycle-Entscheidung. `unclassified_clean` bleibt unmanaged oder legacy; managed Retention-Ablauf und Identitätsdrift werden ausdrücklich blockierend. |
 
@@ -61,6 +69,10 @@ Die Phasen werden read-only wie folgt projiziert:
   nicht auf `unclassified_clean` zurück.
 - `completed_retained` bleibt als terminal-retained und
   archivierungspflichtig sichtbar.
+- `externally_terminal_missing` bezeichnet ausschließlich einen durch
+  Quellreceipt und CAS belegten externen Abschluss bei bereits fehlendem Checkout.
+  Dieser Zustand ist weder Archiv noch Cleanup-Kandidat. Ein wieder erschienener
+  Worktree wird erneut blockierende Identitätsdrift.
 - `archived` gelangt mit passendem offenem Recovery-Archiv in
   `archived_blocked` oder `cleanup_candidate`; Apply bleibt jedoch für mindestens
   24 Stunden nach der Archivierung gesperrt. Auch Retention desselben Owners muss
@@ -77,13 +89,23 @@ blockierende Drift-Evidenz, wird aber weder als Owner-Autorität noch als
 terminale Konvergenzautorität verwendet. Konsistente aktive Bindungen bleiben
 aktiv; abgelaufene managed Bindungen blockieren; `completed_retained` und
 `archived` werden als `closed-not-cleaned` priorisiert, solange der Checkout
-noch existiert. Daraus folgt keine Effekt- oder Löschautorität.
+noch existiert. `externally_terminal_missing` wird nur als terminale Evidenz
+projiziert und erzeugt keine Aufräumaktion. Daraus folgt keine Effekt- oder
+Löschautorität.
 
 Eine vollständig verwaiste Binding-Zeile ohne Git-Worktree-Record gehört nicht
 zu dieser Worktree-Inventarsicht. `grabowski_checkout_binding_reconciliation`
 vergleicht solche Bindings read-only mit der kanonischen Git-Beobachtung und
 projiziert unklare oder widersprüchliche Fälle blockierend. Die Binding-Zeile
 darf nicht aus Abwesenheit allein automatisch entfernt oder terminalisiert werden.
+Der T140-Vertrag erlaubt nur einen gesonderten Evidenzzustandswechsel: Ein
+read-only Preview bindet Checkout-Key, Repository/Common-Dir, Pfad, Owner, Branch,
+HEAD, Source-Kind und Source-ID, die source-spezifische Terminalquittung sowie
+fehlende Tasks, Prozesse, Leases und Archive. Der Apply verlangt denselben Digest
+mit gebundenem Erstellungs- und Ablaufzeitpunkt, die exakte Bestätigung
+`record-external-terminal-missing`, frische Quell- und Konfliktbeobachtung sowie
+einen unveränderten SQLite-CAS-Readback. Unterstützte Quellen sind Bureau-Task,
+Operator-Verpflichtung, Thread-Fokus und GitHub-Issue.
 Nur wenn ein identitätsgleiches `archived`-Binding zusätzlich einen vollständigen
 Archive-Record mit positivem `cleaned_at_unix` und gebundener `cleanup_plan_id`
 besitzt, wird die frisch beobachtete Checkout-Abwesenheit als `archived_cleaned`
@@ -111,8 +133,10 @@ weiterhin nur nach Archiv- und Dry-Run-Vertrag.
    Repository blockieren Apply.
 7. Ein Lifecycle-Binding autorisiert weder automatische Archivierung noch
    Cleanup oder Branch-Löschung.
-8. `~/repos/merges` bleibt unveränderbare Evidence-Zone.
-9. Es gibt keine direkte oder forcierte Dateisystemlöschung durch den
+8. `externally_terminal_missing` verändert nur Phase und Terminalzeit; Binding,
+   Retention, Branch, Ref, Archiv und Dateisystem bleiben unverändert.
+9. `~/repos/merges` bleibt unveränderbare Evidence-Zone.
+10. Es gibt keine direkte oder forcierte Dateisystemlöschung durch den
    Lifecycle-Code.
 
 ## Recovery

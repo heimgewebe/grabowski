@@ -143,12 +143,32 @@ class WorkAdmissionTests(unittest.TestCase):
             and isinstance(node.value, ast.Constant)
             and isinstance(node.value.value, str)
         }
-        explicitly_handled = set(admission.CONVERGENCE_STATES) | {
-            "main",
-            "dirty",
-            "retained",
-        }
+        explicitly_handled = (
+            set(admission.CONVERGENCE_STATES)
+            | set(admission.TERMINAL_NONBLOCKING_STATES)
+            | {
+                "main",
+                "dirty",
+                "retained",
+            }
+        )
         self.assertEqual(emitted_states, explicitly_handled)
+
+    def test_external_terminal_missing_is_not_live_work_or_convergence(self) -> None:
+        terminal = self._linked(
+            state="externally_terminal_missing",
+            owner="foreign-historical-owner",
+            source_id="terminal-source",
+        )
+        result = self._assess(
+            [self._main(), terminal],
+            source_kind="bureau_task",
+            source_id="terminal-source",
+        )
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["blockers"], [])
+        self.assertNotIn("similar-active-source-binding", result["blocker_codes"])
+        self.assertIn("cleanup authority", result["does_not_establish"])
 
     def test_clean_primary_only_allows_new_broad_lane(self) -> None:
         result = self._assess([self._main()])

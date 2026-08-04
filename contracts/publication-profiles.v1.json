@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "50a83e35a5635330a376c3677e9cceeaafe62196db8fa73f1befc6f0aa140f15"
+    "sha256": "08fc7a08ddf0faf442bef31eb37aa617329800b4173de65638b6906167eea399"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "e5ed31750df56ae26e4979625371612917c07d791836bd3ab3b77ba802662dac"
+    "sha256": "3be47e86574543ca584ebb914d0e86c06615a9b36e33e385f8b7946cfa650460"
   },
   "counts": {
     "core": 22,
-    "full": 182,
-    "operator": 167
+    "full": 184,
+    "operator": 169
   },
   "profiles": {
     "core": [
@@ -102,6 +102,8 @@
       "grabowski_git_branch",
       "grabowski_checkout_inventory",
       "grabowski_checkout_binding_reconciliation",
+      "grabowski_checkout_binding_terminal_preview",
+      "grabowski_checkout_binding_terminal_apply",
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",
@@ -275,6 +277,8 @@
       "grabowski_git_branch",
       "grabowski_checkout_inventory",
       "grabowski_checkout_binding_reconciliation",
+      "grabowski_checkout_binding_terminal_preview",
+      "grabowski_checkout_binding_terminal_apply",
       "grabowski_checkout_retain",
       "grabowski_checkout_archive",
       "grabowski_checkout_cleanup",

@@ -345,6 +345,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_checkout_binding_terminal_preview": {
+        "category": "checkout-lifecycle",
+        "purpose": "Preview one exact source- and identity-bound external terminal transition for an already missing managed checkout.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
+    "grabowski_checkout_binding_terminal_apply": {
+        "category": "checkout-lifecycle",
+        "purpose": "Apply one fresh compare-and-swap transition to externally_terminal_missing while preserving retention, branch, refs, archive state and filesystem contents.",
+        "risk_class": "medium",
+        "effects": ["audit-append", "receipt-create", "resource-lease", "state-change"],
+        "reversibility": "compare-and-swap-state-transition-with-retained-evidence",
+    },
     "grabowski_checkout_retain": {
         "category": "checkout-lifecycle",
         "purpose": "Assign explicit retention ownership to one temporary linked Git checkout.",

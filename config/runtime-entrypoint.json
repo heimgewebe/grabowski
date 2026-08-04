@@ -64,6 +64,8 @@
     "grabowski_git_branch",
     "grabowski_checkout_inventory",
     "grabowski_checkout_binding_reconciliation",
+    "grabowski_checkout_binding_terminal_preview",
+    "grabowski_checkout_binding_terminal_apply",
     "grabowski_checkout_retain",
     "grabowski_checkout_archive",
     "grabowski_checkout_cleanup",
@@ -303,6 +305,14 @@
     {
       "module": "grabowski_checkout_binding_reconciler",
       "source": "src/grabowski_checkout_binding_reconciler.py"
+    },
+    {
+      "module": "grabowski_checkout_terminal_sources",
+      "source": "src/grabowski_checkout_terminal_sources.py"
+    },
+    {
+      "module": "grabowski_checkout_terminal_reconciliation",
+      "source": "src/grabowski_checkout_terminal_reconciliation.py"
     },
     {
       "module": "grabowski_current_work",
