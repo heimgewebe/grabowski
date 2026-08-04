@@ -114,6 +114,29 @@ class IntentReplacementRoundtripTests(unittest.TestCase):
             verified["verification_receipt_sha256"],
         )
 
+    def test_exact_verified_intent_is_replayed_and_consumable(self) -> None:
+        pending = self.begin(FIRST_INTENT, now=100)
+        verified = self.acknowledge(
+            str(pending["challenge_receipt_sha256"]),
+            now=101,
+        )
+        replay = self.begin(FIRST_INTENT, now=102)
+
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["state"], "verified")
+        self.assertEqual(replay["pending_challenge_count"], 0)
+        self.assertEqual(replay["verified_receipt_count"], 1)
+        self.assertEqual(
+            replay["verification_receipt_sha256"],
+            verified["verification_receipt_sha256"],
+        )
+
+        consumed = self.consume(FIRST_INTENT, now=103)
+        self.assertEqual(
+            consumed["verification_receipt_sha256"],
+            verified["verification_receipt_sha256"],
+        )
+
     def test_verified_replacement_invalidates_only_the_old_intent(self) -> None:
         first = self.begin(FIRST_INTENT, now=100)
         first_verified = self.acknowledge(
