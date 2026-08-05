@@ -54,6 +54,9 @@ SOURCE_CACHE_OWNER_PREFIXES = (
     "system:repobrief-source-cache:",
     "system:repoground-source-cache:",
 )
+SCOPED_CHECKOUT_OPERATIONS = frozenset(
+    {"worktree_create", "agent_workspace_create"}
+)
 
 
 class WorkAdmissionBlocked(RuntimeError):
@@ -406,6 +409,117 @@ def _inert_checkout_for_admission(item: dict[str, Any], *, state: str) -> bool:
         SOURCE_CACHE_OWNER_PREFIXES
     )
 
+
+def _canonical_checkout_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return str(Path(value).expanduser().resolve(strict=False))
+    except OSError:
+        return None
+
+
+def _same_checkout_path(left: Any, right: Any) -> bool:
+    canonical_left = _canonical_checkout_path(left)
+    canonical_right = _canonical_checkout_path(right)
+    return (
+        canonical_left is not None
+        and canonical_right is not None
+        and canonical_left == canonical_right
+    )
+
+
+def _exact_checkout_scope(
+    *,
+    operation: str,
+    requested_scope: dict[str, Any] | None,
+    target_path: str | None,
+    branch: str | None,
+) -> bool:
+    if (
+        operation not in SCOPED_CHECKOUT_OPERATIONS
+        or not isinstance(requested_scope, dict)
+        or not isinstance(target_path, str)
+        or not target_path
+        or not isinstance(branch, str)
+        or not branch
+        or requested_scope.get("branch") != branch
+    ):
+        return False
+    if operation == "worktree_create":
+        paths = requested_scope.get("paths")
+        return (
+            isinstance(paths, list)
+            and len(paths) == 1
+            and _same_checkout_path(paths[0], target_path)
+        )
+    allowed_paths = requested_scope.get("allowed_paths")
+    forbidden_paths = requested_scope.get("forbidden_paths")
+    return (
+        isinstance(allowed_paths, list)
+        and bool(allowed_paths)
+        and all(isinstance(path, str) and path for path in allowed_paths)
+        and isinstance(forbidden_paths, list)
+        and all(isinstance(path, str) and path for path in forbidden_paths)
+    )
+
+
+def _normalized_source_kind(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value.strip().lower().replace("_", "-")
+
+
+def _reconciliation_overlaps_scope(
+    row: dict[str, Any],
+    *,
+    target_path: str | None,
+    branch: str | None,
+    source_kind: str | None,
+    source_id: str | None,
+) -> bool:
+    scope_identity_observed = False
+    for key in ("binding_identity", "worktree_identity"):
+        identity = row.get(key)
+        if not isinstance(identity, dict):
+            continue
+        observed_path = _canonical_checkout_path(identity.get("checkout_path"))
+        observed_branches = {
+            value
+            for value in (
+                identity.get("expected_branch"),
+                identity.get("branch"),
+            )
+            if isinstance(value, str) and value
+        }
+        scope_identity_observed = (
+            scope_identity_observed
+            or observed_path is not None
+            or bool(observed_branches)
+        )
+        if target_path is not None and _same_checkout_path(
+            observed_path, target_path
+        ):
+            return True
+        if branch and branch in observed_branches:
+            return True
+    evidence = row.get("evidence")
+    source = evidence.get("source") if isinstance(evidence, dict) else None
+    if isinstance(source, dict):
+        observed_source_id = source.get("id")
+        observed_kind = _normalized_source_kind(source.get("kind"))
+        if isinstance(observed_source_id, str) and observed_source_id:
+            scope_identity_observed = True
+            if source_id and observed_source_id == source_id:
+                requested_kind = _normalized_source_kind(source_kind)
+                return (
+                    requested_kind is None
+                    or observed_kind is None
+                    or requested_kind == observed_kind
+                )
+    return not scope_identity_observed
+
+
 def _foreign_coordination(item: dict[str, Any], owner_id: str) -> list[dict[str, Any]]:
     coordination = item.get("coordination")
     if not isinstance(coordination, dict):
@@ -500,6 +614,12 @@ def assess_repository_admission(
         raise ValueError("owner_id must be a non-empty string")
     if not isinstance(operation, str) or not operation:
         raise ValueError("operation must be a non-empty string")
+    exact_checkout_scope = _exact_checkout_scope(
+        operation=operation,
+        requested_scope=requested_scope,
+        target_path=target_path,
+        branch=branch,
+    )
 
     inventory_error: str | None = None
     reconciliation_error: str | None = None
@@ -584,22 +704,27 @@ def assess_repository_admission(
             blockers.append({"code": "inventory-unobservable", "detail": "malformed worktree row"})
             continue
         path = str(item.get("path") or "")
+        scope_relevant = (
+            not exact_checkout_scope
+            or _same_checkout_path(path, target_path)
+        )
         status = item.get("status") if isinstance(item.get("status"), dict) else {}
         dirty = status.get("dirty")
-        if dirty is True:
-            blockers.append({"code": "dirty-worktree", "path": path})
-        elif dirty is not False:
-            blockers.append({"code": "dirty-state-unobservable", "path": path})
+        if scope_relevant:
+            if dirty is True:
+                blockers.append({"code": "dirty-worktree", "path": path})
+            elif dirty is not False:
+                blockers.append({"code": "dirty-state-unobservable", "path": path})
 
-        foreign = _foreign_coordination(item, owner_id)
-        if foreign:
-            blockers.append(
-                {
-                    "code": "foreign-live-coordination",
-                    "path": path,
-                    "coordination": foreign[:16],
-                }
-            )
+            foreign = _foreign_coordination(item, owner_id)
+            if foreign:
+                blockers.append(
+                    {
+                        "code": "foreign-live-coordination",
+                        "path": path,
+                        "coordination": foreign[:16],
+                    }
+                )
 
         if item.get("is_main"):
             continue
@@ -622,7 +747,7 @@ def assess_repository_admission(
             and requested_scope.get("head") == item.get("head")
         )
         inert_checkout = _inert_checkout_for_admission(item, state=state)
-        if not inert_checkout and not requested_target_checkout:
+        if scope_relevant and not inert_checkout and not requested_target_checkout:
             if len(lifecycle_owners) > 1:
                 blockers.append(
                     {
@@ -696,7 +821,16 @@ def assess_repository_admission(
                 {"code": "reconciliation-unobservable", "detail": "malformed reconciliation row"}
             )
             continue
-        if row.get("blocking"):
+        if row.get("blocking") and (
+            not exact_checkout_scope
+            or _reconciliation_overlaps_scope(
+                row,
+                target_path=target_path,
+                branch=branch,
+                source_kind=source_kind,
+                source_id=source_id,
+            )
+        ):
             blockers.append(
                 {
                     "code": "binding-reconciliation-blocking",
@@ -715,6 +849,7 @@ def assess_repository_admission(
         "repository": repository,
         "owner_id": owner_id,
         "operation": operation,
+        "scope_mode": "exact_checkout" if exact_checkout_scope else "repository",
         "requested_scope": requested_scope,
         "target_path": target_path,
         "branch": branch,
@@ -726,10 +861,14 @@ def assess_repository_admission(
         "reconciliation_sha256": reconciliation.get("snapshot_sha256") if isinstance(reconciliation, dict) else None,
         "read_only": True,
         "next_action": (
-            "run bounded worktree lifecycle convergence before opening the broad lane"
+            "resolve target, branch or source overlap before retry"
+            if exact_checkout_scope and decision != "allow"
+            else "run bounded worktree lifecycle convergence before opening the broad lane"
             if decision == "converge_first"
             else "resolve dirty, unobservable or foreign live overlap before retry"
             if decision == "blocked"
+            else "exact checkout scope is disjoint; unrelated repository hygiene remains outside this lane"
+            if exact_checkout_scope
             else "admission preflight passed"
         ),
         "does_not_establish": [

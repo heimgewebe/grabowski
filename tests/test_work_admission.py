@@ -197,6 +197,212 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertIn("foreign-live-coordination", foreign["blocker_codes"])
         self.assertIn("foreign-retained-worktree", foreign["blocker_codes"])
 
+    def test_exact_disjoint_checkout_ignores_unrelated_repository_hygiene(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = "fix/fresh-target"
+        unrelated = self._linked(
+            state="managed_lifecycle_drift",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        reconciliation = {
+            "bindings": [
+                {
+                    "blocking": True,
+                    "checkout_key": "unrelated",
+                    "state": "orphaned_binding",
+                    "reasons": ["binding-has-no-current-git-worktree-record"],
+                    "binding_identity": {
+                        "checkout_path": str(self.repo.parent / "worktrees" / "old"),
+                        "expected_branch": "fix/old",
+                    },
+                    "evidence": {
+                        "source": {"kind": "bureau-task", "id": "OLD-TASK"}
+                    },
+                }
+            ],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "b" * 64,
+        }
+
+        result = self._assess(
+            [self._main(dirty=True), unrelated],
+            reconciliation=reconciliation,
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["scope_mode"], "exact_checkout")
+        self.assertEqual(result["blockers"], [])
+
+    def test_exact_checkout_still_blocks_target_overlap(self) -> None:
+        target = self._linked(
+            state="retained",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        target_path = str(target["path"])
+        branch = str(target["branch"])
+
+        result = self._assess(
+            [self._main(), target],
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+        )
+
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("dirty-worktree", result["blocker_codes"])
+        self.assertIn("foreign-live-coordination", result["blocker_codes"])
+        self.assertIn("foreign-retained-worktree", result["blocker_codes"])
+
+    def test_exact_checkout_still_blocks_same_branch_and_source(self) -> None:
+        existing = self._linked(
+            state="retained",
+            owner="owner-a",
+            source_id="SAME-TASK",
+        )
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = str(existing["branch"])
+
+        result = self._assess(
+            [self._main(), existing],
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="SAME-TASK",
+        )
+
+        self.assertEqual(result["decision"], "converge_first")
+        self.assertIn("branch-already-bound", result["blocker_codes"])
+        self.assertIn("similar-active-source-binding", result["blocker_codes"])
+
+    def test_exact_checkout_still_blocks_matching_reconciliation(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = "fix/fresh-target"
+        reconciliation = {
+            "bindings": [
+                {
+                    "blocking": True,
+                    "checkout_key": "target",
+                    "state": "binding_identity_drift",
+                    "reasons": ["expected-branch-mismatch"],
+                    "binding_identity": {
+                        "checkout_path": target_path,
+                        "expected_branch": branch,
+                    },
+                }
+            ],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "b" * 64,
+        }
+
+        result = self._assess(
+            [self._main()],
+            reconciliation=reconciliation,
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+        )
+
+        self.assertEqual(result["decision"], "converge_first")
+        self.assertIn("binding-reconciliation-blocking", result["blocker_codes"])
+
+    def test_exact_agent_workspace_ignores_unrelated_repository_hygiene(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "agent-target")
+        branch = "fix/agent-target"
+        unrelated = self._linked(
+            state="completed_retained",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="agent_workspace_create",
+            requested_scope={
+                "allowed_paths": ["src/example.py"],
+                "forbidden_paths": ["src/foreign.py"],
+                "branch": branch,
+            },
+            target_path=target_path,
+            branch=branch,
+            source_kind="operator-obligation",
+            source_id="NEW-OBLIGATION",
+            inventory_loader=lambda _repo: {
+                "worktrees": [self._main(dirty=True), unrelated],
+                "inventory_sha256": "a" * 64,
+            },
+            reconciliation_loader=lambda _repo: {
+                "bindings": [
+                    {
+                        "blocking": True,
+                        "checkout_key": "unrelated",
+                        "state": "orphaned",
+                        "reasons": ["bound checkout missing"],
+                        "binding_identity": {
+                            "checkout_path": str(
+                                self.repo.parent / "worktrees" / "old"
+                            ),
+                            "expected_branch": "fix/old",
+                        },
+                    }
+                ],
+                "pagination": {"has_more": False},
+                "source_snapshot": {"repository_errors": []},
+                "snapshot_sha256": "b" * 64,
+            },
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["scope_mode"], "exact_checkout")
+        self.assertEqual(result["blockers"], [])
+
+    def test_exact_checkout_fails_closed_on_unidentifiable_reconciliation(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = "fix/fresh-target"
+
+        result = self._assess(
+            [self._main()],
+            reconciliation=self._reconciliation(blocking=True),
+            requested_scope={"paths": [target_path], "branch": branch},
+            target_path=target_path,
+            branch=branch,
+        )
+
+        self.assertEqual(result["decision"], "converge_first")
+        self.assertIn("binding-reconciliation-blocking", result["blocker_codes"])
+
+    def test_incomplete_checkout_scope_remains_repository_wide(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "fresh-target")
+        branch = "fix/fresh-target"
+
+        result = self._assess(
+            [self._main(dirty=True)],
+            requested_scope={"branch": branch},
+            target_path=target_path,
+            branch=branch,
+        )
+
+        self.assertEqual(result["scope_mode"], "repository")
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("dirty-worktree", result["blocker_codes"])
+
     def test_clean_detached_source_caches_do_not_block_broad_lane(self) -> None:
         repoground_path = self.repo.parent / ".repoground-sources" / "org__repo__main"
         repobrief_path = self.repo.parent / ".repobrief-sources" / "org__repo__main"
