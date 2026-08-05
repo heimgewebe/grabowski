@@ -17,6 +17,7 @@ except ModuleNotFoundError:
 import grabowski_bureau_intake as bureau
 import grabowski_bureau_leases as bureau_leases
 import grabowski_resources as resources
+import grabowski_work_admission as work_admission
 
 try:
     import grabowski_operator_core as operator
@@ -118,8 +119,14 @@ class RegistryBinding(TypedDict):
 
 
 class BureauPickupError(RuntimeError):
-    def __init__(self, code: str, *, details: dict[str, Any] | None = None) -> None:
-        super().__init__(code)
+    def __init__(
+        self,
+        code: str,
+        *,
+        details: dict[str, Any] | None = None,
+        summary: str | None = None,
+    ) -> None:
+        super().__init__(summary or code)
         self.code = code
         self.details = details or {}
 
@@ -1539,6 +1546,60 @@ def _intent_repository_scope_manifest(
     }
 
 
+def _bounded_work_admission_evidence(assessment: Any) -> dict[str, Any]:
+    if not isinstance(assessment, dict):
+        return {"assessment_present": False}
+    evidence: dict[str, Any] = {"assessment_present": True}
+    for key, limit in (
+        ("kind", 128),
+        ("repository", 1024),
+        ("operation", 256),
+        ("decision", 64),
+        ("next_action", 1024),
+    ):
+        value = assessment.get(key)
+        if isinstance(value, str) and value:
+            evidence[key] = value[:limit]
+    schema_version = assessment.get("schema_version")
+    if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+        evidence["schema_version"] = schema_version
+    assessment_sha256 = assessment.get("assessment_sha256")
+    if isinstance(assessment_sha256, str) and SHA256_RE.fullmatch(assessment_sha256):
+        evidence["assessment_sha256"] = assessment_sha256
+    blocker_codes = assessment.get("blocker_codes")
+    if isinstance(blocker_codes, list):
+        evidence["blocker_codes"] = [
+            value[:128]
+            for value in blocker_codes[:16]
+            if isinstance(value, str) and value
+        ]
+    raw_blockers = assessment.get("blockers")
+    if isinstance(raw_blockers, list):
+        evidence["blocker_count"] = len(raw_blockers)
+        evidence["blockers_truncated"] = len(raw_blockers) > 16
+        blockers: list[dict[str, str]] = []
+        for raw in raw_blockers[:16]:
+            if not isinstance(raw, dict):
+                continue
+            bounded: dict[str, str] = {}
+            for key, limit in (
+                ("code", 128),
+                ("detail", 1024),
+                ("path", 1024),
+                ("state", 128),
+                ("checkout_key", 256),
+                ("owner_id", 256),
+                ("resource_key", 1024),
+            ):
+                value = raw.get(key)
+                if isinstance(value, str) and value:
+                    bounded[key] = value[:limit]
+            if bounded:
+                blockers.append(bounded)
+        evidence["blockers"] = blockers
+    return evidence
+
+
 def _acquisition_groups(
     intent: dict[str, Any], request: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1662,13 +1723,26 @@ def _acquire_groups(
             _write_bound_json(run_dir / f"lease-acquired-{index:02d}.json", entry)
     except Exception as exc:
         released = _compensate_acquisitions(owner_id, acquired, run_dir)
+        details: dict[str, Any] = {
+            "error_type": type(exc).__name__,
+            "acquired_group_count": len(acquired),
+            "compensation": released,
+        }
+        summary = None
+        if isinstance(exc, work_admission.WorkAdmissionBlocked):
+            summary = "lease-acquisition-work-admission-blocked"
+            details.update(
+                {
+                    "cause_code": "work-admission-blocked",
+                    "work_admission": _bounded_work_admission_evidence(
+                        exc.assessment
+                    ),
+                }
+            )
         raise BureauPickupError(
             "lease-acquisition-failed",
-            details={
-                "error_type": type(exc).__name__,
-                "acquired_group_count": len(acquired),
-                "compensation": released,
-            },
+            details=details,
+            summary=summary,
         ) from exc
     flattened = [
         lease
