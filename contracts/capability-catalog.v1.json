@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "5caccfc58f79c489df82e26a66e501a24eefb6b092dee439cd292bd960533a53",
+  "capability_source_sha256": "6f176d0f0e9a97aa871d49e26f69289ca1d65f93690e8fd294502db502eb5722",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "430e895a652f7c0923f30881fed677ebb99e53c6d039fa0961510d0c5ba70f07",
+  "contract_sha256": "1f08f8b19cf4e561d1b858279ab4f64ce52f9ac1e9cdc2a38ecefcec456cab52",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -504,6 +504,22 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_current_work"
+    },
+    {
+      "category": "work-coordination",
+      "description": "Atomically acquire a lane, narrow leases and an exact isolated worktree.",
+      "effects": [
+        "resource-lease",
+        "git-worktree-create",
+        "checkout-lifecycle-bind",
+        "lane-receipt-create"
+      ],
+      "id": "grabowski_work_acquire",
+      "purpose": "Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree.",
+      "read_only": false,
+      "reversibility": "pre-effect lease compensation; created worktree retained for explicit closeout",
+      "risk_class": "high",
+      "tool": "grabowski_work_acquire"
     },
     {
       "category": "repository-observation",
@@ -2252,10 +2268,10 @@
     },
     {
       "category": "agent-workspace",
-      "description": "Keep all authoritative work direct; rank agents only as advisory reviewers.",
+      "description": "Keep controller integration authoritative while allowing lane-scoped writers.",
       "effects": [],
       "id": "grabowski_coding_agent_route",
-      "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
+      "purpose": "Keep controller integration authoritative and recommend explicit lane-scoped writers or independent reviewers by role.",
       "read_only": true,
       "reversibility": "not-applicable",
       "risk_class": "low",

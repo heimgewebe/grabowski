@@ -116,15 +116,15 @@ class CodingAgentRouterCliTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(coding["decision"], "controller")
         self.assertEqual(coding["controller"], "grabowski-primary")
-        self.assertEqual(coding["primary_role"], "direct-writer")
-        self.assertTrue(coding["external_primary_writer_forbidden"])
-        self.assertFalse(coding["automatic_execution_authorized"])
+        self.assertEqual(coding["primary_role"], "controller-integrator")
+        self.assertFalse(coding["external_primary_writer_forbidden"])
+        self.assertTrue(coding["automatic_execution_authorized"])
 
         status, review = self._main(
             ["recommend", "--task-class", "security-review"]
         )
         self.assertEqual(status, 0)
-        self.assertEqual(review["primary_role"], "direct-reviewer")
+        self.assertEqual(review["primary_role"], "controller-reviewer")
         self.assertTrue(review["external_primary_reviewer_forbidden"])
 
     def test_probe_preserves_history_and_status_binds_deployment_catalog(self) -> None:

@@ -651,7 +651,7 @@
       "minimum_comparable_runs": 5,
       "prior_strength": 8
     },
-    "automatic_execution_authorized": false,
+    "automatic_execution_authorized": true,
     "controller_owned_task_classes": [
       "ambiguous",
       "system",
@@ -665,16 +665,17 @@
     "direct_work_policy": {
       "applies_to_all_implementation_sizes": true,
       "canonical_primary": "grabowski-primary",
-      "capacity_fallback_to_external_writer": false,
+      "capacity_fallback_to_external_writer": true,
       "contrast_authority": "advisory_only",
       "contrast_requires_explicit_request": true,
-      "direct_implementation_required": true,
+      "direct_implementation_required": false,
       "external_agent_roles": [
-        "review",
-        "contrast"
+        "scoped_writer",
+        "reviewer",
+        "observer"
       ],
       "external_primary_reviewer_forbidden": true,
-      "external_primary_writer_forbidden": true,
+      "external_primary_writer_forbidden": false,
       "operator_owns": [
         "state-inspection",
         "planning",
@@ -686,7 +687,11 @@
         "deployment",
         "closeout"
       ],
-      "review_authority": "advisory_until_operator_verification"
+      "review_authority": "advisory_until_operator_verification",
+      "delegated_scoped_writers_allowed": true,
+      "single_mutating_writer_scope": "overlapping-resource-lane",
+      "controller_integration_required": true,
+      "operator_ownership_semantics": "controller-accountability-not-exclusive-execution"
     },
     "effort_levels": {
       "high": 2,
@@ -702,7 +707,7 @@
       "secrets"
     ],
     "exploration_rate_low_risk": 0.05,
-    "external_results_advisory": true,
+    "external_results_advisory": false,
     "final_integrator": "grabowski-primary",
     "forbidden_api_key_env": [
       "OPENAI_API_KEY",
@@ -715,8 +720,8 @@
     "frontier_model_policy": {
       "benchmark_prior_not_local_truth": true,
       "escalation_route": "codex-sol-xhigh",
-      "opus_role": "Upper-frontier Anthropic review via the Claude Pro baseline; live alias resolves to Claude Opus 5. Never an authoritative writer.",
-      "principle": "Grabowski/ChatGPT performs every authoritative implementation directly, independent of size. External frontier models are ranked only for advisory review or explicitly requested isolated contrast work.",
+      "opus_role": "Upper-frontier Anthropic reviewer through the Claude Pro baseline; review remains advisory unless separately delegated as a scoped writer lane.",
+      "principle": "The controller owns authoritative integration and closeout. Explicitly lane-bound scoped writers may implement and publish PRs; reviewer and observer results remain advisory.",
       "same_task_peer_use": true,
       "top_contrast_routes": [
         "codex-sol-high"
@@ -840,7 +845,52 @@
       "quota_exhaustion_action": "block_and_surface",
       "route_selection": "quality_and_task_fit_within_remaining_subscription_baselines",
       "traffic_balancing_by_provider": false
-    }
+    },
+    "automatic_execution_authorization_scope": "trusted-owner-or-explicit-mandate",
+    "agent_roles": {
+      "controller": {
+        "authoritative": true,
+        "may_delegate": true,
+        "owns": [
+          "planning",
+          "integration",
+          "merge",
+          "deployment",
+          "closeout"
+        ]
+      },
+      "scoped_writer": {
+        "authoritative_within_lane": true,
+        "allowed_effects": [
+          "implement",
+          "test",
+          "commit",
+          "push",
+          "pull-request-create-or-update"
+        ],
+        "forbidden_without_delegation": [
+          "merge",
+          "deployment",
+          "bureau-terminalization"
+        ],
+        "requires": [
+          "explicit-lane",
+          "resource-scope",
+          "controller-binding"
+        ]
+      },
+      "reviewer": {
+        "authoritative": false,
+        "read_only": true,
+        "mode": "advisory"
+      },
+      "observer": {
+        "authoritative": false,
+        "read_only": true,
+        "mode": "evidence"
+      }
+    },
+    "external_results_authority": "role-dependent"
   },
   "quota_pools": {
     "antigravity-account": {

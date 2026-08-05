@@ -283,6 +283,7 @@ def _route_capabilities_from_partitions(
     contrast_only = route.get("contrast_only") is True
     review_only = route.get("review_only") is True
     direct_capable = controller
+    scoped_writer_capable = bool(route.get("task_classes")) and not controller and not review_only
     contrast_capable = bool(contrast_capabilities) and not controller and not review_only
     review_capable = (
         bool(review_capabilities)
@@ -291,30 +292,35 @@ def _route_capabilities_from_partitions(
         and not contrast_only
     )
     if direct_capable:
-        route_role = "direct-operator"
-    elif contrast_capable and review_capable:
-        route_role = "contrast-reviewer"
-    elif contrast_capable:
-        route_role = "contrast"
+        route_role = "controller"
+        authority_role = "controller"
+    elif scoped_writer_capable:
+        route_role = "scoped-writer"
+        authority_role = "scoped_writer"
     elif review_capable:
         route_role = "reviewer"
+        authority_role = "reviewer"
     else:
-        route_role = "none"
-    agent_roles = []
+        route_role = "observer"
+        authority_role = "observer"
+    advisory_modes = []
     if contrast_capable:
-        agent_roles.append("contrast")
+        advisory_modes.append("contrast")
     if review_capable:
-        agent_roles.append("review")
+        advisory_modes.append("review")
     return {
         "route_role": route_role,
-        "agent_roles": agent_roles,
+        "authority_role": authority_role,
+        "agent_roles": [authority_role],
+        "advisory_modes": advisory_modes,
         "contrast_only": contrast_only,
         "review_only": review_only,
         "direct_capable": direct_capable,
-        "writer_capable": direct_capable,
+        "scoped_writer_capable": scoped_writer_capable,
+        "writer_capable": direct_capable or scoped_writer_capable,
         "contrast_capable": contrast_capable,
         "review_capable": review_capable,
-        "writer_capabilities": list(route.get("task_classes", [])) if direct_capable else [],
+        "writer_capabilities": list(route.get("task_classes", [])) if direct_capable or scoped_writer_capable else [],
         "contrast_capabilities": contrast_capabilities if contrast_capable else [],
         "review_capabilities": review_capabilities if review_capable else [],
     }
@@ -469,10 +475,14 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
         if (
             route.get("enabled") is True
             and route.get("controller") is not True
-            and not (capabilities["contrast_capable"] or capabilities["review_capable"])
+            and not (
+                capabilities["scoped_writer_capable"]
+                or capabilities["contrast_capable"]
+                or capabilities["review_capable"]
+            )
         ):
             raise CodingAgentRouterError(
-                f"{identifier}: enabled external route has no review or contrast capability"
+                f"{identifier}: enabled external route has no scoped-writer, review or contrast capability"
             )
 
         quality_class = route.get("quality_class")
@@ -586,21 +596,42 @@ def _validate_catalog(catalog: dict[str, Any]) -> dict[str, Any]:
             "catalog direct_work_policy canonical_primary must equal controller_route"
         )
     required_direct_booleans = {
-        "direct_implementation_required": True,
+        "direct_implementation_required": False,
         "applies_to_all_implementation_sizes": True,
-        "external_primary_writer_forbidden": True,
+        "external_primary_writer_forbidden": False,
         "external_primary_reviewer_forbidden": True,
-        "capacity_fallback_to_external_writer": False,
+        "capacity_fallback_to_external_writer": True,
         "contrast_requires_explicit_request": True,
+        "delegated_scoped_writers_allowed": True,
+        "controller_integration_required": True,
     }
     for key, expected in required_direct_booleans.items():
         if direct_policy.get(key) is not expected:
             raise CodingAgentRouterError(
                 f"catalog direct_work_policy {key} must be {str(expected).lower()}"
             )
-    if direct_policy.get("external_agent_roles") != ["review", "contrast"]:
+    if direct_policy.get("external_agent_roles") != ["scoped_writer", "reviewer", "observer"]:
         raise CodingAgentRouterError(
-            "catalog direct_work_policy external_agent_roles must be review and contrast"
+            "catalog direct_work_policy external_agent_roles must be scoped_writer, reviewer and observer"
+        )
+    if direct_policy.get("single_mutating_writer_scope") != "overlapping-resource-lane":
+        raise CodingAgentRouterError(
+            "catalog direct_work_policy single_mutating_writer_scope is invalid"
+        )
+    roles = catalog["policy"].get("agent_roles")
+    if not isinstance(roles, dict) or set(roles) != {"controller", "scoped_writer", "reviewer", "observer"}:
+        raise CodingAgentRouterError("catalog agent_roles must define the four canonical authority roles")
+    if catalog["policy"].get("automatic_execution_authorized") is not True:
+        raise CodingAgentRouterError(
+            "catalog automatic_execution_authorized must be true for the owner mandate"
+        )
+    if catalog["policy"].get("automatic_execution_authorization_scope") != "trusted-owner-or-explicit-mandate":
+        raise CodingAgentRouterError(
+            "catalog automatic execution scope is invalid"
+        )
+    if direct_policy.get("operator_ownership_semantics") != "controller-accountability-not-exclusive-execution":
+        raise CodingAgentRouterError(
+            "catalog operator ownership semantics are invalid"
         )
     if direct_policy.get("contrast_authority") != "advisory_only":
         raise CodingAgentRouterError(
@@ -1812,7 +1843,11 @@ def grabowski_coding_agent_catalog(include_disabled: bool = False) -> dict[str, 
         "harnesses": catalog["harnesses"],
         "quota_pools": catalog["quota_pools"],
         "task_classes": catalog["task_classes"],
-        "automatic_execution_authorized": False,
+        "automatic_execution_authorized": True,
+        "automatic_execution_authorization_scope": catalog["policy"].get(
+            "automatic_execution_authorization_scope"
+        ),
+        "agent_roles": catalog["policy"].get("agent_roles"),
         "does_not_establish": [
             "execution_authority",
             "model_benchmark_superiority",
@@ -1833,7 +1868,7 @@ def grabowski_coding_agent_route(
     latency_priority: bool = False,
     need_review: bool = False,
 ) -> dict[str, Any]:
-    """Keep all authoritative work direct; rank agents only as advisory reviewers."""
+    """Keep controller integration authoritative while allowing lane-scoped writers."""
     catalog, validation = _load_catalog()
     (
         task_value,
@@ -1873,25 +1908,71 @@ def grabowski_coding_agent_route(
         "need_review": review_value,
     }
 
+    scoped_writer_allowed = not direct_review_task and task_value not in controller_owned
+    scoped_writer: dict[str, Any] | None = None
+    scoped_writer_fallbacks: list[dict[str, Any]] = []
+    scoped_writer_status = "controller-only" if not scoped_writer_allowed else "not-evaluated"
+    scoped_writer_state_error_type: str | None = None
     reviewers: list[dict[str, Any]] = []
     review_fallbacks: list[dict[str, Any]] = []
     excluded: dict[str, list[str]] = {}
     review_status = "not-requested"
     review_state_error_type: str | None = None
-    if external_review_requested:
-        state, review_state_error_type = _load_optional_advisory_state()
-        if review_state_error_type is not None:
-            review_status = "router-state-invalid"
-            excluded["reviewer:state"] = [review_state_error_type]
-        elif not state:
-            review_status = "router-state-unavailable"
-        elif state.get("catalog_sha256") != validation["catalog_sha256"]:
-            review_status = "router-state-catalog-mismatch"
-        elif not _state_catalog_fresh(state):
-            review_status = "router-state-stale"
-        else:
+
+    state: dict[str, Any] | None = None
+    state_status = "not-required"
+    state_error_type: str | None = None
+    route_derivations: dict[str, dict[str, Any]] | None = None
+    if scoped_writer_allowed or external_review_requested:
+        state, state_status, state_error_type = _current_contrast_state(catalog, validation)
+        if state is not None:
             try:
                 route_derivations = _route_derivations(catalog)
+            except (AttributeError, CodingAgentRouterError, KeyError, TypeError, ValueError) as exc:
+                state = None
+                state_status = "router-state-invalid"
+                state_error_type = type(exc).__name__
+
+    if scoped_writer_allowed:
+        scoped_writer_status = state_status
+        scoped_writer_state_error_type = state_error_type
+        if state is not None and route_derivations is not None:
+            try:
+                ranked_writers, writer_excluded = _rank_routes(
+                    task_value,
+                    catalog,
+                    state,
+                    reviewer=False,
+                    previous_group=None,
+                    previous_provider=None,
+                    route_derivations=route_derivations,
+                    **common,
+                )
+            except (AttributeError, CodingAgentRouterError, KeyError, TypeError, ValueError) as exc:
+                scoped_writer_status = "router-state-invalid"
+                scoped_writer_state_error_type = type(exc).__name__
+                excluded["scoped-writer:state"] = [scoped_writer_state_error_type]
+            else:
+                excluded.update(
+                    {
+                        f"scoped-writer:{route_id}": reasons
+                        for route_id, reasons in writer_excluded.items()
+                    }
+                )
+                if ranked_writers:
+                    scoped_writer = ranked_writers[0]
+                    scoped_writer_fallbacks = ranked_writers[1:6]
+                    scoped_writer_status = "recommended"
+                else:
+                    scoped_writer_status = "no-eligible-scoped-writer"
+        elif state_error_type is not None:
+            excluded["scoped-writer:state"] = [state_error_type]
+
+    if external_review_requested:
+        review_status = state_status
+        review_state_error_type = state_error_type
+        if state is not None and route_derivations is not None:
+            try:
                 ranked, review_excluded = _rank_routes(
                     review_task_class,
                     catalog,
@@ -1902,13 +1983,7 @@ def grabowski_coding_agent_route(
                     route_derivations=route_derivations,
                     **common,
                 )
-            except (
-                AttributeError,
-                CodingAgentRouterError,
-                KeyError,
-                TypeError,
-                ValueError,
-            ) as exc:
+            except (AttributeError, CodingAgentRouterError, KeyError, TypeError, ValueError) as exc:
                 review_state_error_type = type(exc).__name__
                 review_status = "router-state-invalid"
                 excluded["reviewer:state"] = [review_state_error_type]
@@ -1925,14 +2000,16 @@ def grabowski_coding_agent_route(
                     review_status = "recommended"
                 else:
                     review_status = "no-independent-review-route"
+        elif state_error_type is not None:
+            excluded["reviewer:state"] = [state_error_type]
 
-    primary_role = "direct-reviewer" if direct_review_task else "direct-writer"
+    primary_role = "controller-reviewer" if direct_review_task else "controller-integrator"
     if direct_review_task:
-        reason = "direct operator review is canonical; external review is supplementary"
+        reason = "controller review is canonical; external review is supplementary"
     elif task_value in controller_owned:
         reason = "controller-owned task class"
     else:
-        reason = "direct implementation is canonical for every task size"
+        reason = "controller integration is canonical; implementation may be delegated to a scoped writer"
     body = {
         "schema_version": 2,
         "decision": "controller",
@@ -1942,13 +2019,21 @@ def grabowski_coding_agent_route(
         "controller": controller_id,
         "reason": reason,
         "input": input_value,
-        "direct_work_required": True,
+        "direct_work_required": False,
         "direct_review_required": direct_review_task,
-        "direct_implementation_required": True,
-        "external_primary_writer_forbidden": True,
+        "direct_implementation_required": False,
+        "controller_integration_required": True,
+        "delegated_scoped_writers_allowed": True,
+        "external_primary_writer_forbidden": False,
         "external_primary_reviewer_forbidden": True,
-        "capacity_fallback_to_external_writer": False,
+        "capacity_fallback_to_external_writer": True,
         "operator_owns": catalog["policy"]["direct_work_policy"]["operator_owns"],
+        "scoped_writer_allowed": scoped_writer_allowed,
+        "scoped_writer": scoped_writer,
+        "scoped_writer_fallbacks": scoped_writer_fallbacks,
+        "scoped_writer_status": scoped_writer_status,
+        "scoped_writer_state_error_type": scoped_writer_state_error_type,
+        "work_acquire_tool": "grabowski_work_acquire",
         "reviewers": reviewers,
         "review_fallbacks": review_fallbacks,
         "review_status": review_status,
@@ -1970,11 +2055,17 @@ def grabowski_coding_agent_route(
             "automatic_patch_apply": False,
         },
         "single_mutating_writer": True,
+        "single_mutating_writer_scope": "overlapping-resource-lane",
         "single_authoritative_mutating_writer": True,
-        "authoritative_implementation_remains_direct": True,
+        "authoritative_implementation_remains_direct": False,
+        "delegated_writer_artifacts_require_controller_integration": True,
         "final_integrator": catalog["policy"]["final_integrator"],
-        "automatic_execution_authorized": False,
-        "external_results_advisory": True,
+        "automatic_execution_authorized": True,
+        "automatic_execution_authorization_scope": catalog["policy"].get(
+            "automatic_execution_authorization_scope"
+        ),
+        "external_results_advisory": catalog["policy"].get("external_results_advisory", True),
+        "external_results_authority": catalog["policy"].get("external_results_authority"),
         "excluded": excluded,
         "does_not_establish": [
             "execution_authority",

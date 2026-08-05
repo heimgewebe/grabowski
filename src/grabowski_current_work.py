@@ -37,7 +37,7 @@ CHECKOUT_LIFECYCLE_PHASES = {
     "externally_terminal_missing",
 }
 CURRENT_WORK_VIEWS = {"current", "history"}
-PROJECTION_STATES = {"active", "blocking", "resumable", "terminal_archived", "unknown"}
+PROJECTION_STATES = {"active", "blocking", "resumable", "hygiene", "terminal_archived", "unknown"}
 ATTENTION_BLOCKING_CLASSIFICATIONS = {"actionable", "outcome_unknown", "invalid_evidence"}
 ATTENTION_RESUMABLE_CLASSIFICATIONS = {"decision_deferred"}
 ATTENTION_ARCHIVED_CLASSIFICATIONS = {"decision_closed", "decision_superseded"}
@@ -155,6 +155,7 @@ def _group(work_id: str, kind: str, binding_id: str) -> dict[str, Any]:
         "work_id": work_id,
         "binding": {"kind": kind, "id": binding_id},
         "binding_status": "unbound",
+        "work_class": "operational",
         "projection_state": "unknown",
         "action_required": False,
         "action_reasons": [],
@@ -187,7 +188,14 @@ def _ensure(
 def _set_projection_state(group: dict[str, Any], state: str) -> None:
     if state not in PROJECTION_STATES:
         raise CurrentWorkProjectionError(f"unsupported projection state: {state}")
-    priority = {"unknown": 0, "terminal_archived": 1, "resumable": 2, "active": 3, "blocking": 4}
+    priority = {
+        "unknown": 0,
+        "terminal_archived": 1,
+        "hygiene": 2,
+        "resumable": 3,
+        "active": 4,
+        "blocking": 5,
+    }
     if priority[state] >= priority[group["projection_state"]]:
         group["projection_state"] = state
 
@@ -195,6 +203,15 @@ def _set_projection_state(group: dict[str, Any], state: str) -> None:
 def _blocking(group: dict[str, Any], reason: str) -> None:
     group["action_required"] = True
     _set_projection_state(group, "blocking")
+    if reason and reason not in group["action_reasons"]:
+        group["action_reasons"].append(reason)
+
+
+def _hygiene(group: dict[str, Any], reason: str) -> None:
+    group["work_class"] = "hygiene"
+    group["action_required"] = True
+    if group["projection_state"] not in {"active", "blocking", "resumable"}:
+        group["projection_state"] = "hygiene"
     if reason and reason not in group["action_reasons"]:
         group["action_reasons"].append(reason)
 
@@ -566,7 +583,14 @@ def _task_has_more(payload: dict[str, Any] | None) -> bool:
 
 
 def _sort_key(group: dict[str, Any]) -> tuple[int, int, str]:
-    rank = {"blocking": 0, "active": 1, "resumable": 2, "unknown": 3, "terminal_archived": 4}.get(group["projection_state"], 5)
+    rank = {
+        "blocking": 0,
+        "active": 1,
+        "resumable": 2,
+        "unknown": 3,
+        "hygiene": 4,
+        "terminal_archived": 5,
+    }.get(group["projection_state"], 6)
     return rank, -int(group["latest_activity_unix"]), group["work_id"]
 
 
@@ -1044,6 +1068,7 @@ def _add_binding_reconciliation(
             )
         work_id = f"checkout:{checkout_key}"
         group = groups.get(work_id)
+        historical_only = group is None and raw.get("worktree_identity") is None
         if group is None:
             work_id = f"checkout-binding:{checkout_key}"
             group = _ensure(groups, work_id, "checkout-binding", checkout_key)
@@ -1068,7 +1093,10 @@ def _add_binding_reconciliation(
         group["source_states"].append(
             f"checkout-binding-reconciliation:{state}"
         )
-        _blocking(group, f"checkout-binding-{state}")
+        if historical_only:
+            _hygiene(group, f"checkout-binding-{state}")
+        else:
+            _blocking(group, f"checkout-binding-{state}")
         for reason in sorted(set(reasons_raw)):
             if len(group["action_reasons"]) >= MAX_EVIDENCE:
                 break
@@ -1384,6 +1412,16 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "priority": 1,
         }
 
+    # Historical reconciliation without a current authority or physical surface is
+    # hygiene.  It remains visible but must not displace operative work.
+    if projection_state == "hygiene":
+        return {
+            "convergence_stage": "hygiene",
+            "next_convergence_action": "process historical checkout-binding hygiene separately",
+            "finishable_chain": False,
+            "priority": 5,
+        }
+
     # Fallbacks for active/blocking/resumable states
     if projection_state == "blocking":
         reason_str = ", ".join(sorted(action_reasons)[:2]) or "unresolved evidence"
@@ -1412,14 +1450,14 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
             "convergence_stage": "terminal_archived",
             "next_convergence_action": "none: work group terminal and cleaned",
             "finishable_chain": False,
-            "priority": 5,
+            "priority": 6,
         }
 
     return {
         "convergence_stage": "unknown",
         "next_convergence_action": "inspect work group bindings and authority references",
         "finishable_chain": False,
-        "priority": 6,
+        "priority": 7,
     }
 
 
@@ -1670,6 +1708,7 @@ def build_current_work_projection(
             "blocking_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "blocking"),
             "resumable_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "resumable"),
             "active_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "active"),
+            "hygiene_count": sum(1 for c in chain_candidates if c["convergence_stage"] == "hygiene"),
         },
         "does_not_establish": [
             "a new independently mutable lifecycle or work-state truth",

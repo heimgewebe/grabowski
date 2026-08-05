@@ -9,6 +9,7 @@ import grabowski_operator_core
 import grabowski_checkouts
 import grabowski_checkout_binding_reconciler
 import grabowski_current_work_surface
+import grabowski_work_acquire  # noqa: F401
 import grabowski_operator_optimization
 import grabowski_runtime_extensions
 import grabowski_audit_query
