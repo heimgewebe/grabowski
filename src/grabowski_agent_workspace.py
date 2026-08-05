@@ -7735,6 +7735,16 @@ def _workspace_cleanup_plan_data(
                         "blocking_counts": coordination.get("blocking_counts", {}),
                     }
                 )
+            # Remote security is required only for checkout-cleanup apply, not for
+            # workspace archival. Surface observation for operators; do not block
+            # the archive-eligible plan phase on it.
+            remote = checkouts._remote_secured_observation(record)
+            checkout_state["remote_secured"] = bool(remote.get("remote_secured"))
+            checkout_state["remote_secured_refs"] = list(
+                remote.get("remote_secured_refs") or []
+            )
+            if remote.get("error"):
+                checkout_state["remote_secured_error"] = remote.get("error")
         except Exception as exc:
             blockers.append(
                 {
@@ -9931,8 +9941,10 @@ def grabowski_agent_workspace_cleanup(
         )
         cleanup_plan = dry_run["plan"]
         if not cleanup_plan.get("safe_to_apply"):
+            blockers = cleanup_plan.get("cleanup_blockers") or []
             raise AgentWorkspaceActionError(
-                "checkout cleanup dry run acquired new blockers"
+                "checkout cleanup dry run acquired new blockers: "
+                f"{blockers}"
             )
         dry_run_record = dry_run["dry_run_record"]
         with _lock(identifier):
