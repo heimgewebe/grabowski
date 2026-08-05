@@ -19,15 +19,11 @@ BINDING = {
     "registered_names_sha256": "b" * 64,
     "agent_instructions_sha256": "c" * 64,
 }
-META_SCOPE = {"kind": "connector_session", "label": "mcp-client-1-session-1"}
-OTHER_SCOPE = {"kind": "connector_session", "label": "mcp-client-2-session-2"}
-SESSION_POOL_SCOPE = {
-    "kind": "connector_session",
-    "label": "mcp-client-pool-session",
+META_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-1"}
+SHARED_SCOPE = {
+    "kind": "shared_unlabeled",
+    "label": roundtrip.SHARED_UNLABELED_SCOPE,
 }
-# Alias for older concurrent-handshake tests inside one session.
-SHARED_SCOPE = SESSION_POOL_SCOPE
-
 
 
 class TransportGripIntegrationTests(unittest.TestCase):
@@ -76,7 +72,7 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertEqual(ack["status"], "passed")
         self.assertEqual(ack["output"]["state"], "verified")
         self.assertTrue(ack["output"]["mutation_gate_open"])
-        self.assertEqual(ack["output"]["client_scope_kind"], "connector_session")
+        self.assertEqual(ack["output"]["client_scope_kind"], "client_declared_meta")
         self.assertEqual(
             [item["status"] for item in ack["receipt"]["checks"][-4:]],
             ["pass", "pass", "pass", "pass"],
@@ -119,9 +115,8 @@ class TransportGripIntegrationTests(unittest.TestCase):
             for item in grips.list_grips(profile="operator")
             if item["name"] == "transport-roundtrip"
         )
-        self.assertEqual(contract["version"], "1.2")
+        self.assertEqual(contract["version"], "1.1")
         self.assertIn("exact-target-bound", contract["acceptance_ids"])
-        self.assertIn("connector-session-bound", contract["acceptance_ids"])
         for fragment in ("target_tool_name", "target_arguments"):
             self.assertIn(fragment, contract["summary"])
             self.assertIn(fragment, contract["recovery_path"])
@@ -213,7 +208,13 @@ class CentralTransportGateTests(unittest.TestCase):
     def configured_operator(self):
         operator = _load_operator_module()
         operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
-        operator.base._transport_roundtrip_client_scope = lambda context: META_SCOPE
+        operator.base._transport_roundtrip_client_scope = (
+            lambda context: (
+                META_SCOPE
+                if getattr(context, "client_id", None)
+                else SHARED_SCOPE
+            )
+        )
         operator.mcp._tool_manager.get_tool = lambda _name: self.mutating_tool()
         operator._configure_http_runtime()
         return operator
@@ -258,12 +259,11 @@ class CentralTransportGateTests(unittest.TestCase):
             arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
         )
 
-    def test_session_pool_admits_two_independent_handshakes(self) -> None:
+    def test_stateless_shared_scope_admits_two_independent_handshakes(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name) / "state"
         operator = self.configured_operator()
-        operator.base._transport_roundtrip_client_scope = lambda context: SHARED_SCOPE
         transport = operator.grabowski_transport_roundtrip
         with mock.patch.object(
             transport, "STATE_ROOT", root
@@ -290,9 +290,7 @@ class CentralTransportGateTests(unittest.TestCase):
                     runtime_binding=BINDING,
                 )
 
-            context = types.SimpleNamespace(
-                client_id="pool", session_id="session-pool"
-            )
+            context = types.SimpleNamespace(client_id=None)
             first = asyncio.run(
                 operator.mcp._tool_manager.call_tool(
                     "write", {"sequence": 1}, context
@@ -314,16 +312,15 @@ class CentralTransportGateTests(unittest.TestCase):
                     )
                 )
 
-    def test_bound_session_verification_bootstraps_exact_handshake_without_theft(
+    def test_bound_shared_verification_bootstraps_exact_handshake_without_theft(
         self,
     ) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name) / "state"
         operator = self.configured_operator()
-        operator.base._transport_roundtrip_client_scope = lambda context: SHARED_SCOPE
         transport = operator.grabowski_transport_roundtrip
-        context = types.SimpleNamespace(client_id="pool", session_id="session-pool")
+        context = types.SimpleNamespace(client_id=None)
         arguments = {"sequence": 1}
         arguments_sha256 = transport.canonical_arguments_sha256(arguments)
         with (
@@ -455,75 +452,24 @@ class CentralTransportGateTests(unittest.TestCase):
                 )
             )
 
-    def test_missing_connector_session_identity_fails_closed_before_consumption(
-        self,
-    ) -> None:
-        import grabowski_mcp as live_base
-
-        operator = _load_operator_module()
-        operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
-        operator.base._transport_roundtrip_client_scope = (
-            live_base._transport_roundtrip_client_scope
-        )
-        operator.mcp._tool_manager.get_tool = lambda _name: self.mutating_tool()
-        operator._configure_http_runtime()
+    def test_missing_meta_uses_explicit_shared_unlabeled_scope(self) -> None:
+        operator = self.configured_operator()
         context = types.SimpleNamespace(client_id=None)
         with mock.patch.object(
-            operator.grabowski_transport_roundtrip, "consume_verified"
-        ) as consume_verified, mock.patch.object(
-            operator.grabowski_transport_roundtrip, "begin"
-        ) as begin:
-            with self.assertRaisesRegex(
-                RuntimeError, "connector session identity is unavailable"
-            ):
-                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
-        consume_verified.assert_not_called()
-        begin.assert_not_called()
-
-    def test_runtime_scope_binds_protocol_session_identity(self) -> None:
-        import grabowski_mcp as live_base
-
-        context = types.SimpleNamespace(
-            client_id="mcp-client-1",
-            session_id="protocol-session-abc",
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            return_value={"state": "consumed"},
+        ) as consume_verified:
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool("write", {}, context)
+            )
+        self.assertTrue(result["called"])
+        consume_verified.assert_called_once_with(
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="write",
+            arguments_sha256=roundtrip.canonical_arguments_sha256({}),
         )
-        scope = live_base._transport_roundtrip_client_scope(context)
-        expected = roundtrip.derive_connector_session_scope(
-            client_id="mcp-client-1",
-            connector_session_id="protocol-session-abc",
-            server_instance_id=live_base._TRANSPORT_SERVER_INSTANCE_ID,
-        )
-        self.assertEqual(scope, expected)
-        self.assertEqual(scope["kind"], "connector_session")
-
-    def test_runtime_scope_reads_mcp_session_id_header(self) -> None:
-        import grabowski_mcp as live_base
-
-        request = types.SimpleNamespace(
-            headers={"mcp-session-id": "header-session-xyz"}
-        )
-        request_context = types.SimpleNamespace(request=request)
-
-        class ContextWithoutSessionId:
-            client_id = None
-
-            def __init__(self) -> None:
-                self.request_context = request_context
-
-        scope = live_base._transport_roundtrip_client_scope(ContextWithoutSessionId())
-        expected = roundtrip.derive_connector_session_scope(
-            client_id=None,
-            connector_session_id="header-session-xyz",
-            server_instance_id=live_base._TRANSPORT_SERVER_INSTANCE_ID,
-        )
-        self.assertEqual(scope, expected)
-
-    def test_read_only_status_without_live_session_reports_unavailable(self) -> None:
-        import grabowski_mcp as live_base
-
-        status = live_base._transport_roundtrip_status(None)
-        self.assertEqual(status["state"], "unavailable")
-        self.assertFalse(status["mutation_gate_open"])
 
 
 class StaleServingProcessGateTests(unittest.TestCase):
@@ -612,15 +558,17 @@ class StaleServingProcessGateTests(unittest.TestCase):
         )
 
 
-class ConnectorSessionIsolationBoundaryTests(unittest.TestCase):
-    """Two connector sessions remain strictly isolated.
+class SharedPartitionEffectBoundaryTests(unittest.TestCase):
+    """The declared boundary of a shared, unlabeled storage partition.
 
-    Identical target arguments never admit a foreign session. Admission is
-    at most once, consumption receipts are distinct, and a failed effect leaves
-    no reusable proof.
+    shared_unlabeled is a storage partition, never a caller identity. Two
+    unlabeled callers of the same exact intent are indistinguishable by
+    construction. What the contract must still guarantee for them is
+    at-most-once admission of the effect, a distinct consumption receipt per
+    admission, and no reusable proof once an admission was spent.
     """
 
-    INTENT_ARGUMENTS = {"path": "/tmp/session-target"}
+    INTENT_ARGUMENTS = {"path": "/tmp/shared-target"}
 
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -634,14 +582,10 @@ class ConnectorSessionIsolationBoundaryTests(unittest.TestCase):
         self.lock_patch.start()
         self.addCleanup(self.root_patch.stop)
         self.addCleanup(self.lock_patch.stop)
-        self.owner_scope = META_SCOPE
-        self.foreign_scope = OTHER_SCOPE
 
-    def bind(
-        self, arguments: dict[str, object], *, scope: dict[str, str]
-    ) -> None:
+    def bind(self, arguments: dict[str, object]) -> None:
         begun = roundtrip.begin(
-            client_scope=scope,
+            client_scope=SHARED_SCOPE,
             runtime_binding=BINDING,
             mutation_intent={
                 "tool_name": "write",
@@ -649,61 +593,48 @@ class ConnectorSessionIsolationBoundaryTests(unittest.TestCase):
             },
         )
         roundtrip.acknowledge(
-            client_scope=scope,
+            client_scope=SHARED_SCOPE,
             challenge_receipt_sha256=begun["challenge_receipt_sha256"],
             runtime_binding=BINDING,
         )
 
-    def consume(
-        self, arguments: dict[str, object], *, scope: dict[str, str]
-    ) -> dict[str, object]:
+    def consume(self, arguments: dict[str, object]) -> dict[str, object]:
         return roundtrip.consume_verified(
-            client_scope=scope,
+            client_scope=SHARED_SCOPE,
             runtime_binding=BINDING,
             tool_name="write",
             arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
         )
 
-    def test_foreign_session_cannot_consume_owner_verification(self) -> None:
-        self.bind(self.INTENT_ARGUMENTS, scope=self.owner_scope)
-        with self.assertRaises(roundtrip.TransportRoundtripRequired):
-            self.consume(self.INTENT_ARGUMENTS, scope=self.foreign_scope)
-        consumed = self.consume(self.INTENT_ARGUMENTS, scope=self.owner_scope)
-        self.assertEqual(consumed["state"], "consumed")
+    def test_shared_scope_is_declared_a_partition_not_an_identity(self) -> None:
+        self.bind(self.INTENT_ARGUMENTS)
+        consumed = self.consume(self.INTENT_ARGUMENTS)
         self.assertIn(
-            "that identical target arguments alone admit a mutation",
+            "caller identity: shared_unlabeled is a shared storage partition, "
+            "not an identity",
             consumed["does_not_establish"],
         )
-
-    def test_foreign_session_cannot_ack_owner_challenge(self) -> None:
-        begun = roundtrip.begin(
-            client_scope=self.owner_scope,
-            runtime_binding=BINDING,
-            mutation_intent={
-                "tool_name": "write",
-                "arguments_sha256": roundtrip.canonical_arguments_sha256(
-                    self.INTENT_ARGUMENTS
-                ),
-            },
+        status = roundtrip.status(
+            client_scope=SHARED_SCOPE, runtime_binding=BINDING
         )
-        with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
-            roundtrip.acknowledge(
-                client_scope=self.foreign_scope,
-                challenge_receipt_sha256=begun["challenge_receipt_sha256"],
-                runtime_binding=BINDING,
-            )
+        self.assertIn(
+            "that two unlabeled callers of the same exact intent are "
+            "distinguishable",
+            status["does_not_establish"],
+        )
 
-    def test_second_consume_of_one_intent_is_refused(self) -> None:
-        self.bind(self.INTENT_ARGUMENTS, scope=self.owner_scope)
-        self.consume(self.INTENT_ARGUMENTS, scope=self.owner_scope)
+    def test_second_unlabeled_caller_of_one_intent_is_refused(self) -> None:
+        """One admission per handshake, even though the callers are alike."""
+        self.bind(self.INTENT_ARGUMENTS)
+        self.consume(self.INTENT_ARGUMENTS)
         with self.assertRaises(roundtrip.TransportRoundtripRequired):
-            self.consume(self.INTENT_ARGUMENTS, scope=self.owner_scope)
+            self.consume(self.INTENT_ARGUMENTS)
 
     def test_each_admission_carries_a_distinct_consumption_receipt(self) -> None:
-        self.bind(self.INTENT_ARGUMENTS, scope=self.owner_scope)
-        first = self.consume(self.INTENT_ARGUMENTS, scope=self.owner_scope)
-        self.bind(self.INTENT_ARGUMENTS, scope=self.owner_scope)
-        second = self.consume(self.INTENT_ARGUMENTS, scope=self.owner_scope)
+        self.bind(self.INTENT_ARGUMENTS)
+        first = self.consume(self.INTENT_ARGUMENTS)
+        self.bind(self.INTENT_ARGUMENTS)
+        second = self.consume(self.INTENT_ARGUMENTS)
         self.assertNotEqual(
             first["consumption_receipt_sha256"],
             second["consumption_receipt_sha256"],
@@ -714,16 +645,21 @@ class ConnectorSessionIsolationBoundaryTests(unittest.TestCase):
         )
 
     def test_a_failed_effect_leaves_no_reusable_proof(self) -> None:
-        """Admission is consumed before the effect, so failure cannot replay."""
+        """Admission is consumed before the effect, so failure cannot replay.
+
+        This is the ambiguity contract: a lost response and a failed effect are
+        indistinguishable to the gate, and both must leave the caller without a
+        spendable proof.
+        """
         operator = _load_operator_module()
         operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
-        operator.base._transport_roundtrip_client_scope = (
-            lambda context: self.owner_scope
-        )
+        operator.base._transport_roundtrip_client_scope = lambda context: SHARED_SCOPE
 
         async def exploding_effect(*_args: object, **_kwargs: object):
             raise RuntimeError("effect failed after admission")
 
+        # Replace the underlying effect before the gate wraps it, so the
+        # admission is genuinely spent and only then does the effect fail.
         operator.mcp._tool_manager.call_tool = exploding_effect
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=True,
@@ -733,7 +669,7 @@ class ConnectorSessionIsolationBoundaryTests(unittest.TestCase):
         operator._configure_http_runtime()
         gated = operator.mcp._tool_manager.call_tool
 
-        self.bind(self.INTENT_ARGUMENTS, scope=self.owner_scope)
+        self.bind(self.INTENT_ARGUMENTS)
         with mock.patch.object(
             operator.grabowski_transport_roundtrip, "STATE_ROOT", self.root
         ), mock.patch.object(
@@ -744,147 +680,14 @@ class ConnectorSessionIsolationBoundaryTests(unittest.TestCase):
                     gated(
                         "write",
                         dict(self.INTENT_ARGUMENTS),
-                        types.SimpleNamespace(
-                            client_id="owner", session_id="session-owner"
-                        ),
+                        types.SimpleNamespace(client_id=None),
                     )
                 )
+            # The verification was spent before the effect ran, so no proof
+            # survives the failure.
             with self.assertRaises(roundtrip.TransportRoundtripRequired):
-                self.consume(self.INTENT_ARGUMENTS, scope=self.owner_scope)
+                self.consume(self.INTENT_ARGUMENTS)
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
-
-
-class DualConnectorSessionHarnessTests(unittest.TestCase):
-    """Revision-bound two-client harness without a live ChatGPT connector.
-
-    Two logical connector sessions complete begin/ack/mutation through the real
-    transport engine and the central gate. Cross-session theft is refused.
-    """
-
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name) / "state"
-        self.root_patch = mock.patch.object(roundtrip, "STATE_ROOT", self.root)
-        self.lock_patch = mock.patch.object(
-            roundtrip, "LOCK_PATH", self.root / ".lock"
-        )
-        self.root_patch.start()
-        self.lock_patch.start()
-        self.addCleanup(self.root_patch.stop)
-        self.addCleanup(self.lock_patch.stop)
-        self.client_a = roundtrip.derive_connector_session_scope(
-            client_id="client-a",
-            connector_session_id="session-a",
-            server_instance_id="harness-server",
-        )
-        self.client_b = roundtrip.derive_connector_session_scope(
-            client_id="client-b",
-            connector_session_id="session-b",
-            server_instance_id="harness-server",
-        )
-        self.arguments = {"path": "/tmp/dual-client", "content": "proof"}
-
-    def handshake(
-        self, transport: object, scope: dict[str, str]
-    ) -> dict[str, object]:
-        # Use wall-clock time so the central gate (which does not freeze time)
-        # still sees a current verification.
-        begun = transport.begin(
-            client_scope=scope,
-            runtime_binding=BINDING,
-            mutation_intent={
-                "tool_name": "write",
-                "arguments_sha256": transport.canonical_arguments_sha256(
-                    self.arguments
-                ),
-            },
-        )
-        return transport.acknowledge(
-            client_scope=scope,
-            challenge_receipt_sha256=begun["challenge_receipt_sha256"],
-            runtime_binding=BINDING,
-        )
-
-    def test_two_clients_complete_isolated_three_call_roundtrips(self) -> None:
-        operator = _load_operator_module()
-        transport = operator.grabowski_transport_roundtrip
-        operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
-        scopes = {"session-a": self.client_a, "session-b": self.client_b}
-        operator.base._transport_roundtrip_client_scope = (
-            lambda context: scopes[str(getattr(context, "session_id"))]
-        )
-        calls: list[str] = []
-
-        async def effect(name: str, arguments: dict[str, object], context: object):
-            del arguments, context
-            calls.append(str(name))
-            return {"called": True, "name": name}
-
-        operator.mcp._tool_manager.call_tool = effect
-        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
-            is_async=True,
-            context_kwarg="ctx",
-            annotations=types.SimpleNamespace(readOnlyHint=False),
-        )
-        operator._configure_http_runtime()
-        gated = operator.mcp._tool_manager.call_tool
-
-        with mock.patch.object(
-            transport, "STATE_ROOT", self.root
-        ), mock.patch.object(
-            transport, "LOCK_PATH", self.root / ".lock"
-        ):
-            ack_a = self.handshake(transport, self.client_a)
-            ack_b = self.handshake(transport, self.client_b)
-            self.assertTrue(ack_a["mutation_gate_open"])
-            self.assertTrue(ack_b["mutation_gate_open"])
-            self.assertNotEqual(
-                ack_a["client_scope_sha256"], ack_b["client_scope_sha256"]
-            )
-            self.assertNotEqual(
-                ack_a["verification_receipt_sha256"],
-                ack_b["verification_receipt_sha256"],
-            )
-            # Sanity: owner scope still has an unconsumed verification.
-            status_a = transport.status(
-                client_scope=self.client_a, runtime_binding=BINDING
-            )
-            self.assertTrue(status_a["mutation_gate_open"])
-            self.assertEqual(status_a["verified_receipt_count"], 1)
-
-            result_a = asyncio.run(
-                gated(
-                    "write",
-                    dict(self.arguments),
-                    types.SimpleNamespace(client_id="client-a", session_id="session-a"),
-                )
-            )
-            # Client B still holds its own verification after A mutated.
-            result_b = asyncio.run(
-                gated(
-                    "write",
-                    dict(self.arguments),
-                    types.SimpleNamespace(client_id="client-b", session_id="session-b"),
-                )
-            )
-            # Replaying A without a new handshake fails closed before effect.
-            with self.assertRaisesRegex(
-                RuntimeError, "fresh intent-bound transport verification required"
-            ):
-                asyncio.run(
-                    gated(
-                        "write",
-                        dict(self.arguments),
-                        types.SimpleNamespace(
-                            client_id="client-a", session_id="session-a"
-                        ),
-                    )
-                )
-
-        self.assertTrue(result_a["called"])
-        self.assertTrue(result_b["called"])
-        self.assertEqual(calls, ["write", "write"])
 
 
 if __name__ == "__main__":

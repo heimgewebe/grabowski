@@ -169,10 +169,7 @@ CONSUMER_VIEWS = consumer_surface.CONSUMER_VIEWS
 CONSUMER_VIEW_ALIASES = consumer_surface.CONSUMER_VIEW_ALIASES
 MAX_CONSUMER_FIELDS = consumer_surface.MAX_CONSUMER_FIELDS
 MAX_CONSUMER_CURSOR_BYTES = consumer_surface.MAX_CONSUMER_CURSOR_BYTES
-# Stateful Streamable HTTP so mcp-session-id is a stable connector identity
-# across begin, ack and the bound mutation. Idle timeout stays unset to avoid
-# bulk session-cleanup waves.
-HTTP_STATELESS_MODE = False
+HTTP_STATELESS_MODE = True
 HTTP_LOG_LEVEL = "WARNING"
 HTTP_TRANSPORT_VERBOSE_LOGGERS = (
     "mcp.server.lowlevel.server",
@@ -492,13 +489,8 @@ def _require_transport_roundtrip_for_tool(
             "readOnlyHint annotation"
         )
     _require_current_serving_process()
-    try:
-        # Missing connector-session identity fails closed before any handshake
-        # state is created or consumed.
-        client_scope = base._transport_roundtrip_client_scope(context)
-        runtime_binding = base._transport_roundtrip_runtime_binding()
-    except RuntimeError as exc:
-        raise RuntimeError(str(exc)) from exc
+    client_scope = base._transport_roundtrip_client_scope(context)
+    runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
         arguments_sha256 = (
             grabowski_transport_roundtrip.canonical_arguments_sha256(

@@ -326,13 +326,12 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
-        version="1.2",
+        version="1.1",
         summary=(
-            "Issue or acknowledge one challenge bound to the connector session, "
-            "runtime contract, exact target tool and canonical argument digest, so "
-            "the central operator gate admits that one mutation and nothing else. "
-            "action=begin requires target_tool_name and target_arguments; action=ack "
-            "requires the exact challenge_receipt_sha256."
+            "Issue or acknowledge one challenge bound to the exact target tool and "
+            "canonical argument digest, so the central operator gate admits that one "
+            "mutation and nothing else. action=begin requires target_tool_name and "
+            "target_arguments; action=ack requires the exact challenge_receipt_sha256."
         ),
         effect=MUTATING,
         required_parameters=("action",),
@@ -341,7 +340,6 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "runtime-contract-bound",
             "response-roundtrip",
             "exact-target-bound",
-            "connector-session-bound",
             "private-receipt-persisted",
         ),
         runner="transport_roundtrip",
@@ -557,9 +555,7 @@ GRIP_SURFACE_TARGETS = {
     "bureau-pickup-status": "one coordinated Bureau pickup status and lease projection",
     "bureau-pickup-release": "one terminal coordinated pickup lease release",
     "connector-snapshot-bind": "one connector client snapshot receipt",
-    "transport-roundtrip": (
-        "one connector-session, runtime and exact-target-bound transport roundtrip"
-    ),
+    "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
     "gate-evidence-preflight": "one fail-closed gate evidence preparation",
     "convergence-state-classify": "bounded historical convergence state records",
@@ -595,13 +591,11 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "never substitute generic resource release or force-release"
     ),
     "transport-roundtrip": (
-        "ensure the same connector session identity is presented for begin, ack and "
-        "the bound mutation; run action=begin with the exact target_tool_name and "
-        "target_arguments, then action=ack with the returned challenge_receipt_sha256, "
-        "then invoke that exact unchanged call once; a verification admits only that "
-        "target for that connector session, is consumed before the effect runs, "
-        "changes no product target, and grants no retry authority after a later "
-        "ambiguous mutation"
+        "run action=begin with the exact target_tool_name and target_arguments, then "
+        "action=ack with the returned challenge_receipt_sha256, then invoke that exact "
+        "unchanged call once; a verification admits only that target, is consumed before "
+        "the effect runs, changes no product target, and grants no retry authority after "
+        "a later ambiguous mutation"
     ),
 }
 # Conditional requirements cannot be expressed as static required_parameters,
@@ -612,8 +606,6 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
         "an unbound begin is refused fail-closed",
         "action=ack requires challenge_receipt_sha256 and must not carry "
         "target_tool_name or target_arguments",
-        "begin, ack and the bound mutation must share one connector_session "
-        "scope derived from protocol session identity and server instance",
     ),
 }
 MECHANIC_NORMAL_GRIPS = frozenset(
@@ -2950,12 +2942,6 @@ def _run_transport_roundtrip(
         "exact-target-bound",
         "pass" if output.get("mutation_intent_bound") else "fail",
         f"{output.get('target_tool_name')}:{output.get('target_arguments_sha256')}",
-    )
-    _check(
-        receipt,
-        "connector-session-bound",
-        "pass" if output.get("client_scope_kind") == "connector_session" else "fail",
-        f"{output.get('client_scope_kind')}:{output.get('client_scope_sha256')}",
     )
     receipt_hash = output.get("verification_receipt_sha256") or output.get(
         "challenge_receipt_sha256"
