@@ -254,6 +254,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_audit_query": ("audit_read",),
     "grabowski_audit_trace": ("audit_read",),
     "grabowski_audit_analyze": ("audit_read",),
+    "grabowski_reposkop_effectiveness": ("audit_read",),
     "latest_complete_bundles": ("bundle_registry",),
     "repoground_bundle_discover": ("bundle_registry",),
     "repoground_bundle_status": ("bundle_registry",),

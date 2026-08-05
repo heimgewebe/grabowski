@@ -13,6 +13,7 @@ import grabowski_work_acquire  # noqa: F401
 import grabowski_operator_optimization
 import grabowski_runtime_extensions
 import grabowski_audit_query
+import grabowski_reposkop_effectiveness  # noqa: F401
 import grabowski_read_surface
 import grabowski_self_deploy
 import grabowski_fleet

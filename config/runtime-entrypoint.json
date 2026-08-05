@@ -22,6 +22,7 @@
     "grabowski_audit_query",
     "grabowski_audit_trace",
     "grabowski_audit_analyze",
+    "grabowski_reposkop_effectiveness",
     "latest_complete_bundles",
     "repoground_bundle_discover",
     "repoground_bundle_status",
@@ -318,6 +319,10 @@
     {
       "module": "grabowski_audit_query",
       "source": "src/grabowski_audit_query.py"
+    },
+    {
+      "module": "grabowski_reposkop_effectiveness",
+      "source": "src/grabowski_reposkop_effectiveness.py"
     },
     {
       "module": "grabowski_checkouts",

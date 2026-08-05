@@ -33,6 +33,7 @@ import grabowski_command_identity as command_identity
 import grabowski_lifecycle_projection as lifecycle_projection
 import grabowski_sqlite_store as sqlite_store
 import grabowski_terminal_convergence as terminal_convergence
+import grabowski_reposkop_effectiveness as reposkop_effectiveness
 try:
     import grabowski_operator_core as operator
 except ModuleNotFoundError:
@@ -935,9 +936,9 @@ TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
     "attention": ("interrupted", "outcome_unknown", "failed", "timed_out", "signalled"),
     "terminal": ("completed", "failed", "cancelled", "timed_out", "signalled"),
 }
-MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex", "opencode", "openhands"})
-READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
-REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION = 1
+MUTATING_AGENT_EXECUTABLES = reposkop_effectiveness.AGENT_EXECUTABLES
+READ_ONLY_AGENT_MODES = reposkop_effectiveness.READ_ONLY_AGENT_MODES
+REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION = reposkop_effectiveness.POLICY_VERSION
 REPOSKOP_EXECUTION_ATTESTATION_KIND = (
     "grabowski.task_reposkop_execution_attestation"
 )
@@ -2604,6 +2605,20 @@ def _record_reposkop_execution_attestation(
     except (TypeError, json.JSONDecodeError):
         return None
     value = launcher.get("reposkop_execution_attestation")
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _record_task_effect_classification(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        launcher = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    value = launcher.get("task_effect_classification")
     return dict(value) if isinstance(value, dict) else None
 
 
@@ -4705,6 +4720,15 @@ def _apply_terminalization_projection(
             (receipt_sha256, task_id),
         )
         connection.commit()
+    reposkop_effectiveness.record_task_outcome(
+        marker_root=TASK_OUTCOMES_DIR / ".reposkop-outcomes",
+        attestation=_record_reposkop_execution_attestation(updated),
+        task_id=task_id,
+        terminal_state=state,
+        lifecycle_receipt_sha256=receipt_sha256,
+        terminalized_at_unix=int(updated["terminalized_at_unix"]),
+        observation=observation,
+    )
     resources.complete_task_terminalization(
         task_id,
         transition_sha256,
@@ -6038,6 +6062,7 @@ def grabowski_task_start(
     supersedes_task_id: str = "",
     supersedes_receipt_sha256: str = "",
     force_new_reason: str = "",
+    effect_profile: str | None = None,
     _retry_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
@@ -6059,6 +6084,17 @@ def grabowski_task_start(
         target=target,
         cwd=working_directory,
         enabled=runtime_python,
+    )
+    mutating_agent_workspace = _mutating_agent_workspace(
+        host,
+        command,
+        cwd=working_directory,
+    )
+    task_effect_classification = reposkop_effectiveness.classify_task_effect(
+        transport=str(target["transport"]),
+        argv=command,
+        mutating_workspace=mutating_agent_workspace,
+        explicit_effect_profile=effect_profile,
     )
     runtime = operator._job_runtime(runtime_seconds)
     policy = _validate_resume_policy(resume_policy)
@@ -6092,6 +6128,11 @@ def grabowski_task_start(
     )
     reused_record = operation_resolution["reuse"]
     if reused_record is not None:
+        reused_attestation = _record_reposkop_execution_attestation(reused_record)
+        reused_classification = (
+            _record_task_effect_classification(reused_record)
+            or task_effect_classification
+        )
         reuse_audit = {
             "timestamp_unix": _now(),
             "operation": "task-start-deduplicated",
@@ -6101,6 +6142,22 @@ def grabowski_task_start(
             "operation_identity_sha256": normalized_operation_identity[
                 "operation_identity_sha256"
             ],
+            "effect_profile": reused_classification["effect_profile"],
+            "reposkop_policy": reused_classification["reposkop_policy"],
+            "surface": reused_classification["surface"],
+            "agent_executable": reused_classification.get("agent_executable"),
+            "policy_version": reused_classification["policy_version"],
+            "evaluation_id": (
+                reused_attestation.get("evaluation_id")
+                if reused_attestation is not None
+                else None
+            ),
+            "reposkop_reuse_status": (
+                "reused_existing_evaluation"
+                if reused_attestation is not None
+                and reused_attestation.get("evaluation_id")
+                else "legacy_unattested"
+            ),
             "no_process_started": True,
         }
         base._append_audit(reuse_audit)
@@ -6112,9 +6169,8 @@ def grabowski_task_start(
             "routing_shadow_capture": None,
             "operation_identity": normalized_operation_identity,
             "operation_retry_binding": None,
-            "reposkop_execution_attestation": (
-                _record_reposkop_execution_attestation(reused_record)
-            ),
+            "reposkop_execution_attestation": reused_attestation,
+            "task_effect_classification": reused_classification,
             "deduplicated_reuse": {
                 "reused": True,
                 "task_id": str(reused_record["task_id"]),
@@ -6123,11 +6179,6 @@ def grabowski_task_start(
         }
     operation_retry_binding = operation_resolution["retry_binding"]
     requested_resources = _resource_keys(resource_keys)
-    mutating_agent_workspace = _mutating_agent_workspace(
-        host,
-        command,
-        cwd=working_directory,
-    )
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
         command,
@@ -6244,6 +6295,37 @@ def grabowski_task_start(
         execution_backend=execution_backend,
         systemd_scope=systemd_scope,
     )
+    reposkop_evaluation_id: str | None = None
+    reposkop_checkout_binding_sha256: str | None = None
+    if task_effect_classification["reposkop_policy"] == "required":
+        if mutating_agent_workspace is None:
+            raise RuntimeError("required Reposkop task has no local workspace")
+        if (
+            repository_scope_manifest is not None
+            and repository_scope_manifest["repository"]
+            == mutating_agent_workspace
+        ):
+            checkout_head = str(repository_scope_manifest["head"])
+            checkout_branch = str(repository_scope_manifest["branch"])
+        else:
+            checkout_head, checkout_branch = _workspace_scope_identity(
+                mutating_agent_workspace
+            )
+        reposkop_checkout_binding_sha256 = _sha256_json(
+            {
+                "schema_version": 1,
+                "workspace": mutating_agent_workspace,
+                "head": checkout_head,
+                "branch": checkout_branch,
+            }
+        )
+        reposkop_evaluation_id = reposkop_effectiveness.evaluation_id(
+            task_id=task_id,
+            execution_identity_sha256=execution_identity["identity_sha256"],
+            checkout_binding_sha256=reposkop_checkout_binding_sha256,
+            argv_sha256=argv_sha256,
+            policy_version=int(task_effect_classification["policy_version"]),
+        )
     active_execution_reuse = None
     if (
         normalized_operation_identity is None
@@ -6256,6 +6338,13 @@ def grabowski_task_start(
             resume_policy=policy,
         )
     if active_execution_reuse is not None:
+        reused_attestation = _record_reposkop_execution_attestation(
+            active_execution_reuse
+        )
+        reused_classification = (
+            _record_task_effect_classification(active_execution_reuse)
+            or task_effect_classification
+        )
         reuse_audit = {
             "timestamp_unix": _now(),
             "operation": "task-start-execution-deduplicated",
@@ -6263,6 +6352,22 @@ def grabowski_task_start(
             "reused_task_id": str(active_execution_reuse["task_id"]),
             "reuse_reason": "active_execution_identity",
             "execution_identity_sha256": execution_identity["identity_sha256"],
+            "effect_profile": reused_classification["effect_profile"],
+            "reposkop_policy": reused_classification["reposkop_policy"],
+            "surface": reused_classification["surface"],
+            "agent_executable": reused_classification.get("agent_executable"),
+            "policy_version": reused_classification["policy_version"],
+            "evaluation_id": (
+                reused_attestation.get("evaluation_id")
+                if reused_attestation is not None
+                else None
+            ),
+            "reposkop_reuse_status": (
+                "reused_existing_evaluation"
+                if reused_attestation is not None
+                and reused_attestation.get("evaluation_id")
+                else "legacy_unattested"
+            ),
             "no_process_started": True,
         }
         base._append_audit(reuse_audit)
@@ -6276,9 +6381,8 @@ def grabowski_task_start(
             "routing_shadow_capture": None,
             "operation_identity": None,
             "operation_retry_binding": None,
-            "reposkop_execution_attestation": (
-                _record_reposkop_execution_attestation(active_execution_reuse)
-            ),
+            "reposkop_execution_attestation": reused_attestation,
+            "task_effect_classification": reused_classification,
             "deduplicated_reuse": {
                 "reused": True,
                 "task_id": str(active_execution_reuse["task_id"]),
@@ -6331,7 +6435,35 @@ def grabowski_task_start(
             metadata=lease_metadata,
         )
     reposkop_execution_attestation: dict[str, Any] | None = None
-    if mutating_agent_workspace is not None:
+    reposkop_requested_audit_ref: str | None = None
+    reposkop_completed_audit_ref: str | None = None
+    reposkop_decision_audit_ref: str | None = None
+    reposkop_event_identity = (
+        {
+            "transaction_id": reposkop_evaluation_id,
+            "evaluation_id": reposkop_evaluation_id,
+            "task_id": task_id,
+            "effect_profile": task_effect_classification["effect_profile"],
+            "reposkop_policy": task_effect_classification["reposkop_policy"],
+            "surface": task_effect_classification["surface"],
+            "agent_executable": task_effect_classification.get(
+                "agent_executable"
+            ),
+            "policy_version": task_effect_classification["policy_version"],
+            "argv_sha256": argv_sha256,
+            "execution_identity_sha256": execution_identity[
+                "identity_sha256"
+            ],
+            "checkout_binding_sha256": (
+                reposkop_checkout_binding_sha256
+            ),
+        }
+        if reposkop_evaluation_id is not None
+        else None
+    )
+    if task_effect_classification["reposkop_policy"] == "required":
+        if mutating_agent_workspace is None or reposkop_event_identity is None:
+            raise RuntimeError("required Reposkop task lacks evaluation identity")
         try:
             if lease_result is None:
                 raise RuntimeError(
@@ -6353,7 +6485,21 @@ def grabowski_task_start(
                         "write-capable agent workspace lease evidence is "
                         "missing, foreign or expired"
                     )
-            reposkop_execution_attestation = _attest_mutating_agent_workspace(
+            reposkop_requested_audit_ref = (
+                reposkop_effectiveness.append_event(
+                    {
+                        "timestamp_unix": _now(),
+                        "operation": "reposkop-evaluation-requested",
+                        **reposkop_event_identity,
+                        "workspace_lease_resource_keys": (
+                            workspace_lease_resource_keys
+                        ),
+                        "baseline_decision": "allow_without_reposkop",
+                    }
+                )
+            )
+            reposkop_started_ns = time.monotonic_ns()
+            raw_attestation = _attest_mutating_agent_workspace(
                 workspace=mutating_agent_workspace,
                 task_id=task_id,
                 lease_owner_id=lease_owner,
@@ -6366,7 +6512,143 @@ def grabowski_task_start(
                     "identity_sha256"
                 ],
             )
+            reposkop_duration_ms = max(
+                0,
+                (time.monotonic_ns() - reposkop_started_ns) // 1_000_000,
+            )
+            reposkop_execution_attestation = (
+                reposkop_effectiveness.enrich_attestation(
+                    raw_attestation,
+                    evaluation=reposkop_evaluation_id,
+                    classification=task_effect_classification,
+                    checkout_binding_sha256=(
+                        reposkop_checkout_binding_sha256
+                    ),
+                    duration_ms=reposkop_duration_ms,
+                )
+            )
+            finding_summary = reposkop_execution_attestation[
+                "finding_summary"
+            ]
+            reposkop_completed_audit_ref = (
+                reposkop_effectiveness.append_event(
+                    {
+                        "timestamp_unix": _now(),
+                        "operation": "reposkop-evaluation-completed",
+                        **reposkop_event_identity,
+                        "status": "verified",
+                        "duration_ms": reposkop_duration_ms,
+                        "reposkop_executable_sha256": (
+                            reposkop_execution_attestation[
+                                "reposkop_executable_sha256"
+                            ]
+                        ),
+                        "report_sha256": reposkop_execution_attestation[
+                            "report_sha256"
+                        ],
+                        "observation_sha256": (
+                            reposkop_execution_attestation[
+                                "observation_sha256"
+                            ]
+                        ),
+                        "projection_sha256": (
+                            reposkop_execution_attestation[
+                                "projection_sha256"
+                            ]
+                        ),
+                        "repository_identity_sha256": (
+                            reposkop_execution_attestation[
+                                "repository_identity_sha256"
+                            ]
+                        ),
+                        "checkout_identity_sha256": (
+                            reposkop_execution_attestation[
+                                "checkout_identity_sha256"
+                            ]
+                        ),
+                        "usage_key_sha256": (
+                            reposkop_execution_attestation[
+                                "usage_key_sha256"
+                            ]
+                        ),
+                        "usage_receipt_sha256": (
+                            reposkop_execution_attestation[
+                                "usage_receipt_sha256"
+                            ]
+                        ),
+                        "requested_audit_ref": (
+                            reposkop_requested_audit_ref
+                        ),
+                        **finding_summary,
+                    }
+                )
+            )
+            reposkop_decision_audit_ref = (
+                reposkop_effectiveness.append_event(
+                    {
+                        "timestamp_unix": _now(),
+                        "operation": "reposkop-decision-applied",
+                        **reposkop_event_identity,
+                        "baseline_decision": "allow_without_reposkop",
+                        "final_decision": "allow",
+                        "decision_changed": False,
+                        "action": "task_start_allowed",
+                        "rule_ids": ["reposkop-policy-v2"],
+                        "completed_audit_ref": (
+                            reposkop_completed_audit_ref
+                        ),
+                    }
+                )
+            )
+            attestation_material = {
+                key: value
+                for key, value in reposkop_execution_attestation.items()
+                if key != "execution_binding_sha256"
+            }
+            attestation_material.update(
+                {
+                    "requested_audit_ref": (
+                        reposkop_requested_audit_ref
+                    ),
+                    "completed_audit_ref": (
+                        reposkop_completed_audit_ref
+                    ),
+                    "decision_audit_ref": reposkop_decision_audit_ref,
+                }
+            )
+            reposkop_execution_attestation = {
+                **attestation_material,
+                "execution_binding_sha256": _sha256_json(
+                    attestation_material
+                ),
+            }
         except Exception as exc:
+            if reposkop_event_identity is not None:
+                try:
+                    reposkop_decision_audit_ref = (
+                        reposkop_effectiveness.append_event(
+                            {
+                                "timestamp_unix": _now(),
+                                "operation": "reposkop-decision-applied",
+                                **reposkop_event_identity,
+                                "baseline_decision": (
+                                    "allow_without_reposkop"
+                                ),
+                                "final_decision": "block",
+                                "decision_changed": True,
+                                "action": (
+                                    "blocked_before_task_record"
+                                ),
+                                "rule_ids": ["reposkop-policy-v2"],
+                                "failure_class": type(exc).__name__,
+                                "requested_audit_ref": (
+                                    reposkop_requested_audit_ref
+                                ),
+                            }
+                        )
+                    )
+                except Exception:
+                    reposkop_decision_audit_ref = None
             compensation: dict[str, Any] | None = None
             compensation_error: str | None = None
             if task_resources and lease_result is not None:
@@ -6386,6 +6668,8 @@ def grabowski_task_start(
             blocked_audit = {
                 "timestamp_unix": _now(),
                 "operation": "reposkop-execution-attestation-blocked",
+                "transaction_id": reposkop_evaluation_id,
+                "evaluation_id": reposkop_evaluation_id,
                 "task_id": task_id,
                 "host": host,
                 "workspace": mutating_agent_workspace,
@@ -6397,11 +6681,26 @@ def grabowski_task_start(
                 "execution_identity_sha256": execution_identity[
                     "identity_sha256"
                 ],
-                "policy_version": (
-                    REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION
+                "checkout_binding_sha256": (
+                    reposkop_checkout_binding_sha256
                 ),
+                "effect_profile": task_effect_classification[
+                    "effect_profile"
+                ],
+                "reposkop_policy": task_effect_classification[
+                    "reposkop_policy"
+                ],
+                "surface": task_effect_classification["surface"],
+                "agent_executable": task_effect_classification.get(
+                    "agent_executable"
+                ),
+                "policy_version": task_effect_classification[
+                    "policy_version"
+                ],
                 "error_type": type(exc).__name__,
                 "error": _redact_reason(str(exc))[:1024],
+                "requested_audit_ref": reposkop_requested_audit_ref,
+                "decision_audit_ref": reposkop_decision_audit_ref,
                 "lease_compensation": compensation,
                 "lease_compensation_error": compensation_error,
                 "no_task_record_created": True,
@@ -6437,6 +6736,9 @@ def grabowski_task_start(
         "launcher_json": _canonical_json(
             {
                 "pending": True,
+                "task_effect_classification": dict(
+                    task_effect_classification
+                ),
                 **(
                     {"retry_binding": dict(retry_binding)}
                     if retry_binding is not None
@@ -6514,7 +6816,10 @@ def grabowski_task_start(
                 ],
             )
         raise
-    launcher = _launch(record)
+    launcher = {
+        **_launch(record),
+        "task_effect_classification": dict(task_effect_classification),
+    }
     if retry_binding is not None:
         launcher = {**launcher, "retry_binding": dict(retry_binding)}
     if normalized_operation_identity is not None:
@@ -6575,8 +6880,25 @@ def grabowski_task_start(
         ),
         "resource_lease_maintenance": lease_maintenance,
         "routing_shadow_capture": routing_shadow_capture,
+        "effect_profile": task_effect_classification["effect_profile"],
+        "reposkop_policy": task_effect_classification["reposkop_policy"],
+        "surface": task_effect_classification["surface"],
+        "agent_executable": task_effect_classification.get(
+            "agent_executable"
+        ),
+        "classification_source": task_effect_classification[
+            "classification_source"
+        ],
+        "policy_version": task_effect_classification["policy_version"],
+        "evaluation_id": reposkop_evaluation_id,
+        "reposkop_checkout_binding_sha256": (
+            reposkop_checkout_binding_sha256
+        ),
+        "reposkop_requested_audit_ref": reposkop_requested_audit_ref,
+        "reposkop_completed_audit_ref": reposkop_completed_audit_ref,
+        "reposkop_decision_audit_ref": reposkop_decision_audit_ref,
         "reposkop_execution_attestation_required": (
-            mutating_agent_workspace is not None
+            task_effect_classification["reposkop_policy"] == "required"
         ),
         "reposkop_execution_attestation_sha256": (
             reposkop_execution_attestation[
@@ -6608,6 +6930,7 @@ def grabowski_task_start(
         "operation_identity": normalized_operation_identity,
         "operation_retry_binding": operation_retry_binding,
         "reposkop_execution_attestation": reposkop_execution_attestation,
+        "task_effect_classification": task_effect_classification,
         "deduplicated_reuse": None,
     }
 
@@ -7594,6 +7917,11 @@ def _terminal_retry_successor(
             int(context["pr_number"])
             if isinstance(context.get("pr_number"), int)
             else None
+        ),
+        effect_profile=(
+            (_record_task_effect_classification(record) or {}).get(
+                "effect_profile"
+            )
         ),
         _retry_context=retry_context,
     )
@@ -8862,6 +9190,7 @@ async def _grabowski_task_start_tool(
     supersedes_task_id: str = "",
     supersedes_receipt_sha256: str = "",
     force_new_reason: str = "",
+    effect_profile: str | None = None,
 ) -> dict[str, Any]:
     """Start one persistent local or fleet task in its own systemd unit.
 
@@ -8893,6 +9222,7 @@ async def _grabowski_task_start_tool(
         supersedes_task_id,
         supersedes_receipt_sha256,
         force_new_reason,
+        effect_profile,
     )
 
 
