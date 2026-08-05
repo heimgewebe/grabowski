@@ -309,6 +309,32 @@ class GitFixture:
         subprocess.run(["git", "commit", "-m", "writer"], cwd=self.writer, check=True, stdout=subprocess.PIPE)
         return run(self.writer, "git", "rev-parse", "HEAD")
 
+    def publish_remote_head(self, head: str, branch: str) -> None:
+        """Expose head on a local remote-tracking ref (cleanup precondition)."""
+        origin = self.repo.parent / "origin.git"
+        if not origin.exists():
+            subprocess.run(
+                ["git", "init", "--bare", str(origin)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(origin)],
+                cwd=self.repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        subprocess.run(
+            ["git", "update-ref", f"refs/remotes/origin/{branch}", head],
+            cwd=self.repo,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
 
 class AgentWorkspaceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -5222,6 +5248,12 @@ class AgentWorkspaceTests(unittest.TestCase):
                 (mature_at, archive["checkout_key"]),
             )
             connection.commit()
+        # Checkout cleanup requires the archived head on local remote-tracking
+        # refs. Success-path fixtures must publish that evidence after grace.
+        head = archive.get("head")
+        branch = archive.get("branch") or "feat/writer"
+        if isinstance(head, str) and head and isinstance(branch, str) and branch:
+            self.git.publish_remote_head(head, branch)
 
     def test_cleanup_plan_marks_closed_clean_linked_worktree_eligible(self) -> None:
         manifest = self._closed_cleanup_manifest()
