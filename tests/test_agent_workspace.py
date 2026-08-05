@@ -238,6 +238,45 @@ def missing_module_preflight(manifest: dict, role_name: str, command: list[str])
     return result
 
 
+def reposkop_context(repo: str, purpose: str) -> dict:
+    def sha(character: str) -> str:
+        return character * 64
+
+    return {
+        "schema_version": 2,
+        "kind": "grabowski_reposkop_context",
+        "effect_authorized": False,
+        "target": {"path": repo, "purpose": purpose},
+        "reposkop": {"sha256": sha("1")},
+        "report": {
+            "schema_version": 2,
+            "kind": "reposkop_coherence_report",
+            "effect_authorized": False,
+            "report_sha256": sha("2"),
+            "observation": {
+                "observation_complete": True,
+                "observation_sha256": sha("3"),
+                "identities": {
+                    "path": repo,
+                    "purpose": purpose,
+                    "repository_identity_sha256": sha("4"),
+                    "checkout_identity_sha256": sha("5"),
+                },
+            },
+            "projection": {
+                "effect_authorized": False,
+                "projection_sha256": sha("6"),
+            },
+        },
+        "usage_receipt": {
+            "path": "/tmp/test-reposkop-workspace-receipt.json",
+            "sha256": sha("7"),
+            "usage_key_sha256": sha("8"),
+            "audit_ref": "audit-record-sha256:" + sha("9"),
+        },
+    }
+
+
 class GitFixture:
     def __init__(self, root: Path) -> None:
         self.repo = root / "repo"
@@ -359,6 +398,13 @@ class AgentWorkspaceTests(unittest.TestCase):
         )
         self.renew_patch.start()
         self.addCleanup(self.renew_patch.stop)
+        self.reposkop_patch = mock.patch.object(
+            workspace.work_admission,
+            "_default_reposkop_context",
+            side_effect=reposkop_context,
+        )
+        self.reposkop_patch.start()
+        self.addCleanup(self.reposkop_patch.stop)
         self.addCleanup(self.temp.cleanup)
 
     def manifest(self, *, with_writer: bool = True) -> dict:
