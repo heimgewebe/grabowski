@@ -280,6 +280,8 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "observed_release_id",
         "observed_agent_instructions_sha256",
         "observed_tools",
+        "cutover_id",
+        "cutover_generation",
         "_server_tool_contract",
         "_server_runtime",
         "_server_agent_instructions_sha256",
@@ -387,11 +389,14 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
                 ],
             }
         )
+    cutover_binding = _optional_cutover_binding(parameters)
     verification_model = (
         "client-declared-server-schema-compared-v2"
         if schema_evidence is not None
         else "client-declared-server-compared-v1"
     )
+    if cutover_binding is not None:
+        verification_model = f"{verification_model}+cutover-rebind-v1"
     receipt: dict[str, Any] = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "kind": SNAPSHOT_KIND,
@@ -407,6 +412,7 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
             "agent_instructions_sha256": instructions_sha256,
         },
         "schema_evidence": schema_evidence,
+        "cutover_binding": cutover_binding,
         "verified": not mismatches,
         "mismatches": mismatches,
         "verification_model": verification_model,
@@ -415,6 +421,7 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
             "that the client invoked every declared tool",
             "client instruction compliance",
             "resistance to compromised same-uid code",
+            "deployment success without a bound cutover receipt",
         ],
     }
     receipt["receipt_sha256"] = _sha256_json(receipt)
@@ -431,11 +438,68 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "receipt_sha256": receipt["receipt_sha256"],
         "verification_model": verification_model,
         "schema_evidence_observed": schema_evidence is not None,
+        "cutover_binding": cutover_binding,
         **schema_probe,
         "recommended_next_action": (
             "none" if not mismatches else "refresh the connector tool snapshot and bind it again"
         ),
         "does_not_establish": list(receipt["does_not_establish"]),
+    }
+
+
+def _optional_cutover_binding(parameters: dict[str, Any]) -> dict[str, Any] | None:
+    cutover_id = parameters.get("cutover_id")
+    cutover_generation = parameters.get("cutover_generation")
+    if cutover_id is None and cutover_generation is None:
+        return None
+    if cutover_id is None or cutover_generation is None:
+        raise ClientSnapshotError(
+            "cutover rebind requires both cutover_id and cutover_generation"
+        )
+    cutover_id_text = _validate_identifier(cutover_id, label="cutover_id")
+    if (
+        isinstance(cutover_generation, bool)
+        or not isinstance(cutover_generation, int)
+        or cutover_generation < 1
+        or cutover_generation > 1_000_000
+    ):
+        raise ClientSnapshotError(
+            "cutover_generation must be an integer from 1 to 1000000"
+        )
+    return {
+        "cutover_id": cutover_id_text,
+        "cutover_generation": cutover_generation,
+        "rebind_role": "blue-green-cutover",
+    }
+
+
+def rebind_for_cutover(
+    parameters: dict[str, Any],
+    *,
+    cutover_id: str,
+    cutover_generation: int,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Bind the connector snapshot as an atomic step of blue-green cutover.
+
+    Snapshot rebind belongs to the cutover, not to a later best-effort refresh.
+    A mismatch remains fail-closed and does not claim connector delivery.
+    """
+    bound_parameters = dict(parameters)
+    bound_parameters["cutover_id"] = cutover_id
+    bound_parameters["cutover_generation"] = cutover_generation
+    result = bind_snapshot(bound_parameters, now_unix=now_unix)
+    if result.get("verified") is not True or result.get("state") != "matched":
+        raise ClientSnapshotError(
+            "cutover snapshot rebind did not match the green runtime contract: "
+            + ",".join(result.get("mismatches") or ["unspecified"])
+        )
+    if not isinstance(result.get("cutover_binding"), dict):
+        raise ClientSnapshotError("cutover snapshot rebind missing cutover binding")
+    return {
+        **result,
+        "cutover_rebind": True,
+        "recommended_next_action": "none",
     }
 
 def _validate_receipt(receipt: dict[str, Any]) -> None:
