@@ -1351,6 +1351,75 @@ class BureauPickupTests(unittest.TestCase):
                 )
         acquire.assert_not_called()
 
+    def test_work_admission_block_is_classified_with_bounded_evidence(self) -> None:
+        repo_key = "repo:/tmp/repository"
+        intent = self.intent([repo_key])
+        intent["workspace"] = {
+            "repository": "/tmp/repository",
+            "source_head_at_intent": "a" * 40,
+            "workspace_branch": "bureau/test-t001/0123456789",
+            "workspace_path": "/tmp/worktrees/BUR-RUN-20260724T120000Z-0123456789",
+        }
+        blockers = [
+            {
+                "code": "dirty-worktree",
+                "path": f"/tmp/repository-worktree-{index}",
+                "detail": "x" * 2048,
+            }
+            for index in range(20)
+        ]
+        assessment = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_admission",
+            "repository": "/tmp/repository",
+            "operation": "broad_repository_lease",
+            "decision": "blocked",
+            "blocker_codes": ["dirty-worktree", "foreign-lifecycle-owner"],
+            "blockers": blockers,
+            "next_action": "resolve repository overlap before retry",
+            "assessment_sha256": "b" * 64,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                side_effect=pickup.work_admission.WorkAdmissionBlocked(assessment),
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "lease-acquisition-work-admission-blocked",
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(self.request())
+
+        self.assertEqual("lease-acquisition-failed", raised.exception.code)
+        self.assertEqual(
+            "lease-acquisition-work-admission-blocked", str(raised.exception)
+        )
+        self.assertEqual(
+            "lease-acquisition-failed", raised.exception.as_dict()["code"]
+        )
+        self.assertEqual("work-admission-blocked", raised.exception.details["cause_code"])
+        self.assertEqual(0, raised.exception.details["acquired_group_count"])
+        self.assertEqual(
+            {"required": False, "released": []},
+            raised.exception.details["compensation"],
+        )
+        evidence = raised.exception.details["work_admission"]
+        self.assertEqual("blocked", evidence["decision"])
+        self.assertEqual(20, evidence["blocker_count"])
+        self.assertTrue(evidence["blockers_truncated"])
+        self.assertEqual(16, len(evidence["blockers"]))
+        self.assertEqual(1024, len(evidence["blockers"][0]["detail"]))
+        self.assertEqual("b" * 64, evidence["assessment_sha256"])
+        release.assert_not_called()
+
     def test_partial_acquisition_is_compensated(self) -> None:
         bureau_key = "/home/alex/repos/bureau/.bureau-scopes/core-code"
         repo_key = "repo:/tmp/repository"
