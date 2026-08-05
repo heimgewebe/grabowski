@@ -937,6 +937,10 @@ TASK_STATE_PROJECTIONS: dict[str, tuple[str, ...]] = {
 }
 MUTATING_AGENT_EXECUTABLES = frozenset({"agy", "claude", "cline", "codex", "opencode", "openhands"})
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
+REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION = 1
+REPOSKOP_EXECUTION_ATTESTATION_KIND = (
+    "grabowski.task_reposkop_execution_attestation"
+)
 TASK_EXECUTION_BACKENDS = {"systemd-user", "systemd-root-broker"}
 SYSTEMD_SCOPES = {"user", "system"}
 TASK_SCHEMA_V4_ADDITIVE_COLUMNS = {
@@ -2447,6 +2451,115 @@ def _mutating_agent_workspace(
     # their workspace lifecycle. Inferring a second task-owned lease here would
     # make the formal workspace deadlock against itself.
     return None
+
+
+def _reposkop_task_purpose(
+    *,
+    task_id: str,
+    argv_sha256: str,
+    executable: str,
+) -> str:
+    readable = re.sub(
+        r"[^a-z0-9._-]+",
+        "-",
+        Path(executable).name.strip().lower(),
+    ).strip("-._") or "agent"
+    binding = _sha256_json(
+        {
+            "policy_version": REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION,
+            "task_id": task_id,
+            "argv_sha256": argv_sha256,
+            "executable": executable,
+        }
+    )
+    return f"grabowski-task-start:{readable[:32]}:{binding[:8]}"
+
+
+def _default_reposkop_execution_context(
+    workspace: str,
+    purpose: str,
+) -> dict[str, Any]:
+    import grabowski_reposkop_context
+
+    return grabowski_reposkop_context.grabowski_reposkop_context(
+        workspace,
+        purpose,
+    )
+
+
+def _attest_mutating_agent_workspace(
+    *,
+    workspace: str,
+    task_id: str,
+    lease_owner_id: str,
+    argv: list[str],
+    argv_sha256: str,
+    execution_identity_sha256: str,
+    reposkop_context_loader: Any | None = None,
+) -> dict[str, Any]:
+    import grabowski_work_admission as work_admission
+
+    purpose = _reposkop_task_purpose(
+        task_id=task_id,
+        argv_sha256=argv_sha256,
+        executable=argv[0],
+    )
+    result = (
+        reposkop_context_loader or _default_reposkop_execution_context
+    )(workspace, purpose)
+    evidence = work_admission._reposkop_context_evidence(
+        result,
+        repository=workspace,
+        purpose=purpose,
+    )
+    material = {
+        "schema_version": 1,
+        "kind": REPOSKOP_EXECUTION_ATTESTATION_KIND,
+        "policy_version": REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION,
+        "required": True,
+        "status": "verified",
+        "task_id": task_id,
+        "lease_owner_id": lease_owner_id,
+        "workspace": workspace,
+        "argv_sha256": argv_sha256,
+        "execution_identity_sha256": execution_identity_sha256,
+        "purpose": evidence["purpose"],
+        "reposkop_executable_sha256": evidence[
+            "reposkop_executable_sha256"
+        ],
+        "report_sha256": evidence["report_sha256"],
+        "observation_sha256": evidence["observation_sha256"],
+        "projection_sha256": evidence["projection_sha256"],
+        "repository_identity_sha256": evidence[
+            "repository_identity_sha256"
+        ],
+        "checkout_identity_sha256": evidence[
+            "checkout_identity_sha256"
+        ],
+        "usage_receipt_path": evidence["usage_receipt_path"],
+        "usage_receipt_sha256": evidence["usage_receipt_sha256"],
+        "usage_key_sha256": evidence["usage_key_sha256"],
+        "audit_ref": evidence["audit_ref"],
+        "effect_authorized": False,
+    }
+    return {
+        **material,
+        "execution_binding_sha256": _sha256_json(material),
+    }
+
+
+def _record_reposkop_execution_attestation(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        launcher = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    value = launcher.get("reposkop_execution_attestation")
+    return dict(value) if isinstance(value, dict) else None
 
 
 def _task_resource_keys(
@@ -5885,8 +5998,10 @@ def grabowski_task_start(
     """Start one persistent local or fleet task in its own systemd unit.
 
     Direct local write-capable agent CLIs receive an implicit repository lease
-    unless the caller supplies an explicit path or repository scope. Every
-    task-owned broad repository lease carries a complete whole-repository scope manifest.
+    unless the caller supplies an explicit path or repository scope. Before any new
+    local writer process starts, its exact checkout receives a task- and execution-bound
+    Reposkop attestation while the task resource lease is held. Every task-owned broad
+    repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
     another process, even when no explicit operation identity was supplied.
     """
@@ -5952,6 +6067,9 @@ def grabowski_task_start(
             "routing_shadow_capture": None,
             "operation_identity": normalized_operation_identity,
             "operation_retry_binding": None,
+            "reposkop_execution_attestation": (
+                _record_reposkop_execution_attestation(reused_record)
+            ),
             "deduplicated_reuse": {
                 "reused": True,
                 "task_id": str(reused_record["task_id"]),
@@ -5960,6 +6078,11 @@ def grabowski_task_start(
         }
     operation_retry_binding = operation_resolution["retry_binding"]
     requested_resources = _resource_keys(resource_keys)
+    mutating_agent_workspace = _mutating_agent_workspace(
+        host,
+        command,
+        cwd=working_directory,
+    )
     task_resources, implicit_workspace_resource = _task_resource_keys(
         host,
         command,
@@ -6094,6 +6217,9 @@ def grabowski_task_start(
             "routing_shadow_capture": None,
             "operation_identity": None,
             "operation_retry_binding": None,
+            "reposkop_execution_attestation": (
+                _record_reposkop_execution_attestation(active_execution_reuse)
+            ),
             "deduplicated_reuse": {
                 "reused": True,
                 "task_id": str(active_execution_reuse["task_id"]),
@@ -6124,6 +6250,86 @@ def grabowski_task_start(
     attempt = 1
     unit = _task_unit(task_id, attempt)
     now = _now()
+    lease_result = None
+    lease_metadata = None
+    if task_resources:
+        lease_metadata = _task_lease_metadata(
+            task_id=task_id,
+            host=host,
+            attempt=attempt,
+            repository_resource=repository_resource,
+            implicit_workspace_resource=implicit_workspace_resource,
+            repository_scope_manifest=repository_scope_manifest,
+        )
+        lease_result = resources.acquire_resources(
+            lease_owner,
+            task_resources,
+            purpose=f"persistent task {task_id}",
+            ttl_seconds=min(
+                resources.MAX_TTL_SECONDS,
+                max(resources.MIN_TTL_SECONDS, runtime + 300),
+            ),
+            metadata=lease_metadata,
+        )
+    reposkop_execution_attestation: dict[str, Any] | None = None
+    if mutating_agent_workspace is not None:
+        try:
+            reposkop_execution_attestation = _attest_mutating_agent_workspace(
+                workspace=mutating_agent_workspace,
+                task_id=task_id,
+                lease_owner_id=lease_owner,
+                argv=command,
+                argv_sha256=argv_sha256,
+                execution_identity_sha256=execution_identity[
+                    "identity_sha256"
+                ],
+            )
+        except Exception as exc:
+            compensation: dict[str, Any] | None = None
+            compensation_error: str | None = None
+            if task_resources and lease_result is not None:
+                try:
+                    compensation = resources.release_resources(
+                        lease_owner,
+                        task_resources,
+                        expected_leases=[
+                            resources._release_lease_snapshot(item)
+                            for item in lease_result["leases"]
+                        ],
+                    )
+                except Exception as release_exc:
+                    compensation_error = (
+                        f"{type(release_exc).__name__}: {release_exc}"
+                    )[:1024]
+            blocked_audit = {
+                "timestamp_unix": _now(),
+                "operation": "reposkop-execution-attestation-blocked",
+                "task_id": task_id,
+                "host": host,
+                "workspace": mutating_agent_workspace,
+                "lease_owner_id": lease_owner,
+                "argv_sha256": argv_sha256,
+                "execution_identity_sha256": execution_identity[
+                    "identity_sha256"
+                ],
+                "policy_version": (
+                    REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION
+                ),
+                "error_type": type(exc).__name__,
+                "error": _redact_reason(str(exc))[:1024],
+                "lease_compensation": compensation,
+                "lease_compensation_error": compensation_error,
+                "no_task_record_created": True,
+                "no_process_started": True,
+            }
+            base._append_audit(blocked_audit)
+            if compensation_error is not None:
+                raise RuntimeError(
+                    "Reposkop execution attestation and lease compensation failed"
+                ) from exc
+            raise RuntimeError(
+                "Reposkop execution attestation failed before task launch"
+            ) from exc
     record = {
         "task_id": task_id,
         "host": host,
@@ -6161,6 +6367,15 @@ def grabowski_task_start(
                     if operation_retry_binding is not None
                     else {}
                 ),
+                **(
+                    {
+                        "reposkop_execution_attestation": dict(
+                            reposkop_execution_attestation
+                        )
+                    }
+                    if reposkop_execution_attestation is not None
+                    else {}
+                ),
             }
         ),
         "last_observation_json": None,
@@ -6175,27 +6390,6 @@ def grabowski_task_start(
             else None
         ),
     }
-    lease_result = None
-    lease_metadata = None
-    if task_resources:
-        lease_metadata = _task_lease_metadata(
-            task_id=task_id,
-            host=host,
-            attempt=attempt,
-            repository_resource=repository_resource,
-            implicit_workspace_resource=implicit_workspace_resource,
-            repository_scope_manifest=repository_scope_manifest,
-        )
-        lease_result = resources.acquire_resources(
-            lease_owner,
-            task_resources,
-            purpose=f"persistent task {task_id}",
-            ttl_seconds=min(
-                resources.MAX_TTL_SECONDS,
-                max(resources.MIN_TTL_SECONDS, runtime + 300),
-            ),
-            metadata=lease_metadata,
-        )
     try:
         with _database_connection() as connection:
             connection.execute(
@@ -6225,8 +6419,15 @@ def grabowski_task_start(
             _register_task_reconcile_sequence(connection, task_id)
             connection.commit()
     except Exception:
-        if task_resources:
-            resources.release_resources(lease_owner, task_resources)
+        if task_resources and lease_result is not None:
+            resources.release_resources(
+                lease_owner,
+                task_resources,
+                expected_leases=[
+                    resources._release_lease_snapshot(item)
+                    for item in lease_result["leases"]
+                ],
+            )
         raise
     launcher = _launch(record)
     if retry_binding is not None:
@@ -6240,6 +6441,13 @@ def grabowski_task_start(
         launcher = {
             **launcher,
             "operation_retry_binding": dict(operation_retry_binding),
+        }
+    if reposkop_execution_attestation is not None:
+        launcher = {
+            **launcher,
+            "reposkop_execution_attestation": dict(
+                reposkop_execution_attestation
+            ),
         }
     state = _launch_state(launcher)
     stored = _set_state(task_id, state, launcher=launcher)
@@ -6282,6 +6490,21 @@ def grabowski_task_start(
         ),
         "resource_lease_maintenance": lease_maintenance,
         "routing_shadow_capture": routing_shadow_capture,
+        "reposkop_execution_attestation_required": (
+            mutating_agent_workspace is not None
+        ),
+        "reposkop_execution_attestation_sha256": (
+            reposkop_execution_attestation[
+                "execution_binding_sha256"
+            ]
+            if reposkop_execution_attestation is not None
+            else None
+        ),
+        "reposkop_usage_key_sha256": (
+            reposkop_execution_attestation["usage_key_sha256"]
+            if reposkop_execution_attestation is not None
+            else None
+        ),
     }
     base._append_audit(audit)
     return {
@@ -6292,6 +6515,7 @@ def grabowski_task_start(
         "routing_shadow_capture": routing_shadow_capture,
         "operation_identity": normalized_operation_identity,
         "operation_retry_binding": operation_retry_binding,
+        "reposkop_execution_attestation": reposkop_execution_attestation,
         "deduplicated_reuse": None,
     }
 

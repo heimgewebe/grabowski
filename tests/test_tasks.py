@@ -151,6 +151,39 @@ class TaskTests(unittest.TestCase):
                 "read_only": True,
             },
         )
+        self.real_reposkop_attest = tasks._attest_mutating_agent_workspace
+        self.reposkop_attestation = {
+            "schema_version": 1,
+            "kind": tasks.REPOSKOP_EXECUTION_ATTESTATION_KIND,
+            "policy_version": (
+                tasks.REPOSKOP_EXECUTION_ATTESTATION_POLICY_VERSION
+            ),
+            "required": True,
+            "status": "verified",
+            "task_id": "test-task",
+            "lease_owner_id": "task:test-task",
+            "workspace": str(self.root),
+            "argv_sha256": "1" * 64,
+            "execution_identity_sha256": "2" * 64,
+            "purpose": "grabowski-task-start:codex:12345678",
+            "reposkop_executable_sha256": "3" * 64,
+            "report_sha256": "4" * 64,
+            "observation_sha256": "5" * 64,
+            "projection_sha256": "6" * 64,
+            "repository_identity_sha256": "7" * 64,
+            "checkout_identity_sha256": "8" * 64,
+            "usage_receipt_path": "/tmp/test-reposkop-receipt.json",
+            "usage_receipt_sha256": "9" * 64,
+            "usage_key_sha256": "a" * 64,
+            "audit_ref": "audit-record-sha256:" + "b" * 64,
+            "effect_authorized": False,
+            "execution_binding_sha256": "c" * 64,
+        }
+        self.reposkop_patch = patch.object(
+            tasks,
+            "_attest_mutating_agent_workspace",
+            return_value=self.reposkop_attestation,
+        )
         self.task_archive_root = self.root / "state" / "task-archives"
         self.task_projection_root = self.root / "state" / "task-projection"
         (self.root / "state").mkdir(parents=True, exist_ok=True)
@@ -163,9 +196,11 @@ class TaskTests(unittest.TestCase):
         self.output_root_patch.start()
         self.resource_patch.start()
         self.admission_patch.start()
+        self.reposkop_attestation_mock = self.reposkop_patch.start()
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.reposkop_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
         self.output_root_patch.stop()
@@ -2728,6 +2763,181 @@ class TaskTests(unittest.TestCase):
             result["audit"]["repository_scope_manifest_sha256"],
             r"^[0-9a-f]{64}$",
         )
+
+    def test_mutating_agent_reposkop_attestation_is_lease_and_execution_bound(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        key = f"repo:{self.root}"
+
+        def attest(**kwargs):
+            lease = tasks.resources.inspect_resource(key)
+            self.assertIsNotNone(lease)
+            self.assertEqual(lease["owner_id"], kwargs["lease_owner_id"])
+            evidence = {
+                **self.reposkop_attestation,
+                "task_id": kwargs["task_id"],
+                "lease_owner_id": kwargs["lease_owner_id"],
+                "workspace": kwargs["workspace"],
+                "argv_sha256": kwargs["argv_sha256"],
+                "execution_identity_sha256": kwargs[
+                    "execution_identity_sha256"
+                ],
+            }
+            evidence["execution_binding_sha256"] = tasks._sha256_json(
+                {
+                    key: value
+                    for key, value in evidence.items()
+                    if key != "execution_binding_sha256"
+                }
+            )
+            return evidence
+
+        self.reposkop_attestation_mock.side_effect = attest
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 151}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        attestation = result["reposkop_execution_attestation"]
+        self.assertEqual(attestation["task_id"], result["task"]["task_id"])
+        self.assertEqual(
+            attestation["execution_identity_sha256"],
+            result["execution_identity"]["identity_sha256"],
+        )
+        self.assertEqual(
+            result["audit"]["reposkop_execution_attestation_sha256"],
+            attestation["execution_binding_sha256"],
+        )
+        with sqlite3.connect(self.database) as connection:
+            launcher = json.loads(
+                connection.execute(
+                    "SELECT launcher_json FROM tasks WHERE task_id=?",
+                    (result["task"]["task_id"],),
+                ).fetchone()[0]
+            )
+        self.assertEqual(
+            launcher["reposkop_execution_attestation"], attestation
+        )
+
+    def test_mutating_agent_reposkop_failure_releases_lease_before_launch(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        self.reposkop_attestation_mock.side_effect = RuntimeError(
+            "reposkop unavailable"
+        )
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ) as append_audit, patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 152}
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Reposkop execution attestation failed before task launch",
+            ):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60
+                )
+
+        dispatch.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
+        with sqlite3.connect(self.database) as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+                0,
+            )
+        blocked = [
+            call.args[0]
+            for call in append_audit.call_args_list
+            if call.args
+            and call.args[0].get("operation")
+            == "reposkop-execution-attestation-blocked"
+        ]
+        self.assertEqual(len(blocked), 1)
+        self.assertIs(blocked[0]["no_process_started"], True)
+        self.assertIs(blocked[0]["no_task_record_created"], True)
+
+    def test_read_only_codex_task_does_not_require_reposkop(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "read-only"]
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 153}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        self.assertIsNone(result["reposkop_execution_attestation"])
+        self.assertIs(
+            result["audit"]["reposkop_execution_attestation_required"],
+            False,
+        )
+        self.reposkop_attestation_mock.assert_not_called()
+
+    def test_reposkop_execution_attestation_contract_is_hash_bound(self) -> None:
+        workspace = str(self.root)
+
+        def sha(character: str) -> str:
+            return character * 64
+
+        def loader(repo: str, purpose: str) -> dict[str, object]:
+            self.assertEqual(repo, workspace)
+            return {
+                "schema_version": 2,
+                "kind": "grabowski_reposkop_context",
+                "effect_authorized": False,
+                "target": {"path": repo, "purpose": purpose},
+                "reposkop": {"sha256": sha("1")},
+                "report": {
+                    "schema_version": 2,
+                    "kind": "reposkop_coherence_report",
+                    "effect_authorized": False,
+                    "report_sha256": sha("2"),
+                    "observation": {
+                        "observation_complete": True,
+                        "observation_sha256": sha("3"),
+                        "identities": {
+                            "path": repo,
+                            "purpose": purpose,
+                            "repository_identity_sha256": sha("4"),
+                            "checkout_identity_sha256": sha("5"),
+                        },
+                    },
+                    "projection": {
+                        "effect_authorized": False,
+                        "projection_sha256": sha("6"),
+                    },
+                },
+                "usage_receipt": {
+                    "path": "/tmp/receipt.json",
+                    "sha256": sha("7"),
+                    "usage_key_sha256": sha("8"),
+                    "audit_ref": "audit-record-sha256:" + sha("9"),
+                },
+            }
+
+        result = self.real_reposkop_attest(
+            workspace=workspace,
+            task_id="a" * 24,
+            lease_owner_id="task:" + "a" * 24,
+            argv=["/opt/codex", "exec"],
+            argv_sha256=sha("a"),
+            execution_identity_sha256=sha("b"),
+            reposkop_context_loader=loader,
+        )
+        material = dict(result)
+        claimed = material.pop("execution_binding_sha256")
+        self.assertEqual(claimed, tasks._sha256_json(material))
+        self.assertEqual(result["status"], "verified")
+        self.assertIs(result["effect_authorized"], False)
 
     def test_expired_implicit_repository_lease_reacquires_complete_scope(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]

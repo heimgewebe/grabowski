@@ -5204,6 +5204,7 @@ def _assess_new_agent_workspace(
 ) -> dict[str, Any]:
     return work_admission.require_repository_admission(
         mode="normal",
+        reposkop_required=True,
         repo=str(plan["repository"]),
         owner_id=str(plan["resources"]["owner_id"]),
         operation="agent_workspace_create",
