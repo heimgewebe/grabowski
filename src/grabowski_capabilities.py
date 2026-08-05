@@ -1057,6 +1057,18 @@ TOOL_PROFILES.update(
             "effects": [],
             "reversibility": "not-applicable",
         },
+        "grabowski_work_acquire": {
+            "category": "work-coordination",
+            "purpose": "Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree.",
+            "risk_class": "high",
+            "effects": [
+                "resource-lease",
+                "git-worktree-create",
+                "checkout-lifecycle-bind",
+                "lane-receipt-create",
+            ],
+            "reversibility": "pre-effect lease compensation; created worktree retained for explicit closeout",
+        },
         "grabowski_operator_optimization_report": {
             "category": "operations-observability",
             "purpose": "Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report.",
@@ -1269,7 +1281,7 @@ TOOL_PROFILES.update(
         },
         "grabowski_coding_agent_route": {
             "category": "agent-workspace",
-            "purpose": "Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review.",
+            "purpose": "Keep controller integration authoritative and recommend explicit lane-scoped writers or independent reviewers by role.",
             "risk_class": "low",
             "effects": [],
             "reversibility": "not-applicable",

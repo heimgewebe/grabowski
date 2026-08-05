@@ -1110,6 +1110,34 @@
         "tool": "grabowski_text_artifact_read"
       }
     },
+    "grabowski_work_acquire": {
+      "evidence_refs": [
+        "docs:agent-authority-lanes-v1.md",
+        "tests:test_work_acquire.py",
+        "tests:test_current_work.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns only the atomic transition from one controller mandate to narrow leases, one exact isolated worktree and an integrity-bound work-lane receipt.",
+        "evidence": "Exact source, actor, repository, base, branch, path and resource binding; existing lease and worktree authorities remain canonical; pre-effect compensation and outcome-unknown retention are tested."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Separate resource-acquire and worktree-ensure calls were rejected because their inter-call gap repeatedly left callers without an owner-bound lease or with ambiguous partial preparation. Generic terminal execution cannot preserve atomic compensation, idempotent lane identity and typed authority roles.",
+      "rationale": "Work acquisition crosses the existing resource and checkout authorities and must either prepare both coherently or retain exact reconciliation evidence. The tool does not replace either lifecycle store and does not start, merge or deploy work.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "work-coordination",
+        "effects": [
+          "checkout-lifecycle-bind",
+          "git-worktree-create",
+          "lane-receipt-create",
+          "resource-lease"
+        ],
+        "read_only": false,
+        "reversibility": "pre-effect lease compensation; created worktree retained for explicit closeout",
+        "risk_class": "high",
+        "tool": "grabowski_work_acquire"
+      }
+    },
     "ipad_capability_manifest": {
       "evidence_refs": [
         "docs:juno-ipad-storage.md",

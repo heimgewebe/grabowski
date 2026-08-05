@@ -71,6 +71,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
 | `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
 | `grabowski_current_work` | operations-observability | yes | low | Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth. |
+| `grabowski_work_acquire` | work-coordination | no | high | Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree. |
 | `grabowski_reposkop_context` | repository-observation | no | low | Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt. |
 | `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
 | `grabowski_git_status` | version-control | yes | low | Read fixed short Git status for one allowed repository. |
@@ -205,7 +206,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_agent_workspace_cleanup` | agent-workspace | no | high | Create durable recovery refs and remove one eligible closed writer checkout without deleting workspace evidence. |
 | `grabowski_agent_execution_route` | agent-workspace | yes | low | Return direct_operator for every authoritative task and optionally describe explicitly requested advisory contrast or competition candidates. |
 | `grabowski_coding_agent_catalog` | agent-workspace | yes | low | Read the validated canonical coding-model, harness, route and quota inventory without probing or executing external agents. |
-| `grabowski_coding_agent_route` | agent-workspace | yes | low | Keep every authoritative implementation on grabowski-primary and rank external routes only for independent review. |
+| `grabowski_coding_agent_route` | agent-workspace | yes | low | Keep controller integration authoritative and recommend explicit lane-scoped writers or independent reviewers by role. |
 | `grabowski_agent_competition_start` | agent-workspace | no | medium | Start one durable advisory-only external competitor or contrast programmer against a commit-bound context packet with a frozen runner and isolated provider workspace. |
 | `grabowski_agent_competition_status` | agent-workspace | yes | low | Read one external candidate task and validate its immutable advisory receipt. |
 | `grabowski_agent_competition_compare` | agent-workspace | yes | low | Generate a deterministic contrast matrix, consensus signals and validation opportunities from exactly two bound external candidates. |
