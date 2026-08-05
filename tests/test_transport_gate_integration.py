@@ -246,7 +246,11 @@ class CentralTransportGateTests(unittest.TestCase):
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
             "consume_verified",
-            return_value={"state": "consumed"},
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
         ) as consume_verified:
             result = asyncio.run(
                 operator.mcp._tool_manager.call_tool("write", arguments, context)
@@ -458,7 +462,11 @@ class CentralTransportGateTests(unittest.TestCase):
         with mock.patch.object(
             operator.grabowski_transport_roundtrip,
             "consume_verified",
-            return_value={"state": "consumed"},
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
         ) as consume_verified:
             result = asyncio.run(
                 operator.mcp._tool_manager.call_tool("write", {}, context)

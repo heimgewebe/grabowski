@@ -41,6 +41,7 @@ import grabowski_command_identity as command_identity
 import grabowski_job_origin as job_origin
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
+import grabowski_effect_interceptor
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 
@@ -477,7 +478,7 @@ def _require_transport_roundtrip_for_tool(
     arguments: Any,
     context: Context | None,
     tool: Any,
-) -> None:
+) -> dict[str, Any] | None:
     if _transport_roundtrip_exempt_call(tool_name, arguments):
         return
     read_only_hint = _tool_read_only_hint(tool)
@@ -498,7 +499,7 @@ def _require_transport_roundtrip_for_tool(
             )
         )
         tool_name_text = str(tool_name)
-        grabowski_transport_roundtrip.consume_verified(
+        return grabowski_transport_roundtrip.consume_verified(
             client_scope=client_scope,
             runtime_binding=runtime_binding,
             tool_name=tool_name_text,
@@ -520,13 +521,12 @@ def _require_transport_roundtrip_for_tool(
                 },
             )
             if handshake.get("state") == "verified":
-                grabowski_transport_roundtrip.consume_verified(
+                return grabowski_transport_roundtrip.consume_verified(
                     client_scope=client_scope,
                     runtime_binding=runtime_binding,
                     tool_name=tool_name_text,
                     arguments_sha256=arguments_sha256,
                 )
-                return
         except grabowski_transport_roundtrip.TransportRoundtripError as begin_exc:
             raise RuntimeError(str(begin_exc)) from begin_exc
         challenge = handshake.get("challenge_receipt_sha256")
@@ -751,12 +751,46 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     }
 
 
+def _append_effect_audit(record: dict[str, Any]) -> str:
+    appender = getattr(base, "_append_audit_with_digest", None)
+    if callable(appender):
+        return appender(record)
+    legacy = getattr(base, "_append_audit", None)
+    if not callable(legacy):
+        raise RuntimeError("Grabowski audit append boundary is unavailable")
+    legacy(record)
+    return hashlib.sha256(_canonical_json_bytes(record)).hexdigest()
+
+
 def _run_sync_tool_call(
     original: Any,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
 ) -> Any:
     return asyncio.run(original(*args, **kwargs))
+
+
+def _run_sync_tool_call_with_effect(
+    original: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    effect_admission: dict[str, Any],
+) -> Any:
+    try:
+        result = _run_sync_tool_call(original, args, kwargs)
+    except BaseException as error:
+        grabowski_effect_interceptor.record_exception_best_effort(
+            effect_admission,
+            error,
+            append_audit=_append_effect_audit,
+        )
+        raise
+    grabowski_effect_interceptor.record_success_best_effort(
+        effect_admission,
+        result,
+        append_audit=_append_effect_audit,
+    )
+    return result
 
 
 def _install_deployment_admission_gate() -> None:
@@ -828,19 +862,35 @@ def _install_deployment_admission_gate() -> None:
                     "Grabowski deployment admission drain rejects new tool calls "
                     f"while marker state is {marker.get('state')}"
                 )
-            _require_transport_roundtrip_for_tool(
+            transport_evidence = _require_transport_roundtrip_for_tool(
                 tool_name=tool_name,
                 arguments=arguments,
                 context=context,
                 tool=tool,
             )
+            effect_admission = (
+                grabowski_effect_interceptor.admit_mutation(
+                    tool_name=str(tool_name),
+                    arguments=arguments,
+                    transport_evidence=transport_evidence,
+                    context=context,
+                    append_audit=_append_effect_audit,
+                )
+                if transport_evidence is not None
+                else None
+            )
             if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
                 worker_future = _SYNC_TOOL_EXECUTOR.submit(
-                    _run_sync_tool_call,
+                    (
+                        _run_sync_tool_call_with_effect
+                        if effect_admission is not None
+                        else _run_sync_tool_call
+                    ),
                     original,
                     args,
                     kwargs,
+                    *((effect_admission,) if effect_admission is not None else ()),
                 )
 
                 def _release_when_worker_finishes(_completed: Any) -> None:
@@ -849,7 +899,23 @@ def _install_deployment_admission_gate() -> None:
                 worker_future.add_done_callback(_release_when_worker_finishes)
                 release_in_finally = False
                 return await asyncio.wrap_future(worker_future, loop=loop)
-            return await original(*args, **kwargs)
+            try:
+                result = await original(*args, **kwargs)
+            except BaseException as error:
+                if effect_admission is not None:
+                    grabowski_effect_interceptor.record_exception_best_effort(
+                        effect_admission,
+                        error,
+                        append_audit=_append_effect_audit,
+                    )
+                raise
+            if effect_admission is not None:
+                grabowski_effect_interceptor.record_success_best_effort(
+                    effect_admission,
+                    result,
+                    append_audit=_append_effect_audit,
+                )
+            return result
         finally:
             if release_in_finally:
                 _deployment_admission_release_tool_call(identity)

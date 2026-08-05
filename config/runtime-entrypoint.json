@@ -196,6 +196,18 @@
       "source": "src/grabowski_operator.py"
     },
     {
+      "module": "grabowski_effect_receipt",
+      "source": "src/grabowski_effect_receipt.py"
+    },
+    {
+      "module": "grabowski_effect_interceptor",
+      "source": "src/grabowski_effect_interceptor.py"
+    },
+    {
+      "module": "grabowski_lane_closeout",
+      "source": "src/grabowski_lane_closeout.py"
+    },
+    {
       "module": "grabowski_deployment_observer",
       "source": "src/grabowski_deployment_observer.py"
     },
