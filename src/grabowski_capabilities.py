@@ -163,6 +163,13 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": [],
         "reversibility": "not-applicable",
     },
+    "grabowski_reposkop_effectiveness": {
+        "category": "audit",
+        "purpose": "Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain.",
+        "risk_class": "low",
+        "effects": [],
+        "reversibility": "not-applicable",
+    },
     "latest_complete_bundles": {
         "category": "knowledge",
         "purpose": "Read latest RepoGround publications with canonical catalog precedence.",

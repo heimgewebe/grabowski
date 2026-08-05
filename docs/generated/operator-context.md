@@ -51,6 +51,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_audit_query` | audit | yes | low | Query bounded safe fields from a verified audit snapshot with explicit scan completeness. |
 | `grabowski_audit_trace` | audit | yes | low | Trace one exact audit anchor through bounded one-hop typed evidence correlations without claiming causality. |
 | `grabowski_audit_analyze` | audit | yes | low | Compute bounded-memory descriptive statistics from a verified audit snapshot with explicit approximation semantics. |
+| `grabowski_reposkop_effectiveness` | audit | yes | low | Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain. |
 | `latest_complete_bundles` | knowledge | yes | low | Read latest RepoGround publications with canonical catalog precedence. |
 | `repoground_bundle_discover` | knowledge | yes | low | Discover current RepoGround bundles from the canonical publication catalog. |
 | `repoground_bundle_status` | knowledge | yes | low | Read bounded manifest, health, and sidecar status for one RepoGround bundle. |

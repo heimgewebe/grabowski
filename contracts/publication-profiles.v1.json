@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "54e55200be80b82f8a76705b3774f84bb5f96c9b559db01e4dbdc6b7df48522a"
+    "sha256": "cd789f98c59d752877a0f24c26d18a45799bbfb88206613d6184850ef352e3ad"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "54e4075811434c10ae56597b9cef5cd6dda9db8e882bf01b8fd46a5eecb549b4"
+    "sha256": "9e2310d21aaec7a501fd43bccbc9f20da232cab473892f18dae8e69c9d2097a4"
   },
   "counts": {
     "core": 22,
-    "full": 185,
-    "operator": 170
+    "full": 186,
+    "operator": 171
   },
   "profiles": {
     "core": [
@@ -60,6 +60,7 @@
       "grabowski_audit_query",
       "grabowski_audit_trace",
       "grabowski_audit_analyze",
+      "grabowski_reposkop_effectiveness",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",
@@ -246,6 +247,7 @@
       "grabowski_audit_query",
       "grabowski_audit_trace",
       "grabowski_audit_analyze",
+      "grabowski_reposkop_effectiveness",
       "latest_complete_bundles",
       "repoground_bundle_discover",
       "repoground_bundle_status",

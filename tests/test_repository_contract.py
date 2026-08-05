@@ -178,7 +178,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 185)
+        self.assertEqual(len(tools), 186)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -251,6 +251,7 @@ class RepositoryContractTests(unittest.TestCase):
                 "grabowski_audit_query",
                 "grabowski_audit_trace",
                 "grabowski_audit_analyze",
+                "grabowski_reposkop_effectiveness",
             }.issubset(tools)
         )
         supporting = {
