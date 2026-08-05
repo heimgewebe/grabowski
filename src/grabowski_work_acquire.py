@@ -316,7 +316,13 @@ def acquire_work(
                 compensation = release_resources_fn(
                     inputs["lease_owner_id"],
                     inputs["resource_keys"],
-                    expected_leases=acquired.get("leases"),
+                    expected_leases=[
+                        {
+                            key: lease[key]
+                            for key in sorted(resources.LEASE_SNAPSHOT_KEYS)
+                        }
+                        for lease in acquired.get("leases", [])
+                    ],
                 )
             except Exception as release_exc:
                 compensation = {
@@ -424,7 +430,13 @@ def acquire_work(
                 compensation = release_resources_fn(
                     inputs["lease_owner_id"],
                     inputs["resource_keys"],
-                    expected_leases=acquired.get("leases"),
+                    expected_leases=[
+                        {
+                            key: lease[key]
+                            for key in sorted(resources.LEASE_SNAPSHOT_KEYS)
+                        }
+                        for lease in acquired.get("leases", [])
+                    ],
                 )
             except Exception as exc:
                 compensation = {"released": False, "error": f"{type(exc).__name__}: {exc}"[:2048]}
