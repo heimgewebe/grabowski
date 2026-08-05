@@ -197,6 +197,231 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertIn("foreign-live-coordination", foreign["blocker_codes"])
         self.assertIn("foreign-retained-worktree", foreign["blocker_codes"])
 
+    def test_isolated_worktree_ignores_only_unrelated_checkout_debt(self) -> None:
+        unrelated = self._linked(
+            state="retained",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        target = str(self.repo.parent / "worktrees" / "new-isolated")
+        branch = "feat/new-isolated"
+        reconciliation = {
+            "bindings": [
+                {
+                    "blocking": True,
+                    "checkout_key": "old-checkout",
+                    "state": "orphaned_binding",
+                    "reasons": ["binding-has-no-current-git-worktree-record"],
+                    "binding_identity": {
+                        "checkout_path": str(self.repo.parent / "worktrees" / "old"),
+                        "expected_branch": "feat/old",
+                    },
+                    "worktree_identity": None,
+                    "evidence": {
+                        "source": {"kind": "bureau_task", "id": "OLD-TASK"}
+                    },
+                }
+            ],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "b" * 64,
+        }
+
+        result = self._assess(
+            [self._main(dirty=True), unrelated],
+            reconciliation=reconciliation,
+            requested_scope={"paths": [target], "branch": branch},
+            target_path=target,
+            branch=branch,
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(result["ignored_unrelated_worktrees"], 2)
+        self.assertEqual(result["ignored_unrelated_bindings"], 1)
+        self.assertEqual(
+            result["isolated_scope"], {"target_path": target, "branch": branch}
+        )
+
+    def test_isolated_worktree_still_blocks_real_branch_and_path_overlap(self) -> None:
+        target = str(self.repo.parent / "worktrees" / "new-isolated")
+        branch = "feat/new-isolated"
+        same_branch = self._linked(state="retained", owner="foreign-owner")
+        same_branch["branch"] = branch
+        branch_result = self._assess(
+            [self._main(), same_branch],
+            requested_scope={"paths": [target], "branch": branch},
+            target_path=target,
+            branch=branch,
+        )
+        self.assertEqual(branch_result["decision"], "blocked")
+        self.assertIn("branch-already-bound", branch_result["blocker_codes"])
+        self.assertIn("foreign-retained-worktree", branch_result["blocker_codes"])
+
+        same_path = self._linked(state="retained", dirty=True, owner="owner-a")
+        same_path["path"] = target
+        path_result = self._assess(
+            [self._main(), same_path],
+            requested_scope={"paths": [target], "branch": branch},
+            target_path=target,
+            branch=branch,
+        )
+        self.assertEqual(path_result["decision"], "blocked")
+        self.assertIn("dirty-worktree", path_result["blocker_codes"])
+
+    def test_broad_repository_lease_needs_complete_explicit_worktree_isolation(self) -> None:
+        target = str(self.repo.parent / "worktrees" / "task-isolated")
+        scope = {
+            "repository": str(self.repo),
+            "isolation": "worktree",
+            "worktree": target,
+            "branch": "feat/task-isolated",
+            "allowed_paths": ["merger/repoground"],
+        }
+        inventory = lambda _repo: {
+            "worktrees": [
+                self._main(dirty=True),
+                self._linked(state="retained", dirty=True, owner="foreign-owner"),
+            ],
+            "inventory_sha256": "a" * 64,
+        }
+        isolated = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=inventory,
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(isolated["decision"], "allow")
+
+        broad = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope={**scope, "isolation": "repository"},
+            inventory_loader=inventory,
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(broad["decision"], "blocked")
+        self.assertIn("dirty-worktree", broad["blocker_codes"])
+
+        incomplete = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope={
+                key: value for key, value in scope.items() if key != "allowed_paths"
+            },
+            inventory_loader=inventory,
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(incomplete["decision"], "blocked")
+        self.assertIn("dirty-worktree", incomplete["blocker_codes"])
+
+        dot_scope = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope={**scope, "allowed_paths": ["."]},
+            inventory_loader=inventory,
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(dot_scope["decision"], "blocked")
+        self.assertIn("dirty-worktree", dot_scope["blocker_codes"])
+
+    def test_isolated_worktree_keeps_unidentifiable_reconciliation_fail_closed(self) -> None:
+        target = str(self.repo.parent / "worktrees" / "new-isolated")
+        result = self._assess(
+            [self._main()],
+            reconciliation=self._reconciliation(blocking=True),
+            requested_scope={"paths": [target], "branch": "feat/new-isolated"},
+            target_path=target,
+            branch="feat/new-isolated",
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("reconciliation-unobservable", result["blocker_codes"])
+        self.assertNotIn("binding-reconciliation-blocking", result["blocker_codes"])
+
+    def test_source_difference_alone_does_not_prove_binding_isolation(self) -> None:
+        target = str(self.repo.parent / "worktrees" / "new-isolated")
+        reconciliation = {
+            "bindings": [
+                {
+                    "blocking": True,
+                    "checkout_key": "source-only",
+                    "state": "orphaned_binding",
+                    "reasons": ["binding-has-no-current-git-worktree-record"],
+                    "binding_identity": {},
+                    "worktree_identity": None,
+                    "evidence": {
+                        "source": {"kind": "bureau_task", "id": "OTHER-TASK"}
+                    },
+                }
+            ],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "b" * 64,
+        }
+        result = self._assess(
+            [self._main()],
+            reconciliation=reconciliation,
+            requested_scope={"paths": [target], "branch": "feat/new-isolated"},
+            target_path=target,
+            branch="feat/new-isolated",
+            source_kind="bureau_task",
+            source_id="NEW-TASK",
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("reconciliation-unobservable", result["blocker_codes"])
+        self.assertEqual(result["ignored_unrelated_bindings"], 0)
+
+    def test_branch_difference_alone_does_not_prove_binding_isolation(self) -> None:
+        target = str(self.repo.parent / "worktrees" / "new-isolated")
+        reconciliation = {
+            "bindings": [
+                {
+                    "blocking": True,
+                    "checkout_key": "branch-only",
+                    "state": "orphaned_binding",
+                    "reasons": ["binding-has-no-current-git-worktree-record"],
+                    "binding_identity": {"expected_branch": "feat/other"},
+                    "worktree_identity": None,
+                    "evidence": None,
+                }
+            ],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "b" * 64,
+        }
+        result = self._assess(
+            [self._main()],
+            reconciliation=reconciliation,
+            requested_scope={"paths": [target], "branch": "feat/new-isolated"},
+            target_path=target,
+            branch="feat/new-isolated",
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("reconciliation-unobservable", result["blocker_codes"])
+        self.assertEqual(result["ignored_unrelated_bindings"], 0)
+
+    def test_relative_worktree_path_never_proves_isolation(self) -> None:
+        target = str(self.repo.parent / "worktrees" / "new-isolated")
+        row = self._linked(state="retained", owner="foreign-owner")
+        row["path"] = "relative/worktree"
+        result = self._assess(
+            [self._main(), row],
+            requested_scope={"paths": [target], "branch": "feat/new-isolated"},
+            target_path=target,
+            branch="feat/new-isolated",
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("inventory-unobservable", result["blocker_codes"])
+        self.assertEqual(result["ignored_unrelated_worktrees"], 1)
+
     def test_clean_detached_source_caches_do_not_block_broad_lane(self) -> None:
         repoground_path = self.repo.parent / ".repoground-sources" / "org__repo__main"
         repobrief_path = self.repo.parent / ".repobrief-sources" / "org__repo__main"
