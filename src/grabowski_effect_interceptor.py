@@ -140,9 +140,32 @@ def admit_mutation(
     )
 
 
+def _positive_deduplicated_reuse(value: Any) -> bool:
+    """Return True only for the documented positive reuse signal.
+
+    Accepted positive forms:
+    - mapping with ``reused is True`` (task-start dedup shape)
+    Rejected (not reuse):
+    - None, False, 0, empty containers, bare True, mappings without reused=True
+    """
+
+    if not isinstance(value, Mapping):
+        return False
+    return value.get("reused") is True
+
+
 def success_completion_class(result: Any) -> str:
+    """Classify a successful domain result for completion evidence.
+
+    ``deduplicated`` is accepted only as the boolean True.
+    ``deduplicated_reuse`` is accepted only as a mapping with ``reused is True``.
+    False, 0, empty, or other truthy non-document values are not reuse signals.
+    """
+
     data = _mapping(result)
-    if data.get("deduplicated") is True or data.get("deduplicated_reuse") is not None:
+    if data.get("deduplicated") is True or _positive_deduplicated_reuse(
+        data.get("deduplicated_reuse")
+    ):
         return "deduplicated"
     if data.get("effect_started") is True:
         return "effect_observed"

@@ -148,6 +148,127 @@ class LaneCloseoutTests(unittest.TestCase):
         self.assertEqual(rescue["phase"], "rescue_required")
         self.assertIn("create_durable_followup", rescue["recovery_actions"])
 
+    def test_active_liveness_with_readback_errors_stays_non_terminal(self) -> None:
+        active = closeout.classify(
+            self.observation(
+                writer_state="running",
+                task_active=True,
+                durable_followup_id="followup-1",
+                readback_errors=("github-timeout",),
+            )
+        )
+        self.assertEqual(active["phase"], "active")
+        self.assertIsNone(active["closeout_state"])
+        self.assertFalse(active["lease_release_ready"])
+        self.assertEqual(active["reason_codes"], ["writer_or_process_active"])
+
+        process_active = closeout.classify(
+            self.observation(
+                writer_state="completed",
+                process_active=True,
+                durable_followup_id="followup-1",
+                readback_errors=("github-timeout",),
+            )
+        )
+        self.assertEqual(process_active["phase"], "active")
+        self.assertIsNone(process_active["closeout_state"])
+
+    def test_unknown_liveness_with_readback_errors_stays_rescue(self) -> None:
+        rescue = closeout.classify(
+            self.observation(
+                writer_state="completed",
+                process_active=None,
+                durable_followup_id="followup-1",
+                readback_errors=("github-timeout",),
+            )
+        )
+        self.assertEqual(rescue["phase"], "rescue_required")
+        self.assertIsNone(rescue["closeout_state"])
+        self.assertFalse(rescue["lease_release_ready"])
+        self.assertIn("readback_error:github-timeout", rescue["reason_codes"])
+        self.assertIn(
+            "observation_unknown:process_active", rescue["reason_codes"]
+        )
+        self.assertIn("create_durable_followup", rescue["recovery_actions"])
+
+    def test_pr_merged_requires_head_binding_clean_zero_ahead(self) -> None:
+        by_merged = closeout.classify(
+            self.observation(
+                head_sha=MERGED,
+                remote_head_sha=MERGED,
+                pr_state="merged",
+                pr_number=633,
+                pr_head_sha=HEAD,
+                merged_sha=MERGED,
+            )
+        )
+        self.assertEqual(by_merged["closeout_state"], "pr_merged")
+        self.assertTrue(by_merged["lease_release_ready"])
+
+        by_pr_head = closeout.classify(
+            self.observation(
+                pr_state="merged",
+                pr_number=633,
+                pr_head_sha=HEAD,
+                merged_sha=MERGED,
+            )
+        )
+        self.assertEqual(by_pr_head["closeout_state"], "pr_merged")
+        self.assertTrue(by_pr_head["lease_release_ready"])
+
+        unbound = closeout.classify(
+            self.observation(
+                head_sha=None,
+                pr_state="merged",
+                pr_number=633,
+                pr_head_sha=HEAD,
+                merged_sha=MERGED,
+            )
+        )
+        self.assertEqual(unbound["phase"], "rescue_required")
+        self.assertIn("merged_head_unbound", unbound["reason_codes"])
+        self.assertFalse(unbound["lease_release_ready"])
+
+        mismatch = closeout.classify(
+            self.observation(
+                head_sha="d" * 40,
+                remote_head_sha="d" * 40,
+                pr_state="merged",
+                pr_number=633,
+                pr_head_sha=HEAD,
+                merged_sha=MERGED,
+            )
+        )
+        self.assertEqual(mismatch["phase"], "rescue_required")
+        self.assertIn("merged_head_mismatch", mismatch["reason_codes"])
+        self.assertFalse(mismatch["lease_release_ready"])
+
+        dirty = closeout.classify(
+            self.observation(
+                pr_state="merged",
+                pr_number=633,
+                pr_head_sha=HEAD,
+                merged_sha=HEAD,
+                git_dirty=True,
+            )
+        )
+        self.assertEqual(dirty["phase"], "rescue_required")
+        self.assertIn("valuable_dirty_state", dirty["reason_codes"])
+        self.assertFalse(dirty["lease_release_ready"])
+
+        ahead = closeout.classify(
+            self.observation(
+                pr_state="merged",
+                pr_number=633,
+                pr_head_sha=HEAD,
+                merged_sha=HEAD,
+                ahead_commits=1,
+            )
+        )
+        self.assertEqual(ahead["phase"], "rescue_required")
+        self.assertIn("unpushed_commits", ahead["reason_codes"])
+        self.assertFalse(ahead["lease_release_ready"])
+
     def test_assessment_is_audit_bound_without_granting_cleanup(self) -> None:
         records = []
         result = closeout.assess(

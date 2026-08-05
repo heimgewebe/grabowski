@@ -61,10 +61,57 @@ class EffectInterceptorTests(unittest.TestCase):
             "deduplicated",
         )
         self.assertEqual(
+            interceptor.success_completion_class(
+                {
+                    "deduplicated_reuse": {
+                        "reused": True,
+                        "task_id": "task-1",
+                        "reason": "active_execution_identity",
+                    }
+                }
+            ),
+            "deduplicated",
+        )
+        self.assertEqual(
             interceptor.success_completion_class({"receipt_sha256": "c" * 64}),
             "effect_observed",
         )
         self.assertEqual(interceptor.success_completion_class({"ok": True}), "succeeded")
+
+    def test_deduplicated_reuse_requires_positive_documented_signal(self) -> None:
+        for negative in (
+            None,
+            False,
+            0,
+            "",
+            [],
+            {},
+            True,
+            {"reused": False},
+            {"reused": 1},
+            {"task_id": "task-1"},
+        ):
+            with self.subTest(negative=negative):
+                self.assertEqual(
+                    interceptor.success_completion_class(
+                        {"ok": True, "deduplicated_reuse": negative}
+                    ),
+                    "succeeded",
+                )
+        self.assertEqual(
+            interceptor.success_completion_class({"deduplicated": False}),
+            "succeeded",
+        )
+        self.assertEqual(
+            interceptor.success_completion_class({"deduplicated": 1}),
+            "succeeded",
+        )
+        self.assertTrue(
+            interceptor._positive_deduplicated_reuse({"reused": True})
+        )
+        self.assertFalse(interceptor._positive_deduplicated_reuse(None))
+        self.assertFalse(interceptor._positive_deduplicated_reuse(False))
+        self.assertFalse(interceptor._positive_deduplicated_reuse({}))
 
     def test_success_and_exception_are_audit_bound(self) -> None:
         records = []

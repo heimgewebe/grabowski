@@ -263,6 +263,90 @@ class CentralTransportGateTests(unittest.TestCase):
             arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
         )
 
+    def test_admission_failure_after_consume_still_runs_domain_tool(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        arguments = {"path": "/tmp/example"}
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
+        ) as consume_verified:
+            with mock.patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+                side_effect=RuntimeError("audit unavailable"),
+            ) as admit_mutation:
+                with mock.patch.object(
+                    operator.grabowski_effect_interceptor,
+                    "record_success_best_effort",
+                ) as record_success:
+                    result = asyncio.run(
+                        operator.mcp._tool_manager.call_tool(
+                            "write", arguments, context
+                        )
+                    )
+        self.assertTrue(result["called"])
+        consume_verified.assert_called_once()
+        admit_mutation.assert_called_once()
+        record_success.assert_not_called()
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
+    def test_sync_executor_submit_failure_records_exception_then_reraises(self) -> None:
+        operator = self.configured_operator()
+
+        class RejectingExecutor:
+            def submit(self, *args, **kwargs):
+                raise RuntimeError("executor rejected")
+
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._SYNC_TOOL_EXECUTOR = RejectingExecutor()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        admission = {
+            "schema_version": 1,
+            "kind": "grabowski.effect_admission",
+            "request_id": "a" * 32,
+            "admission_sha256": "b" * 64,
+        }
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
+        ):
+            with mock.patch.object(
+                operator.grabowski_effect_interceptor,
+                "admit_mutation",
+                return_value=admission,
+            ):
+                with mock.patch.object(
+                    operator.grabowski_effect_interceptor,
+                    "record_exception_best_effort",
+                ) as record_exception:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "executor rejected"
+                    ):
+                        asyncio.run(
+                            operator.mcp._tool_manager.call_tool(
+                                "write", {}, context
+                            )
+                        )
+        record_exception.assert_called_once()
+        self.assertIs(record_exception.call_args.args[0], admission)
+        self.assertIsInstance(record_exception.call_args.args[1], RuntimeError)
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
     def test_stateless_shared_scope_admits_two_independent_handshakes(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

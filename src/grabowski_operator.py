@@ -868,37 +868,63 @@ def _install_deployment_admission_gate() -> None:
                 context=context,
                 tool=tool,
             )
-            effect_admission = (
-                grabowski_effect_interceptor.admit_mutation(
-                    tool_name=str(tool_name),
-                    arguments=arguments,
-                    transport_evidence=transport_evidence,
-                    context=context,
-                    append_audit=_append_effect_audit,
-                )
-                if transport_evidence is not None
-                else None
-            )
+            # Admission is correlation evidence only. After transport consume,
+            # audit/admission failure must not prevent the authorized domain
+            # tool from executing; missing admission only suppresses completion
+            # correlation.
+            effect_admission: dict[str, Any] | None = None
+            if transport_evidence is not None:
+                try:
+                    effect_admission = grabowski_effect_interceptor.admit_mutation(
+                        tool_name=str(tool_name),
+                        arguments=arguments,
+                        transport_evidence=transport_evidence,
+                        context=context,
+                        append_audit=_append_effect_audit,
+                    )
+                except BaseException as admission_error:
+                    logging.getLogger(__name__).error(
+                        "effect admission evidence failed after transport "
+                        "consume; domain tool will execute without completion "
+                        "correlation: %s",
+                        type(admission_error).__name__,
+                        exc_info=admission_error,
+                    )
+                    effect_admission = None
             if kind == _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC:
                 loop = asyncio.get_running_loop()
-                worker_future = _SYNC_TOOL_EXECUTOR.submit(
-                    (
-                        _run_sync_tool_call_with_effect
-                        if effect_admission is not None
-                        else _run_sync_tool_call
-                    ),
-                    original,
-                    args,
-                    kwargs,
-                    *((effect_admission,) if effect_admission is not None else ()),
-                )
+                try:
+                    worker_future = _SYNC_TOOL_EXECUTOR.submit(
+                        (
+                            _run_sync_tool_call_with_effect
+                            if effect_admission is not None
+                            else _run_sync_tool_call
+                        ),
+                        original,
+                        args,
+                        kwargs,
+                        *(
+                            (effect_admission,)
+                            if effect_admission is not None
+                            else ()
+                        ),
+                    )
+                    wrapped = asyncio.wrap_future(worker_future, loop=loop)
+                except BaseException as error:
+                    if effect_admission is not None:
+                        grabowski_effect_interceptor.record_exception_best_effort(
+                            effect_admission,
+                            error,
+                            append_audit=_append_effect_audit,
+                        )
+                    raise
 
                 def _release_when_worker_finishes(_completed: Any) -> None:
                     _deployment_admission_release_tool_call(identity)
 
                 worker_future.add_done_callback(_release_when_worker_finishes)
                 release_in_finally = False
-                return await asyncio.wrap_future(worker_future, loop=loop)
+                return await wrapped
             try:
                 result = await original(*args, **kwargs)
             except BaseException as error:

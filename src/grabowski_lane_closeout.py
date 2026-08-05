@@ -239,9 +239,38 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
     reasons: list[str] = []
     actions: list[str] = []
 
+    # Active liveness is higher priority than any terminal readback closeout.
+    # A still-running writer/task/process must stay non-terminal active even when
+    # readback failed and a durable followup id is already bound.
+    if (
+        data["writer_state"] in ACTIVE_WRITER_STATES
+        or data["task_active"] is True
+        or data["process_active"] is True
+    ):
+        return {
+            "phase": "active",
+            "closeout_state": None,
+            "action_required": False,
+            "reason_codes": ["writer_or_process_active"],
+            "recovery_actions": [],
+            "lease_release_ready": False,
+            "workspace_cleanup_ready": False,
+            "lane_id": data["lane_id"],
+        }
+
+    liveness_unknown = data["task_active"] is None or data["process_active"] is None
     if data["readback_errors"]:
         reasons.extend(f"readback_error:{value}" for value in data["readback_errors"])
         actions.append("refresh_git_task_process_and_pr_readback")
+        # Unknown liveness with readback errors must never become terminal
+        # blocked_with_durable_followup; only known-inactive liveness may.
+        if liveness_unknown:
+            if data["task_active"] is None:
+                reasons.append("observation_unknown:task_active")
+            if data["process_active"] is None:
+                reasons.append("observation_unknown:process_active")
+            actions.append("create_durable_followup")
+            return _rescue_result(data, reasons, actions)
         if data["durable_followup_id"] is not None:
             return _terminal_result(
                 data,
@@ -268,22 +297,6 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
         )
         return _rescue_result(data, reasons, actions)
 
-    if (
-        data["writer_state"] in ACTIVE_WRITER_STATES
-        or data["task_active"]
-        or data["process_active"]
-    ):
-        return {
-            "phase": "active",
-            "closeout_state": None,
-            "action_required": False,
-            "reason_codes": ["writer_or_process_active"],
-            "recovery_actions": [],
-            "lease_release_ready": False,
-            "workspace_cleanup_ready": False,
-            "lane_id": data["lane_id"],
-        }
-
     head = data["head_sha"]
     remote = data["remote_head_sha"]
     pr_head = data["pr_head_sha"]
@@ -295,12 +308,35 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
         reasons.append("deployed_head_mismatch")
         actions.append("verify_deployment_and_repository_heads")
 
-    if data["pr_state"] == "merged" and data["merged_sha"] is not None:
-        if head is not None and pr_head is not None and pr_head != head:
-            reasons.append("merged_pr_head_mismatch")
-            actions.append("verify_pr_and_workspace_heads")
-        else:
+    if data["pr_state"] == "merged":
+        head_bound_to_merged = (
+            head is not None
+            and data["merged_sha"] is not None
+            and head == data["merged_sha"]
+        )
+        head_matches_pr = (
+            head is not None and pr_head is not None and head == pr_head
+        )
+        merged_clean = (
+            data["git_dirty"] is False and data["ahead_commits"] == 0
+        )
+        if (head_bound_to_merged or head_matches_pr) and merged_clean:
             return _terminal_result(data, "pr_merged", ["merged_pr_observed"])
+        if head is None:
+            reasons.append("merged_head_unbound")
+            actions.append("verify_pr_and_workspace_heads")
+        elif not head_bound_to_merged and not head_matches_pr:
+            reasons.append("merged_head_mismatch")
+            actions.append("verify_pr_and_workspace_heads")
+        if data["git_dirty"] is not False:
+            reasons.append("valuable_dirty_state")
+            actions.extend(["bind_successor_controller", "commit_validated_changes"])
+        if data["ahead_commits"] is None:
+            reasons.append("ahead_count_unobserved")
+            actions.append("refresh_git_branch_readback")
+        elif data["ahead_commits"] > 0:
+            reasons.append("unpushed_commits")
+            actions.append("push_exact_branch_head")
 
     open_pr_complete = bool(
         data["pr_state"] == "open"
@@ -334,15 +370,17 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
     if data["writer_state"] == "outcome_unknown":
         reasons.append("writer_outcome_unknown")
         actions.append("refresh_git_task_process_and_pr_readback")
-    if data["git_dirty"]:
+    if data["git_dirty"] and "valuable_dirty_state" not in reasons:
         reasons.append("valuable_dirty_state")
         actions.extend(["bind_successor_controller", "commit_validated_changes"])
     if data["ahead_commits"] is None:
-        reasons.append("ahead_count_unobserved")
-        actions.append("refresh_git_branch_readback")
+        if "ahead_count_unobserved" not in reasons:
+            reasons.append("ahead_count_unobserved")
+            actions.append("refresh_git_branch_readback")
     elif data["ahead_commits"] > 0:
-        reasons.append("unpushed_commits")
-        actions.append("push_exact_branch_head")
+        if "unpushed_commits" not in reasons:
+            reasons.append("unpushed_commits")
+            actions.append("push_exact_branch_head")
     if head is not None and remote is not None and remote != head:
         reasons.append("remote_head_mismatch")
         actions.append("push_or_reconcile_exact_branch_head")
