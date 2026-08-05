@@ -383,6 +383,100 @@ def read_activation(path: Path) -> dict[str, Any] | None:
     return value
 
 
+CUTOVER_PHASES = (
+    "prepare",
+    "start_green",
+    "verify_green",
+    "pre_cutover_ready",
+    "cutover",
+    "post_cutover",
+    "terminalize_effects",
+    "retire_blue",
+    "completed",
+    "rolled_back",
+    "outcome_unknown",
+)
+CUTOVER_PHASE_SET = frozenset(CUTOVER_PHASES)
+PRE_CUTOVER_PHASES = frozenset(
+    {
+        "prepare",
+        "start_green",
+        "verify_green",
+        "pre_cutover_ready",
+    }
+)
+POST_CUTOVER_PHASES = frozenset(
+    {
+        "cutover",
+        "post_cutover",
+        "terminalize_effects",
+        "retire_blue",
+        "completed",
+        "outcome_unknown",
+    }
+)
+
+
+def validate_cutover_phase(phase: Any) -> str:
+    if not isinstance(phase, str) or phase not in CUTOVER_PHASE_SET:
+        raise ValueError(f"blue-green cutover phase is invalid: {phase!r}")
+    return phase
+
+
+def cutover_failure_class(phase: Any) -> str:
+    """Classify whether a failed cutover remains pre-cutover-rollbackable."""
+    validated = validate_cutover_phase(phase)
+    if validated in PRE_CUTOVER_PHASES:
+        return "pre_cutover_rollback"
+    if validated == "rolled_back":
+        return "pre_cutover_rollback"
+    if validated == "completed":
+        return "completed"
+    return "post_cutover_outcome_unknown"
+
+
+def build_cutover_observation(
+    *,
+    cutover_id: str,
+    phase: str,
+    expected_head: str,
+    blue_release_id: str,
+    green_release_id: str,
+    source_identity_sha256: str,
+    details: dict[str, Any] | None = None,
+    observed_at_unix: int | None = None,
+) -> dict[str, Any]:
+    """Build one bounded cutover observation for deployment observer evidence."""
+    if not isinstance(cutover_id, str) or not cutover_id.strip() or len(cutover_id) > 128:
+        raise ValueError("cutover_id must be a bounded non-empty string")
+    phase_text = validate_cutover_phase(phase)
+    if HEAD_RE.fullmatch(expected_head) is None:
+        raise ValueError("cutover observation expected_head is invalid")
+    if not isinstance(blue_release_id, str) or not blue_release_id.strip():
+        raise ValueError("blue_release_id is invalid")
+    if not isinstance(green_release_id, str) or not green_release_id.strip():
+        raise ValueError("green_release_id is invalid")
+    if not isinstance(source_identity_sha256, str) or SHA256_RE.fullmatch(source_identity_sha256) is None:
+        raise ValueError("source_identity_sha256 is invalid")
+    if details is not None and not isinstance(details, dict):
+        raise ValueError("cutover observation details must be an object when present")
+    observed = int(time.time()) if observed_at_unix is None else int(observed_at_unix)
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_blue_green_cutover_observation",
+        "cutover_id": cutover_id.strip(),
+        "phase": phase_text,
+        "failure_class": cutover_failure_class(phase_text),
+        "expected_head": expected_head,
+        "blue_release_id": blue_release_id,
+        "green_release_id": green_release_id,
+        "source_identity_sha256": source_identity_sha256,
+        "observed_at_unix": observed,
+        "details": details or {},
+    }
+    return {**material, "observation_sha256": sha256_json(material)}
+
+
 def create_activation(path: Path, value: dict[str, Any]) -> None:
     payload = canonical_json_bytes(value) + b"\n"
     if len(payload) > MAX_FILE_BYTES:

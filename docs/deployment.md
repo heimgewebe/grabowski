@@ -26,6 +26,16 @@ Das Tunnelprofil muss dadurch nicht umgeschrieben werden. Ein Profilbefehl wie
 wird beim Dienstneustart über den stabilen Symlink auf das ausgewählte Release
 aufgelöst.
 
+## Blue-Green-Cutover
+
+Der agentengeführte Blue-Green- und Connector-Konvergenz-Schnitt ist in
+[`blue-green-deploy-cutover-v1.md`](blue-green-deploy-cutover-v1.md)
+beschrieben. Er startet Green parallel, prüft Manifest/Werkzeuge/Schemas/
+Sentinel/Bedienvertrag, schaltet den Connector atomar um, rebindet den
+Snapshot im Cutover, schließt Blue für neue Mutationen, lässt Reads auslaufen
+und terminalisiert nur effect-bearing Aufrufe. Pre-Cutover-Fehler rollen
+zurück; Post-Cutover-Fehler enden in `outcome_unknown` mit Recovery-Readback.
+
 ## Runtimevertrag
 
 Der versionierte Entry-Point steht in:

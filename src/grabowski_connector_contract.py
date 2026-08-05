@@ -275,3 +275,134 @@ def mixed_artifact_from_runtime_tools(
     }
     parse_observed_artifact(artifact, label="runtime artifact")
     return artifact
+
+
+def _require_sha256(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64:
+        raise ConnectorContractError(f"{label} must be a lowercase SHA-256")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ConnectorContractError(f"{label} must be a lowercase SHA-256") from exc
+    if value != value.lower():
+        raise ConnectorContractError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _require_release_id(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ConnectorContractError(f"{label} must be a non-empty release id")
+    if len(value) > 512:
+        raise ConnectorContractError(f"{label} exceeds the release id bound")
+    return value
+
+
+def _require_repo_head(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 40:
+        raise ConnectorContractError(f"{label} must be a 40-character Git head")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ConnectorContractError(f"{label} must be a 40-character Git head") from exc
+    if value != value.lower():
+        raise ConnectorContractError(f"{label} must be a 40-character Git head")
+    return value
+
+
+def evaluate_green_readiness(
+    *,
+    observed_names: list[str],
+    observed_schemas: dict[str, dict[str, Any]],
+    runtime_names: list[str],
+    runtime_schemas: dict[str, dict[str, Any]],
+    contract_names: list[str],
+    observed_release_id: str,
+    expected_release_id: str,
+    observed_repo_head: str,
+    expected_repo_head: str,
+    observed_agent_instructions_sha256: str,
+    expected_agent_instructions_sha256: str,
+) -> dict[str, Any]:
+    """Evaluate a parallel green runtime against manifest/tools/schemas/sentinel/Bedienvertrag.
+
+    The result is readiness evidence for the blue-green cutover. It does not
+    mutate connector state and does not authorize the cutover itself.
+    """
+    observed_release = _require_release_id(
+        observed_release_id, label="observed_release_id"
+    )
+    expected_release = _require_release_id(
+        expected_release_id, label="expected_release_id"
+    )
+    observed_head = _require_repo_head(observed_repo_head, label="observed_repo_head")
+    expected_head = _require_repo_head(expected_repo_head, label="expected_repo_head")
+    observed_instructions = _require_sha256(
+        observed_agent_instructions_sha256,
+        label="observed_agent_instructions_sha256",
+    )
+    expected_instructions = _require_sha256(
+        expected_agent_instructions_sha256,
+        label="expected_agent_instructions_sha256",
+    )
+    probe = probe_contract(
+        observed_names,
+        observed_schemas,
+        runtime_names,
+        runtime_schemas,
+        contract_names,
+    )
+    release_matches = observed_release == expected_release
+    head_matches = observed_head == expected_head
+    bedienvertrag_matches = observed_instructions == expected_instructions
+    ready = (
+        probe["matches"] is True
+        and release_matches
+        and head_matches
+        and bedienvertrag_matches
+    )
+    mismatches: list[str] = []
+    if not release_matches:
+        mismatches.append("release_id")
+    if not head_matches:
+        mismatches.append("repo_head")
+    if not bedienvertrag_matches:
+        mismatches.append("agent_instructions_sha256")
+    if probe["name_contract_matches"] is not True:
+        mismatches.append("tool_names")
+    if probe["runtime_contract_matches"] is not True:
+        mismatches.append("runtime_contract")
+    if probe["schema_contract_matches"] is not True:
+        mismatches.append("schemas_or_sentinels")
+    return {
+        "schema_version": 1,
+        "kind": "grabowski_blue_green_green_readiness",
+        "ready": ready,
+        "mismatches": mismatches,
+        "release_id": expected_release if release_matches else None,
+        "repo_head": expected_head if head_matches else None,
+        "agent_instructions_sha256": (
+            expected_instructions if bedienvertrag_matches else None
+        ),
+        "observed_release_id": observed_release,
+        "expected_release_id": expected_release,
+        "observed_repo_head": observed_head,
+        "expected_repo_head": expected_head,
+        "observed_agent_instructions_sha256": observed_instructions,
+        "expected_agent_instructions_sha256": expected_instructions,
+        "bedienvertrag_matches": bedienvertrag_matches,
+        "manifest_identity_matches": release_matches and head_matches,
+        "probe": probe,
+        "names_sha256": probe["runtime_names_sha256"],
+        "schema_sentinels": sorted(REQUIRED_SCHEMA_SENTINELS),
+        "recommended_next_action": (
+            "proceed to connector cutover"
+            if ready
+            else "repair green readiness mismatches before cutover"
+        ),
+        "does_not_establish": [
+            "cutover authority",
+            "connector delivery of the green surface",
+            "live pointer mutation",
+        ],
+    }
+
