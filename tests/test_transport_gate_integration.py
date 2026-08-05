@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from pathlib import Path
 import tempfile
 import types
@@ -345,6 +346,158 @@ class CentralTransportGateTests(unittest.TestCase):
         record_exception.assert_called_once()
         self.assertIs(record_exception.call_args.args[0], admission)
         self.assertIsInstance(record_exception.call_args.args[1], RuntimeError)
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
+    def test_wrap_failure_after_submit_keeps_admission_until_worker_callback(
+        self,
+    ) -> None:
+        operator = self.configured_operator()
+        held = concurrent.futures.Future()
+
+        class HoldingExecutor:
+            def submit(self, *args, **kwargs):
+                return held
+
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._SYNC_TOOL_EXECUTOR = HoldingExecutor()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        admission = {
+            "schema_version": 1,
+            "kind": "grabowski.effect_admission",
+            "request_id": "a" * 32,
+            "admission_sha256": "b" * 64,
+        }
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
+        ), mock.patch.object(
+            operator.grabowski_effect_interceptor,
+            "admit_mutation",
+            return_value=admission,
+        ), mock.patch.object(
+            operator.grabowski_effect_interceptor,
+            "record_exception_best_effort",
+        ) as record_exception, mock.patch.object(
+            operator.asyncio,
+            "wrap_future",
+            side_effect=RuntimeError("wrap failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "wrap failed"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {}, context)
+                )
+        record_exception.assert_called_once()
+        self.assertIs(record_exception.call_args.args[0], admission)
+        # Outer finally must not release while the submitted worker may run.
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 1)
+        held.set_result({"called": True})
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
+    def test_callback_registration_failure_after_submit_does_not_release_in_finally(
+        self,
+    ) -> None:
+        operator = self.configured_operator()
+
+        class FutureRejectingCallback(concurrent.futures.Future):
+            def add_done_callback(self, fn):  # type: ignore[override]
+                raise RuntimeError("callback registration failed")
+
+        held = FutureRejectingCallback()
+
+        class HoldingExecutor:
+            def submit(self, *args, **kwargs):
+                return held
+
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=False,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._SYNC_TOOL_EXECUTOR = HoldingExecutor()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        admission = {
+            "schema_version": 1,
+            "kind": "grabowski.effect_admission",
+            "request_id": "a" * 32,
+            "admission_sha256": "b" * 64,
+        }
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
+        ), mock.patch.object(
+            operator.grabowski_effect_interceptor,
+            "admit_mutation",
+            return_value=admission,
+        ), mock.patch.object(
+            operator.grabowski_effect_interceptor,
+            "record_exception_best_effort",
+        ) as record_exception:
+            with self.assertRaisesRegex(
+                RuntimeError, "callback registration failed"
+            ):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {}, context)
+                )
+        record_exception.assert_called_once()
+        # Conservative hold: no outer finally release while worker may still run.
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 1)
+
+    def test_admission_keyboard_interrupt_does_not_start_domain_tool(self) -> None:
+        operator = _load_operator_module()
+        operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
+        operator.base._transport_roundtrip_client_scope = (
+            lambda context: (
+                META_SCOPE
+                if getattr(context, "client_id", None)
+                else SHARED_SCOPE
+            )
+        )
+        domain_calls: list[object] = []
+
+        async def original_call(*args, **kwargs):
+            domain_calls.append({"args": args, "kwargs": kwargs})
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = original_call
+        operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
+            is_async=True,
+            context_kwarg="ctx",
+            annotations=types.SimpleNamespace(readOnlyHint=False),
+        )
+        operator._configure_http_runtime()
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            return_value={
+                "state": "consumed",
+                "runtime_binding_sha256": roundtrip._sha256_json(BINDING),
+                "consumption_receipt_sha256": "d" * 64,
+            },
+        ), mock.patch.object(
+            operator.grabowski_effect_interceptor,
+            "admit_mutation",
+            side_effect=KeyboardInterrupt("interrupted"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool("write", {}, context)
+                )
+        self.assertEqual(domain_calls, [])
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
     def test_stateless_shared_scope_admits_two_independent_handshakes(self) -> None:

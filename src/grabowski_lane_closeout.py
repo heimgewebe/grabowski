@@ -109,11 +109,15 @@ def _sha(value: Any, field: str, *, optional: bool = False) -> str | None:
     return value
 
 
-def _boolean(value: Any, field: str) -> bool | None:
+def _boolean(value: Any, field: str, *, allow_null: bool = True) -> bool | None:
     if value is None:
-        return None
+        if allow_null:
+            return None
+        raise ValueError(f"{field} must be a boolean")
     if not isinstance(value, bool):
-        raise ValueError(f"{field} must be a boolean or null")
+        raise ValueError(
+            f"{field} must be a boolean" + (" or null" if allow_null else "")
+        )
     return value
 
 
@@ -182,7 +186,11 @@ def _validated(observation: LaneCloseoutObservation) -> dict[str, Any]:
         "deployed_sha": _sha(
             observation.deployed_sha, "deployed_sha", optional=True
         ),
-        "no_change_proven": bool(observation.no_change_proven),
+        # Terminal no-change closeout accepts only the exact boolean True.
+        # Truthy non-booleans (e.g. "yes", 1) must not become terminal proof.
+        "no_change_proven": _boolean(
+            observation.no_change_proven, "no_change_proven", allow_null=False
+        ),
         "durable_followup_id": _identity(
             observation.durable_followup_id,
             "durable_followup_id",
@@ -304,9 +312,30 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
     if data["deployed_sha"] is not None:
         deploy_sources = {value for value in (head, data["merged_sha"]) if value}
         if data["deployed_sha"] in deploy_sources:
-            return _terminal_result(data, "deployed", ["deployment_head_bound"])
-        reasons.append("deployed_head_mismatch")
-        actions.append("verify_deployment_and_repository_heads")
+            # deployed is lease-release-ready only when the deployed head is
+            # bound and the workspace is clean with zero unpushed commits.
+            # Missing ahead observation, dirty, or ahead must not release.
+            deployed_clean = (
+                data["git_dirty"] is False and data["ahead_commits"] == 0
+            )
+            if deployed_clean:
+                return _terminal_result(
+                    data, "deployed", ["deployment_head_bound"]
+                )
+            if data["git_dirty"] is not False:
+                reasons.append("valuable_dirty_state")
+                actions.extend(
+                    ["bind_successor_controller", "commit_validated_changes"]
+                )
+            if data["ahead_commits"] is None:
+                reasons.append("ahead_count_unobserved")
+                actions.append("refresh_git_branch_readback")
+            elif data["ahead_commits"] > 0:
+                reasons.append("unpushed_commits")
+                actions.append("push_exact_branch_head")
+        else:
+            reasons.append("deployed_head_mismatch")
+            actions.append("verify_deployment_and_repository_heads")
 
     if data["pr_state"] == "merged":
         head_bound_to_merged = (
@@ -352,7 +381,7 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
         return _terminal_result(data, state, ["open_pr_exact_head_bound"])
 
     no_change_complete = bool(
-        data["no_change_proven"]
+        data["no_change_proven"] is True
         and data["git_dirty"] is False
         and data["ahead_commits"] == 0
         and (head == data["base_revision"] or head == remote)
@@ -387,7 +416,7 @@ def classify(observation: LaneCloseoutObservation) -> dict[str, Any]:
     if data["pr_state"] == "open" and pr_head != head:
         reasons.append("pr_head_mismatch")
         actions.append("update_pr_to_exact_branch_head")
-    if data["pr_state"] is None and not data["no_change_proven"]:
+    if data["pr_state"] is None and data["no_change_proven"] is not True:
         reasons.append("pr_or_no_change_closeout_missing")
         actions.append("create_or_update_pr")
     if data["pr_state"] == "closed":

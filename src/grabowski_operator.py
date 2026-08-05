@@ -882,7 +882,10 @@ def _install_deployment_admission_gate() -> None:
                         context=context,
                         append_audit=_append_effect_audit,
                     )
-                except BaseException as admission_error:
+                except Exception as admission_error:
+                    # Catch Exception only: process-level BaseException
+                    # (KeyboardInterrupt, SystemExit) must propagate without
+                    # starting the domain tool after interruption.
                     logging.getLogger(__name__).error(
                         "effect admission evidence failed after transport "
                         "consume; domain tool will execute without completion "
@@ -909,8 +912,8 @@ def _install_deployment_admission_gate() -> None:
                             else ()
                         ),
                     )
-                    wrapped = asyncio.wrap_future(worker_future, loop=loop)
                 except BaseException as error:
+                    # Submit never accepted work: outer finally may release.
                     if effect_admission is not None:
                         grabowski_effect_interceptor.record_exception_best_effort(
                             effect_admission,
@@ -919,11 +922,45 @@ def _install_deployment_admission_gate() -> None:
                         )
                     raise
 
+                # After successful submit the worker may already run. Release
+                # ownership stays with the completion callback; outer finally
+                # must not release admission while that worker may still run.
+                release_in_finally = False
+
                 def _release_when_worker_finishes(_completed: Any) -> None:
                     _deployment_admission_release_tool_call(identity)
 
-                worker_future.add_done_callback(_release_when_worker_finishes)
-                release_in_finally = False
+                callback_registered = False
+                try:
+                    worker_future.add_done_callback(
+                        _release_when_worker_finishes
+                    )
+                    callback_registered = True
+                    wrapped = asyncio.wrap_future(worker_future, loop=loop)
+                except BaseException as error:
+                    if not callback_registered:
+                        try:
+                            worker_future.add_done_callback(
+                                _release_when_worker_finishes
+                            )
+                            callback_registered = True
+                        except BaseException as callback_error:
+                            logging.getLogger(__name__).error(
+                                "sync tool release callback registration "
+                                "failed after submit; admission remains held "
+                                "until process lifecycle: %s",
+                                type(callback_error).__name__,
+                                exc_info=callback_error,
+                            )
+                    # Conservative outcome only: do not release admission or
+                    # start a conflicting new effect while the worker may run.
+                    if effect_admission is not None:
+                        grabowski_effect_interceptor.record_exception_best_effort(
+                            effect_admission,
+                            error,
+                            append_audit=_append_effect_audit,
+                        )
+                    raise
                 return await wrapped
             try:
                 result = await original(*args, **kwargs)

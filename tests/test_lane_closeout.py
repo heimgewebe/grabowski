@@ -116,6 +116,7 @@ class LaneCloseoutTests(unittest.TestCase):
             )
         )
         self.assertEqual(success["closeout_state"], "deployed")
+        self.assertTrue(success["lease_release_ready"])
 
         mismatch = closeout.classify(
             self.observation(
@@ -125,6 +126,55 @@ class LaneCloseoutTests(unittest.TestCase):
         )
         self.assertEqual(mismatch["phase"], "rescue_required")
         self.assertIn("deployed_head_mismatch", mismatch["reason_codes"])
+
+    def test_deployed_requires_clean_worktree_and_zero_ahead(self) -> None:
+        dirty = closeout.classify(
+            self.observation(
+                deployed_sha=HEAD,
+                git_dirty=True,
+            )
+        )
+        self.assertEqual(dirty["phase"], "rescue_required")
+        self.assertIsNone(dirty["closeout_state"])
+        self.assertIn("valuable_dirty_state", dirty["reason_codes"])
+        self.assertFalse(dirty["lease_release_ready"])
+
+        ahead = closeout.classify(
+            self.observation(
+                deployed_sha=HEAD,
+                ahead_commits=1,
+            )
+        )
+        self.assertEqual(ahead["phase"], "rescue_required")
+        self.assertIsNone(ahead["closeout_state"])
+        self.assertIn("unpushed_commits", ahead["reason_codes"])
+        self.assertFalse(ahead["lease_release_ready"])
+
+        unobserved_ahead = closeout.classify(
+            self.observation(
+                deployed_sha=HEAD,
+                ahead_commits=None,
+            )
+        )
+        self.assertEqual(unobserved_ahead["phase"], "rescue_required")
+        self.assertIsNone(unobserved_ahead["closeout_state"])
+        self.assertIn("ahead_count_unobserved", unobserved_ahead["reason_codes"])
+        self.assertFalse(unobserved_ahead["lease_release_ready"])
+
+    def test_no_change_proven_rejects_truthy_non_booleans(self) -> None:
+        for value in ("yes", 1, "true", object()):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "no_change_proven"):
+                    closeout.classify(self.observation(no_change_proven=value))
+
+        refused = closeout.classify(
+            self.observation(
+                head_sha=BASE,
+                remote_head_sha=BASE,
+                no_change_proven=False,
+            )
+        )
+        self.assertNotEqual(refused.get("closeout_state"), "no_change_proven")
 
     def test_readback_error_can_close_only_with_durable_followup(self) -> None:
         blocked = closeout.classify(
