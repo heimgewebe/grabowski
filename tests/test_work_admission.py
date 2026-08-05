@@ -407,11 +407,25 @@ class WorkAdmissionTests(unittest.TestCase):
         target_path = str(self.repo.parent / "worktrees" / "bureau-target")
         branch = "feat/bureau-target"
         scope = {
+            "schema_version": 1,
             "repository": str(self.repo),
-            "isolation": "worktree",
-            "worktree": target_path,
+            "task_id": "REPOGROUND-TEST-T005",
+            "base_head": "0" * 40,
+            "head": "a" * 40,
             "branch": branch,
-            "allowed_paths": ["src/example.py", "tests/test_example.py"],
+            "worktree": target_path,
+            "effects": ["write"],
+            "paths": [
+                str(self.repo / "src" / "example.py"),
+                str(self.repo / "tests" / "test_example.py"),
+            ],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
         }
         result = admission.assess_repository_admission(
             repo=str(self.repo),
@@ -441,9 +455,14 @@ class WorkAdmissionTests(unittest.TestCase):
         )
 
         for invalid_scope in (
-            {**scope, "isolation": "repository"},
-            {**scope, "allowed_paths": ["."]},
-            {key: value for key, value in scope.items() if key != "allowed_paths"},
+            {**scope, "isolation": "worktree"},
+            {**scope, "paths": []},
+            {
+                **scope,
+                "effects": ["deploy"],
+                "deployments": ["production"],
+                "shared_gates": ["repository-runtime-deploy"],
+            },
         ):
             blocked = admission.assess_repository_admission(
                 repo=str(self.repo),
