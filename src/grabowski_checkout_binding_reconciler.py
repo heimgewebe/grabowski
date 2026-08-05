@@ -186,32 +186,47 @@ def _durable_evidence_drift_reasons(
     """Check identity continuity across durable retention and archive evidence."""
     reasons: list[str] = []
     retention = binding.get("retention")
+    archive = binding.get("latest_archive")
+    archived_terminal_evidence = phase == "archived" and isinstance(archive, Mapping)
     if isinstance(retention, Mapping):
-        retention_checks = (
+        retention_checks = [
             ("repo_common_dir", "repo_common_dir", "binding-retention-repo-common-dir-mismatch"),
             ("repo_path", "repo_path", "binding-retention-repo-path-mismatch"),
             ("checkout_path", "checkout_path", "binding-retention-checkout-path-mismatch"),
             ("owner_id", "owner_id", "binding-retention-owner-mismatch"),
-            ("expected_head", "expected_head", "binding-retention-head-mismatch"),
-            ("expected_branch", "expected_branch", "binding-retention-branch-mismatch"),
-        )
+        ]
+        if not archived_terminal_evidence:
+            retention_checks.extend(
+                (
+                    ("expected_head", "expected_head", "binding-retention-head-mismatch"),
+                    ("expected_branch", "expected_branch", "binding-retention-branch-mismatch"),
+                )
+            )
         for binding_field, retention_field, reason in retention_checks:
             if _text(binding.get(binding_field)) != _text(retention.get(retention_field)):
                 reasons.append(reason)
 
-    archive = binding.get("latest_archive")
-    if phase == "archived" and isinstance(archive, Mapping):
+    if archived_terminal_evidence:
+        assert isinstance(archive, Mapping)
         archive_checks = (
             ("repo_common_dir", "repo_common_dir", "binding-archive-repo-common-dir-mismatch"),
             ("repo_path", "repo_path", "binding-archive-repo-path-mismatch"),
             ("checkout_path", "checkout_path", "binding-archive-checkout-path-mismatch"),
             ("owner_id", "owner_id", "binding-archive-owner-mismatch"),
-            ("expected_head", "head", "binding-archive-head-mismatch"),
-            ("expected_branch", "branch", "binding-archive-branch-mismatch"),
         )
         for binding_field, archive_field, reason in archive_checks:
             if _text(binding.get(binding_field)) != _text(archive.get(archive_field)):
                 reasons.append(reason)
+        terminal_evidence = retention if isinstance(retention, Mapping) else binding
+        terminal_prefix = "retention-archive" if isinstance(retention, Mapping) else "binding-archive"
+        for expected_field, archive_field, suffix in (
+            ("expected_head", "head", "head-mismatch"),
+            ("expected_branch", "branch", "branch-mismatch"),
+        ):
+            if _text(terminal_evidence.get(expected_field)) != _text(
+                archive.get(archive_field)
+            ):
+                reasons.append(f"{terminal_prefix}-{suffix}")
     return reasons
 
 
