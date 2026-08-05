@@ -150,7 +150,8 @@ def _runtime_error_details(
 def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
     """Return stable identity fields for one filesystem object.
 
-    Directory size and timestamps are mutable namespace metadata. They may
+    Directory link count, size and timestamps are mutable namespace
+    metadata. They may
     change between stat and fstat when an unrelated process updates a shared
     ancestor such as /tmp, so they must not participate in path-to-fd binding.
     """
@@ -158,7 +159,6 @@ def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_nlink,
         metadata.st_uid,
         metadata.st_gid,
     )
@@ -167,6 +167,7 @@ def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
 def _file_snapshot_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         *_directory_identity(metadata),
+        metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
