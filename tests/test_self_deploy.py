@@ -118,6 +118,20 @@ def _contention_result(*, decision: str = "proceed") -> dict[str, object]:
         "dispatcher": {"state": "idle"},
     }
 
+def _sidecar_controller_contract() -> dict[str, object]:
+    return {
+        "decision": "controller",
+        "controller": "grabowski-primary",
+        "primary_role": "controller-integrator",
+        "delegated_scoped_writers_allowed": True,
+        "controller_integration_required": True,
+        "single_mutating_writer": True,
+        "single_mutating_writer_scope": "overlapping-resource-lane",
+        "external_primary_writer_forbidden": False,
+        "automatic_execution_authorized": True,
+    }
+
+
 def _sidecar_apply_receipt() -> dict[str, object]:
     return {
         "kind": "coding-agent-router-cli-install-receipt",
@@ -127,11 +141,11 @@ def _sidecar_apply_receipt() -> dict[str, object]:
         "runtime_catalog_sha256": "c" * 64,
         "wrapper_sha256": "a" * 64,
         "scheduler_sha256": "b" * 64,
-        "automatic_execution_authorized": False,
+        "automatic_execution_authorized": True,
         "rollback_performed": False,
         "readback": {
+            **_sidecar_controller_contract(),
             "catalog_sha256": "c" * 64,
-            "automatic_execution_authorized": False,
         },
     }
 
@@ -144,7 +158,8 @@ def _sidecar_check_receipt() -> dict[str, object]:
         "runtime_catalog_sha256": "c" * 64,
         "wrapper_sha256": "a" * 64,
         "scheduler_sha256": "b" * 64,
-        "automatic_execution_authorized": False,
+        **_sidecar_controller_contract(),
+        "catalog_sha256": "c" * 64,
     }
 
 
@@ -164,7 +179,7 @@ def _sidecar_reconciliation(expected: str = "f" * 40) -> dict[str, object]:
         "check_receipt_sha256": RUNNER.canonical_json_sha256(
             _sidecar_check_receipt()
         ),
-        "automatic_execution_authorized": False,
+        "automatic_execution_authorized": True,
     }
     return {**material, "evidence_sha256": RUNNER.canonical_json_sha256(material)}
 
@@ -1102,6 +1117,65 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
                         repo,
                         {"release_id": "r", "repo_head": "f" * 40},
                     )
+
+    def test_sidecar_reconciliation_rejects_controller_contract_regressions(
+        self,
+    ) -> None:
+        live = {"release_id": "r", "repo_head": "f" * 40}
+        regressions = {
+            "direct-writer role": {"primary_role": "direct-writer"},
+            "external writer prohibition true": {
+                "external_primary_writer_forbidden": True
+            },
+            "automatic false": {"automatic_execution_authorized": False},
+            "missing delegated writers": {
+                "delegated_scoped_writers_allowed": False
+            },
+            "missing controller integration": {
+                "controller_integration_required": False
+            },
+            "missing single writer": {"single_mutating_writer": False},
+            "wrong writer scope": {
+                "single_mutating_writer_scope": "whole-repository"
+            },
+            "catalog mismatch": {"catalog_sha256": "d" * 64},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            installer = repo / RUNNER.SIDECAR_INSTALLER_RELATIVE_PATH
+            installer.parent.mkdir(parents=True)
+            installer.write_text("pass\n", encoding="utf-8")
+            for label, override in regressions.items():
+                with self.subTest(surface="apply-readback", label=label):
+                    applied = _sidecar_apply_receipt()
+                    applied["readback"] = {
+                        **applied["readback"],
+                        **override,
+                    }
+                    if "automatic_execution_authorized" in override:
+                        applied["automatic_execution_authorized"] = override[
+                            "automatic_execution_authorized"
+                        ]
+                    with patch.object(
+                        RUNNER,
+                        "_json_command",
+                        side_effect=[applied, _sidecar_check_receipt()],
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "sidecar apply"
+                        ):
+                            RUNNER.reconcile_coding_agent_sidecars(repo, live)
+                with self.subTest(surface="check", label=label):
+                    checked = {**_sidecar_check_receipt(), **override}
+                    with patch.object(
+                        RUNNER,
+                        "_json_command",
+                        side_effect=[_sidecar_apply_receipt(), checked],
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "sidecar post-install check"
+                        ):
+                            RUNNER.reconcile_coding_agent_sidecars(repo, live)
 
     def test_json_sidecar_command_strips_job_finalization_bindings(self) -> None:
         bindings = {
