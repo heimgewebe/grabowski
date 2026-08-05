@@ -43,6 +43,7 @@ class ReposkopAdmissionSurfaceTests(unittest.TestCase):
             function.index("_launch(record)"),
         )
         self.assertIn("reposkop_execution_attestation", function)
+        self.assertIn("_workspace_lease_resource_keys", function)
         self.assertIn("resources._release_lease_snapshot(item)", function)
 
     def test_future_work_acquire_surface_must_require_reposkop(self) -> None:

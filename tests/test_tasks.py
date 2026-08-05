@@ -162,6 +162,10 @@ class TaskTests(unittest.TestCase):
             "status": "verified",
             "task_id": "test-task",
             "lease_owner_id": "task:test-task",
+            "workspace_lease_resource_keys": [f"repo:{self.root}"],
+            "workspace_lease_resource_keys_sha256": tasks._sha256_json(
+                [f"repo:{self.root}"]
+            ),
             "workspace": str(self.root),
             "argv_sha256": "1" * 64,
             "execution_identity_sha256": "2" * 64,
@@ -2772,10 +2776,19 @@ class TaskTests(unittest.TestCase):
             lease = tasks.resources.inspect_resource(key)
             self.assertIsNotNone(lease)
             self.assertEqual(lease["owner_id"], kwargs["lease_owner_id"])
+            self.assertEqual(
+                kwargs["workspace_lease_resource_keys"], [key]
+            )
             evidence = {
                 **self.reposkop_attestation,
                 "task_id": kwargs["task_id"],
                 "lease_owner_id": kwargs["lease_owner_id"],
+                "workspace_lease_resource_keys": kwargs[
+                    "workspace_lease_resource_keys"
+                ],
+                "workspace_lease_resource_keys_sha256": tasks._sha256_json(
+                    kwargs["workspace_lease_resource_keys"]
+                ),
                 "workspace": kwargs["workspace"],
                 "argv_sha256": kwargs["argv_sha256"],
                 "execution_identity_sha256": kwargs[
@@ -2823,6 +2836,92 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(
             launcher["reposkop_execution_attestation"], attestation
         )
+
+    def test_unrelated_path_resource_does_not_replace_workspace_lease(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        unrelated = self.root.parent / f"{self.root.name}-other"
+        unrelated_key = f"path:{unrelated}"
+        workspace_key = f"repo:{self.root}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 154}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[unrelated_key],
+            )
+
+        self.assertEqual(
+            result["task"]["resource_keys"],
+            sorted([unrelated_key, workspace_key]),
+        )
+        self.assertEqual(
+            self.reposkop_attestation_mock.call_args.kwargs[
+                "workspace_lease_resource_keys"
+            ],
+            [workspace_key],
+        )
+        self.assertIsNotNone(tasks.resources.inspect_resource(workspace_key))
+
+    def test_exact_path_resource_covers_workspace_without_implicit_repo_lease(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        path_key = f"path:{self.root}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 155}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[path_key],
+            )
+
+        self.assertEqual(result["task"]["resource_keys"], [path_key])
+        self.assertIsNone(result["audit"]["implicit_workspace_resource_key"])
+        self.assertEqual(
+            self.reposkop_attestation_mock.call_args.kwargs[
+                "workspace_lease_resource_keys"
+            ],
+            [path_key],
+        )
+
+    def test_unrelated_repository_resource_fails_before_acquisition(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        unrelated = self.root.parent / f"{self.root.name}-repo"
+        unrelated_key = f"repo:{unrelated}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 156}
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "at most one broad repository"
+            ):
+                tasks.grabowski_task_start(
+                    "local",
+                    argv,
+                    cwd=str(self.root),
+                    runtime_seconds=60,
+                    resource_keys=[unrelated_key],
+                )
+
+        dispatch.assert_not_called()
+        self.reposkop_attestation_mock.assert_not_called()
+        self.assertIsNone(tasks.resources.inspect_resource(unrelated_key))
+        self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
     def test_mutating_agent_reposkop_failure_releases_lease_before_launch(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -2928,6 +3027,7 @@ class TaskTests(unittest.TestCase):
             workspace=workspace,
             task_id="a" * 24,
             lease_owner_id="task:" + "a" * 24,
+            workspace_lease_resource_keys=[f"repo:{workspace}"],
             argv=["/opt/codex", "exec"],
             argv_sha256=sha("a"),
             execution_identity_sha256=sha("b"),
@@ -2938,6 +3038,21 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(claimed, tasks._sha256_json(material))
         self.assertEqual(result["status"], "verified")
         self.assertIs(result["effect_authorized"], False)
+        with self.assertRaisesRegex(
+            ValueError, "workspace-covering lease resources"
+        ):
+            self.real_reposkop_attest(
+                workspace=workspace,
+                task_id="b" * 24,
+                lease_owner_id="task:" + "b" * 24,
+                workspace_lease_resource_keys=[
+                    f"path:{Path(workspace).parent / (Path(workspace).name + '-outside')}"
+                ],
+                argv=["/opt/codex", "exec"],
+                argv_sha256=sha("c"),
+                execution_identity_sha256=sha("d"),
+                reposkop_context_loader=loader,
+            )
 
     def test_expired_implicit_repository_lease_reacquires_complete_scope(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -3182,13 +3297,14 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(dispatch.call_count, 1)
         self.assertEqual(tasks.grabowski_task_list()["count"], 1)
 
-    def test_explicit_path_scopes_allow_disjoint_agent_tasks(self) -> None:
+    def test_explicit_file_scopes_do_not_replace_workspace_guard(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         left = f"path:{self.root / 'left.py'}"
         right = f"path:{self.root / 'right.py'}"
+        workspace = f"repo:{self.root}"
         with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
             tasks, "_validate_command", return_value=argv
-        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()) as dispatch, patch.object(
             tasks.base, "_append_audit"
         ), patch.object(
             tasks, "_require_recovery_gate", return_value={"checked_at_unix": 152}
@@ -3197,8 +3313,38 @@ class TaskTests(unittest.TestCase):
                 "local", argv, cwd=str(self.root), runtime_seconds=60,
                 resource_keys=[left],
             )
+            with self.assertRaises(tasks.resources.ResourceConflict):
+                tasks.grabowski_task_start(
+                    "local", argv, cwd=str(self.root), runtime_seconds=60,
+                    resource_keys=[right],
+                )
+        self.assertEqual(first["task"]["resource_keys"], sorted([left, workspace]))
+        self.assertEqual(first["audit"]["implicit_workspace_resource_key"], workspace)
+        self.assertEqual(dispatch.call_count, 1)
+
+    def test_exact_disjoint_workspace_paths_allow_parallel_agent_tasks(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        left_workspace = self.root / "left"
+        right_workspace = self.root / "right"
+        left_workspace.mkdir()
+        right_workspace.mkdir()
+        (left_workspace / ".git").write_text("gitdir: /tmp/test-left-worktree\n")
+        (right_workspace / ".git").write_text("gitdir: /tmp/test-right-worktree\n")
+        left = f"path:{left_workspace}"
+        right = f"path:{right_workspace}"
+        with patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 153}
+        ):
+            first = tasks.grabowski_task_start(
+                "local", argv, cwd=str(left_workspace), runtime_seconds=60,
+                resource_keys=[left],
+            )
             second = tasks.grabowski_task_start(
-                "local", argv, cwd=str(self.root), runtime_seconds=60,
+                "local", argv, cwd=str(right_workspace), runtime_seconds=60,
                 resource_keys=[right],
             )
         self.assertEqual(first["task"]["resource_keys"], [left])

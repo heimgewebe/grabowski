@@ -2487,17 +2487,58 @@ def _default_reposkop_execution_context(
     )
 
 
+def _workspace_lease_resource_keys(
+    workspace: str,
+    resource_keys: list[str],
+) -> list[str]:
+    exact_repository = resources.normalize_resource_key(f"repo:{workspace}")
+    covering: set[str] = set()
+    for value in resource_keys:
+        key = resources.normalize_resource_key(value)
+        if key == exact_repository:
+            covering.add(key)
+            continue
+        if not key.startswith("path:"):
+            continue
+        path = key.removeprefix("path:")
+        try:
+            if os.path.commonpath([path, workspace]) == path:
+                covering.add(key)
+        except ValueError:
+            continue
+    return sorted(covering)
+
+
 def _attest_mutating_agent_workspace(
     *,
     workspace: str,
     task_id: str,
     lease_owner_id: str,
+    workspace_lease_resource_keys: list[str],
     argv: list[str],
     argv_sha256: str,
     execution_identity_sha256: str,
     reposkop_context_loader: Any | None = None,
 ) -> dict[str, Any]:
     import grabowski_work_admission as work_admission
+
+    normalized_workspace_leases = sorted(
+        {
+            resources.normalize_resource_key(value)
+            for value in workspace_lease_resource_keys
+        }
+    )
+    covering_workspace_leases = _workspace_lease_resource_keys(
+        workspace, normalized_workspace_leases
+    )
+    if (
+        not covering_workspace_leases
+        or covering_workspace_leases != normalized_workspace_leases
+    ):
+        raise ValueError(
+            "Reposkop execution attestation requires only workspace-covering "
+            "lease resources"
+        )
 
     purpose = _reposkop_task_purpose(
         task_id=task_id,
@@ -2520,6 +2561,10 @@ def _attest_mutating_agent_workspace(
         "status": "verified",
         "task_id": task_id,
         "lease_owner_id": lease_owner_id,
+        "workspace_lease_resource_keys": covering_workspace_leases,
+        "workspace_lease_resource_keys_sha256": _sha256_json(
+            covering_workspace_leases
+        ),
         "workspace": workspace,
         "argv_sha256": argv_sha256,
         "execution_identity_sha256": execution_identity_sha256,
@@ -2572,7 +2617,7 @@ def _task_resource_keys(
     workspace = _mutating_agent_workspace(host, argv, cwd=cwd)
     if workspace is None:
         return requested, None
-    if any(key.startswith(("path:", "repo:")) for key in requested):
+    if _workspace_lease_resource_keys(workspace, requested):
         return requested, None
     implicit = resources.normalize_resource_key(f"repo:{workspace}")
     return sorted({*requested, implicit}), implicit
@@ -6089,6 +6134,20 @@ def grabowski_task_start(
         cwd=working_directory,
         requested=requested_resources,
     )
+    workspace_lease_resource_keys = (
+        _workspace_lease_resource_keys(
+            mutating_agent_workspace, task_resources
+        )
+        if mutating_agent_workspace is not None
+        else []
+    )
+    if (
+        mutating_agent_workspace is not None
+        and not workspace_lease_resource_keys
+    ):
+        raise RuntimeError(
+            "write-capable agent task has no lease covering its workspace"
+        )
     chronik_context_json = (
         _chronik_context(
             host,
@@ -6274,10 +6333,33 @@ def grabowski_task_start(
     reposkop_execution_attestation: dict[str, Any] | None = None
     if mutating_agent_workspace is not None:
         try:
+            if lease_result is None:
+                raise RuntimeError(
+                    "write-capable agent workspace lease was not acquired"
+                )
+            acquired_leases = {
+                str(item.get("resource_key")): item
+                for item in lease_result.get("leases", [])
+                if isinstance(item, dict)
+            }
+            for resource_key in workspace_lease_resource_keys:
+                acquired = acquired_leases.get(resource_key)
+                if (
+                    acquired is None
+                    or acquired.get("owner_id") != lease_owner
+                    or int(acquired.get("expires_at_unix", 0)) <= now
+                ):
+                    raise RuntimeError(
+                        "write-capable agent workspace lease evidence is "
+                        "missing, foreign or expired"
+                    )
             reposkop_execution_attestation = _attest_mutating_agent_workspace(
                 workspace=mutating_agent_workspace,
                 task_id=task_id,
                 lease_owner_id=lease_owner,
+                workspace_lease_resource_keys=(
+                    workspace_lease_resource_keys
+                ),
                 argv=command,
                 argv_sha256=argv_sha256,
                 execution_identity_sha256=execution_identity[
@@ -6308,6 +6390,9 @@ def grabowski_task_start(
                 "host": host,
                 "workspace": mutating_agent_workspace,
                 "lease_owner_id": lease_owner,
+                "workspace_lease_resource_keys": (
+                    workspace_lease_resource_keys
+                ),
                 "argv_sha256": argv_sha256,
                 "execution_identity_sha256": execution_identity[
                     "identity_sha256"
@@ -6504,6 +6589,13 @@ def grabowski_task_start(
             reposkop_execution_attestation["usage_key_sha256"]
             if reposkop_execution_attestation is not None
             else None
+        ),
+        "reposkop_workspace_lease_resource_keys": (
+            reposkop_execution_attestation[
+                "workspace_lease_resource_keys"
+            ]
+            if reposkop_execution_attestation is not None
+            else []
         ),
     }
     base._append_audit(audit)
