@@ -1154,6 +1154,50 @@ def _worktree_status(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _remote_secured_observation(record: dict[str, Any]) -> dict[str, Any]:
+    """Observe whether the checkout head is already present on a remote-tracking ref.
+
+    This uses only local remote-tracking refs. It never fetches and never treats
+    dirty or unpushed exclusive work as obsolete.
+    """
+    path = Path(record["path"])
+    head = record.get("head")
+    if (
+        record.get("prunable")
+        or not path.exists()
+        or not isinstance(head, str)
+        or GIT_OBJECT_RE.fullmatch(head) is None
+    ):
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "checkout head is missing or unobservable",
+        }
+    # Prefer the shared repository common directory for remote-tracking visibility.
+    repo_for_refs = Path(record.get("repo_path") or path)
+    completed = _git_read(
+        repo_for_refs,
+        ["for-each-ref", "--format=%(refname)", f"--contains={head}", "refs/remotes"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": (completed.stderr or completed.stdout).strip() or "remote ref query failed",
+        }
+    refs = [
+        line.strip()
+        for line in completed.stdout.splitlines()
+        if line.strip().startswith("refs/remotes/")
+    ][:32]
+    return {
+        "remote_secured": bool(refs),
+        "remote_secured_refs": sorted(refs),
+        "error": None,
+    }
+
+
 def _read_resource_leases() -> list[dict[str, Any]]:
     connection = _readonly_connection(resources.RESOURCE_DB)
     if connection is None:
@@ -1517,6 +1561,7 @@ def _checkout_lifecycle_decision(
     *,
     exists: bool,
     now: int,
+    remote_secured: bool | None = None,
 ) -> dict[str, Any]:
     """Classify one checkout without authorizing cleanup by classification alone."""
     retention = lifecycle.get("retention")
@@ -1539,9 +1584,14 @@ def _checkout_lifecycle_decision(
         and archive_age_seconds >= CHECKOUT_CLEANUP_GRACE_SECONDS
     )
     blocking = bool(coordination.get("blocking"))
+    process_count = 0
+    processes = coordination.get("processes")
+    if isinstance(processes, list):
+        process_count = len(processes)
     reasons: list[str] = []
     cleanup_candidate = False
     requires_cleanup_dry_run = False
+    remote_is_secured = bool(remote_secured)
 
     if record["is_main"]:
         state = "main"
@@ -1573,6 +1623,14 @@ def _checkout_lifecycle_decision(
         reasons.append("checkout has staged, unstaged or untracked entries")
         if retention_is_active:
             reasons.append("active retention exists but does not make dirty state clean")
+        if blocking:
+            reasons.append(
+                "dirty checkout has real resource coordination overlap and is coordination-blocking"
+            )
+        else:
+            reasons.append(
+                "dirty checkout is visible hygiene; dirty state is never deleted or cleaned"
+            )
     elif status["dirty"] is not False:
         state = "unobservable"
         hygiene_mark = "unknown"
@@ -1621,13 +1679,22 @@ def _checkout_lifecycle_decision(
             hygiene_mark = "archived"
             next_step = "wait_for_archive_grace_before_cleanup_dry_run"
             reasons.append("archived checkout is still inside the recovery grace period")
+        elif not remote_is_secured:
+            state = "archived_not_remote_secured"
+            hygiene_mark = "archived"
+            next_step = "secure_checkout_head_on_remote_before_cleanup_dry_run"
+            reasons.append(
+                "clean managed archive exists but head is not present on local remote-tracking refs"
+            )
         else:
             state = "cleanup_candidate"
             hygiene_mark = "obsolete"
             cleanup_candidate = True
             requires_cleanup_dry_run = True
             next_step = "run_checkout_cleanup_dry_run_before_apply"
-            reasons.append("clean managed checkout has a mature matching recovery archive")
+            reasons.append(
+                "terminal clean remote-secured checkout is lease/process/retention-free with mature archive"
+            )
     elif archive_present and not archive_open:
         state = "archive_closed"
         hygiene_mark = "unknown"
@@ -1653,13 +1720,22 @@ def _checkout_lifecycle_decision(
         hygiene_mark = "archived"
         next_step = "wait_for_archive_grace_before_cleanup_dry_run"
         reasons.append("archived checkout is still inside the recovery grace period")
+    elif archive_present and not remote_is_secured:
+        state = "archived_not_remote_secured"
+        hygiene_mark = "archived"
+        next_step = "secure_checkout_head_on_remote_before_cleanup_dry_run"
+        reasons.append(
+            "clean archive exists but head is not present on local remote-tracking refs"
+        )
     elif archive_present:
         state = "cleanup_candidate"
         hygiene_mark = "obsolete"
         cleanup_candidate = True
         requires_cleanup_dry_run = True
         next_step = "run_checkout_cleanup_dry_run_before_apply"
-        reasons.append("clean linked checkout has a mature matching recovery archive")
+        reasons.append(
+            "terminal clean remote-secured checkout is lease/process/retention-free with mature archive"
+        )
     elif retention_is_active:
         state = "retained"
         hygiene_mark = "retained"
@@ -1678,6 +1754,17 @@ def _checkout_lifecycle_decision(
             "clean linked checkout has no retention or archive; local inventory does not prove it is obsolete"
         )
 
+    # Cleanup is never authorized for dirty checkouts or while coordination remains.
+    if cleanup_candidate and (
+        status.get("dirty") is not False
+        or blocking
+        or retention_is_active
+        or process_count > 0
+        or not remote_is_secured
+    ):
+        cleanup_candidate = False
+        requires_cleanup_dry_run = False
+
     return {
         "state": state,
         "hygiene_mark": hygiene_mark,
@@ -1693,6 +1780,7 @@ def _checkout_lifecycle_decision(
         "archive_age_seconds": archive_age_seconds,
         "archive_grace_seconds": CHECKOUT_CLEANUP_GRACE_SECONDS,
         "archive_grace_elapsed": archive_grace_elapsed,
+        "remote_secured": remote_is_secured,
         "coordination_blocking": blocking,
         "cleanup_candidate": cleanup_candidate,
         "requires_cleanup_dry_run": requires_cleanup_dry_run,
@@ -1703,6 +1791,7 @@ def _checkout_lifecycle_decision(
             "branch_is_obsolete",
             "safe_to_delete_branch",
             "terminal_external_work_truth_from_binding_alone",
+            "permission_to_delete_dirty_state",
         ],
     }
 
@@ -1740,6 +1829,7 @@ def checkout_inventory(
             "latest_archive": archives.get(record["checkout_key"]),
         }
         exists = checkout_path.exists()
+        remote = _remote_secured_observation(record)
         decision = _checkout_lifecycle_decision(
             record,
             status,
@@ -1747,6 +1837,7 @@ def checkout_inventory(
             coordination,
             exists=exists,
             now=now,
+            remote_secured=bool(remote.get("remote_secured")),
         )
         worktrees.append(
             {
@@ -1759,6 +1850,8 @@ def checkout_inventory(
                 "hygiene_mark": decision["hygiene_mark"],
                 "lifecycle_decision": decision,
                 "cleanup_candidate": decision["cleanup_candidate"],
+                "remote_secured": bool(remote.get("remote_secured")),
+                "remote_secured_refs": list(remote.get("remote_secured_refs") or []),
             }
         )
     body = {
@@ -2277,6 +2370,9 @@ def _cleanup_plan(
         include_tasks=True,
         include_resources=True,
     )
+    remote = _remote_secured_observation(record)
+    remote_secured = bool(remote.get("remote_secured"))
+    dirty = status.get("dirty") is not False
     command = ["git", "-C", str(top_level), "worktree", "remove", str(checkout)]
     body = {
         "schema_version": CLEANUP_PLAN_SCHEMA_VERSION,
@@ -2297,12 +2393,16 @@ def _cleanup_plan(
         "archive_age_seconds": archive_age_seconds,
         "archive_grace_seconds": CHECKOUT_CLEANUP_GRACE_SECONDS,
         "archive_grace_elapsed": archive_grace_elapsed,
+        "remote_secured": remote_secured,
+        "remote_secured_refs": list(remote.get("remote_secured_refs") or []),
         "cleanup_blockers": [
             reason
             for reason, blocked in (
                 ("active_retention_not_elapsed", retention_active),
                 ("archive_grace_not_elapsed", not archive_grace_elapsed),
                 ("active_coordination", coordination["blocking"]),
+                ("dirty_checkout", dirty),
+                ("head_not_remote_secured", not remote_secured),
             )
             if blocked
         ],
@@ -2314,6 +2414,8 @@ def _cleanup_plan(
             not retention_active
             and archive_grace_elapsed
             and not coordination["blocking"]
+            and not dirty
+            and remote_secured
         ),
         "rollback": {
             "available": True,

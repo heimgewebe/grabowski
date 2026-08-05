@@ -98,6 +98,27 @@ class CheckoutLifecycleTests(unittest.TestCase):
             text=True,
         )
 
+    def _publish_remote(self) -> None:
+        """Make the current heads visible on local origin remote-tracking refs.
+
+        The test environment blocks direct pushes to main, so remote-tracking
+        refs are written with update-ref after a bare origin is available.
+        """
+        origin = self.root / "origin.git"
+        if not origin.exists():
+            subprocess.run(
+                ["git", "init", "--bare", str(origin)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self._git("remote", "add", "origin", str(origin))
+        head = self._git("rev-parse", "HEAD").stdout.strip()
+        topic = self._git("rev-parse", "topic").stdout.strip()
+        self._git("update-ref", "refs/remotes/origin/main", head)
+        self._git("update-ref", "refs/remotes/origin/topic", topic)
+
     def _archive(self, *, aged: bool = True) -> dict[str, object]:
         result = checkouts.grabowski_checkout_archive(
             str(self.repo),
@@ -870,6 +891,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIn("archive_grace_not_elapsed", dry_run["plan"]["cleanup_blockers"])
 
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
+        self._publish_remote()
         archive = self._archive()["archive"]
         with self.assertRaisesRegex(ValueError, "plan_id"):
             checkouts.grabowski_checkout_cleanup(
@@ -890,6 +912,7 @@ class CheckoutLifecycleTests(unittest.TestCase):
             expected_head=self.head,
             expected_branch="topic",
         )
+        self.assertTrue(dry_run["plan"]["remote_secured"])
         self.assertTrue(dry_run["plan"]["safe_to_apply"])
         applied = checkouts.grabowski_checkout_cleanup(
             str(self.repo),
