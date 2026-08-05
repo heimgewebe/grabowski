@@ -1307,7 +1307,34 @@ class BureauPickupTests(unittest.TestCase):
             self.assertRegex(summary["sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn(oversized, json.dumps(rejection.details))
 
-    def test_repository_scope_is_required_before_any_acquisition(self) -> None:
+    def test_repository_scope_is_derived_from_bound_workspace(self) -> None:
+        key = "repo:/tmp/repository"
+        intent = self.intent([key])
+        intent["workspace"] = {
+            "repository": "/tmp/repository",
+            "source_head_at_intent": "a" * 40,
+            "workspace_branch": "bureau/test-t001/0123456789",
+            "workspace_path": "/tmp/worktrees/BUR-RUN-20260724T120000Z-0123456789",
+        }
+
+        groups = pickup._acquisition_groups(
+            intent,
+            pickup._normalize_request(self.request()),
+        )
+
+        self.assertEqual(1, len(groups))
+        scope = groups[0]["metadata"]["scope_manifest"]
+        self.assertTrue(groups[0]["metadata"]["scope_manifest_complete"])
+        self.assertEqual("/tmp/repository", scope["repository"])
+        self.assertEqual(intent["task_id"], scope["task_id"])
+        self.assertEqual("a" * 40, scope["base_head"])
+        self.assertEqual("a" * 40, scope["head"])
+        self.assertEqual(intent["workspace"]["workspace_branch"], scope["branch"])
+        self.assertEqual(intent["workspace"]["workspace_path"], scope["worktree"])
+        self.assertEqual(["/tmp/repository"], scope["paths"])
+        self.assertEqual(["write"], scope["effects"])
+
+    def test_repository_scope_is_required_without_workspace_creation(self) -> None:
         key = "repo:/tmp/repository"
         intent = self.intent([key])
         with (
@@ -1319,7 +1346,9 @@ class BureauPickupTests(unittest.TestCase):
             mock.patch.object(pickup.resources, "acquire_resources") as acquire,
         ):
             with self.assertRaisesRegex(pickup.BureauPickupError, "repository-scope-required"):
-                pickup.grabowski_bureau_pickup_execute(self.request())
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(create_workspace=False)
+                )
         acquire.assert_not_called()
 
     def test_partial_acquisition_is_compensated(self) -> None:
