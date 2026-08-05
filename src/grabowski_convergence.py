@@ -859,3 +859,321 @@ def build_pr_closure_request(
     request_sha256 = hashlib.sha256(request_bytes).hexdigest()
     return request_dict, request_bytes, request_sha256
 
+
+BLUE_GREEN_PROFILE_ID = "blue-green-deployment-cutover-v1"
+BLUE_GREEN_EVIDENCE_CATEGORIES = (
+    "deployment_receipt",
+    "green_readiness",
+    "snapshot_rebind",
+    "effect_terminalization",
+    "runtime_identity",
+)
+
+
+def build_blue_green_deployment_profile(
+    receipt: dict[str, Any] | None = None,
+    *,
+    evidence_authority: str = "supplied",
+    source_state: str | None = None,
+) -> dict[str, Any]:
+    """Build a convergence evidence profile from one blue-green deployment receipt.
+
+    The profile binds runtime, names, schemas/sentinels, snapshot rebind and
+    Bedienvertrag evidence already present in the receipt. It never synthesizes
+    missing cutover success and does not authorize deployment.
+    """
+    if receipt is None:
+        receipt = {}
+    if not isinstance(receipt, dict):
+        raise ConvergenceInputError("blue-green receipt must be a dictionary")
+    authority = receipt.get("evidence_authority") or evidence_authority
+    if authority not in ALLOWED_EVIDENCE_AUTHORITIES:
+        raise ConvergenceInputError(
+            f"evidence_authority must be 'supplied' or 'authoritative_receipts', got '{authority}'"
+        )
+    categories: dict[str, dict[str, Any]] = {}
+    blocked_by: list[str] = []
+    missing_evidence: list[str] = []
+    conflicts: list[str] = []
+    claims: list[str] = []
+    source_refs: list[dict[str, str]] = []
+    effects: list[dict[str, Any]] = []
+    verifications: list[dict[str, Any]] = []
+
+    receipt_kind = receipt.get("kind")
+    receipt_sha = receipt.get("receipt_sha256")
+    outcome = receipt.get("outcome")
+    if receipt_kind != "grabowski_blue_green_deployment_receipt":
+        missing_evidence.append("deployment_receipt")
+        blocked_by.append("evidence_missing:deployment_receipt")
+        categories["deployment_receipt"] = {"status": "missing"}
+    elif not isinstance(receipt_sha, str) or SHA256_RE.fullmatch(receipt_sha) is None:
+        conflicts.append("deployment_receipt:receipt_sha256")
+        blocked_by.append("conflicting_evidence:deployment_receipt")
+        categories["deployment_receipt"] = {"status": "conflicted"}
+    else:
+        unsigned = dict(receipt)
+        unsigned.pop("receipt_sha256", None)
+        material = json.dumps(
+            unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if hashlib.sha256(material).hexdigest() != receipt_sha:
+            conflicts.append("deployment_receipt:hash_mismatch")
+            blocked_by.append("conflicting_evidence:deployment_receipt")
+            categories["deployment_receipt"] = {
+                "status": "conflicted",
+                "ref": f"grabowski:blue-green-receipt:{receipt.get('cutover_id', 'unknown')}",
+                "subject_sha256": receipt_sha,
+            }
+        else:
+            categories["deployment_receipt"] = {
+                "status": "present",
+                "outcome": outcome,
+                "phase": receipt.get("phase"),
+                "ref": f"grabowski:blue-green-receipt:{receipt.get('cutover_id')}",
+                "subject_sha256": receipt_sha,
+            }
+            source_refs.append(
+                {
+                    "kind": "deployment_receipt",
+                    "ref": categories["deployment_receipt"]["ref"],
+                    "subject_sha256": receipt_sha,
+                }
+            )
+            claims.append(
+                f"Bound blue-green deployment receipt for cutover {receipt.get('cutover_id')}"
+            )
+            effects.append(
+                {
+                    "schema_version": 1,
+                    "kind": "deployment",
+                    "evidence_ref": categories["deployment_receipt"]["ref"],
+                    "subject_sha256": receipt_sha,
+                }
+            )
+
+    readiness = receipt.get("green_readiness")
+    if not isinstance(readiness, dict) or readiness.get("ready") is not True:
+        missing_evidence.append("green_readiness")
+        blocked_by.append("evidence_missing:green_readiness")
+        categories["green_readiness"] = {"status": "missing"}
+    else:
+        readiness_sha = _sha256_canonical(readiness)
+        categories["green_readiness"] = {
+            "status": "ready",
+            "names_sha256": readiness.get("names_sha256"),
+            "bedienvertrag_matches": readiness.get("bedienvertrag_matches"),
+            "subject_sha256": readiness_sha,
+        }
+        claims.append("Green runtime matched manifest/tools/schemas/sentinel/Bedienvertrag")
+        verifications.append(
+            {
+                "schema_version": 1,
+                "kind": "runtime_identity",
+                "result": "pass",
+                "evidence_ref": "green_readiness",
+                "subject_sha256": readiness_sha,
+            }
+        )
+        source_refs.append(
+            {
+                "kind": "green_readiness",
+                "ref": "green_readiness",
+                "subject_sha256": readiness_sha,
+            }
+        )
+
+    snapshot = receipt.get("snapshot_rebind")
+    if (
+        not isinstance(snapshot, dict)
+        or snapshot.get("verified") is not True
+        or not isinstance(snapshot.get("receipt_sha256"), str)
+        or SHA256_RE.fullmatch(snapshot.get("receipt_sha256") or "") is None
+    ):
+        missing_evidence.append("snapshot_rebind")
+        blocked_by.append("evidence_missing:snapshot_rebind")
+        categories["snapshot_rebind"] = {"status": "missing"}
+    else:
+        categories["snapshot_rebind"] = {
+            "status": "matched",
+            "receipt_sha256": snapshot["receipt_sha256"],
+            "cutover_binding": snapshot.get("cutover_binding"),
+        }
+        claims.append("Connector snapshot rebind was part of the cutover")
+        verifications.append(
+            {
+                "schema_version": 1,
+                "kind": "consumer_compatibility",
+                "result": "pass",
+                "evidence_ref": "snapshot_rebind",
+                "subject_sha256": snapshot["receipt_sha256"],
+            }
+        )
+        source_refs.append(
+            {
+                "kind": "snapshot_rebind",
+                "ref": "snapshot_rebind",
+                "subject_sha256": snapshot["receipt_sha256"],
+            }
+        )
+
+    terminalization = receipt.get("effect_terminalization")
+    if not isinstance(terminalization, dict) or not isinstance(
+        terminalization.get("terminalized_count"), int
+    ):
+        missing_evidence.append("effect_terminalization")
+        blocked_by.append("evidence_missing:effect_terminalization")
+        categories["effect_terminalization"] = {"status": "missing"}
+    else:
+        term_sha = _sha256_canonical(terminalization)
+        categories["effect_terminalization"] = {
+            "status": "present",
+            "terminalized_count": terminalization.get("terminalized_count"),
+            "remaining_read_count": terminalization.get("remaining_read_count"),
+            "subject_sha256": term_sha,
+        }
+        claims.append(
+            "Only effect-bearing blue calls were terminalized; long-lived reads were not required to drain"
+        )
+        verifications.append(
+            {
+                "schema_version": 1,
+                "kind": "recovery",
+                "result": "pass",
+                "evidence_ref": "effect_terminalization",
+                "subject_sha256": term_sha,
+            }
+        )
+
+    runtime_fields = (
+        receipt.get("green_release_id"),
+        receipt.get("expected_head"),
+        receipt.get("names_sha256"),
+        receipt.get("agent_instructions_sha256"),
+    )
+    if any(not isinstance(item, str) or not item for item in runtime_fields):
+        missing_evidence.append("runtime_identity")
+        blocked_by.append("evidence_missing:runtime_identity")
+        categories["runtime_identity"] = {"status": "missing"}
+    else:
+        runtime_subject = _sha256_canonical(
+            {
+                "green_release_id": receipt["green_release_id"],
+                "expected_head": receipt["expected_head"],
+                "names_sha256": receipt["names_sha256"],
+                "agent_instructions_sha256": receipt["agent_instructions_sha256"],
+                "schema_sentinels": receipt.get("schema_sentinels"),
+            }
+        )
+        categories["runtime_identity"] = {
+            "status": "bound",
+            "green_release_id": receipt["green_release_id"],
+            "expected_head": receipt["expected_head"],
+            "subject_sha256": runtime_subject,
+        }
+        claims.append("Deployment receipt bound runtime, names, schemas/sentinels and Bedienvertrag")
+        verifications.append(
+            {
+                "schema_version": 1,
+                "kind": "deployment_identity",
+                "result": "pass",
+                "evidence_ref": "runtime_identity",
+                "subject_sha256": runtime_subject,
+            }
+        )
+
+    if outcome not in {"completed"}:
+        blocked_by.append(f"deployment_outcome:{outcome or 'missing'}")
+
+    if authority == "supplied":
+        blocked_by.append("supplied_evidence_requires_authoritative_read")
+        effective_source_state = "stale" if source_state == "stale" else "unknown"
+    else:
+        if source_state is None or source_state not in ALLOWED_SOURCE_STATES:
+            raise ConvergenceInputError(
+                "authoritative_receipts requires an explicit source_state "
+                "('current', 'stale', or 'unknown')"
+            )
+        effective_source_state = source_state
+
+    return {
+        "schema_version": 1,
+        "profile_id": BLUE_GREEN_PROFILE_ID,
+        "evidence_categories": list(BLUE_GREEN_EVIDENCE_CATEGORIES),
+        "categories": categories,
+        "blocked_by": sorted(set(blocked_by)),
+        "conflicts": sorted(set(conflicts)),
+        "missing_evidence": sorted(set(missing_evidence)),
+        "claims": claims,
+        "source_refs": source_refs,
+        "effects": effects,
+        "verifications": verifications,
+        "source_state": effective_source_state,
+        "evidence_authority": authority,
+        "does_not_establish": [
+            "automatic_deploy_authority",
+            "connector platform identity",
+            "unread runtime truth",
+        ],
+    }
+
+
+def build_blue_green_assessment_request(
+    receipt: dict[str, Any] | None = None,
+    *,
+    risk_level: str = "R2",
+    assessment_id: str | None = None,
+    observed_at: str | None = None,
+    change_class: str = "runtime",
+    evidence_authority: str = "supplied",
+    source_state: str | None = None,
+) -> dict[str, Any]:
+    """Build one deterministic convergence assessment request for blue-green cutover closure."""
+    observed_at = _validate_iso_datetime(observed_at, label="observed_at")
+    if risk_level not in ("R0", "R1", "R2", "R3"):
+        raise ConvergenceInputError("risk_level must be one of R0, R1, R2, R3")
+    if change_class not in ALLOWED_CHANGE_CLASSES:
+        raise ConvergenceInputError(
+            f"change_class must be one of {sorted(ALLOWED_CHANGE_CLASSES)}"
+        )
+    profile = build_blue_green_deployment_profile(
+        receipt,
+        evidence_authority=evidence_authority,
+        source_state=source_state,
+    )
+    categories_sha = _sha256_canonical(profile["categories"])
+    if not assessment_id:
+        assessment_id = f"blue-green-{categories_sha[:16]}"
+    request = {
+        "schema_version": 1,
+        "assessment_id": assessment_id,
+        "risk_level": risk_level,
+        "classification": {
+            "schema_version": 1,
+            "change_class": change_class,
+            "semantic_change": "material",
+            "blocked_by": list(profile["blocked_by"]),
+        },
+        "observation": {
+            "schema_version": 1,
+            "observation_id": f"obs-{assessment_id}",
+            "observed_at": observed_at,
+            "source_state": profile["source_state"],
+            "claims": list(profile["claims"])
+            or ["No positive blue-green evidence claims read"],
+            "does_not_establish": list(profile["does_not_establish"]),
+            "source_refs": list(profile["source_refs"])
+            or [
+                {
+                    "kind": "assessment_input",
+                    "ref": f"grabowski:assessment-request-input:{assessment_id}",
+                    "subject_sha256": categories_sha,
+                }
+            ],
+        },
+        "effects": profile["effects"],
+        "verifications": profile["verifications"],
+    }
+    return request
+
+

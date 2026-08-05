@@ -68,9 +68,14 @@ Disjoint lanes may run in parallel. Controller integration remains authoritative
 This contract does not claim completion of:
 
 - single-call connector authorization,
-- blue-green runtime deployment,
 - automatic PR and dirty-state rescue closeout,
 - scoped-writer process start and lane-lease handoff.
+
+Blue-green runtime deployment cutover protocol v1 lives in
+`docs/blue-green-deploy-cutover-v1.md` and the bound `src/grabowski_*` modules.
+Host dual-service wiring that starts a second operator process remains a
+separate runtime integration step; the protocol already classifies pre-cutover
+rollback versus post-cutover `outcome_unknown` recovery.
 
 The P0 contract prepares and binds the lane. Starting a delegated writer process and transferring or delegating the lane leases to that process remains a separate follow-up; this document does not claim that launcher path is complete.
 

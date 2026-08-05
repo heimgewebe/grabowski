@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import time
 import uuid
-from typing import Annotated, Any, Iterator
+from dataclasses import dataclass, field
+from typing import Annotated, Any, Callable, Iterator
 
 try:
     from mcp.server.fastmcp import Context
@@ -19,10 +21,13 @@ except ImportError:
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+import grabowski_client_snapshot as client_snapshot
+import grabowski_connector_contract as connector_contract
 import grabowski_mcp as base
 import grabowski_deployment_observer as deployment_observer
 import grabowski_operator_core as operator
 import grabowski_read_surface as read_surface
+import grabowski_serving_process as serving_process
 
 
 mcp = operator.mcp
@@ -61,6 +66,548 @@ MAX_DEPLOY_INDEX_ENTRIES = 512
 DEPLOY_INDEX_FILENAME = "runtime-deploy-index.json"
 REUSABLE_JOB_STATUSES = frozenset({"running"})
 TERMINAL_JOB_STATUSES = frozenset({"completed", "succeeded", "failed", "launch_failed"})
+BLUE_GREEN_RECEIPT_KIND = "grabowski_blue_green_deployment_receipt"
+BLUE_GREEN_RECEIPT_SCHEMA_VERSION = 1
+
+
+class BlueGreenCutoverError(RuntimeError):
+    """Raised when a blue-green cutover phase fails with a classified recovery path."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        phase: str,
+        failure_class: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.failure_class = failure_class
+        self.details = details or {}
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256_json(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+@dataclass
+class BlueGreenHooks:
+    """Injectable runtime effects for the blue-green cutover protocol.
+
+    Production wiring may start a parallel green process, switch the connector
+    pointer and retire blue. Tests supply deterministic fakes. None of the hooks
+    receive secret material.
+    """
+
+    start_green: Callable[[], dict[str, Any]]
+    verify_green: Callable[[], dict[str, Any]]
+    switch_connector: Callable[[], dict[str, Any]]
+    rebind_snapshot: Callable[[str, int], dict[str, Any]]
+    close_blue_mutations: Callable[[], dict[str, Any]]
+    terminalize_blue_effects: Callable[[], dict[str, Any]]
+    retire_blue: Callable[[], dict[str, Any]]
+    rollback_green: Callable[[], dict[str, Any]]
+    observations: list[dict[str, Any]] = field(default_factory=list)
+
+
+def build_blue_green_plan(
+    *,
+    expected_head: str,
+    blue_release_id: str,
+    green_release_id: str,
+    source_identity_sha256: str,
+    expected_names_sha256: str,
+    expected_agent_instructions_sha256: str,
+    cutover_id: str | None = None,
+    cutover_generation: int = 1,
+) -> dict[str, Any]:
+    """Build one hash-bound blue-green cutover plan without executing it."""
+    if not isinstance(expected_head, str) or len(expected_head) not in {40, 64}:
+        raise ValueError("expected_head must be a Git object id")
+    for label, value in (
+        ("blue_release_id", blue_release_id),
+        ("green_release_id", green_release_id),
+    ):
+        if not isinstance(value, str) or not value.strip() or len(value) > 512:
+            raise ValueError(f"{label} is invalid")
+    for label, value in (
+        ("source_identity_sha256", source_identity_sha256),
+        ("expected_names_sha256", expected_names_sha256),
+        ("expected_agent_instructions_sha256", expected_agent_instructions_sha256),
+    ):
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(f"{label} must be a lowercase SHA-256")
+        try:
+            int(value, 16)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a lowercase SHA-256") from exc
+        if value != value.lower():
+            raise ValueError(f"{label} must be a lowercase SHA-256")
+    if (
+        isinstance(cutover_generation, bool)
+        or not isinstance(cutover_generation, int)
+        or cutover_generation < 1
+    ):
+        raise ValueError("cutover_generation must be a positive integer")
+    cutover = cutover_id or f"bgc-{secrets.token_hex(8)}"
+    if not isinstance(cutover, str) or not cutover.strip() or len(cutover) > 128:
+        raise ValueError("cutover_id is invalid")
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_blue_green_cutover_plan",
+        "cutover_id": cutover.strip(),
+        "cutover_generation": cutover_generation,
+        "expected_head": expected_head,
+        "blue_release_id": blue_release_id,
+        "green_release_id": green_release_id,
+        "source_identity_sha256": source_identity_sha256,
+        "expected_names_sha256": expected_names_sha256,
+        "expected_agent_instructions_sha256": expected_agent_instructions_sha256,
+        "phases": list(deployment_observer.CUTOVER_PHASES),
+        "drain_policy": {
+            "wait_for_long_lived_reads": False,
+            "terminalize_effect_bearing_only": True,
+            "close_blue_mutations_before_retirement": True,
+            "snapshot_rebind_is_part_of_cutover": True,
+        },
+    }
+    return {**material, "plan_sha256": _sha256_json(material)}
+
+
+def _record_observation(
+    hooks: BlueGreenHooks,
+    plan: dict[str, Any],
+    phase: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    observation = deployment_observer.build_cutover_observation(
+        cutover_id=plan["cutover_id"],
+        phase=phase,
+        expected_head=plan["expected_head"],
+        blue_release_id=plan["blue_release_id"],
+        green_release_id=plan["green_release_id"],
+        source_identity_sha256=plan["source_identity_sha256"],
+        details=details,
+    )
+    hooks.observations.append(observation)
+    return observation
+
+
+def build_deployment_receipt(
+    *,
+    plan: dict[str, Any],
+    phase: str,
+    green_readiness: dict[str, Any] | None,
+    snapshot_rebind: dict[str, Any] | None,
+    effect_terminalization: dict[str, Any] | None,
+    observations: list[dict[str, Any]],
+    outcome: str,
+    recovery: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one deployment receipt binding runtime, names, schemas, sentinel, snapshot and Bedienvertrag."""
+    if outcome not in {
+        "completed",
+        "rolled_back",
+        "outcome_unknown",
+        "failed_pre_cutover",
+    }:
+        raise ValueError(f"unsupported blue-green outcome: {outcome!r}")
+    material = {
+        "schema_version": BLUE_GREEN_RECEIPT_SCHEMA_VERSION,
+        "kind": BLUE_GREEN_RECEIPT_KIND,
+        "cutover_id": plan["cutover_id"],
+        "cutover_generation": plan["cutover_generation"],
+        "expected_head": plan["expected_head"],
+        "blue_release_id": plan["blue_release_id"],
+        "green_release_id": plan["green_release_id"],
+        "source_identity_sha256": plan["source_identity_sha256"],
+        "names_sha256": plan["expected_names_sha256"],
+        "agent_instructions_sha256": plan["expected_agent_instructions_sha256"],
+        "schema_sentinels": sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS),
+        "phase": phase,
+        "outcome": outcome,
+        "failure_class": deployment_observer.cutover_failure_class(phase),
+        "green_readiness": green_readiness,
+        "snapshot_rebind": (
+            {
+                "receipt_sha256": snapshot_rebind.get("receipt_sha256"),
+                "client_declaration_sha256": snapshot_rebind.get(
+                    "client_declaration_sha256"
+                ),
+                "cutover_binding": snapshot_rebind.get("cutover_binding"),
+                "verified": snapshot_rebind.get("verified"),
+            }
+            if isinstance(snapshot_rebind, dict)
+            else None
+        ),
+        "effect_terminalization": (
+            {
+                "terminalized_count": effect_terminalization.get("terminalized_count"),
+                "remaining_read_count": effect_terminalization.get(
+                    "remaining_read_count"
+                ),
+            }
+            if isinstance(effect_terminalization, dict)
+            else None
+        ),
+        "observations": [
+            {
+                "phase": item.get("phase"),
+                "observation_sha256": item.get("observation_sha256"),
+                "failure_class": item.get("failure_class"),
+            }
+            for item in observations
+        ],
+        "recovery": recovery,
+        "preserves": [
+            "manifest_integrity",
+            "provenance_integrity",
+            "audit_integrity",
+        ],
+        "does_not_establish": [
+            "connector platform identity",
+            "that every remote client refreshed tools/list",
+            "application success of terminalized mutations",
+        ],
+    }
+    return {**material, "receipt_sha256": _sha256_json(material)}
+
+
+def execute_blue_green_cutover(
+    plan: dict[str, Any],
+    hooks: BlueGreenHooks,
+) -> dict[str, Any]:
+    """Execute the blue-green cutover protocol with classified rollback/recovery.
+
+    Pre-cutover failure rolls green back and leaves blue authoritative.
+    After the atomic connector switch, failures become ``outcome_unknown`` and
+    require recovery readback rather than automatic pointer reversal.
+    """
+    if not isinstance(plan, dict) or plan.get("kind") != "grabowski_blue_green_cutover_plan":
+        raise ValueError("blue-green cutover plan is invalid")
+    declared = plan.get("plan_sha256")
+    unsigned = dict(plan)
+    unsigned.pop("plan_sha256", None)
+    if declared != _sha256_json(unsigned):
+        raise ValueError("blue-green cutover plan hash mismatch")
+
+    phase = "prepare"
+    green_readiness: dict[str, Any] | None = None
+    snapshot_rebind: dict[str, Any] | None = None
+    effect_terminalization: dict[str, Any] | None = None
+    connector_switched = False
+    green_started = False
+
+    def fail(message: str, *, details: dict[str, Any] | None = None) -> None:
+        raise BlueGreenCutoverError(
+            message,
+            phase=phase,
+            failure_class=deployment_observer.cutover_failure_class(phase),
+            details=details,
+        )
+
+    try:
+        _record_observation(hooks, plan, phase)
+        phase = "start_green"
+        start_result = hooks.start_green()
+        green_started = True
+        _record_observation(hooks, plan, phase, details={"start": start_result})
+
+        phase = "verify_green"
+        green_readiness = hooks.verify_green()
+        if not isinstance(green_readiness, dict) or green_readiness.get("ready") is not True:
+            fail(
+                "green runtime failed readiness against manifest/tools/schemas/sentinel/Bedienvertrag",
+                details={"green_readiness": green_readiness},
+            )
+        readiness_release = green_readiness.get("release_id") or green_readiness.get(
+            "expected_release_id"
+        )
+        if readiness_release not in {None, plan["green_release_id"]}:
+            fail(
+                "green readiness release does not match the cutover plan",
+                details={"green_readiness": green_readiness},
+            )
+        _record_observation(
+            hooks, plan, phase, details={"ready": True, "green_readiness_ready": True}
+        )
+
+        phase = "pre_cutover_ready"
+        _record_observation(hooks, plan, phase)
+
+        phase = "cutover"
+        switch_result = hooks.switch_connector()
+        connector_switched = True
+        snapshot_rebind = hooks.rebind_snapshot(
+            plan["cutover_id"], plan["cutover_generation"]
+        )
+        _record_observation(
+            hooks,
+            plan,
+            phase,
+            details={
+                "switch": switch_result,
+                "snapshot_receipt_sha256": (
+                    snapshot_rebind.get("receipt_sha256")
+                    if isinstance(snapshot_rebind, dict)
+                    else None
+                ),
+            },
+        )
+
+        phase = "post_cutover"
+        close_result = hooks.close_blue_mutations()
+        _record_observation(hooks, plan, phase, details={"close_blue": close_result})
+
+        phase = "terminalize_effects"
+        effect_terminalization = hooks.terminalize_blue_effects()
+        if (
+            not isinstance(effect_terminalization, dict)
+            or "terminalized_count" not in effect_terminalization
+        ):
+            fail(
+                "effect-bearing terminalization returned an invalid receipt",
+                details={"effect_terminalization": effect_terminalization},
+            )
+        _record_observation(
+            hooks,
+            plan,
+            phase,
+            details={
+                "terminalized_count": effect_terminalization.get("terminalized_count"),
+                "remaining_read_count": effect_terminalization.get(
+                    "remaining_read_count"
+                ),
+            },
+        )
+
+        phase = "retire_blue"
+        retire_result = hooks.retire_blue()
+        _record_observation(hooks, plan, phase, details={"retire": retire_result})
+
+        phase = "completed"
+        _record_observation(hooks, plan, phase)
+        return build_deployment_receipt(
+            plan=plan,
+            phase=phase,
+            green_readiness=green_readiness,
+            snapshot_rebind=snapshot_rebind,
+            effect_terminalization=effect_terminalization,
+            observations=hooks.observations,
+            outcome="completed",
+        )
+    except BlueGreenCutoverError as exc:
+        failure_class = exc.failure_class
+        if failure_class == "pre_cutover_rollback":
+            rollback_details: dict[str, Any] = {"error": str(exc), "details": exc.details}
+            if green_started:
+                try:
+                    rollback_details["rollback"] = hooks.rollback_green()
+                except Exception as rollback_error:  # noqa: BLE001 - classified recovery
+                    rollback_details["rollback_error"] = {
+                        "type": type(rollback_error).__name__,
+                        "message": str(rollback_error),
+                    }
+                    phase = "outcome_unknown"
+                    _record_observation(hooks, plan, phase, details=rollback_details)
+                    return build_deployment_receipt(
+                        plan=plan,
+                        phase=phase,
+                        green_readiness=green_readiness,
+                        snapshot_rebind=snapshot_rebind,
+                        effect_terminalization=effect_terminalization,
+                        observations=hooks.observations,
+                        outcome="outcome_unknown",
+                        recovery={
+                            "action": "inspect_green_and_blue_runtimes",
+                            "reason": "pre-cutover rollback itself failed",
+                        },
+                    )
+            phase = "rolled_back"
+            _record_observation(hooks, plan, phase, details=rollback_details)
+            return build_deployment_receipt(
+                plan=plan,
+                phase=phase,
+                green_readiness=green_readiness,
+                snapshot_rebind=snapshot_rebind,
+                effect_terminalization=effect_terminalization,
+                observations=hooks.observations,
+                outcome="rolled_back",
+                recovery={
+                    "action": "retry_from_clean_blue",
+                    "reason": "failure occurred before connector cutover",
+                },
+            )
+        phase = "outcome_unknown"
+        _record_observation(
+            hooks,
+            plan,
+            phase,
+            details={
+                "error": str(exc),
+                "details": exc.details,
+                "connector_switched": connector_switched,
+            },
+        )
+        return build_deployment_receipt(
+            plan=plan,
+            phase=phase,
+            green_readiness=green_readiness,
+            snapshot_rebind=snapshot_rebind,
+            effect_terminalization=effect_terminalization,
+            observations=hooks.observations,
+            outcome="outcome_unknown",
+            recovery={
+                "action": "readback_active_runtime_and_recover",
+                "reason": "failure occurred after connector cutover",
+                "connector_switched": connector_switched,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - map unexpected failures into recovery classes
+        failure_class = deployment_observer.cutover_failure_class(phase)
+        if failure_class == "pre_cutover_rollback" and not connector_switched:
+            rollback_details = {
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
+            if green_started:
+                try:
+                    rollback_details["rollback"] = hooks.rollback_green()
+                except Exception as rollback_error:  # noqa: BLE001
+                    rollback_details["rollback_error"] = {
+                        "type": type(rollback_error).__name__,
+                        "message": str(rollback_error),
+                    }
+                    phase = "outcome_unknown"
+                    _record_observation(hooks, plan, phase, details=rollback_details)
+                    return build_deployment_receipt(
+                        plan=plan,
+                        phase=phase,
+                        green_readiness=green_readiness,
+                        snapshot_rebind=snapshot_rebind,
+                        effect_terminalization=effect_terminalization,
+                        observations=hooks.observations,
+                        outcome="outcome_unknown",
+                        recovery={
+                            "action": "inspect_green_and_blue_runtimes",
+                            "reason": "pre-cutover rollback itself failed",
+                        },
+                    )
+            phase = "rolled_back"
+            _record_observation(hooks, plan, phase, details=rollback_details)
+            return build_deployment_receipt(
+                plan=plan,
+                phase=phase,
+                green_readiness=green_readiness,
+                snapshot_rebind=snapshot_rebind,
+                effect_terminalization=effect_terminalization,
+                observations=hooks.observations,
+                outcome="rolled_back",
+                recovery={
+                    "action": "retry_from_clean_blue",
+                    "reason": "failure occurred before connector cutover",
+                },
+            )
+        phase = "outcome_unknown"
+        _record_observation(
+            hooks,
+            plan,
+            phase,
+            details={
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "connector_switched": connector_switched,
+            },
+        )
+        return build_deployment_receipt(
+            plan=plan,
+            phase=phase,
+            green_readiness=green_readiness,
+            snapshot_rebind=snapshot_rebind,
+            effect_terminalization=effect_terminalization,
+            observations=hooks.observations,
+            outcome="outcome_unknown",
+            recovery={
+                "action": "readback_active_runtime_and_recover",
+                "reason": "unexpected failure after or during cutover",
+                "connector_switched": connector_switched,
+            },
+        )
+
+
+def default_local_blue_green_hooks(
+    *,
+    green_readiness: dict[str, Any],
+    snapshot_parameters: dict[str, Any] | None = None,
+) -> BlueGreenHooks:
+    """Build hooks that exercise local serving-process and snapshot cutover seams."""
+
+    def start_green() -> dict[str, Any]:
+        serving_process.set_role(serving_process.ROLE_STANDBY)
+        return {"started": True, "role": serving_process.ROLE_STANDBY}
+
+    def verify_green() -> dict[str, Any]:
+        return green_readiness
+
+    def switch_connector() -> dict[str, Any]:
+        return {"connector": "green", "switched": True}
+
+    def rebind_snapshot(cutover_id: str, cutover_generation: int) -> dict[str, Any]:
+        if snapshot_parameters is None:
+            return {
+                "verified": True,
+                "receipt_sha256": "0" * 64,
+                "client_declaration_sha256": "1" * 64,
+                "cutover_binding": {
+                    "cutover_id": cutover_id,
+                    "cutover_generation": cutover_generation,
+                    "rebind_role": "blue-green-cutover",
+                },
+            }
+        return client_snapshot.rebind_for_cutover(
+            snapshot_parameters,
+            cutover_id=cutover_id,
+            cutover_generation=cutover_generation,
+        )
+
+    def close_blue_mutations() -> dict[str, Any]:
+        return serving_process.close_for_mutations(reason="blue-green-cutover")
+
+    def terminalize_blue_effects() -> dict[str, Any]:
+        return serving_process.terminalize_effect_bearing_calls()
+
+    def retire_blue() -> dict[str, Any]:
+        return {
+            "retired": True,
+            "remaining_read_count": len(serving_process.active_read_calls()),
+        }
+
+    def rollback_green() -> dict[str, Any]:
+        serving_process.set_role(serving_process.ROLE_ACTIVE)
+        return {"rolled_back": True, "role": serving_process.ROLE_ACTIVE}
+
+    return BlueGreenHooks(
+        start_green=start_green,
+        verify_green=verify_green,
+        switch_connector=switch_connector,
+        rebind_snapshot=rebind_snapshot,
+        close_blue_mutations=close_blue_mutations,
+        terminalize_blue_effects=terminalize_blue_effects,
+        retire_blue=retire_blue,
+        rollback_green=rollback_green,
+    )
+
 
 
 def _git_result(repository: Path, *arguments: str) -> dict[str, Any]:
