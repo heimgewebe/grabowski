@@ -239,6 +239,100 @@ class WorktreeEnsureTests(unittest.TestCase):
         stored = checkouts._retention_records([lifecycle["checkout_key"]])
         self.assertEqual(stored[lifecycle["checkout_key"]]["owner_id"], self.owner)
 
+    def test_success_replay_preflight_readback_is_action_failure(self) -> None:
+        parameters = self._parameters(
+            key="replay-readback-preflight",
+            branch="feat/replay-readback-preflight",
+            target=self.worktree_root / "replay-readback-preflight",
+        )
+        self.assertEqual(self._ensure(parameters)["result_state"], "CREATED")
+
+        with patch.object(
+            worktree_ensure,
+            "_observe",
+            side_effect=worktree_ensure.WorktreeEnsurePreflight(
+                "simulated unreadable Git root"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                worktree_ensure.WorktreeEnsureAction,
+                "durable success replay observation failed",
+            ):
+                self._ensure(parameters)
+
+    def test_intent_recovery_preflight_readback_is_action_failure(self) -> None:
+        parameters = self._parameters(
+            key="intent-readback-preflight",
+            branch="feat/intent-readback-preflight",
+            target=self.worktree_root / "intent-readback-preflight",
+        )
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_WORKTREE_ENSURE_RECEIPT_ROOT": str(self.receipt_root)},
+        ), patch.object(
+            worktree_ensure,
+            "_after_worktree_mutation",
+            side_effect=SystemExit("simulated process loss"),
+        ):
+            with self.assertRaises(SystemExit):
+                worktree_ensure.ensure_worktree(
+                    parameters,
+                    grips._default_command_runner,
+                    self._lease,
+                    record_friction=self._record_friction,
+                    resolve_friction=self._resolve_friction,
+                )
+
+        with patch.object(
+            worktree_ensure,
+            "_observe",
+            side_effect=worktree_ensure.WorktreeEnsurePreflight(
+                "simulated unreadable Git root"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                worktree_ensure.WorktreeEnsureAction,
+                "interrupted intent recovery observation failed",
+            ):
+                self._ensure(parameters)
+
+        receipt_files = list(self.receipt_root.glob("*.json"))
+        self.assertEqual(len(receipt_files), 1)
+        self.assertEqual(json.loads(receipt_files[0].read_text())["state"], "intent")
+
+    def test_post_mutation_preflight_readback_is_action_failure(self) -> None:
+        parameters = self._parameters(
+            key="post-mutation-readback-preflight",
+            branch="feat/post-mutation-readback-preflight",
+            target=self.worktree_root / "post-mutation-readback-preflight",
+        )
+        real_observe = worktree_ensure._observe
+        observation_calls = 0
+
+        def fail_second_observation(inputs, runner):
+            nonlocal observation_calls
+            observation_calls += 1
+            if observation_calls == 2:
+                raise worktree_ensure.WorktreeEnsurePreflight(
+                    "simulated unreadable Git root"
+                )
+            return real_observe(inputs, runner)
+
+        with patch.object(
+            worktree_ensure, "_observe", side_effect=fail_second_observation
+        ):
+            with self.assertRaisesRegex(
+                worktree_ensure.WorktreeEnsureAction,
+                "post-mutation observation failed",
+            ):
+                self._ensure(parameters)
+
+        self.assertEqual(observation_calls, 2)
+        self.assertTrue(Path(str(parameters["target_path"])).is_dir())
+        receipt_files = list(self.receipt_root.glob("*.json"))
+        self.assertEqual(len(receipt_files), 1)
+        self.assertEqual(json.loads(receipt_files[0].read_text())["state"], "intent")
+
     def test_legacy_success_replay_marks_lifecycle_as_unbound_projection(self) -> None:
         parameters = self._parameters(key="legacy-success")
         created = self._ensure(parameters)
