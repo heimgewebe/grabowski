@@ -435,6 +435,18 @@ def _observe(inputs: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
     return post_state
 
 
+def _observe_after_possible_effect(
+    inputs: dict[str, Any], runner: CommandRunner, *, phase: str
+) -> dict[str, Any]:
+    try:
+        return _observe(inputs, runner)
+    except WorktreeEnsurePreflight as exc:
+        raise WorktreeEnsureAction(
+            f"{phase} observation failed after a durable intent or worktree effect may exist: "
+            f"{_bounded_text(exc)}"
+        ) from exc
+
+
 def _lease_state(inputs: dict[str, Any], inspect_lease: LeaseInspector) -> dict[str, Any]:
     now = int(time.time())
     owner = inputs["lease_owner_id"]
@@ -737,7 +749,9 @@ def ensure_worktree(
         if existing is not None and existing.get("state") == "complete":
             result_state = existing.get("result_state")
             if result_state in SUCCESS_STATES:
-                observation = _observe(inputs, runner)
+                observation = _observe_after_possible_effect(
+                    inputs, runner, phase="durable success replay"
+                )
                 if not observation.get("matches_requested_state"):
                     return {
                         "receipt_status": "blocked",
@@ -779,7 +793,9 @@ def ensure_worktree(
                 symptom="incomplete worktree-ensure intent found during idempotent replay",
                 notes=[f"receipt={receipt_path}", "post-state readback will determine recovery"],
             )
-            observation = _observe(inputs, runner)
+            observation = _observe_after_possible_effect(
+                inputs, runner, phase="interrupted intent recovery"
+            )
             lease = _lease_state(inputs, inspect_lease)
 
             if observation["classification"] == "ALREADY_CORRECT":
@@ -1011,7 +1027,9 @@ def ensure_worktree(
         )
         _after_worktree_mutation()
 
-        post_state = _observe(inputs, runner)
+        post_state = _observe_after_possible_effect(
+            inputs, runner, phase="post-mutation"
+        )
         if post_state.get("matches_requested_state"):
             event_id = str((recovery_friction or {}).get("event_id") or "")
             closeout = _resolve_friction(resolve_friction, event_id, receipt_path, parameters_sha256)
