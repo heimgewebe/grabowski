@@ -1305,7 +1305,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             0,
         )
 
-    def test_orphaned_binding_projects_one_blocking_current_work_group(self) -> None:
+    def test_orphaned_binding_projects_one_hygiene_current_work_group(self) -> None:
         result = project(
             reconciliation_payload={
                 "bindings": [
@@ -1327,7 +1327,8 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         row = result["work"][0]
         self.assertEqual(row["work_id"], "checkout-binding:key-orphan")
         self.assertEqual(row["binding_status"], "unbound")
-        self.assertEqual(row["projection_state"], "blocking")
+        self.assertEqual(row["projection_state"], "hygiene")
+        self.assertEqual(row["work_class"], "hygiene")
         self.assertIn("checkout-binding-orphaned_binding", row["action_reasons"])
         self.assertIn(
             "checkout_binding_reconciliation",
@@ -1358,6 +1359,37 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0]["projection_state"], "blocking")
         self.assertIn("checkout-path-mismatch", matching[0]["action_reasons"])
+
+    def test_historical_reconciliation_does_not_displace_active_work(self) -> None:
+        bindings = [
+            {
+                "checkout_key": f"old-{index}",
+                "state": "orphaned_binding",
+                "blocking": True,
+                "reasons": ["binding-has-no-current-git-worktree-record"],
+                "binding_identity": {"checkout_key": f"old-{index}"},
+                "worktree_identity": None,
+                "evidence": {"owner_id": "operator:historical"},
+                "recommended_next_step": "inspect_git_and_binding_history_without_mutation",
+            }
+            for index in range(8)
+        ]
+        result = project(
+            tasks_payload={
+                "tasks": [task("live-task", state="running", updated=100)],
+                "pagination": {"has_more": False},
+            },
+            reconciliation_payload={
+                "bindings": bindings,
+                "pagination": {"has_more": False},
+            },
+            limit=3,
+        )
+        self.assertEqual(result["work"][0]["work_id"], "task:live-task")
+        self.assertEqual(result["work"][0]["projection_state"], "active")
+        self.assertEqual(result["state_counts"]["blocking"], 0)
+        self.assertEqual(result["state_counts"]["hygiene"], 8)
+        self.assertEqual(result["convergence_summary"]["hygiene_count"], 8)
 
 
 if __name__ == "__main__":

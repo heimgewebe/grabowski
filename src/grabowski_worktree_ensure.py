@@ -282,7 +282,10 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
         "artifact_class": artifact_class,
         "retention_until_unix": retention_until_unix,
         "idempotency_key": idempotency_key,
-        "required_resource_keys": [f"path:{target}", f"repo:{repo}"],
+        "required_resource_keys": [
+            f"path:{target}",
+            f"repo:{repo}:branch:{branch}",
+        ],
     }
 
 
