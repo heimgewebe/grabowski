@@ -1401,6 +1401,21 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertIn("User=root", service_unit)
         self.assertIn("StandardInput=socket", service_unit)
         self.assertIn("NoNewPrivileges=yes", service_unit)
+        address_family_lines = [
+            line
+            for line in service_unit.splitlines()
+            if line.startswith("RestrictAddressFamilies=")
+        ]
+        self.assertEqual(
+            address_family_lines,
+            ["RestrictAddressFamilies=AF_UNIX AF_NETLINK"],
+        )
+        allowed_address_families = set(
+            address_family_lines[0].split("=", 1)[1].split()
+        )
+        self.assertEqual(allowed_address_families, {"AF_UNIX", "AF_NETLINK"})
+        self.assertNotIn("AF_INET", allowed_address_families)
+        self.assertNotIn("AF_INET6", allowed_address_families)
         self.assertIn("ProtectHome=tmpfs", service_unit)
         self.assertIn(
             "BindReadOnlyPaths=-/home/alex/.local/state/grabowski/recovery/last-server-recovery.json",
