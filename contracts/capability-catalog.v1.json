@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "6f176d0f0e9a97aa871d49e26f69289ca1d65f93690e8fd294502db502eb5722",
+  "capability_source_sha256": "d705fe4c2861c7d26f2fd2b8f5269a09e7f08c8f2443244983c5d242b9748a4e",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "54e55200be80b82f8a76705b3774f84bb5f96c9b559db01e4dbdc6b7df48522a",
+  "contract_sha256": "cd789f98c59d752877a0f24c26d18a45799bbfb88206613d6184850ef352e3ad",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -284,6 +284,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_audit_analyze"
+    },
+    {
+      "category": "audit",
+      "description": "Project bounded Reposkop coverage, technical outcomes and improvement signals.",
+      "effects": [],
+      "id": "grabowski_reposkop_effectiveness",
+      "purpose": "Project bounded Reposkop coverage, technical outcomes, latency and evidence-bound improvement candidates from the verified audit chain.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_reposkop_effectiveness"
     },
     {
       "category": "knowledge",

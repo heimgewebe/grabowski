@@ -1170,13 +1170,16 @@ class OperatorV2RuntimeTests(unittest.TestCase):
             ]
         }
         summary = status["capability_requirements"]
-        self.assertEqual(summary["registered_tool_requirements"], 185)
+        self.assertEqual(summary["registered_tool_requirements"], 186)
         self.assertEqual(missing["grabowski_remove_path"], ["file_delete"])
         self.assertEqual(missing["grabowski_restore_removed_path"], ["file_delete"])
         self.assertEqual(missing["repoground_bundle_discover"], ["bundle_registry"])
         self.assertEqual(missing["grabowski_audit_query"], ["audit_read"])
         self.assertEqual(missing["grabowski_audit_trace"], ["audit_read"])
         self.assertEqual(missing["grabowski_audit_analyze"], ["audit_read"])
+        self.assertEqual(
+            missing["grabowski_reposkop_effectiveness"], ["audit_read"]
+        )
         self.assertEqual(
             missing["grabowski_checkout_binding_terminal_preview"],
             ["git_cli", "github_cli"],

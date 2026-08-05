@@ -125,6 +125,29 @@
         "tool": "grabowski_audit_query"
       }
     },
+    "grabowski_reposkop_effectiveness": {
+      "evidence_refs": [
+        "tests:test_reposkop_effectiveness.py",
+        "tests:test_reposkop_effectiveness_integration.py",
+        "contract:task-reposkop-execution-attestation-v2"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded coverage, technical-outcome, latency and evidence-qualified improvement projections derived from the verified audit chain.",
+        "evidence": "Complete classified task-start denominator, deterministic evaluation binding, ordered evaluation/decision/outcome events, bounded grouping and percentile limits, privacy exclusions, explicit non-causality claims and focused projection plus lifecycle tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic audit query or analysis would require callers to reconstruct a multi-event task lifecycle, denominator rules, percentile semantics and improvement thresholds, risking false success claims and inconsistent treatment of legacy or missing attestations.",
+      "rationale": "Reposkop effectiveness is a materially distinct joined lifecycle projection over classified task starts, verified evaluations, decisions and terminal outcomes. The dedicated read-only shape preserves bounded evidence semantics without creating a second truth store or granting mutation authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "audit",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_reposkop_effectiveness"
+      }
+    },
     "grabowski_audit_trace": {
       "evidence_refs": [
         "docs:audit-query-trace-v1.md",
