@@ -172,6 +172,86 @@ class CheckoutBindingReconcilerTests(unittest.TestCase):
             "checkout_absence_as_cleanup_proof", result["does_not_establish"]
         )
 
+    def test_cleaned_archive_uses_terminal_retention_identity(self) -> None:
+        final_head = "b" * 40
+        retention = dict(binding()["retention"])
+        retention.update({"expected_head": final_head, "expected_branch": None})
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                retention=retention,
+                latest_archive={
+                    "archive_id": "archive-final",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": final_head,
+                    "branch": None,
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": 2,
+                    "cleanup_plan_id": "plan-final",
+                },
+            ),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "archived_cleaned")
+        self.assertFalse(result["blocking"])
+        self.assertEqual(result["reasons"], [])
+
+    def test_cleaned_archive_rejects_terminal_retention_drift(self) -> None:
+        retention = dict(binding()["retention"])
+        retention["expected_head"] = "b" * 40
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                retention=retention,
+                latest_archive={
+                    "archive_id": "archive-drift",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": "c" * 40,
+                    "branch": "topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": 2,
+                    "cleanup_plan_id": "plan-drift",
+                },
+            ),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertTrue(result["blocking"])
+        self.assertIn("retention-archive-head-mismatch", result["reasons"])
+
+    def test_cleaned_archive_without_retention_falls_back_to_binding_identity(self) -> None:
+        result = reconcile_binding(
+            binding(
+                phase="archived",
+                retention=None,
+                latest_archive={
+                    "archive_id": "archive-no-retention",
+                    "repo_common_dir": COMMON,
+                    "repo_path": REPO,
+                    "checkout_path": CHECKOUT,
+                    "owner_id": "operator:test",
+                    "head": "c" * 40,
+                    "branch": "topic",
+                    "created_at_unix": 1,
+                    "cleaned_at_unix": 2,
+                    "cleanup_plan_id": "plan-no-retention",
+                },
+            ),
+            None,
+            repository_observable=True,
+        )
+        self.assertEqual(result["state"], "binding_identity_drift")
+        self.assertTrue(result["blocking"])
+        self.assertIn("binding-archive-head-mismatch", result["reasons"])
+
     def test_cleaned_archive_requires_complete_cleanup_evidence(self) -> None:
         result = reconcile_binding(
             binding(
