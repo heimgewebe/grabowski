@@ -159,6 +159,24 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertIsNone(result["effect_observed"])
         release.assert_not_called()
 
+    def test_preflight_exception_after_lease_acquisition_is_compensated(self) -> None:
+        release = Mock(return_value={"released": True})
+        result = work_acquire.acquire_work(
+            self.parameters(), acquire_resources_fn=self.acquire,
+            release_resources_fn=release, inspect_resource_fn=Mock(),
+            ensure_worktree_fn=Mock(
+                side_effect=work_acquire.worktree_ensure.WorktreeEnsurePreflight(
+                    "invalid branch"
+                )
+            ),
+            runner=Mock(),
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "AUTO_PREPARE_FAILED")
+        self.assertFalse(result["effect_observed"])
+        release.assert_called_once()
+        self.assertIsInstance(release.call_args.kwargs["expected_leases"], list)
+
     def test_non_object_result_is_durable_outcome_unknown(self) -> None:
         release = Mock()
         result = work_acquire.acquire_work(
