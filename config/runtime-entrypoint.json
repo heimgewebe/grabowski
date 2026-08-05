@@ -265,6 +265,10 @@
       "source": "src/grabowski_worktree_ensure.py"
     },
     {
+      "module": "grabowski_checkout_identity",
+      "source": "src/grabowski_checkout_identity.py"
+    },
+    {
       "module": "grabowski_work_acquire",
       "source": "src/grabowski_work_acquire.py"
     },

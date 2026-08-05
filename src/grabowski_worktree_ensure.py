@@ -13,6 +13,7 @@ import time
 import uuid
 from typing import Any, Callable, Iterator
 
+import grabowski_checkout_identity as checkout_identity
 import grabowski_work_admission as work_admission
 
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
@@ -254,6 +255,9 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
         source_kind, source_id = checkouts._source_binding(source_kind, source_id)
         artifact_class = checkouts._artifact_class(artifact_class)
         retention_until_unix = checkouts._retention_until(retention_until_unix)
+        identity_supersession = checkout_identity.normalize_supersession(
+            parameters.get("identity_supersession")
+        )
     except ValueError as exc:
         raise WorktreeEnsurePreflight(str(exc)) from exc
 
@@ -270,7 +274,7 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
     if not target.parent.exists() or not target.parent.is_dir():
         raise WorktreeEnsurePreflight("target_path parent must already exist")
 
-    return {
+    normalized = {
         "repo": str(repo),
         "target_path": str(target),
         "branch": branch,
@@ -287,6 +291,9 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
             f"repo:{repo}:branch:{branch}",
         ],
     }
+    if identity_supersession is not None:
+        normalized["identity_supersession"] = identity_supersession
+    return normalized
 
 
 def _command(runner: CommandRunner, repo: Path, argv: list[str]) -> dict[str, Any]:
@@ -615,23 +622,38 @@ def _public_output(
 def _reserve_input_lifecycle(inputs: dict[str, Any]) -> dict[str, Any]:
     import grabowski_checkouts as checkouts
 
+    identity_reservation = checkout_identity.prepare(inputs)
     repo = Path(inputs["repo"])
     checkout = Path(inputs["target_path"])
     top_level = checkouts._git_top_level(repo)
     common_dir = checkouts._git_common_dir(repo)
-    return checkouts._reserve_checkout_lifecycle(
-        repo_common_dir=common_dir,
-        repo_path=top_level,
-        checkout_path=checkout,
-        owner_id=str(inputs["lease_owner_id"]),
-        purpose=str(inputs["purpose"]),
-        source_kind=str(inputs["source_kind"]),
-        source_id=str(inputs["source_id"]),
-        artifact_class=str(inputs["artifact_class"]),
-        retention_until_unix=int(inputs["retention_until_unix"]),
-        expected_head=str(inputs["base_head"]),
-        expected_branch=str(inputs["branch"]),
-    )
+    try:
+        lifecycle = checkouts._reserve_checkout_lifecycle(
+            repo_common_dir=common_dir,
+            repo_path=top_level,
+            checkout_path=checkout,
+            owner_id=str(inputs["lease_owner_id"]),
+            purpose=str(inputs["purpose"]),
+            source_kind=str(inputs["source_kind"]),
+            source_id=str(inputs["source_id"]),
+            artifact_class=str(inputs["artifact_class"]),
+            retention_until_unix=int(inputs["retention_until_unix"]),
+            expected_head=str(inputs["base_head"]),
+            expected_branch=str(inputs["branch"]),
+        )
+    except Exception as exc:
+        try:
+            checkout_identity.abort(
+                identity_reservation,
+                reason=f"checkout lifecycle reservation rejected: {_bounded_text(exc)}",
+            )
+        except Exception as rollback_exc:
+            raise WorktreeEnsureAction(
+                "checkout lifecycle reservation failed and identity rollback "
+                f"could not be completed: {_bounded_text(rollback_exc)}"
+            ) from exc
+        raise
+    return {**lifecycle, "identity_reservation": identity_reservation}
 
 
 def _bind_checkout_lifecycle(
@@ -669,6 +691,10 @@ def _bind_checkout_lifecycle(
         expected_head=str(post_state["actual_head"]),
         expected_branch=str(inputs["branch"]),
     )
+    identity_reservation = lifecycle_binding.get("identity_reservation")
+    if not isinstance(identity_reservation, dict):
+        raise WorktreeEnsureAction("worktree lifecycle identity reservation is missing")
+    identity = checkout_identity.finalize(identity_reservation)
     return {
         "schema_version": 1,
         "state": "retained",
@@ -685,6 +711,7 @@ def _bind_checkout_lifecycle(
         "expires_at_unix": retention["retention_until_unix"],
         "expected_head": retention["expected_head"],
         "expected_branch": retention["expected_branch"],
+        "identity": identity,
         "terminal_decision": "retain",
         "terminal_reason": "external GitHub and Bureau truth require later reconciliation",
         "automatic_cleanup_authorized": False,
@@ -1060,13 +1087,37 @@ def ensure_worktree(
 
         lifecycle_released = False
         lifecycle_preserved = post_state["classification"] != "ABSENT"
-        if not lifecycle_preserved:
+        identity_reservation = lifecycle_reservation.get("identity_reservation")
+        identity_transition: dict[str, Any] | None = None
+        if not isinstance(identity_reservation, dict):
+            raise WorktreeEnsureAction("checkout identity reservation disappeared after Git mutation")
+        error = _command_error(mutation)
+        if lifecycle_preserved:
+            identity_transition = checkout_identity.mark_blocking(
+                identity_reservation,
+                reason=(
+                    "Git worktree mutation produced a conflicting or ambiguous exact path: "
+                    + error
+                ),
+            )
+        else:
             lifecycle_released = checkouts._release_checkout_lifecycle_exact(
                 lifecycle_reservation
             )
-        error = _command_error(mutation)
-        if not lifecycle_preserved and not lifecycle_released:
-            error = f"{error}; lifecycle reservation could not be released exactly"
+            if lifecycle_released:
+                identity_transition = checkout_identity.abort(
+                    identity_reservation,
+                    reason="Git worktree mutation produced no registered target: " + error,
+                )
+            else:
+                identity_transition = checkout_identity.mark_blocking(
+                    identity_reservation,
+                    reason=(
+                        "Git worktree mutation produced no target, but the lifecycle "
+                        "reservation could not be released exactly: " + error
+                    ),
+                )
+                error = f"{error}; lifecycle reservation could not be released exactly"
         result_state = "CONFLICT" if post_state["classification"] == "CONFLICT" else "NOT_ACCEPTED"
         error_class = "POST_MUTATION_CONFLICT" if result_state == "CONFLICT" else "GIT_WORKTREE_ADD_REJECTED"
         friction = recovery_friction or _record_friction(
@@ -1091,6 +1142,7 @@ def ensure_worktree(
             "preserved": lifecycle_preserved,
             "released": lifecycle_released,
             "binding": lifecycle_reservation if lifecycle_preserved else None,
+            "identity_transition": identity_transition,
         }
         record["mutation"] = {
             "returncode": _returncode(mutation),
