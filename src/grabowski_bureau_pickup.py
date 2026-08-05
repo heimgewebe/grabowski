@@ -148,6 +148,12 @@ def _runtime_error_details(
 
 
 def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return stable identity fields for one filesystem object.
+
+    Directory size and timestamps are mutable namespace metadata. They may
+    change between stat and fstat when an unrelated process updates a shared
+    ancestor such as /tmp, so they must not participate in path-to-fd binding.
+    """
     return (
         metadata.st_dev,
         metadata.st_ino,
@@ -155,6 +161,12 @@ def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_nlink,
         metadata.st_uid,
         metadata.st_gid,
+    )
+
+
+def _file_snapshot_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        *_directory_identity(metadata),
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
@@ -495,7 +507,7 @@ def _read_private_bytes_at(
             raise BureauPickupError(f"{label}-mode-invalid")
         if before.st_nlink != 1:
             raise BureauPickupError(f"{label}-hardlink-invalid")
-        if _directory_identity(before) != _directory_identity(linked):
+        if _file_snapshot_identity(before) != _file_snapshot_identity(linked):
             raise BureauPickupError(f"{label}-binding-invalid")
         if before.st_size > MAX_REQUEST_BYTES:
             raise BureauPickupError(f"{label}-too-large")
@@ -512,8 +524,8 @@ def _read_private_bytes_at(
     finally:
         os.close(descriptor)
     if (
-        _directory_identity(before) != _directory_identity(after)
-        or _directory_identity(after) != _directory_identity(linked_after)
+        _file_snapshot_identity(before) != _file_snapshot_identity(after)
+        or _file_snapshot_identity(after) != _file_snapshot_identity(linked_after)
     ):
         raise BureauPickupError(f"{label}-changed-during-read")
     _assert_private_directory_binding(

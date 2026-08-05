@@ -218,6 +218,50 @@ class BureauPickupTests(unittest.TestCase):
             ):
                 pickup._private_root()
 
+    def test_existing_directory_chain_ignores_parent_metadata_churn(self) -> None:
+        real_fstat = pickup.os.fstat
+        churned = False
+
+        def fstat_after_parent_churn(descriptor: int):
+            nonlocal churned
+            if not churned:
+                descriptor_path = Path(f"/proc/self/fd/{descriptor}").resolve()
+                if descriptor_path == self.root.parent:
+                    marker = self.root.parent / (
+                        f".pickup-parent-churn-{os.getpid()}-{time.time_ns()}"
+                    )
+                    marker.mkdir(mode=0o700)
+                    marker.rmdir()
+                    churned = True
+            return real_fstat(descriptor)
+
+        with mock.patch.object(
+            pickup.os, "fstat", side_effect=fstat_after_parent_churn
+        ):
+            descriptor = pickup._open_existing_directory_chain(
+                self.root, label="test-parent"
+            )
+        try:
+            self.assertTrue(churned)
+        finally:
+            os.close(descriptor)
+
+    def test_file_snapshot_identity_keeps_mutable_metadata(self) -> None:
+        path = self.root / "snapshot-identity.txt"
+        path.write_text("a", encoding="utf-8")
+        before = path.stat()
+        path.write_text("a longer value", encoding="utf-8")
+        after = path.stat()
+
+        self.assertEqual(
+            pickup._directory_identity(before),
+            pickup._directory_identity(after),
+        )
+        self.assertNotEqual(
+            pickup._file_snapshot_identity(before),
+            pickup._file_snapshot_identity(after),
+        )
+
     def test_coordination_root_rejects_public_override(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported request fields"):
             pickup._normalize_request(
