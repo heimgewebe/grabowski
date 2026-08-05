@@ -2733,6 +2733,18 @@
         "source": "src/grabowski_operator.py"
       },
       {
+        "module": "grabowski_effect_receipt",
+        "source": "src/grabowski_effect_receipt.py"
+      },
+      {
+        "module": "grabowski_effect_interceptor",
+        "source": "src/grabowski_effect_interceptor.py"
+      },
+      {
+        "module": "grabowski_lane_closeout",
+        "source": "src/grabowski_lane_closeout.py"
+      },
+      {
         "module": "grabowski_deployment_observer",
         "source": "src/grabowski_deployment_observer.py"
       },
@@ -3102,7 +3114,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "1f08f8b19cf4e561d1b858279ab4f64ce52f9ac1e9cdc2a38ecefcec456cab52"
+      "sha256": "54e55200be80b82f8a76705b3774f84bb5f96c9b559db01e4dbdc6b7df48522a"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3141,6 +3153,8 @@
       "src/grabowski_current_work.py": "96cbf7097927956443a2df9aa6ccb848570694cfeaf51d98c9a9b860f472dd10",
       "src/grabowski_current_work_surface.py": "baaa3c56b971e52abeec8c70af2c5f846962f0a5970c81a28a1c76726c0af8a1",
       "src/grabowski_deployment_observer.py": "01a9cbae636f29559c63cfe09a191d0e6ea78f5e838dc001914a6c4140be9e1c",
+      "src/grabowski_effect_interceptor.py": "7d87939bbc003ef65164e7dc29bdd344fa6118619977ae67c4117d2e1dac4583",
+      "src/grabowski_effect_receipt.py": "40de8d05bd90dda17dc99d5a37fad328b8f9a4af2a1876a952825c18832bae62",
       "src/grabowski_fleet.py": "22b3afdde81ff3f0ec1b36d4f8d886bced6fdeb64c2f291f319df8a654dee20c",
       "src/grabowski_friction.py": "15137b57106c15bfac5d27b0fdb22fa7e958b06b32120217623d38abf3350d32",
       "src/grabowski_grip_orchestration.py": "04b6a9844dcaf353a5f4bb9a926cf80fc7ee4e56aab0551a936b7926703851c0",
@@ -3149,6 +3163,7 @@
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "365672cd52ff58fb0dd83e5e4abf3fec36fa0a21fa6637785fe6dbd991abc9fe",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
+      "src/grabowski_lane_closeout.py": "77e78c3b2949206de9fade8608a59972c95ad472bf9426e416ac456f1de425f8",
       "src/grabowski_lifecycle_archive.py": "55ca2cfb58bb56a2c068b3a7c34c6bdc21f040492e1c437e5d8300783a23b3ce",
       "src/grabowski_lifecycle_collectors.py": "212dfce41c7764a386bd2124c9df32cf31d7a3cd572d36dcba5e5358be42e4d3",
       "src/grabowski_lifecycle_effect_plan.py": "d6435b8357652fbfc1976be8d861059d684d7e6baf07e4ae8848483b4039e892",
@@ -3163,7 +3178,7 @@
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "982bc06d4e4be7823fcc7613df01d39294ebb2b76d2ed378f412e762191dfbc5",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
-      "src/grabowski_operator.py": "1c6a0b7b0e4298c667737c836a55b79cec35f4a6f90c735793794737ef5739cc",
+      "src/grabowski_operator.py": "d92a576482dad384fce7ff3abb6933be87b196fa972e5232a404b9db53a5d4ea",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
       "src/grabowski_operator_relay.py": "3f314d82bb6c3c7b91eff774b487088e25ec44372512d50936eb18f199eaa02c",
