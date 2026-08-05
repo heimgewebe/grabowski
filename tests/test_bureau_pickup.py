@@ -137,6 +137,70 @@ class BureauPickupTests(unittest.TestCase):
         self.assertTrue(optional.isdisjoint(request_schema["required"]))
         self.assertFalse(request_schema["additionalProperties"])
 
+    def test_error_message_preserves_structured_details_at_mcp_boundary(
+        self,
+    ) -> None:
+        details = {
+            "status": "failed",
+            "source_code": "state-error",
+            "detail": "unknown coordinated claim task TEST-T001",
+        }
+        message = pickup._bureau_pickup_error_message(
+            "claim-intent-state-error", details, None
+        )
+
+        prefix, payload = message.split(
+            f"\n{pickup.MCP_ERROR_ENVELOPE_MARKER}", 1
+        )
+
+        self.assertEqual("claim-intent-state-error", prefix)
+        self.assertEqual(
+            {
+                "schema_version": 1,
+                "kind": "grabowski_bureau_pickup_error",
+                "code": "claim-intent-state-error",
+                "details": {
+                    "status": "failed",
+                    "source_code": "state-error",
+                    "detail": "unknown coordinated claim task TEST-T001",
+                },
+            },
+            json.loads(payload),
+        )
+
+    def test_fastmcp_error_keeps_structured_pickup_evidence(self) -> None:
+        if not hasattr(pickup.mcp, "_tool_manager"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        error = pickup.BureauPickupError(
+            "claim-intent-state-error",
+            details={
+                "status": "failed",
+                "source_code": "state-error",
+                "detail": "unknown coordinated claim task TEST-T001",
+            },
+        )
+        with mock.patch.object(pickup, "_prepare_request", side_effect=error):
+            with self.assertRaises(ToolError) as raised:
+                asyncio.run(
+                    pickup.mcp._tool_manager.call_tool(
+                        "grabowski_bureau_pickup_execute",
+                        {
+                            "request": {
+                                "worker_id": "operator-test",
+                                "capabilities": ["repository", "shell"],
+                                "task_id": "TEST-T001",
+                            }
+                        },
+                    )
+                )
+
+        message = str(raised.exception)
+        self.assertIn(pickup.MCP_ERROR_ENVELOPE_MARKER, message)
+        self.assertIn('"source_code":"state-error"', message)
+        self.assertIn('"status":"failed"', message)
+
     def test_minimal_valid_request_normalizes_without_changing_runtime_defaults(
         self,
     ) -> None:
