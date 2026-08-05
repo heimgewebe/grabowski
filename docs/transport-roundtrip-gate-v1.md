@@ -10,24 +10,16 @@ The check is installed at the central FastMCP `call_tool` boundary. A mutating t
 
 FastMCP exposes `_meta.client_id`, but the installed SDK documents it as request metadata supplied by the client, not OAuth identity. Grabowski therefore treats it only as a **client-declared scope label**. It is never described as authentication or authorization.
 
-Transport authority requires a stable **connector session** identity (T142): the
-Streamable HTTP `mcp-session-id` header or an explicit context `session_id`,
-combined with the server process instance and optional `_meta.client_id`. The
-HTTP transport is stateful so protocol sessions can span begin, ack and the
-bound mutation when the client returns the header. A bounded token pool exists
-only inside one connector session. There is no global `shared_unlabeled`
-authorization pool; missing identity fails closed before handshake creation or
-consumption. Python object identity and weakrefs are not authority.
+When `_meta.client_id` is absent, a stateful HTTP deployment assigns a random server-session scope that remains stable only for the lifetime of that server session. The production HTTP transport is stateless, so it cannot honestly provide that identity and uses the explicit `shared_unlabeled` scope instead. That scope uses a bounded shared token pool: exact challenges and verifications coexist under one lock, concurrent handshakes no longer overwrite one another, and every admitted mutation still consumes exactly one verification. The pool proves only possession within the shared transport boundary; it neither attributes a token to one caller nor distinguishes concurrent unauthenticated clients.
 
-See `docs/transport-roundtrip-v3.md` and
-`docs/proofs/transport-connector-session-v1-t142.md`.
+The automatic loopback snapshot observer supplies its stable label explicitly through `_meta` on status, begin, ack, and snapshot-binding calls.
 
 ## Handshake
 
 The existing `grip_run` surface exposes the operator-only `transport-roundtrip` grip; no new public MCP tool is added.
 
 1. Run `transport-roundtrip` with `action=begin`.
-2. A connector session may reuse its still-current, unconsumed verification for the exact same intent. Distinct exact intents inside one session coexist under the session-private pool limit.
+2. A declared or stateful-session scope may reuse its still-current, unconsumed verification. The stateless shared scope always allocates a new exact challenge, subject to its bounded pool limit.
 3. Acknowledge the returned `challenge_receipt_sha256` with `action=ack`; only that pending entry becomes a verification.
 4. Invoke exactly one mutating tool. Central admission consumes the verification before tool effect.
 5. Repeat the handshake before every later mutation.
@@ -38,7 +30,7 @@ The caller cannot inject the server-reserved scope object or runtime binding thr
 
 Each receipt binds the scope kind and hash, release id, full repository head, registered tool-name hash, agent-instruction hash, timestamps, receipt chain, and canonical receipt hash. The consumption receipt additionally binds the mutating tool name and canonical argument SHA-256. Release, head, catalog, instruction, time, receipt, file-owner, permission, symlink, or hardlink drift closes the gate.
 
-Challenges expire after five minutes. Completed verification expires after fifteen minutes but is single-use. Consumption is serialized under the same private state lock, preventing two admitted mutations from using one verification. Each connector session is capped at 32 pending challenges and 32 verified receipts; stale or runtime-mismatched entries are pruned on the next mutation, and a full live pool blocks fail-closed.
+Challenges expire after five minutes. Completed verification expires after fifteen minutes but is single-use. Consumption is serialized under the same private state lock, preventing two admitted mutations from using one verification. Declared and stateful-session scopes retain one pending and one verified slot. The stateless shared scope is capped at 32 pending challenges and 32 verified receipts; stale or runtime-mismatched entries are pruned on the next mutation, and a full live pool blocks fail-closed.
 
 State lives below `~/.local/state/grabowski/transport-roundtrip/` with a private directory, private regular files, bounded JSON, serialized writers, atomic replacement, and file plus directory synchronization. Legacy single-slot state is validated and migrated on the next mutation. Status reads do not create or rewrite state.
 

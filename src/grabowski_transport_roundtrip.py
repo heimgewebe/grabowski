@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-STATE_SCHEMA_VERSION = 4
+STATE_SCHEMA_VERSION = 2
 STATE_KIND = "grabowski_transport_roundtrip_state"
 CHALLENGE_KIND = "grabowski_transport_roundtrip_challenge"
 VERIFICATION_KIND = "grabowski_transport_roundtrip_verification"
@@ -23,17 +23,11 @@ CHALLENGE_TTL_SECONDS = 300
 VERIFICATION_TTL_SECONDS = 900
 CLOCK_SKEW_SECONDS = 30
 MAX_STATE_BYTES = 128 * 1024
-# Pool is private to one connector session (name kept for test/patch compatibility).
 MAX_SHARED_PENDING_CHALLENGES = 32
 MAX_SHARED_VERIFIED_RECEIPTS = 32
-MAX_SESSION_PENDING_CHALLENGES = MAX_SHARED_PENDING_CHALLENGES
-MAX_SESSION_VERIFIED_RECEIPTS = MAX_SHARED_VERIFIED_RECEIPTS
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-roundtrip"
 LOCK_PATH = STATE_ROOT / ".lock"
-# Legacy labels retained only so migration can recognize and reject them.
 SHARED_UNLABELED_SCOPE = "shared-unlabeled-transport-v1"
-CONNECTOR_SESSION_SCOPE_KIND = "connector_session"
-MCP_SESSION_ID_HEADER = "mcp-session-id"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
 _RUNTIME_BINDING_KEYS = frozenset(
@@ -45,10 +39,7 @@ _RUNTIME_BINDING_KEYS = frozenset(
     }
 )
 _CLIENT_SCOPE_KEYS = frozenset({"kind", "label"})
-_CLIENT_SCOPE_KINDS = frozenset({CONNECTOR_SESSION_SCOPE_KIND})
-_LEGACY_SCOPE_KINDS = frozenset(
-    {"client_declared_meta", "shared_unlabeled", "caller_session"}
-)
+_CLIENT_SCOPE_KINDS = frozenset({"client_declared_meta", "shared_unlabeled"})
 _MUTATION_INTENT_KEYS = frozenset({"tool_name", "arguments_sha256"})
 _LEGACY_STATE_KEYS = frozenset(
     {
@@ -72,7 +63,6 @@ _STATE_KEYS = frozenset(
         "last_consumption_receipt",
     }
 )
-_LEGACY_STATE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 
 
 class TransportRoundtripError(RuntimeError):
@@ -167,59 +157,15 @@ def validate_client_scope(value: Any) -> dict[str, str]:
         raise TransportRoundtripError("transport client scope is incomplete")
     kind = value.get("kind")
     label = _validate_text(value.get("label"), label="transport client scope label")
-    if kind in _LEGACY_SCOPE_KINDS:
-        raise TransportRoundtripError(
-            "legacy transport client scope cannot authorize mutation; "
-            "connector_session identity is required"
-        )
     if kind not in _CLIENT_SCOPE_KINDS:
-        raise TransportRoundtripError(
-            "transport connector-session scope is required"
-        )
+        raise TransportRoundtripError("transport client scope kind is invalid")
+    if kind == "shared_unlabeled" and label != SHARED_UNLABELED_SCOPE:
+        raise TransportRoundtripError("shared transport client scope is invalid")
     return {"kind": str(kind), "label": label}
 
 
 def client_scope_sha256(value: Any) -> str:
     return _sha256_json(validate_client_scope(value))
-
-
-def derive_connector_session_scope(
-    *,
-    client_id: str | None,
-    connector_session_id: str,
-    server_instance_id: str,
-) -> dict[str, str]:
-    """Bind transport authority to a protocol-level connector session.
-
-    The connector_session_id must be a stable transport identity such as the
-    Streamable HTTP ``mcp-session-id``. Python object identity, weakrefs and
-    per-call context wrappers are not accepted here; callers must supply the
-    already-resolved protocol string.
-    """
-    normalized_client_id = (
-        None
-        if client_id is None
-        else _validate_text(client_id, label="transport connector client id")
-    )
-    normalized_session_id = _validate_text(
-        connector_session_id, label="transport connector session id"
-    )
-    normalized_server_instance_id = _validate_text(
-        server_instance_id,
-        label="transport server instance id",
-    )
-    return validate_client_scope(
-        {
-            "kind": CONNECTOR_SESSION_SCOPE_KIND,
-            "label": _sha256_json(
-                {
-                    "client_id": normalized_client_id,
-                    "connector_session_id": normalized_session_id,
-                    "server_instance_id": normalized_server_instance_id,
-                }
-            ),
-        }
-    )
 
 
 def validate_runtime_binding(value: Any) -> dict[str, str]:
@@ -479,14 +425,8 @@ def _validate_receipt(
     return receipt
 
 
-def _is_session_pool(scope: dict[str, str]) -> bool:
-    """A pool is private to one connector session; there is no global pool."""
-    return scope["kind"] == CONNECTOR_SESSION_SCOPE_KIND
-
-
 def _is_shared_pool(scope: dict[str, str]) -> bool:
-    # Compatibility alias used by older call sites and tests.
-    return _is_session_pool(scope)
+    return scope["kind"] == "shared_unlabeled"
 
 
 def _empty_state(scope: dict[str, str]) -> dict[str, Any]:
@@ -619,17 +559,11 @@ def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
         raise TransportRoundtripError(
             "transport roundtrip state must be an object"
         )
-    schema_version = state.get("schema_version")
-    # Schema v1 single-slot, v2 shared_unlabeled pools, and v3 object/weakref-
-    # bound caller_session states may contain cross-client or object-tied
-    # authority. They never become v4 connector-session authority.
-    if state.get("kind") == STATE_KIND and schema_version in _LEGACY_STATE_SCHEMA_VERSIONS:
-        return _empty_state(scope)
     if (
-        schema_version == SCHEMA_VERSION
+        state.get("schema_version") == SCHEMA_VERSION
         and set(state) == _LEGACY_STATE_KEYS
     ):
-        return _empty_state(scope)
+        return _legacy_state_to_current(state, scope=scope)
     if set(state) != _STATE_KEYS:
         raise TransportRoundtripError(
             "transport roundtrip state contract mismatch"
@@ -637,18 +571,18 @@ def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
     _validate_state_identity(
         state, scope=scope, schema_version=STATE_SCHEMA_VERSION
     )
-    session_pool = _is_session_pool(scope)
+    shared = _is_shared_pool(scope)
     pending = _validate_receipt_sequence(
         state.get("pending_challenges"),
         expected_kind=CHALLENGE_KIND,
         scope=scope,
-        maximum=MAX_SHARED_PENDING_CHALLENGES if session_pool else 1,
+        maximum=MAX_SHARED_PENDING_CHALLENGES if shared else 1,
     )
     verified = _validate_receipt_sequence(
         state.get("verified_receipts"),
         expected_kind=VERIFICATION_KIND,
         scope=scope,
-        maximum=MAX_SHARED_VERIFIED_RECEIPTS if session_pool else 1,
+        maximum=MAX_SHARED_VERIFIED_RECEIPTS if shared else 1,
     )
     consumption = state.get("last_consumption_receipt")
     if consumption is not None:
@@ -954,16 +888,24 @@ def _projection(
         next_action = (
             "invoke exactly one bound mutating tool: " + projected_intent["tool_name"]
         )
-    session_pool = _is_session_pool(scope)
+    shared = _is_shared_pool(scope)
     does_not_establish = [
         "authenticated client identity",
         "application-level success of a mutating tool",
         "absence of response loss after a mutation",
         "client instruction compliance",
         "resistance to compromised same-uid code",
-        "that Python object identity or weakrefs authorize transport mutation",
-        "that a global shared_unlabeled pool can authorize mutation",
     ]
+    if shared:
+        does_not_establish.extend(
+            [
+                "which unlabeled caller owns a pooled verification",
+                "caller identity: shared_unlabeled is a shared storage "
+                "partition, not an identity",
+                "that two unlabeled callers of the same exact intent are "
+                "distinguishable",
+            ]
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "state_schema_version": STATE_SCHEMA_VERSION,
@@ -972,9 +914,7 @@ def _projection(
         "replayed": replayed,
         "mutation_gate_open": gate_open,
         "single_use": True,
-        "pool_mode": (
-            "connector-session-token-pool" if session_pool else "single-slot"
-        ),
+        "pool_mode": ("bounded-shared-token-pool" if shared else "single-slot"),
         "pending_challenge_count": len(pending_current),
         "verified_receipt_count": len(verified_current),
         "pool_limits": (
@@ -982,7 +922,7 @@ def _projection(
                 "pending_challenges": MAX_SHARED_PENDING_CHALLENGES,
                 "verified_receipts": MAX_SHARED_VERIFIED_RECEIPTS,
             }
-            if session_pool
+            if shared
             else {
                 "pending_challenges": 1,
                 "verified_receipts": 1,
@@ -1064,40 +1004,41 @@ def begin(
         )
         verified = sorted(state["verified_receipts"], key=_receipt_order)
         pending = sorted(state["pending_challenges"], key=_receipt_order)
-        session_pool = _is_session_pool(scope)
-        matching_verified = [
-            receipt
-            for receipt in verified
-            if _receipt_mutation_intent(receipt) == intent
-        ]
-        if matching_verified:
-            return _projection(
-                state=state,
-                scope=scope,
-                runtime_binding=binding,
-                now_unix=timestamp,
-                action="begin",
-                replayed=True,
-                selected_verified=matching_verified[0],
-            )
-        matching_pending = [
-            receipt
-            for receipt in pending
-            if _receipt_mutation_intent(receipt) == intent
-        ]
-        if matching_pending:
-            return _projection(
-                state=state,
-                scope=scope,
-                runtime_binding=binding,
-                now_unix=timestamp,
-                action="begin",
-                replayed=True,
-                selected_pending=matching_pending[0],
-            )
-        if session_pool and len(pending) >= MAX_SHARED_PENDING_CHALLENGES:
+        shared = _is_shared_pool(scope)
+        if not shared or intent is not None:
+            matching_verified = [
+                receipt
+                for receipt in verified
+                if _receipt_mutation_intent(receipt) == intent
+            ]
+            if matching_verified:
+                return _projection(
+                    state=state,
+                    scope=scope,
+                    runtime_binding=binding,
+                    now_unix=timestamp,
+                    action="begin",
+                    replayed=True,
+                    selected_verified=matching_verified[0],
+                )
+            matching_pending = [
+                receipt
+                for receipt in pending
+                if _receipt_mutation_intent(receipt) == intent
+            ]
+            if matching_pending:
+                return _projection(
+                    state=state,
+                    scope=scope,
+                    runtime_binding=binding,
+                    now_unix=timestamp,
+                    action="begin",
+                    replayed=True,
+                    selected_pending=matching_pending[0],
+                )
+        if _is_shared_pool(scope) and len(pending) >= MAX_SHARED_PENDING_CHALLENGES:
             raise TransportRoundtripRequired(
-                "connector-session transport pending challenge pool is full"
+                "shared transport pending challenge pool is full"
             )
         previous = verified[-1] if verified else None
         challenge = _new_challenge(
@@ -1110,9 +1051,9 @@ def begin(
         state = {
             **state,
             "pending_challenges": (
-                [*pending, challenge] if session_pool else [challenge]
+                [*pending, challenge] if _is_shared_pool(scope) else [challenge]
             ),
-            "verified_receipts": (verified if session_pool else []),
+            "verified_receipts": (verified if _is_shared_pool(scope) else []),
         }
         _write_private_json(_state_path(_sha256_json(scope)), state)
         return _projection(
@@ -1205,10 +1146,12 @@ def acknowledge(
             now_unix=timestamp,
         )
         current_verified = sorted(state["verified_receipts"], key=_receipt_order)
-        session_pool = _is_session_pool(scope)
-        if session_pool and len(current_verified) >= MAX_SHARED_VERIFIED_RECEIPTS:
+        if (
+            _is_shared_pool(scope)
+            and len(current_verified) >= MAX_SHARED_VERIFIED_RECEIPTS
+        ):
             raise TransportRoundtripRequired(
-                "connector-session transport verified receipt pool is full"
+                "shared transport verified receipt pool is full"
             )
         previous = current_verified[-1] if current_verified else None
         verification = _new_verification(
@@ -1226,10 +1169,10 @@ def acknowledge(
         ]
         state = {
             **state,
-            "pending_challenges": (remaining_pending if session_pool else []),
+            "pending_challenges": (remaining_pending if _is_shared_pool(scope) else []),
             "verified_receipts": (
                 [*current_verified, verification]
-                if session_pool
+                if _is_shared_pool(scope)
                 else [verification]
             ),
         }
@@ -1366,7 +1309,7 @@ def consume_verified(
             }
         )
         consumption["receipt_sha256"] = _receipt_sha256(consumption)
-        if _is_session_pool(scope):
+        if _is_shared_pool(scope):
             remaining_verified = [
                 receipt
                 for receipt in verified_receipts
@@ -1390,19 +1333,22 @@ def consume_verified(
             "that the admitted effect completed: admission is consumed before "
             "the effect runs, so a failed or lost effect leaves no reusable "
             "proof and requires a new handshake plus target readback",
-            "that Python object identity or weakrefs authorize transport mutation",
-            "that identical target arguments alone admit a mutation",
-            "that a global shared_unlabeled pool can authorize mutation",
         ]
+        if _is_shared_pool(scope):
+            does_not_establish.extend(
+                [
+                    "which unlabeled caller supplied the consumed verification",
+                    "caller identity: shared_unlabeled is a shared storage "
+                    "partition, not an identity",
+                ]
+            )
         return {
             "schema_version": SCHEMA_VERSION,
             "state_schema_version": STATE_SCHEMA_VERSION,
             "state": "consumed",
             "single_use": True,
             "pool_mode": (
-                "connector-session-token-pool"
-                if _is_session_pool(scope)
-                else "single-slot"
+                "bounded-shared-token-pool" if _is_shared_pool(scope) else "single-slot"
             ),
             "pending_challenge_count": len(remaining_pending),
             "verified_receipt_count": len(remaining_verified),

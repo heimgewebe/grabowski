@@ -53,8 +53,6 @@ import grabowski_merge_guard
 import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
-# Process-local nonce: connector-session scopes never survive a server restart.
-_TRANSPORT_SERVER_INSTANCE_ID = uuid.uuid4().hex
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
 RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS = frozenset({
     "runtime-entrypoint.json",
@@ -4785,96 +4783,31 @@ def _transport_roundtrip_runtime_binding() -> dict[str, str]:
     )
 
 
-def _transport_context_text(ctx: Context, name: str) -> str | None:
-    try:
-        raw = getattr(ctx, name)
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return None
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        rendered = raw
-    elif isinstance(raw, uuid.UUID):
-        rendered = str(raw)
-    else:
-        return None
-    if not rendered or rendered.strip() != rendered or "\x00" in rendered:
-        return None
-    return rendered
-
-
-def _transport_connector_session_id(ctx: Context) -> str:
-    """Resolve a stable protocol-level connector session identity.
-
-    Authority comes only from an explicit session id attribute or the Streamable
-    HTTP ``mcp-session-id`` header. Python object identity, weakrefs and
-    per-call context wrappers are intentionally not consulted.
-    """
-    explicit = _transport_context_text(ctx, "session_id")
-    if explicit is not None:
-        return explicit
-
-    request: Any = None
-    try:
-        request_context = getattr(ctx, "request_context", None)
-        if request_context is not None:
-            request = getattr(request_context, "request", None)
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        request = None
-    if request is not None:
-        headers = getattr(request, "headers", None)
-        if headers is not None:
-            try:
-                header_value = headers.get(
-                    grabowski_transport_roundtrip.MCP_SESSION_ID_HEADER
-                )
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                header_value = None
-            if (
-                isinstance(header_value, str)
-                and header_value
-                and header_value.strip() == header_value
-                and "\x00" not in header_value
-            ):
-                return header_value
-
-    raise RuntimeError("transport connector session identity is unavailable")
-
-
 def _transport_roundtrip_client_scope(
     ctx: Context | None,
 ) -> dict[str, str]:
-    if ctx is None:
-        raise RuntimeError("transport connector session identity is unavailable")
-    connector_session_id = _transport_connector_session_id(ctx)
-    client_id = _transport_context_text(ctx, "client_id")
-    return grabowski_transport_roundtrip.derive_connector_session_scope(
-        client_id=client_id,
-        connector_session_id=connector_session_id,
-        server_instance_id=_TRANSPORT_SERVER_INSTANCE_ID,
+    client_label: str | None = None
+    if ctx is not None:
+        try:
+            raw_label = ctx.client_id
+        except (AttributeError, RuntimeError, ValueError):
+            raw_label = None
+        if isinstance(raw_label, str) and raw_label.strip() == raw_label and raw_label:
+            client_label = raw_label
+    if client_label is None:
+        return grabowski_transport_roundtrip.validate_client_scope(
+            {
+                "kind": "shared_unlabeled",
+                "label": grabowski_transport_roundtrip.SHARED_UNLABELED_SCOPE,
+            }
+        )
+    return grabowski_transport_roundtrip.validate_client_scope(
+        {"kind": "client_declared_meta", "label": client_label}
     )
 
 
 def _transport_roundtrip_status(ctx: Context | None) -> dict[str, Any]:
-    try:
-        client_scope = _transport_roundtrip_client_scope(ctx)
-    except RuntimeError as exc:
-        return {
-            "schema_version": 1,
-            "state": "unavailable",
-            "mutation_gate_open": False,
-            "error": type(exc).__name__,
-            "recommended_next_action": (
-                "invoke through a live MCP connector session that presents a "
-                "stable protocol session identity before transport verification"
-            ),
-            "does_not_establish": [
-                "connector-session identity outside a live MCP invocation",
-                "that Python object identity or weakrefs authorize mutation",
-                "application-level success of any mutating tool",
-                "absence of response loss after a later mutation",
-            ],
-        }
+    client_scope = _transport_roundtrip_client_scope(ctx)
     try:
         runtime_binding = _transport_roundtrip_runtime_binding()
     except (RuntimeError, ValueError) as exc:
