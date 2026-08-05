@@ -1501,6 +1501,44 @@ def _lease_metadata(intent: dict[str, Any], *, group: str) -> dict[str, Any]:
     }
 
 
+def _intent_repository_scope_manifest(
+    intent: dict[str, Any], resource_key: str
+) -> dict[str, Any]:
+    repository = resource_key.removeprefix("repo:")
+    workspace = intent.get("workspace")
+    if not isinstance(workspace, dict):
+        raise BureauPickupError(
+            "repository-scope-required",
+            details={
+                "resource_key": resource_key,
+                "reason": "claim-intent-workspace-missing",
+            },
+        )
+    if workspace.get("repository") != repository:
+        raise BureauPickupError(
+            "claim-intent-workspace-repository-mismatch",
+            details={"resource_key": resource_key},
+        )
+    return {
+        "schema_version": 1,
+        "repository": repository,
+        "task_id": intent["task_id"],
+        "base_head": workspace.get("source_head_at_intent"),
+        "head": workspace.get("source_head_at_intent"),
+        "branch": workspace.get("workspace_branch"),
+        "worktree": workspace.get("workspace_path"),
+        "effects": ["write"],
+        "paths": [repository],
+        "components": [],
+        "runtime_resources": [],
+        "processes": [],
+        "deployments": [],
+        "migrations": [],
+        "generated_artifacts": [],
+        "shared_gates": [],
+    }
+
+
 def _acquisition_groups(
     intent: dict[str, Any], request: dict[str, Any]
 ) -> list[dict[str, Any]]:
@@ -1532,9 +1570,11 @@ def _acquisition_groups(
     for key in repo_keys:
         scope = request["repository_scope_manifests"].get(key)
         if scope is None:
-            raise BureauPickupError(
-                "repository-scope-required", details={"resource_key": key}
-            )
+            if not request["create_workspace"]:
+                raise BureauPickupError(
+                    "repository-scope-required", details={"resource_key": key}
+                )
+            scope = _intent_repository_scope_manifest(intent, key)
         metadata = _lease_metadata(intent, group=key)
         metadata["scope_manifest"] = scope
         metadata["scope_manifest_complete"] = True
