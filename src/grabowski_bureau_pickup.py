@@ -148,13 +148,26 @@ def _runtime_error_details(
 
 
 def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    """Return stable identity fields for one filesystem object.
+
+    Directory link count, size and timestamps are mutable namespace
+    metadata. They may
+    change between stat and fstat when an unrelated process updates a shared
+    ancestor such as /tmp, so they must not participate in path-to-fd binding.
+    """
     return (
         metadata.st_dev,
         metadata.st_ino,
         metadata.st_mode,
-        metadata.st_nlink,
         metadata.st_uid,
         metadata.st_gid,
+    )
+
+
+def _file_snapshot_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        *_directory_identity(metadata),
+        metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
@@ -495,7 +508,7 @@ def _read_private_bytes_at(
             raise BureauPickupError(f"{label}-mode-invalid")
         if before.st_nlink != 1:
             raise BureauPickupError(f"{label}-hardlink-invalid")
-        if _directory_identity(before) != _directory_identity(linked):
+        if _file_snapshot_identity(before) != _file_snapshot_identity(linked):
             raise BureauPickupError(f"{label}-binding-invalid")
         if before.st_size > MAX_REQUEST_BYTES:
             raise BureauPickupError(f"{label}-too-large")
@@ -512,8 +525,8 @@ def _read_private_bytes_at(
     finally:
         os.close(descriptor)
     if (
-        _directory_identity(before) != _directory_identity(after)
-        or _directory_identity(after) != _directory_identity(linked_after)
+        _file_snapshot_identity(before) != _file_snapshot_identity(after)
+        or _file_snapshot_identity(after) != _file_snapshot_identity(linked_after)
     ):
         raise BureauPickupError(f"{label}-changed-during-read")
     _assert_private_directory_binding(
@@ -2686,20 +2699,50 @@ def _verify_release_binding(
     return owner_id, keys
 
 
-def _terminal_release_lease_projection(value: Any) -> Any:
+def _terminal_release_lease_projection(value: Any, resource_keys: Any) -> Any:
     if not isinstance(value, dict):
         return value
+    status = value.get("status")
     error = value.get("error")
+    expected_keys = (
+        {key for key in resource_keys if isinstance(key, str)}
+        if isinstance(resource_keys, list)
+        else set()
+    )
+    if status == "terminal-released-or-expired" and isinstance(error, dict):
+        code = error.get("code")
+        details = error.get("details")
+        if code == "lease-expired" and isinstance(details, dict):
+            resource_key = details.get("resource_key")
+            expires_at = details.get("expires_at_unix")
+            if (
+                resource_key in expected_keys
+                and isinstance(expires_at, int)
+                and not isinstance(expires_at, bool)
+            ):
+                return {
+                    "status": status,
+                    "terminal_owner_lease_state": "unavailable",
+                }
+        if code == "lease-resources-missing" and isinstance(details, dict):
+            missing = details.get("missing")
+            if (
+                isinstance(missing, list)
+                and missing
+                and all(isinstance(key, str) for key in missing)
+                and len(missing) == len(set(missing))
+                and set(missing).issubset(expected_keys)
+            ):
+                return {
+                    "status": status,
+                    "terminal_owner_lease_state": "unavailable",
+                }
     if not isinstance(error, dict):
         stable_error = error
     else:
         details = error.get("details")
         stable_details = (
-            {
-                key: item
-                for key, item in details.items()
-                if key != "required_after_unix"
-            }
+            {key: item for key, item in details.items() if key != "required_after_unix"}
             if isinstance(details, dict)
             else details
         )
@@ -2708,18 +2751,20 @@ def _terminal_release_lease_projection(value: Any) -> Any:
             "message": error.get("message"),
             "details": stable_details,
         }
-    return {"status": value.get("status"), "error": stable_error}
+    return {"status": status, "error": stable_error}
 
 
 def _terminal_release_readback_projection(status: dict[str, Any]) -> dict[str, Any]:
+    release = status.get("release")
+    resource_keys = release.get("resource_keys") if isinstance(release, dict) else None
     return {
         "status": status.get("status"),
         "blocking": status.get("blocking"),
         "claim_intent_sha256": status.get("claim_intent_sha256"),
         "run": status.get("run"),
-        "release": status.get("release"),
+        "release": release,
         "stored_lease_binding": status.get("stored_lease_binding"),
-        "lease": _terminal_release_lease_projection(status.get("lease")),
+        "lease": _terminal_release_lease_projection(status.get("lease"), resource_keys),
     }
 
 
