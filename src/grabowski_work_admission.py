@@ -482,6 +482,139 @@ def _foreign_coordination(item: dict[str, Any], owner_id: str) -> list[dict[str,
     return blockers
 
 
+ISOLATED_WORKTREE_OPERATIONS = frozenset(
+    {
+        "agent_workspace_create",
+        "broad_repository_lease",
+        "worktree_create",
+    }
+)
+
+
+def _resolved_optional_path(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            return None
+        return str(path.resolve(strict=False))
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _paths_overlap(left: str, right: str) -> bool:
+    left_path = Path(left)
+    right_path = Path(right)
+    return (
+        left_path == right_path
+        or left_path in right_path.parents
+        or right_path in left_path.parents
+    )
+
+
+def _isolated_worktree_scope(
+    *,
+    repository: str,
+    operation: str,
+    requested_scope: dict[str, Any] | None,
+    target_path: str | None,
+    branch: str | None,
+) -> dict[str, str] | None:
+    if operation not in ISOLATED_WORKTREE_OPERATIONS or not isinstance(
+        requested_scope, dict
+    ):
+        return None
+
+    scope_branch = requested_scope.get("branch")
+    if not isinstance(scope_branch, str) or not scope_branch:
+        return None
+    if branch is not None and scope_branch != branch:
+        return None
+
+    scope_target = requested_scope.get("worktree")
+    if scope_target is None:
+        scope_target = requested_scope.get("target_path")
+    requested_target = target_path if target_path is not None else scope_target
+    resolved_target = _resolved_optional_path(requested_target)
+    if resolved_target is None:
+        return None
+    if scope_target is not None and _resolved_optional_path(scope_target) != resolved_target:
+        return None
+
+    if operation == "broad_repository_lease":
+        if requested_scope.get("isolation") != "worktree":
+            return None
+        if requested_scope.get("repository") != repository:
+            return None
+        allowed_paths = requested_scope.get("allowed_paths")
+        if not isinstance(allowed_paths, list) or not allowed_paths:
+            return None
+        for item in allowed_paths:
+            if not isinstance(item, str) or not item:
+                return None
+            relative = Path(item)
+            if (
+                relative == Path(".")
+                or relative.is_absolute()
+                or ".." in relative.parts
+            ):
+                return None
+
+    if _paths_overlap(repository, resolved_target):
+        return None
+    return {"target_path": resolved_target, "branch": scope_branch}
+
+
+def _binding_isolation_relation(
+    row: dict[str, Any],
+    *,
+    isolated_scope: dict[str, str],
+    source_kind: str | None,
+    source_id: str | None,
+) -> bool | None:
+    observed_checkout_path = False
+    overlaps = False
+    for key in ("binding_identity", "worktree_identity"):
+        identity = row.get(key)
+        if identity is None:
+            continue
+        if not isinstance(identity, dict):
+            return None
+        raw_checkout_path = identity.get("checkout_path")
+        checkout_path = _resolved_optional_path(raw_checkout_path)
+        if raw_checkout_path is not None and checkout_path is None:
+            return None
+        if checkout_path is not None:
+            observed_checkout_path = True
+            if _paths_overlap(checkout_path, isolated_scope["target_path"]):
+                overlaps = True
+        expected_branch = identity.get("expected_branch")
+        if expected_branch is not None:
+            if not isinstance(expected_branch, str) or not expected_branch:
+                return None
+            if expected_branch == isolated_scope["branch"]:
+                overlaps = True
+
+    evidence = row.get("evidence")
+    if evidence is not None:
+        if not isinstance(evidence, dict):
+            return None
+        source = evidence.get("source")
+        if source is not None:
+            if not isinstance(source, dict):
+                return None
+            if (
+                source_id
+                and source.get("id") == source_id
+                and (source_kind is None or source.get("kind") == source_kind)
+            ):
+                overlaps = True
+    if overlaps:
+        return True
+    return False if observed_checkout_path else None
+
+
 def assess_repository_admission(
     *,
     repo: str,
@@ -500,6 +633,20 @@ def assess_repository_admission(
         raise ValueError("owner_id must be a non-empty string")
     if not isinstance(operation, str) or not operation:
         raise ValueError("operation must be a non-empty string")
+
+    isolated_scope = _isolated_worktree_scope(
+        repository=repository,
+        operation=operation,
+        requested_scope=requested_scope,
+        target_path=target_path,
+        branch=branch,
+    )
+    effective_target_path = (
+        isolated_scope["target_path"] if isolated_scope is not None else target_path
+    )
+    effective_branch = isolated_scope["branch"] if isolated_scope is not None else branch
+    ignored_unrelated_worktrees = 0
+    ignored_unrelated_bindings = 0
 
     inventory_error: str | None = None
     reconciliation_error: str | None = None
@@ -584,6 +731,43 @@ def assess_repository_admission(
             blockers.append({"code": "inventory-unobservable", "detail": "malformed worktree row"})
             continue
         path = str(item.get("path") or "")
+        if isolated_scope is not None and not path:
+            blockers.append(
+                {
+                    "code": "inventory-unobservable",
+                    "detail": "worktree path is unavailable for isolation comparison",
+                }
+            )
+            continue
+
+        existing_source_kind, existing_source_id = _source_binding(item)
+        isolated_overlap = isolated_scope is None
+        if isolated_scope is not None:
+            resolved_path = _resolved_optional_path(path)
+            if resolved_path is None:
+                blockers.append(
+                    {
+                        "code": "inventory-unobservable",
+                        "detail": "worktree path is not an absolute observable path",
+                        "path": path,
+                    }
+                )
+                continue
+            isolated_overlap = _paths_overlap(
+                resolved_path, isolated_scope["target_path"]
+            )
+            isolated_overlap = isolated_overlap or (
+                item.get("branch") == isolated_scope["branch"]
+            )
+            isolated_overlap = isolated_overlap or (
+                bool(source_id)
+                and existing_source_id == source_id
+                and (source_kind is None or existing_source_kind == source_kind)
+            )
+            if not isolated_overlap:
+                ignored_unrelated_worktrees += 1
+                continue
+
         status = item.get("status") if isinstance(item.get("status"), dict) else {}
         dirty = status.get("dirty")
         if dirty is True:
@@ -612,13 +796,13 @@ def assess_repository_admission(
             source_kind == "expired_same_owner_lease"
             and isinstance(source_id, str)
             and len(source_id) == 64
-            and target_path is not None
-            and path == target_path
+            and effective_target_path is not None
+            and path == effective_target_path
             and isinstance(requested_scope, dict)
             and requested_scope.get("repository") == repository
             and requested_scope.get("worktree") == path
-            and requested_scope.get("branch") == branch
-            and item.get("branch") == branch
+            and requested_scope.get("branch") == effective_branch
+            and item.get("branch") == effective_branch
             and requested_scope.get("head") == item.get("head")
         )
         inert_checkout = _inert_checkout_for_admission(item, state=state)
@@ -665,12 +849,11 @@ def assess_repository_admission(
                     }
                 )
 
-        existing_source_kind, existing_source_id = _source_binding(item)
         if (
             source_id
             and existing_source_id == source_id
             and (source_kind is None or existing_source_kind == source_kind)
-            and (target_path is None or path != target_path)
+            and (effective_target_path is None or path != effective_target_path)
             and state not in TERMINAL_NONBLOCKING_STATES
         ):
             blockers.append(
@@ -681,12 +864,16 @@ def assess_repository_admission(
                     "source_id": existing_source_id,
                 }
             )
-        if branch and item.get("branch") == branch and (target_path is None or path != target_path):
+        if (
+            effective_branch
+            and item.get("branch") == effective_branch
+            and (effective_target_path is None or path != effective_target_path)
+        ):
             blockers.append(
                 {
                     "code": "branch-already-bound",
                     "path": path,
-                    "branch": branch,
+                    "branch": effective_branch,
                 }
             )
 
@@ -696,15 +883,35 @@ def assess_repository_admission(
                 {"code": "reconciliation-unobservable", "detail": "malformed reconciliation row"}
             )
             continue
-        if row.get("blocking"):
-            blockers.append(
-                {
-                    "code": "binding-reconciliation-blocking",
-                    "checkout_key": row.get("checkout_key"),
-                    "state": row.get("state"),
-                    "reasons": list(row.get("reasons") or [])[:16],
-                }
+        if not row.get("blocking"):
+            continue
+        if isolated_scope is not None:
+            relation = _binding_isolation_relation(
+                row,
+                isolated_scope=isolated_scope,
+                source_kind=source_kind,
+                source_id=source_id,
             )
+            if relation is False:
+                ignored_unrelated_bindings += 1
+                continue
+            if relation is None:
+                blockers.append(
+                    {
+                        "code": "reconciliation-unobservable",
+                        "detail": "blocking reconciliation row lacks bounded checkout identity",
+                        "checkout_key": row.get("checkout_key"),
+                    }
+                )
+                continue
+        blockers.append(
+            {
+                "code": "binding-reconciliation-blocking",
+                "checkout_key": row.get("checkout_key"),
+                "state": row.get("state"),
+                "reasons": list(row.get("reasons") or [])[:16],
+            }
+        )
 
     blocker_codes = sorted({str(item["code"]) for item in blockers})
     hard_blocked = any(code in HARD_BLOCK_CODES or code.startswith("foreign-") for code in blocker_codes)
@@ -718,6 +925,9 @@ def assess_repository_admission(
         "requested_scope": requested_scope,
         "target_path": target_path,
         "branch": branch,
+        "isolated_scope": isolated_scope,
+        "ignored_unrelated_worktrees": ignored_unrelated_worktrees,
+        "ignored_unrelated_bindings": ignored_unrelated_bindings,
         "source": {"kind": source_kind, "id": source_id},
         "decision": decision,
         "blocker_codes": blocker_codes,
@@ -737,6 +947,7 @@ def assess_repository_admission(
             "cleanup authority",
             "permission to override foreign ownership",
             "global one-lane serialization for exact disjoint resource keys",
+            "absence of later semantic or merge conflicts between isolated branches",
         ],
     }
     return {**material, "assessment_sha256": _digest(material)}
