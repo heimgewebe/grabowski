@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 import unittest
 from unittest.mock import Mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 import grabowski_work_acquire as work_acquire
 
@@ -81,6 +87,9 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertIn(f"path:{self.target}", seen["keys"])
         self.assertIn(f"repo:{self.repo}:branch:feat/authority-p0", seen["keys"])
         self.assertNotIn(f"repo:{self.repo}", seen["keys"])
+        ensure.assert_called_once()
+        ensure_parameters = ensure.call_args.args[0]
+        self.assertIs(ensure_parameters["reposkop_required"], True)
 
     def test_identical_retry_reuses_lane_identity(self) -> None:
         ensure = Mock(return_value={
