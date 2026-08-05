@@ -18,7 +18,13 @@ BINDING = {
     "registered_names_sha256": "b" * 64,
     "agent_instructions_sha256": "c" * 64,
 }
-META_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-1"}
+META_SCOPE = {"kind": "connector_session", "label": "mcp-client-1-session-1"}
+OTHER_SCOPE = {"kind": "connector_session", "label": "mcp-client-2-session-2"}
+# Session pool used for concurrent exact intents inside one connector session.
+SESSION_POOL_SCOPE = {
+    "kind": "connector_session",
+    "label": "mcp-client-pool-session",
+}
 # The gate only ever admits an exactly intent-bound verification, so the shared
 # helpers hand out a real intent. Tests that need an unbound handshake pass
 # mutation_intent=None explicitly and assert that it authorizes nothing.
@@ -26,11 +32,11 @@ DEFAULT_INTENT = {
     "tool_name": "grabowski_file_write",
     "arguments_sha256": "e" * 64,
 }
-OTHER_SCOPE = {"kind": "client_declared_meta", "label": "mcp-client-2"}
-SHARED_SCOPE = {
-    "kind": "shared_unlabeled",
-    "label": roundtrip.SHARED_UNLABELED_SCOPE,
-}
+DEFAULT_TOOL_NAME = DEFAULT_INTENT["tool_name"]
+DEFAULT_ARGUMENTS_SHA256 = DEFAULT_INTENT["arguments_sha256"]
+# Alias kept for older helper names in this suite.
+SHARED_SCOPE = SESSION_POOL_SCOPE
+
 
 
 def _consume_worker(
@@ -164,7 +170,7 @@ class TransportRoundtripTests(_TransportHarness):
         self.assertEqual(ack["state"], "verified")
         self.assertTrue(ack["mutation_gate_open"])
         self.assertTrue(ack["single_use"])
-        self.assertEqual(ack["client_scope_kind"], "client_declared_meta")
+        self.assertEqual(ack["client_scope_kind"], "connector_session")
         # There is no generic "is the gate open" API any more: admission is
         # only ever proven by naming the exact target.
         self.assertFalse(hasattr(roundtrip, "require_verified"))
@@ -272,7 +278,7 @@ class TransportRoundtripTests(_TransportHarness):
         )
         self.assertEqual(results[0][1], "TransportRoundtripRequired")
 
-    def test_shared_unlabeled_handshakes_coexist_without_overwrite(self) -> None:
+    def test_connector_session_handshakes_coexist_without_overwrite(self) -> None:
         first = self.begin(
             scope=SHARED_SCOPE,
             mutation_intent={"tool_name": "first-write", "arguments_sha256": "d" * 64},
@@ -484,9 +490,9 @@ class TransportRoundtripTests(_TransportHarness):
             first_ack["verification_receipt_sha256"],
         )
 
-    def test_single_scope_replaces_pending_challenge_for_different_intent(self) -> None:
+    def test_session_pool_preserves_pending_challenge_for_different_intent(self) -> None:
         first = self.begin()
-        replacement = roundtrip.begin(
+        second = roundtrip.begin(
             client_scope=META_SCOPE,
             runtime_binding=BINDING,
             mutation_intent={
@@ -495,17 +501,18 @@ class TransportRoundtripTests(_TransportHarness):
             },
             now_unix=101,
         )
-        self.assertFalse(replacement["replayed"])
-        self.assertEqual(replacement["state"], "challenge_pending")
-        self.assertNotEqual(replacement["challenge_receipt_sha256"], first["challenge_receipt_sha256"])
-        self.assertEqual(replacement["pending_challenge_count"], 1)
-        self.assertEqual(replacement["target_tool_name"], "write")
-        with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
-            self.acknowledge(first["challenge_receipt_sha256"], now=102)
+        self.assertFalse(second["replayed"])
+        self.assertEqual(second["state"], "challenge_pending")
+        self.assertNotEqual(second["challenge_receipt_sha256"], first["challenge_receipt_sha256"])
+        self.assertEqual(second["pending_challenge_count"], 2)
+        self.assertEqual(second["target_tool_name"], "write")
+        first_ack = self.acknowledge(first["challenge_receipt_sha256"], now=102)
+        self.assertEqual(first_ack["state"], "verified")
+        self.assertEqual(first_ack["pending_challenge_count"], 1)
 
-    def test_single_scope_replaces_verified_receipt_for_different_intent(self) -> None:
+    def test_session_pool_preserves_verified_receipt_for_different_intent(self) -> None:
         verified = self.verify()
-        replacement = roundtrip.begin(
+        second = roundtrip.begin(
             client_scope=META_SCOPE,
             runtime_binding=BINDING,
             mutation_intent={
@@ -514,19 +521,25 @@ class TransportRoundtripTests(_TransportHarness):
             },
             now_unix=102,
         )
-        self.assertFalse(replacement["replayed"])
-        self.assertEqual(replacement["state"], "challenge_pending")
-        self.assertEqual(replacement["verified_receipt_count"], 0)
-        self.assertEqual(replacement["target_arguments_sha256"], "d" * 64)
-        with self.assertRaises(roundtrip.TransportRoundtripRequired):
-            roundtrip.consume_verified(
-                client_scope=META_SCOPE,
-                runtime_binding=BINDING,
-                tool_name="other-write",
-                arguments_sha256="e" * 64,
-                now_unix=103,
-            )
-        self.assertNotEqual(replacement["challenge_receipt_sha256"], verified["verification_receipt_sha256"])
+        self.assertFalse(second["replayed"])
+        self.assertEqual(second["state"], "challenge_pending")
+        self.assertEqual(second["verified_receipt_count"], 1)
+        self.assertEqual(second["target_arguments_sha256"], "d" * 64)
+        still_open = roundtrip.consume_verified(
+            client_scope=META_SCOPE,
+            runtime_binding=BINDING,
+            tool_name=DEFAULT_TOOL_NAME,
+            arguments_sha256=DEFAULT_ARGUMENTS_SHA256,
+            now_unix=103,
+        )
+        self.assertEqual(
+            still_open["verification_receipt_sha256"],
+            verified["verification_receipt_sha256"],
+        )
+        self.assertNotEqual(
+            second["challenge_receipt_sha256"],
+            verified["verification_receipt_sha256"],
+        )
 
     def test_shared_pending_pool_is_bounded_and_prunes_stale_entries(self) -> None:
         with mock.patch.object(roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2):
@@ -580,25 +593,47 @@ class TransportRoundtripTests(_TransportHarness):
         self.assertEqual(status["pending_challenge_count"], 1)
         self.assertEqual(status["verified_receipt_count"], 1)
 
-    def test_legacy_single_slot_state_migrates_on_next_mutation(self) -> None:
+    def test_legacy_schema_state_authorizes_no_mutation(self) -> None:
         begin = self.begin()
         path = roundtrip._state_path(roundtrip.client_scope_sha256(META_SCOPE))
         current = json.loads(path.read_text(encoding="utf-8"))
-        legacy = {
-            "schema_version": roundtrip.SCHEMA_VERSION,
-            "kind": roundtrip.STATE_KIND,
-            "client_scope_sha256": current["client_scope_sha256"],
-            "client_scope_kind": current["client_scope_kind"],
-            "pending_challenge": current["pending_challenges"][0],
-            "verified_receipt": None,
-            "last_consumption_receipt": None,
-        }
-        roundtrip._write_private_json(path, legacy)
-        acknowledged = self.acknowledge(begin["challenge_receipt_sha256"])
-        migrated = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["schema_version"], roundtrip.STATE_SCHEMA_VERSION)
-        self.assertEqual(len(migrated["verified_receipts"]), 1)
-        self.assertEqual(acknowledged["state"], "verified")
+        for schema_version in (1, 2, 3):
+            legacy = {
+                "schema_version": schema_version,
+                "kind": roundtrip.STATE_KIND,
+                "client_scope_sha256": current["client_scope_sha256"],
+                "client_scope_kind": current["client_scope_kind"],
+                "pending_challenges": current["pending_challenges"],
+                "verified_receipts": [],
+                "last_consumption_receipt": None,
+            }
+            if schema_version == 1:
+                legacy = {
+                    "schema_version": 1,
+                    "kind": roundtrip.STATE_KIND,
+                    "client_scope_sha256": current["client_scope_sha256"],
+                    "client_scope_kind": current["client_scope_kind"],
+                    "pending_challenge": current["pending_challenges"][0],
+                    "verified_receipt": None,
+                    "last_consumption_receipt": None,
+                }
+            roundtrip._write_private_json(path, legacy)
+            with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
+                self.acknowledge(begin["challenge_receipt_sha256"], now=101)
+            with self.assertRaises(roundtrip.TransportRoundtripRequired):
+                roundtrip.consume_verified(
+                    client_scope=META_SCOPE,
+                    runtime_binding=BINDING,
+                    tool_name=DEFAULT_TOOL_NAME,
+                    arguments_sha256=DEFAULT_ARGUMENTS_SHA256,
+                    now_unix=102,
+                )
+            replacement = self.begin(now=103)
+            self.assertFalse(replacement["replayed"])
+            self.assertEqual(replacement["state"], "challenge_pending")
+            migrated = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["schema_version"], roundtrip.STATE_SCHEMA_VERSION)
+            self.assertEqual(len(migrated["pending_challenges"]), 1)
 
     def test_different_client_scope_cannot_ack_or_consume(self) -> None:
         begin = self.begin()
@@ -611,18 +646,116 @@ class TransportRoundtripTests(_TransportHarness):
             roundtrip.consume_verified(
                 client_scope=OTHER_SCOPE,
                 runtime_binding=BINDING,
-                tool_name="write",
-                arguments_sha256="d" * 64,
+                tool_name=DEFAULT_TOOL_NAME,
+                arguments_sha256=DEFAULT_ARGUMENTS_SHA256,
                 now_unix=102,
             )
 
-    def test_shared_unlabeled_scope_is_explicit_and_functional(self) -> None:
+    def test_connector_session_scope_is_explicit_and_functional(self) -> None:
         begin = self.begin(scope=SHARED_SCOPE)
         ack = self.acknowledge(
             begin["challenge_receipt_sha256"], scope=SHARED_SCOPE
         )
-        self.assertEqual(ack["client_scope_kind"], "shared_unlabeled")
+        self.assertEqual(ack["client_scope_kind"], "connector_session")
+        self.assertEqual(ack["pool_mode"], "connector-session-token-pool")
         self.assertIn("authenticated client identity", ack["does_not_establish"])
+        self.assertIn(
+            "that Python object identity or weakrefs authorize transport mutation",
+            ack["does_not_establish"],
+        )
+        self.assertIn(
+            "that a global shared_unlabeled pool can authorize mutation",
+            ack["does_not_establish"],
+        )
+
+    def test_legacy_shared_and_object_scopes_are_rejected(self) -> None:
+        for kind, label in (
+            ("shared_unlabeled", roundtrip.SHARED_UNLABELED_SCOPE),
+            ("client_declared_meta", "mcp-client-1"),
+            ("caller_session", "legacy-object-bound"),
+        ):
+            with self.assertRaisesRegex(
+                roundtrip.TransportRoundtripError, "legacy transport client scope"
+            ):
+                roundtrip.validate_client_scope({"kind": kind, "label": label})
+
+    def test_server_restart_scope_cannot_consume_previous_session_authority(self) -> None:
+        previous_scope = roundtrip.derive_connector_session_scope(
+            client_id=None,
+            connector_session_id="session-token",
+            server_instance_id="server-before-restart",
+        )
+        restarted_scope = roundtrip.derive_connector_session_scope(
+            client_id=None,
+            connector_session_id="session-token",
+            server_instance_id="server-after-restart",
+        )
+        started = roundtrip.begin(
+            client_scope=previous_scope,
+            runtime_binding=BINDING,
+            mutation_intent=DEFAULT_INTENT,
+            now_unix=100,
+        )
+        roundtrip.acknowledge(
+            client_scope=previous_scope,
+            challenge_receipt_sha256=started["challenge_receipt_sha256"],
+            runtime_binding=BINDING,
+            now_unix=101,
+        )
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=restarted_scope,
+                runtime_binding=BINDING,
+                tool_name=DEFAULT_TOOL_NAME,
+                arguments_sha256=DEFAULT_ARGUMENTS_SHA256,
+                now_unix=102,
+            )
+
+    def test_regression_shared_scope_baseline_vs_connector_session_isolation(
+        self,
+    ) -> None:
+        owner_scope = roundtrip.derive_connector_session_scope(
+            client_id=None,
+            connector_session_id="owner-session",
+            server_instance_id="candidate-server",
+        )
+        foreign_scope = roundtrip.derive_connector_session_scope(
+            client_id=None,
+            connector_session_id="foreign-session",
+            server_instance_id="candidate-server",
+        )
+        candidate = roundtrip.begin(
+            client_scope=owner_scope,
+            runtime_binding=BINDING,
+            mutation_intent=DEFAULT_INTENT,
+            now_unix=200,
+        )
+        roundtrip.acknowledge(
+            client_scope=owner_scope,
+            challenge_receipt_sha256=candidate["challenge_receipt_sha256"],
+            runtime_binding=BINDING,
+            now_unix=201,
+        )
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=foreign_scope,
+                runtime_binding=BINDING,
+                tool_name=DEFAULT_TOOL_NAME,
+                arguments_sha256=DEFAULT_ARGUMENTS_SHA256,
+                now_unix=202,
+            )
+        owner_admission = roundtrip.consume_verified(
+            client_scope=owner_scope,
+            runtime_binding=BINDING,
+            tool_name=DEFAULT_TOOL_NAME,
+            arguments_sha256=DEFAULT_ARGUMENTS_SHA256,
+            now_unix=202,
+        )
+        self.assertEqual(owner_admission["state"], "consumed")
+        self.assertNotEqual(
+            owner_scope["label"],
+            foreign_scope["label"],
+        )
 
     def test_expired_challenge_fails_closed(self) -> None:
         begin = self.begin()
