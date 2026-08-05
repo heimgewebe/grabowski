@@ -3165,6 +3165,64 @@ class ResourceTests(unittest.TestCase):
         stored = resources.inspect_resource(f"repo:{self.root}")
         self.assertIsNotNone(stored)
 
+    def test_broad_repository_full_scope_reaches_exact_checkout_admission(self) -> None:
+        (self.root / ".git").mkdir()
+        scoped_path = self.root / "src" / "example.py"
+        scope = self.scope_manifest(
+            self.root, name="full-scope-admission", path=scoped_path
+        )
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            call = dict(kwargs)
+            calls.append(call)
+            call.pop("mode")
+            return work_admission.assess_repository_admission(
+                **call,
+                inventory_loader=lambda _repo: {
+                    "worktrees": [
+                        {
+                            "path": str(self.root),
+                            "is_main": True,
+                            "status": {"dirty": True},
+                            "coordination": {
+                                "blocking": False,
+                                "resource_leases": [],
+                                "tasks": [],
+                                "processes": [],
+                            },
+                        }
+                    ],
+                    "inventory_sha256": "a" * 64,
+                },
+                reconciliation_loader=lambda _repo: {
+                    "bindings": [],
+                    "pagination": {"has_more": False},
+                    "source_snapshot": {"repository_errors": []},
+                    "snapshot_sha256": "b" * 64,
+                },
+            )
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="full scope admission integration",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=assessor,
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["requested_scope"],
+            resources.nonconflict.normalize_scope_manifest(scope),
+        )
+        self.assertEqual(result["work_admission"][0]["decision"], "allow")
+        self.assertIsNotNone(resources.inspect_resource(f"repo:{self.root}"))
+
     def test_broad_repository_same_owner_reentry_preserves_admission_generation(self) -> None:
         (self.root / ".git").mkdir()
         key = f"repo:{self.root}"

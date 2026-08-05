@@ -8,6 +8,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
+import grabowski_nonconflict as nonconflict
+
 SCHEMA_VERSION = 1
 MAX_WORKTREES = 256
 MAX_RECONCILIATIONS = 100
@@ -471,17 +473,37 @@ def _exact_checkout_scope(
     ):
         return None
 
+    scope_contract = requested_scope
     if operation == "broad_repository_lease":
-        scope_target = requested_scope.get("worktree")
-        scope_branch = requested_scope.get("branch")
+        try:
+            scope_contract = nonconflict.normalize_scope_manifest(requested_scope)
+        except ValueError:
+            return None
+        effects = set(scope_contract["effects"])
+        nonlocal_axes = (
+            "components",
+            "runtime_resources",
+            "processes",
+            "deployments",
+            "migrations",
+            "shared_gates",
+        )
         if (
-            requested_scope.get("repository") != repository
-            or requested_scope.get("isolation") != "worktree"
-            or not _safe_relative_paths(
-                requested_scope.get("allowed_paths"), require_nonempty=True
+            scope_contract["repository"] != repository
+            or not effects
+            or not effects <= {"read", "write", "generate"}
+            or any(scope_contract[axis] for axis in nonlocal_axes)
+            or (
+                bool(effects - {"read"})
+                and not (
+                    scope_contract["paths"]
+                    or scope_contract["generated_artifacts"]
+                )
             )
         ):
             return None
+        scope_target = scope_contract["worktree"]
+        scope_branch = scope_contract["branch"]
     else:
         scope_target = target_path
         scope_branch = branch
@@ -489,7 +511,7 @@ def _exact_checkout_scope(
     if (
         not isinstance(scope_branch, str)
         or not scope_branch
-        or requested_scope.get("branch") != scope_branch
+        or scope_contract.get("branch") != scope_branch
         or (branch is not None and branch != scope_branch)
     ):
         return None
@@ -502,7 +524,7 @@ def _exact_checkout_scope(
         return None
 
     if operation == "worktree_create":
-        paths = requested_scope.get("paths")
+        paths = scope_contract.get("paths")
         if not (
             isinstance(paths, list)
             and len(paths) == 1
@@ -512,10 +534,10 @@ def _exact_checkout_scope(
     elif operation == "agent_workspace_create":
         if not (
             _safe_relative_paths(
-                requested_scope.get("allowed_paths"), require_nonempty=True
+                scope_contract.get("allowed_paths"), require_nonempty=True
             )
             and _safe_relative_paths(
-                requested_scope.get("forbidden_paths"), require_nonempty=False
+                scope_contract.get("forbidden_paths"), require_nonempty=False
             )
         ):
             return None
