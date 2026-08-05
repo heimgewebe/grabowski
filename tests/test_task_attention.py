@@ -2196,6 +2196,48 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(4, result["total_attention"])
         self.assertEqual("raw_task_state_projection_before_decisions", result["total_attention_scope"])
 
+    def test_current_reconciliation_auto_hides_non_actionable_failure_classes(self) -> None:
+        started = self._start()
+        expected_red = tasks._set_state(
+            str(started["task"]["task_id"]),
+            "failed",
+            observation={
+                "state": "failed",
+                "failure_classification": "expected_red_phase",
+            },
+        )
+        env_started = self._start()
+        env_failure = tasks._set_state(
+            str(env_started["task"]["task_id"]),
+            "failed",
+            observation={
+                "state": "failed",
+                "failure_classification": "environment_toolchain_failure",
+            },
+        )
+        actionable = self._failed_task()
+
+        with patch.object(tasks, "_observe", side_effect=AssertionError("probe called")), patch.object(
+            tasks, "_dispatch", side_effect=AssertionError("dispatch called")
+        ):
+            result = attention.reconcile_attention({"limit": 20, "view": "current"})
+            history = attention.reconcile_attention({"limit": 20, "view": "history"})
+
+        current_ids = {item["task_id"] for item in result["records"]}
+        self.assertNotIn(expected_red["task_id"], current_ids)
+        self.assertNotIn(env_failure["task_id"], current_ids)
+        self.assertIn(actionable["task_id"], current_ids)
+        self.assertGreaterEqual(
+            result["filtered_classification_counts"]["expected_red"], 1
+        )
+        self.assertGreaterEqual(
+            result["filtered_classification_counts"]["historical_environment_failure"],
+            1,
+        )
+        history_ids = {item["task_id"] for item in history["records"]}
+        self.assertIn(expected_red["task_id"], history_ids)
+        self.assertIn(env_failure["task_id"], history_ids)
+
     def test_current_user_surfaces_apply_verified_retry_convergence_without_decision_store(self) -> None:
         source, successor = self._verified_retry_pair()
         self.assertFalse(self.decisions.exists())
@@ -2344,8 +2386,10 @@ class TaskAttentionTests(unittest.TestCase):
         self.assertEqual(1, projection["current_attention_count"])
         self.assertEqual(2, projection["excluded_attention_count"])
         self.assertEqual(
-            {"decision_closed": 1, "decision_superseded": 1},
-            projection["excluded_classification_counts"],
+            1, projection["excluded_classification_counts"]["decision_closed"]
+        )
+        self.assertEqual(
+            1, projection["excluded_classification_counts"]["decision_superseded"]
         )
         self.assertEqual(
             1, projection["decision_classification_counts"]["decision_deferred"]

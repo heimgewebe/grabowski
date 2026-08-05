@@ -30,10 +30,38 @@ SCHEMA_VERSION = 1
 DECISION_KIND = "grabowski_task_attention_decision"
 DECISIONS = frozenset({"closed", "deferred", "superseded"})
 ATTENTION_VIEWS = frozenset({"current", "history"})
+# Auto-hidden from the operator current/actionable attention surface.
+# History view preserves the full technical projection.
 CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS = frozenset(
-    {"decision_closed", "decision_superseded"}
+    {
+        "decision_closed",  # already_decided
+        "decision_superseded",  # superseded / already_decided
+        "superseded",
+        "retry_succeeded",
+        "superseded_by_verified_retry",
+        "expected_red",
+        "expected_red_phase",
+        "historical_environment_failure",
+        "already_decided",
+        "already_satisfied",
+    }
 )
-ARCHIVE_RESOLVED_CLASSIFICATIONS = CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
+ARCHIVE_RESOLVED_CLASSIFICATIONS = frozenset(
+    {"decision_closed", "decision_superseded", "already_decided"}
+)
+NON_ACTIONABLE_FAILURE_CLASSIFICATIONS = frozenset(
+    {
+        "expected_red",
+        "expected_red_phase",
+        "historical_environment_failure",
+        "environment_toolchain_failure",
+        "environment_tooling",
+        "superseded",
+        "retry_succeeded",
+        "already_satisfied",
+        "already_decided",
+    }
+)
 TERMINAL_ATTENTION_STATES = frozenset({"failed", "timed_out", "signalled"})
 RECOVERY_ATTENTION_STATES = frozenset({"interrupted", "outcome_unknown"})
 ATTENTION_STATES = tuple(tasks.TASK_STATE_PROJECTIONS["attention"])
@@ -862,6 +890,47 @@ def record_decision(parameters: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _non_actionable_failure_class(record: dict[str, Any], outcome: dict[str, Any] | None) -> str | None:
+    """Map explicit failure signals to auto-hidden attention classifications."""
+    candidates: list[Any] = [
+        record.get("failure_classification"),
+        record.get("failure_class"),
+        record.get("attention_classification"),
+    ]
+    if isinstance(outcome, dict):
+        observation = outcome.get("observation")
+        candidates.extend(
+            [
+                outcome.get("failure_classification"),
+                outcome.get("failure_class"),
+            ]
+        )
+        if isinstance(observation, dict):
+            candidates.extend(
+                [
+                    observation.get("failure_classification"),
+                    observation.get("failure_class"),
+                    observation.get("typed_failure_classification"),
+                ]
+            )
+    for value in candidates:
+        if not isinstance(value, str) or not value:
+            continue
+        if value in {"expected_red", "expected_red_phase"}:
+            return "expected_red"
+        if value in {
+            "historical_environment_failure",
+            "environment_toolchain_failure",
+            "environment_tooling",
+        }:
+            return "historical_environment_failure"
+        if value in {"superseded", "retry_succeeded", "already_satisfied", "already_decided"}:
+            return value
+        if value in NON_ACTIONABLE_FAILURE_CLASSIFICATIONS:
+            return value
+    return None
+
+
 def _classify_record(
     record: dict[str, Any],
     *,
@@ -903,8 +972,9 @@ def _classify_record(
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = "decision_without_eligible_outcome"
         return base
+    outcome: dict[str, Any] | None = None
     try:
-        _outcome, outcome_receipt_sha256, outcome_file_sha256 = _read_valid_outcome(
+        outcome, outcome_receipt_sha256, outcome_file_sha256 = _read_valid_outcome(
             record,
             expected_receipt_sha256=None,
         )
@@ -913,6 +983,9 @@ def _classify_record(
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = type(exc).__name__
         return base
+    non_actionable = _non_actionable_failure_class(record, outcome)
+    if non_actionable is not None:
+        base["classification"] = non_actionable
     if not include_decisions:
         return base
     target = _decision_path(binding)
@@ -939,6 +1012,7 @@ def _classify_record(
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = type(exc).__name__
         return base
+    # Explicit closeout decisions dominate non-actionable failure classes.
     base["classification"] = f"decision_{decision['decision']}"
     base["decision"] = decision["decision"]
     base["authority"] = decision["authority"]
@@ -3042,6 +3116,18 @@ def current_attention_projection(
     decision_excluded_task_ids: set[str] = set()
     decision_classification_counts: dict[str, int] = {}
     decision_candidate_count = 0
+    # Auto-hide non-actionable failure classes even without a decision receipt.
+    for task_id, record in current_by_task.items():
+        if task_id in excluded_task_ids:
+            continue
+        classified = _classify_record(record, include_decisions=False)
+        classification = str(classified["classification"])
+        if classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
+            decision_classification_counts[classification] = (
+                decision_classification_counts.get(classification, 0) + 1
+            )
+            decision_excluded_task_ids.add(task_id)
+            excluded_task_ids.add(task_id)
     if include_decisions:
         root = _state_root()
         try:
@@ -3192,9 +3278,8 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
 
     scanned_raw = 0
     filtered_counts = {
-        "decision_closed": 0,
-        "decision_superseded": 0,
-        "superseded_by_verified_retry": 0,
+        classification: 0
+        for classification in sorted(CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS)
     }
     convergence_status = "not_applicable"
     convergence_error: str | None = None
@@ -3332,6 +3417,7 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                     task_id_value = str(raw["task_id"])
                     if task_id_value in convergence_excluded_task_ids:
                         filtered_counts["superseded_by_verified_retry"] += 1
+                        filtered_counts["retry_succeeded"] += 1
                     else:
                         classified = _classify_record(
                             raw,
@@ -3354,12 +3440,21 @@ def reconcile_attention(parameters: dict[str, Any] | None = None) -> dict[str, A
                                     evidence_error = "decision_without_eligible_outcome"
                             classified["evidence_error"] = evidence_error
                         classification = classified["classification"]
-                        if task_id_value in decision_excluded_task_ids:
+                        if (
+                            task_id_value in decision_excluded_task_ids
+                            or classification in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS
+                        ):
                             if classification not in CURRENT_ATTENTION_EXCLUDED_CLASSIFICATIONS:
                                 raise TaskAttentionIntegrityError(
                                     "decision exclusion classification changed during snapshot"
                                 )
-                            filtered_counts[classification] += 1
+                            filtered_counts[classification] = (
+                                filtered_counts.get(classification, 0) + 1
+                            )
+                            if classification in {"decision_closed", "decision_superseded"}:
+                                filtered_counts["already_decided"] = (
+                                    filtered_counts.get("already_decided", 0) + 1
+                                )
                         else:
                             visible.append((raw, classified))
                             if len(visible) > limit:
