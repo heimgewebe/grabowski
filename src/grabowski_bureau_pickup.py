@@ -68,6 +68,54 @@ MAX_CLAIM_REJECTION_VALUE_BYTES = 16 * 1024
 MIN_LEASE_TTL_SECONDS = 120
 MAX_LEASE_TTL_SECONDS = 3600
 MAX_JOURNAL_REPLAY_RUNS = 4096
+MAX_MCP_ERROR_ENVELOPE_BYTES = 16 * 1024
+MCP_ERROR_ENVELOPE_MARKER = "GRABOWSKI_ERROR_ENVELOPE="
+
+
+def _bureau_pickup_error_message(
+    code: str, details: dict[str, Any], summary: str | None
+) -> str:
+    prefix = summary or code
+    envelope: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_bureau_pickup_error",
+        "code": code,
+        "details": details,
+    }
+    try:
+        payload = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "grabowski_bureau_pickup_error",
+                "code": code,
+                "details": {"serialization_failed": True},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    encoded = payload.encode("utf-8")
+    if len(encoded) > MAX_MCP_ERROR_ENVELOPE_BYTES:
+        payload = json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "grabowski_bureau_pickup_error",
+                "code": code,
+                "details": {
+                    "truncated": True,
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                },
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return f"{prefix}\n{MCP_ERROR_ENVELOPE_MARKER}{payload}"
 
 
 class _RequiredBureauPickupRequest(TypedDict):
@@ -2592,6 +2640,33 @@ def grabowski_bureau_pickup_execute(
         else "claim-commit-recovery-required"
     )
     raise BureauPickupError(code, details={"result": result})
+
+
+def _install_bureau_pickup_mcp_error_boundary() -> None:
+    manager = getattr(mcp, "_tool_manager", None)
+    get_tool = getattr(manager, "get_tool", None)
+    if not callable(get_tool):
+        return
+    tool = get_tool("grabowski_bureau_pickup_execute")
+    original = getattr(tool, "fn", None)
+    if not callable(original):
+        raise RuntimeError("Bureau pickup MCP tool function is unavailable")
+    if getattr(original, "_grabowski_pickup_error_boundary", False):
+        return
+
+    def bounded(request: BureauPickupRequest) -> dict[str, Any]:
+        try:
+            return original(request)
+        except BureauPickupError as exc:
+            raise RuntimeError(
+                _bureau_pickup_error_message(exc.code, exc.details, str(exc))
+            ) from exc
+
+    bounded._grabowski_pickup_error_boundary = True  # type: ignore[attr-defined]
+    tool.fn = bounded
+
+
+_install_bureau_pickup_mcp_error_boundary()
 
 
 def _journal_available(run_id: str) -> bool:
