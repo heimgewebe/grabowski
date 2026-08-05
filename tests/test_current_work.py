@@ -332,12 +332,12 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["binding_status"], "physical-only")
-        self.assertEqual(group["projection_state"], "unknown")
+        self.assertEqual(group["projection_state"], "hygiene")
         self.assertIn(
-            "physical-workspace-without-authority", group["action_reasons"]
+            "physical-workspace-rescue-candidate", group["action_reasons"]
         )
 
-    def test_unbound_tmux_and_coding_agent_are_samples_only(self) -> None:
+    def test_unbound_tmux_and_coding_agent_are_hygiene_rescue_candidates(self) -> None:
         result = project(
             tmux_payload={"returncode": 0, "stdout": "manual-shell\t1\t0\t70\n"},
             process_payload={
@@ -347,15 +347,20 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(result["count"], 0)
         self.assertEqual(result["unbound_physical"]["tmux_total_unbound"], 1)
         self.assertEqual(result["unbound_physical"]["process_total_unbound"], 1)
         process_sample = result["unbound_physical"]["processes"][0]
         self.assertEqual(process_sample["executable"], "claude")
         self.assertNotIn("arguments", process_sample)
         self.assertNotIn("very-secret", str(result))
+        work_ids = {group["work_id"] for group in result["work"]}
+        self.assertIn("physical-tmux-rescue:manual-shell", work_ids)
+        self.assertIn("physical-process-rescue:200", work_ids)
+        for group in result["work"]:
+            self.assertEqual(group["projection_state"], "hygiene")
+            self.assertEqual(group["work_class"], "hygiene")
 
-    def test_dirty_unbound_checkout_is_attention(self) -> None:
+    def test_dirty_unbound_checkout_is_hygiene_not_coordination_blocking(self) -> None:
         result = project(
             checkout_payloads=[
                 {
@@ -372,8 +377,10 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["binding_status"], "checkout-bound")
-        self.assertEqual(group["projection_state"], "blocking")
-        self.assertIn("dirty-checkout", group["action_reasons"])
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
+        self.assertIn("dirty-checkout-visible", group["action_reasons"])
+        self.assertNotIn("dirty-checkout", group["action_reasons"])
 
     def test_dirty_checkout_with_exact_live_operation_lease_is_active(self) -> None:
         owner = "operator:active-edit"
@@ -425,7 +432,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertTrue(group["action_required"])
         self.assertIn("dirty-main-checkout", group["action_reasons"])
 
-    def test_dirty_retained_checkout_with_unrelated_live_lease_remains_blocking(self) -> None:
+    def test_dirty_retained_checkout_with_unrelated_live_lease_is_hygiene(self) -> None:
         owner = "operator:retained-edit"
         path = "/home/alex/repos/.worktrees/retained-edit"
         record = checkout("retained-edit", path, dirty=True)
@@ -442,9 +449,33 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         group = result["work"][0]
         self.assertEqual(group["work_id"], f"operation:{owner}")
-        self.assertEqual(group["projection_state"], "blocking")
+        # Unrelated leases keep the owner group active; dirty alone is not coordination-blocking.
+        self.assertEqual(group["projection_state"], "active")
         self.assertTrue(group["action_required"])
-        self.assertIn("dirty-checkout", group["action_reasons"])
+        self.assertIn("dirty-checkout-visible", group["action_reasons"])
+        self.assertNotIn("dirty-checkout-resource-overlap", group["action_reasons"])
+
+    def test_dirty_checkout_with_resource_overlap_is_coordination_blocking(self) -> None:
+        path = "/home/alex/repos/.worktrees/overlap-edit"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "overlap-edit",
+                            path,
+                            dirty=True,
+                            blocking=True,
+                            owner_ids=["operator:other"],
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("dirty-checkout-resource-overlap", group["action_reasons"])
 
     def test_dirty_checkout_bound_to_terminal_task_remains_blocking(self) -> None:
         task_id = "terminal-edit"
@@ -479,7 +510,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(group["work_id"], f"task:{task_id}")
         self.assertEqual(group["projection_state"], "blocking")
         self.assertTrue(group["action_required"])
-        self.assertIn("dirty-checkout", group["action_reasons"])
+        self.assertIn("terminal-task-with-live-surfaces", group["action_reasons"])
 
     def test_clean_unbound_checkout_is_not_current_work(self) -> None:
         result = project(
@@ -498,7 +529,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         )
         self.assertEqual(result["count"], 0)
 
-    def test_cleanup_candidate_is_attention(self) -> None:
+    def test_cleanup_candidate_without_remote_security_is_hygiene(self) -> None:
         result = project(
             checkout_payloads=[
                 {
@@ -515,8 +546,23 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             ]
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "blocking")
-        self.assertIn("cleanup-candidate", group["action_reasons"])
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertIn("cleanup-candidate-not-remote-secured", group["action_reasons"])
+
+    def test_cleanup_candidate_remote_secured_ready_is_hygiene(self) -> None:
+        record = checkout(
+            "cleanup-ready",
+            "/home/alex/repos/.worktrees/cleanup-ready",
+            cleanup_candidate=True,
+            lifecycle_state="cleanup_candidate",
+        )
+        record["remote_secured"] = True
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [record]}]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertIn("cleanup-candidate-ready", group["action_reasons"])
 
     def test_dirty_main_checkout_is_attention(self) -> None:
         result = project(
@@ -557,8 +603,9 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         group = result["work"][0]
         self.assertEqual(group["binding_status"], "physical-only")
         self.assertIn(
-            "physical-checkout-without-authority", group["action_reasons"]
+            "physical-checkout-rescue-candidate", group["action_reasons"]
         )
+        self.assertEqual(group["projection_state"], "hygiene")
 
     def test_ambiguous_checkout_binding_is_explicit(self) -> None:
         result = project(
@@ -796,7 +843,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             ]
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["projection_state"], "hygiene")
         self.assertEqual(group["convergence_stage"], "closed-not-cleaned")
         self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
 
@@ -1189,7 +1236,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertTrue(result["convergence_summary"]["finishable_chain_prioritized"])
         self.assertEqual(result["convergence_summary"]["closed_not_cleaned_count"], 1)
 
-    def test_generic_blocking_group_with_cleanup_candidate_is_blocking_not_closed_cleaned(self) -> None:
+    def test_generic_active_group_with_cleanup_candidate_is_not_closed_cleaned(self) -> None:
         result = project(
             tasks_payload={
                 "tasks": [task("t-running", state="running", updated=50)],
@@ -1209,9 +1256,11 @@ class CurrentWorkProjectionTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(result["convergence_summary"]["primary_stage"], "blocking")
+        # Active operative work outranks hygiene cleanup inventory.
+        self.assertEqual(result["work"][0]["work_id"], "task:t-running")
+        self.assertEqual(result["convergence_summary"]["primary_stage"], "active")
         self.assertEqual(result["convergence_summary"]["closed_not_cleaned_count"], 0)
-        self.assertIn("inspect blocking work group", result["next_convergence_action"])
+        self.assertIn("monitor active work execution", result["next_convergence_action"])
 
 
     def test_bound_present_reconciliation_does_not_duplicate_checkout(self) -> None:
@@ -1390,6 +1439,22 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(result["state_counts"]["blocking"], 0)
         self.assertEqual(result["state_counts"]["hygiene"], 8)
         self.assertEqual(result["convergence_summary"]["hygiene_count"], 8)
+        self.assertEqual(result["selection"]["authority_or_physical_bound_count"], 1)
+        # No selection inversion: heuristic hygiene never precedes positively bound work.
+        seen_heuristic = False
+        for group in result["work"]:
+            heuristic_only = (
+                group["projection_state"] == "hygiene"
+                and not group["authority_refs"]
+                and group["lease_summary"]["count"] == 0
+                and not group["checkout_refs"]
+            )
+            if heuristic_only:
+                seen_heuristic = True
+            elif seen_heuristic and (
+                group["authority_refs"] or group["lease_summary"]["count"]
+            ):
+                self.fail("positively bound work appeared after heuristic-only hygiene")
 
 
 if __name__ == "__main__":

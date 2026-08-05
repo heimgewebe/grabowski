@@ -43,14 +43,15 @@ Cleanup-plan schema 2 keeps `archive_age_seconds` visible as a compatibility obs
 Cleanup remains blocked by:
 
 - the repository main worktree;
-- a dirty linked checkout;
+- a dirty linked checkout (dirty state is never deleted);
 - active tasks whose exact cwd is inside the checkout or repository main worktree;
 - live processes inside those scopes;
 - relevant path or repository resource leases;
 - retention ownership;
+- head not present on local remote-tracking refs (`remote_secured=false`);
 - head, branch, archive or dry-run drift.
 
-Disjoint source-path leases do not globally block an unrelated checkout. No cleanup is automatic; archive creation, dry-run and apply remain separate evidenced actions.
+Cleanup inventory and dry-run therefore require terminal + clean + remote-secured + lease/process/retention-free evidence together. Disjoint source-path leases do not globally block an unrelated checkout. No cleanup is automatic; archive creation, dry-run and apply remain separate evidenced actions.
 
 ## Non-claims
 

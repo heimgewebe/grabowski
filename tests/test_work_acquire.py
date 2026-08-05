@@ -58,7 +58,16 @@ class WorkAcquireTests(unittest.TestCase):
     @staticmethod
     def acquired(owner: str, keys: list[str]) -> dict[str, object]:
         leases = [
-            {"resource_key": key, "owner_id": owner, "expires_at_unix": int(time.time()) + 1200}
+            {
+                "resource_key": key,
+                "owner_id": owner,
+                "purpose": "direct user implementation lane",
+                "acquired_at_unix": int(time.time()),
+                "updated_at_unix": int(time.time()),
+                "expires_at_unix": int(time.time()) + 1200,
+                "metadata_sha256": "d" * 64,
+                "reclaimed_from_owner": None,
+            }
             for key in keys
         ]
         return {"owner_id": owner, "leases": leases, "preserved": [], "reclaimed": []}
@@ -167,6 +176,30 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(result["state"], "outcome_unknown")
         self.assertIsNone(result["effect_observed"])
         release.assert_not_called()
+
+    def test_preflight_exception_after_lease_acquisition_is_compensated(self) -> None:
+        release = Mock(return_value={"released": True})
+        result = work_acquire.acquire_work(
+            self.parameters(), acquire_resources_fn=self.acquire,
+            release_resources_fn=release, inspect_resource_fn=Mock(),
+            ensure_worktree_fn=Mock(
+                side_effect=work_acquire.worktree_ensure.WorktreeEnsurePreflight(
+                    "invalid branch"
+                )
+            ),
+            runner=Mock(),
+        )
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["decision"], "AUTO_PREPARE_FAILED")
+        self.assertFalse(result["effect_observed"])
+        release.assert_called_once()
+        expected_leases = release.call_args.kwargs["expected_leases"]
+        self.assertIsInstance(expected_leases, list)
+        self.assertTrue(expected_leases)
+        self.assertEqual(
+            set(expected_leases[0]),
+            work_acquire.resources.LEASE_SNAPSHOT_KEYS,
+        )
 
     def test_non_object_result_is_durable_outcome_unknown(self) -> None:
         release = Mock()

@@ -36,11 +36,11 @@ Branch-Löschung.
 | Markierung | Typische States | Bedeutung |
 | --- | --- | --- |
 | `primary` | `main` | Haupt-Worktree; nie temporärer Cleanup-Kandidat. |
-| `dirty` | `dirty` | Änderungen oder untracked Dateien vorhanden; erst reviewen oder retainen. |
+| `dirty` | `dirty` | Änderungen oder untracked Dateien vorhanden; immer sichtbar, nie löschbar. Coordination-blocking nur bei realer Ressourcenüberschneidung (Leases, Tasks, Prozesse). |
 | `retained` | `retained`, `completed_retained`, `completed_retained_blocked` | Aktive managed Arbeit ist wirksam retained; terminale managed Arbeit bleibt bis zur Archivierung explizit sichtbar. |
-| `archived` | `archived_blocked` | Eine konsistente `phase=archived`-Bindung besitzt ein passendes offenes Recovery-Archiv; nur aktive Koordination blockiert die Erstellung des Cleanup-Dry-Runs. |
+| `archived` | `archived_blocked`, `archived_not_remote_secured` | Eine konsistente `phase=archived`-Bindung besitzt ein passendes offenes Recovery-Archiv. Cleanup setzt zusätzlich Grace, Remote-Sicherung und Koordinationsfreiheit voraus. |
 | `terminal` | `externally_terminal_missing` | Der Checkout fehlt bereits und seine externe Quelle ist revisions- und receiptgebunden terminal. Das ist weder Archiv noch Cleanup-Kandidat. |
-| `obsolete` | `cleanup_candidate`, `prunable_or_missing` | Nur lokal gemeint: ein sauberer Checkout hat ein passendes offenes Recovery-Archiv und braucht vor Apply trotzdem einen Dry-Run; oder Git meldet den Worktree als prunable/missing. |
+| `obsolete` | `cleanup_candidate`, `prunable_or_missing` | Nur lokal gemeint: ein terminaler, sauberer, remote-gesicherter Checkout hat ein reifes Recovery-Archiv und ist lease-/prozess-/retentionfrei; vor Apply bleibt der Dry-Run Pflicht. Oder Git meldet den Worktree als prunable/missing. |
 | `unknown` | `unclassified_clean`, `managed_active_attention`, `managed_lifecycle_drift`, `archive_drifted`, `archive_closed`, `blocked_unarchived`, `unobservable` | Lokale Evidenz reicht nicht für eine sichere Lifecycle-Entscheidung. `unclassified_clean` bleibt unmanaged oder legacy; managed Retention-Ablauf und Identitätsdrift werden ausdrücklich blockierend. |
 
 Die Entscheidung enthält zusätzlich:
@@ -122,6 +122,8 @@ weiterhin nur nach Archiv- und Dry-Run-Vertrag.
 
 1. Der Haupt-Worktree ist kein temporärer Cleanup-Kandidat.
 2. Dirty oder untracked Checkouts werden nicht archiviert oder entfernt.
+   Dirty-State wird nie gelöscht und ist nur bei realer Ressourcenüberschneidung
+   coordination-blocking.
 3. Branches werden nicht gelöscht. Cleanup entfernt nur die verlinkte
    Arbeitskopie; `refs/heads/...` und Recovery-Refs bleiben erhalten.
 4. Cleanup verlangt eine vorherige Archivierung mit verifizierbaren
@@ -129,8 +131,10 @@ weiterhin nur nach Archiv- und Dry-Run-Vertrag.
 5. Cleanup verlangt einen frischen Dry-Run-Plan. Apply scheitert, wenn der
    aktuelle Zustand vom Plan-Hash abweicht.
    `cleanup_candidate=true` im Inventar ersetzt diesen Plan nicht.
-6. Aktive Tasks, Prozesse oder fremde Resource-Leases am Checkout oder am
-   Repository blockieren Apply.
+6. Cleanup ist nur zulässig, wenn der Checkout terminal, sauber und auf
+   lokalen Remote-Tracking-Refs gesichert ist sowie lease-, prozess- und
+   retentionfrei bleibt. Aktive Tasks, Prozesse oder fremde Resource-Leases
+   am Checkout oder am Repository blockieren Apply.
 7. Ein Lifecycle-Binding autorisiert weder automatische Archivierung noch
    Cleanup oder Branch-Löschung.
 8. `externally_terminal_missing` verändert nur Phase und Terminalzeit; Binding,

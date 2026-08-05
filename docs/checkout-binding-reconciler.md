@@ -20,7 +20,7 @@ Die Ausgabe ist auf höchstens 100 Datensätze je Seite begrenzt. Der Cursor ist
 
 ## Current Work und Attention
 
-`bound_present` und `archived_cleaned` erzeugen keine zweite Current-Work-Zeile. Blockierende Reconciliation-Ergebnisse werden an eine bereits vorhandene `checkout:<key>`-Gruppe angehängt. Fehlt ein physischer Checkout ohne vollständige Cleanup-Evidenz, entsteht eine ungebundene `checkout-binding:<key>`-Gruppe. Diese Projektion ist Aufmerksamkeitsevidenz, keine Checkout- oder Eigentumsautorität.
+`bound_present` und `archived_cleaned` erzeugen keine zweite Current-Work-Zeile. Blockierende Reconciliation-Ergebnisse werden an eine bereits vorhandene `checkout:<key>`-Gruppe angehängt. Fehlt ein physischer Checkout ohne vollständige Cleanup-Evidenz, entsteht eine ungebundene `checkout-binding:<key>`-Gruppe. Historische, fehlende oder nur heuristische Bindings erscheinen in `grabowski_current_work` als `hygiene` und verdrängen keine positiv autoritäts- oder physisch gebundenen Gruppen auf begrenzten Seiten. Diese Projektion ist Aufmerksamkeitsevidenz, keine Checkout- oder Eigentumsautorität.
 
 Die direkte Tool-Antwort enthält zusätzlich eine begrenzte `attention`-Projektion für die Datensätze der aktuellen Seite und `attention_total_count` für den vollständigen Snapshot. Sie erzeugt oder verändert keine dauerhafte Attention-Entscheidung.
 

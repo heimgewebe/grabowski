@@ -40,7 +40,18 @@ CURRENT_WORK_VIEWS = {"current", "history"}
 PROJECTION_STATES = {"active", "blocking", "resumable", "hygiene", "terminal_archived", "unknown"}
 ATTENTION_BLOCKING_CLASSIFICATIONS = {"actionable", "outcome_unknown", "invalid_evidence"}
 ATTENTION_RESUMABLE_CLASSIFICATIONS = {"decision_deferred"}
-ATTENTION_ARCHIVED_CLASSIFICATIONS = {"decision_closed", "decision_superseded"}
+ATTENTION_ARCHIVED_CLASSIFICATIONS = {
+    "decision_closed",
+    "decision_superseded",
+    "already_decided",
+    "already_satisfied",
+    "superseded",
+    "retry_succeeded",
+    "superseded_by_verified_retry",
+    "expected_red",
+    "expected_red_phase",
+    "historical_environment_failure",
+}
 WORKSPACE_PROCESS_RE = re.compile(
     r"(?:^|\s)-m\s+grabowski_agent_workspace\s+pane\s+(?P<workspace>[^\s]+)(?:\s|$)"
 )
@@ -214,6 +225,61 @@ def _hygiene(group: dict[str, Any], reason: str) -> None:
         group["projection_state"] = "hygiene"
     if reason and reason not in group["action_reasons"]:
         group["action_reasons"].append(reason)
+
+
+def _has_positive_binding(group: dict[str, Any]) -> bool:
+    """True when current authority or physical surface evidence is present."""
+    return bool(
+        group.get("authority_refs")
+        or group.get("lease_summary", {}).get("count")
+        or group.get("checkout_refs")
+        or group.get("worker_refs")
+        or group.get("physical_refs", {}).get("tmux_sessions")
+        or group.get("physical_refs", {}).get("processes")
+    )
+
+
+def _is_heuristic_only_group(group: dict[str, Any]) -> bool:
+    """Historical/missing bindings with only non-authoritative heuristic evidence."""
+    if _has_positive_binding(group):
+        return False
+    heuristic_refs = group.get("heuristic_refs") or []
+    if not heuristic_refs:
+        return False
+    sources = {
+        str(item.get("source") or item.get("kind") or "")
+        for item in heuristic_refs
+        if isinstance(item, dict)
+    }
+    return bool(sources) and all(
+        source.startswith("checkout-binding-reconciliation")
+        or source in {
+            "task-cwd-overlap",
+            "task-cwd",
+            "checkout-inventory-task-proximity",
+            "task-resource-repository-overlap",
+            "checkout-resource-overlap",
+            "tmux-session-name-workspace-candidate",
+            "process-argv-workspace-candidate",
+            "unbound-tmux-rescue-candidate",
+            "unbound-process-rescue-candidate",
+        }
+        or source.startswith("checkout-lifecycle-binding")
+        for source in sources
+    )
+
+
+def _dirty_has_resource_overlap(item: dict[str, Any]) -> bool:
+    """Real resource overlap: identifying leases, coordination, or live processes."""
+    identifying_live_lease = any(
+        _resource_identifies_checkout(lease["resource_key"], item)
+        for lease in item["resource_leases"]
+    )
+    return bool(
+        item["coordination_blocking"]
+        or identifying_live_lease
+        or item["processes"]
+    )
 
 
 def _resumable(group: dict[str, Any], reason: str = "") -> None:
@@ -493,6 +559,15 @@ def _checkout(raw: dict[str, Any], repository: str) -> dict[str, Any]:
         "entry_count": _integer(status.get("entry_count"), "checkout.status.entry_count"),
         "lifecycle_state": str(raw.get("lifecycle_state", ""))[:128],
         "cleanup_candidate": _boolean(raw.get("cleanup_candidate"), "checkout.cleanup_candidate"),
+        "remote_secured": (
+            None
+            if raw.get("remote_secured") is None
+            and decision.get("remote_secured") is None
+            else _boolean(
+                raw.get("remote_secured", decision.get("remote_secured")),
+                "checkout.remote_secured",
+            )
+        ),
         "coordination_blocking": _boolean(coordination.get("blocking"), "checkout.coordination.blocking"),
         "heuristic_task_ids": [str(item.get("task_id")) for item in task_rows if isinstance(item, dict) and item.get("task_id")][:MAX_EVIDENCE],
         "resource_leases": [
@@ -582,8 +657,10 @@ def _task_has_more(payload: dict[str, Any] | None) -> bool:
     return _has_more(pagination, "tasks.pagination")
 
 
-def _sort_key(group: dict[str, Any]) -> tuple[int, int, str]:
-    rank = {
+def _sort_key(group: dict[str, Any]) -> tuple[int, int, int, str]:
+    # Positive authority/physical surfaces always outrank pure hygiene inventory.
+    positive_rank = 0 if _has_positive_binding(group) else 1
+    state_rank = {
         "blocking": 0,
         "active": 1,
         "resumable": 2,
@@ -591,7 +668,15 @@ def _sort_key(group: dict[str, Any]) -> tuple[int, int, str]:
         "hygiene": 4,
         "terminal_archived": 5,
     }.get(group["projection_state"], 6)
-    return rank, -int(group["latest_activity_unix"]), group["work_id"]
+    # Heuristic-only hygiene never displaces positively bound operative work.
+    if group["projection_state"] == "hygiene" and not _has_positive_binding(group):
+        state_rank = 4
+    return (
+        positive_rank,
+        state_rank,
+        -int(group["latest_activity_unix"]),
+        group["work_id"],
+    )
 
 
 def _add_tasks(
@@ -971,18 +1056,31 @@ def _add_checkouts(
                 _resource_identifies_checkout(lease["resource_key"], item)
                 for lease in item["resource_leases"]
             )
-            if (
-                item["is_main"]
-                or len(exact) != 1
-                or group["projection_state"] != "active"
-                or not identifying_live_lease
-            ):
-                _blocking(
-                    group,
-                    "dirty-main-checkout" if item["is_main"] else "dirty-checkout",
-                )
+            resource_overlap = _dirty_has_resource_overlap(item)
+            sole_active_leased_owner = (
+                not item["is_main"]
+                and len(exact) == 1
+                and group["projection_state"] == "active"
+                and identifying_live_lease
+            )
+            if item["is_main"]:
+                _blocking(group, "dirty-main-checkout")
+            elif sole_active_leased_owner:
+                # Exact live path/branch lease keeps dirty work operative, not blocking.
+                pass
+            elif resource_overlap:
+                # Dirty is coordination-blocking only with real resource overlap.
+                _blocking(group, "dirty-checkout-resource-overlap")
+            else:
+                # Dirty remains visible as hygiene; it never authorizes cleanup.
+                _hygiene(group, "dirty-checkout-visible")
         elif item["cleanup_candidate"]:
-            _blocking(group, "cleanup-candidate")
+            if item.get("remote_secured") is not True:
+                _hygiene(group, "cleanup-candidate-not-remote-secured")
+            elif item["coordination_blocking"] or item["processes"] or item["retention_active"]:
+                _blocking(group, "cleanup-candidate-coordination-blocked")
+            else:
+                _hygiene(group, "cleanup-candidate-ready")
         elif (
             item["binding_present"]
             and item["binding_consistent"]
@@ -1012,7 +1110,7 @@ def _add_checkouts(
             _set_projection_state(group, "active")
         elif item["processes"] and not exact:
             group["binding_status"] = "physical-only"
-            _unknown(group, "physical-checkout-without-authority")
+            _hygiene(group, "physical-checkout-rescue-candidate")
         elif view == "history":
             _set_projection_state(group, "terminal_archived")
 
@@ -1133,11 +1231,28 @@ def _add_physical_surfaces(
             )
             group["related_work_ids"].append(authoritative_work_id)
             group["latest_activity_unix"] = max(group["latest_activity_unix"], session["activity_unix"])
-            _unknown(group, "physical-workspace-without-authority")
+            _hygiene(group, "physical-workspace-rescue-candidate")
         else:
             unbound_tmux_total += 1
             if len(unbound_tmux) < MAX_UNBOUND_SAMPLE:
                 unbound_tmux.append(session)
+            # Bounded hygiene/rescue projection without elevating heuristics to authority.
+            rescue_id = f"physical-tmux-rescue:{name}"
+            group = _ensure(groups, rescue_id, "physical-session-rescue", name)
+            group["binding_status"] = "physical-only"
+            _append(group["physical_refs"]["tmux_sessions"], {"source": "tmux", **session})
+            _append(
+                group["heuristic_refs"],
+                {
+                    "kind": "unbound-tmux-rescue-candidate",
+                    "session_name": name,
+                    "authority": False,
+                },
+            )
+            group["latest_activity_unix"] = max(
+                group["latest_activity_unix"], session["activity_unix"]
+            )
+            _hygiene(group, "unbound-tmux-rescue-candidate")
 
     unbound_processes: list[dict[str, Any]] = []
     unbound_process_total = 0
@@ -1160,12 +1275,35 @@ def _add_physical_surfaces(
                     },
                 )
                 group["related_work_ids"].append(authoritative_work_id)
-                _unknown(group, "physical-workspace-without-authority")
+                _hygiene(group, "physical-workspace-rescue-candidate")
             _append(group["physical_refs"]["processes"], {"source": "process-list", **process})
         elif process["command_class"] == "coding-agent":
             unbound_process_total += 1
             if len(unbound_processes) < MAX_UNBOUND_SAMPLE:
                 unbound_processes.append(process)
+            pid = int(process.get("pid") or 0)
+            rescue_id = f"physical-process-rescue:{pid}"
+            group = _ensure(
+                groups,
+                rescue_id,
+                "physical-process-rescue",
+                str(pid),
+            )
+            group["binding_status"] = "physical-only"
+            _append(
+                group["physical_refs"]["processes"],
+                {"source": "process-list", **process},
+            )
+            _append(
+                group["heuristic_refs"],
+                {
+                    "kind": "unbound-process-rescue-candidate",
+                    "pid": pid,
+                    "command_class": process.get("command_class"),
+                    "authority": False,
+                },
+            )
+            _hygiene(group, "unbound-process-rescue-candidate")
     return unbound_tmux, unbound_tmux_total, unbound_processes, unbound_process_total
 
 
@@ -1401,7 +1539,7 @@ def derive_group_convergence_recommendation(group: dict[str, Any]) -> dict[str, 
     # 1. closed-not-cleaned: task/obligation explicitly terminal or closed, but checkout/leases/tmux retained
     if has_terminal_evidence and (
         has_cleanup_candidate
-        or "cleanup-candidate" in action_reasons
+        or any(reason.startswith("cleanup-candidate") for reason in action_reasons)
         or has_terminal_checkout_binding
         or (projection_state == "terminal_archived" and has_live_surfaces)
     ):
@@ -1632,12 +1770,30 @@ def build_current_work_projection(
         state: sum(1 for group in projected if group["projection_state"] == state)
         for state in sorted(PROJECTION_STATES)
     }
+    page_positive_bound = sum(1 for group in page if _has_positive_binding(group))
+    page_heuristic_only = sum(1 for group in page if _is_heuristic_only_group(group))
+    page_hygiene = sum(1 for group in page if group["projection_state"] == "hygiene")
+    # Selection is unsafe when hygiene/heuristic inventory crowds out operative surfaces.
+    selection_safe = not (
+        len(page) > 0
+        and page_heuristic_only * 2 >= len(page)
+        and page_positive_bound > 0
+        and any(
+            group["projection_state"] in {"active", "blocking", "resumable"}
+            and _has_positive_binding(group)
+            for group in projected
+        )
+    )
 
     warnings: list[str] = []
     if any(source_truncation.values()):
         warnings.append("one or more source surfaces were truncated")
     if errors:
         warnings.append("one or more source surfaces returned errors or malformed records")
+    if not selection_safe:
+        warnings.append(
+            "bounded page mixes heuristic-only hygiene with positively bound work"
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1651,6 +1807,13 @@ def build_current_work_projection(
         "total_projected_scope": "bounded_source_snapshot",
         "state_counts": state_counts,
         "state_counts_scope": "bounded_source_snapshot",
+        "selection": {
+            "authority_or_physical_bound_count": page_positive_bound,
+            "heuristic_only_count": page_heuristic_only,
+            "hygiene_count": page_hygiene,
+            "selection_safe": selection_safe,
+            "scope": "returned_page",
+        },
         "work": page,
         "pagination": {
             "limit": limit,
@@ -1694,10 +1857,12 @@ def build_current_work_projection(
         },
         "warnings": warnings,
         "recommended_next_action": (
-            "inspect the first blocking work group and its authority references"
+            "inspect the first positively bound blocking work group and its authority references"
             if state_counts["blocking"]
             else "inspect resumable work groups"
             if state_counts["resumable"]
+            else "process hygiene and rescue candidates separately"
+            if state_counts["hygiene"]
             else "none"
         ),
         "next_convergence_action": top_rec["next_convergence_action"],
@@ -1719,6 +1884,8 @@ def build_current_work_projection(
             "authority from task cwd overlap or session naming heuristics",
             "mutation authority or automatic execution from convergence recommendation",
             "GitHub PR status or remote deployment truth not collected by current_work",
+            "permission to delete dirty checkout state",
+            "cleanup safety without terminal+clean+remote-secured+coordination-free evidence",
         ],
     }
 
