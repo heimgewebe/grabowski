@@ -311,6 +311,40 @@ def acquire_work(
                 runner,
                 inspect_resource_fn,
             )
+        except worktree_ensure.WorktreeEnsurePreflight as exc:
+            try:
+                compensation = release_resources_fn(
+                    inputs["lease_owner_id"],
+                    inputs["resource_keys"],
+                    expected_leases=acquired.get("leases"),
+                )
+            except Exception as release_exc:
+                compensation = {
+                    "released": False,
+                    "error": f"{type(release_exc).__name__}: {release_exc}"[:2048],
+                }
+            record = _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": "blocked",
+                    "decision": "AUTO_PREPARE_FAILED",
+                    "lease_receipt": acquired,
+                    "error_class": type(exc).__name__,
+                    "error": str(exc)[:2048],
+                    "effect_observed": False,
+                    "compensation": compensation,
+                },
+            )
+            if audit_fn is not None:
+                audit_fn({
+                    "operation": "work-acquire",
+                    "lane_id": lane_id,
+                    "state": "blocked",
+                    "inputs_sha256": inputs_sha256,
+                    "effect_observed": False,
+                })
+            return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
         except Exception as exc:
             record = _write_state(
                 receipt_path,
