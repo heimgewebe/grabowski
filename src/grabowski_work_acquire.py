@@ -303,6 +303,7 @@ def acquire_work(
             "artifact_class": inputs["artifact_class"],
             "retention_until_unix": inputs["retention_until_unix"],
             "idempotency_key": f"work-acquire:{lane_id}",
+            "reposkop_required": True,
         }
         try:
             output = ensure_worktree_fn(

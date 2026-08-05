@@ -50,12 +50,36 @@ class ReposkopAdmissionSurfaceTests(unittest.TestCase):
         path = SRC / "grabowski_work_acquire.py"
         if not path.exists():
             self.skipTest("work-acquire surface is not present on this revision")
-        source = path.read_text(encoding="utf-8")
-        self.assertIn(
-            "reposkop_required=True",
-            source,
-            "work-acquire must not create a productive worktree without Reposkop",
-        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "acquire_work"
+        ]
+        self.assertEqual(len(functions), 1)
+        assignments = [
+            node
+            for node in ast.walk(functions[0])
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "ensure_parameters"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(assignments), 1)
+        value = assignments[0].value
+        self.assertIsInstance(value, ast.Dict)
+        parameters = {
+            key.value: item
+            for key, item in zip(value.keys, value.values, strict=True)
+            if isinstance(key, ast.Constant)
+            and isinstance(key.value, str)
+        }
+        required = parameters.get("reposkop_required")
+        self.assertIsInstance(required, ast.Constant)
+        self.assertIs(required.value, True)
 
 
 if __name__ == "__main__":
