@@ -828,6 +828,20 @@ def _retention_records(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     return {row["checkout_key"]: _retention_public(row) for row in rows}
 
 
+def _archive_supersession_ids(connection: sqlite3.Connection) -> set[str]:
+    try:
+        rows = connection.execute(
+            "SELECT archive_id FROM checkout_identity_archive_supersessions"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {
+        str(row["archive_id"])
+        for row in rows
+        if isinstance(row["archive_id"], str) and row["archive_id"]
+    }
+
+
 def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     wanted = sorted(set(keys))
     if not wanted:
@@ -838,24 +852,23 @@ def _latest_archives(keys: Iterable[str]) -> dict[str, dict[str, Any]]:
     try:
         rows = connection.execute(
             f"""
-            SELECT a.* FROM archives a
-            JOIN (
-                SELECT checkout_key, max(created_at_unix) AS created_at_unix
-                FROM archives
-                WHERE checkout_key IN ({','.join('?' for _ in wanted)})
-                GROUP BY checkout_key
-            ) latest
-            ON a.checkout_key=latest.checkout_key
-            AND a.created_at_unix=latest.created_at_unix
-            ORDER BY a.checkout_key, a.archive_id
+            SELECT * FROM archives
+            WHERE checkout_key IN ({','.join('?' for _ in wanted)})
+            ORDER BY checkout_key, created_at_unix DESC, archive_id DESC
             """,
             wanted,
         ).fetchall()
+        superseded = _archive_supersession_ids(connection)
     except sqlite3.OperationalError:
         return {}
     finally:
         connection.close()
-    return {row["checkout_key"]: _archive_public(row) for row in rows}
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["archive_id"] in superseded or row["checkout_key"] in latest:
+            continue
+        latest[row["checkout_key"]] = _archive_public(row)
+    return latest
 
 
 def _load_archive(archive_id: str) -> dict[str, Any]:
@@ -872,15 +885,16 @@ def _load_archive(archive_id: str) -> dict[str, Any]:
 
 def _latest_archive_for_key(checkout_key: str) -> dict[str, Any] | None:
     with _database() as connection:
-        row = connection.execute(
+        rows = connection.execute(
             """
             SELECT * FROM archives
             WHERE checkout_key=? AND cleaned_at_unix IS NULL
             ORDER BY created_at_unix DESC, archive_id DESC
-            LIMIT 1
             """,
             (checkout_key,),
-        ).fetchone()
+        ).fetchall()
+        superseded = _archive_supersession_ids(connection)
+    row = next((candidate for candidate in rows if candidate["archive_id"] not in superseded), None)
     return None if row is None else _archive_public(row)
 
 
