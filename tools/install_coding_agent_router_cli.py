@@ -347,6 +347,49 @@ def _verify_runtime(runtime_python: Path) -> dict[str, Any]:
     return validation
 
 
+def _controller_integrator_contract(
+    recommendation: dict[str, Any],
+) -> dict[str, Any]:
+    """Require the live controller-integrator contract; fail closed on any drift."""
+    contract = {
+        "decision": recommendation.get("decision"),
+        "controller": recommendation.get("controller"),
+        "primary_role": recommendation.get("primary_role"),
+        "delegated_scoped_writers_allowed": recommendation.get(
+            "delegated_scoped_writers_allowed"
+        ),
+        "controller_integration_required": recommendation.get(
+            "controller_integration_required"
+        ),
+        "single_mutating_writer": recommendation.get("single_mutating_writer"),
+        "single_mutating_writer_scope": recommendation.get(
+            "single_mutating_writer_scope"
+        ),
+        "external_primary_writer_forbidden": recommendation.get(
+            "external_primary_writer_forbidden"
+        ),
+        "automatic_execution_authorized": recommendation.get(
+            "automatic_execution_authorized"
+        ),
+    }
+    expected = {
+        "decision": "controller",
+        "controller": "grabowski-primary",
+        "primary_role": "controller-integrator",
+        "delegated_scoped_writers_allowed": True,
+        "controller_integration_required": True,
+        "single_mutating_writer": True,
+        "single_mutating_writer_scope": "overlapping-resource-lane",
+        "external_primary_writer_forbidden": False,
+        "automatic_execution_authorized": True,
+    }
+    if contract != expected:
+        raise InstallError(
+            "installed router does not satisfy controller-integrator contract"
+        )
+    return contract
+
+
 def _verify_installed(target: Path) -> dict[str, Any]:
     recommendation = _run_json(
         [
@@ -363,14 +406,7 @@ def _verify_installed(target: Path) -> dict[str, Any]:
             "--need-review",
         ]
     )
-    if (
-        recommendation.get("decision") != "controller"
-        or recommendation.get("controller") != "grabowski-primary"
-        or recommendation.get("primary_role") != "direct-writer"
-        or recommendation.get("external_primary_writer_forbidden") is not True
-        or recommendation.get("automatic_execution_authorized") is not False
-    ):
-        raise InstallError("installed router does not satisfy direct-first readback")
+    _controller_integrator_contract(recommendation)
     return recommendation
 
 
@@ -451,7 +487,7 @@ def check(
     else:
         scheduler_state = _safe_existing(scheduler_target)
     runtime = _verify_runtime(runtime_python)
-    installed = (
+    files_match = (
         target_state.present
         and target_state.data == wrapper
         and stat.S_IMODE(target_state.mode) == 0o755
@@ -462,16 +498,36 @@ def check(
         and scheduler_state.data == scheduler
         and stat.S_IMODE(scheduler_state.mode) == 0o755
     )
+    # Missing or drifted files stay installed=false without executing the wrapper.
+    # Exact files require a live functional controller-contract readback.
+    if not files_match:
+        return {
+            "schema_version": 1,
+            "kind": "coding-agent-router-cli-install-check",
+            "installed": False,
+            "wrapper_sha256": digest,
+            "scheduler_sha256": scheduler_digest,
+            "scheduler_target": str(scheduler_target),
+            "runtime_catalog_sha256": runtime.get("catalog_sha256"),
+            "runtime_catalog_source": runtime.get("catalog_source"),
+        }
+    recommendation = _verify_installed(target)
+    if recommendation.get("catalog_sha256") != runtime.get("catalog_sha256"):
+        raise InstallError(
+            "installed router catalog identity differs from verified runtime"
+        )
+    contract = _controller_integrator_contract(recommendation)
     return {
         "schema_version": 1,
         "kind": "coding-agent-router-cli-install-check",
-        "installed": installed,
+        "installed": True,
         "wrapper_sha256": digest,
         "scheduler_sha256": scheduler_digest,
         "scheduler_target": str(scheduler_target),
         "runtime_catalog_sha256": runtime.get("catalog_sha256"),
         "runtime_catalog_source": runtime.get("catalog_source"),
-        "automatic_execution_authorized": False,
+        **contract,
+        "catalog_sha256": recommendation.get("catalog_sha256"),
     }
 
 
@@ -503,6 +559,7 @@ def apply(
                 raise InstallError(
                     "installed router catalog identity differs from verified runtime"
                 )
+            contract = _controller_integrator_contract(recommendation)
         except BaseException:
             errors: list[str] = []
             rollback_items = (
@@ -542,16 +599,13 @@ def apply(
         "runtime_catalog_source": runtime.get("catalog_source"),
         "runtime_python": str(runtime_python),
         "readback": {
-            "decision": recommendation.get("decision"),
-            "controller": recommendation.get("controller"),
-            "primary_role": recommendation.get("primary_role"),
+            **contract,
             "catalog_sha256": recommendation.get("catalog_sha256"),
-            "automatic_execution_authorized": recommendation.get(
-                "automatic_execution_authorized"
-            ),
         },
         "rollback_performed": False,
-        "automatic_execution_authorized": False,
+        "automatic_execution_authorized": contract[
+            "automatic_execution_authorized"
+        ],
     }
 
 

@@ -327,6 +327,22 @@ def _sidecar_digest(value: Any, *, label: str) -> str:
     return value
 
 
+def _sidecar_controller_contract_valid(value: dict[str, Any]) -> bool:
+    """Exact controller-integrator contract required for sidecar receipts."""
+    return (
+        value.get("decision") == "controller"
+        and value.get("controller") == "grabowski-primary"
+        and value.get("primary_role") == "controller-integrator"
+        and value.get("delegated_scoped_writers_allowed") is True
+        and value.get("controller_integration_required") is True
+        and value.get("single_mutating_writer") is True
+        and value.get("single_mutating_writer_scope")
+        == "overlapping-resource-lane"
+        and value.get("external_primary_writer_forbidden") is False
+        and value.get("automatic_execution_authorized") is True
+    )
+
+
 def reconcile_coding_agent_sidecars(
     repo: Path,
     live: dict[str, Any],
@@ -353,15 +369,15 @@ def reconcile_coding_agent_sidecars(
         or applied.get("status") != "installed"
         or applied.get("installed") is not True
         or applied.get("runtime_catalog_source") != "deployment_catalog"
-        or applied.get("automatic_execution_authorized") is not False
+        or applied.get("automatic_execution_authorized") is not True
         or applied.get("rollback_performed") is not False
     ):
         raise RuntimeError("sidecar apply receipt is invalid")
     readback = applied.get("readback")
     if (
         not isinstance(readback, dict)
-        or readback.get("automatic_execution_authorized") is not False
         or readback.get("catalog_sha256") != applied.get("runtime_catalog_sha256")
+        or not _sidecar_controller_contract_valid(readback)
     ):
         raise RuntimeError("sidecar apply readback is invalid")
 
@@ -373,7 +389,8 @@ def reconcile_coding_agent_sidecars(
         checked.get("kind") != "coding-agent-router-cli-install-check"
         or checked.get("installed") is not True
         or checked.get("runtime_catalog_source") != "deployment_catalog"
-        or checked.get("automatic_execution_authorized") is not False
+        or not _sidecar_controller_contract_valid(checked)
+        or checked.get("catalog_sha256") != checked.get("runtime_catalog_sha256")
     ):
         raise RuntimeError("sidecar post-install check is invalid")
 
@@ -404,7 +421,7 @@ def reconcile_coding_agent_sidecars(
         "runtime_catalog_sha256": runtime_catalog_sha256,
         "apply_receipt_sha256": canonical_json_sha256(applied),
         "check_receipt_sha256": canonical_json_sha256(checked),
-        "automatic_execution_authorized": False,
+        "automatic_execution_authorized": True,
     }
     return {**material, "evidence_sha256": canonical_json_sha256(material)}
 
