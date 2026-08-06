@@ -3228,7 +3228,7 @@
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_transport_roundtrip.py": "13f1e9e3d8fe624e5c995675f579b01af01e922fec5cb0a891428bc2957c39c9",
       "src/grabowski_work_acquire.py": "9fecc681a1dfcb9abb116e22401906334a51715cc39b593c24b6b3ee0be2dd16",
-      "src/grabowski_work_admission.py": "43585542b93c47b91cda3fd4de74d04c475134845439137df1996193465ba1a5",
+      "src/grabowski_work_admission.py": "6d8c89b54cd35e792bebc7ccfc116ff2b067675cb4e16ac9d5db9ccce1b8e470",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "815914a20a0972210bdfd4ceb5774e2ca0d409c03858322a2fcdf8bf9219be3f",
       "src/grabowski_worktree_ensure.py": "d8bb4a9867a404106772399e645cb7bc7d6320277e8b41b7a7ca54c5c159de9f"
