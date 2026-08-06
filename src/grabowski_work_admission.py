@@ -760,7 +760,7 @@ def assess_repository_admission(
     if not isinstance(worktrees, list):
         blockers.append({"code": "inventory-unobservable", "detail": "worktree inventory is unavailable"})
         worktrees = []
-    elif len(worktrees) > MAX_WORKTREES:
+    elif len(worktrees) > MAX_WORKTREES and exact_checkout_scope is None:
         blockers.append(
             {
                 "code": "bounded-inventory-exceeded",
