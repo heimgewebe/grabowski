@@ -870,6 +870,7 @@ class GripFoundationTests(unittest.TestCase):
             {
                 "branch-publish",
                 "bureau-pickup-execute",
+                "bureau-pickup-orphan-reconcile",
                 "bureau-pickup-release",
                 "bureau-pickup-status",
                 "captain-preflight",
@@ -1003,6 +1004,9 @@ class GripFoundationTests(unittest.TestCase):
         self.assertFalse(by_name["bureau-pickup-execute"]["availability"]["available"])
         self.assertTrue(by_name["bureau-pickup-status"]["availability"]["available"])
         self.assertFalse(by_name["bureau-pickup-release"]["availability"]["available"])
+        self.assertFalse(
+            by_name["bureau-pickup-orphan-reconcile"]["availability"]["available"]
+        )
         self.assertFalse(by_name["captain-preflight"]["availability"]["available"])
         self.assertFalse(by_name["captain-run"]["availability"]["available"])
         self.assertTrue(by_name["repo-orient"]["availability"]["available"])
@@ -10775,6 +10779,120 @@ class BureauPickupGripTests(unittest.TestCase):
             )
         self.assertEqual("blocked", blocked["receipt"]["status"])
         self.assertEqual("run-still-active", blocked["output"]["error"])
+
+    def orphan_request(self) -> dict[str, object]:
+        return {
+            "run_id": self.RUN_ID,
+            "expected_registry_binding_sha256": "a" * 64,
+            "expected_coordination_sha256": "b" * 64,
+            "expected_lease_sha256": "c" * 64,
+        }
+
+    def test_orphan_reconcile_requires_mutation_permission_before_dispatch(self) -> None:
+        pickup = self.pickup()
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-orphan-reconcile",
+                {"request": self.orphan_request()},
+                profile="operator",
+                allow_mutation=False,
+            )
+        pickup.grabowski_bureau_pickup_orphan_reconcile.assert_not_called()
+        self.assertEqual("blocked", result["receipt"]["status"])
+
+    def test_orphan_reconcile_success_is_receipt_and_preservation_bound(self) -> None:
+        request = self.orphan_request()
+        output = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_orphan_reconcile",
+            "status": "reconciled",
+            "run_id": self.RUN_ID,
+            **{key: request[key] for key in request if key != "run_id"},
+            "release": {"status": "released"},
+            "receipt": {
+                "status": "reconciled",
+                "run_id": self.RUN_ID,
+                "release_status": "released",
+                "preserves": [
+                    "dirty worktree content",
+                    "branch identity",
+                    "unrelated leases",
+                ],
+            },
+        }
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_orphan_reconcile.return_value = output
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-orphan-reconcile",
+                {"request": request},
+                profile="operator",
+                allow_mutation=True,
+            )
+        pickup.grabowski_bureau_pickup_orphan_reconcile.assert_called_once_with(request)
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertEqual("passed", result["output"]["receipt_status"])
+
+    def test_orphan_reconcile_outcome_unknown_requires_readback(self) -> None:
+        request = self.orphan_request()
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_orphan_reconcile.return_value = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_pickup_orphan_reconcile",
+            "status": "outcome_unknown",
+            "run_id": self.RUN_ID,
+            "readback_required": True,
+            "required_readback": [f"bureau_run:{self.RUN_ID}"],
+            "effect_started": True,
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            result = grips.grip_run(
+                "bureau-pickup-orphan-reconcile",
+                {"request": request},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual(
+            ["bureau_pickup_orphan_reconcile_readback_required"],
+            result["output"]["blocked_reasons"],
+        )
+
+    def test_orphan_reconcile_rejection_and_incomplete_success_fail_closed(self) -> None:
+        request = self.orphan_request()
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_orphan_reconcile.side_effect = FakeBureauPickupError(
+            "orphan-reconcile-execution-actively-bound",
+            details={"effect_started": False},
+        )
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            blocked = grips.grip_run(
+                "bureau-pickup-orphan-reconcile",
+                {"request": request},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", blocked["receipt"]["status"])
+        self.assertEqual(
+            ["bureau_pickup_orphan_reconcile_rejected"],
+            blocked["output"]["blocked_reasons"],
+        )
+
+        pickup = self.pickup()
+        pickup.grabowski_bureau_pickup_orphan_reconcile.return_value = {
+            "status": "reconciled",
+            "run_id": self.RUN_ID,
+            **{key: request[key] for key in request if key != "run_id"},
+        }
+        with patch.object(grips, "_bureau_pickup_module", return_value=pickup):
+            failed = grips.grip_run(
+                "bureau-pickup-orphan-reconcile",
+                {"request": request},
+                profile="operator",
+                allow_mutation=True,
+            )
+        self.assertEqual("failed", failed["receipt"]["status"])
+        self.assertIn("invalid post-state", failed["output"]["error"])
 
 
 class RuntimeRefreshLeaseReleaseGripTests(unittest.TestCase):
