@@ -14,6 +14,8 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
 class _FakeFastMCP:
     def tool(self, *args, **kwargs):
@@ -631,6 +633,58 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual(result["source_identity_sha256"], identity["identity_sha256"])
         self.assertEqual(1, SELF_DEPLOY.base._append_audit.call_count)
 
+    def test_schedule_reports_effective_source_when_reusing_same_target(self) -> None:
+        canonical = Path("/home/alex/repos/grabowski")
+        requested_repo = Path(
+            "/home/alex/repos/.grabowski-worktrees/deploy-requested"
+        )
+        expected = "e" * 40
+        requested_identity = _source_identity(
+            requested_repo,
+            expected,
+            kind="detached-worktree",
+            canonical=canonical,
+        )
+        existing = {
+            "unit": "grabowski-job-abcdef012345",
+            "argv_sha256": "f" * 64,
+            "delay_seconds": 6,
+            "metadata_path": "/state/meta",
+            "stdout_path": "/state/out",
+            "stderr_path": "/state/err",
+            "final_status": "running",
+            "source_identity_sha256": "1" * 64,
+        }
+        with patch.object(
+            SELF_DEPLOY,
+            "_deployment_source_preflight",
+            return_value=(
+                requested_repo,
+                requested_repo / "tools/run_scheduled_deploy.py",
+                requested_identity,
+            ),
+        ), patch.object(
+            SELF_DEPLOY, "_deploy_schedule_lock", return_value=nullcontext()
+        ), patch.object(
+            SELF_DEPLOY, "_matching_inflight_deploy_job", return_value=existing
+        ), patch.object(SELF_DEPLOY.base, "_append_audit") as audit:
+            result = SELF_DEPLOY.grabowski_runtime_deploy_schedule(
+                expected,
+                8,
+                str(requested_repo),
+                "task:deploy-requested",
+            )
+        self.assertTrue(result["already_scheduled"])
+        self.assertEqual(
+            requested_identity["identity_sha256"],
+            result["source_identity_sha256"],
+        )
+        self.assertEqual("1" * 64, result["effective_source_identity_sha256"])
+        self.assertTrue(result["reused_across_source_identity"])
+        observed = audit.call_args.args[0]
+        self.assertEqual("1" * 64, observed["effective_source_identity_sha256"])
+        self.assertTrue(observed["reused_across_source_identity"])
+
     def test_deploy_identity_accepts_canonical_options_in_any_order(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
         runner = repo / "tools/run_scheduled_deploy.py"
@@ -731,6 +785,61 @@ class SelfDeployToolTests(unittest.TestCase):
         self.assertEqual("running", result["final_status"])
         self.assertEqual(6, result["delay_seconds"])
         self.assertEqual(expected_receipt["metadata_path"], result["metadata_path"])
+
+    def test_matching_inflight_job_reuses_same_target_across_source_worktrees(self) -> None:
+        canonical = Path("/home/alex/repos/grabowski")
+        first_repo = Path("/home/alex/repos/.grabowski-worktrees/deploy-first")
+        second_repo = Path("/home/alex/repos/.grabowski-worktrees/deploy-second")
+        head = "a" * 40
+        first_command = SELF_DEPLOY._deploy_command(
+            first_repo,
+            first_repo / "tools/run_scheduled_deploy.py",
+            head,
+            6,
+            canonical_repository=canonical,
+            source_kind="detached-worktree",
+            source_identity_sha256="1" * 64,
+        )
+        desired = SELF_DEPLOY._deploy_command(
+            second_repo,
+            second_repo / "tools/run_scheduled_deploy.py",
+            head,
+            8,
+            canonical_repository=canonical,
+            source_kind="detached-worktree",
+            source_identity_sha256="2" * 64,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            job_dir = root / "grabowski-job-abcdef012345"
+            job_dir.mkdir()
+            metadata = {
+                "argv": first_command,
+                "argv_sha256": SELF_DEPLOY.operator._argv_hash(first_command),
+                "cwd": str(first_repo),
+                "expected_receipt": {
+                    "unit": job_dir.name,
+                    "metadata_path": str(job_dir / "metadata.json"),
+                    "stdout_path": str(job_dir / "stdout.log"),
+                    "stderr_path": str(job_dir / "stderr.log"),
+                    "status_tool": "grabowski_job_status",
+                    "logs_tool": "grabowski_job_logs",
+                },
+            }
+            with patch.object(
+                SELF_DEPLOY.operator, "_jobs_root", return_value=root
+            ), patch.object(
+                SELF_DEPLOY.operator, "_read_job_metadata", return_value=metadata
+            ), patch.object(
+                SELF_DEPLOY.operator,
+                "grabowski_job_status",
+                return_value={"final_status": "running"},
+            ):
+                result = SELF_DEPLOY._matching_inflight_deploy_job(desired, second_repo)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(job_dir.name, result["unit"])
+        self.assertEqual("1" * 64, result["source_identity_sha256"])
 
     def test_matching_job_with_unclear_outcome_blocks_duplicate(self) -> None:
         repo = Path("/home/alex/repos/grabowski")
