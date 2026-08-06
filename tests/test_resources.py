@@ -3165,6 +3165,45 @@ class ResourceTests(unittest.TestCase):
         stored = resources.inspect_resource(f"repo:{self.root}")
         self.assertIsNotNone(stored)
 
+    def test_broad_repository_read_only_scope_skips_work_admission(self) -> None:
+        (self.root / ".git").mkdir()
+        scope = self.scope_manifest(
+            self.root,
+            name="read-only-admission",
+            path=self.root,
+            effects=["read"],
+        )
+        scope["worktree"] = str(self.root)
+        scope["paths"] = []
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            self.fail("read-only repository observation must not require work admission")
+
+        result = resources.acquire_resources(
+            "owner-a",
+            [f"repo:{self.root}"],
+            purpose="read-only repository observation",
+            ttl_seconds=60,
+            metadata={
+                "scope_manifest": scope,
+                "scope_manifest_complete": True,
+            },
+            admission_assessor=assessor,
+        )
+
+        self.assertEqual(
+            result["work_admission"],
+            [
+                {
+                    "repository": str(self.root.resolve()),
+                    "decision": "allow",
+                    "reason": "attested-read-only-scope",
+                    "read_only": True,
+                }
+            ],
+        )
+        self.assertIsNotNone(resources.inspect_resource(f"repo:{self.root}"))
+
     def test_broad_repository_full_scope_reaches_exact_checkout_admission(self) -> None:
         (self.root / ".git").mkdir()
         scoped_path = self.root / "src" / "example.py"
