@@ -340,6 +340,53 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             effectiveness.record_review_classification(parameters)
 
 
+    def test_review_classification_rejects_unrelated_corroborating_audit_ref(self) -> None:
+        evaluation = "8" * 64
+        decision_ref = _ref("d")
+        unrelated_ref = _ref("f")
+        records = [
+            _event(
+                "reposkop-evaluation-requested",
+                evaluation,
+                "1",
+                task_id="task-8",
+            ),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-8",
+                final_decision="block",
+            ),
+            {
+                "operation": "task-start",
+                "task_id": "different-task",
+                "transaction_id": "7" * 64,
+                "_audit_ref": unrelated_ref,
+            },
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "operational_failure",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "observation_completeness",
+            "reason_codes": ["observation_incomplete"],
+            "evidence_refs": [decision_ref, unrelated_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_raw_records",
+            return_value=(records, {}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "not bound to the reviewed evaluation or task",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+
     def test_review_classification_rejects_semantically_impossible_claim(self) -> None:
         evaluation = "b" * 64
         decision_ref = _ref("c")

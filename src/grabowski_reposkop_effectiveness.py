@@ -820,6 +820,7 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
         raise ReposkopReviewIntegrityError(
             "review evidence references are unavailable in the verified audit window"
         )
+    verified_corroborating: list[str] = []
     if classification not in {"neutral", "unresolved"}:
         verified_corroborating = [
             reference
@@ -863,6 +864,20 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
     task_id = (request or decision).get("task_id")
     if not isinstance(task_id, str) or not task_id:
         raise ReposkopReviewIntegrityError("Reposkop evaluation has no task binding")
+    if verified_corroborating:
+        correlated_corroborating = [
+            reference
+            for reference in verified_corroborating
+            if (
+                audit_records_by_ref[reference].get("evaluation_id") == evaluation
+                or audit_records_by_ref[reference].get("transaction_id") == evaluation
+                or audit_records_by_ref[reference].get("task_id") == task_id
+            )
+        ]
+        if not correlated_corroborating:
+            raise ReposkopReviewIntegrityError(
+                "corroborating audit evidence is not bound to the reviewed evaluation or task"
+            )
     final_decision = decision.get("final_decision")
     if final_decision not in {"allow", "block"}:
         raise ReposkopReviewIntegrityError("Reposkop decision outcome is unsupported")

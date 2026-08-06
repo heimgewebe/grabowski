@@ -16,7 +16,7 @@ Every required writer start records a baseline decision, final decision and stab
 
 The `reposkop-review-classification` grip records one evidence-bound append-only review. Supported classes are `confirmed_prevention`, `beneficial_context`, `neutral`, `false_positive`, `false_negative`, `operational_failure` and `unresolved`.
 
-Reviews are bound to the exact evaluation and decision audit reference. Revisions must explicitly supersede the latest review reference. Reviewer identity is hashed; evidence references and reason codes are bounded. Every material classification requires corroborating evidence beyond the decision itself, including at least one nontrivial reference that is actually present in the verified Grabowski audit window. A false-negative claim additionally requires an allowed evaluation and a declared detectable category.
+Reviews are bound to the exact evaluation and decision audit reference. Revisions must explicitly supersede the latest review reference. Reviewer identity is hashed; evidence references and reason codes are bounded. Every material classification requires corroborating evidence beyond the decision itself, including at least one nontrivial reference that is actually present in the verified Grabowski audit window and bound to the same evaluation or task. A false-negative claim additionally requires an allowed evaluation and a declared detectable category.
 
 ## Projection
 
