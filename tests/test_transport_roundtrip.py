@@ -662,12 +662,20 @@ class TransportRoundtripTests(_TransportHarness):
 
     def test_shared_unlabeled_scope_is_explicit_and_functional(self) -> None:
         begun = self.begin(scope=SHARED_SCOPE)
+        self.assertIn("action=execute", begun["recommended_next_action"])
+        self.assertNotIn("action=ack", begun["recommended_next_action"])
+        self.assertIn("unchanged target_arguments", begun["recommended_next_action"])
         reserved = self.reserve(begun["challenge_receipt_sha256"])
         consumed, _ = self.consume_reserved(begun["challenge_receipt_sha256"])
         self.assertEqual(reserved["client_scope_kind"], "shared_unlabeled")
         self.assertTrue(reserved["execution_capability_bound"])
         self.assertTrue(consumed["execution_capability_bound"])
         self.assertIn("authenticated client identity", consumed["does_not_establish"])
+
+    def test_declared_scope_begin_still_recommends_ack(self) -> None:
+        begun = self.begin(scope=META_SCOPE)
+        self.assertIn("action=ack", begun["recommended_next_action"])
+        self.assertNotIn("action=execute", begun["recommended_next_action"])
 
     def test_expired_challenge_fails_closed(self) -> None:
         begin = self.begin()

@@ -975,6 +975,20 @@ def _verified_projection(receipt: dict[str, Any]) -> tuple[str, bool, str]:
     )
 
 
+def _pending_challenge_next_action(scope: dict[str, str]) -> str:
+    """Return an executable next step for the caller's actual scope."""
+    if _is_shared_pool(scope):
+        return (
+            "call grip_run for transport-roundtrip with action=execute, the exact "
+            "challenge_receipt_sha256, target_tool_name, and unchanged "
+            "target_arguments; do not retry the target separately"
+        )
+    return (
+        "call grip_run for transport-roundtrip with action=ack and the "
+        "exact challenge_receipt_sha256"
+    )
+
+
 def _projection(
     *,
     state: dict[str, Any],
@@ -1022,10 +1036,7 @@ def _projection(
         projected_verified = None
         state_name = "challenge_pending"
         gate_open = False
-        next_action = (
-            "call grip_run for transport-roundtrip with action=ack and the "
-            "exact challenge_receipt_sha256"
-        )
+        next_action = _pending_challenge_next_action(scope)
     elif verified_current:
         # _current_receipts already dropped every unbound receipt, so no second
         # filter is needed here.
@@ -1037,10 +1048,7 @@ def _projection(
         projected_verified = None
         state_name = "challenge_pending"
         gate_open = False
-        next_action = (
-            "call grip_run for transport-roundtrip with action=ack and the "
-            "exact challenge_receipt_sha256"
-        )
+        next_action = _pending_challenge_next_action(scope)
     elif state["verified_receipts"] or state["pending_challenges"]:
         projected_pending = None
         projected_verified = None
