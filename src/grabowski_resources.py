@@ -4365,7 +4365,6 @@ def acquire_resources(
                 and existing["expires_at_unix"] > now
                 and existing.get("owner_id") != owner
             ):
-                assessor = admission_assessor or work_admission.require_repository_admission
                 requested_repository_scope = (
                     scope
                     if isinstance(scope, dict)
@@ -4383,6 +4382,20 @@ def acquire_resources(
                     expired_reentry_expectations[broad_key] = reentry_binding[
                         "expected_lease"
                     ]
+                if (
+                    requested_repository_scope is not None
+                    and set(requested_repository_scope["effects"]) == {"read"}
+                ):
+                    admission_evidence.append(
+                        {
+                            "repository": repository,
+                            "decision": "allow",
+                            "reason": "attested-read-only-scope",
+                            "read_only": True,
+                        }
+                    )
+                    continue
+                assessor = admission_assessor or work_admission.require_repository_admission
                 assessment = assessor(
                     mode=admission_mode,
                     repo=repository,
