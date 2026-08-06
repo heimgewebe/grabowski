@@ -560,8 +560,18 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             list(signature.parameters),
         )
         self.assertIsNone(signature.parameters["selector"].default)
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(
+            ValueError,
+            "candidate_id, event_id or idempotency_key.*binding checks",
+        ):
             intake.grabowski_bureau_candidate_assess()
+        with self.assertRaisesRegex(
+            ValueError,
+            "initiative and task_id are binding checks",
+        ):
+            intake.grabowski_bureau_candidate_assess(
+                initiative="INIT", task_id="INIT-T001"
+            )
         with self.assertRaises(ValueError):
             intake.grabowski_bureau_candidate_assess(
                 {"kind": "candidate_id", "candidate_id": 1}
