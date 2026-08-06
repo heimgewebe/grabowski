@@ -277,10 +277,35 @@ class CentralTransportGateTests(unittest.TestCase):
         ) as consume_verified:
             with self.assertRaisesRegex(
                 RuntimeError, "fresh intent-bound transport verification required"
-            ):
+            ) as raised:
                 asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
+        self.assertIn("action=ack", str(raised.exception))
+        self.assertIn("retry the exact mutation", str(raised.exception))
         consume_verified.assert_called_once_with(
             client_scope=META_SCOPE,
+            runtime_binding=BINDING,
+            tool_name="write",
+            arguments_sha256=roundtrip.canonical_arguments_sha256({}),
+        )
+        self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
+
+    def test_shared_unlabeled_call_directs_atomic_execute_not_ack(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace()
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+        ) as consume_verified:
+            with self.assertRaisesRegex(RuntimeError, "action=execute") as raised:
+                asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
+        message = str(raised.exception)
+        self.assertIn("target_tool_name=write", message)
+        self.assertIn("exact unchanged target_arguments", message)
+        self.assertIn("do not retry the target separately", message)
+        self.assertNotIn("action=ack", message)
+        consume_verified.assert_called_once_with(
+            client_scope=SHARED_SCOPE,
             runtime_binding=BINDING,
             tool_name="write",
             arguments_sha256=roundtrip.canonical_arguments_sha256({}),

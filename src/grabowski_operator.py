@@ -537,6 +537,14 @@ def _require_transport_roundtrip_for_tool(
             raise RuntimeError(
                 "transport handshake did not yield an exact pending challenge"
             ) from exc
+        if client_scope.get("kind") == "shared_unlabeled":
+            raise RuntimeError(
+                "fresh intent-bound transport verification required; call grip_run "
+                "for transport-roundtrip with action=execute, "
+                f"challenge_receipt_sha256={challenge}, "
+                f"target_tool_name={tool_name_text}, and the exact unchanged "
+                "target_arguments; do not retry the target separately"
+            ) from exc
         raise RuntimeError(
             "fresh intent-bound transport verification required; call grip_run "
             "for transport-roundtrip with action=ack and "
