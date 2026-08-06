@@ -3059,6 +3059,72 @@ class BureauPickupTests(unittest.TestCase):
         release.assert_not_called()
         self.assertTrue((run_dir / "lease-reacquire.json").is_file())
 
+    def test_request_binding_mismatch_replays_exact_journal(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        self.write_registry_bound_request(run_dir, normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        request_mismatch = {
+            "status": "failed",
+            "code": "state-error",
+            "detail": (
+                "request binding mismatch for existing assignment "
+                f"{intent['task_id']}: expected={'a' * 64} actual={'b' * 64}"
+            ),
+        }
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[request_mismatch, coordinated],
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-assignment", result["status"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
+        self.assertEqual(2, invoke.call_count)
+        self.assertIn("claim-intent", invoke.call_args_list[0].args[0])
+        self.assertIn("claim-coordination-status", invoke.call_args_list[1].args[0])
+        acquire.assert_not_called()
+
+    def test_request_binding_mismatch_rejects_nonmatching_journal(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, _acquisition = self.create_acquisition_journal(intent, lease)
+        normalized["capabilities"] = ["different-capability"]
+        self.write_registry_bound_request(run_dir, normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        request_mismatch = {
+            "status": "failed",
+            "code": "state-error",
+            "detail": (
+                "request binding mismatch for existing assignment "
+                f"{intent['task_id']}: expected={'a' * 64} actual={'b' * 64}"
+            ),
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=request_mismatch
+            ),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "claim-intent-state-error"
+            ):
+                pickup.grabowski_bureau_pickup_execute(request)
+        acquire.assert_not_called()
+
     def test_existing_assignment_rejects_self_consistent_misbound_acquisition(
         self,
     ) -> None:

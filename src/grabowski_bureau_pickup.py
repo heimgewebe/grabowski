@@ -2122,7 +2122,33 @@ def _journal_run_ids() -> list[str]:
             os.close(runs_descriptor)
 
 
-def _journaled_existing_assignment_after_runtime_drift(
+def _claim_rejection_allows_journal_replay(
+    error: BureauPickupError, request: dict[str, Any]
+) -> bool:
+    if error.code in {
+        "claim-intent-runtime-drift-blocked",
+        "claim-intent-stale-runtime-blocked",
+    }:
+        return True
+    if error.code != "claim-intent-state-error":
+        return False
+    detail = error.details.get("detail")
+    if not isinstance(detail, str):
+        return False
+    prefix = (
+        "request binding mismatch for existing assignment "
+        f"{request['task_id']}: "
+    )
+    if not detail.startswith(prefix):
+        return False
+    digests = detail[len(prefix) :]
+    match = re.fullmatch(
+        r"expected=([0-9a-f]{64}) actual=([0-9a-f]{64})", digests
+    )
+    return match is not None and match.group(1) != match.group(2)
+
+
+def _journaled_existing_assignment_after_claim_rejection(
     request: dict[str, Any],
     registry_binding: RegistryBinding,
 ) -> tuple[dict[str, Any], RegistryBinding, dict[str, Any], dict[str, Any]] | None:
@@ -2481,12 +2507,9 @@ def grabowski_bureau_pickup_execute(
     try:
         intent, existing = _validate_intent_result(intent_payload, normalized)
     except BureauPickupError as exc:
-        if exc.code not in {
-            "claim-intent-runtime-drift-blocked",
-            "claim-intent-stale-runtime-blocked",
-        }:
+        if not _claim_rejection_allows_journal_replay(exc, normalized):
             raise
-        replay = _journaled_existing_assignment_after_runtime_drift(
+        replay = _journaled_existing_assignment_after_claim_rejection(
             normalized, registry_binding
         )
         if replay is None:
