@@ -26,6 +26,7 @@ import grabowski_merge_guard
 Receipt = dict[str, Any]
 CommandRunner = Callable[[Path, list[str]], dict[str, Any]]
 GithubRunner = Callable[[Path, list[str]], dict[str, Any]]
+TransportTargetDispatcher = Callable[[str, dict[str, Any], str], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -326,12 +327,13 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
-        version="1.1",
+        version="2.0",
         summary=(
-            "Issue or acknowledge one challenge bound to the exact target tool and "
-            "canonical argument digest, so the central operator gate admits that one "
-            "mutation and nothing else. action=begin requires target_tool_name and "
-            "target_arguments; action=ack requires the exact challenge_receipt_sha256."
+            "Issue a private exact-target challenge or atomically execute its target. "
+            "action=begin requires target_tool_name and target_arguments; action=execute "
+            "requires the returned challenge plus the unchanged target. action=ack remains "
+            "available only for a stable client-declared scope and is fail-closed for "
+            "shared_unlabeled callers."
         ),
         effect=MUTATING,
         required_parameters=("action",),
@@ -592,10 +594,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
     ),
     "transport-roundtrip": (
         "run action=begin with the exact target_tool_name and target_arguments, then "
-        "action=ack with the returned challenge_receipt_sha256, then invoke that exact "
-        "unchanged call once; a verification admits only that target, is consumed before "
-        "the effect runs, changes no product target, and grants no retry authority after "
-        "a later ambiguous mutation"
+        "action=execute with the private challenge and unchanged target; the server "
+        "reserves, consumes and dispatches through the normal central gate in one bounded "
+        "operation. After an ambiguous target result, read back the target before any new "
+        "challenge; no transport receipt grants retry authority"
     ),
 }
 # Conditional requirements cannot be expressed as static required_parameters,
@@ -604,8 +606,10 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
         "an unbound begin is refused fail-closed",
-        "action=ack requires challenge_receipt_sha256 and must not carry "
-        "target_tool_name or target_arguments",
+        "action=execute requires challenge_receipt_sha256, target_tool_name and "
+        "target_arguments together and dispatches the target through the normal MCP gate",
+        "action=ack requires challenge_receipt_sha256 and must not carry target fields; "
+        "shared_unlabeled callers are refused and must use action=execute",
     ),
 }
 MECHANIC_NORMAL_GRIPS = frozenset(
@@ -2840,6 +2844,7 @@ def _run_transport_roundtrip(
     parameters: dict[str, Any],
     receipt: Receipt,
     runner: CommandRunner,
+    target_dispatcher: TransportTargetDispatcher | None = None,
 ) -> dict[str, Any]:
     del spec, runner
     allowed = {
@@ -2858,8 +2863,8 @@ def _run_transport_roundtrip(
     action = parameters.get("action")
     client_scope = parameters.get("_server_transport_client_scope")
     runtime_binding = parameters.get("_server_transport_runtime_binding")
-    if action not in {"begin", "ack"}:
-        raise GripPreflightError("action must be begin or ack")
+    if action not in {"begin", "ack", "execute"}:
+        raise GripPreflightError("action must be begin, ack or execute")
     try:
         scope = grabowski_transport_roundtrip.validate_client_scope(client_scope)
         binding = grabowski_transport_roundtrip.validate_runtime_binding(
@@ -2870,44 +2875,142 @@ def _run_transport_roundtrip(
                 raise GripPreflightError(
                     "action=begin must not include challenge_receipt_sha256"
                 )
-            target_tool_present = "target_tool_name" in parameters
-            target_arguments_present = "target_arguments" in parameters
-            if not (target_tool_present and target_arguments_present):
-                # Conditional requirement: an unbound begin would authorize
-                # nothing and would only occupy the bounded pool.
-                raise GripPreflightError(
-                    "action=begin requires target_tool_name and target_arguments together"
-                )
             target_tool_name = parameters.get("target_tool_name")
             target_arguments = parameters.get("target_arguments")
             if not isinstance(target_tool_name, str):
-                raise GripPreflightError("target_tool_name must be text")
+                raise GripPreflightError(
+                    "action=begin requires target_tool_name as text"
+                )
             if not isinstance(target_arguments, dict):
-                raise GripPreflightError("target_arguments must be an object")
-            mutation_intent = {
-                "tool_name": target_tool_name,
-                "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
-                    target_arguments
-                ),
-            }
+                raise GripPreflightError(
+                    "action=begin requires target_arguments as an object"
+                )
             output = grabowski_transport_roundtrip.begin(
                 client_scope=scope,
                 runtime_binding=binding,
-                mutation_intent=mutation_intent,
+                mutation_intent={
+                    "tool_name": target_tool_name,
+                    "arguments_sha256": grabowski_transport_roundtrip.canonical_arguments_sha256(
+                        target_arguments
+                    ),
+                },
             )
-        else:
+        elif action == "ack":
             if "target_tool_name" in parameters or "target_arguments" in parameters:
                 raise GripPreflightError(
                     "action=ack must not include target_tool_name or target_arguments"
                 )
-            challenge_receipt_sha256 = parameters.get("challenge_receipt_sha256")
+            challenge_receipt_sha256 = parameters.get(
+                "challenge_receipt_sha256"
+            )
             if not isinstance(challenge_receipt_sha256, str):
-                raise GripPreflightError("action=ack requires challenge_receipt_sha256")
+                raise GripPreflightError(
+                    "action=ack requires challenge_receipt_sha256"
+                )
             output = grabowski_transport_roundtrip.acknowledge(
                 client_scope=scope,
                 challenge_receipt_sha256=challenge_receipt_sha256,
                 runtime_binding=binding,
             )
+        else:
+            challenge_receipt_sha256 = parameters.get(
+                "challenge_receipt_sha256"
+            )
+            target_tool_name = parameters.get("target_tool_name")
+            target_arguments = parameters.get("target_arguments")
+            if not isinstance(challenge_receipt_sha256, str):
+                raise GripPreflightError(
+                    "action=execute requires challenge_receipt_sha256"
+                )
+            if not isinstance(target_tool_name, str):
+                raise GripPreflightError(
+                    "action=execute requires target_tool_name as text"
+                )
+            if not isinstance(target_arguments, dict):
+                raise GripPreflightError(
+                    "action=execute requires target_arguments as an object"
+                )
+            if (
+                target_tool_name == "grip_run"
+                and target_arguments.get("name") == "transport-roundtrip"
+            ):
+                raise GripPreflightError(
+                    "atomic transport execution cannot recursively target itself"
+                )
+            if target_dispatcher is None:
+                raise GripPreflightError(
+                    "action=execute is available only through the registered MCP adapter"
+                )
+            arguments_sha256 = (
+                grabowski_transport_roundtrip.canonical_arguments_sha256(
+                    target_arguments
+                )
+            )
+            reservation = grabowski_transport_roundtrip.reserve_execution(
+                client_scope=scope,
+                challenge_receipt_sha256=challenge_receipt_sha256,
+                runtime_binding=binding,
+                tool_name=target_tool_name,
+                arguments_sha256=arguments_sha256,
+            )
+            try:
+                dispatched = target_dispatcher(
+                    target_tool_name, target_arguments, challenge_receipt_sha256
+                )
+            except Exception as exc:
+                revoked = grabowski_transport_roundtrip.revoke_execution_reservation(
+                    client_scope=scope,
+                    challenge_receipt_sha256=challenge_receipt_sha256,
+                    runtime_binding=binding,
+                )
+                detail = (
+                    "target dispatch failed before transport consumption"
+                    if revoked
+                    else "target dispatch failed after or during transport consumption"
+                )
+                raise GripActionError(
+                    f"{detail}: {type(exc).__name__}: {exc}"
+                ) from exc
+            execution = dispatched.get("execution")
+            if not isinstance(execution, dict):
+                grabowski_transport_roundtrip.revoke_execution_reservation(
+                    client_scope=scope,
+                    challenge_receipt_sha256=challenge_receipt_sha256,
+                    runtime_binding=binding,
+                )
+                raise GripActionError(
+                    "atomic target dispatcher returned no execution evidence"
+                )
+            consumed = execution.get("consumption_receipt_sha256")
+            target_error = dispatched.get("target_error")
+            if consumed is None:
+                grabowski_transport_roundtrip.revoke_execution_reservation(
+                    client_scope=scope,
+                    challenge_receipt_sha256=challenge_receipt_sha256,
+                    runtime_binding=binding,
+                )
+                raise GripActionError(
+                    "target returned without consuming the reserved transport capability"
+                )
+            output = {
+                **reservation,
+                "state": "executed" if target_error is None else "target_failed",
+                "atomic_execution_ready": False,
+                "mutation_gate_open": False,
+                "verification_receipt_sha256": execution.get(
+                    "verification_receipt_sha256"
+                ),
+                "consumption_receipt_sha256": consumed,
+                "target_result": dispatched.get("target_result"),
+                "target_error": target_error,
+                "application_result_observed": target_error is None,
+                "receipt_status": "passed" if target_error is None else "failed",
+                "does_not_establish": [
+                    "authenticated client identity",
+                    "absence of response loss after target execution",
+                    "retry authority after an ambiguous target result",
+                ],
+            }
     except grabowski_transport_roundtrip.TransportRoundtripError as exc:
         _check(receipt, "response-roundtrip", "fail", str(exc))
         raise GripPreflightError(str(exc)) from exc
@@ -2931,10 +3034,15 @@ def _run_transport_roundtrip(
         "pass",
         output["runtime_binding_sha256"],
     )
+    response_pass = bool(
+        output.get("mutation_gate_open")
+        or output.get("atomic_execution_ready")
+        or output.get("consumption_receipt_sha256")
+    )
     _check(
         receipt,
         "response-roundtrip",
-        "pass" if output["mutation_gate_open"] else "skip",
+        "pass" if response_pass else "skip",
         output["state"],
     )
     _check(
@@ -2943,8 +3051,10 @@ def _run_transport_roundtrip(
         "pass" if output.get("mutation_intent_bound") else "fail",
         f"{output.get('target_tool_name')}:{output.get('target_arguments_sha256')}",
     )
-    receipt_hash = output.get("verification_receipt_sha256") or output.get(
-        "challenge_receipt_sha256"
+    receipt_hash = (
+        output.get("consumption_receipt_sha256")
+        or output.get("verification_receipt_sha256")
+        or output.get("challenge_receipt_sha256")
     )
     _check(
         receipt,
@@ -2953,7 +3063,6 @@ def _run_transport_roundtrip(
         str(receipt_hash),
     )
     return output
-
 
 def _run_convergence_assess(
     spec: GripSpec,
@@ -8263,6 +8372,7 @@ def run_grip(
     allow_mutation: bool = False,
     command_runner: CommandRunner | None = None,
     github_runner: GithubRunner | None = None,
+    transport_target_dispatcher: TransportTargetDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     spec = GRIP_SPECS.get(name)
@@ -8306,6 +8416,14 @@ def run_grip(
                 receipt,
                 command,
                 github_runner or _default_github_runner,
+            )
+        elif spec.runner == "transport_roundtrip":
+            output = action(
+                spec,
+                parameters,
+                receipt,
+                command,
+                transport_target_dispatcher,
             )
         else:
             output = action(spec, parameters, receipt, command)
@@ -8450,6 +8568,7 @@ def grip_run(
     allow_mutation: bool = False,
     command_runner: CommandRunner | None = None,
     github_runner: GithubRunner | None = None,
+    transport_target_dispatcher: TransportTargetDispatcher | None = None,
 ) -> dict[str, Any]:
     parameters = dict(parameters or {})
     try:
@@ -8468,4 +8587,5 @@ def grip_run(
         allow_mutation=allow_mutation,
         command_runner=command_runner,
         github_runner=github_runner,
+        transport_target_dispatcher=transport_target_dispatcher,
     )

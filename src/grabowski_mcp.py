@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+import asyncio
 import base64
 import fcntl
 import hashlib
@@ -81,7 +82,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Before every mutating MCP call, run grip_run transport-roundtrip action begin with the exact target_tool_name and target_arguments, ack the exact returned challenge when required, then invoke that unchanged target once. A later ambiguous mutation still requires target readback before retry.",
+        "Before every mutating MCP call, run grip_run transport-roundtrip action=begin with the exact target_tool_name and target_arguments. For shared_unlabeled callers, continue with action=execute carrying the returned challenge and the unchanged target so reservation, consumption, and dispatch are atomic. A stable client-declared scope may action=ack and then invoke the unchanged target once. A later ambiguous mutation still requires target readback before retry.",
     ),
     (
         "typed-operation-preference",
@@ -10066,13 +10067,14 @@ def _captain_audit_completion(
     )
 
 
-@mcp.tool(name="grip_run", annotations=CREATE_ANNOTATIONS)
-def grip_run(
+def _grip_run_core(
     name: str,
     parameters: dict[str, Any] | None = None,
     profile: str = "operator",
     allow_mutation: bool = False,
     ctx: Context | None = None,
+    *,
+    transport_target_dispatcher: grabowski_grips.TransportTargetDispatcher | None = None,
 ) -> dict[str, Any]:
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
     _require_capability("terminal_execute")
@@ -10248,6 +10250,7 @@ def grip_run(
         dispatch_parameters,
         profile=profile,
         allow_mutation=allow_mutation,
+        transport_target_dispatcher=transport_target_dispatcher,
     )
     if name == "captain-run" and allow_mutation and captain_actor_identity is not None and captain_intent_audit is not None:
         try:
@@ -10270,6 +10273,136 @@ def grip_run(
                 "does_not_establish": ["audited_execution_completion"],
             }
     return result
+
+
+def grip_run(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    profile: str = "operator",
+    allow_mutation: bool = False,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Run one allowlisted grip synchronously for direct Python callers."""
+
+    return _grip_run_core(
+        name,
+        parameters,
+        profile,
+        allow_mutation,
+        ctx,
+    )
+
+
+def _transport_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _transport_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_transport_json_safe(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _transport_json_safe(model_dump(mode="json"))
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _transport_json_safe(to_dict())
+    return {
+        "type": type(value).__name__,
+        "text": str(value),
+    }
+
+
+def _transport_tool_result_error(value: Any) -> dict[str, Any] | None:
+    if getattr(value, "isError", False) is not True:
+        return None
+    return {
+        "type": type(value).__name__,
+        "message": "atomic transport target returned an MCP error result",
+        "structured_content": _transport_json_safe(
+            getattr(value, "structuredContent", None)
+        ),
+    }
+
+
+async def _dispatch_atomic_transport_target(
+    target_tool_name: str,
+    target_arguments: dict[str, Any],
+    challenge_receipt_sha256: str,
+    ctx: Context | None,
+) -> dict[str, Any]:
+    tool = mcp._tool_manager.get_tool(target_tool_name)
+    if tool is None:
+        raise RuntimeError(f"unknown atomic transport target: {target_tool_name}")
+    annotations = getattr(tool, "annotations", None)
+    if bool(getattr(annotations, "readOnlyHint", False)):
+        raise ValueError(
+            f"atomic transport target must be mutating: {target_tool_name}"
+        )
+    with grabowski_transport_roundtrip.execution_capability(
+        challenge_receipt_sha256
+    ) as execution_session:
+        try:
+            target_result = await mcp._tool_manager.call_tool(
+                target_tool_name,
+                dict(target_arguments),
+                ctx,
+            )
+            target_error = _transport_tool_result_error(target_result)
+        except Exception as exc:
+            target_result = None
+            target_error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+        execution = grabowski_transport_roundtrip.execution_capability_snapshot(
+            execution_session
+        )
+    return {
+        "target_result": _transport_json_safe(target_result),
+        "target_error": target_error,
+        "execution": execution,
+    }
+
+
+@mcp.tool(name="grip_run", annotations=CREATE_ANNOTATIONS)
+async def _grip_run_mcp(
+    name: str,
+    parameters: dict[str, Any] | None = None,
+    profile: str = "operator",
+    allow_mutation: bool = False,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Run one allowlisted Grabowski grip and return its receipt-bound result."""
+
+    _require_capability("terminal_execute")
+    loop = asyncio.get_running_loop()
+
+    def target_dispatcher(
+        target_tool_name: str,
+        target_arguments: dict[str, Any],
+        challenge_receipt_sha256: str,
+    ) -> dict[str, Any]:
+        future = asyncio.run_coroutine_threadsafe(
+            _dispatch_atomic_transport_target(
+                target_tool_name,
+                target_arguments,
+                challenge_receipt_sha256,
+                ctx,
+            ),
+            loop,
+        )
+        return future.result()
+
+    return await asyncio.to_thread(
+        lambda: _grip_run_core(
+            name,
+            parameters,
+            profile,
+            allow_mutation,
+            ctx,
+            transport_target_dispatcher=target_dispatcher,
+        )
+    )
 
 
 @mcp.tool(name="grabowski_task_archive_list", annotations=READ_ANNOTATIONS)

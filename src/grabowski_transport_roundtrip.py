@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import fcntl
 import hashlib
 import json
@@ -14,7 +15,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 STATE_KIND = "grabowski_transport_roundtrip_state"
 CHALLENGE_KIND = "grabowski_transport_roundtrip_challenge"
 VERIFICATION_KIND = "grabowski_transport_roundtrip_verification"
@@ -41,6 +42,10 @@ _RUNTIME_BINDING_KEYS = frozenset(
 _CLIENT_SCOPE_KEYS = frozenset({"kind", "label"})
 _CLIENT_SCOPE_KINDS = frozenset({"client_declared_meta", "shared_unlabeled"})
 _MUTATION_INTENT_KEYS = frozenset({"tool_name", "arguments_sha256"})
+_EXECUTION_CAPABILITY_KEY = "execution_capability_sha256"
+_EXECUTION_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "grabowski_transport_execution_context", default=None
+)
 _LEGACY_STATE_KEYS = frozenset(
     {
         "schema_version",
@@ -81,6 +86,22 @@ class TransportMutationIntentRequired(TransportRoundtripError):
     """Raised when a handshake is attempted without an exact target intent."""
 
 
+class TransportAtomicExecutionRequired(TransportRoundtripRequired):
+    """Raised when a shared caller must use the atomic execute action."""
+
+
+class TransportExecutionReservationConflict(TransportRoundtripRequired):
+    """Raised when an exact challenge already has an active execution reservation."""
+
+
+class TransportExecutionCapabilityRequired(TransportRoundtripRequired):
+    """Raised when a reserved verification is consumed outside its execution context."""
+
+
+class TransportExecutionCapabilityMismatch(TransportMutationIntentMismatch):
+    """Raised when an execution context does not own the exact reservation."""
+
+
 def _canonical_bytes(value: Any) -> bytes:
     try:
         return json.dumps(
@@ -98,6 +119,96 @@ def _canonical_bytes(value: Any) -> bytes:
 
 def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _execution_capability_sha256(challenge_receipt_sha256: Any) -> str:
+    challenge_hash = _validate_sha256(
+        challenge_receipt_sha256, label="transport execution challenge hash"
+    )
+    return hashlib.sha256(
+        ("grabowski-transport-execution-v1:" + challenge_hash).encode("ascii")
+    ).hexdigest()
+
+
+@contextmanager
+def execution_capability(
+    challenge_receipt_sha256: str,
+) -> Iterator[dict[str, Any]]:
+    """Bind one challenge-derived bearer capability to an in-process dispatch.
+
+    The plaintext challenge never enters target arguments or durable state. Its
+    digest is matched by consume_verified() through this ContextVar, so an
+    unrelated caller with the same tool and arguments cannot spend the
+    reservation. Nested atomic executions are refused to keep ownership
+    unambiguous.
+    """
+
+    capability_sha256 = _execution_capability_sha256(challenge_receipt_sha256)
+    if _EXECUTION_CONTEXT.get() is not None:
+        raise TransportExecutionCapabilityMismatch(
+            "nested transport execution capabilities are not allowed"
+        )
+    session: dict[str, Any] = {
+        "capability_sha256": capability_sha256,
+        "verification_receipt_sha256": None,
+        "consumption_receipt_sha256": None,
+    }
+    token = _EXECUTION_CONTEXT.set(session)
+    try:
+        yield session
+    finally:
+        _EXECUTION_CONTEXT.reset(token)
+
+
+def execution_capability_snapshot(session: Any) -> dict[str, str | None]:
+    if not isinstance(session, dict):
+        raise TransportExecutionCapabilityMismatch(
+            "transport execution session is invalid"
+        )
+    capability_sha256 = _validate_sha256(
+        session.get("capability_sha256"),
+        label="transport execution capability hash",
+    )
+    verification = session.get("verification_receipt_sha256")
+    consumption = session.get("consumption_receipt_sha256")
+    if verification is not None:
+        verification = _validate_sha256(
+            verification, label="transport execution verification receipt hash"
+        )
+    if consumption is not None:
+        consumption = _validate_sha256(
+            consumption, label="transport execution consumption receipt hash"
+        )
+    return {
+        "capability_sha256": capability_sha256,
+        "verification_receipt_sha256": verification,
+        "consumption_receipt_sha256": consumption,
+    }
+
+
+def _record_execution_consumption(
+    *,
+    capability_sha256: str,
+    verification_receipt_sha256: str,
+    consumption_receipt_sha256: str,
+) -> None:
+    session = _EXECUTION_CONTEXT.get()
+    if not isinstance(session, dict):
+        raise TransportExecutionCapabilityRequired(
+            "reserved transport verification requires its atomic execution context"
+        )
+    if not secrets.compare_digest(
+        str(session.get("capability_sha256")), capability_sha256
+    ):
+        raise TransportExecutionCapabilityMismatch(
+            "transport execution capability does not own this reservation"
+        )
+    if session.get("consumption_receipt_sha256") is not None:
+        raise TransportExecutionCapabilityMismatch(
+            "transport execution capability has already been consumed"
+        )
+    session["verification_receipt_sha256"] = verification_receipt_sha256
+    session["consumption_receipt_sha256"] = consumption_receipt_sha256
 
 
 def canonical_arguments_sha256(arguments: Any) -> str:
@@ -131,6 +242,17 @@ def _receipt_mutation_intent(receipt: dict[str, Any]) -> dict[str, str] | None:
         raise TransportRoundtripError("transport receipt mutation intent is incomplete")
     return validate_mutation_intent(
         {key: receipt[key] for key in _MUTATION_INTENT_KEYS}
+    )
+
+
+def _receipt_execution_capability_sha256(
+    receipt: dict[str, Any],
+) -> str | None:
+    value = receipt.get(_EXECUTION_CAPABILITY_KEY)
+    if value is None:
+        return None
+    return _validate_sha256(
+        value, label="transport execution capability hash"
     )
 
 
@@ -493,6 +615,7 @@ def _validate_receipt_sequence(
                     "transport verification pool reuses one challenge"
                 )
             challenge_hashes.add(challenge_hash)
+            _receipt_execution_capability_sha256(validated)
         _receipt_mutation_intent(validated)
         receipts.append(validated)
     return receipts
@@ -507,6 +630,12 @@ def _legacy_state_to_current(
     consumption = state.get("last_consumption_receipt")
     pending_values = [] if pending is None else [pending]
     verified_values = [] if verified is None else [verified]
+    if _is_shared_pool(scope):
+        verified_values = [
+            receipt
+            for receipt in verified_values
+            if _receipt_execution_capability_sha256(receipt) is not None
+        ]
     _validate_receipt_sequence(
         pending_values,
         expected_kind=CHALLENGE_KIND,
@@ -528,6 +657,43 @@ def _legacy_state_to_current(
         "client_scope_kind": state["client_scope_kind"],
         "pending_challenges": pending_values,
         "verified_receipts": verified_values,
+        "last_consumption_receipt": consumption,
+    }
+
+
+def _state_v2_to_current(
+    state: dict[str, Any], *, scope: dict[str, str]
+) -> dict[str, Any]:
+    """Migrate exact-intent v2 state and discard transferable shared proofs."""
+
+    _validate_state_identity(state, scope=scope, schema_version=2)
+    shared = _is_shared_pool(scope)
+    pending = _validate_receipt_sequence(
+        state.get("pending_challenges"),
+        expected_kind=CHALLENGE_KIND,
+        scope=scope,
+        maximum=MAX_SHARED_PENDING_CHALLENGES if shared else 1,
+    )
+    verified = _validate_receipt_sequence(
+        state.get("verified_receipts"),
+        expected_kind=VERIFICATION_KIND,
+        scope=scope,
+        maximum=MAX_SHARED_VERIFIED_RECEIPTS if shared else 1,
+    )
+    if shared:
+        verified = [
+            receipt
+            for receipt in verified
+            if _receipt_execution_capability_sha256(receipt) is not None
+        ]
+    consumption = state.get("last_consumption_receipt")
+    if consumption is not None:
+        _validate_consumption_receipt(consumption, scope=scope)
+    return {
+        **state,
+        "schema_version": STATE_SCHEMA_VERSION,
+        "pending_challenges": pending,
+        "verified_receipts": verified,
         "last_consumption_receipt": consumption,
     }
 
@@ -564,6 +730,8 @@ def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
         and set(state) == _LEGACY_STATE_KEYS
     ):
         return _legacy_state_to_current(state, scope=scope)
+    if state.get("schema_version") == 2 and set(state) == _STATE_KEYS:
+        return _state_v2_to_current(state, scope=scope)
     if set(state) != _STATE_KEYS:
         raise TransportRoundtripError(
             "transport roundtrip state contract mismatch"
@@ -621,6 +789,7 @@ def _receipt_is_current(
 def _current_receipts(
     receipts: list[dict[str, Any]],
     *,
+    scope: dict[str, str],
     runtime_binding: dict[str, str],
     now_unix: int,
 ) -> list[dict[str, Any]]:
@@ -634,6 +803,11 @@ def _current_receipts(
         receipt
         for receipt in receipts
         if _receipt_mutation_intent(receipt) is not None
+        and (
+            receipt.get("kind") != VERIFICATION_KIND
+            or not _is_shared_pool(scope)
+            or _receipt_execution_capability_sha256(receipt) is not None
+        )
         and _receipt_is_current(
             receipt,
             runtime_binding=runtime_binding,
@@ -652,6 +826,7 @@ def _receipt_order(receipt: dict[str, Any]) -> tuple[int, str]:
 def _prune_state(
     state: dict[str, Any],
     *,
+    scope: dict[str, str],
     runtime_binding: dict[str, str],
     now_unix: int,
 ) -> dict[str, Any]:
@@ -659,11 +834,13 @@ def _prune_state(
         **state,
         "pending_challenges": _current_receipts(
             state["pending_challenges"],
+            scope=scope,
             runtime_binding=runtime_binding,
             now_unix=now_unix,
         ),
         "verified_receipts": _current_receipts(
             state["verified_receipts"],
+            scope=scope,
             runtime_binding=runtime_binding,
             now_unix=now_unix,
         ),
@@ -738,6 +915,7 @@ def _new_verification(
     challenge_sha256: str,
     previous_verification: dict[str, Any] | None,
     mutation_intent: dict[str, str] | None,
+    execution_capability_sha256: str | None = None,
 ) -> dict[str, Any]:
     verification = _receipt_base(
         kind=VERIFICATION_KIND,
@@ -758,6 +936,11 @@ def _new_verification(
     )
     if mutation_intent is not None:
         verification.update(mutation_intent)
+    if execution_capability_sha256 is not None:
+        verification[_EXECUTION_CAPABILITY_KEY] = _validate_sha256(
+            execution_capability_sha256,
+            label="transport execution capability hash",
+        )
     verification["receipt_sha256"] = _receipt_sha256(verification)
     return verification
 
@@ -775,6 +958,12 @@ def _verified_projection(receipt: dict[str, Any]) -> tuple[str, bool, str]:
     gate that opens for an unbound receipt.
     """
     if _receipt_mutation_intent(receipt) is not None:
+        if _receipt_execution_capability_sha256(receipt) is not None:
+            return (
+                "execution_reserved",
+                False,
+                "dispatch the exact target inside the private atomic execution context",
+            )
         return "verified", True, "invoke exactly one mutating tool"
     return (
         "unbound_verification",
@@ -800,6 +989,7 @@ def _projection(
     pending_current = sorted(
         _current_receipts(
             state["pending_challenges"],
+            scope=scope,
             runtime_binding=runtime_binding,
             now_unix=now_unix,
         ),
@@ -808,6 +998,7 @@ def _projection(
     verified_current = sorted(
         _current_receipts(
             state["verified_receipts"],
+            scope=scope,
             runtime_binding=runtime_binding,
             now_unix=now_unix,
         ),
@@ -884,6 +1075,10 @@ def _projection(
         if projected_receipt is not None
         else None
     )
+    execution_capability_bound = bool(
+        projected_verified is not None
+        and _receipt_execution_capability_sha256(projected_verified) is not None
+    )
     if projected_intent is not None and gate_open:
         next_action = (
             "invoke exactly one bound mutating tool: " + projected_intent["tool_name"]
@@ -914,7 +1109,9 @@ def _projection(
         "replayed": replayed,
         "mutation_gate_open": gate_open,
         "single_use": True,
-        "pool_mode": ("bounded-shared-token-pool" if shared else "single-slot"),
+        "pool_mode": (
+            "bounded-shared-capability-pool" if shared else "single-slot"
+        ),
         "pending_challenge_count": len(pending_current),
         "verified_receipt_count": len(verified_current),
         "pool_limits": (
@@ -931,6 +1128,8 @@ def _projection(
         "client_scope_kind": scope["kind"],
         "client_scope_sha256": _sha256_json(scope),
         "mutation_intent_bound": projected_intent is not None,
+        "execution_capability_bound": execution_capability_bound,
+        "atomic_execution_ready": execution_capability_bound,
         "target_tool_name": projected_intent["tool_name"]
         if projected_intent is not None
         else None,
@@ -939,7 +1138,7 @@ def _projection(
         else None,
         "challenge_receipt_sha256": (
             projected_pending.get("receipt_sha256")
-            if projected_pending is not None
+            if action == "begin" and selected_pending_current is not None
             else None
         ),
         "challenge_created_at_unix": (
@@ -999,13 +1198,17 @@ def begin(
     with _state_lock():
         state = _prune_state(
             _load_state(scope),
+            scope=scope,
             runtime_binding=binding,
             now_unix=timestamp,
         )
         verified = sorted(state["verified_receipts"], key=_receipt_order)
         pending = sorted(state["pending_challenges"], key=_receipt_order)
         shared = _is_shared_pool(scope)
-        if not shared or intent is not None:
+        # A shared unlabeled caller is not an identity. Replaying a pending
+        # challenge for an identical intent would disclose another caller's
+        # bearer capability, so every shared begin gets a fresh challenge.
+        if not shared:
             matching_verified = [
                 receipt
                 for receipt in verified
@@ -1094,6 +1297,12 @@ def acknowledge(
                 "intent and cannot be replayed; begin a new handshake with "
                 "target_tool_name and target_arguments"
             )
+        if _is_shared_pool(scope):
+            raise TransportAtomicExecutionRequired(
+                "shared_unlabeled transport cannot acknowledge into a transferable "
+                "verification; use action=execute with the exact challenge, target "
+                "tool and target arguments"
+            )
         if existing is not None and _receipt_is_current(
             existing,
             runtime_binding=binding,
@@ -1142,6 +1351,7 @@ def acknowledge(
 
         state = _prune_state(
             loaded,
+            scope=scope,
             runtime_binding=binding,
             now_unix=timestamp,
         )
@@ -1186,6 +1396,161 @@ def acknowledge(
             replayed=False,
             selected_verified=verification,
         )
+
+def reserve_execution(
+    *,
+    client_scope: dict[str, Any],
+    challenge_receipt_sha256: str,
+    runtime_binding: dict[str, Any],
+    tool_name: str,
+    arguments_sha256: str,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Reserve one verified challenge for bearer-bound in-process execution."""
+
+    scope = validate_client_scope(client_scope)
+    challenge_hash = _validate_sha256(
+        challenge_receipt_sha256, label="challenge_receipt_sha256"
+    )
+    binding = validate_runtime_binding(runtime_binding)
+    name = _validate_text(
+        tool_name, label="transport mutation tool name", maximum_bytes=256
+    )
+    arguments_hash = _validate_sha256(
+        arguments_sha256, label="transport mutation arguments hash"
+    )
+    requested_intent = {"tool_name": name, "arguments_sha256": arguments_hash}
+    capability_sha256 = _execution_capability_sha256(challenge_hash)
+    timestamp = _timestamp(now_unix)
+    with _state_lock():
+        loaded = _load_state(scope)
+        existing = _verification_for_challenge(
+            loaded["verified_receipts"], challenge_hash
+        )
+        if existing is not None:
+            if not _receipt_is_current(
+                existing, runtime_binding=binding, now_unix=timestamp
+            ):
+                raise TransportRoundtripError(
+                    "transport execution reservation is stale or runtime-bound elsewhere"
+                )
+            if _receipt_mutation_intent(existing) != requested_intent:
+                raise TransportExecutionCapabilityMismatch(
+                    "transport execution reservation targets another exact mutation"
+                )
+            if _receipt_execution_capability_sha256(existing) != capability_sha256:
+                raise TransportExecutionCapabilityMismatch(
+                    "transport execution reservation capability mismatch"
+                )
+            return _projection(
+                state=loaded,
+                scope=scope,
+                runtime_binding=binding,
+                now_unix=timestamp,
+                action="execute",
+                replayed=True,
+                selected_verified=existing,
+            )
+        pending = _receipt_for_hash(loaded["pending_challenges"], challenge_hash)
+        if pending is None:
+            raise TransportRoundtripError(
+                "transport challenge is missing; begin a new handshake"
+            )
+        if pending.get("runtime_binding") != binding:
+            raise TransportRoundtripError(
+                "transport challenge is bound to a different runtime"
+            )
+        if not _receipt_is_current(
+            pending, runtime_binding=binding, now_unix=timestamp
+        ):
+            raise TransportRoundtripError(
+                "transport challenge is stale; begin a new handshake"
+            )
+        if _receipt_mutation_intent(pending) != requested_intent:
+            raise TransportMutationIntentMismatch(
+                "transport challenge is not bound to the requested atomic mutation"
+            )
+        state = _prune_state(
+            loaded, scope=scope, runtime_binding=binding, now_unix=timestamp
+        )
+        current_verified = sorted(state["verified_receipts"], key=_receipt_order)
+        if (
+            _is_shared_pool(scope)
+            and len(current_verified) >= MAX_SHARED_VERIFIED_RECEIPTS
+        ):
+            raise TransportRoundtripRequired(
+                "shared transport verified receipt pool is full"
+            )
+        previous = current_verified[-1] if current_verified else None
+        verification = _new_verification(
+            scope=scope,
+            runtime_binding=binding,
+            timestamp=timestamp,
+            challenge_sha256=challenge_hash,
+            previous_verification=previous,
+            mutation_intent=requested_intent,
+            execution_capability_sha256=capability_sha256,
+        )
+        remaining_pending = [
+            item
+            for item in state["pending_challenges"]
+            if item.get("receipt_sha256") != challenge_hash
+        ]
+        state = {
+            **state,
+            "pending_challenges": remaining_pending if _is_shared_pool(scope) else [],
+            "verified_receipts": (
+                [*current_verified, verification]
+                if _is_shared_pool(scope)
+                else [verification]
+            ),
+        }
+        _write_private_json(_state_path(_sha256_json(scope)), state)
+        return _projection(
+            state=state,
+            scope=scope,
+            runtime_binding=binding,
+            now_unix=timestamp,
+            action="execute",
+            replayed=False,
+            selected_verified=verification,
+        )
+
+
+def revoke_execution_reservation(
+    *,
+    client_scope: dict[str, Any],
+    challenge_receipt_sha256: str,
+    runtime_binding: dict[str, Any],
+) -> bool:
+    """Remove an unconsumed exact reservation after pre-effect dispatch failure."""
+
+    scope = validate_client_scope(client_scope)
+    challenge_hash = _validate_sha256(
+        challenge_receipt_sha256, label="challenge_receipt_sha256"
+    )
+    binding = validate_runtime_binding(runtime_binding)
+    capability_sha256 = _execution_capability_sha256(challenge_hash)
+    with _state_lock():
+        state = _load_state(scope)
+        remaining: list[dict[str, Any]] = []
+        removed = False
+        for receipt in state["verified_receipts"]:
+            if (
+                receipt.get("challenge_receipt_sha256") == challenge_hash
+                and receipt.get("runtime_binding") == binding
+                and _receipt_execution_capability_sha256(receipt)
+                == capability_sha256
+            ):
+                removed = True
+                continue
+            remaining.append(receipt)
+        if not removed:
+            return False
+        state = {**state, "verified_receipts": remaining}
+        _write_private_json(_state_path(_sha256_json(scope)), state)
+        return True
+
 
 def status(
     *,
@@ -1258,10 +1623,22 @@ def consume_verified(
         arguments_sha256,
         label="transport mutation arguments hash",
     )
+    execution_session = _EXECUTION_CONTEXT.get()
+    execution_capability_sha256: str | None = None
+    if execution_session is not None:
+        if not isinstance(execution_session, dict):
+            raise TransportExecutionCapabilityMismatch(
+                "transport execution context is invalid"
+            )
+        execution_capability_sha256 = _validate_sha256(
+            execution_session.get("capability_sha256"),
+            label="transport execution capability hash",
+        )
     timestamp = _timestamp(now_unix)
     with _state_lock():
         state = _prune_state(
             _load_state(scope),
+            scope=scope,
             runtime_binding=binding,
             now_unix=timestamp,
         )
@@ -1272,16 +1649,15 @@ def consume_verified(
             )
         requested_intent = {"tool_name": name, "arguments_sha256": arguments_hash}
         exact = [
-            r
-            for r in verified_receipts
-            if _receipt_mutation_intent(r) == requested_intent
+            receipt
+            for receipt in verified_receipts
+            if _receipt_mutation_intent(receipt) == requested_intent
         ]
         if not exact:
-            # An unbound verification must never authorize a mutation. Selecting
-            # one would let any handshake admit any target, which is the whole
-            # defect this gate exists to prevent.
             bound_count = sum(
-                1 for r in verified_receipts if _receipt_mutation_intent(r) is not None
+                1
+                for receipt in verified_receipts
+                if _receipt_mutation_intent(receipt) is not None
             )
             unbound_count = len(verified_receipts) - bound_count
             raise TransportMutationIntentMismatch(
@@ -1292,8 +1668,36 @@ def consume_verified(
                 f"unbound_verifications={unbound_count}; "
                 "unbound verifications cannot authorize any mutation"
             )
-        verified = exact[0]
+        if execution_capability_sha256 is not None:
+            matching = [
+                receipt
+                for receipt in exact
+                if _receipt_execution_capability_sha256(receipt)
+                == execution_capability_sha256
+            ]
+            if not matching:
+                raise TransportExecutionCapabilityMismatch(
+                    "atomic transport capability is not bound to this exact reservation"
+                )
+            verified = matching[0]
+        else:
+            unreserved = [
+                receipt
+                for receipt in exact
+                if _receipt_execution_capability_sha256(receipt) is None
+            ]
+            if not unreserved:
+                if _is_shared_pool(scope):
+                    raise TransportAtomicExecutionRequired(
+                        "shared_unlabeled mutation requires action=execute; a direct "
+                        "target call cannot consume another caller's reservation"
+                    )
+                raise TransportExecutionCapabilityRequired(
+                    "reserved transport verification requires its atomic execution context"
+                )
+            verified = unreserved[0]
         verification_intent = _receipt_mutation_intent(verified)
+        reserved_capability_sha256 = _receipt_execution_capability_sha256(verified)
         consumption = _receipt_base(
             kind=CONSUMPTION_KIND,
             scope=scope,
@@ -1308,6 +1712,8 @@ def consume_verified(
                 "arguments_sha256": arguments_hash,
             }
         )
+        if reserved_capability_sha256 is not None:
+            consumption[_EXECUTION_CAPABILITY_KEY] = reserved_capability_sha256
         consumption["receipt_sha256"] = _receipt_sha256(consumption)
         if _is_shared_pool(scope):
             remaining_verified = [
@@ -1326,6 +1732,12 @@ def consume_verified(
             "last_consumption_receipt": consumption,
         }
         _write_private_json(_state_path(_sha256_json(scope)), state)
+        if reserved_capability_sha256 is not None:
+            _record_execution_consumption(
+                capability_sha256=reserved_capability_sha256,
+                verification_receipt_sha256=str(verified["receipt_sha256"]),
+                consumption_receipt_sha256=str(consumption["receipt_sha256"]),
+            )
         does_not_establish = [
             "authenticated client identity",
             "application-level success of the admitted mutation",
@@ -1337,9 +1749,9 @@ def consume_verified(
         if _is_shared_pool(scope):
             does_not_establish.extend(
                 [
-                    "which unlabeled caller supplied the consumed verification",
-                    "caller identity: shared_unlabeled is a shared storage "
-                    "partition, not an identity",
+                    "caller identity: shared_unlabeled remains a storage partition, "
+                    "while admission is bound only to possession of the private challenge",
+                    "resistance to compromised same-uid code that can read private state",
                 ]
             )
         return {
@@ -1348,7 +1760,9 @@ def consume_verified(
             "state": "consumed",
             "single_use": True,
             "pool_mode": (
-                "bounded-shared-token-pool" if _is_shared_pool(scope) else "single-slot"
+                "bounded-shared-capability-pool"
+                if _is_shared_pool(scope)
+                else "single-slot"
             ),
             "pending_challenge_count": len(remaining_pending),
             "verified_receipt_count": len(remaining_verified),
@@ -1360,5 +1774,6 @@ def consume_verified(
             "tool_name": name,
             "arguments_sha256": arguments_hash,
             "verification_was_intent_bound": verification_intent is not None,
+            "execution_capability_bound": reserved_capability_sha256 is not None,
             "does_not_establish": does_not_establish,
         }
