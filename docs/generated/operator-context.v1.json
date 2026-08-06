@@ -3170,7 +3170,7 @@
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
       "src/grabowski_bureau_intake.py": "711ae16feab59e85e4561c254a914b828712bc98ad6314ba1904b7aa7551806e",
       "src/grabowski_bureau_leases.py": "2643dad66c4e35f3c18a5e7a11f809b17c15ef6afa497c61dcf41b27e3eeb218",
-      "src/grabowski_bureau_pickup.py": "923f92c4a3bf4b0fbc7146d59d4344720308a7298db8eb12f14e0d0ab9f90714",
+      "src/grabowski_bureau_pickup.py": "a0e2d1b8d7b0cf9ede5ec8221f1b1265479732c8e31b0e8e78c662f65e9a072f",
       "src/grabowski_capabilities.py": "59af47eff107866ebb8d2d6a452658a8e1608a661a67d4cd0cab73b2bd3240bf",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",

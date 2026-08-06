@@ -57,7 +57,6 @@ class BureauPickupTests(unittest.TestCase):
             "grabowski_bureau_pickup_execute": "MUTATING",
             "grabowski_bureau_pickup_status": "READ_ONLY",
             "grabowski_bureau_pickup_release": "MUTATING",
-            "grabowski_bureau_pickup_orphan_reconcile": "MUTATING",
         }
         observed: dict[str, str] = {}
         for node in tree.body:

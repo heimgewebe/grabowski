@@ -3580,7 +3580,6 @@ def _assert_owner_leases_unchanged_or_absent(
                 details={"resource_key": key},
             )
 
-@mcp.tool(name="grabowski_bureau_pickup_orphan_reconcile", annotations=MUTATING)
 def grabowski_bureau_pickup_orphan_reconcile(
     request: BureauPickupOrphanReconcileRequest,
 ) -> dict[str, Any]:
