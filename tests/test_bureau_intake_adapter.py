@@ -443,6 +443,80 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertEqual(result["status"], "recorded")
         self.assertEqual(request_path.stem, result["adapter_request_sha256"])
 
+    def test_candidate_record_exposes_exact_ambiguous_readback_selector(self) -> None:
+        request = {
+            "schema_version": 1,
+            "idempotency_key": " conversation:bounty:path-b:v1 ",
+            "title": "Authorized bounty path",
+            "source_kind": "conversation",
+            "desired_outcome": "Create one task",
+        }
+        failure = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_intake_adapter_failure",
+            "code": "bureau-command-rejected",
+            "effect_started": True,
+            "retryable": False,
+            "ambiguity": True,
+            "required_readback": ["candidate_by_idempotency_key"],
+            "details": {},
+        }
+        with mock.patch.object(intake, "_invoke_bureau", return_value=failure):
+            result = intake.grabowski_bureau_candidate_record(request)
+        self.assertEqual(
+            result["readback_selector"],
+            {
+                "kind": "idempotency_key",
+                "idempotency_key": "conversation:bounty:path-b:v1",
+            },
+        )
+
+    def test_candidate_record_omits_unusable_ambiguous_readback_selector(self) -> None:
+        request = {
+            "schema_version": 1,
+            "idempotency_key": "conversation:bounty:path-b:v1",
+            "title": "Authorized bounty path",
+            "source_kind": "conversation",
+            "desired_outcome": "Create one task",
+        }
+        failure = {
+            "schema_version": 1,
+            "kind": "grabowski_bureau_intake_adapter_failure",
+            "code": "bureau-output-invalid",
+            "effect_started": True,
+            "retryable": False,
+            "ambiguity": True,
+            "required_readback": None,
+            "details": {},
+        }
+        with mock.patch.object(intake, "_invoke_bureau", return_value=failure):
+            result = intake.grabowski_bureau_candidate_record(request)
+        self.assertNotIn("readback_selector", result)
+
+    def test_candidate_assess_supports_idempotency_key_readback(self) -> None:
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={"kind": "bureau_candidate_assessment"},
+        ) as invoke:
+            result = intake.grabowski_bureau_candidate_assess(
+                {
+                    "kind": "idempotency_key",
+                    "idempotency_key": "conversation:bounty:path-b:v1",
+                }
+            )
+        self.assertEqual(result["kind"], "bureau_candidate_assessment")
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--idempotency-key",
+                "conversation:bounty:path-b:v1",
+            ],
+            invoke.call_args.args[0],
+        )
+
     def test_candidate_record_preserves_bureau_refinement_failure(self) -> None:
         request = {
             "schema_version": 1,
@@ -479,6 +553,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                 "expected_task_id",
                 "candidate_id",
                 "event_id",
+                "idempotency_key",
                 "initiative",
                 "task_id",
             ],
@@ -537,6 +612,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
                 "expected_task_id",
                 "candidate_id",
                 "event_id",
+                "idempotency_key",
                 "initiative",
                 "task_id",
             },
@@ -547,6 +623,7 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             {
                 "#/$defs/BureauCandidateIdSelector",
                 "#/$defs/BureauEventIdSelector",
+                "#/$defs/BureauIdempotencyKeySelector",
             },
             {
                 variant["$ref"]
@@ -556,14 +633,25 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         )
         candidate = schema["$defs"]["BureauCandidateIdSelector"]
         event = schema["$defs"]["BureauEventIdSelector"]
+        idempotency = schema["$defs"]["BureauIdempotencyKeySelector"]
         self.assertFalse(candidate["additionalProperties"])
         self.assertFalse(event["additionalProperties"])
+        self.assertFalse(idempotency["additionalProperties"])
         self.assertEqual({"kind", "candidate_id"}, set(candidate["required"]))
         self.assertEqual({"kind", "event_id"}, set(event["required"]))
+        self.assertEqual(
+            {"kind", "idempotency_key"}, set(idempotency["required"])
+        )
         self.assertEqual("candidate_id", candidate["properties"]["kind"]["const"])
         self.assertEqual("event_id", event["properties"]["kind"]["const"])
+        self.assertEqual(
+            "idempotency_key", idempotency["properties"]["kind"]["const"]
+        )
         self.assertEqual("string", candidate["properties"]["candidate_id"]["type"])
         self.assertEqual("integer", event["properties"]["event_id"]["type"])
+        self.assertEqual(
+            "string", idempotency["properties"]["idempotency_key"]["type"]
+        )
 
     def test_candidate_assess_accepts_stale_published_connector_shape(self) -> None:
         if not hasattr(intake.mcp, "_tool_manager"):
@@ -600,6 +688,38 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             invoke.call_args.args[0],
         )
 
+    def test_candidate_assess_accepts_flat_idempotency_key_shape(self) -> None:
+        if not hasattr(intake.mcp, "_tool_manager"):
+            self.skipTest("real FastMCP unavailable in dependency-free validation")
+        with mock.patch.object(
+            intake,
+            "_invoke_bureau",
+            return_value={"kind": "bureau_candidate_assessment"},
+        ) as invoke:
+            result = asyncio.run(
+                intake.mcp._tool_manager.call_tool(
+                    "grabowski_bureau_candidate_assess",
+                    {
+                        "candidate_id": "",
+                        "event_id": 0,
+                        "idempotency_key": "conversation:bounty:path-b:v1",
+                        "initiative": "",
+                        "task_id": "",
+                    },
+                )
+            )
+        self.assertEqual("bureau_candidate_assessment", result["kind"])
+        self.assertEqual(
+            [
+                "--json",
+                "--json-envelope",
+                "operator-candidate-assess",
+                "--idempotency-key",
+                "conversation:bounty:path-b:v1",
+            ],
+            invoke.call_args.args[0],
+        )
+
     def test_candidate_assess_legacy_event_id_is_strict_before_dispatch(self) -> None:
         if not hasattr(intake.mcp, "_tool_manager"):
             self.skipTest("real FastMCP unavailable in dependency-free validation")
@@ -624,6 +744,11 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not both"):
             intake.grabowski_bureau_candidate_assess(
                 {"kind": "event_id", "event_id": 31}, candidate_id="candidate-a"
+            )
+        with self.assertRaisesRegex(ValueError, "exactly one"):
+            intake.grabowski_bureau_candidate_assess(
+                candidate_id="candidate-a",
+                idempotency_key="conversation:bounty:path-b:v1",
             )
         with self.assertRaisesRegex(ValueError, "conflicting initiative binding"):
             intake.grabowski_bureau_candidate_assess(
@@ -652,6 +777,18 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             {
                 "kind": "event_id",
                 "event_id": 31,
+                "candidate_id": "candidate-a",
+            },
+            {"kind": "idempotency_key"},
+            {"kind": "idempotency_key", "idempotency_key": 31},
+            {"kind": "idempotency_key", "idempotency_key": ""},
+            {
+                "kind": "idempotency_key",
+                "idempotency_key": "conversation:bounty\x00path-b",
+            },
+            {
+                "kind": "idempotency_key",
+                "idempotency_key": "conversation:bounty:path-b:v1",
                 "candidate_id": "candidate-a",
             },
         ]
