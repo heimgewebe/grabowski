@@ -12,6 +12,7 @@ REQUIRED_SCHEMA_PROPERTIES = {
     "grabowski_bureau_candidate_assess": {
         "candidate_id",
         "event_id",
+        "idempotency_key",
         "expected_initiative",
         "expected_task_id",
         "initiative",

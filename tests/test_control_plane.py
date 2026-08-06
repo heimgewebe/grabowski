@@ -1679,6 +1679,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 "expected_task_id": {"type": "string", "default": ""},
                 "candidate_id": {"type": "string", "default": ""},
                 "event_id": {"type": "integer", "default": 0},
+                "idempotency_key": {"type": "string", "default": ""},
                 "initiative": {"type": "string", "default": ""},
                 "task_id": {"type": "string", "default": ""},
             },
