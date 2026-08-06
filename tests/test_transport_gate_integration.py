@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import grabowski_grips as grips
+from tests.test_operator_v2_runtime import _load_grabowski_mcp
 import grabowski_transport_roundtrip as roundtrip
 import grabowski_serving_process as serving
 from tests.test_operator_contract import _load_operator_module
@@ -116,19 +117,17 @@ class TransportGripIntegrationTests(unittest.TestCase):
             for item in grips.list_grips(profile="operator")
             if item["name"] == "transport-roundtrip"
         )
-        self.assertEqual(contract["version"], "1.1")
+        self.assertEqual(contract["version"], "2.0")
         self.assertIn("exact-target-bound", contract["acceptance_ids"])
-        for fragment in ("target_tool_name", "target_arguments"):
-            self.assertIn(fragment, contract["summary"])
-            self.assertIn(fragment, contract["recovery_path"])
+        for fragment in ("target_tool_name", "target_arguments", "action=execute"):
+            self.assertIn(fragment, contract["summary"] + contract["recovery_path"])
         preconditions = " | ".join(contract["preconditions"])
         self.assertIn(
             "action=begin requires target_tool_name and target_arguments together",
             preconditions,
         )
-        self.assertIn("action=ack requires challenge_receipt_sha256", preconditions)
-        # The conditional fields must not become statically required, or ack
-        # would be forced to carry begin-only fields.
+        self.assertIn("action=execute requires challenge_receipt_sha256", preconditions)
+        self.assertIn("shared_unlabeled callers are refused", preconditions)
         self.assertEqual(contract["required_parameters"], ["action"])
 
     def test_unbound_begin_is_refused_by_the_grip_preflight(self) -> None:
@@ -143,10 +142,7 @@ class TransportGripIntegrationTests(unittest.TestCase):
             allow_mutation=True,
         )
         self.assertEqual(blocked["status"], "blocked")
-        self.assertIn(
-            "target_tool_name and target_arguments together",
-            blocked["output"]["error"],
-        )
+        self.assertIn("requires target_tool_name", blocked["output"]["error"])
 
     def test_bound_begin_emits_the_exact_target_check(self) -> None:
         begun = grips.grip_run(
@@ -177,6 +173,57 @@ class TransportGripIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(acked["status"], "passed")
         self.assertEqual(acked["output"]["state"], "verified")
+
+    def test_execute_dispatches_exact_target_with_private_capability(self) -> None:
+        arguments = {"path": "/tmp/example", "content": "x"}
+        begin = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters(
+                "begin",
+                _server_transport_client_scope=SHARED_SCOPE,
+                target_tool_name="write",
+                target_arguments=arguments,
+            ),
+            profile="operator",
+            allow_mutation=True,
+        )
+        challenge = begin["output"]["challenge_receipt_sha256"]
+
+        def dispatcher(tool_name, target_arguments, private_challenge):
+            with roundtrip.execution_capability(private_challenge) as session:
+                consumed = roundtrip.consume_verified(
+                    client_scope=SHARED_SCOPE,
+                    runtime_binding=BINDING,
+                    tool_name=tool_name,
+                    arguments_sha256=roundtrip.canonical_arguments_sha256(
+                        target_arguments
+                    ),
+                )
+                execution = roundtrip.execution_capability_snapshot(session)
+            self.assertEqual(consumed["state"], "consumed")
+            return {
+                "target_result": {"called": True},
+                "target_error": None,
+                "execution": execution,
+            }
+
+        executed = grips.grip_run(
+            "transport-roundtrip",
+            self.parameters(
+                "execute",
+                _server_transport_client_scope=SHARED_SCOPE,
+                challenge_receipt_sha256=challenge,
+                target_tool_name="write",
+                target_arguments=arguments,
+            ),
+            profile="operator",
+            allow_mutation=True,
+            transport_target_dispatcher=dispatcher,
+        )
+        self.assertEqual(executed["status"], "passed")
+        self.assertEqual(executed["output"]["state"], "executed")
+        self.assertTrue(executed["output"]["target_result"]["called"])
+        self.assertIsNotNone(executed["output"]["consumption_receipt_sha256"])
 
     def test_grip_requires_mutation_permission_and_rejects_extra_fields(self) -> None:
         denied = grips.grip_run(
@@ -500,58 +547,114 @@ class CentralTransportGateTests(unittest.TestCase):
         self.assertEqual(domain_calls, [])
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
+    def test_atomic_dispatch_classifies_mcp_error_result(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name) / "state"
+        base = _load_grabowski_mcp()
+        transport = base.grabowski_transport_roundtrip
+        arguments = {"sequence": 1}
+        digest = transport.canonical_arguments_sha256(arguments)
+
+        async def error_result(_name, _arguments, _context):
+            transport.consume_verified(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                tool_name="write",
+                arguments_sha256=digest,
+            )
+            return types.SimpleNamespace(
+                isError=True,
+                structuredContent={
+                    "kind": "grabowski_bureau_pickup_error",
+                    "code": "work-admission-blocked",
+                },
+            )
+
+        base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda _name: self.mutating_tool(),
+            call_tool=error_result,
+        )
+        with (
+            mock.patch.object(transport, "STATE_ROOT", root),
+            mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
+        ):
+            begun = transport.begin(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                mutation_intent={
+                    "tool_name": "write",
+                    "arguments_sha256": digest,
+                },
+            )
+            challenge = begun["challenge_receipt_sha256"]
+            transport.reserve_execution(
+                client_scope=SHARED_SCOPE,
+                challenge_receipt_sha256=challenge,
+                runtime_binding=BINDING,
+                tool_name="write",
+                arguments_sha256=digest,
+            )
+            result = asyncio.run(
+                base._dispatch_atomic_transport_target(
+                    "write", arguments, challenge, None
+                )
+            )
+        self.assertEqual(result["target_error"]["type"], "SimpleNamespace")
+        self.assertEqual(
+            result["target_error"]["structured_content"]["code"],
+            "work-admission-blocked",
+        )
+        self.assertIsNotNone(
+            result["execution"]["consumption_receipt_sha256"]
+        )
+
     def test_stateless_shared_scope_admits_two_independent_handshakes(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name) / "state"
         operator = self.configured_operator()
         transport = operator.grabowski_transport_roundtrip
-        with mock.patch.object(
-            transport, "STATE_ROOT", root
-        ), mock.patch.object(
-            transport, "LOCK_PATH", root / ".lock"
+        context = types.SimpleNamespace(client_id=None)
+        arguments = {"sequence": 1}
+        digest = transport.canonical_arguments_sha256(arguments)
+        with (
+            mock.patch.object(transport, "STATE_ROOT", root),
+            mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
         ):
-            challenges = [
-                transport.begin(
-                    client_scope=SHARED_SCOPE,
-                    runtime_binding=BINDING,
-                    mutation_intent={
-                        "tool_name": "write",
-                        "arguments_sha256": transport.canonical_arguments_sha256(
-                            {"sequence": sequence}
-                        ),
-                    },
-                )["challenge_receipt_sha256"]
-                for sequence in (1, 2)
-            ]
-            for challenge in challenges:
-                transport.acknowledge(
-                    client_scope=SHARED_SCOPE,
-                    challenge_receipt_sha256=challenge,
-                    runtime_binding=BINDING,
-                )
-
-            context = types.SimpleNamespace(client_id=None)
-            first = asyncio.run(
-                operator.mcp._tool_manager.call_tool(
-                    "write", {"sequence": 1}, context
-                )
+            begun = transport.begin(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                mutation_intent={
+                    "tool_name": "write",
+                    "arguments_sha256": digest,
+                },
             )
-            second = asyncio.run(
-                operator.mcp._tool_manager.call_tool(
-                    "write", {"sequence": 2}, context
-                )
+            challenge = begun["challenge_receipt_sha256"]
+            transport.reserve_execution(
+                client_scope=SHARED_SCOPE,
+                challenge_receipt_sha256=challenge,
+                runtime_binding=BINDING,
+                tool_name="write",
+                arguments_sha256=digest,
             )
-            self.assertTrue(first["called"])
-            self.assertTrue(second["called"])
             with self.assertRaisesRegex(
                 RuntimeError, "fresh intent-bound transport verification required"
             ):
                 asyncio.run(
                     operator.mcp._tool_manager.call_tool(
-                        "write", {"sequence": 3}, context
+                        "write", arguments, context
                     )
                 )
+            with transport.execution_capability(challenge) as session:
+                result = asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "write", arguments, context
+                    )
+                )
+                execution = transport.execution_capability_snapshot(session)
+        self.assertTrue(result["called"])
+        self.assertIsNotNone(execution["consumption_receipt_sha256"])
 
     def test_bound_shared_verification_bootstraps_exact_handshake_without_theft(
         self,
@@ -563,73 +666,60 @@ class CentralTransportGateTests(unittest.TestCase):
         transport = operator.grabowski_transport_roundtrip
         context = types.SimpleNamespace(client_id=None)
         arguments = {"sequence": 1}
-        arguments_sha256 = transport.canonical_arguments_sha256(arguments)
+        digest = transport.canonical_arguments_sha256(arguments)
+        intent = {"tool_name": "write", "arguments_sha256": digest}
         with (
             mock.patch.object(transport, "STATE_ROOT", root),
             mock.patch.object(transport, "LOCK_PATH", root / ".lock"),
         ):
-            begin = transport.begin(
+            first = transport.begin(
                 client_scope=SHARED_SCOPE,
                 runtime_binding=BINDING,
-                mutation_intent={
-                    "tool_name": "write",
-                    "arguments_sha256": arguments_sha256,
-                },
+                mutation_intent=intent,
             )
-            transport.acknowledge(
+            second = transport.begin(
                 client_scope=SHARED_SCOPE,
-                challenge_receipt_sha256=begin["challenge_receipt_sha256"],
                 runtime_binding=BINDING,
+                mutation_intent=intent,
             )
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "fresh intent-bound transport verification required",
-            ) as blocked:
-                asyncio.run(
+            first_challenge = first["challenge_receipt_sha256"]
+            second_challenge = second["challenge_receipt_sha256"]
+            self.assertNotEqual(first_challenge, second_challenge)
+            for challenge in (first_challenge, second_challenge):
+                transport.reserve_execution(
+                    client_scope=SHARED_SCOPE,
+                    challenge_receipt_sha256=challenge,
+                    runtime_binding=BINDING,
+                    tool_name="write",
+                    arguments_sha256=digest,
+                )
+            with transport.execution_capability(first_challenge):
+                first_result = asyncio.run(
                     operator.mcp._tool_manager.call_tool(
-                        "other-write", arguments, context
+                        "write", arguments, context
                     )
                 )
-            message = str(blocked.exception)
-            challenge = message.split("challenge_receipt_sha256=", 1)[1].split()[0]
-            with self.assertRaisesRegex(
-                RuntimeError,
-                "fresh intent-bound transport verification required",
-            ) as replayed:
-                asyncio.run(
+            with transport.execution_capability(first_challenge):
+                with self.assertRaisesRegex(
+                    RuntimeError, "fresh intent-bound transport verification required"
+                ):
+                    asyncio.run(
+                        operator.mcp._tool_manager.call_tool(
+                            "write", arguments, context
+                        )
+                    )
+            status = transport.status(
+                client_scope=SHARED_SCOPE, runtime_binding=BINDING
+            )
+            self.assertEqual(status["verified_receipt_count"], 1)
+            with transport.execution_capability(second_challenge):
+                second_result = asyncio.run(
                     operator.mcp._tool_manager.call_tool(
-                        "other-write", arguments, context
+                        "write", arguments, context
                     )
                 )
-            replayed_challenge = str(replayed.exception).split(
-                "challenge_receipt_sha256=", 1
-            )[1].split()[0]
-            self.assertEqual(replayed_challenge, challenge)
-            state = transport._load_state(SHARED_SCOPE)
-            self.assertEqual(len(state["verified_receipts"]), 1)
-            self.assertEqual(len(state["pending_challenges"]), 1)
-            pending = state["pending_challenges"][0]
-            self.assertEqual(pending["receipt_sha256"], challenge)
-            self.assertEqual(pending["tool_name"], "other-write")
-            self.assertEqual(pending["arguments_sha256"], arguments_sha256)
-
-            transport.acknowledge(
-                client_scope=SHARED_SCOPE,
-                challenge_receipt_sha256=challenge,
-                runtime_binding=BINDING,
-            )
-            other_result = asyncio.run(
-                operator.mcp._tool_manager.call_tool(
-                    "other-write", arguments, context
-                )
-            )
-            state = transport._load_state(SHARED_SCOPE)
-            self.assertEqual(len(state["verified_receipts"]), 1)
-            result = asyncio.run(
-                operator.mcp._tool_manager.call_tool("write", arguments, context)
-            )
-        self.assertTrue(other_result["called"])
-        self.assertTrue(result["called"])
+        self.assertTrue(first_result["called"])
+        self.assertTrue(second_result["called"])
 
     def test_handshake_grip_is_narrowly_exempt(self) -> None:
         operator = self.configured_operator()
@@ -804,14 +894,7 @@ class StaleServingProcessGateTests(unittest.TestCase):
 
 
 class SharedPartitionEffectBoundaryTests(unittest.TestCase):
-    """The declared boundary of a shared, unlabeled storage partition.
-
-    shared_unlabeled is a storage partition, never a caller identity. Two
-    unlabeled callers of the same exact intent are indistinguishable by
-    construction. What the contract must still guarantee for them is
-    at-most-once admission of the effect, a distinct consumption receipt per
-    admission, and no reusable proof once an admission was spent.
-    """
+    """Bearer-bound atomic admission for the shared unlabeled partition."""
 
     INTENT_ARGUMENTS = {"path": "/tmp/shared-target"}
 
@@ -828,74 +911,74 @@ class SharedPartitionEffectBoundaryTests(unittest.TestCase):
         self.addCleanup(self.root_patch.stop)
         self.addCleanup(self.lock_patch.stop)
 
-    def bind(self, arguments: dict[str, object]) -> None:
+    def bind(self, arguments: dict[str, object]) -> str:
+        digest = roundtrip.canonical_arguments_sha256(arguments)
         begun = roundtrip.begin(
             client_scope=SHARED_SCOPE,
             runtime_binding=BINDING,
             mutation_intent={
                 "tool_name": "write",
-                "arguments_sha256": roundtrip.canonical_arguments_sha256(arguments),
+                "arguments_sha256": digest,
             },
         )
-        roundtrip.acknowledge(
+        challenge = begun["challenge_receipt_sha256"]
+        roundtrip.reserve_execution(
             client_scope=SHARED_SCOPE,
-            challenge_receipt_sha256=begun["challenge_receipt_sha256"],
-            runtime_binding=BINDING,
-        )
-
-    def consume(self, arguments: dict[str, object]) -> dict[str, object]:
-        return roundtrip.consume_verified(
-            client_scope=SHARED_SCOPE,
+            challenge_receipt_sha256=challenge,
             runtime_binding=BINDING,
             tool_name="write",
-            arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+            arguments_sha256=digest,
         )
+        return challenge
+
+    def consume(
+        self, challenge: str, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        with roundtrip.execution_capability(challenge):
+            return roundtrip.consume_verified(
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+                tool_name="write",
+                arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+            )
 
     def test_shared_scope_is_declared_a_partition_not_an_identity(self) -> None:
-        self.bind(self.INTENT_ARGUMENTS)
-        consumed = self.consume(self.INTENT_ARGUMENTS)
-        self.assertIn(
-            "caller identity: shared_unlabeled is a shared storage partition, "
-            "not an identity",
-            consumed["does_not_establish"],
-        )
-        status = roundtrip.status(
-            client_scope=SHARED_SCOPE, runtime_binding=BINDING
-        )
-        self.assertIn(
-            "that two unlabeled callers of the same exact intent are "
-            "distinguishable",
-            status["does_not_establish"],
+        challenge = self.bind(self.INTENT_ARGUMENTS)
+        consumed = self.consume(challenge, self.INTENT_ARGUMENTS)
+        self.assertTrue(consumed["execution_capability_bound"])
+        self.assertTrue(
+            any(
+                item.startswith("caller identity: shared_unlabeled remains")
+                for item in consumed["does_not_establish"]
+            )
         )
 
     def test_second_unlabeled_caller_of_one_intent_is_refused(self) -> None:
-        """One admission per handshake, even though the callers are alike."""
-        self.bind(self.INTENT_ARGUMENTS)
-        self.consume(self.INTENT_ARGUMENTS)
-        with self.assertRaises(roundtrip.TransportRoundtripRequired):
-            self.consume(self.INTENT_ARGUMENTS)
+        challenge = self.bind(self.INTENT_ARGUMENTS)
+        self.consume(challenge, self.INTENT_ARGUMENTS)
+        with roundtrip.execution_capability(challenge):
+            with self.assertRaises(roundtrip.TransportRoundtripRequired):
+                roundtrip.consume_verified(
+                    client_scope=SHARED_SCOPE,
+                    runtime_binding=BINDING,
+                    tool_name="write",
+                    arguments_sha256=roundtrip.canonical_arguments_sha256(
+                        self.INTENT_ARGUMENTS
+                    ),
+                )
 
     def test_each_admission_carries_a_distinct_consumption_receipt(self) -> None:
-        self.bind(self.INTENT_ARGUMENTS)
-        first = self.consume(self.INTENT_ARGUMENTS)
-        self.bind(self.INTENT_ARGUMENTS)
-        second = self.consume(self.INTENT_ARGUMENTS)
+        first_challenge = self.bind(self.INTENT_ARGUMENTS)
+        first = self.consume(first_challenge, self.INTENT_ARGUMENTS)
+        second_challenge = self.bind(self.INTENT_ARGUMENTS)
+        second = self.consume(second_challenge, self.INTENT_ARGUMENTS)
+        self.assertNotEqual(first_challenge, second_challenge)
         self.assertNotEqual(
             first["consumption_receipt_sha256"],
             second["consumption_receipt_sha256"],
         )
-        self.assertNotEqual(
-            first["verification_receipt_sha256"],
-            second["verification_receipt_sha256"],
-        )
 
     def test_a_failed_effect_leaves_no_reusable_proof(self) -> None:
-        """Admission is consumed before the effect, so failure cannot replay.
-
-        This is the ambiguity contract: a lost response and a failed effect are
-        indistinguishable to the gate, and both must leave the caller without a
-        spendable proof.
-        """
         operator = _load_operator_module()
         operator.base._transport_roundtrip_runtime_binding = lambda: BINDING
         operator.base._transport_roundtrip_client_scope = lambda context: SHARED_SCOPE
@@ -903,8 +986,6 @@ class SharedPartitionEffectBoundaryTests(unittest.TestCase):
         async def exploding_effect(*_args: object, **_kwargs: object):
             raise RuntimeError("effect failed after admission")
 
-        # Replace the underlying effect before the gate wraps it, so the
-        # admission is genuinely spent and only then does the effect fail.
         operator.mcp._tool_manager.call_tool = exploding_effect
         operator.mcp._tool_manager.get_tool = lambda _name: types.SimpleNamespace(
             is_async=True,
@@ -913,12 +994,17 @@ class SharedPartitionEffectBoundaryTests(unittest.TestCase):
         )
         operator._configure_http_runtime()
         gated = operator.mcp._tool_manager.call_tool
-
-        self.bind(self.INTENT_ARGUMENTS)
-        with mock.patch.object(
-            operator.grabowski_transport_roundtrip, "STATE_ROOT", self.root
-        ), mock.patch.object(
-            operator.grabowski_transport_roundtrip, "LOCK_PATH", self.root / ".lock"
+        challenge = self.bind(self.INTENT_ARGUMENTS)
+        with (
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip, "STATE_ROOT", self.root
+            ),
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "LOCK_PATH",
+                self.root / ".lock",
+            ),
+            roundtrip.execution_capability(challenge),
         ):
             with self.assertRaisesRegex(RuntimeError, "effect failed after admission"):
                 asyncio.run(
@@ -928,10 +1014,8 @@ class SharedPartitionEffectBoundaryTests(unittest.TestCase):
                         types.SimpleNamespace(client_id=None),
                     )
                 )
-            # The verification was spent before the effect ran, so no proof
-            # survives the failure.
             with self.assertRaises(roundtrip.TransportRoundtripRequired):
-                self.consume(self.INTENT_ARGUMENTS)
+                self.consume(challenge, self.INTENT_ARGUMENTS)
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
 
