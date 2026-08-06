@@ -130,6 +130,7 @@
     "grabowski_context_fabric_compose",
     "grabowski_context_fabric_explain",
     "grabowski_context_fabric_compare",
+    "grabowski_systemkatalog_query",
     "grabowski_bureau_candidate_record",
     "grabowski_bureau_candidate_assess",
     "grabowski_bureau_task_propose",
@@ -423,6 +424,10 @@
     {
       "module": "grabowski_context_fabric",
       "source": "src/grabowski_context_fabric.py"
+    },
+    {
+      "module": "grabowski_systemkatalog",
+      "source": "src/grabowski_systemkatalog.py"
     },
     {
       "module": "grabowski_bureau_leases",

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "d705fe4c2861c7d26f2fd2b8f5269a09e7f08c8f2443244983c5d242b9748a4e",
+  "capability_source_sha256": "59af47eff107866ebb8d2d6a452658a8e1608a661a67d4cd0cab73b2bd3240bf",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "764de51a8f5fa70994ce03d1f9ca5011b17bc1ddf67dd6c47c3e6856be2cca73",
+  "contract_sha256": "46ba648f01da42196e1977b25715aa1c2debf08a7a46937fb5e1bf414836bb1a",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1624,6 +1624,17 @@
       "reversibility": "not-applicable",
       "risk_class": "low",
       "tool": "grabowski_context_fabric_compare"
+    },
+    {
+      "category": "knowledge",
+      "description": "Run one typed, revision-bound Systemkatalog v2 query without write authority.",
+      "effects": [],
+      "id": "grabowski_systemkatalog_query",
+      "purpose": "Run one bounded, revision-bound Systemkatalog v2 semantic query without catalog, task, runtime or merge authority.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_systemkatalog_query"
     },
     {
       "category": "bureau",
