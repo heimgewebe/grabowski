@@ -340,6 +340,70 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             effectiveness.record_review_classification(parameters)
 
 
+    def test_neutral_review_requires_correlated_outcome_evidence(self) -> None:
+        evaluation = "6" * 64
+        decision_ref = _ref("d")
+        outcome_ref = _ref("e")
+        records = [
+            _event(
+                "reposkop-evaluation-requested",
+                evaluation,
+                "1",
+                task_id="task-6",
+            ),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-6",
+                final_decision="allow",
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "e",
+                task_id="task-6",
+                terminal_state="completed",
+            ),
+        ]
+        base = {
+            "evaluation_id": evaluation,
+            "classification": "neutral",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "not_applicable",
+            "reason_codes": ["no_confirmed_decision_value"],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_raw_records",
+            return_value=(records, {}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewInputError,
+            "corroborating evidence beyond the decision",
+        ):
+            effectiveness.record_review_classification(
+                {**base, "evidence_refs": [decision_ref]}
+            )
+        appended: list[dict[str, object]] = []
+        with patch.object(
+            effectiveness,
+            "_raw_records",
+            return_value=(records, {}),
+        ), patch.object(
+            effectiveness,
+            "append_event",
+            side_effect=lambda event: appended.append(event) or _ref("r"),
+        ):
+            result = effectiveness.record_review_classification(
+                {**base, "evidence_refs": [decision_ref, outcome_ref]}
+            )
+        self.assertEqual(result["classification"], "neutral")
+        self.assertEqual(len(appended), 1)
+
+
     def test_review_classification_rejects_unrelated_corroborating_audit_ref(self) -> None:
         evaluation = "8" * 64
         decision_ref = _ref("d")

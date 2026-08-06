@@ -799,7 +799,7 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
         for reference in evidence_refs
         if reference != expected_decision_ref
     ]
-    if classification not in {"neutral", "unresolved"} and not corroborating_refs:
+    if classification != "unresolved" and not corroborating_refs:
         raise ReposkopReviewInputError(
             "material review classifications require corroborating evidence beyond the decision"
         )
@@ -821,7 +821,7 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
             "review evidence references are unavailable in the verified audit window"
         )
     verified_corroborating: list[str] = []
-    if classification not in {"neutral", "unresolved"}:
+    if classification != "unresolved":
         verified_corroborating = [
             reference
             for reference in corroborating_refs
