@@ -12,6 +12,9 @@ MAX_SOURCE_TASKS = current_work.MAX_TASKS
 MAX_SOURCE_LEASES = current_work.MAX_LEASES
 MAX_SOURCE_WORKERS = current_work.MAX_WORKERS
 CURRENT_TASK_STATES = ("launching", "running", "interrupted", "outcome_unknown")
+CURRENT_WORK_GIT_TIMEOUT_SECONDS = 1.0
+CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS = 4.0
+CURRENT_WORK_CHECKOUT_MAX_WORKTREES: int | None = None
 
 
 def _module(name: str) -> Any:
@@ -176,14 +179,34 @@ def _checkout_payloads(
     payloads: list[dict[str, Any]] = []
     for repository in repositories:
         try:
-            payloads.append(
-                checkouts.checkout_inventory(
-                    repository,
-                    include_processes=True,
-                    include_tasks=True,
-                    include_resources=True,
-                )
+            payload = checkouts.checkout_inventory(
+                repository,
+                include_processes=False,
+                include_tasks=False,
+                include_resources=True,
+                git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+                observation_budget_seconds=(
+                    CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS
+                ),
+                max_worktrees=CURRENT_WORK_CHECKOUT_MAX_WORKTREES,
             )
+            payloads.append(payload)
+            if payload.get("truncated") is True and errors is not None:
+                errors.append(
+                    {
+                        "source": "checkouts",
+                        "repository": repository,
+                        "error": "CheckoutObservationPartial",
+                        "omitted_worktree_count": int(
+                            payload.get("omitted_worktree_count", 0) or 0
+                        ),
+                        "probe_error_count": len(
+                            payload.get("probe_errors", [])
+                            if isinstance(payload.get("probe_errors"), list)
+                            else []
+                        ),
+                    }
+                )
         except Exception as exc:
             if errors is None:
                 raise
@@ -201,6 +224,7 @@ def _reconciliation_payload(repositories: list[str]) -> dict[str, Any]:
     return reconciler.reconcile_checkout_bindings(
         repository_filters=repositories,
         limit=reconciler.MAX_PAGE_LIMIT,
+        git_timeout_seconds=CURRENT_WORK_GIT_TIMEOUT_SECONDS,
     )
 
 

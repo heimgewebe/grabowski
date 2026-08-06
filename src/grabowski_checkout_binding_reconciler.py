@@ -595,8 +595,13 @@ def collect_lifecycle_bindings_from_db(
 
 def collect_git_worktrees_for_repos(
     repo_paths: Iterable[str | Path],
+    *,
+    git_timeout_seconds: int | float = (
+        checkouts.DEFAULT_GIT_READ_TIMEOUT_SECONDS
+    ),
 ) -> dict[str, Any]:
-    """Reuse the canonical Git worktree observer and expose failures explicitly."""
+    """Reuse the canonical Git observer under one timeout per repository probe."""
+    git_timeout = checkouts._git_timeout_seconds(git_timeout_seconds)
     worktrees: list[dict[str, Any]] = []
     observable_repo_paths: set[str] = set()
     observations: list[dict[str, Any]] = []
@@ -608,7 +613,14 @@ def collect_git_worktrees_for_repos(
             continue
         seen.add(normalized)
         try:
-            observation = checkouts.observe_worktree_records(raw)
+            observation = (
+                checkouts.observe_worktree_records(raw)
+                if git_timeout == checkouts.DEFAULT_GIT_READ_TIMEOUT_SECONDS
+                else checkouts.observe_worktree_records(
+                    raw,
+                    timeout_seconds=git_timeout,
+                )
+            )
         except Exception as exc:
             if len(errors) < MAX_REPOSITORY_ERRORS:
                 errors.append(
@@ -665,6 +677,9 @@ def reconcile_checkout_bindings(
     repository_filters: list[str] | None = None,
     limit: int = 20,
     cursor: str | None = None,
+    git_timeout_seconds: int | float = (
+        checkouts.DEFAULT_GIT_READ_TIMEOUT_SECONDS
+    ),
 ) -> dict[str, Any]:
     """Compare the pinned durable binding snapshot with current Git observations."""
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE_LIMIT:
@@ -682,7 +697,10 @@ def reconcile_checkout_bindings(
     candidate_repositories = sorted(
         {_normalize_path(str(binding["repo_path"])) for binding in bindings}
     )
-    git = collect_git_worktrees_for_repos(candidate_repositories)
+    git = collect_git_worktrees_for_repos(
+        candidate_repositories,
+        git_timeout_seconds=git_timeout_seconds,
+    )
     full_projection = reconcile_bindings(
         bindings,
         git["worktrees"],
