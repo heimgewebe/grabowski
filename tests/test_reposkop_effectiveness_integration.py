@@ -54,7 +54,9 @@ class ReposkopEffectivenessTaskIntegrationTests(TaskTests):
         self.assertEqual(result["audit"]["evaluation_id"], attestation["evaluation_id"])
         self.assertEqual(len(attestation["evaluation_id"]), 64)
         self.assertEqual(attestation["surface"], "task_start")
-        self.assertEqual(attestation["finding_summary"]["finding_taxonomy_status"], "not_available_v1")
+        self.assertEqual(attestation["finding_summary"]["finding_taxonomy_status"], "available_v2")
+        self.assertEqual(attestation["finding_summary"]["finding_taxonomy_version"], 2)
+        self.assertEqual(attestation["finding_summary"]["advisory_posture"], "informational")
 
     def test_terminal_status_and_recovery_emit_one_outcome(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
