@@ -29,6 +29,8 @@ SNAPSHOT_PATH = STATE_ROOT / "current.json"
 OBSERVER_STATE_PATH = STATE_ROOT / "observer.json"
 LOCK_PATH = STATE_ROOT / ".lock"
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
+OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
+OBSERVATION_SCOPE_SERVER_LOOPBACK = "server_loopback_watchdog"
 AUTO_REFRESH_MCP_URL = "http://127.0.0.1:18181/mcp"
 AUTO_REFRESH_RENEW_MARGIN_SECONDS = 900
 AUTO_REFRESH_TIMEOUT_SECONDS = 8.0
@@ -58,6 +60,12 @@ def _validate_identifier(value: Any, *, label: str) -> str:
     if not isinstance(value, str) or _IDENTIFIER_RE.fullmatch(value) is None:
         raise ClientSnapshotError(f"{label} must be a bounded identifier")
     return value
+
+
+def _client_observation_scope(client_id: str) -> str:
+    if client_id == AUTO_REFRESH_CLIENT_ID:
+        return OBSERVATION_SCOPE_SERVER_LOOPBACK
+    return OBSERVATION_SCOPE_EXTERNAL_CLIENT
 
 
 def _validate_sha256(value: Any, *, label: str) -> str:
@@ -291,6 +299,7 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
     if unknown:
         raise ClientSnapshotError(f"unknown client snapshot field(s): {', '.join(unknown)}")
     client_id = _validate_identifier(parameters.get("client_id"), label="client_id")
+    observation_scope = _client_observation_scope(client_id)
     session_id = _validate_identifier(parameters.get("session_id"), label="session_id")
     observed_count = parameters.get("observed_tool_count")
     if (
@@ -370,6 +379,7 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
     declaration = {
         "client_id": client_id,
         "session_id": session_id,
+        "observation_scope": observation_scope,
         "observed_tool_count": observed_count,
         "observed_names_sha256": observed_names_sha256,
         "observed_release_id": observed_release_id,
@@ -395,8 +405,28 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         if schema_evidence is not None
         else "client-declared-server-compared-v1"
     )
+    if observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK:
+        verification_model = (
+            "server-loopback-schema-compared-v1"
+            if schema_evidence is not None
+            else "server-loopback-contract-compared-v1"
+        )
     if cutover_binding is not None:
         verification_model = f"{verification_model}+cutover-rebind-v1"
+    does_not_establish = [
+        "platform-enforced client snapshot identity",
+        "that the client invoked every declared tool",
+        "client instruction compliance",
+        "resistance to compromised same-uid code",
+        "deployment success without a bound cutover receipt",
+    ]
+    if observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK:
+        does_not_establish.extend(
+            [
+                "platform connector catalog publication",
+                "tool schema visibility in ChatGPT",
+            ]
+        )
     receipt: dict[str, Any] = {
         "schema_version": SNAPSHOT_SCHEMA_VERSION,
         "kind": SNAPSHOT_KIND,
@@ -416,13 +446,7 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "verified": not mismatches,
         "mismatches": mismatches,
         "verification_model": verification_model,
-        "does_not_establish": [
-            "platform-enforced client snapshot identity",
-            "that the client invoked every declared tool",
-            "client instruction compliance",
-            "resistance to compromised same-uid code",
-            "deployment success without a bound cutover receipt",
-        ],
+        "does_not_establish": does_not_establish,
     }
     receipt["receipt_sha256"] = _sha256_json(receipt)
     with _state_lock():
@@ -431,6 +455,7 @@ def bind_snapshot(parameters: dict[str, Any], *, now_unix: int | None = None) ->
         "schema_version": 1,
         "state": "matched" if not mismatches else "mismatch",
         "verified": not mismatches,
+        "observation_scope": observation_scope,
         "mismatches": mismatches,
         "created_at_unix": timestamp,
         "expires_at_unix": receipt["expires_at_unix"],
@@ -531,9 +556,15 @@ def snapshot_status(
     timestamp = int(time.time()) if now_unix is None else now_unix
     base = {
         "observable": False,
+        "observation_scope": None,
         "schema_observable": False,
         "schema_evidence_observed": False,
         "schema_contract_matches": False,
+        "platform_connector_snapshot_observable": False,
+        "platform_connector_schema_observable": False,
+        "server_loopback_observable": False,
+        "server_loopback_schema_observable": False,
+        "server_loopback_schema_contract_matches": False,
         "fresh": False,
         "matched": False,
         "verification_model": "client-declared-server-compared-v1",
@@ -584,6 +615,12 @@ def snapshot_status(
         and declaration.get("observed_agent_instructions_sha256")
         == expected_agent_instructions_sha256
     )
+    observation_scope = declaration.get("observation_scope")
+    if observation_scope not in {
+        OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+        OBSERVATION_SCOPE_SERVER_LOOPBACK,
+    }:
+        observation_scope = _client_observation_scope(str(declaration.get("client_id", "")))
     fresh = created_at - SNAPSHOT_CLOCK_SKEW_SECONDS <= timestamp <= expires_at
     matched = receipt.get("verified") is True and not receipt.get("mismatches") and binding_matches and declaration_matches
     observable = fresh and matched
@@ -595,12 +632,31 @@ def snapshot_status(
         else {}
     )
     schema_evidence_observed = bool(schema_probe)
-    schema_contract_matches = (
+    observed_schema_contract_matches = (
         schema_evidence_observed
         and schema_probe.get("matches") is True
         and schema_probe.get("schema_contract_matches") is True
     )
-    schema_observable = observable and schema_contract_matches
+    platform_connector_snapshot_observable = (
+        observable and observation_scope == OBSERVATION_SCOPE_EXTERNAL_CLIENT
+    )
+    server_loopback_observable = (
+        observable and observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK
+    )
+    schema_contract_matches = (
+        observed_schema_contract_matches
+        and observation_scope == OBSERVATION_SCOPE_EXTERNAL_CLIENT
+    )
+    server_loopback_schema_contract_matches = (
+        observed_schema_contract_matches
+        and observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK
+    )
+    schema_observable = (
+        platform_connector_snapshot_observable and schema_contract_matches
+    )
+    server_loopback_schema_observable = (
+        server_loopback_observable and server_loopback_schema_contract_matches
+    )
     if not fresh:
         state = "stale"
         next_action = "bind the current connector snapshot again"
@@ -609,14 +665,34 @@ def snapshot_status(
         next_action = "refresh the connector tool snapshot and bind it again"
     else:
         state = "matched"
-        next_action = "none"
+        next_action = (
+            "bind a platform connector snapshot to establish published tool visibility"
+            if observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK
+            else "none"
+        )
+    does_not_establish = list(
+        receipt.get("does_not_establish") or base["does_not_establish"]
+    )
+    if observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK:
+        for limitation in (
+            "platform connector catalog publication",
+            "tool schema visibility in ChatGPT",
+        ):
+            if limitation not in does_not_establish:
+                does_not_establish.append(limitation)
     return {
         **base,
         "state": state,
         "observable": observable,
+        "observation_scope": observation_scope,
         "schema_observable": schema_observable,
         "schema_evidence_observed": schema_evidence_observed,
         "schema_contract_matches": schema_contract_matches,
+        "platform_connector_snapshot_observable": platform_connector_snapshot_observable,
+        "platform_connector_schema_observable": schema_observable,
+        "server_loopback_observable": server_loopback_observable,
+        "server_loopback_schema_observable": server_loopback_schema_observable,
+        "server_loopback_schema_contract_matches": server_loopback_schema_contract_matches,
         "schema_probe": schema_probe,
         "fresh": fresh,
         "matched": matched,
@@ -635,6 +711,7 @@ def snapshot_status(
             "verification_model", base["verification_model"]
         ),
         "recommended_next_action": next_action,
+        "does_not_establish": does_not_establish,
     }
 
 def connector_session_id(pid: int, start_ticks: int) -> str:

@@ -154,6 +154,10 @@ class ClientSnapshotTests(unittest.TestCase):
         self.assertTrue(result["name_contract_matches"])
         self.assertTrue(result["runtime_contract_matches"])
         self.assertTrue(result["schema_contract_matches"])
+        self.assertEqual(
+            result["observation_scope"],
+            snapshot.OBSERVATION_SCOPE_EXTERNAL_CLIENT,
+        )
         self.assertEqual(result["missing_schema_sentinels"], [])
         self.assertEqual(result["required_schema_property_mismatches"], [])
         self.assertEqual(result["schema_mismatches"], [])
@@ -173,6 +177,56 @@ class ClientSnapshotTests(unittest.TestCase):
         self.assertTrue(observed["schema_observable"])
         self.assertTrue(observed["schema_evidence_observed"])
         self.assertTrue(observed["schema_contract_matches"])
+        self.assertTrue(observed["platform_connector_snapshot_observable"])
+        self.assertTrue(observed["platform_connector_schema_observable"])
+        self.assertFalse(observed["server_loopback_observable"])
+
+    def test_watchdog_snapshot_is_loopback_evidence_not_platform_publication(self) -> None:
+        parameters = self.schema_parameters(
+            client_id=snapshot.AUTO_REFRESH_CLIENT_ID,
+            session_id=snapshot.connector_session_id(10, 20),
+        )
+        result = snapshot.bind_snapshot(parameters, now_unix=1_000)
+
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["schema_contract_matches"])
+        self.assertEqual(
+            result["observation_scope"],
+            snapshot.OBSERVATION_SCOPE_SERVER_LOOPBACK,
+        )
+
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            parameters["observed_tools"]
+        )
+        observed = snapshot.snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            now_unix=1_100,
+        )
+
+        self.assertTrue(observed["observable"])
+        self.assertEqual(
+            observed["observation_scope"],
+            snapshot.OBSERVATION_SCOPE_SERVER_LOOPBACK,
+        )
+        self.assertTrue(observed["server_loopback_observable"])
+        self.assertTrue(observed["server_loopback_schema_observable"])
+        self.assertTrue(observed["server_loopback_schema_contract_matches"])
+        self.assertFalse(observed["platform_connector_snapshot_observable"])
+        self.assertFalse(observed["platform_connector_schema_observable"])
+        self.assertFalse(observed["schema_observable"])
+        self.assertFalse(observed["schema_contract_matches"])
+        self.assertIn(
+            "platform connector snapshot",
+            observed["recommended_next_action"],
+        )
+        self.assertIn(
+            "tool schema visibility in ChatGPT",
+            observed["does_not_establish"],
+        )
 
     def test_schema_snapshot_fails_closed_on_field_and_binding_drift(self) -> None:
         for field in sorted(
