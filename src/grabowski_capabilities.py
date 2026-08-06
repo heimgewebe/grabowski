@@ -1412,6 +1412,22 @@ TOOL_PROFILES.update(
 )
 
 
+TOOL_PROFILES.update(
+    {
+        "grabowski_systemkatalog_query": {
+            "category": "knowledge",
+            "purpose": (
+                "Run one bounded, revision-bound Systemkatalog v2 semantic "
+                "query without catalog, task, runtime or merge authority."
+            ),
+            "risk_class": "low",
+            "effects": [],
+            "reversibility": "not-applicable",
+        }
+    }
+)
+
+
 PROFILE_CATEGORIES: dict[str, set[str] | None] = {
     "concise": None,
     "repository-work": {
