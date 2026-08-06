@@ -14,6 +14,8 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+sys.path.insert(0, str(SRC))
 
 class _FakeFastMCP:
     def tool(self, *args, **kwargs):
