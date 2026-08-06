@@ -1386,7 +1386,7 @@ def grabowski_runtime_deploy_schedule(
     source_lease_owner_id: SourceLeaseOwner | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Schedule one source-bound self-deployment, reusing the same canonical in-flight target."""
+    """Schedule one source-identity-bound self-deployment, reusing an identical in-flight job."""
     operator._require_operator_mutation("durable_job")
     operator._require_operator_capability("git_cli")
     with _deploy_schedule_lock():
