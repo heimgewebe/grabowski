@@ -1629,7 +1629,7 @@
     },
     {
       "category": "bureau",
-      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors. ``candidate_id``, ``event_id``, ``initiative``\nand ``task_id`` remain accepted only as a compatibility bridge for connector\ncatalogs cached before the typed ``selector`` contract was published.",
+      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors. ``candidate_id``, ``event_id``,\n``idempotency_key``, ``initiative`` and ``task_id`` remain accepted only as a\ncompatibility bridge for connector\ncatalogs cached before the typed ``selector`` contract was published.",
       "effects": [],
       "id": "grabowski_bureau_candidate_assess",
       "purpose": "Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors.",
@@ -3152,7 +3152,7 @@
       "src/grabowski_blockade_runtime.py": "d2e6afd7e7f21e72922d2923ee9700b8f7392a2c42c91a35256a55811c1c84be",
       "src/grabowski_blockade_store.py": "83794145652daac85d5fe6e2d9ceafc0f4ef65493cbc779bf7bf62f0572c15bd",
       "src/grabowski_blockades.py": "3a9f79462c8e8fc1097c1397d7c6d12123bb1fa305bfd397f77a4eb034489b75",
-      "src/grabowski_bureau_intake.py": "47ab3e28ea8d11bf50c83160bf7488ea44e58c1457e0ff7d31b8d00fc215711a",
+      "src/grabowski_bureau_intake.py": "711ae16feab59e85e4561c254a914b828712bc98ad6314ba1904b7aa7551806e",
       "src/grabowski_bureau_leases.py": "2643dad66c4e35f3c18a5e7a11f809b17c15ef6afa497c61dcf41b27e3eeb218",
       "src/grabowski_bureau_pickup.py": "923f92c4a3bf4b0fbc7146d59d4344720308a7298db8eb12f14e0d0ab9f90714",
       "src/grabowski_capabilities.py": "d705fe4c2861c7d26f2fd2b8f5269a09e7f08c8f2443244983c5d242b9748a4e",
