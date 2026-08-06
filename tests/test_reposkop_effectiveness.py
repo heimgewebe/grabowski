@@ -256,7 +256,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             records.insert(0, {**record, "_audit_ref": reference})
             return reference
 
-        with patch.object(effectiveness, "_raw_records", side_effect=raw_records), patch.object(
+        with patch.object(effectiveness, "_review_records", side_effect=raw_records), patch.object(
             effectiveness, "append_event", side_effect=append
         ), patch.object(effectiveness.time, "time", return_value=123):
             first = effectiveness.record_review_classification(parameters)
@@ -331,13 +331,67 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         }
         with patch.object(
             effectiveness,
-            "_raw_records",
+            "_review_records",
             return_value=(records, {}),
         ), self.assertRaisesRegex(
             effectiveness.ReposkopReviewIntegrityError,
             "unavailable in the verified audit window",
         ):
             effectiveness.record_review_classification(parameters)
+
+
+    def test_review_scan_retains_only_bound_records(self) -> None:
+        from types import SimpleNamespace
+
+        evaluation = "4" * 64
+        wanted_ref = _ref("d")
+        records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation,
+                "record_sha256": "1" * 64,
+            },
+            {
+                "operation": "unrelated",
+                "evaluation_id": "3" * 64,
+                "record_sha256": "2" * 64,
+            },
+            {
+                "operation": "external-evidence",
+                "record_sha256": "d" * 64,
+            },
+        ]
+        payload = b"".join(
+            (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            for record in records
+        )
+        segment = SimpleNamespace(records=len(records))
+        snapshot = SimpleNamespace(
+            segments=(segment,),
+            total_records=len(records),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with patch.object(
+            effectiveness.audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ), patch.object(
+            effectiveness.audit_query,
+            "_load_snapshot_segment",
+            return_value=payload,
+        ):
+            selected, source = effectiveness._review_records(
+                evaluation=evaluation,
+                evidence_refs={wanted_ref},
+                scan_limit=10,
+            )
+        self.assertEqual(source["scanned_records"], 3)
+        self.assertEqual(source["retained_records"], 2)
+        self.assertEqual(
+            {record["operation"] for record in selected},
+            {"reposkop-evaluation-requested", "external-evidence"},
+        )
 
 
     def test_review_classification_rejects_truncated_audit_window(self) -> None:
@@ -354,7 +408,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         }
         with patch.object(
             effectiveness,
-            "_raw_records",
+            "_review_records",
             return_value=([], {"scan_truncated": True}),
         ), self.assertRaisesRegex(
             effectiveness.ReposkopReviewIntegrityError,
@@ -401,7 +455,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         }
         with patch.object(
             effectiveness,
-            "_raw_records",
+            "_review_records",
             return_value=(records, {}),
         ), self.assertRaisesRegex(
             effectiveness.ReposkopReviewInputError,
@@ -413,7 +467,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         appended: list[dict[str, object]] = []
         with patch.object(
             effectiveness,
-            "_raw_records",
+            "_review_records",
             return_value=(records, {}),
         ), patch.object(
             effectiveness,
@@ -465,7 +519,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         }
         with patch.object(
             effectiveness,
-            "_raw_records",
+            "_review_records",
             return_value=(records, {}),
         ), self.assertRaisesRegex(
             effectiveness.ReposkopReviewIntegrityError,
@@ -507,7 +561,7 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         }
         with patch.object(
             effectiveness,
-            "_raw_records",
+            "_review_records",
             return_value=(records, {}),
         ), self.assertRaisesRegex(
             effectiveness.ReposkopReviewInputError,

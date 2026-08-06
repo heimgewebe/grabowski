@@ -658,6 +658,58 @@ def _raw_records(
     }
 
 
+def _review_records(
+    *,
+    evaluation: str,
+    evidence_refs: set[str],
+    scan_limit: int = MAX_REVIEW_SCAN_RECORDS,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    snapshot = audit_query.capture_verified_audit_snapshot()
+    if snapshot.total_records > scan_limit:
+        return [], {
+            "chain_content_sha256": snapshot.chain_content_sha256,
+            "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+            "total_records": snapshot.total_records,
+            "scanned_records": 0,
+            "retained_records": 0,
+            "scan_limit": scan_limit,
+            "scan_truncated": True,
+        }
+    selected: list[dict[str, Any]] = []
+    scanned = 0
+    for segment in reversed(snapshot.segments):
+        data = audit_query._load_snapshot_segment(segment)
+        lines = data.splitlines()
+        if len(lines) != segment.records:
+            raise RuntimeError(
+                "verified audit segment changed during Reposkop review scan"
+            )
+        for raw_line in reversed(lines):
+            scanned += 1
+            parsed = json.loads(raw_line.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise RuntimeError("verified audit record is not an object")
+            digest = parsed.get("record_sha256")
+            if not isinstance(digest, str):
+                digest = hashlib.sha256(raw_line).hexdigest()
+            audit_ref = f"audit-record-sha256:{digest}"
+            if (
+                audit_ref in evidence_refs
+                or parsed.get("evaluation_id") == evaluation
+                or parsed.get("transaction_id") == evaluation
+            ):
+                selected.append({**parsed, "_audit_ref": audit_ref})
+    return selected, {
+        "chain_content_sha256": snapshot.chain_content_sha256,
+        "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+        "total_records": snapshot.total_records,
+        "scanned_records": scanned,
+        "retained_records": len(selected),
+        "scan_limit": scan_limit,
+        "scan_truncated": False,
+    }
+
+
 def _percentile(values: list[int], percentile: float) -> int | None:
     if not values:
         return None
@@ -804,7 +856,11 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
             "material review classifications require corroborating evidence beyond the decision"
         )
 
-    records, source = _raw_records(since_unix=0, scan_limit=MAX_REVIEW_SCAN_RECORDS)
+    records, source = _review_records(
+        evaluation=evaluation,
+        evidence_refs=set(evidence_refs),
+        scan_limit=MAX_REVIEW_SCAN_RECORDS,
+    )
     if source.get("scan_truncated") is True:
         raise ReposkopReviewIntegrityError(
             "verified audit chain exceeds the bounded Reposkop review scan"
