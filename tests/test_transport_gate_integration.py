@@ -572,6 +572,92 @@ class CentralTransportGateTests(unittest.TestCase):
         self.assertEqual(domain_calls, [])
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
+    def test_atomic_transport_restores_strict_integer_before_intent_binding(
+        self,
+    ) -> None:
+        base = _load_grabowski_mcp()
+
+        class StrictArguments:
+            @classmethod
+            def model_validate(
+                cls,
+                value: dict[str, object],
+                *,
+                strict: bool,
+            ) -> object:
+                request = value["request"]
+                if not isinstance(request, dict):
+                    raise ValueError("request must be an object")
+                lease_ttl_seconds = request["lease_ttl_seconds"]
+                ratio = request["ratio"]
+                if strict:
+                    if type(lease_ttl_seconds) is not int:
+                        raise ValueError("lease_ttl_seconds must be an integer")
+                    if type(ratio) is not float:
+                        raise ValueError("ratio must be a float")
+                elif (
+                    type(lease_ttl_seconds) is float
+                    and lease_ttl_seconds.is_integer()
+                ):
+                    lease_ttl_seconds = int(lease_ttl_seconds)
+                parsed = {
+                    "request": {
+                        "lease_ttl_seconds": lease_ttl_seconds,
+                        "ratio": ratio,
+                    }
+                }
+                return types.SimpleNamespace(
+                    model_dump=lambda **_kwargs: parsed
+                )
+
+        tool = types.SimpleNamespace(
+            fn_metadata=types.SimpleNamespace(arg_model=StrictArguments)
+        )
+        parameters = {
+            "action": "begin",
+            "target_tool_name": "strict-target",
+            "target_arguments": {
+                "request": {
+                    "lease_ttl_seconds": 900.0,
+                    "ratio": 1.0,
+                }
+            },
+        }
+        base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda _name: tool
+        )
+        with mock.patch.object(base, "_require_capability"), mock.patch.object(
+            base,
+            "_grip_run_core",
+            return_value={"status": "passed"},
+        ) as run_core:
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    parameters,
+                    allow_mutation=True,
+                )
+            )
+        self.assertEqual(result["status"], "passed")
+        normalized = run_core.call_args.args[1]["target_arguments"]
+        self.assertIs(type(normalized["request"]["lease_ttl_seconds"]), int)
+        self.assertIs(type(normalized["request"]["ratio"]), float)
+        self.assertIs(
+            type(parameters["target_arguments"]["request"]["lease_ttl_seconds"]),
+            float,
+        )
+        self.assertEqual(
+            roundtrip.canonical_arguments_sha256(normalized),
+            roundtrip.canonical_arguments_sha256(
+                {
+                    "request": {
+                        "lease_ttl_seconds": 900,
+                        "ratio": 1.0,
+                    }
+                }
+            ),
+        )
+
     def test_atomic_dispatch_classifies_mcp_error_result(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

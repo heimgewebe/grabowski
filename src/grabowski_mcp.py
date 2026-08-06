@@ -10324,6 +10324,83 @@ def _transport_tool_result_error(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _transport_restore_strict_integral_numbers(
+    original: Any,
+    parsed: Any,
+) -> tuple[Any, bool]:
+    if type(original) is float and type(parsed) is int and original.is_integer():
+        return parsed, True
+    if isinstance(original, dict) and isinstance(parsed, dict):
+        restored: dict[Any, Any] = {}
+        changed = False
+        for key, value in original.items():
+            item, item_changed = _transport_restore_strict_integral_numbers(
+                value,
+                parsed.get(key, value),
+            )
+            restored[key] = item
+            changed = changed or item_changed
+        return restored, changed
+    if (
+        isinstance(original, list)
+        and isinstance(parsed, list)
+        and len(original) == len(parsed)
+    ):
+        restored_items: list[Any] = []
+        changed = False
+        for value, parsed_value in zip(original, parsed, strict=True):
+            item, item_changed = _transport_restore_strict_integral_numbers(
+                value,
+                parsed_value,
+            )
+            restored_items.append(item)
+            changed = changed or item_changed
+        return restored_items, changed
+    return original, False
+
+
+def _normalize_atomic_transport_parameters(
+    name: str,
+    parameters: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if name != "transport-roundtrip" or not isinstance(parameters, dict):
+        return parameters
+    if parameters.get("action") not in {"begin", "execute"}:
+        return parameters
+    target_tool_name = parameters.get("target_tool_name")
+    target_arguments = parameters.get("target_arguments")
+    if not isinstance(target_tool_name, str) or not isinstance(
+        target_arguments, dict
+    ):
+        return parameters
+    tool = mcp._tool_manager.get_tool(target_tool_name)
+    metadata = getattr(tool, "fn_metadata", None)
+    argument_model = getattr(metadata, "arg_model", None)
+    if argument_model is None:
+        return parameters
+    try:
+        lenient_model = argument_model.model_validate(
+            dict(target_arguments),
+            strict=False,
+        )
+        lenient_arguments = lenient_model.model_dump(mode="python")
+    except (AttributeError, TypeError, ValueError):
+        return parameters
+    normalized_arguments, changed = _transport_restore_strict_integral_numbers(
+        target_arguments,
+        lenient_arguments,
+    )
+    if not changed:
+        return parameters
+    try:
+        argument_model.model_validate(normalized_arguments, strict=True)
+    except (AttributeError, TypeError, ValueError):
+        return parameters
+    normalized_parameters = dict(parameters)
+    normalized_parameters["target_arguments"] = normalized_arguments
+    return normalized_parameters
+
+
 async def _dispatch_atomic_transport_target(
     target_tool_name: str,
     target_arguments: dict[str, Any],
@@ -10393,10 +10470,14 @@ async def _grip_run_mcp(
         )
         return future.result()
 
+    normalized_parameters = _normalize_atomic_transport_parameters(
+        name,
+        parameters,
+    )
     return await asyncio.to_thread(
         lambda: _grip_run_core(
             name,
-            parameters,
+            normalized_parameters,
             profile,
             allow_mutation,
             ctx,
