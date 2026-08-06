@@ -1641,7 +1641,7 @@
     },
     {
       "category": "bureau",
-      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors. ``candidate_id``, ``event_id``, ``initiative``\nand ``task_id`` remain accepted only as a compatibility bridge for connector\ncatalogs cached before the typed ``selector`` contract was published.",
+      "description": "Assess one explicitly selected operator-intake candidate read-only.\n\n``expected_initiative`` and ``expected_task_id`` are optional binding checks;\nthey are never candidate selectors. ``candidate_id``, ``event_id``,\n``idempotency_key``, ``initiative`` and ``task_id`` remain accepted only as a\ncompatibility bridge for connector\ncatalogs cached before the typed ``selector`` contract was published.",
       "effects": [],
       "id": "grabowski_bureau_candidate_assess",
       "purpose": "Assess one explicitly typed operator-intake candidate or event against current Registry and Live Register truth; task and initiative values are binding checks, never selectors.",

@@ -93,6 +93,13 @@ class BureauEventIdSelector(TypedDict):
     event_id: int
 
 
+class BureauIdempotencyKeySelector(TypedDict):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    kind: Literal["idempotency_key"]
+    idempotency_key: str
+
+
 @dataclass(frozen=True)
 class RegularFileSnapshot:
     path: Path
@@ -760,25 +767,49 @@ def grabowski_bureau_candidate_record(request: dict[str, Any]) -> dict[str, Any]
         mutation=True,
         required_readback=["candidate_by_idempotency_key"],
     )
+    idempotency_key = request.get("idempotency_key")
+    required_readback = payload.get("required_readback")
+    if (
+        payload.get("ambiguity") is True
+        and isinstance(required_readback, list)
+        and "candidate_by_idempotency_key" in required_readback
+        and isinstance(idempotency_key, str)
+        and idempotency_key.strip()
+        and "\x00" not in idempotency_key
+    ):
+        payload = {
+            **payload,
+            "readback_selector": {
+                "kind": "idempotency_key",
+                "idempotency_key": idempotency_key.strip(),
+            },
+        }
     _audit("bureau-candidate-record", payload, request_sha256=request_id)
     return {**payload, "adapter_request_sha256": request_id}
 
 
 @mcp.tool(name="grabowski_bureau_candidate_assess", annotations=READ_ONLY)
 def grabowski_bureau_candidate_assess(
-    selector: BureauCandidateIdSelector | BureauEventIdSelector | None = None,
+    selector: (
+        BureauCandidateIdSelector
+        | BureauEventIdSelector
+        | BureauIdempotencyKeySelector
+        | None
+    ) = None,
     expected_initiative: str = "",
     expected_task_id: str = "",
     candidate_id: str = "",
     event_id: StrictInt = 0,
+    idempotency_key: str = "",
     initiative: str = "",
     task_id: str = "",
 ) -> dict[str, Any]:
     """Assess one explicitly selected operator-intake candidate read-only.
 
     ``expected_initiative`` and ``expected_task_id`` are optional binding checks;
-    they are never candidate selectors. ``candidate_id``, ``event_id``, ``initiative``
-    and ``task_id`` remain accepted only as a compatibility bridge for connector
+    they are never candidate selectors. ``candidate_id``, ``event_id``,
+    ``idempotency_key``, ``initiative`` and ``task_id`` remain accepted only as a
+    compatibility bridge for connector
     catalogs cached before the typed ``selector`` contract was published.
     """
 
@@ -789,7 +820,16 @@ def grabowski_bureau_candidate_assess(
         raise ValueError("candidate_id contains NUL")
     if not isinstance(event_id, int) or isinstance(event_id, bool) or event_id < 0:
         raise ValueError("event_id must be a non-negative integer")
-    legacy_selector_count = int(bool(legacy_candidate_id)) + int(event_id > 0)
+    if not isinstance(idempotency_key, str):
+        raise ValueError("idempotency_key must be text")
+    legacy_idempotency_key = idempotency_key.strip()
+    if "\x00" in legacy_idempotency_key:
+        raise ValueError("idempotency_key contains NUL")
+    legacy_selector_count = (
+        int(bool(legacy_candidate_id))
+        + int(event_id > 0)
+        + int(bool(legacy_idempotency_key))
+    )
     if selector is not None and legacy_selector_count:
         raise ValueError("provide selector or one legacy selector, not both")
     if selector is None:
@@ -798,7 +838,14 @@ def grabowski_bureau_candidate_assess(
         selector = (
             {"kind": "candidate_id", "candidate_id": legacy_candidate_id}
             if legacy_candidate_id
-            else {"kind": "event_id", "event_id": event_id}
+            else (
+                {"kind": "event_id", "event_id": event_id}
+                if event_id > 0
+                else {
+                    "kind": "idempotency_key",
+                    "idempotency_key": legacy_idempotency_key,
+                }
+            )
         )
     if not isinstance(selector, dict):
         raise ValueError("selector must be an object")
@@ -837,6 +884,16 @@ def grabowski_bureau_candidate_assess(
         if not candidate_id or "\x00" in candidate_id:
             raise ValueError("candidate_id is empty or contains NUL")
         arguments.extend(["--candidate-id", candidate_id])
+    elif selector_kind == "idempotency_key":
+        if set(selector) != {"kind", "idempotency_key"}:
+            raise ValueError("idempotency_key selector fields are invalid")
+        selector_value = selector["idempotency_key"]
+        if not isinstance(selector_value, str):
+            raise ValueError("idempotency_key must be text")
+        selector_idempotency_key = selector_value.strip()
+        if not selector_idempotency_key or "\x00" in selector_idempotency_key:
+            raise ValueError("idempotency_key is empty or contains NUL")
+        arguments.extend(["--idempotency-key", selector_idempotency_key])
     elif selector_kind == "event_id":
         if set(selector) != {"kind", "event_id"}:
             raise ValueError("event_id selector fields are invalid")
@@ -849,7 +906,9 @@ def grabowski_bureau_candidate_assess(
             raise ValueError("event_id must be a positive integer")
         arguments.extend(["--event-id", str(selector_value)])
     else:
-        raise ValueError("selector kind must be candidate_id or event_id")
+        raise ValueError(
+            "selector kind must be candidate_id, event_id or idempotency_key"
+        )
     for value, option in (
         (initiative_binding, "--initiative"),
         (task_binding, "--task-id"),
