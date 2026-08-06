@@ -3167,7 +3167,7 @@
       "src/grabowski_coding_agent_router.py": "09a92aabd69873422c8d3a250a6726fe020d902d4011246b33ea2464705e9a8c",
       "src/grabowski_coding_agent_router_cli.py": "af049f09f891b4c018b3beea63c66e5f48a7be3251a339695ae6c5be90682326",
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
-      "src/grabowski_connector_contract.py": "ea586021a3fa810972d77ac38587190c7c38f56b569bd5635b3c58bfa625e184",
+      "src/grabowski_connector_contract.py": "0df5bb6037d3f5c8f3af0612c952f2ec41c6807bcec5439a7b13a6ca627c68cb",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_context_fabric.py": "38f3d83511a8e0e6f8b8faaf43230df1466693f265f9bef70dadfe1ea3a97b95",
       "src/grabowski_convergence.py": "238b0f5df09bb6a8a3b88802ade7aecb6c22258387e206f8dd9a492794e1e771",
