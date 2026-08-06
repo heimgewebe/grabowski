@@ -2234,7 +2234,7 @@ def _repair_existing_assignment_lease_binding(
         isinstance(lease_state, dict)
         and lease_state.get("status") == "active-binding-drift"
         and error_code
-        in {"lease-metadata-binding-mismatch", "lease-resources-missing"}
+        in {"lease-expired", "lease-metadata-binding-mismatch", "lease-resources-missing"}
     ):
         return False
     run = coordination.get("run")
@@ -2273,7 +2273,7 @@ def _repair_existing_assignment_lease_binding(
             "existing-assignment-lease-purpose-journal-mismatch",
             details={"group": group["name"]},
         )
-    if error_code == "lease-resources-missing":
+    if error_code in {"lease-expired", "lease-resources-missing"}:
         result = resources.acquire_resources(
             intent["lease_owner_id"],
             keys,

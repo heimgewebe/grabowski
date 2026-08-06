@@ -2625,6 +2625,63 @@ class BureauPickupTests(unittest.TestCase):
         )
         acquire.assert_not_called()
 
+    def test_existing_assignment_reacquires_expired_lease(self) -> None:
+        request = self.request()
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group other"
+        original = self.lease(key, intent["lease_owner_id"])
+        original["purpose"] = purpose
+        run_dir, acquisition = self.create_acquisition_journal(intent, original)
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        blocking = self.coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-expired",
+                "details": {
+                    "resource_key": key,
+                    "expires_at_unix": original["expires_at_unix"],
+                    "required_after_unix": original["expires_at_unix"] + 1,
+                },
+            },
+        }
+        reacquired = {
+            **original,
+            "acquired_at_unix": original["expires_at_unix"] + 1,
+            "updated_at_unix": original["expires_at_unix"] + 1,
+            "expires_at_unix": original["expires_at_unix"] + 301,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[existing, blocking, self.coordinated_status(intent)],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": [reacquired],
+                },
+            ) as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-assignment", result["status"])
+        self.assertEqual(acquisition["acquisition_sha256"], result["acquisition_sha256"])
+        acquire.assert_called_once()
+        release.assert_not_called()
+        self.assertTrue((run_dir / "lease-reacquire.json").is_file())
+
     def test_runtime_drift_retry_replays_exact_journal_and_reacquires_missing_lease(self) -> None:
         request = self.request()
         normalized = pickup._normalize_request(request)
