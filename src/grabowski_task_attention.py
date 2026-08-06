@@ -338,6 +338,21 @@ def _task_binding(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def derive_task_operation_identity(record: dict[str, Any]) -> str:
+    """Compute deterministic operation identity SHA-256 for operation reuse."""
+    binding = _task_binding(record)
+    explicit_id = record.get("operation_id") or record.get("operation_identity")
+    if isinstance(explicit_id, str) and explicit_id.strip():
+        return explicit_id.strip()
+    material = {
+        "unit": binding["unit"],
+        "argv_sha256": binding["argv_sha256"],
+        "execution_envelope_sha256": binding["execution_envelope_sha256"],
+    }
+    return _sha256_json(material)
+
+
+
 def _task_output_cleanup_now_unix() -> int:
     return int(time.time())
 
@@ -972,6 +987,7 @@ def _classify_record(
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = "decision_without_eligible_outcome"
         return base
+    non_actionable = _non_actionable_failure_class(record, None)
     outcome: dict[str, Any] | None = None
     try:
         outcome, outcome_receipt_sha256, outcome_file_sha256 = _read_valid_outcome(
@@ -979,11 +995,14 @@ def _classify_record(
             expected_receipt_sha256=None,
         )
         base["outcome_receipt_sha256"] = outcome_receipt_sha256
+        non_actionable = _non_actionable_failure_class(record, outcome)
     except (FileNotFoundError, OSError, TaskAttentionError, TaskAttentionInputError) as exc:
+        if non_actionable is not None:
+            base["classification"] = non_actionable
+            return base
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = type(exc).__name__
         return base
-    non_actionable = _non_actionable_failure_class(record, outcome)
     if non_actionable is not None:
         base["classification"] = non_actionable
     if not include_decisions:
