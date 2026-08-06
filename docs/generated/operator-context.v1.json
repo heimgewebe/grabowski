@@ -3233,7 +3233,7 @@
       "src/grabowski_resources.py": "d2a0a0dbe1c0557b36ea09c15bc3efd4c2d1fc273a142f2a22286651518a5a00",
       "src/grabowski_runtime.py": "0496f49edbfe5f5998698f3887d153d7cb871bd331bd8c503256729c487145ee",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
-      "src/grabowski_self_deploy.py": "d70f9e9b7b5ec0a7b4e5a7ce13f631274cd98860eda7763a46f6b16625704bbb",
+      "src/grabowski_self_deploy.py": "569d0f3f2a289e3ece52a98d205151cd78c3efb47d7bd5ca754d2d50c3095659",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",
       "src/grabowski_system_map.py": "16dda15f49bf6e0993510455313c24172625dcddba1123eaad096e393b78908c",
