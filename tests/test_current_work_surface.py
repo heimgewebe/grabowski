@@ -200,6 +200,81 @@ class CurrentWorkSurfaceTests(unittest.TestCase):
                 [REPOSITORY, "/home/alex/repos/../repos/grabowski"]
             )
 
+    def test_checkout_source_uses_bounded_observation_contract(self) -> None:
+        seen: dict[str, object] = {}
+
+        def inventory(repository: str, **kwargs: object) -> dict:
+            seen["repository"] = repository
+            seen.update(kwargs)
+            return {
+                "repository": repository,
+                "worktrees": [],
+                "truncated": True,
+                "omitted_worktree_count": 7,
+                "probe_errors": [{"stage": "status"}],
+            }
+
+        errors: list[dict] = []
+        checkouts = SimpleNamespace(checkout_inventory=inventory)
+        with patch.object(surface, "_module", return_value=checkouts):
+            payloads = surface._checkout_payloads([REPOSITORY], errors)
+
+        self.assertEqual(payloads[0]["repository"], REPOSITORY)
+        self.assertEqual(seen["repository"], REPOSITORY)
+        self.assertFalse(seen["include_processes"])
+        self.assertFalse(seen["include_tasks"])
+        self.assertTrue(seen["include_resources"])
+        self.assertEqual(
+            seen["git_timeout_seconds"],
+            surface.CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            seen["observation_budget_seconds"],
+            surface.CURRENT_WORK_CHECKOUT_OBSERVATION_BUDGET_SECONDS,
+        )
+        self.assertEqual(
+            seen["max_worktrees"],
+            surface.CURRENT_WORK_CHECKOUT_MAX_WORKTREES,
+        )
+        self.assertEqual(
+            errors,
+            [
+                {
+                    "source": "checkouts",
+                    "repository": REPOSITORY,
+                    "error": "CheckoutObservationPartial",
+                    "omitted_worktree_count": 7,
+                    "probe_error_count": 1,
+                }
+            ],
+        )
+
+    def test_reconciliation_source_uses_bounded_git_timeout(self) -> None:
+        seen: dict[str, object] = {}
+
+        def reconcile(**kwargs: object) -> dict:
+            seen.update(kwargs)
+            return {
+                "bindings": [],
+                "pagination": {"has_more": False},
+                "total_count": 0,
+            }
+
+        reconciler = SimpleNamespace(
+            MAX_PAGE_LIMIT=100,
+            reconcile_checkout_bindings=reconcile,
+        )
+        with patch.object(surface, "_module", return_value=reconciler):
+            result = surface._reconciliation_payload([REPOSITORY])
+
+        self.assertEqual(result["bindings"], [])
+        self.assertEqual(seen["repository_filters"], [REPOSITORY])
+        self.assertEqual(seen["limit"], 100)
+        self.assertEqual(
+            seen["git_timeout_seconds"],
+            surface.CURRENT_WORK_GIT_TIMEOUT_SECONDS,
+        )
+
     def test_checkout_source_failure_is_isolated_per_repository(self) -> None:
         missing = "/home/alex/repos/missing"
 
