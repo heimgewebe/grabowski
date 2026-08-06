@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -72,6 +73,20 @@ MAX_MCP_ERROR_ENVELOPE_BYTES = 16 * 1024
 MCP_ERROR_ENVELOPE_MARKER = "GRABOWSKI_ERROR_ENVELOPE="
 
 
+ACTIVE_EXECUTION_STATES = frozenset({"assigned", "running", "verifying"})
+TERMINAL_EXECUTION_STATES = frozenset({"succeeded", "failed", "cancelled", "orphaned"})
+EXECUTION_HEARTBEAT_MAX_AGE_SECONDS = 900
+EXTERNAL_BINDING_FIELDS = ("external_system", "external_id", "external_state")
+ACTIVE_EXTERNAL_STATES = frozenset({"queued", "running", "succeeded"})
+ORPHAN_RECONCILE_ERROR = "orphan-reconcile:stale-or-unbound-execution"
+LEASE_IDENTITY_FIELDS = (
+    "resource_key",
+    "owner_id",
+    "acquired_at_unix",
+    "updated_at_unix",
+    "expires_at_unix",
+    "metadata_sha256",
+)
 def _bureau_pickup_error_message(
     code: str, details: dict[str, Any], summary: str | None
 ) -> str:
@@ -137,6 +152,14 @@ class BureauPickupRequest(_RequiredBureauPickupRequest, total=False):
     nonconflict_proofs: dict[str, dict[str, Any]] | None
     registry_root: str
 
+
+class BureauPickupOrphanReconcileRequest(TypedDict):
+    __pydantic_config__ = {"extra": "forbid", "strict": True}
+
+    run_id: str
+    expected_registry_binding_sha256: str
+    expected_coordination_sha256: str
+    expected_lease_sha256: str
 
 class ExplicitRegistryBindingIdentity(TypedDict):
     schema_version: int
@@ -2060,18 +2083,23 @@ def _recover_after_commit(
 
 
 def _lease_snapshot(value: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value[key]
-        for key in (
-            "resource_key",
-            "owner_id",
-            "acquired_at_unix",
-            "updated_at_unix",
-            "expires_at_unix",
-            "metadata_sha256",
-        )
-    }
+    snapshot = {key: value[key] for key in LEASE_IDENTITY_FIELDS}
+    if "reclaimed_from_owner" in value:
+        snapshot["reclaimed_from_owner"] = value["reclaimed_from_owner"]
+    return snapshot
 
+
+def _owner_lease_matches_snapshot(
+    expected: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    """Exact owner-lease identity vs stored snapshot; missing leases are caller-handled."""
+    for field in LEASE_IDENTITY_FIELDS:
+        if expected.get(field) != observed.get(field):
+            return False
+    if "reclaimed_from_owner" in expected or "reclaimed_from_owner" in observed:
+        if expected.get("reclaimed_from_owner") != observed.get("reclaimed_from_owner"):
+            return False
+    return True
 
 def _journal_run_ids() -> list[str]:
     root = _absolute_path(STATE_ROOT)
@@ -2246,6 +2274,228 @@ def _journaled_existing_assignment_after_claim_rejection(
     return synthetic, stored_binding, stored_request, coordination
 
 
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+def _parse_utc_timestamp(value: Any) -> tuple[datetime | None, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        return None, "heartbeat_missing"
+    raw = value.strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "heartbeat_malformed"
+    if parsed.tzinfo is None:
+        return None, "heartbeat_timezone_missing"
+    return parsed.astimezone(timezone.utc), None
+
+def _external_binding_projection(run: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        field: _optional_text(run.get(field)) for field in EXTERNAL_BINDING_FIELDS
+    }
+    present_fields = [field for field, item in values.items() if item is not None]
+    missing_fields = [field for field, item in values.items() if item is None]
+    present = bool(present_fields)
+    complete = present and not missing_fields
+    return {
+        "present": present,
+        "complete": complete,
+        "external_system": values["external_system"],
+        "external_id": values["external_id"],
+        "external_state": values["external_state"],
+        "present_fields": present_fields,
+        "missing_fields": missing_fields if present else [],
+    }
+
+def _execution_binding_does_not_establish() -> list[str]:
+    return [
+        "process liveness beyond reported heartbeat evidence",
+        "permission to release foreign leases",
+        "workspace cleanup authority",
+        "task verification",
+        "automatic global reconcile authority",
+    ]
+
+def _classify_execution_binding(
+    run: Any, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """Classify whether a coordinated Bureau run has fresh execution evidence."""
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    else:
+        observed_at = observed_at.astimezone(timezone.utc)
+
+    reason_codes: list[str] = []
+    missing_bindings: list[str] = []
+    # Demote from a candidate; only intact fresh evidence remains actively_bound.
+    classification = "actively_bound"
+    heartbeat_at: str | None = None
+    heartbeat_age_seconds: int | None = None
+    heartbeat_parse_error: str | None = None
+    worker_id: str | None = None
+    state: str | None = None
+    run_id: str | None = None
+    external = {
+        "present": False,
+        "complete": False,
+        "external_system": None,
+        "external_id": None,
+        "external_state": None,
+        "present_fields": [],
+        "missing_fields": [],
+    }
+
+    def demote(next_classification: str) -> None:
+        nonlocal classification
+        rank = {
+            "actively_bound": 0,
+            "unbound": 1,
+            "stale": 2,
+            "attention_required": 3,
+        }
+        if rank[next_classification] > rank[classification]:
+            classification = next_classification
+
+    if not isinstance(run, dict):
+        reason_codes.append("run_missing")
+        missing_bindings.append("run")
+        demote("attention_required")
+    else:
+        run_id = _optional_text(run.get("run_id"))
+        state = _optional_text(run.get("state"))
+        worker_id = _optional_text(run.get("worker_id"))
+        external = _external_binding_projection(run)
+        if run_id is None:
+            reason_codes.append("run_id_missing")
+            missing_bindings.append("run_id")
+            demote("attention_required")
+        if state is None:
+            reason_codes.append("state_missing")
+            missing_bindings.append("state")
+            demote("attention_required")
+        elif state in TERMINAL_EXECUTION_STATES:
+            reason_codes.append("state_not_active")
+            demote("unbound")
+        elif state not in ACTIVE_EXECUTION_STATES:
+            reason_codes.append("state_unknown")
+            demote("attention_required")
+        if worker_id is None:
+            reason_codes.append("worker_id_missing")
+            missing_bindings.append("worker_id")
+            demote("unbound")
+        raw_heartbeat = run.get("heartbeat_at")
+        if raw_heartbeat is None or (
+            isinstance(raw_heartbeat, str) and not raw_heartbeat.strip()
+        ):
+            heartbeat_parse_error = "heartbeat_missing"
+            reason_codes.append("heartbeat_missing")
+            missing_bindings.append("heartbeat_at")
+            demote("unbound")
+        elif not isinstance(raw_heartbeat, str):
+            heartbeat_parse_error = "heartbeat_malformed"
+            reason_codes.append("heartbeat_malformed")
+            demote("attention_required")
+        else:
+            heartbeat_at = raw_heartbeat.strip()
+            parsed, parse_error = _parse_utc_timestamp(heartbeat_at)
+            if parse_error is not None:
+                heartbeat_parse_error = parse_error
+                reason_codes.append(parse_error)
+                demote("attention_required")
+            else:
+                assert parsed is not None
+                age = (observed_at - parsed).total_seconds()
+                if age < 0:
+                    heartbeat_age_seconds = int(age)
+                    reason_codes.append("heartbeat_future")
+                    demote("attention_required")
+                else:
+                    heartbeat_age_seconds = int(age)
+                    if age > EXECUTION_HEARTBEAT_MAX_AGE_SECONDS:
+                        reason_codes.append("heartbeat_stale")
+                        demote("stale")
+        if external["present"] and not external["complete"]:
+            reason_codes.append("external_binding_incomplete")
+            missing_bindings.extend(
+                field
+                for field in external["missing_fields"]
+                if field not in missing_bindings
+            )
+            demote("attention_required")
+        elif external["complete"]:
+            external_state = external["external_state"]
+            if external_state not in ACTIVE_EXTERNAL_STATES:
+                reason_codes.append("external_state_invalid")
+                demote("attention_required")
+            elif state in ACTIVE_EXECUTION_STATES:
+                if state == "verifying":
+                    if external_state != "succeeded":
+                        reason_codes.append("external_state_inconsistent")
+                        demote("attention_required")
+                elif external_state == "succeeded":
+                    reason_codes.append("external_state_inconsistent")
+                    demote("attention_required")
+
+        if classification == "actively_bound":
+            reason_codes.append("execution_actively_bound")
+        elif not reason_codes:
+            reason_codes.append("execution_unbound")
+
+    # Prefer a single primary classification; keep reason codes stable/sorted unique.
+    ordered_reasons: list[str] = []
+    for code in reason_codes:
+        if code not in ordered_reasons:
+            ordered_reasons.append(code)
+
+    actively_bound = classification == "actively_bound"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_execution_binding",
+        "classification": classification,
+        "actively_bound": actively_bound,
+        "run_id": run_id,
+        "state": state,
+        "worker_id": worker_id,
+        "heartbeat_at": heartbeat_at,
+        "heartbeat_age_seconds": heartbeat_age_seconds,
+        "heartbeat_parse_error": heartbeat_parse_error,
+        "heartbeat_max_age_seconds": EXECUTION_HEARTBEAT_MAX_AGE_SECONDS,
+        "observed_at": observed_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "external_binding": external,
+        "missing_bindings": missing_bindings,
+        "reason_codes": ordered_reasons,
+        "does_not_establish": _execution_binding_does_not_establish(),
+    }
+
+def _require_active_execution_binding(
+    coordination: dict[str, Any], *, action: str
+) -> dict[str, Any]:
+    run = coordination.get("run")
+    binding = _classify_execution_binding(run)
+    if binding["actively_bound"]:
+        return binding
+    run_dict = run if isinstance(run, dict) else {}
+    raise BureauPickupError(
+        "existing-assignment-execution-not-bound",
+        details={
+            "action": action,
+            "run_id": binding.get("run_id") or run_dict.get("run_id"),
+            "state": binding.get("state") or run_dict.get("state"),
+            "heartbeat_age_seconds": binding.get("heartbeat_age_seconds"),
+            "heartbeat_parse_error": binding.get("heartbeat_parse_error"),
+            "missing_bindings": binding.get("missing_bindings"),
+            "reason_codes": binding.get("reason_codes"),
+            "execution_binding": binding,
+            "does_not_establish": binding.get("does_not_establish"),
+        },
+    )
+
 def _repair_existing_assignment_lease_binding(
     coordination: dict[str, Any],
     intent: dict[str, Any],
@@ -2260,15 +2510,15 @@ def _repair_existing_assignment_lease_binding(
         isinstance(lease_state, dict)
         and lease_state.get("status") == "active-binding-drift"
         and error_code
-        in {"lease-expired", "lease-metadata-binding-mismatch", "lease-resources-missing"}
+        in {
+            "lease-expired",
+            "lease-metadata-binding-mismatch",
+            "lease-resources-missing",
+        }
     ):
         return False
     run = coordination.get("run")
-    if not isinstance(run, dict) or run.get("state") not in {
-        "assigned",
-        "running",
-        "verifying",
-    }:
+    if not isinstance(run, dict) or run.get("state") not in ACTIVE_EXECUTION_STATES:
         return False
     release = coordination.get("release")
     if not isinstance(release, dict):
@@ -2280,6 +2530,10 @@ def _repair_existing_assignment_lease_binding(
     }
     if any(release.get(key) != value for key, value in expected_release.items()):
         return False
+    # Fail closed before any reacquire/rebind side effect without fresh binding.
+    _require_active_execution_binding(
+        coordination, action="repair-existing-assignment-lease-binding"
+    )
     original_by_key = {
         item["resource_key"]: item
         for item in acquisition.get("leases", [])
@@ -2324,11 +2578,9 @@ def _repair_existing_assignment_lease_binding(
                                 "owner_id": observed.get("owner_id"),
                             },
                         )
-                    if (
-                        observed.get("purpose") != purpose
-                        or observed.get("metadata_sha256")
-                        != original_by_key[key].get("metadata_sha256")
-                    ):
+                    if observed.get("purpose") != purpose or observed.get(
+                        "metadata_sha256"
+                    ) != original_by_key[key].get("metadata_sha256"):
                         raise BureauPickupError(
                             "existing-assignment-lease-live-binding-mismatch",
                             details={"group": group["name"], "resource_key": key},
@@ -2373,9 +2625,7 @@ def _repair_existing_assignment_lease_binding(
                         "existing-assignment-lease-reacquire-mismatch",
                         details={"group": group["name"]},
                     )
-                _write_bound_json(
-                    run_dir / f"lease-reacquired-{index:02d}.json", entry
-                )
+                _write_bound_json(run_dir / f"lease-reacquired-{index:02d}.json", entry)
         except Exception as exc:
             compensation = _compensate_acquisitions(
                 intent["lease_owner_id"], compensation_entries, run_dir
@@ -2405,9 +2655,7 @@ def _repair_existing_assignment_lease_binding(
                 for entry in reacquired
             ],
             "resource_keys": sorted(
-                key
-                for entry in reacquired
-                for key in entry["reacquired_resource_keys"]
+                key for entry in reacquired for key in entry["reacquired_resource_keys"]
             ),
         }
         receipt["receipt_sha256"] = _sha256(receipt)
@@ -2445,7 +2693,9 @@ def _repair_existing_assignment_lease_binding(
         ttl_seconds=group["ttl_seconds"],
         metadata=group["metadata"],
         expected_current_leases=[_lease_snapshot(current_by_key[key]) for key in keys],
-        expected_original_leases=[_lease_snapshot(original_by_key[key]) for key in keys],
+        expected_original_leases=[
+            _lease_snapshot(original_by_key[key]) for key in keys
+        ],
     )
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -2912,6 +3162,7 @@ def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
     payload, effective_binding = _coordination_status_for_binding(
         normalized_run_id, binding
     )
+    run = payload.get("run") if isinstance(payload, dict) else None
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski_bureau_pickup_status",
@@ -2919,10 +3170,11 @@ def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
         "registry_root": effective_binding["registry_root"],
         "coordination_root": effective_binding["coordination_root"],
         "root_binding_source": effective_binding["source"],
-        "registry_binding_sha256": effective_binding["registry_binding"][
-            "identity"
-        ]["binding_sha256"],
+        "registry_binding_sha256": effective_binding["registry_binding"]["identity"][
+            "binding_sha256"
+        ],
         "coordination": payload,
+        "execution_binding": _classify_execution_binding(run),
         "journal_available": _journal_available(normalized_run_id),
     }
 
@@ -2957,10 +3209,11 @@ def _verify_release_binding(
     run = status.get("run")
     if not isinstance(run, dict) or run.get("run_id") != run_id:
         raise BureauPickupError("terminal-run-binding-invalid")
-    if run.get("state") in {"assigned", "running", "verifying"}:
-        raise BureauPickupError(
-            "run-still-active", details={"state": run.get("state")}
-        )
+    run_state = run.get("state")
+    if run_state in ACTIVE_EXECUTION_STATES:
+        raise BureauPickupError("run-still-active", details={"state": run_state})
+    if not _run_is_terminal(run):
+        raise BureauPickupError("run-not-terminal", details={"state": run_state})
     release = status.get("release")
     if not isinstance(release, dict) or release.get("required") is not True:
         raise BureauPickupError("lease-release-not-required")
@@ -2970,9 +3223,7 @@ def _verify_release_binding(
         raise BureauPickupError("lease-release-owner-mismatch")
     if keys != acquisition.get("resource_keys"):
         raise BureauPickupError("lease-release-resource-mismatch")
-    if release.get("claim_intent_sha256") != acquisition.get(
-        "claim_intent_sha256"
-    ):
+    if release.get("claim_intent_sha256") != acquisition.get("claim_intent_sha256"):
         raise BureauPickupError("lease-release-intent-mismatch")
     if not isinstance(keys, list):
         raise BureauPickupError("lease-release-resource-set-invalid")
@@ -2992,7 +3243,7 @@ def _verify_release_binding(
             raise BureauPickupError(
                 "lease-release-foreign-owner", details={"resource_key": key}
             )
-        if observed.get("metadata_sha256") != expected.get("metadata_sha256"):
+        if not _owner_lease_matches_snapshot(expected, observed):
             raise BureauPickupError(
                 "lease-release-metadata-drift", details={"resource_key": key}
             )
@@ -3181,4 +3432,486 @@ def grabowski_bureau_pickup_release(run_id: str) -> dict[str, Any]:
     bureau._audit(
         "bureau-pickup-release", payload, run_id=normalized_run_id
     )
+    return payload
+
+def _normalize_sha256_digest(value: Any, *, label: str) -> str:
+    digest = _text(value, label=label, maximum=64)
+    if SHA256_RE.fullmatch(digest) is None:
+        raise ValueError(f"{label} is invalid")
+    return digest
+
+def _normalize_orphan_reconcile_request(
+    request: dict[str, Any],
+) -> dict[str, str]:
+    if not isinstance(request, dict):
+        raise ValueError("request must be an object")
+    allowed = {
+        "run_id",
+        "expected_registry_binding_sha256",
+        "expected_coordination_sha256",
+        "expected_lease_sha256",
+    }
+    extra = sorted(set(request) - allowed)
+    if extra:
+        raise ValueError(f"unsupported request fields: {extra}")
+    run_id = _text(request.get("run_id"), label="run_id", maximum=128)
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        raise ValueError("run_id is invalid")
+    return {
+        "run_id": run_id,
+        "expected_registry_binding_sha256": _normalize_sha256_digest(
+            request.get("expected_registry_binding_sha256"),
+            label="expected_registry_binding_sha256",
+        ),
+        "expected_coordination_sha256": _normalize_sha256_digest(
+            request.get("expected_coordination_sha256"),
+            label="expected_coordination_sha256",
+        ),
+        "expected_lease_sha256": _normalize_sha256_digest(
+            request.get("expected_lease_sha256"),
+            label="expected_lease_sha256",
+        ),
+    }
+
+def _fail_bureau_run(
+    run_id: str,
+    *,
+    registry_root: str,
+    coordination_root: str | None,
+    error: str,
+) -> dict[str, Any]:
+    arguments = _bureau_arguments(
+        "fail",
+        registry_root=registry_root,
+        coordination_root=coordination_root,
+    )
+    arguments.extend([run_id, "--error", error])
+    return bureau._invoke_bureau(
+        arguments,
+        mutation=True,
+        required_readback=[f"bureau_run:{run_id}"],
+    )
+
+def _adapter_outcome_unknown(payload: dict[str, Any], *, run_id: str) -> bool:
+    if payload.get("kind") != "grabowski_bureau_intake_adapter_failure":
+        return False
+    if payload.get("ambiguity") is True or payload.get("effect_started") is True:
+        return True
+    return payload.get("code") in {
+        "bureau-runtime-timeout",
+        "bureau-output-invalid",
+        "bureau-output-too-large",
+        "bureau-runtime-unavailable",
+    }
+
+def _run_is_terminal(run: Any) -> bool:
+    if not isinstance(run, dict):
+        return False
+    state = run.get("state")
+    return isinstance(state, str) and state in TERMINAL_EXECUTION_STATES
+
+def _read_orphan_pre_effect_coordination_digest(run_dir: Path) -> str | None:
+    path = run_dir / "orphan-pre-effect.json"
+    if not path.is_file() or path.is_symlink():
+        return None
+    try:
+        payload = _read_bound_json(path, label="orphan-pre-effect")
+    except BureauPickupError:
+        return None
+    digest = payload.get("observed_coordination_sha256")
+    if isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None:
+        return digest
+    return None
+
+def _write_orphan_pre_effect(
+    run_dir: Path,
+    *,
+    run_id: str,
+    observed_coordination_sha256: str,
+    normalized: dict[str, str],
+) -> None:
+    _write_bound_json(
+        run_dir / "orphan-pre-effect.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_orphan_pre_effect",
+            "run_id": run_id,
+            "observed_coordination_sha256": observed_coordination_sha256,
+            "expected_coordination_sha256": normalized["expected_coordination_sha256"],
+            "expected_registry_binding_sha256": normalized[
+                "expected_registry_binding_sha256"
+            ],
+            "expected_lease_sha256": normalized["expected_lease_sha256"],
+        },
+    )
+
+def _assert_owner_leases_unchanged_or_absent(
+    acquisition: dict[str, Any],
+) -> None:
+    owner_id = acquisition["owner_id"]
+    expected_by_key = {
+        lease["resource_key"]: lease
+        for lease in acquisition.get("leases", [])
+        if isinstance(lease, dict) and isinstance(lease.get("resource_key"), str)
+    }
+    for key in acquisition["resource_keys"]:
+        observed = resources.inspect_resource(key)
+        if observed is None:
+            continue
+        if observed.get("owner_id") != owner_id:
+            raise BureauPickupError(
+                "orphan-reconcile-foreign-lease",
+                details={
+                    "resource_key": key,
+                    "owner_id": observed.get("owner_id"),
+                    "expected_owner_id": owner_id,
+                    "does_not_establish": _execution_binding_does_not_establish(),
+                },
+            )
+        expected = expected_by_key.get(key)
+        if expected is None:
+            raise BureauPickupError(
+                "orphan-reconcile-lease-snapshot-missing",
+                details={"resource_key": key},
+            )
+        if not _owner_lease_matches_snapshot(expected, observed):
+            raise BureauPickupError(
+                "orphan-reconcile-lease-metadata-drift",
+                details={"resource_key": key},
+            )
+
+@mcp.tool(name="grabowski_bureau_pickup_orphan_reconcile", annotations=MUTATING)
+def grabowski_bureau_pickup_orphan_reconcile(
+    request: BureauPickupOrphanReconcileRequest,
+) -> dict[str, Any]:
+    """Terminalize exactly one unbound coordinated run and release its owner leases."""
+    normalized = _normalize_orphan_reconcile_request(request)
+    run_id = normalized["run_id"]
+    binding = _root_binding_for_run(run_id)
+    registry_root = binding["registry_root"]
+    operator._require_operator_mutation("terminal_execute", path=registry_root)
+    coordination_effect_root = (
+        Path(binding["coordination_root"])
+        if binding["coordination_root"] is not None
+        else _legacy_coordination_root()
+    )
+    operator._require_operator_mutation(
+        "terminal_execute", path=str(coordination_effect_root)
+    )
+    operator._require_operator_mutation("resource_lease")
+
+    observed_registry_sha256 = binding["registry_binding"]["identity"]["binding_sha256"]
+    if observed_registry_sha256 != normalized["expected_registry_binding_sha256"]:
+        raise BureauPickupError(
+            "orphan-reconcile-registry-digest-mismatch",
+            details={
+                "run_id": run_id,
+                "expected": normalized["expected_registry_binding_sha256"],
+                "observed": observed_registry_sha256,
+                "effect_started": False,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            },
+        )
+
+    run_dir = _run_directory(run_id)
+    acquisition = _read_bound_json(run_dir / "acquisition.json", label="acquisition")
+    _validate_acquisition(acquisition)
+    if acquisition.get("acquisition_sha256") != normalized["expected_lease_sha256"]:
+        raise BureauPickupError(
+            "orphan-reconcile-lease-digest-mismatch",
+            details={
+                "run_id": run_id,
+                "expected": normalized["expected_lease_sha256"],
+                "observed": acquisition.get("acquisition_sha256"),
+                "effect_started": False,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            },
+        )
+
+    receipt_path = run_dir / "orphan-reconcile.json"
+    if receipt_path.is_file() and not receipt_path.is_symlink():
+        existing_receipt = _read_bound_json(receipt_path, label="orphan-reconcile")
+        if (
+            existing_receipt.get("expected_registry_binding_sha256")
+            == normalized["expected_registry_binding_sha256"]
+            and existing_receipt.get("expected_coordination_sha256")
+            == normalized["expected_coordination_sha256"]
+            and existing_receipt.get("expected_lease_sha256")
+            == normalized["expected_lease_sha256"]
+            and existing_receipt.get("run_id") == run_id
+            and existing_receipt.get("status") in {"reconciled", "already-reconciled"}
+        ):
+            payload = {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_reconcile",
+                "status": "already-reconciled",
+                "run_id": run_id,
+                "registry_root": registry_root,
+                "coordination_root": binding["coordination_root"],
+                "root_binding_source": binding["source"],
+                "registry_binding_sha256": observed_registry_sha256,
+                "expected_registry_binding_sha256": normalized[
+                    "expected_registry_binding_sha256"
+                ],
+                "expected_coordination_sha256": normalized[
+                    "expected_coordination_sha256"
+                ],
+                "expected_lease_sha256": normalized["expected_lease_sha256"],
+                "receipt": existing_receipt,
+                "journal": str(run_dir),
+                "effect_started": False,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            }
+            return payload
+
+    status, effective_binding = _coordination_status_for_binding(run_id, binding)
+    if not isinstance(status, dict):
+        raise BureauPickupError(
+            "orphan-reconcile-status-invalid",
+            details={"run_id": run_id, "effect_started": False},
+        )
+    if status.get("kind") == "grabowski_bureau_intake_adapter_failure":
+        if _adapter_outcome_unknown(status, run_id=run_id):
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_reconcile",
+                "status": "outcome_unknown",
+                "run_id": run_id,
+                "required_readback": [f"bureau_run:{run_id}"],
+                "readback_required": True,
+                "coordination": status,
+                "effect_started": bool(status.get("effect_started")),
+                "does_not_establish": _execution_binding_does_not_establish(),
+            }
+        raise BureauPickupError(
+            "orphan-reconcile-status-unavailable",
+            details={
+                "run_id": run_id,
+                "coordination": status,
+                "effect_started": False,
+            },
+        )
+
+    observed_coordination_sha256 = _sha256(status)
+    run = status.get("run")
+    execution_binding = _classify_execution_binding(run)
+    already_terminal = _run_is_terminal(run)
+
+    if not already_terminal:
+        if observed_coordination_sha256 != normalized["expected_coordination_sha256"]:
+            raise BureauPickupError(
+                "orphan-reconcile-coordination-digest-mismatch",
+                details={
+                    "run_id": run_id,
+                    "expected": normalized["expected_coordination_sha256"],
+                    "observed": observed_coordination_sha256,
+                    "effect_started": False,
+                    "execution_binding": execution_binding,
+                    "does_not_establish": _execution_binding_does_not_establish(),
+                },
+            )
+        if execution_binding["classification"] == "attention_required":
+            raise BureauPickupError(
+                "orphan-reconcile-execution-attention-required",
+                details={
+                    "run_id": run_id,
+                    "execution_binding": execution_binding,
+                    "effect_started": False,
+                    "does_not_establish": _execution_binding_does_not_establish(),
+                },
+            )
+        if execution_binding["actively_bound"]:
+            raise BureauPickupError(
+                "orphan-reconcile-execution-actively-bound",
+                details={
+                    "run_id": run_id,
+                    "execution_binding": execution_binding,
+                    "effect_started": False,
+                    "does_not_establish": _execution_binding_does_not_establish(),
+                },
+            )
+        if status.get("status") != "coordinated":
+            raise BureauPickupError(
+                "orphan-reconcile-not-coordinated",
+                details={
+                    "run_id": run_id,
+                    "status": status.get("status"),
+                    "effect_started": False,
+                },
+            )
+        _assert_owner_leases_unchanged_or_absent(acquisition)
+        # Persist pre-effect digest before any fail mutation for later terminal CAS.
+        _write_orphan_pre_effect(
+            run_dir,
+            run_id=run_id,
+            observed_coordination_sha256=observed_coordination_sha256,
+            normalized=normalized,
+        )
+        fail_result = _bound_bureau_call(
+            effective_binding["registry_binding"],
+            lambda: _fail_bureau_run(
+                run_id,
+                registry_root=effective_binding["registry_root"],
+                coordination_root=effective_binding["coordination_root"],
+                error=ORPHAN_RECONCILE_ERROR,
+            ),
+        )
+        if not isinstance(fail_result, dict):
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_reconcile",
+                "status": "outcome_unknown",
+                "run_id": run_id,
+                "required_readback": [f"bureau_run:{run_id}"],
+                "readback_required": True,
+                "effect_started": True,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            }
+        if _adapter_outcome_unknown(fail_result, run_id=run_id):
+            _write_bound_json(run_dir / "orphan-fail-unknown.json", fail_result)
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_reconcile",
+                "status": "outcome_unknown",
+                "run_id": run_id,
+                "required_readback": sorted(
+                    set(fail_result.get("required_readback") or [])
+                    | {f"bureau_run:{run_id}"}
+                ),
+                "readback_required": True,
+                "fail": fail_result,
+                "effect_started": True,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            }
+        if not (fail_result.get("run_id") == run_id and _run_is_terminal(fail_result)):
+            # Authoritative fail must yield an explicit terminal state.
+            _write_bound_json(run_dir / "orphan-fail-unknown.json", fail_result)
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_reconcile",
+                "status": "outcome_unknown",
+                "run_id": run_id,
+                "required_readback": [f"bureau_run:{run_id}"],
+                "readback_required": True,
+                "fail": fail_result,
+                "effect_started": True,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            }
+        _write_bound_json(run_dir / "orphan-fail-result.json", fail_result)
+        status, effective_binding = _coordination_status_for_binding(
+            run_id, effective_binding
+        )
+        run = status.get("run") if isinstance(status, dict) else None
+        execution_binding = _classify_execution_binding(run)
+        if not _run_is_terminal(run):
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "kind": "grabowski_bureau_pickup_orphan_reconcile",
+                "status": "outcome_unknown",
+                "run_id": run_id,
+                "required_readback": [f"bureau_run:{run_id}"],
+                "readback_required": True,
+                "coordination": status,
+                "execution_binding": execution_binding,
+                "effect_started": True,
+                "does_not_establish": _execution_binding_does_not_establish(),
+            }
+    else:
+        # Already terminal: bind expected digest to current terminal or journaled pre-effect.
+        if status.get("status") != "coordinated":
+            raise BureauPickupError(
+                "orphan-reconcile-not-coordinated",
+                details={
+                    "run_id": run_id,
+                    "status": status.get("status"),
+                    "effect_started": False,
+                },
+            )
+        allowed_coordination_digests = {observed_coordination_sha256}
+        pre_effect_digest = _read_orphan_pre_effect_coordination_digest(run_dir)
+        if pre_effect_digest is not None:
+            allowed_coordination_digests.add(pre_effect_digest)
+        if (
+            normalized["expected_coordination_sha256"]
+            not in allowed_coordination_digests
+        ):
+            raise BureauPickupError(
+                "orphan-reconcile-coordination-digest-mismatch",
+                details={
+                    "run_id": run_id,
+                    "expected": normalized["expected_coordination_sha256"],
+                    "observed": observed_coordination_sha256,
+                    "allowed": sorted(allowed_coordination_digests),
+                    "effect_started": False,
+                    "execution_binding": execution_binding,
+                    "does_not_establish": _execution_binding_does_not_establish(),
+                },
+            )
+        _assert_owner_leases_unchanged_or_absent(acquisition)
+
+    if not isinstance(status, dict) or status.get("status") != "coordinated":
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_orphan_reconcile",
+            "status": "outcome_unknown",
+            "run_id": run_id,
+            "required_readback": [f"bureau_run:{run_id}"],
+            "readback_required": True,
+            "coordination": status,
+            "effect_started": True,
+            "does_not_establish": _execution_binding_does_not_establish(),
+        }
+
+    terminal_readback = _write_or_reuse_terminal_readback(
+        run_dir / "terminal-readback.json", status
+    )
+    release_result = grabowski_bureau_pickup_release(run_id)
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_orphan_reconcile_receipt",
+        "status": "reconciled",
+        "run_id": run_id,
+        "expected_registry_binding_sha256": normalized[
+            "expected_registry_binding_sha256"
+        ],
+        "expected_coordination_sha256": normalized["expected_coordination_sha256"],
+        "expected_lease_sha256": normalized["expected_lease_sha256"],
+        "observed_coordination_sha256": observed_coordination_sha256,
+        "terminal_readback_sha256": _sha256(terminal_readback),
+        "release_status": release_result.get("status"),
+        "execution_binding": execution_binding,
+        "preserves": [
+            "dirty worktree content",
+            "branch identity",
+            "unrelated leases",
+        ],
+        "does_not_establish": _execution_binding_does_not_establish(),
+    }
+    receipt["receipt_sha256"] = _sha256(receipt)
+    _write_bound_json(receipt_path, receipt)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_orphan_reconcile",
+        "status": "reconciled",
+        "run_id": run_id,
+        "registry_root": effective_binding["registry_root"],
+        "coordination_root": effective_binding["coordination_root"],
+        "root_binding_source": effective_binding["source"],
+        "registry_binding_sha256": effective_binding["registry_binding"]["identity"][
+            "binding_sha256"
+        ],
+        "expected_registry_binding_sha256": normalized[
+            "expected_registry_binding_sha256"
+        ],
+        "expected_coordination_sha256": normalized["expected_coordination_sha256"],
+        "expected_lease_sha256": normalized["expected_lease_sha256"],
+        "execution_binding": execution_binding,
+        "terminal_readback_sha256": receipt["terminal_readback_sha256"],
+        "release": release_result,
+        "receipt": receipt,
+        "journal": str(run_dir),
+        "effect_started": True,
+        "does_not_establish": _execution_binding_does_not_establish(),
+    }
+    bureau._audit("bureau-pickup-orphan-reconcile", payload, run_id=run_id)
     return payload
