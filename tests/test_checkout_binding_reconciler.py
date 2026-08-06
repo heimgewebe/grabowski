@@ -776,6 +776,22 @@ class CheckoutBindingLiveIntegrationTests(unittest.TestCase):
             self.assertEqual(result["attention"], [])
             self.assertTrue(result["pagination"]["snapshot_bound"])
 
+    def test_live_reconciliation_forwards_bounded_git_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkouts.sqlite3"
+            create_checkout_db(path)
+            insert_binding(path, checkout_key="key-a", checkout_path=CHECKOUT)
+            with mock.patch(
+                "grabowski_checkout_binding_reconciler.checkouts.observe_worktree_records",
+                return_value=observed_repo(worktree()),
+            ) as observer:
+                result = reconcile_checkout_bindings(
+                    db_path=path,
+                    git_timeout_seconds=1.25,
+                )
+            observer.assert_called_once_with(REPO, timeout_seconds=1.25)
+            self.assertEqual(result["bindings"][0]["state"], "bound_present")
+
     def test_live_cleaned_archive_without_worktree_is_nonblocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "checkouts.sqlite3"
