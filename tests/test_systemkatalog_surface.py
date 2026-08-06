@@ -1,20 +1,59 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
 
-import grabowski_systemkatalog as surface
+
+class _FakeFastMCP:
+    def tool(self, *args: object, **kwargs: object):
+        return lambda function: function
+
+
+def _load_surface():
+    fake_pydantic = types.ModuleType("pydantic")
+    fake_pydantic.Field = lambda **kwargs: kwargs
+    fake_operator = types.ModuleType("grabowski_operator_core")
+    fake_operator.mcp = _FakeFastMCP()
+    fake_operator.READ_ONLY = object()
+
+    module_name = "grabowski_systemkatalog_test_surface"
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        SRC / "grabowski_systemkatalog.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load grabowski_systemkatalog test surface")
+    module = importlib.util.module_from_spec(spec)
+    sentinel = object()
+    previous = {
+        name: sys.modules.get(name, sentinel)
+        for name in ("pydantic", "grabowski_operator_core")
+    }
+    sys.modules["pydantic"] = fake_pydantic
+    sys.modules["grabowski_operator_core"] = fake_operator
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for name, prior in previous.items():
+            if prior is sentinel:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prior
+    return module
+
+
+surface = _load_surface()
 
 
 HEAD = "a" * 40
