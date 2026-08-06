@@ -1676,6 +1676,29 @@
         "risk_class": "low",
         "tool": "repoground_range_get"
       }
+    },
+    "grabowski_systemkatalog_query": {
+      "evidence_refs": [
+        "systemkatalog:heimgewebe/systemkatalog#164",
+        "bureau:candidate-36ef5b573fc8730e48f6d82b",
+        "tests:tests/test_systemkatalog_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one bounded query shape over the canonical, revision-bound Systemkatalog v2 contract without copying catalog truth.",
+        "evidence": "Exact operation and value schema, clean canonical checkout and origin binding, query-script digest, bounded subprocess, strict v2 envelope validation, manifest/source-evidence validation and fail-closed tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic file and terminal tools were rejected because they require callers to discover private paths, compose argv, parse JSON and independently reconstruct commit, manifest and source-evidence validation.",
+      "rationale": "Stable ecosystem semantics need one query-specific typed response whose shape differs materially from generic file, terminal, RepoGround and runtime-status surfaces. One endpoint covers all Systemkatalog operations and adds no service, cache or writable truth.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_systemkatalog_query"
+      }
     }
   },
   "baseline": {
