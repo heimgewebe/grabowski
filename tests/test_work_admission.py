@@ -479,6 +479,72 @@ class WorkAdmissionTests(unittest.TestCase):
             self.assertEqual(blocked["decision"], "blocked")
             self.assertIn("dirty-worktree", blocked["blocker_codes"])
 
+    def test_exact_scope_assesses_complete_inventory_above_legacy_bound(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "bureau-target")
+        branch = "feat/bureau-target"
+        scope = {
+            "schema_version": 1,
+            "repository": str(self.repo),
+            "task_id": "WELTGEWEBE-OS-V1-T067",
+            "base_head": "0" * 40,
+            "head": "a" * 40,
+            "branch": branch,
+            "worktree": target_path,
+            "effects": ["write"],
+            "paths": [str(self.repo / "src" / "example.py")],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        unrelated = [
+            self._linked(state="unclassified_clean")
+            for _ in range(admission.MAX_WORKTREES)
+        ]
+        for index, row in enumerate(unrelated):
+            row["path"] = str(
+                self.repo.parent / "worktrees" / f"unrelated-{index}"
+            )
+            row["branch"] = f"feat/unrelated-{index}"
+
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: {
+                "worktrees": [self._main(dirty=True), *unrelated],
+                "inventory_sha256": "a" * 64,
+            },
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+
+        self.assertGreater(
+            1 + len(unrelated),
+            admission.MAX_WORKTREES,
+        )
+        self.assertEqual(result["decision"], "allow")
+        self.assertNotIn("bounded-inventory-exceeded", result["blocker_codes"])
+
+    def test_repository_scope_above_inventory_bound_remains_fail_closed(self) -> None:
+        unrelated = [
+            self._linked(state="unclassified_clean")
+            for _ in range(admission.MAX_WORKTREES)
+        ]
+        for index, row in enumerate(unrelated):
+            row["path"] = str(
+                self.repo.parent / "worktrees" / f"unrelated-{index}"
+            )
+            row["branch"] = f"feat/unrelated-{index}"
+
+        result = self._assess([self._main(), *unrelated])
+
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("bounded-inventory-exceeded", result["blocker_codes"])
+
     def test_different_branch_or_source_alone_never_proves_disjoint_reconciliation(self) -> None:
         target_path = str(self.repo.parent / "worktrees" / "fresh-target")
         branch = "fix/fresh-target"
