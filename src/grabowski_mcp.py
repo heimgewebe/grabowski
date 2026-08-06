@@ -414,6 +414,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_context_fabric_compose": (),
     "grabowski_context_fabric_explain": (),
     "grabowski_context_fabric_compare": (),
+    "grabowski_systemkatalog_query": (),
     "grabowski_resource_nonconflict_assess": ("resource_lease",),
     "grabowski_runtime_refresh_lease_release": ("resource_lease",),
     "grabowski_resource_reconcile_obsolete_path_leases": ("resource_lease",),
