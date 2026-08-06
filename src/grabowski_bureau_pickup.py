@@ -2262,48 +2262,136 @@ def _repair_existing_assignment_lease_binding(
     if sorted(original_by_key) != intent["required_resource_keys"]:
         raise BureauPickupError("existing-assignment-lease-journal-incomplete")
     groups = _acquisition_groups(intent, request)
-    if len(groups) != 1:
+    if not groups:
         return False
-    group = groups[0]
-    keys = group["resource_keys"]
-    purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
-    original = [original_by_key[key] for key in keys]
-    if any(item.get("purpose") != purpose for item in original):
-        raise BureauPickupError(
-            "existing-assignment-lease-purpose-journal-mismatch",
-            details={"group": group["name"]},
-        )
+
+    def original_group(
+        group: dict[str, Any],
+    ) -> tuple[list[str], str, list[dict[str, Any]]]:
+        keys = group["resource_keys"]
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+        original = [original_by_key[key] for key in keys]
+        if any(item.get("purpose") != purpose for item in original):
+            raise BureauPickupError(
+                "existing-assignment-lease-purpose-journal-mismatch",
+                details={"group": group["name"]},
+            )
+        return keys, purpose, original
+
     if error_code in {"lease-expired", "lease-resources-missing"}:
-        result = resources.acquire_resources(
-            intent["lease_owner_id"],
-            keys,
-            purpose=purpose,
-            ttl_seconds=group["ttl_seconds"],
-            metadata=group["metadata"],
-            nonconflict_proof=group["nonconflict_proof"],
-        )
-        _validate_acquired_group(intent["lease_owner_id"], group, result)
-        leases = result["leases"]
-        if any(
-            item.get("purpose") != purpose
-            or item.get("metadata_sha256")
-            != original_by_key[item["resource_key"]].get("metadata_sha256")
-            for item in leases
-        ):
-            raise BureauPickupError("existing-assignment-lease-reacquire-mismatch")
+        reacquired: list[dict[str, Any]] = []
+        compensation_entries: list[dict[str, Any]] = []
+        try:
+            for index, group in enumerate(groups, start=1):
+                keys, purpose, _original = original_group(group)
+                missing_before: list[str] = []
+                for key in keys:
+                    observed = resources.inspect_resource(key)
+                    if observed is None:
+                        missing_before.append(key)
+                        continue
+                    if observed.get("owner_id") != intent["lease_owner_id"]:
+                        raise BureauPickupError(
+                            "existing-assignment-lease-foreign-owner",
+                            details={
+                                "resource_key": key,
+                                "owner_id": observed.get("owner_id"),
+                            },
+                        )
+                    if (
+                        observed.get("purpose") != purpose
+                        or observed.get("metadata_sha256")
+                        != original_by_key[key].get("metadata_sha256")
+                    ):
+                        raise BureauPickupError(
+                            "existing-assignment-lease-live-binding-mismatch",
+                            details={"group": group["name"], "resource_key": key},
+                        )
+                if not missing_before:
+                    continue
+                result = resources.acquire_resources(
+                    intent["lease_owner_id"],
+                    keys,
+                    purpose=purpose,
+                    ttl_seconds=group["ttl_seconds"],
+                    metadata=group["metadata"],
+                    nonconflict_proof=group["nonconflict_proof"],
+                )
+                entry = {
+                    "group": group["name"],
+                    "resource_keys": keys,
+                    "reacquired_resource_keys": missing_before,
+                    "result": result,
+                }
+                reacquired.append(entry)
+                preserved = {
+                    item.get("resource_key") if isinstance(item, dict) else item
+                    for item in result.get("preserved", [])
+                }
+                compensation_keys = [
+                    key for key in missing_before if key not in preserved
+                ]
+                if compensation_keys:
+                    compensation_entries.append(
+                        {"group": group["name"], "resource_keys": compensation_keys}
+                    )
+                _validate_acquired_group(intent["lease_owner_id"], group, result)
+                leases = result["leases"]
+                if any(
+                    item.get("purpose") != purpose
+                    or item.get("metadata_sha256")
+                    != original_by_key[item["resource_key"]].get("metadata_sha256")
+                    for item in leases
+                ):
+                    raise BureauPickupError(
+                        "existing-assignment-lease-reacquire-mismatch",
+                        details={"group": group["name"]},
+                    )
+                _write_bound_json(
+                    run_dir / f"lease-reacquired-{index:02d}.json", entry
+                )
+        except Exception as exc:
+            compensation = _compensate_acquisitions(
+                intent["lease_owner_id"], compensation_entries, run_dir
+            )
+            raise BureauPickupError(
+                "existing-assignment-lease-reacquire-failed",
+                details={
+                    "error_type": type(exc).__name__,
+                    "reacquired_group_count": len(reacquired),
+                    "compensation": compensation,
+                },
+            ) from exc
+        if not reacquired:
+            return False
         receipt = {
             "schema_version": SCHEMA_VERSION,
             "kind": "grabowski_bureau_pickup_lease_reacquire",
             "run_id": intent["run_id"],
             "task_id": intent["task_id"],
             "claim_intent_sha256": intent["intent_sha256"],
-            "group": group["name"],
-            "resource_keys": keys,
-            "metadata_sha256": original[0]["metadata_sha256"],
+            "groups": [
+                {
+                    "group": entry["group"],
+                    "resource_keys": entry["resource_keys"],
+                    "reacquired_resource_keys": entry["reacquired_resource_keys"],
+                }
+                for entry in reacquired
+            ],
+            "resource_keys": sorted(
+                key
+                for entry in reacquired
+                for key in entry["reacquired_resource_keys"]
+            ),
         }
         receipt["receipt_sha256"] = _sha256(receipt)
         _write_bound_json(run_dir / "lease-reacquire.json", receipt)
         return True
+
+    if len(groups) != 1:
+        return False
+    group = groups[0]
+    keys, purpose, _original = original_group(group)
     current_by_key: dict[str, dict[str, Any]] = {}
     for key in keys:
         observed = resources.inspect_resource(key)

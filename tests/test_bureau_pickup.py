@@ -2667,6 +2667,11 @@ class BureauPickupTests(unittest.TestCase):
             ),
             mock.patch.object(
                 pickup.resources,
+                "inspect_resource",
+                return_value=None,
+            ),
+            mock.patch.object(
+                pickup.resources,
                 "acquire_resources",
                 return_value={
                     "owner_id": intent["lease_owner_id"],
@@ -2681,6 +2686,309 @@ class BureauPickupTests(unittest.TestCase):
         acquire.assert_called_once()
         release.assert_not_called()
         self.assertTrue((run_dir / "lease-reacquire.json").is_file())
+
+    def test_multigroup_lease_repair_reacquires_all_groups(self) -> None:
+        repo_key = "repo:/tmp/repository"
+        path_key = "path:/tmp/pickup-test"
+        intent = self.intent([repo_key, path_key])
+        scope = {
+            "schema_version": 1,
+            "repository": "/tmp/repository",
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-branch",
+            "worktree": "/tmp/repository",
+            "effects": ["read"],
+            "paths": [],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        request = pickup._normalize_request(
+            self.request(
+                create_workspace=False,
+                repository_scope_manifests={repo_key: scope},
+            )
+        )
+        groups = pickup._acquisition_groups(intent, request)
+        originals = []
+        reacquired_results = []
+        for group in groups:
+            _metadata_json, metadata_sha256 = pickup.resources._metadata(
+                group["metadata"]
+            )
+            leases = []
+            purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+            )
+            for key in group["resource_keys"]:
+                original = self.lease(
+                    key, intent["lease_owner_id"], metadata_sha256
+                )
+                original["purpose"] = purpose
+                originals.append(original)
+                leases.append(
+                    {
+                        **original,
+                        "acquired_at_unix": original["expires_at_unix"] + 1,
+                        "updated_at_unix": original["expires_at_unix"] + 1,
+                        "expires_at_unix": original["expires_at_unix"] + 301,
+                    }
+                )
+            reacquired_results.append(
+                {
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": leases,
+                    "preserved": [],
+                }
+            )
+        acquisition = {
+            "schema_version": 1,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+            "leases": originals,
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        run_dir = pickup._run_directory(intent["run_id"])
+        blocking = self.coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-resources-missing",
+                "details": {"missing": intent["required_resource_keys"]},
+            },
+        }
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=None
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                side_effect=reacquired_results,
+            ) as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            repaired = pickup._repair_existing_assignment_lease_binding(
+                blocking, intent, request, acquisition, run_dir
+            )
+        self.assertTrue(repaired)
+        self.assertEqual(2, acquire.call_count)
+        release.assert_not_called()
+        receipt = json.loads((run_dir / "lease-reacquire.json").read_text())
+        self.assertEqual(2, len(receipt["groups"]))
+        self.assertEqual(intent["required_resource_keys"], receipt["resource_keys"])
+
+    def test_multigroup_lease_reacquire_compensates_completed_groups(self) -> None:
+        repo_key = "repo:/tmp/repository"
+        path_key = "path:/tmp/pickup-test"
+        intent = self.intent([repo_key, path_key])
+        scope = {
+            "schema_version": 1,
+            "repository": "/tmp/repository",
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-branch",
+            "worktree": "/tmp/repository",
+            "effects": ["read"],
+            "paths": [],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        request = pickup._normalize_request(
+            self.request(
+                create_workspace=False,
+                repository_scope_manifests={repo_key: scope},
+            )
+        )
+        groups = pickup._acquisition_groups(intent, request)
+        originals = []
+        first_result = None
+        for group in groups:
+            _metadata_json, metadata_sha256 = pickup.resources._metadata(
+                group["metadata"]
+            )
+            purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+            )
+            group_leases = []
+            for key in group["resource_keys"]:
+                original = self.lease(
+                    key, intent["lease_owner_id"], metadata_sha256
+                )
+                original["purpose"] = purpose
+                originals.append(original)
+                group_leases.append({**original})
+            if first_result is None:
+                first_result = {
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": group_leases,
+                    "preserved": [],
+                }
+        acquisition = {
+            "schema_version": 1,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+            "leases": originals,
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        run_dir = pickup._run_directory(intent["run_id"])
+        blocking = self.coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-resources-missing",
+                "details": {"missing": intent["required_resource_keys"]},
+            },
+        }
+        with (
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=None
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                side_effect=[first_result, RuntimeError("second group blocked")],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": first_result["leases"]},
+            ) as release,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "existing-assignment-lease-reacquire-failed",
+            ):
+                pickup._repair_existing_assignment_lease_binding(
+                    blocking, intent, request, acquisition, run_dir
+                )
+        release.assert_called_once_with(
+            intent["lease_owner_id"], groups[0]["resource_keys"]
+        )
+
+    def test_existing_assignment_reacquires_missing_multigroup_leases(self) -> None:
+        repo_key = "repo:/tmp/repository"
+        path_key = "path:/tmp/pickup-test"
+        keys = sorted([repo_key, path_key])
+        intent = self.intent(keys)
+        scope = {
+            "schema_version": 1,
+            "repository": "/tmp/repository",
+            "worktree": "/tmp/repository",
+            "branch": "fix/test",
+            "base_head": "1" * 40,
+            "head": "1" * 40,
+            "task_id": intent["task_id"],
+            "effects": ["read"],
+            "paths": [],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        request = self.request(
+            create_workspace=False,
+            repository_scope_manifests={repo_key: scope},
+        )
+        normalized = pickup._normalize_request(request)
+        run_dir = pickup._run_directory(intent["run_id"])
+        originals = []
+        for key, group_name, metadata in (
+            (repo_key, repo_key, "a" * 64),
+            (path_key, "other", "b" * 64),
+        ):
+            lease = self.lease(key, intent["lease_owner_id"], metadata)
+            lease["purpose"] = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group_name}"
+            )
+            originals.append(lease)
+        acquisition = {
+            "schema_version": 1,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": keys,
+            "leases": originals,
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        pickup._write_bound_json(run_dir / "acquisition.json", acquisition)
+        pickup._write_bound_json(run_dir / "request.json", normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+        existing = {
+            "status": "existing-assignment",
+            "run": {"run_id": intent["run_id"], "state": "assigned"},
+            "envelope": {"claim_intent": intent},
+        }
+        blocking = self.coordinated_status(intent, blocking=True)
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-resources-missing",
+                "details": {"missing": keys},
+            },
+        }
+        reacquired = []
+        for original in originals:
+            reacquired.append(
+                {
+                    **original,
+                    "acquired_at_unix": original["expires_at_unix"] + 1,
+                    "updated_at_unix": original["expires_at_unix"] + 1,
+                    "expires_at_unix": original["expires_at_unix"] + 301,
+                }
+            )
+        by_key = {item["resource_key"]: item for item in reacquired}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[existing, blocking, self.coordinated_status(intent)],
+            ),
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                side_effect=[
+                    {"owner_id": intent["lease_owner_id"], "leases": [by_key[repo_key]]},
+                    {"owner_id": intent["lease_owner_id"], "leases": [by_key[path_key]]},
+                ],
+            ) as acquire,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+        self.assertEqual("existing-assignment", result["status"])
+        self.assertEqual(2, acquire.call_count)
+        release.assert_not_called()
+        receipt = pickup._read_bound_json(
+            run_dir / "lease-reacquire.json", label="lease reacquire"
+        )
+        self.assertEqual(keys, receipt["resource_keys"])
+        self.assertEqual([repo_key, "other"], [item["group"] for item in receipt["groups"]])
 
     def test_runtime_drift_retry_replays_exact_journal_and_reacquires_missing_lease(self) -> None:
         request = self.request()
@@ -2725,6 +3033,11 @@ class BureauPickupTests(unittest.TestCase):
                 "_invoke_bureau",
                 side_effect=[runtime_drift, blocking, coordinated],
             ) as invoke,
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                return_value=None,
+            ),
             mock.patch.object(
                 pickup.resources,
                 "acquire_resources",
