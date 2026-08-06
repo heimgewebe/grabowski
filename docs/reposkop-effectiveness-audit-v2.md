@@ -20,6 +20,6 @@ Reviews are bound to the exact evaluation and decision audit reference. Revision
 
 ## Projection
 
-The existing `grabowski_reposkop_effectiveness` projection reports coverage, technical outcomes, findings, latest review classes, precision over reviewed block decisions, false-negative ratio over reviewed detectable outcomes, latency and evidence-bound improvement candidates.
+The existing `grabowski_reposkop_effectiveness` projection reports coverage, technical outcomes, findings, latest review classes, precision over reviewed block decisions, false-negative ratio over reviewed detectable outcomes, latency and evidence-bound improvement candidates. False-positive and false-negative clusters are grouped by detectable category so unrelated rule domains do not trigger one combined improvement signal.
 
 These metrics do not establish causal product improvement, semantic correctness of agent output, or review truth beyond the supplied evidence references.

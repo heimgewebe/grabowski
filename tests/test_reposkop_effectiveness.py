@@ -583,6 +583,54 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(candidates["false_negative_cluster"]["status"], "clear")
 
 
+    def test_false_positive_cluster_requires_same_detectable_category(self) -> None:
+        records: list[dict[str, object]] = []
+        for index, category in enumerate(("checkout_identity", "remote_freshness", "working_tree_state"), 1):
+            evaluation = f"{index:064x}"
+            records.extend(
+                [
+                    _event("reposkop-evaluation-requested", evaluation, "1"),
+                    _event(
+                        "reposkop-decision-applied",
+                        evaluation,
+                        "2",
+                        final_decision="block",
+                        decision_changed=True,
+                    ),
+                    _event(
+                        "reposkop-execution-attestation-blocked",
+                        evaluation,
+                        "3",
+                    ),
+                    _event(
+                        "reposkop-review-classification-recorded",
+                        evaluation,
+                        "4",
+                        classification="false_positive",
+                        detectable_category=category,
+                        reason_codes=["shared_reason"],
+                        review_sequence=1,
+                    ),
+                ]
+            )
+        result = effectiveness.project_records(records)
+        candidates = {
+            item["metric"]: item
+            for item in result["improvement_candidates"]
+        }
+        candidate = candidates["false_positive_cluster"]
+        self.assertEqual(candidate["status"], "clear")
+        self.assertEqual(candidate["observed"]["max_category_count"], 1)
+        self.assertEqual(
+            result["review"]["detectable_category_counts"]["false_positive"],
+            {
+                "checkout_identity": 1,
+                "remote_freshness": 1,
+                "working_tree_state": 1,
+            },
+        )
+
+
     def test_runtime_regression_candidate_uses_sufficient_sample(self) -> None:
         records: list[dict[str, object]] = []
         for index in range(60):

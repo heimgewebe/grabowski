@@ -1097,6 +1097,11 @@ def project_records(
         "false_negative": {},
         "operational_failure": {},
     }
+    review_category_clusters: dict[str, dict[str, int]] = {
+        "false_positive": {},
+        "false_negative": {},
+        "operational_failure": {},
+    }
     for evaluation in reviewed_ids:
         review = reviews[evaluation]
         classification = review.get("classification")
@@ -1112,9 +1117,23 @@ def project_records(
                         if isinstance(reason, str):
                             cluster = review_reason_clusters[classification]
                             cluster[reason] = cluster.get(reason, 0) + 1
+                detectable_category = review.get("detectable_category")
+                if isinstance(detectable_category, str) and detectable_category:
+                    category_cluster = review_category_clusters[classification]
+                    category_cluster[detectable_category] = (
+                        category_cluster.get(detectable_category, 0) + 1
+                    )
     confirmed_preventions = review_counts["confirmed_prevention"]
     false_positives = review_counts["false_positive"]
     false_negatives = review_counts["false_negative"]
+    false_positive_cluster_size = max(
+        review_category_clusters["false_positive"].values(),
+        default=0,
+    )
+    false_negative_cluster_size = max(
+        review_category_clusters["false_negative"].values(),
+        default=0,
+    )
     precision_denominator = confirmed_preventions + false_positives
     detectable_denominator = confirmed_preventions + false_negatives
     decision_change_ids = {
@@ -1193,31 +1212,51 @@ def project_records(
             "false_positive_cluster",
             status=(
                 "active"
-                if false_positives >= MIN_FALSE_POSITIVE_CLUSTER
+                if false_positive_cluster_size >= MIN_FALSE_POSITIVE_CLUSTER
                 else "clear"
                 if precision_denominator >= MIN_FALSE_POSITIVE_CLUSTER
                 else "insufficient_sample"
             ),
             threshold=MIN_FALSE_POSITIVE_CLUSTER,
-            observed=false_positives,
+            observed={
+                "max_category_count": false_positive_cluster_size,
+                "category_counts": dict(
+                    sorted(review_category_clusters["false_positive"].items())
+                ),
+            },
             sample_size=precision_denominator,
             evidence_refs=review_evidence_refs["false_positive"],
-            context={"reason_counts": review_reason_clusters["false_positive"]},
+            context={
+                "category_counts": dict(
+                    sorted(review_category_clusters["false_positive"].items())
+                ),
+                "reason_counts": review_reason_clusters["false_positive"],
+            },
         ),
         _candidate(
             "false_negative_cluster",
             status=(
                 "active"
-                if false_negatives >= MIN_FALSE_NEGATIVE_CLUSTER
+                if false_negative_cluster_size >= MIN_FALSE_NEGATIVE_CLUSTER
                 else "clear"
                 if detectable_denominator >= MIN_FALSE_NEGATIVE_CLUSTER
                 else "insufficient_sample"
             ),
             threshold=MIN_FALSE_NEGATIVE_CLUSTER,
-            observed=false_negatives,
+            observed={
+                "max_category_count": false_negative_cluster_size,
+                "category_counts": dict(
+                    sorted(review_category_clusters["false_negative"].items())
+                ),
+            },
             sample_size=detectable_denominator,
             evidence_refs=review_evidence_refs["false_negative"],
-            context={"reason_counts": review_reason_clusters["false_negative"]},
+            context={
+                "category_counts": dict(
+                    sorted(review_category_clusters["false_negative"].items())
+                ),
+                "reason_counts": review_reason_clusters["false_negative"],
+            },
         ),
     ]
     if len(durations) >= MIN_RUNTIME_REGRESSION_SAMPLE:
@@ -1304,6 +1343,12 @@ def project_records(
             "detectable_review_denominator": detectable_denominator,
             "decision_changes": len(decision_change_ids),
             "unreviewed_decision_changes": len(unreviewed_decision_changes),
+            "detectable_category_counts": {
+                classification: dict(sorted(counts.items()))
+                for classification, counts in sorted(
+                    review_category_clusters.items()
+                )
+            },
         },
         "duration_ms": {
             "sample_size": len(durations),
