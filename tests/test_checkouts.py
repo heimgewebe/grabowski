@@ -1463,6 +1463,96 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIn("terminal-binding-head-mismatch", reasons)
         self.assertFalse(linked["cleanup_candidate"])
 
+    def test_worktree_status_timeout_is_unobservable_not_clean(self) -> None:
+        record = {
+            "path": str(self.checkout),
+            "prunable": False,
+        }
+        with patch.object(
+            checkouts,
+            "_git_read",
+            side_effect=subprocess.TimeoutExpired(cmd="git status", timeout=0.1),
+        ):
+            status = checkouts._worktree_status(
+                record,
+                timeout_seconds=0.1,
+            )
+        self.assertIsNone(status["dirty"])
+        self.assertIsNone(status["returncode"])
+        self.assertEqual(status["error"], "git status timed out")
+
+    def test_bounded_inventory_prioritizes_main_and_reports_omissions(self) -> None:
+        inventory = checkouts.checkout_inventory(
+            self.repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+            git_timeout_seconds=1.0,
+            observation_budget_seconds=5.0,
+            max_worktrees=1,
+        )
+        self.assertTrue(inventory["truncated"])
+        self.assertEqual(inventory["total_worktree_count"], 2)
+        self.assertEqual(inventory["observed_worktree_count"], 1)
+        self.assertEqual(inventory["omitted_worktree_count"], 1)
+        self.assertTrue(inventory["worktrees"][0]["is_main"])
+        contract = inventory["observation_contract"]
+        self.assertTrue(contract["bounded"])
+        self.assertEqual(contract["max_worktrees"], 1)
+        self.assertTrue(contract["unobserved_worktrees_are_not_reported_clean"])
+
+    def test_bounded_inventory_omits_unobservable_status(self) -> None:
+        clean = {
+            "returncode": 0,
+            "dirty": False,
+            "entry_count": 0,
+            "untracked_count": 0,
+            "error": None,
+        }
+        unknown = {
+            "returncode": None,
+            "dirty": None,
+            "entry_count": None,
+            "untracked_count": None,
+            "error": "git status timed out",
+        }
+        with (
+            patch.object(
+                checkouts,
+                "_worktree_status",
+                side_effect=[clean, unknown],
+            ),
+            patch.object(
+                checkouts,
+                "_remote_secured_observation",
+                return_value={
+                    "remote_secured": False,
+                    "remote_secured_refs": [],
+                },
+            ),
+        ):
+            inventory = checkouts.checkout_inventory(
+                self.repo,
+                include_processes=False,
+                include_tasks=False,
+                include_resources=False,
+                git_timeout_seconds=1.0,
+                observation_budget_seconds=5.0,
+                max_worktrees=2,
+            )
+        self.assertTrue(inventory["truncated"])
+        self.assertEqual(inventory["observed_worktree_count"], 1)
+        self.assertEqual(inventory["omitted_worktree_count"], 1)
+        self.assertTrue(all(
+            item["status"]["dirty"] in {True, False}
+            for item in inventory["worktrees"]
+        ))
+        self.assertEqual(inventory["probe_errors"][0]["stage"], "status")
+        self.assertEqual(
+            inventory["probe_errors"][0]["error"],
+            "git status timed out",
+        )
+
     def test_lifecycle_source_has_no_forced_filesystem_deletion(self) -> None:
         source = (SRC / "grabowski_checkouts.py").read_text(encoding="utf-8")
         self.assertNotIn("shutil.rmtree", source)

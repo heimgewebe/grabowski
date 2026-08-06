@@ -489,6 +489,10 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
                 "cohort": cohort,
                 "route_evidence": None,
                 "event_log": {"integrity_valid": True},
+                "status_observation": {
+                    "mode": "immutable_workspace_evidence",
+                    "integrity_valid": True,
+                },
             },
         }
 
@@ -558,6 +562,76 @@ class AgentWorkspaceObserverTests(unittest.TestCase):
             snapshot["friction_fingerprint_unavailable_reason"],
             "current_cohort_snapshot_incomplete_or_invalid",
         )
+
+    def test_metrics_snapshot_avoids_live_status_and_subprocess_probes(self) -> None:
+        identity_body = {
+            "schema_version": 1,
+            "runtime_release": "release-current",
+            "runtime_repo_head": "a" * 40,
+        }
+        identity = {
+            **identity_body,
+            "identity_sha256": observer._sha256_json(identity_body),
+        }
+        identifier = "gaw-snapshot-immutable-00000001"
+        self._write_snapshot_manifest(identifier, identity)
+        manifest = {
+            "schema_version": workspace.SCHEMA_VERSION,
+            "workspace_id": identifier,
+            "runtime_identity": identity,
+            "expected_base_head": "a" * 40,
+            "collection": {
+                "writer_head": "b" * 40,
+                "expected_base_head": "a" * 40,
+                "diff_sha256": "c" * 64,
+                "tests": {"status": "passed"},
+                "review": {"status": "passed"},
+            },
+        }
+        with (
+            mock.patch.object(
+                workspace, "_workspace_runtime_identity", return_value=identity
+            ),
+            mock.patch.object(workspace, "_manifest", return_value=manifest),
+            mock.patch.object(
+                workspace,
+                "_status_data",
+                side_effect=AssertionError("live workspace status was invoked"),
+            ) as live_status,
+        ):
+            snapshot = observer.workspace_metrics_snapshot(limit=1)
+        live_status.assert_not_called()
+        self.assertTrue(snapshot["integrity_valid"])
+        self.assertEqual(
+            snapshot["status_observation_mode"],
+            "immutable_workspace_evidence",
+        )
+        self.assertFalse(snapshot["live_status_probes_performed"])
+        self.assertIsNotNone(snapshot["friction_fingerprint_sha256"])
+
+    def test_immutable_snapshot_prefers_valid_close_over_stale_collection(self) -> None:
+        manifest = {
+            "workspace_id": "gaw-snapshot-valid-close-00000001",
+            "collection": {
+                "tests": {"status": "failed"},
+                "review": {"status": "failed"},
+            },
+            "close_receipt": {
+                "state": "complete",
+                "closure_outcome": "successful",
+                "failed_roles": [],
+            },
+        }
+        with mock.patch.object(
+            workspace,
+            "_close_integrity_status",
+            return_value={"valid": True, "receipt_present": True},
+        ):
+            status = observer._immutable_snapshot_status(manifest)
+        self.assertTrue(status["closed"])
+        self.assertTrue(status["success_ready"])
+        self.assertEqual(status["failed_roles"], [])
+        self.assertTrue(status["status_observation"]["integrity_valid"])
 
     def test_timing_metric_names_collection_request_truthfully(self) -> None:
         events = [

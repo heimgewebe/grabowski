@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -69,6 +70,51 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 GIT_OBJECT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 ARCHIVE_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\Z")
 PLAN_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
+DEFAULT_GIT_READ_TIMEOUT_SECONDS = 30.0
+MIN_GIT_READ_TIMEOUT_SECONDS = 0.1
+MAX_GIT_READ_TIMEOUT_SECONDS = 30.0
+MAX_INVENTORY_PROBE_ERRORS = 32
+
+
+def _git_timeout_seconds(value: int | float) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not MIN_GIT_READ_TIMEOUT_SECONDS
+        <= float(value)
+        <= MAX_GIT_READ_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "git_timeout_seconds must be a finite number between "
+            f"{MIN_GIT_READ_TIMEOUT_SECONDS:g} and "
+            f"{MAX_GIT_READ_TIMEOUT_SECONDS:g}"
+        )
+    return float(value)
+
+
+def _observation_budget_seconds(value: int | float | None) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0.1 <= float(value) <= 120.0
+    ):
+        raise ValueError(
+            "observation_budget_seconds must be null or a finite number "
+            "between 0.1 and 120"
+        )
+    return float(value)
+
+
+def _max_inventory_worktrees(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
+        raise ValueError("max_worktrees must be null or an integer between 1 and 1000")
+    return value
 
 
 def _now() -> int:
@@ -203,15 +249,16 @@ def _git_read(
     arguments: list[str],
     *,
     check: bool = True,
-    timeout_seconds: int = 30,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
+    timeout_value = _git_timeout_seconds(timeout_seconds)
     completed = subprocess.run(
         ["git", "-C", str(repo), *arguments],
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout_seconds,
+        timeout=timeout_value,
         env=operator._safe_environment(),
     )
     if check and completed.returncode != 0:
@@ -250,16 +297,32 @@ def _git_mutate(repo: Path, arguments: list[str], *, timeout_seconds: int = 60) 
     return result
 
 
-def _git_common_dir(repo: Path) -> Path:
-    raw = _git_read(repo, ["rev-parse", "--git-common-dir"]).stdout.strip()
+def _git_common_dir(
+    repo: Path,
+    *,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+) -> Path:
+    raw = _git_read(
+        repo,
+        ["rev-parse", "--git-common-dir"],
+        timeout_seconds=timeout_seconds,
+    ).stdout.strip()
     path = Path(raw)
     if not path.is_absolute():
         path = repo / path
     return path.resolve(strict=True)
 
 
-def _git_top_level(repo: Path) -> Path:
-    raw = _git_read(repo, ["rev-parse", "--show-toplevel"]).stdout.strip()
+def _git_top_level(
+    repo: Path,
+    *,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+) -> Path:
+    raw = _git_read(
+        repo,
+        ["rev-parse", "--show-toplevel"],
+        timeout_seconds=timeout_seconds,
+    ).stdout.strip()
     return Path(raw).resolve(strict=True)
 
 
@@ -1092,10 +1155,19 @@ def _parse_worktree_list(output: str) -> list[dict[str, Any]]:
     return records
 
 
-def _worktree_records(repo: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
-    top_level = _git_top_level(repo)
-    common_dir = _git_common_dir(repo)
-    completed = _git_read(repo, ["worktree", "list", "--porcelain"])
+def _worktree_records(
+    repo: Path,
+    *,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+) -> tuple[Path, Path, list[dict[str, Any]]]:
+    timeout_value = _git_timeout_seconds(timeout_seconds)
+    top_level = _git_top_level(repo, timeout_seconds=timeout_value)
+    common_dir = _git_common_dir(repo, timeout_seconds=timeout_value)
+    completed = _git_read(
+        repo,
+        ["worktree", "list", "--porcelain"],
+        timeout_seconds=timeout_value,
+    )
     raw_records = _parse_worktree_list(completed.stdout)
     if not raw_records:
         raise RuntimeError("Git returned no worktree records")
@@ -1123,10 +1195,17 @@ def _worktree_records(repo: Path) -> tuple[Path, Path, list[dict[str, Any]]]:
     return top_level, common_dir, sorted(records, key=lambda item: item["path"])
 
 
-def observe_worktree_records(repo: str | Path) -> dict[str, Any]:
-    """Expose the canonical Git worktree records without lifecycle or mutation effects."""
+def observe_worktree_records(
+    repo: str | Path,
+    *,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Expose canonical Git worktree records under one server-owned timeout."""
     repo_path = _resolve_repo(str(repo))
-    top_level, common_dir, records = _worktree_records(repo_path)
+    top_level, common_dir, records = _worktree_records(
+        repo_path,
+        timeout_seconds=timeout_seconds,
+    )
     return {
         "top_level": str(top_level),
         "repo_common_dir": str(common_dir),
@@ -1135,7 +1214,11 @@ def observe_worktree_records(repo: str | Path) -> dict[str, Any]:
     }
 
 
-def _worktree_status(record: dict[str, Any]) -> dict[str, Any]:
+def _worktree_status(
+    record: dict[str, Any],
+    *,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     path = Path(record["path"])
     if record.get("prunable") or not path.exists():
         return {
@@ -1145,11 +1228,21 @@ def _worktree_status(record: dict[str, Any]) -> dict[str, Any]:
             "untracked_count": None,
             "error": "worktree is missing or prunable",
         }
-    completed = _git_read(
-        path,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
-        check=False,
-    )
+    try:
+        completed = _git_read(
+            path,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            check=False,
+            timeout_seconds=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "returncode": None,
+            "dirty": None,
+            "entry_count": None,
+            "untracked_count": None,
+            "error": "git status timed out",
+        }
     entries = [line for line in completed.stdout.splitlines() if line]
     if completed.returncode != 0:
         return {
@@ -1168,7 +1261,11 @@ def _worktree_status(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _remote_secured_observation(record: dict[str, Any]) -> dict[str, Any]:
+def _remote_secured_observation(
+    record: dict[str, Any],
+    *,
+    timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     """Observe whether the checkout head is already present on a remote-tracking ref.
 
     This uses only local remote-tracking refs. It never fetches and never treats
@@ -1189,11 +1286,24 @@ def _remote_secured_observation(record: dict[str, Any]) -> dict[str, Any]:
         }
     # Prefer the shared repository common directory for remote-tracking visibility.
     repo_for_refs = Path(record.get("repo_path") or path)
-    completed = _git_read(
-        repo_for_refs,
-        ["for-each-ref", "--format=%(refname)", f"--contains={head}", "refs/remotes"],
-        check=False,
-    )
+    try:
+        completed = _git_read(
+            repo_for_refs,
+            [
+                "for-each-ref",
+                "--format=%(refname)",
+                f"--contains={head}",
+                "refs/remotes",
+            ],
+            check=False,
+            timeout_seconds=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "remote_secured": False,
+            "remote_secured_refs": [],
+            "error": "remote ref query timed out",
+        }
     if completed.returncode != 0:
         return {
             "remote_secured": False,
@@ -1816,18 +1926,109 @@ def checkout_inventory(
     include_processes: bool = True,
     include_tasks: bool = True,
     include_resources: bool = True,
+    git_timeout_seconds: int | float = DEFAULT_GIT_READ_TIMEOUT_SECONDS,
+    observation_budget_seconds: int | float | None = None,
+    max_worktrees: int | None = None,
 ) -> dict[str, Any]:
+    git_timeout = _git_timeout_seconds(git_timeout_seconds)
+    observation_budget = _observation_budget_seconds(
+        observation_budget_seconds
+    )
+    worktree_limit = _max_inventory_worktrees(max_worktrees)
+    bounded_observation = (
+        observation_budget is not None or worktree_limit is not None
+    )
+    started_monotonic = time.monotonic()
+    deadline_monotonic = (
+        None
+        if observation_budget is None
+        else started_monotonic + observation_budget
+    )
+
     repo_path = _resolve_repo(repo)
-    top_level, common_dir, records = _worktree_records(repo_path)
+    top_level, common_dir, records = _worktree_records(
+        repo_path,
+        timeout_seconds=git_timeout,
+    )
     keys = [record["checkout_key"] for record in records]
     retention = _retention_records(keys)
     bindings = _lifecycle_bindings(keys)
     archives = _latest_archives(keys)
     now = _now()
+
+    def observation_priority(record: dict[str, Any]) -> tuple[int, str]:
+        key = str(record["checkout_key"])
+        if record.get("is_main"):
+            rank = 0
+        elif key in bindings:
+            rank = 1
+        elif key in retention:
+            rank = 2
+        elif key in archives:
+            rank = 3
+        else:
+            rank = 4
+        return rank, str(record["path"])
+
+    ordered_records = sorted(records, key=observation_priority)
+
+    def remaining_git_timeout() -> float | None:
+        if deadline_monotonic is None:
+            return git_timeout
+        remaining = deadline_monotonic - time.monotonic()
+        if remaining < MIN_GIT_READ_TIMEOUT_SECONDS:
+            return None
+        return min(git_timeout, remaining)
+
     worktrees: list[dict[str, Any]] = []
-    for record in records:
+    probe_errors: list[dict[str, Any]] = []
+    omitted_worktree_count = 0
+    attempted_worktree_count = 0
+    for index, record in enumerate(ordered_records):
+        if (
+            worktree_limit is not None
+            and attempted_worktree_count >= worktree_limit
+        ) or (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            omitted_worktree_count += len(ordered_records) - index
+            break
+        attempted_worktree_count += 1
         checkout_path = Path(record["path"])
-        status = _worktree_status(record)
+        status_timeout = remaining_git_timeout()
+        if status_timeout is None:
+            omitted_worktree_count += len(ordered_records) - index
+            break
+        status = _worktree_status(
+            record,
+            timeout_seconds=status_timeout,
+        )
+        if bounded_observation and status.get("dirty") not in {True, False}:
+            omitted_worktree_count += 1
+            if len(probe_errors) < MAX_INVENTORY_PROBE_ERRORS:
+                probe_errors.append(
+                    {
+                        "path": str(checkout_path),
+                        "stage": "status",
+                        "error": str(status.get("error") or "status unobservable")[:256],
+                    }
+                )
+            continue
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            omitted_worktree_count += len(ordered_records) - index
+            if len(probe_errors) < MAX_INVENTORY_PROBE_ERRORS:
+                probe_errors.append(
+                    {
+                        "path": str(checkout_path),
+                        "stage": "budget",
+                        "error": "observation budget exhausted after status",
+                    }
+                )
+            break
         coordination = _linked_checkout_coordination(
             checkout_path,
             top_level,
@@ -1843,7 +2044,27 @@ def checkout_inventory(
             "latest_archive": archives.get(record["checkout_key"]),
         }
         exists = checkout_path.exists()
-        remote = _remote_secured_observation(record)
+        remote_timeout = remaining_git_timeout()
+        remote = (
+            {
+                "remote_secured": False,
+                "remote_secured_refs": [],
+                "error": "observation budget exhausted before remote ref query",
+            }
+            if remote_timeout is None
+            else _remote_secured_observation(
+                record,
+                timeout_seconds=remote_timeout,
+            )
+        )
+        if remote.get("error") and len(probe_errors) < MAX_INVENTORY_PROBE_ERRORS:
+            probe_errors.append(
+                {
+                    "path": str(checkout_path),
+                    "stage": "remote",
+                    "error": str(remote["error"])[:256],
+                }
+            )
         decision = _checkout_lifecycle_decision(
             record,
             status,
@@ -1868,12 +2089,32 @@ def checkout_inventory(
                 "remote_secured_refs": list(remote.get("remote_secured_refs") or []),
             }
         )
+    total_worktree_count = len(ordered_records)
+    observed_worktree_count = len(worktrees)
+    truncated = omitted_worktree_count > 0
     body = {
         "schema_version": 1,
         "repository": str(top_level),
         "requested_repo": str(repo_path),
         "git_common_dir": str(common_dir),
         "worktrees": sorted(worktrees, key=lambda item: item["path"]),
+        "truncated": truncated,
+        "total_worktree_count": total_worktree_count,
+        "observed_worktree_count": observed_worktree_count,
+        "omitted_worktree_count": omitted_worktree_count,
+        "probe_errors": probe_errors,
+        "probe_errors_truncated": (
+            omitted_worktree_count > len(probe_errors)
+            and len(probe_errors) >= MAX_INVENTORY_PROBE_ERRORS
+        ),
+        "observation_contract": {
+            "bounded": bounded_observation,
+            "git_timeout_seconds": git_timeout,
+            "observation_budget_seconds": observation_budget,
+            "max_worktrees": worktree_limit,
+            "attempted_worktree_count": attempted_worktree_count,
+            "unobserved_worktrees_are_not_reported_clean": True,
+        },
     }
     return {
         **body,

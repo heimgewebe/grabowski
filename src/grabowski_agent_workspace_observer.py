@@ -750,6 +750,95 @@ def _metrics_summary(reports: list[dict[str, Any]]) -> dict[str, Any]:
     return body
 
 
+def _immutable_snapshot_status(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Derive bounded status from immutable workspace evidence only."""
+    collection_value = manifest.get("collection")
+    collection = collection_value if isinstance(collection_value, dict) else {}
+    close_receipt = manifest.get("close_receipt")
+    close_receipt_present = isinstance(close_receipt, dict)
+    if close_receipt_present:
+        try:
+            close_integrity = workspace._close_integrity_status(
+                manifest, close_receipt
+            )
+        except Exception as exc:
+            close_integrity = {
+                "valid": False,
+                "receipt_present": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:500],
+            }
+    else:
+        close_integrity = {
+            "valid": True,
+            "receipt_present": False,
+            "not_required": True,
+        }
+    close_valid = close_integrity.get("valid") is True
+    close = close_receipt if close_receipt_present and close_valid else {}
+
+    raw_failed_roles = close.get("failed_roles")
+    failed_roles = (
+        sorted(
+            {
+                item
+                for item in raw_failed_roles
+                if isinstance(item, str) and item
+            }
+        )
+        if isinstance(raw_failed_roles, list)
+        else []
+    )
+    if not close:
+        for role in ("writer", "tests", "review"):
+            role_result = collection.get(role)
+            if (
+                isinstance(role_result, dict)
+                and role_result.get("status") == "failed"
+            ):
+                failed_roles.append(role)
+
+    raw_closeout = close.get("external_closeout_checklist")
+    closeout = (
+        [dict(item) for item in raw_closeout if isinstance(item, dict)]
+        if isinstance(raw_closeout, list)
+        else []
+    )
+    closed = bool(close and close.get("state") == "complete")
+    raw_outcome = close.get("closure_outcome") if closed else None
+    closure_outcome = (
+        raw_outcome
+        if isinstance(raw_outcome, str) and raw_outcome
+        else "not_closed"
+    )
+    status_observation = {
+        "mode": "immutable_workspace_evidence",
+        "live_probes_performed": False,
+        "task_store_lock_acquired": False,
+        "subprocesses_spawned": False,
+        "close_receipt_present": close_receipt_present,
+        "close_receipt_integrity": close_integrity,
+        "integrity_valid": (not close_receipt_present) or close_valid,
+        "does_not_establish": [
+            "current_process_liveness",
+            "current_task_state",
+            "current_git_state",
+            "current_tmux_state",
+            "cleanup_safety",
+        ],
+    }
+    return {
+        "writer": {},
+        "closed": closed,
+        "closure_outcome": closure_outcome,
+        "success_ready": closed and closure_outcome == "successful",
+        "failed_roles": failed_roles,
+        "role_retry": {},
+        "external_closeout_checklist": closeout,
+        "status_observation": status_observation,
+    }
+
+
 def _observer_report(
     workspace_id: str,
     *,
@@ -757,7 +846,25 @@ def _observer_report(
     external_closeout_evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = workspace._manifest(workspace_id)
-    status = workspace._status_data(manifest)
+    snapshot_mode = activation_reason == "workspace-metrics-snapshot"
+    status = (
+        _immutable_snapshot_status(manifest)
+        if snapshot_mode
+        else workspace._status_data(manifest)
+    )
+    status_observation = status.get("status_observation")
+    if not isinstance(status_observation, dict):
+        status_observation = {
+            "mode": "live_workspace_status",
+            "live_probes_performed": True,
+            "task_store_lock_acquired": None,
+            "subprocesses_spawned": None,
+            "integrity_valid": True,
+            "does_not_establish": [
+                "absence_of_future_state_change",
+                "automatic_mutation_authority",
+            ],
+        }
     events, integrity = _read_events(workspace_id)
     failure_classes = _failure_classes(events, status, manifest)
     categorized = _categorized_failures(failure_classes)
@@ -781,6 +888,7 @@ def _observer_report(
         "created_at": manifest.get("created_at"),
         "updated_at": manifest.get("updated_at"),
         "route_evidence": manifest.get("route_evidence"),
+        "status_observation": status_observation,
         "timing": _event_timing_metrics(events),
         **identity,
         "closed": status.get("closed"),
@@ -850,10 +958,18 @@ def _observer_report(
         "report_kind": "agent_workspace_process_observer",
         "workspace_id": workspace_id,
         "activation": {
-            "mode": "explicit_read_only",
+            "mode": (
+                "automatic_immutable_snapshot"
+                if snapshot_mode
+                else "explicit_read_only"
+            ),
             "reason": activation_reason,
             "adds_mutation_authority": False,
-            "runtime_cost": "one bounded local metadata and receipt scan",
+            "runtime_cost": (
+                "one bounded immutable metadata and receipt scan"
+                if snapshot_mode
+                else "one bounded local metadata and receipt scan"
+            ),
             "agent_invocation_required": False,
         },
         "role_ownership": manifest.get("role_ownership"),
@@ -976,6 +1092,10 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
     )
     current_reports_integrity_valid = all(
         report["facts"].get("event_log", {}).get("integrity_valid") is True
+        and report["facts"]
+        .get("status_observation", {})
+        .get("integrity_valid")
+        is True
         for report in current_reports
     )
     snapshot_integrity_valid = bool(
@@ -1043,6 +1163,8 @@ def workspace_metrics_snapshot(limit: int = MAX_OPTIMIZER_WORKSPACES) -> dict[st
         "read_only_projection": True,
         "execution_authorized": False,
         "automatic_live_routing_enabled": False,
+        "status_observation_mode": "immutable_workspace_evidence",
+        "live_status_probes_performed": False,
         "does_not_establish": [
             "causality",
             "route_superiority",
