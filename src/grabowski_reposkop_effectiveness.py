@@ -288,20 +288,34 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
                 category="observation",
                 reason="git_observation_missing",
             )
-        for field, reason in (
-            ("dirty", "working_tree_dirty"),
-            ("staged", "staged_changes_present"),
-            ("unstaged", "unstaged_changes_present"),
-            ("untracked", "untracked_changes_present"),
-        ):
-            if git.get(field) is True:
+        granular_worktree_findings = [
+            reason
+            for field, reason in (
+                ("staged", "staged_changes_present"),
+                ("unstaged", "unstaged_changes_present"),
+                ("untracked", "untracked_changes_present"),
+            )
+            if git.get(field) is True
+        ]
+        for reason in granular_worktree_findings:
+            _finding_add(
+                counts,
+                categories,
+                reasons,
+                severity="warning",
+                category="working_tree_state",
+                reason=reason,
+            )
+        if git.get("dirty") is True:
+            reasons.add("working_tree_dirty")
+            if not granular_worktree_findings:
                 _finding_add(
                     counts,
                     categories,
                     reasons,
                     severity="warning",
                     category="working_tree_state",
-                    reason=reason,
+                    reason="working_tree_dirty",
                 )
         operation_state = git.get("operation_state")
         if isinstance(operation_state, list) and operation_state:
