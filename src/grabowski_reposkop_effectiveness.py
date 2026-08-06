@@ -44,7 +44,7 @@ MIN_RUNTIME_REGRESSION_SAMPLE = 60
 RUNTIME_REGRESSION_FACTOR = 1.5
 FINDING_TAXONOMY_VERSION = 2
 REVIEW_SCHEMA_VERSION = 1
-MAX_REVIEW_SCAN_RECORDS = 100_000
+MAX_REVIEW_SCAN_RECORDS = 500_000
 MAX_REVIEW_EVIDENCE_REFS = 20
 MAX_REVIEW_REASON_CODES = 16
 MIN_FALSE_POSITIVE_CLUSTER = 3
@@ -805,6 +805,10 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
         )
 
     records, source = _raw_records(since_unix=0, scan_limit=MAX_REVIEW_SCAN_RECORDS)
+    if source.get("scan_truncated") is True:
+        raise ReposkopReviewIntegrityError(
+            "verified audit chain exceeds the bounded Reposkop review scan"
+        )
     audit_records_by_ref = {
         str(record["_audit_ref"]): record
         for record in records

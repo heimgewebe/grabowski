@@ -340,6 +340,29 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             effectiveness.record_review_classification(parameters)
 
 
+    def test_review_classification_rejects_truncated_audit_window(self) -> None:
+        parameters = {
+            "evaluation_id": "5" * 64,
+            "classification": "unresolved",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "not_applicable",
+            "reason_codes": ["awaiting_evidence"],
+            "evidence_refs": [_ref("d")],
+            "expected_decision_audit_ref": _ref("d"),
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_raw_records",
+            return_value=([], {"scan_truncated": True}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "exceeds the bounded Reposkop review scan",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+
     def test_neutral_review_requires_correlated_outcome_evidence(self) -> None:
         evaluation = "6" * 64
         decision_ref = _ref("d")
