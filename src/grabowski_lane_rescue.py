@@ -427,6 +427,11 @@ def finalize(
         raise LaneRescueInputError("requesting owner does not match the lane owner")
     if not isinstance(execution_receipt, Mapping) or execution_receipt.get("kind") != RECEIPT_KIND:
         raise LaneRescueInputError("execution receipt has an invalid kind")
+    receipt_material = dict(execution_receipt)
+    receipt_material.pop("replayed", None)
+    receipt_sha256 = receipt_material.pop("receipt_sha256", None)
+    if not isinstance(receipt_sha256, str) or receipt_sha256 != _sha256(receipt_material):
+        raise LaneRescueInputError("execution receipt integrity mismatch")
     if execution_receipt.get("lane_id") != observation.lane_id:
         raise LaneRescueInputError("readback lane does not match the execution receipt")
 

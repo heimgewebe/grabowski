@@ -94,6 +94,43 @@ class LaneRescueEdgeTests(unittest.TestCase):
         self.assertEqual(receipt["error_class"], "INVALID_ADAPTER_RESULT")
         self.assertFalse(receipt["retry_authorized"])
 
+    def test_finalize_rejects_tampered_execution_receipt(self) -> None:
+        plan = _plan()
+        receipt = rescue.execute_plan(
+            plan,
+            actor_owner_id=OWNER,
+            adapters={
+                "commit": lambda payload: {"receipt_sha256": "f" * 64},
+                "create_pr": lambda payload: {"receipt_sha256": "1" * 64},
+            },
+        )
+        tampered = dict(receipt)
+        tampered["status"] = "terminal"
+        terminal_observation = closeout.LaneCloseoutObservation(
+            lane_id="lane-edges",
+            repository="/tmp/repo",
+            workspace="/tmp/workspace",
+            branch="feat/edges",
+            base_revision=BASE,
+            writer_state="completed",
+            task_active=False,
+            process_active=False,
+            lease_active=True,
+            git_dirty=False,
+            head_sha=BASE,
+            remote_head_sha=BASE,
+            ahead_commits=0,
+            behind_commits=0,
+            no_change_proven=True,
+        )
+        with self.assertRaisesRegex(rescue.LaneRescueInputError, "integrity"):
+            rescue.finalize(
+                terminal_observation,
+                tampered,
+                lane_owner_id=OWNER,
+                requesting_owner_id=OWNER,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
