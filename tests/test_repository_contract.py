@@ -20,6 +20,7 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertTrue((ROOT / "src" / "grabowski_read_surface.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_grip_orchestration.py").is_file())
         self.assertTrue((ROOT / "src" / "grabowski_merge_guard.py").is_file())
+        self.assertTrue((ROOT / "src" / "grabowski_systemkatalog.py").is_file())
 
     def test_grabowski_tool_names_are_present(self) -> None:
         source = (ROOT / "src" / "grabowski_mcp.py").read_text(encoding="utf-8")
@@ -178,7 +179,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 186)
+        self.assertEqual(len(tools), 187)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -246,6 +247,7 @@ class RepositoryContractTests(unittest.TestCase):
             }.issubset(tools)
         )
         self.assertIn("grabowski_reposkop_context", tools)
+        self.assertIn("grabowski_systemkatalog_query", tools)
         self.assertTrue(
             {
                 "grabowski_audit_query",
@@ -281,6 +283,10 @@ class RepositoryContractTests(unittest.TestCase):
             supporting["grabowski_task_attention"],
             "src/grabowski_task_attention.py",
         )
+        self.assertEqual(
+            supporting["grabowski_systemkatalog"],
+            "src/grabowski_systemkatalog.py",
+        )
         for module in (
             "grabowski_mcp",
             "grabowski_grips",
@@ -306,6 +312,7 @@ class RepositoryContractTests(unittest.TestCase):
             "grabowski_agent_bootstrap",
             "grabowski_recall",
             "grabowski_context_fabric",
+            "grabowski_systemkatalog",
             "grabowski_consumer_surface",
             "grabowski_private_io",
             "grabowski_job_origin",
