@@ -84,6 +84,39 @@ class ConnectorContractTests(unittest.TestCase):
         self.assertEqual(result["required_schema_property_mismatches"], [])
         self.assertEqual(result["schema_mismatches"], [])
 
+    def test_candidate_assess_idempotency_key_is_a_concrete_negative_probe(self) -> None:
+        runtime_schemas = _sentinel_schemas()
+        observed_schemas = copy.deepcopy(runtime_schemas)
+        del observed_schemas["grabowski_bureau_candidate_assess"]["properties"][
+            "idempotency_key"
+        ]
+
+        result = contract.probe_contract(
+            NAMES,
+            observed_schemas,
+            NAMES,
+            runtime_schemas,
+            NAMES,
+        )
+
+        self.assertFalse(result["matches"])
+        self.assertFalse(result["schema_contract_matches"])
+        self.assertEqual(
+            [
+                item
+                for item in result["required_schema_property_mismatches"]
+                if item["tool"] == "grabowski_bureau_candidate_assess"
+                and item["source"] == "connector"
+            ],
+            [
+                {
+                    "tool": "grabowski_bureau_candidate_assess",
+                    "source": "connector",
+                    "missing_properties": ["idempotency_key"],
+                }
+            ],
+        )
+
     def test_each_task_start_identity_field_is_a_concrete_negative_probe(self) -> None:
         runtime_schemas = _sentinel_schemas()
         for field in sorted(
