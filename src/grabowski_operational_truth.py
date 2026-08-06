@@ -12,6 +12,10 @@ SCHEMA_VERSION = 1
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 50
 MAX_CURSOR = 128
+CURRENT_WORK_PAGE_LIMIT = current_work.PAGE_LIMIT_MAX
+MAX_CURRENT_WORK_PAGES = (
+    current_work.MAX_GROUPS + CURRENT_WORK_PAGE_LIMIT - 1
+) // CURRENT_WORK_PAGE_LIMIT
 
 OT_CURSOR_RE = re.compile(r"ot1\.([0-9a-f]{32})\.([0-9]{1,6})\Z")
 
@@ -105,6 +109,122 @@ def _parse_cursor_offset(cursor: str | None, snapshot_sha256: str) -> int:
     if match.group(1) != snapshot_sha256[:32]:
         raise OperationalTruthInputError("cursor is bound to another live snapshot")
     return int(match.group(2))
+
+
+def _build_complete_current_work_projection(**parameters: Any) -> dict[str, Any]:
+    """Read every page from one snapshot-bound current-work projection."""
+    first_projection: dict[str, Any] | None = None
+    expected_snapshot = ""
+    expected_total = 0
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    all_groups: list[dict[str, Any]] = []
+
+    for _page_number in range(MAX_CURRENT_WORK_PAGES):
+        projection = current_work.build_current_work_projection(
+            **parameters,
+            limit=CURRENT_WORK_PAGE_LIMIT,
+            cursor=cursor,
+        )
+        if not isinstance(projection, dict):
+            raise OperationalTruthIntegrityError(
+                "current-work projection must be an object"
+            )
+        snapshot_sha256 = projection.get("snapshot_sha256")
+        total_projected = projection.get("total_projected")
+        page = projection.get("work")
+        pagination = projection.get("pagination")
+        if (
+            not isinstance(snapshot_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", snapshot_sha256) is None
+        ):
+            raise OperationalTruthIntegrityError(
+                "current-work projection has an invalid snapshot identity"
+            )
+        if (
+            isinstance(total_projected, bool)
+            or not isinstance(total_projected, int)
+            or not 0 <= total_projected <= current_work.MAX_GROUPS
+        ):
+            raise OperationalTruthIntegrityError(
+                "current-work projection has an invalid total"
+            )
+        if not isinstance(page, list) or not all(
+            isinstance(item, dict) for item in page
+        ):
+            raise OperationalTruthIntegrityError(
+                "current-work projection page must contain objects"
+            )
+        if not isinstance(pagination, dict):
+            raise OperationalTruthIntegrityError(
+                "current-work projection pagination is missing"
+            )
+        if first_projection is None:
+            first_projection = projection
+            expected_snapshot = snapshot_sha256
+            expected_total = total_projected
+        elif (
+            snapshot_sha256 != expected_snapshot
+            or total_projected != expected_total
+        ):
+            raise OperationalTruthIntegrityError(
+                "current-work snapshot drifted while reading pages"
+            )
+
+        offset = pagination.get("offset")
+        count = projection.get("count")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset != len(all_groups)
+        ):
+            raise OperationalTruthIntegrityError(
+                "current-work pages are not contiguous"
+            )
+        if isinstance(count, bool) or count != len(page):
+            raise OperationalTruthIntegrityError(
+                "current-work page count is inconsistent"
+            )
+        all_groups.extend(page)
+
+        has_more = pagination.get("has_more")
+        next_cursor = pagination.get("next_cursor")
+        if not isinstance(has_more, bool) or has_more != (next_cursor is not None):
+            raise OperationalTruthIntegrityError(
+                "current-work pagination continuation is inconsistent"
+            )
+        if next_cursor is None:
+            if len(all_groups) != expected_total:
+                raise OperationalTruthIntegrityError(
+                    "current-work projection ended before its declared total"
+                )
+            complete = dict(first_projection)
+            complete["count"] = len(all_groups)
+            complete["work"] = all_groups
+            complete["pagination"] = {
+                "limit": CURRENT_WORK_PAGE_LIMIT,
+                "offset": 0,
+                "has_more": False,
+                "next_cursor": None,
+                "snapshot_bound": True,
+                "complete": True,
+            }
+            return complete
+        if (
+            not isinstance(next_cursor, str)
+            or not next_cursor
+            or next_cursor in seen_cursors
+            or not page
+        ):
+            raise OperationalTruthIntegrityError(
+                "current-work pagination did not make bounded progress"
+            )
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+
+    raise OperationalTruthIntegrityError(
+        "current-work projection exceeded its bounded page count"
+    )
 
 
 def compute_operation_identity(
@@ -362,8 +482,6 @@ def build_operational_truth_projection(
     browser_payload: dict[str, Any] | None = None,
     gui_payload: dict[str, Any] | None = None,
     reconciliation_payload: dict[str, Any] | None = None,
-    deployments_payload: dict[str, Any] | None = None,
-    prs_payload: dict[str, Any] | None = None,
     source_errors: list[dict[str, Any]] | None = None,
     generated_at_unix: int = 0,
     view: str = "current",
@@ -379,10 +497,12 @@ def build_operational_truth_projection(
     """
     if repository_filters is None:
         repository_filters = ["/home/alex/repos/grabowski"]
-    if not (1 <= limit <= MAX_LIMIT):
+    if view not in OPERATIONAL_TRUTH_VIEWS:
+        raise OperationalTruthInputError(f"unsupported view: {view}")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise OperationalTruthInputError(f"limit must be between 1 and {MAX_LIMIT}")
 
-    cw_projection = current_work.build_current_work_projection(
+    cw_projection = _build_complete_current_work_projection(
         tasks_payload=tasks_payload,
         attention_payload=attention_payload,
         resources_payload=resources_payload,
@@ -396,8 +516,6 @@ def build_operational_truth_projection(
         generated_at_unix=generated_at_unix,
         reconciliation_payload=reconciliation_payload,
         view=view if view in {"current", "history"} else "current",
-        limit=50,
-        cursor=None,
     )
 
     all_groups = cw_projection.get("work", [])
@@ -508,6 +626,7 @@ def build_operational_truth_projection(
     target_list = hygiene_items if view == "hygiene" else blockers if view == "actionable" else all_groups
     snapshot_material = {
         "view": view,
+        "all_groups": all_groups,
         "blockers": blockers,
         "hygiene": hygiene_items,
         "reused_identities": reused_identities,
@@ -516,6 +635,8 @@ def build_operational_truth_projection(
     snapshot_sha256 = _sha256_json(snapshot_material)
 
     offset = _parse_cursor_offset(cursor, snapshot_sha256)
+    if offset > len(target_list):
+        raise OperationalTruthInputError("cursor offset exceeds live snapshot")
     page = target_list[offset : offset + limit]
     next_offset = offset + len(page)
     has_more = next_offset < len(target_list)
@@ -530,7 +651,10 @@ def build_operational_truth_projection(
         "total_operational_blockers": len(blockers),
         "total_hygiene_items": len(hygiene_items),
         "work": page,
-        "operational_blockers": blockers[:limit] if view == "actionable" else blockers,
+        "operational_blockers": page if view == "actionable" else blockers,
+        "operational_blockers_scope": (
+            "returned_page" if view == "actionable" else "bounded_source_snapshot"
+        ),
         "actionable_attention": actionable_attention_projection,
         "hygiene_projection": hygiene_projection_payload,
         "reused_operation_identities": reused_identities,

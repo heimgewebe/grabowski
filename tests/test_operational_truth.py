@@ -219,6 +219,68 @@ class OperationalTruthTests(unittest.TestCase):
         self.assertEqual(proj_p2["count"], 1)
         self.assertFalse(proj_p2["pagination"]["has_more"])
 
+    def test_projection_reads_all_current_work_pages(self) -> None:
+        tasks = [
+            make_task(f"{index:024x}", state="running", updated=index + 1)
+            for index in range(1, 52)
+        ]
+        first = op_truth.build_operational_truth_projection(
+            tasks_payload={"tasks": tasks},
+            repository_filters=[REPOSITORY],
+            view="actionable",
+            limit=50,
+        )
+        self.assertEqual(first["total_operational_blockers"], 51)
+        self.assertEqual(first["total_hygiene_items"], 0)
+        self.assertEqual(first["count"], 50)
+        self.assertEqual(len(first["operational_blockers"]), 50)
+        self.assertEqual(first["operational_blockers_scope"], "returned_page")
+        cursor = first["pagination"]["next_cursor"]
+        self.assertIsNotNone(cursor)
+
+        second = op_truth.build_operational_truth_projection(
+            tasks_payload={"tasks": tasks},
+            repository_filters=[REPOSITORY],
+            view="actionable",
+            limit=50,
+            cursor=cursor,
+        )
+        self.assertEqual(second["total_operational_blockers"], 51)
+        self.assertEqual(second["count"], 1)
+        self.assertEqual(len(second["operational_blockers"]), 1)
+        self.assertFalse(second["pagination"]["has_more"])
+        returned_ids = {
+            item["work_id"] for item in first["work"] + second["work"]
+        }
+        self.assertEqual(len(returned_ids), 51)
+        self.assertTrue(
+            all(
+                item["operational_classification"]["is_blocker"]
+                for item in first["work"] + second["work"]
+            )
+        )
+
+    def test_cursor_offset_beyond_snapshot_is_rejected(self) -> None:
+        task = make_task("0000000000000000000000c1", state="running")
+        projection = op_truth.build_operational_truth_projection(
+            tasks_payload={"tasks": [task]},
+            repository_filters=[REPOSITORY],
+        )
+        forged = f"ot1.{projection['snapshot_sha256'][:32]}.999999"
+        with self.assertRaises(op_truth.OperationalTruthInputError):
+            op_truth.build_operational_truth_projection(
+                tasks_payload={"tasks": [task]},
+                repository_filters=[REPOSITORY],
+                cursor=forged,
+            )
+
+    def test_boolean_limit_is_rejected(self) -> None:
+        with self.assertRaises(op_truth.OperationalTruthInputError):
+            op_truth.build_operational_truth_projection(
+                repository_filters=[REPOSITORY],
+                limit=True,
+            )
+
     def test_hygiene_projection_view(self) -> None:
         foreign_dirty = make_checkout(
             "key-hyg",

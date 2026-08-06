@@ -338,21 +338,6 @@ def _task_binding(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def derive_task_operation_identity(record: dict[str, Any]) -> str:
-    """Compute deterministic operation identity SHA-256 for operation reuse."""
-    binding = _task_binding(record)
-    explicit_id = record.get("operation_id") or record.get("operation_identity")
-    if isinstance(explicit_id, str) and explicit_id.strip():
-        return explicit_id.strip()
-    material = {
-        "unit": binding["unit"],
-        "argv_sha256": binding["argv_sha256"],
-        "execution_envelope_sha256": binding["execution_envelope_sha256"],
-    }
-    return _sha256_json(material)
-
-
-
 def _task_output_cleanup_now_unix() -> int:
     return int(time.time())
 
