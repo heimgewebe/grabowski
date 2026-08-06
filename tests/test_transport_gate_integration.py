@@ -577,6 +577,15 @@ class CentralTransportGateTests(unittest.TestCase):
     ) -> None:
         base = _load_grabowski_mcp()
 
+        class StrictValidationError(ValueError):
+            def errors(self) -> list[dict[str, object]]:
+                return [
+                    {
+                        "type": "int_type",
+                        "loc": ("request", "lease_ttl_seconds"),
+                    }
+                ]
+
         class StrictArguments:
             @classmethod
             def model_validate(
@@ -590,20 +599,32 @@ class CentralTransportGateTests(unittest.TestCase):
                     raise ValueError("request must be an object")
                 lease_ttl_seconds = request["lease_ttl_seconds"]
                 ratio = request["ratio"]
+                ambiguous_number = request["ambiguous_number"]
                 if strict:
                     if type(lease_ttl_seconds) is not int:
-                        raise ValueError("lease_ttl_seconds must be an integer")
+                        raise StrictValidationError(
+                            "lease_ttl_seconds must be an integer"
+                        )
                     if type(ratio) is not float:
                         raise ValueError("ratio must be a float")
-                elif (
-                    type(lease_ttl_seconds) is float
-                    and lease_ttl_seconds.is_integer()
-                ):
-                    lease_ttl_seconds = int(lease_ttl_seconds)
+                    if type(ambiguous_number) not in {int, float}:
+                        raise ValueError("ambiguous_number must be numeric")
+                else:
+                    if (
+                        type(lease_ttl_seconds) is float
+                        and lease_ttl_seconds.is_integer()
+                    ):
+                        lease_ttl_seconds = int(lease_ttl_seconds)
+                    if (
+                        type(ambiguous_number) is float
+                        and ambiguous_number.is_integer()
+                    ):
+                        ambiguous_number = int(ambiguous_number)
                 parsed = {
                     "request": {
                         "lease_ttl_seconds": lease_ttl_seconds,
                         "ratio": ratio,
+                        "ambiguous_number": ambiguous_number,
                     }
                 }
                 return types.SimpleNamespace(
@@ -620,6 +641,7 @@ class CentralTransportGateTests(unittest.TestCase):
                 "request": {
                     "lease_ttl_seconds": 900.0,
                     "ratio": 1.0,
+                    "ambiguous_number": 2.0,
                 }
             },
         }
@@ -642,6 +664,7 @@ class CentralTransportGateTests(unittest.TestCase):
         normalized = run_core.call_args.args[1]["target_arguments"]
         self.assertIs(type(normalized["request"]["lease_ttl_seconds"]), int)
         self.assertIs(type(normalized["request"]["ratio"]), float)
+        self.assertIs(type(normalized["request"]["ambiguous_number"]), float)
         self.assertIs(
             type(parameters["target_arguments"]["request"]["lease_ttl_seconds"]),
             float,
@@ -653,10 +676,58 @@ class CentralTransportGateTests(unittest.TestCase):
                     "request": {
                         "lease_ttl_seconds": 900,
                         "ratio": 1.0,
+                        "ambiguous_number": 2.0,
                     }
                 }
             ),
         )
+
+    def test_atomic_transport_preserves_already_strict_valid_arguments(
+        self,
+    ) -> None:
+        base = _load_grabowski_mcp()
+
+        class StrictValidArguments:
+            strict_calls = 0
+            lenient_calls = 0
+
+            @classmethod
+            def model_validate(
+                cls,
+                value: dict[str, object],
+                *,
+                strict: bool,
+            ) -> object:
+                if strict:
+                    cls.strict_calls += 1
+                else:
+                    cls.lenient_calls += 1
+                return types.SimpleNamespace(
+                    model_dump=lambda **_kwargs: {
+                        "value": int(value["value"])
+                    }
+                )
+
+        parameters = {
+            "action": "begin",
+            "target_tool_name": "strict-valid-target",
+            "target_arguments": {"value": 2.0},
+        }
+        base.mcp._tool_manager = types.SimpleNamespace(
+            get_tool=lambda _name: types.SimpleNamespace(
+                fn_metadata=types.SimpleNamespace(
+                    arg_model=StrictValidArguments
+                )
+            )
+        )
+        normalized = base._normalize_atomic_transport_parameters(
+            "transport-roundtrip",
+            parameters,
+        )
+        self.assertIs(normalized, parameters)
+        self.assertEqual(StrictValidArguments.strict_calls, 1)
+        self.assertEqual(StrictValidArguments.lenient_calls, 0)
+        self.assertIs(type(parameters["target_arguments"]["value"]), float)
 
     def test_atomic_dispatch_classifies_mcp_error_result(self) -> None:
         temporary = tempfile.TemporaryDirectory()

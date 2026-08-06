@@ -10324,11 +10324,45 @@ def _transport_tool_result_error(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _transport_strict_integer_error_locations(
+    error: BaseException,
+) -> frozenset[tuple[Any, ...]]:
+    errors = getattr(error, "errors", None)
+    if not callable(errors):
+        return frozenset()
+    try:
+        entries = errors()
+    except (AttributeError, TypeError, ValueError):
+        return frozenset()
+    locations: set[tuple[Any, ...]] = set()
+    if not isinstance(entries, list):
+        return frozenset()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        error_type = entry.get("type")
+        location = entry.get("loc")
+        if not isinstance(error_type, str) or not error_type.startswith("int"):
+            continue
+        if not isinstance(location, (list, tuple)):
+            continue
+        locations.add(tuple(location))
+    return frozenset(locations)
+
+
 def _transport_restore_strict_integral_numbers(
     original: Any,
     parsed: Any,
+    *,
+    integer_error_locations: frozenset[tuple[Any, ...]],
+    path: tuple[Any, ...] = (),
 ) -> tuple[Any, bool]:
-    if type(original) is float and type(parsed) is int and original.is_integer():
+    if (
+        path in integer_error_locations
+        and type(original) is float
+        and type(parsed) is int
+        and original.is_integer()
+    ):
         return parsed, True
     if isinstance(original, dict) and isinstance(parsed, dict):
         restored: dict[Any, Any] = {}
@@ -10337,6 +10371,8 @@ def _transport_restore_strict_integral_numbers(
             item, item_changed = _transport_restore_strict_integral_numbers(
                 value,
                 parsed.get(key, value),
+                integer_error_locations=integer_error_locations,
+                path=(*path, key),
             )
             restored[key] = item
             changed = changed or item_changed
@@ -10348,10 +10384,14 @@ def _transport_restore_strict_integral_numbers(
     ):
         restored_items: list[Any] = []
         changed = False
-        for value, parsed_value in zip(original, parsed, strict=True):
+        for index, (value, parsed_value) in enumerate(
+            zip(original, parsed, strict=True)
+        ):
             item, item_changed = _transport_restore_strict_integral_numbers(
                 value,
                 parsed_value,
+                integer_error_locations=integer_error_locations,
+                path=(*path, index),
             )
             restored_items.append(item)
             changed = changed or item_changed
@@ -10379,6 +10419,19 @@ def _normalize_atomic_transport_parameters(
     if argument_model is None:
         return parameters
     try:
+        argument_model.model_validate(
+            dict(target_arguments),
+            strict=True,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        integer_error_locations = _transport_strict_integer_error_locations(
+            error
+        )
+        if not integer_error_locations:
+            return parameters
+    else:
+        return parameters
+    try:
         lenient_model = argument_model.model_validate(
             dict(target_arguments),
             strict=False,
@@ -10389,6 +10442,7 @@ def _normalize_atomic_transport_parameters(
     normalized_arguments, changed = _transport_restore_strict_integral_numbers(
         target_arguments,
         lenient_arguments,
+        integer_error_locations=integer_error_locations,
     )
     if not changed:
         return parameters
