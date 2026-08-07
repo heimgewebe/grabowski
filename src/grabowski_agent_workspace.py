@@ -7518,6 +7518,75 @@ def _stale_workspace_reconciliation_plan(
     }
 
 
+def _workspace_cleanup_archive_lifecycle(
+    manifest: dict[str, Any],
+    cleanup_intent: dict[str, Any],
+    owner: str,
+    *,
+    expected_checkout_key: str | None = None,
+) -> dict[str, Any]:
+    """Return stable, verified lifecycle evidence for an archived cleanup intent."""
+    archive_id = cleanup_intent.get("archive_id")
+    source_plan_sha256 = cleanup_intent.get("source_plan_sha256")
+    unverified = {
+        "state": "archive_state_unverified",
+        "archive_id": archive_id if isinstance(archive_id, str) else None,
+        "archive_verified": False,
+        "archive_created_at_unix": None,
+        "cleanup_available_at_unix": None,
+        "retention_active": None,
+        "requires_fresh_cleanup_plan": True,
+        "source_plan_sha256": (
+            source_plan_sha256
+            if isinstance(source_plan_sha256, str)
+            else None
+        ),
+    }
+    if (
+        cleanup_intent.get("state") not in {"archived_ready", "waiting_grace"}
+        or not isinstance(archive_id, str)
+        or not isinstance(source_plan_sha256, str)
+        or SHA256_RE.fullmatch(source_plan_sha256) is None
+    ):
+        return {**unverified, "error": "archived cleanup intent identity is incomplete"}
+    try:
+        archive_post_state = _workspace_archive_post_state(
+            manifest,
+            archive_id,
+            expected_checkout_key=expected_checkout_key,
+            expected_head=str(cleanup_intent.get("writer_head", "")),
+            expected_branch=str(cleanup_intent.get("writer_branch", "")),
+            expected_owner=owner,
+        )
+        archive = checkouts._load_archive(archive_id)
+        if (
+            archive.get("cleaned_at_unix") is not None
+            or archive.get("cleanup_plan_id") is not None
+        ):
+            raise AgentWorkspaceActionError(
+                "workspace archive already records physical cleanup without a cleanup receipt"
+            )
+        cleanup_available_at_unix = _workspace_cleanup_available_at(archive)
+    except Exception as exc:
+        return {**unverified, "error": _error_summary(exc)}
+    retention_active = int(time.time()) < cleanup_available_at_unix
+    return {
+        "state": (
+            "archived_waiting_for_cleanup"
+            if retention_active
+            else "archived_ready_for_cleanup"
+        ),
+        "archive_id": archive_id,
+        "archive_verified": True,
+        "archive_created_at_unix": archive["created_at_unix"],
+        "cleanup_available_at_unix": cleanup_available_at_unix,
+        "retention_active": retention_active,
+        "requires_fresh_cleanup_plan": True,
+        "source_plan_sha256": source_plan_sha256,
+        "archive_post_state_sha256": _sha256_json(archive_post_state),
+    }
+
+
 def _workspace_cleanup_plan_data(
     manifest: dict[str, Any]
 ) -> dict[str, Any]:
@@ -7752,6 +7821,50 @@ def _workspace_cleanup_plan_data(
                     "error": _error_summary(exc),
                 }
             )
+    archive_lifecycle: dict[str, Any] = {
+        "state": "not_archived",
+        "archive_id": None,
+        "archive_verified": False,
+        "archive_created_at_unix": None,
+        "cleanup_available_at_unix": None,
+        "retention_active": False,
+        "requires_fresh_cleanup_plan": False,
+        "source_plan_sha256": None,
+    }
+    if (
+        isinstance(cleanup_intent, dict)
+        and cleanup_intent.get("state") in {"archived_ready", "waiting_grace"}
+    ):
+        archive_lifecycle = _workspace_cleanup_archive_lifecycle(
+            manifest,
+            cleanup_intent,
+            owner,
+            expected_checkout_key=(
+                str(checkout_state["checkout_key"])
+                if isinstance(checkout_state.get("checkout_key"), str)
+                else None
+            ),
+        )
+        if archive_lifecycle["archive_verified"] is not True:
+            blockers.append(
+                {
+                    "code": "cleanup_archive_state_unverified",
+                    "archive_id": archive_lifecycle.get("archive_id"),
+                    "error": archive_lifecycle.get("error"),
+                }
+            )
+        elif archive_lifecycle["retention_active"] is True:
+            blockers.append(
+                {
+                    "code": "archive_retention_active",
+                    "archive_id": archive_lifecycle["archive_id"],
+                    "cleanup_available_at_unix": archive_lifecycle[
+                        "cleanup_available_at_unix"
+                    ],
+                    "requires_fresh_cleanup_plan": True,
+                }
+            )
+
     stale_blockers = list(stale_reconciliation["blockers"])
     if close_receipt is None and close_receipt_path.exists():
         stale_blockers.append({"code": "workspace_close_outcome_unknown"})
@@ -7844,7 +7957,34 @@ def _workspace_cleanup_plan_data(
         and not cleanup_receipt_valid
         and not blockers
     )
-    eligible = not blockers and checkout_state["exists"] and checkout_state["linked"]
+    base_eligible = (
+        not blockers and checkout_state["exists"] and checkout_state["linked"]
+    )
+    cleanup_intent_state = (
+        cleanup_intent.get("state") if isinstance(cleanup_intent, dict) else None
+    )
+    if cleanup_receipt_valid:
+        lifecycle_state = "cleaned"
+    elif cleanup_intent_state in {"archived_ready", "waiting_grace"}:
+        lifecycle_state = str(archive_lifecycle["state"])
+    elif cleanup_intent_state == "started":
+        lifecycle_state = "cleanup_outcome_unknown"
+    elif cleanup_intent_state == "recovery_required":
+        lifecycle_state = "cleanup_recovery_required"
+    else:
+        lifecycle_state = "archive_eligible"
+    archive_eligible = bool(base_eligible and lifecycle_state == "archive_eligible")
+    physical_cleanup_eligible = bool(
+        base_eligible and lifecycle_state == "archived_ready_for_cleanup"
+    )
+    eligible = archive_eligible or physical_cleanup_eligible
+    cleanup_method = {
+        "archive_eligible": "archive-recovery-refs",
+        "archived_waiting_for_cleanup": "wait-for-retention",
+        "archived_ready_for_cleanup": "remove-archived-linked-checkout",
+        "archive_state_unverified": "verify-archive-state",
+        "cleaned": "none",
+    }.get(lifecycle_state, "reconcile-cleanup-state")
     body = {
         "schema_version": 1,
         "operation": "agent-workspace-cleanup",
@@ -7878,12 +8018,16 @@ def _workspace_cleanup_plan_data(
         ),
         "already_cleaned": already_cleaned,
         "already_absent": already_absent,
+        "lifecycle_state": lifecycle_state,
+        "archive_lifecycle": archive_lifecycle,
+        "archive_eligible": archive_eligible,
+        "physical_cleanup_eligible": physical_cleanup_eligible,
         "eligible": eligible,
         "blockers": blockers,
         "historical_evidence_preserved": True,
         "workspace_state_deleted": False,
         "execution_authorized": False,
-        "cleanup_method": "archive-recovery-refs-then-remove-linked-checkout",
+        "cleanup_method": cleanup_method,
         "confirmation_required": "archive-and-remove-worktree",
         "does_not_establish": [
             "branch_merge_readiness",
@@ -9447,6 +9591,55 @@ def grabowski_agent_workspace_cleanup(
                 )
             reconciliation_intent_id = str(intent["intent_id"])
         else:
+            prior_intent = manifest.get("workspace_cleanup_intent")
+            if (
+                isinstance(prior_intent, dict)
+                and prior_intent.get("state") in {"archived_ready", "waiting_grace"}
+                and prior_intent.get("source_plan_sha256") == expected_hash
+            ):
+                archive_lifecycle = _workspace_cleanup_archive_lifecycle(
+                    manifest, prior_intent, owner
+                )
+                if (
+                    archive_lifecycle["archive_verified"] is True
+                    and archive_lifecycle["retention_active"] is True
+                ):
+                    cleanup_available_at_unix = int(
+                        archive_lifecycle["cleanup_available_at_unix"]
+                    )
+                    if (
+                        prior_intent.get("state") != "waiting_grace"
+                        or prior_intent.get("cleanup_available_at_unix")
+                        != cleanup_available_at_unix
+                    ):
+                        prior_intent.update(
+                            {
+                                "state": "waiting_grace",
+                                "cleanup_available_at_unix": cleanup_available_at_unix,
+                                "updated_at": _utc(),
+                            }
+                        )
+                        manifest["workspace_cleanup_intent"] = prior_intent
+                        _write_manifest(manifest)
+                    return {
+                        "workspace_id": identifier,
+                        "state": "archived_waiting_for_cleanup",
+                        "idempotent": True,
+                        "archive_id": archive_lifecycle["archive_id"],
+                        "archive_created_at_unix": archive_lifecycle[
+                            "archive_created_at_unix"
+                        ],
+                        "cleanup_available_at_unix": archive_lifecycle[
+                            "cleanup_available_at_unix"
+                        ],
+                        "seconds_until_cleanup": max(
+                            0,
+                            int(archive_lifecycle["cleanup_available_at_unix"])
+                            - int(time.time()),
+                        ),
+                        "requires_fresh_cleanup_plan": True,
+                        "worktree_preserved": True,
+                    }
             plan = _workspace_cleanup_plan_data(manifest)
             if plan["plan_sha256"] != expected_hash:
                 raise AgentWorkspaceError(
