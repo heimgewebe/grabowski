@@ -25,6 +25,13 @@ ACTOR_RE = re.compile(r"[A-Za-z0-9._:@/-]{1,256}\Z")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
+MAX_WRITE_PATHS = 256
+MAX_WRITER_ARGV = 256
+MAX_WRITER_ARGUMENT_BYTES = 8192
+
+
+class ScopedWriterStartPreflight(ValueError):
+    """Writer launch validation failed before any launch effect."""
 
 
 def _canonical(value: Any) -> bytes:
@@ -140,6 +147,82 @@ def _text(value: Any, label: str, *, pattern: re.Pattern[str] | None = None) -> 
     return value
 
 
+def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > MAX_WRITE_PATHS:
+        raise ValueError(
+            f"write_paths must be a list with at most {MAX_WRITE_PATHS} entries"
+        )
+    result: list[str] = []
+    for index, item in enumerate(value):
+        raw = _text(item, f"write_paths[{index}]")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = repo / candidate
+        candidate = candidate.resolve(strict=False)
+        if candidate == repo or not candidate.is_relative_to(repo):
+            raise ValueError(f"write_paths[{index}] must resolve below repo")
+        result.append(f"path:{candidate}")
+    return result
+
+
+def _scoped_writer_argv(value: Any, writer: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    if writer is None:
+        raise ValueError("scoped_writer_argv requires scoped_writer_actor")
+    if not isinstance(value, list) or not value or len(value) > MAX_WRITER_ARGV:
+        raise ValueError(
+            f"scoped_writer_argv must contain between 1 and {MAX_WRITER_ARGV} arguments"
+        )
+    result: list[str] = []
+    for index, item in enumerate(value):
+        if (
+            not isinstance(item, str)
+            or not item
+            or "\x00" in item
+            or len(item.encode("utf-8")) > MAX_WRITER_ARGUMENT_BYTES
+        ):
+            raise ValueError(f"scoped_writer_argv[{index}] is invalid")
+        result.append(item)
+    return result
+
+
+def _start_scoped_writer(
+    argv: list[str], *, cwd: str, runtime_seconds: int
+) -> dict[str, Any]:
+    working_directory = Path(cwd).resolve(strict=True)
+    try:
+        operator._validate_argv(argv, cwd=working_directory)
+        operator._job_runtime(runtime_seconds)
+    except Exception as exc:
+        raise ScopedWriterStartPreflight(str(exc)) from exc
+    return operator._start_job(
+        argv,
+        cwd=str(working_directory),
+        runtime_seconds=runtime_seconds,
+    )
+
+
+def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
+    required = ("job_id", "unit", "argv_sha256", "metadata_path")
+    if not all(isinstance(result.get(key), str) and result[key] for key in required):
+        raise RuntimeError("scoped writer start omitted durable job identity")
+    receipt = {
+        "job_id": result["job_id"],
+        "unit": result["unit"],
+        "owner": result.get("owner"),
+        "argv_sha256": result["argv_sha256"],
+        "cwd": result.get("cwd"),
+        "runtime_seconds": result.get("runtime_seconds"),
+        "metadata_path": result["metadata_path"],
+        "expected_receipt": result.get("expected_receipt"),
+        "final_status": result.get("final_status"),
+    }
+    return {**receipt, "receipt_sha256": _sha(receipt)}
+
+
 def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("parameters must be an object")
@@ -182,8 +265,21 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     requested = parameters.get("resource_keys") or []
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise ValueError("resource_keys must be a list of strings")
+    path_resources = _write_path_resource_keys(repo, parameters.get("write_paths"))
+    writer_argv = _scoped_writer_argv(parameters.get("scoped_writer_argv"), writer)
+    writer_runtime = parameters.get("scoped_writer_runtime_seconds", 7200)
+    if (
+        isinstance(writer_runtime, bool)
+        or not isinstance(writer_runtime, int)
+        or not 120 <= writer_runtime <= 86400
+    ):
+        raise ValueError(
+            "scoped_writer_runtime_seconds must be between 120 and 86400"
+        )
     required = [f"path:{target}", f"repo:{repo}:branch:{branch}"]
-    resource_keys = resources.normalize_resource_keys([*requested, *required])
+    resource_keys = resources.normalize_resource_keys(
+        [*requested, *path_resources, *required]
+    )
     identity = {
         "source": {"kind": source_kind, "id": source_id},
         "controller": {"actor": controller_actor, "role": "controller"},
@@ -198,8 +294,20 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         "resource_keys": resource_keys,
         "idempotency_key": idempotency_key,
     }
+    if writer_argv is not None:
+        identity["scoped_writer_command"] = {
+            "argv_sha256": _sha(writer_argv),
+            "argc": len(writer_argv),
+            "runtime_seconds": writer_runtime,
+        }
     lane_id = _sha(identity)[:32]
-    return {**identity, "lane_id": lane_id, "lease_owner_id": f"lane:{lane_id}", "ttl_seconds": ttl}
+    return {
+        **identity,
+        "lane_id": lane_id,
+        "lease_owner_id": f"lane:{lane_id}",
+        "ttl_seconds": ttl,
+        "_scoped_writer_argv": writer_argv,
+    }
 
 
 def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
@@ -234,15 +342,53 @@ def acquire_work(
     inspect_resource_fn: Callable[[str], dict[str, Any] | None] = resources.inspect_resource,
     ensure_worktree_fn: Callable[..., dict[str, Any]] = worktree_ensure.ensure_worktree,
     runner: Callable[[Path, list[str]], dict[str, Any]] = _git_runner,
+    start_writer_fn: Callable[..., dict[str, Any]] = _start_scoped_writer,
     audit_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     inputs = _normalize(parameters)
+    writer_argv = inputs.pop("_scoped_writer_argv")
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
     with _lane_lock(lane_id) as receipt_path:
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
             raise RuntimeError("work-lane identity collision")
+        existing_writer_job = (
+            existing.get("writer_job")
+            if isinstance(existing, dict) and isinstance(existing.get("writer_job"), dict)
+            else None
+        )
+        existing_writer_start = (
+            existing.get("writer_start") if isinstance(existing, dict) else None
+        )
+        ambiguous_writer_start = (
+            writer_argv is not None
+            and existing is not None
+            and existing_writer_job is None
+            and existing.get("state") in {"writer_starting", "outcome_unknown"}
+            and isinstance(existing_writer_start, dict)
+            and existing_writer_start.get("state") in {"starting", "outcome_unknown"}
+        )
+        if ambiguous_writer_start:
+            record = _write_state(
+                receipt_path,
+                {
+                    **existing,
+                    "state": "outcome_unknown",
+                    "decision": "HARD_BLOCK",
+                    "updated_at_unix": int(time.time()),
+                    "writer_start": {
+                        **existing_writer_start,
+                        "state": "outcome_unknown",
+                    },
+                    "next_action": "readback_scoped_writer_before_retry",
+                },
+            )
+            return {
+                **record,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": True,
+            }
         attempt = int(existing.get("attempt_count", 0)) + 1 if existing else 1
         base_record = {
             "kind": LANE_KIND,
@@ -253,6 +399,16 @@ def acquire_work(
             "attempt_count": attempt,
             "created_at_unix": existing.get("created_at_unix", int(time.time())) if existing else int(time.time()),
             "updated_at_unix": int(time.time()),
+            **(
+                {"writer_job": existing_writer_job}
+                if existing_writer_job is not None
+                else {}
+            ),
+            **(
+                {"writer_start": existing_writer_start}
+                if isinstance(existing_writer_start, dict)
+                else {}
+            ),
         }
         _write_state(receipt_path, {**base_record, "state": "acquiring"})
         metadata = {
@@ -400,6 +556,151 @@ def acquire_work(
         result_state = output.get("result_state")
         if result_state in SUCCESS_STATES:
             decision = "AUTO_PREPARE_AND_EXECUTE" if result_state == "CREATED" else "EXECUTE"
+            authority = {
+                "controller": inputs["controller"],
+                "scoped_writer": inputs["scoped_writer"],
+                "writer_effects": [
+                    "implement",
+                    "test",
+                    "commit",
+                    "push",
+                    "pull-request-create-or-update",
+                ],
+                "controller_only_effects": [
+                    "merge",
+                    "deployment",
+                    "bureau-terminalization",
+                    "closeout",
+                ],
+                "single_writer_scope": "overlapping-resource-lane",
+            }
+            writer_job = existing_writer_job
+            writer_start: dict[str, Any] | None = None
+            if writer_job is not None:
+                writer_start = {
+                    "state": "reused",
+                    "job_receipt_sha256": writer_job.get("receipt_sha256"),
+                }
+            elif writer_argv is not None:
+                _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": "writer_starting",
+                        "decision": decision,
+                        "lease_receipt": acquired,
+                        "worktree_receipt": output,
+                        "authority": authority,
+                        "writer_start": {"state": "starting"},
+                        "next_action": "start_scoped_writer",
+                    },
+                )
+                try:
+                    writer_result = start_writer_fn(
+                        writer_argv,
+                        cwd=inputs["target_path"],
+                        runtime_seconds=inputs["scoped_writer_command"][
+                            "runtime_seconds"
+                        ],
+                    )
+                except ScopedWriterStartPreflight as exc:
+                    record = _write_state(
+                        receipt_path,
+                        {
+                            **base_record,
+                            "state": "ready",
+                            "decision": decision,
+                            "lease_receipt": acquired,
+                            "worktree_receipt": output,
+                            "authority": authority,
+                            "writer_start": {
+                                "state": "preflight_failed",
+                                "error_class": type(exc).__name__,
+                                "error": str(exc)[:2048],
+                            },
+                            "next_action": "controller_execute",
+                        },
+                    )
+                    return {
+                        **record,
+                        "durable_receipt_path": str(receipt_path),
+                        "replayed": existing is not None,
+                    }
+                except Exception as exc:
+                    record = _write_state(
+                        receipt_path,
+                        {
+                            **base_record,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "lease_receipt": acquired,
+                            "worktree_receipt": output,
+                            "authority": authority,
+                            "writer_start": {
+                                "state": "outcome_unknown",
+                                "error_class": type(exc).__name__,
+                                "error": str(exc)[:2048],
+                            },
+                            "next_action": "readback_scoped_writer_before_retry",
+                        },
+                    )
+                    return {
+                        **record,
+                        "durable_receipt_path": str(receipt_path),
+                        "replayed": existing is not None,
+                    }
+                if not isinstance(writer_result, dict):
+                    record = _write_state(
+                        receipt_path,
+                        {
+                            **base_record,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "lease_receipt": acquired,
+                            "worktree_receipt": output,
+                            "authority": authority,
+                            "writer_start": {
+                                "state": "outcome_unknown",
+                                "error_class": "InvalidScopedWriterStartResult",
+                                "error": "scoped writer start returned a non-object result",
+                            },
+                            "next_action": "readback_scoped_writer_before_retry",
+                        },
+                    )
+                    return {
+                        **record,
+                        "durable_receipt_path": str(receipt_path),
+                        "replayed": existing is not None,
+                    }
+                try:
+                    writer_job = _writer_job_receipt(writer_result)
+                except Exception as exc:
+                    record = _write_state(
+                        receipt_path,
+                        {
+                            **base_record,
+                            "state": "outcome_unknown",
+                            "decision": "HARD_BLOCK",
+                            "lease_receipt": acquired,
+                            "worktree_receipt": output,
+                            "authority": authority,
+                            "writer_start": {
+                                "state": "outcome_unknown",
+                                "error_class": type(exc).__name__,
+                                "error": str(exc)[:2048],
+                            },
+                            "next_action": "readback_scoped_writer_before_retry",
+                        },
+                    )
+                    return {
+                        **record,
+                        "durable_receipt_path": str(receipt_path),
+                        "replayed": existing is not None,
+                    }
+                writer_start = {
+                    "state": "started",
+                    "job_receipt_sha256": writer_job["receipt_sha256"],
+                }
             record = _write_state(
                 receipt_path,
                 {
@@ -408,14 +709,16 @@ def acquire_work(
                     "decision": decision,
                     "lease_receipt": acquired,
                     "worktree_receipt": output,
-                    "authority": {
-                        "controller": inputs["controller"],
-                        "scoped_writer": inputs["scoped_writer"],
-                        "writer_effects": ["implement", "test", "commit", "push", "pull-request-create-or-update"],
-                        "controller_only_effects": ["merge", "deployment", "bureau-terminalization", "closeout"],
-                        "single_writer_scope": "overlapping-resource-lane",
-                    },
-                    "next_action": "start_scoped_writer" if inputs["scoped_writer"] else "controller_execute",
+                    "authority": authority,
+                    **({"writer_job": writer_job} if writer_job is not None else {}),
+                    **({"writer_start": writer_start} if writer_start is not None else {}),
+                    "next_action": (
+                        "writer_started"
+                        if writer_job is not None
+                        else "start_scoped_writer"
+                        if inputs["scoped_writer"]
+                        else "controller_execute"
+                    ),
                 },
             )
             if audit_fn is not None:
@@ -471,13 +774,23 @@ def grabowski_work_acquire(
     retention_until_unix: int,
     idempotency_key: str,
     resource_keys: list[str] | None = None,
+    write_paths: list[str] | None = None,
     scoped_writer_actor: str | None = None,
+    scoped_writer_argv: list[str] | None = None,
+    scoped_writer_runtime_seconds: int = 7200,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
 ) -> dict[str, Any]:
     """Atomically acquire a lane, narrow leases and an exact isolated worktree."""
     operator._require_operator_mutation("resource_lease", path=target_path, repo=repo)
     operator._require_operator_capability("git_cli")
+    if scoped_writer_argv is not None:
+        operator._require_operator_mutation(
+            "durable_job",
+            path=target_path,
+            repo=repo,
+            opaque_command=True,
+        )
     return acquire_work(
         {
             "source_kind": source_kind,
@@ -493,8 +806,11 @@ def grabowski_work_acquire(
             "retention_until_unix": retention_until_unix,
             "idempotency_key": idempotency_key,
             "resource_keys": resource_keys or [],
+            "write_paths": write_paths,
+            "scoped_writer_argv": scoped_writer_argv,
+            "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
             "artifact_class": artifact_class,
             "ttl_seconds": ttl_seconds,
         },
-        audit_fn=operator._append_audit,
+        audit_fn=operator.base._append_audit,
     )

@@ -535,7 +535,7 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_contract_drift": (),
     "grabowski_checkout_summary": (),
     "grabowski_current_work": (),
-    "grabowski_work_acquire": ("git_cli", "resource_lease"),
+    "grabowski_work_acquire": ("durable_job", "git_cli", "resource_lease"),
     "grabowski_reposkop_context": ("file_read", "file_write", "terminal_execute"),
     "grabowski_operator_optimization_report": (),
     "grabowski_git_status": (),
