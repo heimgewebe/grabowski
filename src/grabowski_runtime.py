@@ -8,6 +8,7 @@ from pydantic import Field
 import grabowski_operator_core
 import grabowski_checkouts
 import grabowski_checkout_binding_reconciler
+import grabowski_current_work as grabowski_current_work_model
 import grabowski_current_work_surface
 import grabowski_work_acquire  # noqa: F401
 import grabowski_operator_optimization
@@ -58,7 +59,14 @@ async def grabowski_current_work(
         ),
     ],
     view: str = "current",
-    limit: int = 20,
+    limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=grabowski_current_work_model.PAGE_LIMIT_MAX,
+            description="Server-side page size for the bounded current-work projection.",
+        ),
+    ] = 20,
     cursor: str | None = None,
 ) -> dict[str, object]:
     """Project work for absolute local repository paths without blocking the MCP event loop."""
