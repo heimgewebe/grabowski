@@ -3195,6 +3195,7 @@ def grabowski_bureau_pickup_status(run_id: str) -> dict[str, Any]:
             "binding_sha256"
         ],
         "coordination": payload,
+        "coordination_sha256": _coordination_cas_sha256(payload),
         "execution_binding": _classify_execution_binding(run),
         "journal_available": _journal_available(normalized_run_id),
     }
@@ -3338,6 +3339,11 @@ def _terminal_release_readback_projection(status: dict[str, Any]) -> dict[str, A
         "stored_lease_binding": status.get("stored_lease_binding"),
         "lease": _terminal_release_lease_projection(status.get("lease"), resource_keys),
     }
+
+
+def _coordination_cas_sha256(status: dict[str, Any]) -> str:
+    """Hash coordination semantics while excluding observation-only lease fields."""
+    return _sha256(_terminal_release_readback_projection(status))
 
 
 def _write_or_reuse_terminal_readback(
@@ -3712,7 +3718,7 @@ def grabowski_bureau_pickup_orphan_reconcile(
             },
         )
 
-    observed_coordination_sha256 = _sha256(status)
+    observed_coordination_sha256 = _coordination_cas_sha256(status)
     run = status.get("run")
     execution_binding = _classify_execution_binding(run)
     already_terminal = _run_is_terminal(run)

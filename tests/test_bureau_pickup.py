@@ -4011,6 +4011,9 @@ class BureauPickupTests(unittest.TestCase):
         self.assertIn("heartbeat_stale", binding["reason_codes"])
         self.assertEqual(intent["run_id"], binding["run_id"])
         self.assertIn("does_not_establish", binding)
+        self.assertEqual(
+            pickup._coordination_cas_sha256(stale), result["coordination_sha256"]
+        )
 
     def _orphan_setup(
         self, *, state="assigned", heartbeat_age=3600, foreign_lease=False
@@ -4031,13 +4034,70 @@ class BureauPickupTests(unittest.TestCase):
         request = {
             "run_id": intent["run_id"],
             "expected_registry_binding_sha256": registry_sha,
-            "expected_coordination_sha256": pickup._sha256(coordination),
+            "expected_coordination_sha256": pickup._coordination_cas_sha256(coordination),
             "expected_lease_sha256": acquisition["acquisition_sha256"],
         }
         owner_lease = lease
         if foreign_lease:
             owner_lease = self.lease(key, "bureau-run:foreign")
         return intent, run_dir, acquisition, coordination, request, owner_lease, key
+
+    def test_orphan_reconcile_coordination_cas_ignores_lease_observation_drift(
+        self,
+    ) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, _key = (
+            self._orphan_setup()
+        )
+        first = {
+            **coordination,
+            "lease": {
+                "status": "active-bound",
+                "binding": {
+                    "lease_binding_sha256": "a" * 64,
+                    "observed_at_unix": 100,
+                },
+            },
+        }
+        second = {
+            **coordination,
+            "lease": {
+                "status": "active-bound",
+                "binding": {
+                    "lease_binding_sha256": "b" * 64,
+                    "observed_at_unix": 200,
+                },
+            },
+        }
+        request = {
+            **request,
+            "expected_coordination_sha256": pickup._coordination_cas_sha256(first),
+        }
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {"run_id": intent["run_id"], "state": "failed"}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[second, fail_result, terminal, terminal],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ),
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertNotEqual(pickup._sha256(first), pickup._sha256(second))
+        self.assertEqual(
+            pickup._coordination_cas_sha256(first),
+            pickup._coordination_cas_sha256(second),
+        )
+        self.assertEqual("reconciled", result["status"])
 
     def test_orphan_reconcile_success(self) -> None:
         intent, run_dir, _acq, coordination, request, lease, key = self._orphan_setup()
@@ -4280,7 +4340,7 @@ class BureauPickupTests(unittest.TestCase):
         )
         request = {
             **request,
-            "expected_coordination_sha256": pickup._sha256(coordination),
+            "expected_coordination_sha256": pickup._coordination_cas_sha256(coordination),
         }
         with (
             mock.patch.object(
@@ -4337,7 +4397,7 @@ class BureauPickupTests(unittest.TestCase):
         terminal = self.coordinated_status(intent, state="failed")
         request = {
             **request,
-            "expected_coordination_sha256": pickup._sha256(terminal),
+            "expected_coordination_sha256": pickup._coordination_cas_sha256(terminal),
         }
         with (
             mock.patch.object(
