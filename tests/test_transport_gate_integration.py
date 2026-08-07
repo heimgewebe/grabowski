@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 from pathlib import Path
 import tempfile
 import types
@@ -117,16 +118,18 @@ class TransportGripIntegrationTests(unittest.TestCase):
             for item in grips.list_grips(profile="operator")
             if item["name"] == "transport-roundtrip"
         )
-        self.assertEqual(contract["version"], "2.0")
+        self.assertEqual(contract["version"], "2.1")
         self.assertIn("exact-target-bound", contract["acceptance_ids"])
-        for fragment in ("target_tool_name", "target_arguments", "action=execute"):
-            self.assertIn(fragment, contract["summary"] + contract["recovery_path"])
+        combined = contract["summary"] + contract["recovery_path"]
+        for fragment in ("server-retained", "compatibility", "action=execute"):
+            self.assertIn(fragment, combined)
         preconditions = " | ".join(contract["preconditions"])
         self.assertIn(
             "action=begin requires target_tool_name and target_arguments together",
             preconditions,
         )
         self.assertIn("action=execute requires challenge_receipt_sha256", preconditions)
+        self.assertIn("MCP wrapper may inject", preconditions)
         self.assertIn("shared_unlabeled callers are refused", preconditions)
         self.assertEqual(contract["required_parameters"], ["action"])
 
@@ -249,6 +252,209 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertEqual(result["status"], "passed")
         self.assertEqual(observed, [("transport-roundtrip", True)])
 
+    def test_mcp_execute_claims_server_retained_target_from_challenge_only(self) -> None:
+        base = _load_grabowski_mcp()
+        challenge = "e" * 64
+        original_arguments = {
+            "request": {"action": "pickup_next", "owner_id": "chatgpt-operator"}
+        }
+        expected_arguments = {
+            "request": {"action": "pickup_next", "owner_id": "chatgpt-operator"}
+        }
+        base._retain_pending_transport_target(
+            challenge,
+            tool_name="grabowski_bureau_pickup_execute",
+            target_arguments=original_arguments,
+            arguments_sha256=roundtrip.canonical_arguments_sha256(original_arguments),
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+        )
+        original_arguments["request"]["owner_id"] = "mutated-after-retain"
+        caller_parameters = {
+            "action": "execute",
+            "challenge_receipt_sha256": challenge,
+        }
+        observed: list[dict[str, object]] = []
+
+        def fake_core(name, parameters, profile, allow_mutation, ctx, **_kwargs):
+            observed.append(dict(parameters))
+            return {"status": "passed", "name": name}
+
+        with (
+            mock.patch.object(base, "_require_capability"),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(base, "_grip_run_core", side_effect=fake_core),
+        ):
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    caller_parameters,
+                    allow_mutation=False,
+                )
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertNotIn("target_tool_name", caller_parameters)
+        self.assertNotIn("target_arguments", caller_parameters)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(
+            observed[0]["target_tool_name"], "grabowski_bureau_pickup_execute"
+        )
+        self.assertEqual(observed[0]["target_arguments"], expected_arguments)
+        with self.assertRaisesRegex(RuntimeError, "missing or expired"):
+            base._claim_pending_transport_target(
+                challenge, client_scope=SHARED_SCOPE, runtime_binding=BINDING
+            )
+
+    def test_mcp_execute_without_retained_target_requires_readback_when_unused_cannot_be_proven(self) -> None:
+        base = _load_grabowski_mcp()
+        challenge = "f" * 64
+        with (
+            mock.patch.object(base, "_require_capability"),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(
+                base.grabowski_transport_roundtrip,
+                "cancel_pending_execution_challenge",
+                return_value={
+                    "state": "consumed",
+                    "cancelled": False,
+                    "effect_possible": True,
+                },
+            ),
+            mock.patch.object(base, "_grip_run_core") as core,
+        ):
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    {
+                        "action": "execute",
+                        "challenge_receipt_sha256": challenge,
+                    },
+                    allow_mutation=False,
+                )
+            )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("target outcome may be unknown", result["output"]["error"])
+        self.assertIn("target-specific readback", result["output"]["error"])
+        core.assert_not_called()
+
+    def test_mcp_execute_missing_target_can_retry_only_after_atomic_pending_cancel(self) -> None:
+        base = _load_grabowski_mcp()
+        challenge = "d" * 64
+        with (
+            mock.patch.object(base, "_require_capability"),
+            mock.patch.object(
+                base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+            ),
+            mock.patch.object(
+                base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+            ),
+            mock.patch.object(
+                base.grabowski_transport_roundtrip,
+                "cancel_pending_execution_challenge",
+                return_value={
+                    "state": "cancelled_pending",
+                    "cancelled": True,
+                    "effect_possible": False,
+                },
+            ),
+            mock.patch.object(base, "_grip_run_core") as core,
+        ):
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    {
+                        "action": "execute",
+                        "challenge_receipt_sha256": challenge,
+                    },
+                    allow_mutation=False,
+                )
+            )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("atomically cancelled", result["output"]["error"])
+        self.assertIn("retry the original target", result["output"]["error"])
+        core.assert_not_called()
+
+    def test_mcp_execute_rejects_second_claim_while_first_is_in_flight(self) -> None:
+        base = _load_grabowski_mcp()
+        challenge = "c" * 64
+        arguments = {"request": {"action": "pickup_next"}}
+        base._retain_pending_transport_target(
+            challenge,
+            tool_name="grabowski_bureau_pickup_execute",
+            target_arguments=arguments,
+            arguments_sha256=roundtrip.canonical_arguments_sha256(arguments),
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
+        )
+        base._claim_pending_transport_target(
+            challenge, client_scope=SHARED_SCOPE, runtime_binding=BINDING
+        )
+        try:
+            with (
+                mock.patch.object(base, "_require_capability"),
+                mock.patch.object(
+                    base, "_transport_roundtrip_client_scope", return_value=SHARED_SCOPE
+                ),
+                mock.patch.object(
+                    base, "_transport_roundtrip_runtime_binding", return_value=BINDING
+                ),
+                mock.patch.object(base, "_grip_run_core") as core,
+            ):
+                result = asyncio.run(
+                    base._grip_run_mcp(
+                        "transport-roundtrip",
+                        {
+                            "action": "execute",
+                            "challenge_receipt_sha256": challenge,
+                        },
+                        allow_mutation=False,
+                    )
+                )
+            self.assertEqual(result["status"], "blocked")
+            self.assertIn("in flight", result["output"]["error"])
+            core.assert_not_called()
+        finally:
+            base._discard_pending_transport_target(challenge)
+
+    def test_retained_target_pool_has_aggregate_memory_bound(self) -> None:
+        base = _load_grabowski_mcp()
+        first = {"payload": "a" * 64}
+        second = {"payload": "b" * 64}
+        first_bytes = len(
+            json.dumps(first, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        )
+        with mock.patch.object(
+            base, "_RETAINED_TRANSPORT_TARGET_TOTAL_MAX_BYTES", first_bytes + 1
+        ):
+            base._retain_pending_transport_target(
+                "1" * 64,
+                tool_name="write",
+                target_arguments=first,
+                arguments_sha256=roundtrip.canonical_arguments_sha256(first),
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+            )
+            with self.assertRaisesRegex(RuntimeError, "memory bound is full"):
+                base._retain_pending_transport_target(
+                    "2" * 64,
+                    tool_name="write",
+                    target_arguments=second,
+                    arguments_sha256=roundtrip.canonical_arguments_sha256(second),
+                    client_scope=SHARED_SCOPE,
+                    runtime_binding=BINDING,
+                )
+
     def test_mcp_handshake_exemption_does_not_leak_to_other_grips(self) -> None:
         base = _load_grabowski_mcp()
         observed: list[bool] = []
@@ -354,26 +560,48 @@ class CentralTransportGateTests(unittest.TestCase):
     def test_shared_unlabeled_call_directs_atomic_execute_not_ack(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace()
-        with mock.patch.object(
-            operator.grabowski_transport_roundtrip,
-            "consume_verified",
-            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
-        ) as consume_verified:
+        challenge = "a" * 64
+        with (
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "consume_verified",
+                side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+            ) as consume_verified,
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "begin",
+                return_value={
+                    "state": "challenge_pending",
+                    "challenge_receipt_sha256": challenge,
+                },
+            ),
+            mock.patch.object(
+                operator.base, "_retain_pending_transport_target"
+            ) as retain_target,
+        ):
             with self.assertRaisesRegex(RuntimeError, "action=execute") as raised:
                 asyncio.run(operator.mcp._tool_manager.call_tool("write", {}, context))
         message = str(raised.exception)
-        self.assertIn("target_tool_name=write", message)
-        self.assertIn("exact unchanged target_arguments", message)
-        self.assertIn("original target call", message)
-        self.assertIn("preserve omitted optional fields exactly", message)
-        self.assertIn("do not materialize default-valued fields", message)
-        self.assertIn("do not retry the target separately", message)
+        self.assertIn(f"challenge_receipt_sha256={challenge}", message)
+        self.assertIn("exact target is retained server-side", message)
+        self.assertIn("do not include target_tool_name or target_arguments", message)
+        self.assertIn("do not retry the original target separately", message)
+        self.assertNotIn("target_tool_name=write", message)
         self.assertNotIn("action=ack", message)
+        digest = roundtrip.canonical_arguments_sha256({})
         consume_verified.assert_called_once_with(
             client_scope=SHARED_SCOPE,
             runtime_binding=BINDING,
             tool_name="write",
-            arguments_sha256=roundtrip.canonical_arguments_sha256({}),
+            arguments_sha256=digest,
+        )
+        retain_target.assert_called_once_with(
+            challenge,
+            tool_name="write",
+            target_arguments={},
+            arguments_sha256=digest,
+            client_scope=SHARED_SCOPE,
+            runtime_binding=BINDING,
         )
         self.assertEqual(operator._deployment_admission_active_tool_calls(), 0)
 
@@ -842,17 +1070,21 @@ class CentralTransportGateTests(unittest.TestCase):
             "profile": "operator",
             "allow_mutation": True,
         }
-        with mock.patch.object(
-            operator.grabowski_transport_roundtrip,
-            "consume_verified",
-            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
-        ) as consume_verified, mock.patch.object(
-            operator.grabowski_transport_roundtrip,
-            "begin",
-            return_value={
-                "state": "challenge_pending",
-                "challenge_receipt_sha256": "a" * 64,
-            },
+        with (
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "consume_verified",
+                side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+            ) as consume_verified,
+            mock.patch.object(
+                operator.grabowski_transport_roundtrip,
+                "begin",
+                return_value={
+                    "state": "challenge_pending",
+                    "challenge_receipt_sha256": "a" * 64,
+                },
+            ),
+            mock.patch.object(operator.base, "_retain_pending_transport_target"),
         ):
             with self.assertRaisesRegex(RuntimeError, "action=execute"):
                 asyncio.run(
