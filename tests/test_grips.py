@@ -930,6 +930,7 @@ class GripFoundationTests(unittest.TestCase):
                 "task-closeout-archive",
                 "scout",
                 "situation",
+                "work-acquire",
                 "worktree-ensure",
                 "worktree-hygiene-reconcile",
                 "worktree-orient",
@@ -953,6 +954,45 @@ class GripFoundationTests(unittest.TestCase):
         ):
             self.assertIn(field, specs["repo-orient"])
         self.assertEqual("operator", specs["repo-orient"]["profile"])
+
+    def test_work_acquire_grip_exposes_existing_lane_contract(self) -> None:
+        parameters = {
+            "source_kind": "direct",
+            "source_id": "user-mandate:test",
+            "controller_actor": "operator:chatgpt:test",
+            "repo": "/tmp/repo",
+            "base_head": "a" * 40,
+            "branch": "test/work-acquire",
+            "target_path": "/tmp/worktree",
+            "purpose": "test work acquire grip",
+            "retention_until_unix": 1_900_000_000,
+            "idempotency_key": "work-acquire-grip-test",
+        }
+        lane = {
+            "state": "ready",
+            "decision": "EXECUTE",
+            "inputs": {
+                "source": {"kind": "direct", "id": "user-mandate:test"},
+                "controller": {"actor": "operator:chatgpt:test", "role": "controller"},
+            },
+            "lease_receipt": {"leases": [{"resource_key": "path:/tmp/worktree"}]},
+            "worktree_receipt": {"result_state": "ALREADY_CORRECT"},
+            "authority": {"controller_only_effects": ["merge", "deployment", "closeout"]},
+            "durable_receipt_path": "/tmp/work-acquire-lane.json",
+        }
+
+        with patch.object(
+            grips.grabowski_work_acquire,
+            "grabowski_work_acquire",
+            return_value=lane,
+        ) as acquire:
+            result = grips.grip_run("work-acquire", parameters, allow_mutation=True)
+
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("EXECUTE", result["output"]["decision"])
+        self.assertEqual("passed", result["output"]["receipt_status"])
+        acquire.assert_called_once_with(**parameters)
+
 
     def test_reposkop_review_grip_runs_evidence_bound_surface(self) -> None:
         parameters = {

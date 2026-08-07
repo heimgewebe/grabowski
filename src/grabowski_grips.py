@@ -20,6 +20,7 @@ import grabowski_convergence
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
 import grabowski_operator_obligation
+import grabowski_work_acquire
 import grabowski_worktree_ensure
 import grabowski_merge_guard
 
@@ -98,6 +99,32 @@ GRIP_SPECS: dict[str, GripSpec] = {
         required_parameters=("repo",),
         acceptance_ids=("worktree-orient-grip", "dirty-and-stale-visible", "next-safe-grip", "focused-tests"),
         runner="worktree_orient",
+    ),
+    "work-acquire": GripSpec(
+        name="work-acquire",
+        version="1.0",
+        summary="Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree.",
+        effect=MUTATING,
+        required_parameters=(
+            "source_kind",
+            "source_id",
+            "controller_actor",
+            "repo",
+            "base_head",
+            "branch",
+            "target_path",
+            "purpose",
+            "retention_until_unix",
+            "idempotency_key",
+        ),
+        acceptance_ids=(
+            "source-and-controller-bound",
+            "lease-and-worktree-bound",
+            "decision-explicit",
+            "single-writer-authority-visible",
+            "durable-lane-receipt",
+        ),
+        runner="work_acquire",
     ),
     "worktree-ensure": GripSpec(
         name="worktree-ensure",
@@ -550,6 +577,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
     {
         "repo-orient",
         "worktree-orient",
+        "work-acquire",
         "worktree-ensure",
         "worktree-hygiene-reconcile",
         "situation",
@@ -588,6 +616,7 @@ GRIP_SURFACE_MUTATING_PROFILES = {"operator", "captain"}
 GRIP_SURFACE_TARGETS = {
     "repo-orient": "repository checkout",
     "worktree-orient": "repository worktree inventory",
+    "work-acquire": "one controller-owned work lane and exact isolated worktree",
     "worktree-ensure": "one exact repository worktree",
     "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
     "situation": "repository and PR situation snapshot",
@@ -672,6 +701,7 @@ MECHANIC_NORMAL_GRIPS = frozenset(
     {
         "repo-orient",
         "worktree-orient",
+        "work-acquire",
         "worktree-ensure",
         "situation",
         "scout",
@@ -3720,6 +3750,33 @@ def _short_branch_name(parameters: dict[str, Any], name: str) -> str:
         raise GripPreflightError(f"{name} parameter must be a safe short branch name")
     return branch
 
+
+
+def _run_work_acquire(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    try:
+        output = grabowski_work_acquire.grabowski_work_acquire(**parameters)
+    except (TypeError, ValueError) as exc:
+        _check(receipt, "work_acquire_preflight", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except (OSError, RuntimeError) as exc:
+        _check(receipt, "work_acquire_action", "fail", str(exc))
+        raise GripActionError(str(exc)) from exc
+
+    state = str(output.get("state") or "unknown")
+    decision = str(output.get("decision") or "unknown")
+    ready = state == "ready" and decision in {"EXECUTE", "AUTO_PREPARE_AND_EXECUTE"}
+    _check(receipt, "source_and_controller_bound", "pass" if isinstance(output.get("inputs"), dict) else "fail", state)
+    _check(receipt, "lease_and_worktree_bound", "pass" if ready and output.get("lease_receipt") and output.get("worktree_receipt") else ("skip" if not ready else "fail"), state)
+    _check(receipt, "decision_explicit", "pass" if decision != "unknown" else "fail", decision)
+    _check(receipt, "single_writer_authority_visible", "pass" if ready and isinstance(output.get("authority"), dict) else ("skip" if not ready else "fail"), state)
+    _check(receipt, "durable_lane_receipt", "pass" if output.get("durable_receipt_path") else "fail", str(output.get("durable_receipt_path") or "missing"))
+    return {**output, "receipt_status": "passed" if ready else "blocked"}
 
 
 def _run_worktree_ensure(
@@ -8690,6 +8747,7 @@ _RUNNERS = {
     "repo_orient": _run_repo_orient,
     "pr_check_readiness": _run_pr_check_readiness,
     "worktree_orient": _run_worktree_orient,
+    "work_acquire": _run_work_acquire,
     "worktree_ensure": _run_worktree_ensure,
     "worktree_hygiene_reconcile": _run_worktree_hygiene_reconcile,
     "post_merge_sync": _run_post_merge_sync,
