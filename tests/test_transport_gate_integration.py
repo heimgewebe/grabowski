@@ -749,6 +749,65 @@ class CentralTransportGateTests(unittest.TestCase):
         self.assertTrue(first_result["called"])
         self.assertTrue(second_result["called"])
 
+    def test_registered_read_only_grip_skips_mutation_roundtrip(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace(client_id=None)
+        arguments = {
+            "name": "situation",
+            "parameters": {"repo": "/tmp/example"},
+            "profile": "operator",
+            "allow_mutation": False,
+        }
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=AssertionError("read-only grip reached mutation gate"),
+        ) as consume_verified:
+            result = asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grip_run", arguments, context
+                )
+            )
+        self.assertTrue(result["called"])
+        consume_verified.assert_not_called()
+
+    def test_registered_mutating_grip_still_requires_exact_roundtrip(self) -> None:
+        operator = self.configured_operator()
+        context = types.SimpleNamespace(client_id=None)
+        arguments = {
+            "name": "worktree-ensure",
+            "parameters": {},
+            "profile": "operator",
+            "allow_mutation": True,
+        }
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+        ) as consume_verified, mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "begin",
+            return_value={
+                "state": "challenge_pending",
+                "challenge_receipt_sha256": "a" * 64,
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "action=execute"):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grip_run", arguments, context
+                    )
+                )
+        consume_verified.assert_called_once()
+
+    def test_unknown_grip_is_not_exempt_from_mutation_roundtrip(self) -> None:
+        operator = self.configured_operator()
+        self.assertFalse(
+            operator._transport_roundtrip_exempt_call(
+                "grip_run", {"name": "not-a-registered-grip"}
+            )
+        )
+
     def test_handshake_grip_is_narrowly_exempt(self) -> None:
         operator = self.configured_operator()
         context = types.SimpleNamespace(client_id="mcp-client-1")

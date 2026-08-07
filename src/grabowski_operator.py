@@ -42,6 +42,7 @@ import grabowski_job_origin as job_origin
 import grabowski_deployment_observer as deployment_observer
 import grabowski_private_io as private_io
 import grabowski_effect_interceptor
+import grabowski_grips
 import grabowski_transport_roundtrip
 import grabowski_serving_process
 
@@ -440,11 +441,19 @@ def _tool_read_only_hint(tool: Any) -> bool | None:
 def _transport_roundtrip_exempt_call(
     tool_name: Any, arguments: Any
 ) -> bool:
-    return bool(
-        tool_name == "grip_run"
-        and isinstance(arguments, dict)
-        and arguments.get("name") == "transport-roundtrip"
-    )
+    if tool_name != "grip_run" or not isinstance(arguments, dict):
+        return False
+    grip_name = arguments.get("name")
+    if grip_name == "transport-roundtrip":
+        # The handshake grip must remain exempt to avoid recursive gating.
+        return True
+    if not isinstance(grip_name, str):
+        return False
+    spec = grabowski_grips.GRIP_SPECS.get(grip_name)
+    # grip_run is a multiplexed MCP surface. Its outer annotation is mutating,
+    # but the registered grip effect is the authoritative inner contract.
+    # Unknown grips stay fail-closed and continue through the mutation gate.
+    return spec is not None and spec.effect == grabowski_grips.READ_ONLY
 
 
 def _require_current_serving_process() -> None:
