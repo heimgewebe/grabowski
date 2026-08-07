@@ -1315,6 +1315,57 @@
         "tool": "ipad_file_stat"
       }
     },
+    "ipad_native_permission_status": {
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded native iPad authorization metadata and no private user content.",
+        "evidence": "Fixed capability set, exact agent/session binding, device-job receipts, host semantic validation, strict top-level and nested schemas, and tests that reject capability or result drift."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because callers could access broader native APIs and could not enforce the fixed permission-only result schema.",
+      "rationale": "Native permission state is a distinct device boundary from document-provider storage and must be inspectable without granting a generic native-call primitive.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "device-worker",
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "not-applicable-device-job-and-receipt-retained",
+        "risk_class": "medium",
+        "tool": "ipad_native_permission_status"
+      }
+    },
+    "ipad_native_permission_request": {
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool can request only one of five fixed native iPad permissions and returns only post-request authorization metadata.",
+        "evidence": "Strict capability allowlist, foreground gate, already-determined no-op path, bounded wait, late-callback retention, post-request readback, exact agent/session binding and tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it cannot constrain permission choice, foreground admission, callback lifetime, post-readback semantics or future native API expansion.",
+      "rationale": "iPadOS permission prompts are user-visible effects with a materially narrower authority boundary than arbitrary device code; a dedicated tool prevents implicit expansion to always-location, tracking or private-content APIs.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "device-worker",
+        "effects": [
+          "device-job-execute",
+          "device-permission-request",
+          "receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "manual-permission-change-in-ipados-settings",
+        "risk_class": "high",
+        "tool": "ipad_native_permission_request"
+      }
+    },
     "ipad_permission_probe": {
       "evidence_refs": [
         "docs:juno-ipad-storage.md",

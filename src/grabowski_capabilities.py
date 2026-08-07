@@ -496,6 +496,20 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["device-job-execute", "device-state-change", "receipt-create"],
         "reversibility": "job-dependent-with-local-stop-switch",
     },
+    "ipad_native_permission_status": {
+        "category": "device-worker",
+        "purpose": "Read bounded native iPad permission states without reading private content.",
+        "risk_class": "medium",
+        "effects": ["device-job-execute", "receipt-create"],
+        "reversibility": "not-applicable-device-job-and-receipt-retained",
+    },
+    "ipad_native_permission_request": {
+        "category": "device-worker",
+        "purpose": "Request one allowlisted native iPad permission with foreground and post-readback gates.",
+        "risk_class": "high",
+        "effects": ["device-job-execute", "device-permission-request", "receipt-create"],
+        "reversibility": "manual-permission-change-in-ipados-settings",
+    },
     "ipad_capability_manifest": {
         "category": "device-storage",
         "purpose": "Return the bounded iPad/Juno storage capability manifest without exposing bookmark bytes.",
