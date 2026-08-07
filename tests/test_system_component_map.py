@@ -28,7 +28,12 @@ SOURCE_REGISTRY = {
 def _component_map(**overrides: object) -> dict[str, object]:
     arguments = {
         "runtime_healthy": True,
-        "client_snapshot": {"observable": True, "matched": True, "fresh": True},
+        "client_snapshot": {
+            "observable": True,
+            "matched": True,
+            "fresh": True,
+            "platform_connector_snapshot_observable": True,
+        },
         "coding_agent_catalog": {
             "ready": True,
             "model_count": 23,
@@ -77,6 +82,26 @@ def test_component_map_is_projection_only_and_target_bound() -> None:
         "target_required": 5,
         "green": 6,
     }
+
+
+def test_server_loopback_snapshot_does_not_make_platform_connector_green() -> None:
+    result = _component_map(
+        client_snapshot={
+            "observable": True,
+            "matched": True,
+            "fresh": True,
+            "platform_connector_snapshot_observable": False,
+            "server_loopback_observable": True,
+        }
+    )
+
+    components = {item["id"]: item for item in result["components"]}
+    connector = components["connector"]
+    assert connector["signal"] == "unknown"
+    assert connector["observed"] is False
+    assert connector["evidence"]["platform_connector_snapshot_observable"] is False
+    assert connector["evidence"]["server_loopback_observable"] is True
+    assert result["overall_signal"] == "unknown"
 
 
 def test_attention_is_amber_without_becoming_health_failure() -> None:
