@@ -2254,7 +2254,7 @@ class BureauPickupTests(unittest.TestCase):
                 pickup.grabowski_bureau_pickup_release(intent["run_id"])
         release.assert_not_called()
 
-    def test_release_rejects_renewed_lease_with_same_metadata(self) -> None:
+    def test_release_allows_renewed_lease_with_same_metadata(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
         lease = self.lease(key, intent["lease_owner_id"])
@@ -2269,15 +2269,45 @@ class BureauPickupTests(unittest.TestCase):
                 return_value=self.terminal_status(intent),
             ),
             mock.patch.object(
-                pickup.resources, "inspect_resource", return_value=renewed
+                pickup.resources, "inspect_resource", side_effect=[renewed, None]
             ),
-            mock.patch.object(pickup.resources, "release_resources") as release,
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [renewed]},
+            ) as release,
         ):
-            with self.assertRaisesRegex(
-                pickup.BureauPickupError, "lease-release-metadata-drift"
-            ):
-                pickup.grabowski_bureau_pickup_release(intent["run_id"])
-        release.assert_not_called()
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("released", result["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
+    def test_release_allows_reacquired_lease_with_same_lineage(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        reacquired = dict(lease)
+        reacquired["acquired_at_unix"] = lease["expires_at_unix"] + 1
+        reacquired["updated_at_unix"] = reacquired["acquired_at_unix"]
+        reacquired["expires_at_unix"] = reacquired["acquired_at_unix"] + 300
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[reacquired, None]
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [reacquired]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("released", result["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
 
     def test_release_rejects_unknown_run_state(self) -> None:
         intent = self.intent()

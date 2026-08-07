@@ -2101,6 +2101,16 @@ def _owner_lease_matches_snapshot(
             return False
     return True
 
+
+def _owner_lease_matches_terminal_lineage(
+    expected: dict[str, Any], observed: dict[str, Any]
+) -> bool:
+    """Bind terminal release to owner lineage while allowing valid renewal/reacquire."""
+    return all(
+        expected.get(field) == observed.get(field)
+        for field in ("resource_key", "owner_id", "metadata_sha256")
+    )
+
 def _journal_run_ids() -> list[str]:
     root = _absolute_path(STATE_ROOT)
     parent_descriptor = _open_existing_directory_chain(
@@ -3243,7 +3253,7 @@ def _verify_release_binding(
             raise BureauPickupError(
                 "lease-release-foreign-owner", details={"resource_key": key}
             )
-        if not _owner_lease_matches_snapshot(expected, observed):
+        if not _owner_lease_matches_terminal_lineage(expected, observed):
             raise BureauPickupError(
                 "lease-release-metadata-drift", details={"resource_key": key}
             )
