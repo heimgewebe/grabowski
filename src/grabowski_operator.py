@@ -547,14 +547,32 @@ def _require_transport_roundtrip_for_tool(
                 "transport handshake did not yield an exact pending challenge"
             ) from exc
         if client_scope.get("kind") == "shared_unlabeled":
+            target_arguments = arguments if arguments is not None else {}
+            try:
+                base._retain_pending_transport_target(
+                    challenge,
+                    tool_name=tool_name_text,
+                    target_arguments=target_arguments,
+                    arguments_sha256=arguments_sha256,
+                    client_scope=client_scope,
+                    runtime_binding=runtime_binding,
+                )
+            except (RuntimeError, TypeError, ValueError) as retain_exc:
+                raise RuntimeError(
+                    "fresh intent-bound transport verification required; server-side "
+                    "target retention failed, so use the compatibility path: call "
+                    "grip_run for transport-roundtrip with action=execute, "
+                    f"challenge_receipt_sha256={challenge}, "
+                    f"target_tool_name={tool_name_text}, and the exact unchanged "
+                    "target_arguments JSON object from the original target call; do not "
+                    f"retry the target separately; retention_error={type(retain_exc).__name__}"
+                ) from retain_exc
             raise RuntimeError(
                 "fresh intent-bound transport verification required; call grip_run "
-                "for transport-roundtrip with action=execute, "
-                f"challenge_receipt_sha256={challenge}, "
-                f"target_tool_name={tool_name_text}, and the exact unchanged "
-                "target_arguments JSON object from the original target call; preserve "
-                "omitted optional fields exactly and do not materialize default-valued "
-                "fields; do not retry the target separately"
+                "for transport-roundtrip with action=execute and "
+                f"challenge_receipt_sha256={challenge}; the exact target is retained "
+                "server-side for this challenge, so do not include target_tool_name or "
+                "target_arguments and do not retry the original target separately"
             ) from exc
         raise RuntimeError(
             "fresh intent-bound transport verification required; call grip_run "

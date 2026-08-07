@@ -148,6 +148,14 @@ def _load_operator_module():
 
     fake_base._read_bound_regular_bytes = read_bound_regular_bytes
     fake_base._append_audit = lambda record: None
+    fake_base._retain_pending_transport_target = (
+        lambda challenge_receipt_sha256, **kwargs: {
+            "challenge_receipt_sha256": challenge_receipt_sha256,
+            "target_tool_name": kwargs.get("tool_name"),
+            "target_arguments_sha256": kwargs.get("arguments_sha256"),
+            "replayed": False,
+        }
+    )
 
     module_name = "grabowski_operator_contract_test"
     spec = importlib.util.spec_from_file_location(

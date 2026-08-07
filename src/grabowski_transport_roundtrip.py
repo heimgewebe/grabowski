@@ -1560,6 +1560,94 @@ def revoke_execution_reservation(
         return True
 
 
+def cancel_pending_execution_challenge(
+    *,
+    client_scope: dict[str, Any],
+    challenge_receipt_sha256: str,
+    runtime_binding: dict[str, Any],
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    """Atomically cancel only a still-unreserved challenge for safe retry."""
+
+    scope = validate_client_scope(client_scope)
+    challenge_hash = _validate_sha256(
+        challenge_receipt_sha256, label="challenge_receipt_sha256"
+    )
+    binding = validate_runtime_binding(runtime_binding)
+    capability_sha256 = _execution_capability_sha256(challenge_hash)
+    timestamp = _timestamp(now_unix)
+    with _state_lock():
+        loaded = _load_state(scope)
+        verification = _verification_for_challenge(
+            loaded["verified_receipts"], challenge_hash
+        )
+        if verification is not None:
+            return {
+                "state": "reserved",
+                "cancelled": False,
+                "effect_possible": True,
+                "challenge_receipt_sha256": challenge_hash,
+                "recommended_next_action": (
+                    "perform target-specific readback before any retry"
+                ),
+            }
+        consumption = loaded.get("last_consumption_receipt")
+        if (
+            isinstance(consumption, dict)
+            and _receipt_execution_capability_sha256(consumption)
+            == capability_sha256
+        ):
+            return {
+                "state": "consumed",
+                "cancelled": False,
+                "effect_possible": True,
+                "challenge_receipt_sha256": challenge_hash,
+                "recommended_next_action": (
+                    "perform target-specific readback before any retry"
+                ),
+            }
+        pending = _receipt_for_hash(loaded["pending_challenges"], challenge_hash)
+        if pending is None:
+            return {
+                "state": "unknown",
+                "cancelled": False,
+                "effect_possible": True,
+                "challenge_receipt_sha256": challenge_hash,
+                "recommended_next_action": (
+                    "perform target-specific readback before any retry"
+                ),
+            }
+        if pending.get("runtime_binding") != binding:
+            return {
+                "state": "runtime_mismatch",
+                "cancelled": False,
+                "effect_possible": True,
+                "challenge_receipt_sha256": challenge_hash,
+                "recommended_next_action": (
+                    "perform target-specific readback before any retry"
+                ),
+            }
+        remaining_pending = [
+            item
+            for item in loaded["pending_challenges"]
+            if item.get("receipt_sha256") != challenge_hash
+        ]
+        state = {**loaded, "pending_challenges": remaining_pending}
+        _write_private_json(_state_path(_sha256_json(scope)), state)
+        return {
+            "state": "cancelled_pending",
+            "cancelled": True,
+            "effect_possible": False,
+            "challenge_receipt_sha256": challenge_hash,
+            "challenge_was_current": _receipt_is_current(
+                pending, runtime_binding=binding, now_unix=timestamp
+            ),
+            "recommended_next_action": (
+                "retry the original target call to obtain a new challenge"
+            ),
+        }
+
+
 def status(
     *,
     client_scope: dict[str, Any],
