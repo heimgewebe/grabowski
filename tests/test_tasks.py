@@ -180,6 +180,21 @@ class TaskTests(unittest.TestCase):
             "usage_receipt_sha256": "9" * 64,
             "usage_key_sha256": "a" * 64,
             "audit_ref": "audit-record-sha256:" + "b" * 64,
+            "finding_summary": {
+                "finding_taxonomy_status": "available_v2",
+                "finding_taxonomy_version": 2,
+                "finding_count": 1,
+                "finding_counts": {
+                    "critical": 0,
+                    "error": 0,
+                    "warning": 0,
+                    "information": 1,
+                },
+                "finding_categories": {"lifecycle_evidence": 1},
+                "finding_reason_codes": ["lifecycle_evidence_missing"],
+                "projection_state": "inconclusive",
+                "advisory_posture": "informational",
+            },
             "effect_authorized": False,
             "execution_binding_sha256": "c" * 64,
         }
@@ -3038,6 +3053,14 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(claimed, tasks._sha256_json(material))
         self.assertEqual(result["status"], "verified")
         self.assertIs(result["effect_authorized"], False)
+        self.assertEqual(
+            result["finding_summary"]["finding_taxonomy_status"],
+            "available_v2",
+        )
+        self.assertIn(
+            "git_observation_missing",
+            result["finding_summary"]["finding_reason_codes"],
+        )
         with self.assertRaisesRegex(
             ValueError, "workspace-covering lease resources"
         ):
