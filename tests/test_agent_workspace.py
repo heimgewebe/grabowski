@@ -5492,6 +5492,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
             plan = report["plans"][0]
             self.assertTrue(plan["eligible"])
+            self.assertTrue(plan["archive_eligible"])
+            self.assertFalse(plan["physical_cleanup_eligible"])
+            self.assertEqual(plan["lifecycle_state"], "archive_eligible")
             archived = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
                 plan["plan_sha256"],
@@ -5500,22 +5503,89 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(archived["state"], "archived_waiting_for_cleanup")
             self.assertTrue(archived["requires_fresh_cleanup_plan"])
             self.assertTrue(self.git.writer.exists())
+            with mock.patch.object(
+                workspace.checkouts,
+                "_load_archive",
+                side_effect=ValueError("simulated missing archive"),
+            ):
+                invalid_plan = workspace.grabowski_agent_workspace_cleanup_plan(
+                    [manifest["workspace_id"]]
+                )["plans"][0]
+            self.assertFalse(invalid_plan["eligible"])
+            self.assertEqual(
+                invalid_plan["lifecycle_state"], "archive_state_unverified"
+            )
+            self.assertIn(
+                "cleanup_archive_state_unverified",
+                {item["code"] for item in invalid_plan["blockers"]},
+            )
             waiting_plan = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
+            self.assertFalse(waiting_plan["eligible"])
+            self.assertFalse(waiting_plan["archive_eligible"])
+            self.assertFalse(waiting_plan["physical_cleanup_eligible"])
+            self.assertEqual(
+                waiting_plan["lifecycle_state"], "archived_waiting_for_cleanup"
+            )
+            self.assertNotEqual(waiting_plan["plan_sha256"], plan["plan_sha256"])
+            self.assertIn(
+                "archive_retention_active",
+                {item["code"] for item in waiting_plan["blockers"]},
+            )
             waiting = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
-                waiting_plan["plan_sha256"],
+                plan["plan_sha256"],
                 "archive-and-remove-worktree",
             )
             self.assertEqual(waiting["state"], "archived_waiting_for_cleanup")
             self.assertTrue(waiting["idempotent"])
+            waiting_updated_at = workspace._manifest(
+                manifest["workspace_id"]
+            )["workspace_cleanup_intent"]["updated_at"]
+            waiting_replay = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            self.assertEqual(
+                waiting_replay["state"], "archived_waiting_for_cleanup"
+            )
+            self.assertEqual(
+                workspace._manifest(manifest["workspace_id"])[
+                    "workspace_cleanup_intent"
+                ]["updated_at"],
+                waiting_updated_at,
+            )
+            blocked = workspace.grabowski_agent_workspace_cleanup(
+                manifest["workspace_id"],
+                waiting_plan["plan_sha256"],
+                "archive-and-remove-worktree",
+            )
+            self.assertEqual(blocked["state"], "cleanup_blocked")
             self.assertTrue(self.git.writer.exists())
             self._mature_checkout_archive(str(archived["archive_id"]))
             refreshed = workspace.grabowski_agent_workspace_cleanup_plan(
                 [manifest["workspace_id"]]
             )["plans"][0]
             self.assertTrue(refreshed["eligible"])
+            self.assertFalse(refreshed["archive_eligible"])
+            self.assertTrue(refreshed["physical_cleanup_eligible"])
+            self.assertEqual(
+                refreshed["lifecycle_state"], "archived_ready_for_cleanup"
+            )
+            self.assertNotEqual(refreshed["plan_sha256"], plan["plan_sha256"])
+            self.assertNotEqual(
+                refreshed["plan_sha256"], waiting_plan["plan_sha256"]
+            )
+            with self.assertRaisesRegex(
+                workspace.AgentWorkspaceError, "plan is stale"
+            ):
+                workspace.grabowski_agent_workspace_cleanup(
+                    manifest["workspace_id"],
+                    plan["plan_sha256"],
+                    "archive-and-remove-worktree",
+                )
             result = workspace.grabowski_agent_workspace_cleanup(
                 manifest["workspace_id"],
                 refreshed["plan_sha256"],
