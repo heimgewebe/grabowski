@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
+import grabowski_convergence as convergence
 import grabowski_nonconflict as nonconflict
 
 SCHEMA_VERSION = 1
@@ -17,6 +18,7 @@ MAX_RECONCILIATIONS = 100
 InventoryLoader = Callable[[str], dict[str, Any]]
 ReconciliationLoader = Callable[[str], dict[str, Any]]
 ReposkopContextLoader = Callable[[str, str], dict[str, Any]]
+ConvergencePlanner = Callable[[dict[str, Any] | None], dict[str, Any]]
 
 CONVERGENCE_STATES = frozenset(
     {
@@ -74,6 +76,51 @@ def _canonical_json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def plan_system_convergence(
+    context: dict[str, Any] | None,
+    *,
+    planner: ConvergencePlanner | None = None,
+) -> dict[str, Any]:
+    try:
+        return (planner or convergence.build_system_convergence_plan)(context)
+    except convergence.ConvergenceExecutionError as exc:
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski.system_convergence_plan",
+            "status": "unavailable",
+            "change_risk": (context or {}).get("change_risk") if isinstance(context, dict) else None,
+            "target_criticality": (context or {}).get("target_criticality") if isinstance(context, dict) else None,
+            "protocol_head": (context or {}).get("expected_protocol_head") if isinstance(context, dict) else None,
+            "profile_id": None,
+            "profile_cell_id": None,
+            "profile_sha256": None,
+            "protocol_source": None,
+            "required_effects": [],
+            "required_verifications": [],
+            "required_closure_fields": [],
+            "requires_resilience_evidence": None,
+            "requires_independent_recovery": None,
+            "systemic_closure_gate": "unavailable",
+            "hard_gate_required": None,
+            "criticality_resolution_required": bool(
+                isinstance(context, dict)
+                and context.get("change_risk") in {"R2", "R3"}
+                and context.get("target_criticality") == "unknown"
+            ),
+            "admission_blocking": False,
+            "planning_error": f"{type(exc).__name__}: {exc}"[:2048],
+            "next_action": "restore the pinned convergence bundle before claiming systemic convergence",
+            "does_not_establish": [
+                "task state",
+                "execution authority",
+                "merge authorization",
+                "deployment truth",
+                "systemic convergence",
+            ],
+        }
+        return {**material, "plan_sha256": _digest(material)}
 
 
 def _default_inventory(repo: str) -> dict[str, Any]:
@@ -698,12 +745,17 @@ def assess_repository_admission(
     source_id: str | None = None,
     inventory_loader: InventoryLoader | None = None,
     reconciliation_loader: ReconciliationLoader | None = None,
+    system_convergence: dict[str, Any] | None = None,
+    convergence_planner: ConvergencePlanner | None = None,
 ) -> dict[str, Any]:
     repository = str(Path(repo).expanduser().resolve(strict=True))
     if not isinstance(owner_id, str) or not owner_id:
         raise ValueError("owner_id must be a non-empty string")
     if not isinstance(operation, str) or not operation:
         raise ValueError("operation must be a non-empty string")
+    system_convergence_plan = plan_system_convergence(
+        system_convergence, planner=convergence_planner
+    )
     exact_checkout_scope = _exact_checkout_scope(
         repository=repository,
         operation=operation,
@@ -978,6 +1030,7 @@ def assess_repository_admission(
         "target_path": target_path,
         "branch": branch,
         "source": {"kind": source_kind, "id": source_id},
+        "system_convergence_plan": system_convergence_plan,
         "decision": decision,
         "blocker_codes": blocker_codes,
         "blockers": blockers,
@@ -1001,6 +1054,7 @@ def assess_repository_admission(
             "permission to override foreign ownership",
             "global one-lane serialization for exact disjoint resource keys",
             "absence of later semantic or merge conflicts between isolated branches",
+            "systemic convergence completion",
         ],
     }
     return {**material, "assessment_sha256": _digest(material)}
