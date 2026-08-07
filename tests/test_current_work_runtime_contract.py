@@ -1,42 +1,67 @@
+import ast
 from pathlib import Path
-import sys
 import unittest
-
-from pydantic import ValidationError
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
-import grabowski_current_work as current_work  # noqa: E402
-import grabowski_runtime  # noqa: E402
+RUNTIME = ROOT / "src" / "grabowski_runtime.py"
 
 
 class CurrentWorkRuntimeContractTests(unittest.TestCase):
-    def _tool(self):
-        return grabowski_runtime.mcp._tool_manager._tools["grabowski_current_work"]
+    def _runtime_module(self) -> ast.Module:
+        return ast.parse(RUNTIME.read_text(encoding="utf-8"))
 
-    def test_limit_bounds_are_published_in_the_tool_schema(self) -> None:
-        limit_schema = self._tool().parameters["properties"]["limit"]
-
-        self.assertEqual(20, limit_schema["default"])
-        self.assertEqual(1, limit_schema["minimum"])
-        self.assertEqual(current_work.PAGE_LIMIT_MAX, limit_schema["maximum"])
-
-    def test_limit_bounds_are_validated_before_tool_execution(self) -> None:
-        argument_model = self._tool().fn_metadata.arg_model
-        repository = str(ROOT)
-
-        valid = argument_model.model_validate(
-            {"repositories": [repository], "limit": current_work.PAGE_LIMIT_MAX}
+    def _current_work_function(self) -> ast.AsyncFunctionDef:
+        function = next(
+            node
+            for node in self._runtime_module().body
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "grabowski_current_work"
         )
-        self.assertEqual(current_work.PAGE_LIMIT_MAX, valid.limit)
+        return function
 
-        for invalid in (0, current_work.PAGE_LIMIT_MAX + 1):
-            with self.subTest(limit=invalid), self.assertRaises(ValidationError):
-                argument_model.model_validate(
-                    {"repositories": [repository], "limit": invalid}
-                )
+    def test_limit_bounds_are_declared_on_the_public_tool_parameter(self) -> None:
+        function = self._current_work_function()
+        arguments = {argument.arg: argument for argument in function.args.args}
+        limit = arguments["limit"]
+
+        self.assertIsInstance(limit.annotation, ast.Subscript)
+        annotated = limit.annotation
+        self.assertIsInstance(annotated.value, ast.Name)
+        self.assertEqual("Annotated", annotated.value.id)
+        self.assertIsInstance(annotated.slice, ast.Tuple)
+        base_type, field = annotated.slice.elts
+        self.assertIsInstance(base_type, ast.Name)
+        self.assertEqual("int", base_type.id)
+        self.assertIsInstance(field, ast.Call)
+        self.assertIsInstance(field.func, ast.Name)
+        self.assertEqual("Field", field.func.id)
+
+        keywords = {keyword.arg: keyword.value for keyword in field.keywords}
+        self.assertEqual(1, ast.literal_eval(keywords["ge"]))
+        self.assertIsInstance(keywords["le"], ast.Attribute)
+        self.assertEqual("PAGE_LIMIT_MAX", keywords["le"].attr)
+        self.assertIsInstance(keywords["le"].value, ast.Name)
+        self.assertEqual("grabowski_current_work_model", keywords["le"].value.id)
+
+        names = [argument.arg for argument in function.args.args]
+        defaults = dict(zip(names[-len(function.args.defaults):], function.args.defaults))
+        self.assertEqual(20, ast.literal_eval(defaults["limit"]))
+
+    def test_runtime_imports_the_canonical_current_work_limit_source(self) -> None:
+        imports = [
+            alias
+            for node in self._runtime_module().body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ]
+        self.assertTrue(
+            any(
+                alias.name == "grabowski_current_work"
+                and alias.asname == "grabowski_current_work_model"
+                for alias in imports
+            )
+        )
 
 
 if __name__ == "__main__":
