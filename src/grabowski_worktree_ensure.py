@@ -371,8 +371,11 @@ def _observe(inputs: dict[str, Any], runner: CommandRunner) -> dict[str, Any]:
     root_result = _command(runner, repo, ["rev-parse", "--show-toplevel"])
     if _returncode(root_result) != 0:
         raise WorktreeEnsurePreflight(f"repo is not a readable Git checkout: {_command_error(root_result)}")
+    root_output = _stdout(root_result).strip()
+    if not root_output:
+        raise WorktreeEnsurePreflight("Git root could not be resolved")
     try:
-        actual_root = Path(_stdout(root_result)).resolve(strict=True)
+        actual_root = Path(root_output).resolve(strict=True)
     except (FileNotFoundError, OSError) as exc:
         raise WorktreeEnsurePreflight("Git root could not be resolved") from exc
     if actual_root != repo:

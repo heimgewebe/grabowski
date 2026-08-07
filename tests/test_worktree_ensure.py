@@ -187,6 +187,23 @@ class WorktreeEnsureTests(unittest.TestCase):
             self._ensure(parameters)
         self.assertFalse(Path(str(parameters["target_path"])).exists())
 
+    def test_real_git_toplevel_output_with_trailing_newline_is_accepted(self) -> None:
+        parameters = self._parameters(
+            key="real-git-root-newline",
+            branch="feat/real-git-root-newline",
+            target=self.worktree_root / "real-git-root-newline",
+        )
+
+        def newline_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+            result = dict(grips._default_command_runner(repo, argv))
+            if argv == ["rev-parse", "--show-toplevel"] and result.get("returncode") == 0:
+                result["stdout"] = str(result.get("stdout", "")).rstrip("\n") + "\n"
+            return result
+
+        created = self._ensure(parameters, runner=newline_runner)
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertTrue(Path(str(parameters["target_path"])).is_dir())
+
     def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
         first = self._parameters(
             key="limit-first",
