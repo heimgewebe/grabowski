@@ -1145,12 +1145,89 @@ def _json_stdout(result: dict[str, Any]) -> Any:
         raise GripActionError("invalid JSON output from gh command") from exc
 
 
+def _upstream_orientation(
+    repo: Path,
+    runner: CommandRunner,
+    branch: str,
+) -> dict[str, Any]:
+    resolved = _git_optional(
+        repo,
+        runner,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    if _returncode(resolved) == 0:
+        name = str(resolved.get("stdout", "")).strip()
+        if name:
+            return {
+                "name": name,
+                "source": "resolved-ref",
+                "ref_materialized": True,
+                "remote": None,
+                "merge_ref": None,
+            }
+
+    if not branch or branch == "HEAD":
+        return {
+            "name": None,
+            "source": "none",
+            "ref_materialized": False,
+            "remote": None,
+            "merge_ref": None,
+        }
+
+    remote_result = _git_optional(
+        repo, runner, ["config", "--get", f"branch.{branch}.remote"]
+    )
+    merge_result = _git_optional(
+        repo, runner, ["config", "--get", f"branch.{branch}.merge"]
+    )
+    remote = (
+        str(remote_result.get("stdout", "")).strip()
+        if _returncode(remote_result) == 0
+        else ""
+    )
+    merge_ref = (
+        str(merge_result.get("stdout", "")).strip()
+        if _returncode(merge_result) == 0
+        else ""
+    )
+    remote_configured = False
+    if remote and remote != ".":
+        remote_urls = _git_optional(
+            repo, runner, ["config", "--get-all", f"remote.{remote}.url"]
+        )
+        remote_configured = bool(
+            _returncode(remote_urls) == 0
+            and str(remote_urls.get("stdout", "")).strip()
+        )
+    prefix = "refs/heads/"
+    if (
+        remote_configured
+        and merge_ref.startswith(prefix)
+        and len(merge_ref) > len(prefix)
+    ):
+        return {
+            "name": f"{remote}/{merge_ref.removeprefix(prefix)}",
+            "source": "branch-config",
+            "ref_materialized": False,
+            "remote": remote,
+            "merge_ref": merge_ref,
+        }
+    return {
+        "name": None,
+        "source": "none",
+        "ref_materialized": False,
+        "remote": remote or None,
+        "merge_ref": merge_ref or None,
+    }
+
+
 def _orient(repo: Path, runner: CommandRunner) -> dict[str, Any]:
     root = _git(repo, runner, ["rev-parse", "--show-toplevel"])["stdout"]
     branch = _git(repo, runner, ["rev-parse", "--abbrev-ref", "HEAD"])["stdout"]
     head = _git(repo, runner, ["rev-parse", "HEAD"])["stdout"]
     status = _git(repo, runner, ["status", "--short", "--branch"])["stdout"]
-    upstream = _git_optional(repo, runner, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    upstream = _upstream_orientation(repo, runner, str(branch).strip())
     lines = [line for line in status.splitlines() if line]
     body = [line for line in lines[1:] if line]
     return {
@@ -1161,7 +1238,11 @@ def _orient(repo: Path, runner: CommandRunner) -> dict[str, Any]:
         "dirty": bool(body),
         "status_header": lines[0] if lines else "",
         "status_entries": body,
-        "upstream": upstream.get("stdout") if upstream.get("returncode") == 0 else None,
+        "upstream": upstream["name"],
+        "upstream_source": upstream["source"],
+        "upstream_ref_materialized": upstream["ref_materialized"],
+        "upstream_remote": upstream["remote"],
+        "upstream_merge_ref": upstream["merge_ref"],
     }
 
 
