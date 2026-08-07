@@ -174,6 +174,8 @@ class FakeGh:
         diff_text: str = "captain-diff\n",
         codex_state: dict[str, object] | None = None,
         codex_state_sequence: list[dict[str, object]] | None = None,
+        required_checks: list[dict[str, object]] | None = None,
+        required_checks_returncode: int = 0,
     ):
         self.existing = existing
         self.failure = failure
@@ -213,6 +215,12 @@ class FakeGh:
         self.codex_state_sequence = [
             deepcopy(item) for item in (codex_state_sequence or [])
         ]
+        self.required_checks = deepcopy(
+            required_checks
+            if required_checks is not None
+            else [{"bucket": "pass", "name": "validate", "state": "SUCCESS"}]
+        )
+        self.required_checks_returncode = required_checks_returncode
         self.view_failure_after_merge = view_failure_after_merge
         self.post_merge_view = post_merge_view or {}
         self.post_merge_view_failures = post_merge_view_failures
@@ -393,6 +401,18 @@ class FakeGh:
             return {"returncode": 0, "stdout": "", "stderr": ""}
         if argv[:2] == ["pr", "diff"]:
             return {"returncode": 0, "stdout": self.diff_text, "stderr": ""}
+        if argv[:2] == ["pr", "checks"] and "--required" in argv:
+            if self.required_checks_returncode != 0:
+                return {
+                    "returncode": self.required_checks_returncode,
+                    "stdout": "",
+                    "stderr": "required checks unavailable",
+                }
+            return {
+                "returncode": 0,
+                "stdout": json.dumps(self.required_checks),
+                "stderr": "",
+            }
         if argv[:2] == ["pr", "merge"]:
             if self.merge_exception:
                 raise RuntimeError("merge runner exploded")
@@ -5981,6 +6001,134 @@ class CaptainAuthorityPathTests(unittest.TestCase):
                 self.assertIn(expected_reason, result["output"]["blocked_reasons"])
                 self.assertFalse(result["output"]["executions"][0]["execution_attempted"])
                 self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_allows_unstable_when_all_required_checks_pass(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+            },
+            required_checks=[
+                {"bucket": "pass", "name": "validate (3.10)", "state": "SUCCESS"},
+                {"bucket": "pass", "name": "validate (3.12)", "state": "SUCCESS"},
+            ],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("passed", result["receipt"]["status"])
+        self.assertTrue(result["output"]["executions"][0]["execution_attempted"])
+        self.assertTrue(result["output"]["executions"][0]["verification_passed"])
+        probe = result["output"]["executions"][0]["preflight_view_summary"]["required_checks_probe"]
+        self.assertEqual(2, probe["required_check_count"])
+        self.assertEqual(0, probe["non_passing_required_check_count"])
+        # Re-check at Captain preflight, merge-guard admission, and immediately
+        # before dispatch so a late required-check regression stays fail-closed.
+        self.assertEqual(3, len([call for call in gh.calls if call[:2] == ("pr", "checks")]))
+        self.assertEqual(1, len([call for call in gh.calls if call[:2] == ("pr", "merge")]))
+
+    def test_captain_run_blocks_unstable_when_required_check_is_not_green(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+            },
+            required_checks=[
+                {"bucket": "fail", "name": "validate (3.12)", "state": "FAILURE"},
+            ],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn(
+            "pr_required_checks_not_green_for_unstable_merge_state",
+            result["output"]["blocked_reasons"],
+        )
+        self.assertFalse(result["output"]["executions"][0]["execution_attempted"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_captain_run_blocks_unstable_when_required_checks_are_unavailable(self) -> None:
+        parameters = captain_parameters(
+            trusted_owner_mode=True,
+            autonomy_policy=grips.CAPTAIN_TRUSTED_OWNER_AUTONOMY_POLICY,
+            allow_execution=True,
+        )
+        parameters.pop("human_authorization")
+        parameters.pop("execution_authority")
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "UNSTABLE",
+            },
+            required_checks_returncode=1,
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertIn(
+            "pr_required_checks_unavailable_for_unstable_merge_state",
+            result["output"]["blocked_reasons"],
+        )
+        self.assertFalse(result["output"]["executions"][0]["execution_attempted"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_captain_run_blocks_unknown_and_missing_pr_view_fields_before_execution(self) -> None:
         cases = (

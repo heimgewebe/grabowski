@@ -774,6 +774,64 @@ def _github_json_call(
     return value, evidence, []
 
 
+def required_pr_checks_probe(
+    repo_path: Path,
+    github_runner: Any,
+    *,
+    repo_slug: str,
+    pr_number: int | str,
+) -> dict[str, Any]:
+    args = [
+        "pr",
+        "checks",
+        str(pr_number),
+        "--repo",
+        repo_slug,
+        "--required",
+        "--json",
+        "name,state,bucket",
+    ]
+    value, query, query_errors = _github_json_call(
+        repo_path,
+        github_runner,
+        args,
+        label="required_pr_checks",
+    )
+    probe: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "grabowski_required_pr_checks_probe",
+        "repository": repo_slug,
+        "pull_request": int(pr_number),
+        "query": query,
+        "status": "unavailable" if query_errors else "unknown",
+        "required_check_count": None,
+        "non_passing_required_check_count": None,
+        "required_check_names": [],
+        "errors": list(query_errors),
+    }
+    if query_errors:
+        return probe
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        probe["status"] = "unparseable"
+        probe["errors"] = ["required_pr_checks_payload_invalid"]
+        return probe
+    checks = [dict(item) for item in value]
+    non_passing = [item for item in checks if item.get("bucket") != "pass"]
+    probe["required_check_count"] = len(checks)
+    probe["non_passing_required_check_count"] = len(non_passing)
+    probe["required_check_names"] = sorted(
+        str(item.get("name"))
+        for item in checks
+        if isinstance(item.get("name"), str)
+    )
+    if non_passing:
+        probe["status"] = "not_green"
+        probe["errors"] = ["required_pr_checks_not_green"]
+    else:
+        probe["status"] = "green"
+    return probe
+
+
 def _normalize_active_rule_pages(value: Any) -> tuple[list[Any] | None, int]:
     if not isinstance(value, list):
         return None, 0
@@ -2144,7 +2202,18 @@ class CaptainMergeGuardRunner:
             errors.append("merge_guard_base_branch_drift")
         if viewed.get("mergeable") != "MERGEABLE":
             errors.append("merge_guard_mergeable_not_confirmed")
-        if viewed.get("mergeStateStatus") != "CLEAN":
+        merge_state_status = viewed.get("mergeStateStatus")
+        if merge_state_status == "UNSTABLE":
+            required_checks = required_pr_checks_probe(
+                self.repo_path,
+                self.github_runner,
+                repo_slug=repo_slug,
+                pr_number=pr_number,
+            )
+            self.receipt["required_checks_probe"] = required_checks
+            if required_checks.get("status") != "green":
+                errors.append("merge_guard_required_checks_not_green_for_unstable_merge_state")
+        elif merge_state_status != "CLEAN":
             errors.append("merge_guard_merge_state_not_clean")
 
         changed_files = viewed.get("changedFiles")
@@ -2229,6 +2298,7 @@ class CaptainMergeGuardRunner:
             "expected_base_sha": expected_base_sha,
             "head_branch": head_branch,
             "head_sha": expected_head,
+            "merge_state_status": merge_state_status,
             "diff_sha256": live_diff_sha256,
             "execution_intent_sha256": self.execution_intent_sha256,
             "changed_paths": changed_paths,
@@ -2293,14 +2363,31 @@ class CaptainMergeGuardRunner:
             "baseRefOid": bindings["base_sha"],
             "isDraft": False,
             "mergeable": "MERGEABLE",
-            "mergeStateStatus": "CLEAN",
         }
         for field, expected_value in expected.items():
             if viewed.get(field) != expected_value:
                 errors.append(f"merge_guard_dispatch_revalidation_drift:{field}")
+        dispatch_merge_state = viewed.get("mergeStateStatus")
+        if dispatch_merge_state == "UNSTABLE":
+            required_checks = required_pr_checks_probe(
+                self.repo_path,
+                self.github_runner,
+                repo_slug=str(bindings["repository"]),
+                pr_number=int(bindings["pull_request"]),
+            )
+            self.receipt["dispatch_required_checks_probe"] = required_checks
+            if required_checks.get("status") != "green":
+                errors.append(
+                    "merge_guard_dispatch_required_checks_not_green_for_unstable_merge_state"
+                )
+        elif dispatch_merge_state != "CLEAN":
+            errors.append("merge_guard_dispatch_revalidation_drift:mergeStateStatus")
         self.receipt["dispatch_revalidation"]["errors"] = list(errors)
         self.receipt["dispatch_revalidation"]["binding_sha256"] = _sha256_json(
-            {field: viewed.get(field) for field in sorted(expected)}
+            {
+                **{field: viewed.get(field) for field in sorted(expected)},
+                "mergeStateStatus": dispatch_merge_state,
+            }
         )
         (
             base_update_guard,
