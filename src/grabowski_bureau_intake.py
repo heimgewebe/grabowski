@@ -834,7 +834,11 @@ def grabowski_bureau_candidate_assess(
         raise ValueError("provide selector or one legacy selector, not both")
     if selector is None:
         if legacy_selector_count != 1:
-            raise ValueError("provide selector or exactly one of candidate_id and event_id")
+            raise ValueError(
+                "provide selector or exactly one legacy selector: "
+                "candidate_id, event_id or idempotency_key; "
+                "initiative and task_id are binding checks"
+            )
         selector = (
             {"kind": "candidate_id", "candidate_id": legacy_candidate_id}
             if legacy_candidate_id

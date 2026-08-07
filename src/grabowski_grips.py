@@ -220,6 +220,31 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="task_attention_decision",
     ),
+    "reposkop-review-classification": GripSpec(
+        name="reposkop-review-classification",
+        version="1.0",
+        summary="Record one evidence-bound append-only Reposkop effectiveness review.",
+        effect=MUTATING,
+        required_parameters=(
+            "evaluation_id",
+            "classification",
+            "reviewer",
+            "scope",
+            "detectable_category",
+            "reason_codes",
+            "evidence_refs",
+            "expected_decision_audit_ref",
+            "supersedes_review_audit_ref",
+        ),
+        acceptance_ids=(
+            "evaluation-decision-bound",
+            "classification-contract-valid",
+            "evidence-refs-bounded",
+            "append-only-review",
+            "idempotent-replay",
+        ),
+        runner="reposkop_review_classification",
+    ),
     "task-attention-reconciliation": GripSpec(
         name="task-attention-reconciliation",
         version="1.0",
@@ -529,6 +554,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "scout",
         "runtime-deploy-check",
         "runtime-refresh-lease-release",
+        "reposkop-review-classification",
         "task-attention-decision",
         "task-attention-reconciliation",
         "task-closeout-archive",
@@ -566,6 +592,7 @@ GRIP_SURFACE_TARGETS = {
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
     "runtime-refresh-lease-release": "one terminal Bureau runtime-refresh lease release",
+    "reposkop-review-classification": "one append-only evidence-bound Reposkop review classification",
     "task-attention-decision": "one create-only current-attempt attention decision",
     "task-attention-reconciliation": "bounded attention-task evidence classification",
     "task-closeout-archive": "one retention-eligible terminal task archive and current projection switch",
@@ -608,6 +635,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
     "bureau-pickup-release": (
         "read bureau-pickup-status for the exact run and inspect the release receipt; "
         "never substitute generic resource release or force-release"
+    ),
+    "reposkop-review-classification": (
+        "re-read the exact evaluation and latest review audit reference; revisions must "
+        "supersede the latest review and may not rewrite prior evidence"
     ),
     "bureau-pickup-orphan-reconcile": (
         "read bureau-pickup-status for the exact run; on outcome_unknown perform the named "
@@ -7676,6 +7707,71 @@ def _run_task_attention_decision(
     return {**output, "receipt_status": "passed"}
 
 
+def _run_reposkop_review_classification(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_reposkop_effectiveness
+
+    try:
+        output = grabowski_reposkop_effectiveness.record_review_classification(
+            parameters
+        )
+    except grabowski_reposkop_effectiveness.ReposkopReviewInputError as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except grabowski_reposkop_effectiveness.ReposkopReviewConflictError as exc:
+        _check(receipt, "append-only-review", "fail", str(exc))
+        return {
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["reposkop_review_conflict"],
+            "error": str(exc),
+        }
+    except (
+        grabowski_reposkop_effectiveness.ReposkopReviewIntegrityError,
+        grabowski_reposkop_effectiveness.ReposkopReviewError,
+        OSError,
+    ) as exc:
+        _check(receipt, "evaluation-decision-bound", "fail", type(exc).__name__)
+        raise GripActionError(
+            "Reposkop review evaluation evidence is invalid or unavailable"
+        ) from exc
+    _check(
+        receipt,
+        "evaluation-decision-bound",
+        "pass",
+        output["expected_decision_audit_ref"],
+    )
+    _check(
+        receipt,
+        "classification-contract-valid",
+        "pass",
+        output["classification"],
+    )
+    _check(
+        receipt,
+        "evidence-refs-bounded",
+        "pass",
+        str(len(output["evidence_refs"])),
+    )
+    _check(
+        receipt,
+        "append-only-review",
+        "pass",
+        str(output["review_sequence"]),
+    )
+    _check(
+        receipt,
+        "idempotent-replay",
+        "pass",
+        "replayed" if output["replayed"] else "created",
+    )
+    return {**output, "receipt_status": "passed"}
+
+
 def _run_task_attention_reconciliation(
     spec: GripSpec,
     parameters: dict[str, Any],
@@ -8482,6 +8578,7 @@ _RUNNERS = {
     "scout": _run_scout,
     "runtime_deploy_check": _run_runtime_deploy_check,
     "runtime_refresh_lease_release": _run_runtime_refresh_lease_release,
+    "reposkop_review_classification": _run_reposkop_review_classification,
     "task_attention_decision": _run_task_attention_decision,
     "task_attention_reconciliation": _run_task_attention_reconciliation,
     "task_closeout_archive": _run_task_closeout_archive,

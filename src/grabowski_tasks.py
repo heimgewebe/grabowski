@@ -2554,6 +2554,7 @@ def _attest_mutating_agent_workspace(
         repository=workspace,
         purpose=purpose,
     )
+    summary = reposkop_effectiveness.finding_summary(result.get("report"))
     material = {
         "schema_version": 1,
         "kind": REPOSKOP_EXECUTION_ATTESTATION_KIND,
@@ -2586,6 +2587,7 @@ def _attest_mutating_agent_workspace(
         "usage_receipt_sha256": evidence["usage_receipt_sha256"],
         "usage_key_sha256": evidence["usage_key_sha256"],
         "audit_ref": evidence["audit_ref"],
+        "finding_summary": summary,
         "effect_authorized": False,
     }
     return {
@@ -6594,6 +6596,18 @@ def grabowski_task_start(
                         "decision_changed": False,
                         "action": "task_start_allowed",
                         "rule_ids": ["reposkop-policy-v2"],
+                        "decision_reason_codes": (
+                            reposkop_effectiveness.decision_reason_codes(
+                                finding_summary,
+                                final_decision="allow",
+                            )
+                        ),
+                        "projection_state": finding_summary.get(
+                            "projection_state"
+                        ),
+                        "advisory_posture": finding_summary.get(
+                            "advisory_posture"
+                        ),
                         "completed_audit_ref": (
                             reposkop_completed_audit_ref
                         ),
@@ -6623,6 +6637,7 @@ def grabowski_task_start(
                 ),
             }
         except Exception as exc:
+            failure = reposkop_effectiveness.failure_summary(exc)
             if reposkop_event_identity is not None:
                 try:
                     reposkop_decision_audit_ref = (
@@ -6641,6 +6656,12 @@ def grabowski_task_start(
                                 ),
                                 "rule_ids": ["reposkop-policy-v2"],
                                 "failure_class": type(exc).__name__,
+                                "failure_category": failure[
+                                    "failure_category"
+                                ],
+                                "decision_reason_codes": failure[
+                                    "decision_reason_codes"
+                                ],
                                 "requested_audit_ref": (
                                     reposkop_requested_audit_ref
                                 ),
@@ -6699,6 +6720,10 @@ def grabowski_task_start(
                 ],
                 "error_type": type(exc).__name__,
                 "error": _redact_reason(str(exc))[:1024],
+                "failure_category": failure["failure_category"],
+                "decision_reason_codes": failure[
+                    "decision_reason_codes"
+                ],
                 "requested_audit_ref": reposkop_requested_audit_ref,
                 "decision_audit_ref": reposkop_decision_audit_ref,
                 "lease_compensation": compensation,

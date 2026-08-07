@@ -163,6 +163,413 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertNotEqual(first, changed)
         self.assertRegex(first, r"^[0-9a-f]{64}$")
 
+    def test_finding_taxonomy_projects_only_bounded_reason_codes(self) -> None:
+        report = {
+            "observation": {
+                "errors": ["private raw detail"],
+                "git": {
+                    "dirty": True,
+                    "staged": False,
+                    "unstaged": True,
+                    "untracked": True,
+                    "operation_state": ["rebase"],
+                    "detached": False,
+                    "alternates_configured": False,
+                    "gitmodules_present": True,
+                    "ahead": 2,
+                    "behind": 1,
+                    "upstream": None,
+                    "upstream_freshness": "locally_available_only",
+                },
+                "role": {"value": "canonical_checkout"},
+            },
+            "projection": {
+                "state": "inconclusive",
+                "reasons": ["lifecycle_evidence_missing", "secret internal reason"],
+                "active_bindings": [{"private": "value"}],
+                "observation_validation": {"valid": True},
+            },
+        }
+        summary = effectiveness.finding_summary(report)
+        self.assertEqual(summary["finding_taxonomy_status"], "available_v2")
+        self.assertEqual(summary["finding_taxonomy_version"], 2)
+        self.assertEqual(summary["projection_state"], "inconclusive")
+        self.assertEqual(summary["advisory_posture"], "attention")
+        self.assertGreater(summary["finding_counts"]["error"], 0)
+        self.assertEqual(summary["finding_counts"]["warning"], 3)
+        self.assertEqual(summary["finding_categories"]["working_tree_state"], 2)
+        self.assertIn("working_tree_dirty", summary["finding_reason_codes"])
+        self.assertIn("projection_reason_other", summary["finding_reason_codes"])
+        self.assertNotIn("secret internal reason", summary["finding_reason_codes"])
+        self.assertNotIn("private raw detail", json.dumps(summary))
+
+    def test_failure_summary_uses_stable_categories_without_raw_error(self) -> None:
+        result = effectiveness.failure_summary(
+            ValueError("Reposkop observation must be complete: /private/path")
+        )
+        self.assertEqual(result["failure_category"], "observation_incomplete")
+        self.assertEqual(
+            result["decision_reason_codes"],
+            ["observation_incomplete", "reposkop_evaluation_failed"],
+        )
+        self.assertNotIn("private", json.dumps(result))
+
+    def test_review_classification_is_create_only_replayable_and_revisable(self) -> None:
+        evaluation = "a" * 64
+        decision_ref = _ref("d")
+        records: list[dict[str, object]] = [
+            _event("reposkop-evaluation-requested", evaluation, "1", task_id="task-1"),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-1",
+                final_decision="block",
+                decision_changed=True,
+            ),
+            _event(
+                "reposkop-execution-attestation-blocked",
+                evaluation,
+                "b",
+                task_id="task-1",
+            ),
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "operational_failure",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "observation_completeness",
+            "reason_codes": ["observation_incomplete"],
+            "evidence_refs": [decision_ref, _ref("b")],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        appended: list[dict[str, object]] = []
+
+        def raw_records(**_kwargs):
+            return list(records), {"chain_content_sha256": "f" * 64}
+
+        def append(record):
+            appended.append(record)
+            reference = _ref("e") if len(appended) == 1 else _ref("f")
+            records.insert(0, {**record, "_audit_ref": reference})
+            return reference
+
+        with patch.object(effectiveness, "_review_records", side_effect=raw_records), patch.object(
+            effectiveness, "append_event", side_effect=append
+        ), patch.object(effectiveness.time, "time", return_value=123):
+            first = effectiveness.record_review_classification(parameters)
+            replay = effectiveness.record_review_classification(parameters)
+            with self.assertRaises(effectiveness.ReposkopReviewConflictError):
+                effectiveness.record_review_classification(
+                    {**parameters, "classification": "false_positive"}
+                )
+            revised = effectiveness.record_review_classification(
+                {
+                    **parameters,
+                    "classification": "false_positive",
+                    "reason_codes": ["block_not_material"],
+                    "supersedes_review_audit_ref": first["audit_ref"],
+                }
+            )
+        self.assertFalse(first["replayed"])
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(revised["review_sequence"], 2)
+        self.assertEqual(len(appended), 2)
+        self.assertNotIn("reviewer", appended[0])
+        self.assertRegex(appended[0]["reviewer_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_material_review_requires_corroborating_evidence(self) -> None:
+        evaluation = "c" * 64
+        decision_ref = _ref("d")
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "operational_failure",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "observation_completeness",
+            "reason_codes": ["observation_incomplete"],
+            "evidence_refs": [decision_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with self.assertRaisesRegex(
+            effectiveness.ReposkopReviewInputError,
+            "corroborating evidence",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+    def test_review_classification_rejects_unverified_corroborating_audit_ref(self) -> None:
+        evaluation = "9" * 64
+        decision_ref = _ref("d")
+        records = [
+            _event(
+                "reposkop-evaluation-requested",
+                evaluation,
+                "1",
+                task_id="task-9",
+            ),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-9",
+                final_decision="block",
+            ),
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "operational_failure",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "observation_completeness",
+            "reason_codes": ["observation_incomplete"],
+            "evidence_refs": [decision_ref, _ref("f")],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_review_records",
+            return_value=(records, {}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "unavailable in the verified audit window",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+
+    def test_review_scan_retains_only_bound_records(self) -> None:
+        from types import SimpleNamespace
+
+        evaluation = "4" * 64
+        wanted_ref = _ref("d")
+        records = [
+            {
+                "operation": "reposkop-evaluation-requested",
+                "evaluation_id": evaluation,
+                "record_sha256": "1" * 64,
+            },
+            {
+                "operation": "unrelated",
+                "evaluation_id": "3" * 64,
+                "record_sha256": "2" * 64,
+            },
+            {
+                "operation": "external-evidence",
+                "record_sha256": "d" * 64,
+            },
+        ]
+        payload = b"".join(
+            (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            for record in records
+        )
+        segment = SimpleNamespace(records=len(records))
+        snapshot = SimpleNamespace(
+            segments=(segment,),
+            total_records=len(records),
+            chain_content_sha256="a" * 64,
+            chain_materialization_sha256="b" * 64,
+        )
+        with patch.object(
+            effectiveness.audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ), patch.object(
+            effectiveness.audit_query,
+            "_load_snapshot_segment",
+            return_value=payload,
+        ):
+            selected, source = effectiveness._review_records(
+                evaluation=evaluation,
+                evidence_refs={wanted_ref},
+                scan_limit=10,
+            )
+        self.assertEqual(source["scanned_records"], 3)
+        self.assertEqual(source["retained_records"], 2)
+        self.assertEqual(
+            {record["operation"] for record in selected},
+            {"reposkop-evaluation-requested", "external-evidence"},
+        )
+
+
+    def test_review_classification_rejects_truncated_audit_window(self) -> None:
+        parameters = {
+            "evaluation_id": "5" * 64,
+            "classification": "unresolved",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "not_applicable",
+            "reason_codes": ["awaiting_evidence"],
+            "evidence_refs": [_ref("d")],
+            "expected_decision_audit_ref": _ref("d"),
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_review_records",
+            return_value=([], {"scan_truncated": True}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "exceeds the bounded Reposkop review scan",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+
+    def test_neutral_review_requires_correlated_outcome_evidence(self) -> None:
+        evaluation = "6" * 64
+        decision_ref = _ref("d")
+        outcome_ref = _ref("e")
+        records = [
+            _event(
+                "reposkop-evaluation-requested",
+                evaluation,
+                "1",
+                task_id="task-6",
+            ),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-6",
+                final_decision="allow",
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "e",
+                task_id="task-6",
+                terminal_state="completed",
+            ),
+        ]
+        base = {
+            "evaluation_id": evaluation,
+            "classification": "neutral",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "not_applicable",
+            "reason_codes": ["no_confirmed_decision_value"],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_review_records",
+            return_value=(records, {}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewInputError,
+            "corroborating evidence beyond the decision",
+        ):
+            effectiveness.record_review_classification(
+                {**base, "evidence_refs": [decision_ref]}
+            )
+        appended: list[dict[str, object]] = []
+        with patch.object(
+            effectiveness,
+            "_review_records",
+            return_value=(records, {}),
+        ), patch.object(
+            effectiveness,
+            "append_event",
+            side_effect=lambda event: appended.append(event) or _ref("r"),
+        ):
+            result = effectiveness.record_review_classification(
+                {**base, "evidence_refs": [decision_ref, outcome_ref]}
+            )
+        self.assertEqual(result["classification"], "neutral")
+        self.assertEqual(len(appended), 1)
+
+
+    def test_review_classification_rejects_unrelated_corroborating_audit_ref(self) -> None:
+        evaluation = "8" * 64
+        decision_ref = _ref("d")
+        unrelated_ref = _ref("f")
+        records = [
+            _event(
+                "reposkop-evaluation-requested",
+                evaluation,
+                "1",
+                task_id="task-8",
+            ),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-8",
+                final_decision="block",
+            ),
+            {
+                "operation": "task-start",
+                "task_id": "different-task",
+                "transaction_id": "7" * 64,
+                "_audit_ref": unrelated_ref,
+            },
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "operational_failure",
+            "reviewer": "operator:reviewer",
+            "scope": "technical",
+            "detectable_category": "observation_completeness",
+            "reason_codes": ["observation_incomplete"],
+            "evidence_refs": [decision_ref, unrelated_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_review_records",
+            return_value=(records, {}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "not bound to the reviewed evaluation or task",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+
+    def test_review_classification_rejects_semantically_impossible_claim(self) -> None:
+        evaluation = "b" * 64
+        decision_ref = _ref("c")
+        records = [
+            _event("reposkop-evaluation-requested", evaluation, "1", task_id="task-2"),
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "c",
+                task_id="task-2",
+                final_decision="block",
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "e",
+                task_id="task-2",
+                terminal_state="completed",
+            ),
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "false_negative",
+            "reviewer": "operator:reviewer",
+            "scope": "repository",
+            "detectable_category": "foreign_dirty_state",
+            "reason_codes": ["later_conflict"],
+            "evidence_refs": [decision_ref, _ref("e")],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness,
+            "_review_records",
+            return_value=(records, {}),
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewInputError,
+            "requires an allowed evaluation",
+        ):
+            effectiveness.record_review_classification(parameters)
+
+
     def test_projection_separates_verified_blocked_missing_and_legacy(self) -> None:
         verified = "a" * 64
         blocked = "b" * 64
@@ -241,6 +648,129 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         candidates = {item["metric"]: item for item in result["improvement_candidates"]}
         self.assertEqual(candidates["missing_required_attestation"]["status"], "active")
         self.assertEqual(candidates["repeated_operational_failure"]["status"], "insufficient_sample")
+
+    def test_projection_uses_latest_review_and_computes_quality_metrics(self) -> None:
+        confirmed = "1" * 64
+        false_positive = "2" * 64
+        false_negative = "3" * 64
+        records: list[dict[str, object]] = []
+        for evaluation, decision, classification, character in (
+            (confirmed, "block", "confirmed_prevention", "a"),
+            (false_positive, "block", "false_positive", "b"),
+            (false_negative, "allow", "false_negative", "c"),
+        ):
+            records.append(_event("reposkop-evaluation-requested", evaluation, character))
+            if decision == "allow":
+                records.append(
+                    _event(
+                        "reposkop-evaluation-completed",
+                        evaluation,
+                        character,
+                        duration_ms=10,
+                        finding_counts={
+                            "critical": 0,
+                            "error": 0,
+                            "warning": 1,
+                            "information": 0,
+                        },
+                        finding_categories={"working_tree_state": 1},
+                        finding_reason_codes=["working_tree_dirty"],
+                        projection_state="inconclusive",
+                    )
+                )
+            records.append(
+                _event(
+                    "reposkop-decision-applied",
+                    evaluation,
+                    character,
+                    final_decision=decision,
+                    decision_changed=decision == "block",
+                )
+            )
+            if decision == "block":
+                records.append(
+                    _event(
+                        "reposkop-execution-attestation-blocked",
+                        evaluation,
+                        character,
+                    )
+                )
+            records.append(
+                _event(
+                    "reposkop-review-classification-recorded",
+                    evaluation,
+                    character,
+                    classification=classification,
+                    reason_codes=["shared_reason"],
+                    review_sequence=1,
+                )
+            )
+        result = effectiveness.project_records(records)
+        review = result["review"]
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(review["reviewed_evaluations"], 3)
+        self.assertEqual(review["confirmed_preventions"], 1)
+        self.assertEqual(review["false_positives"], 1)
+        self.assertEqual(review["false_negatives"], 1)
+        self.assertEqual(review["precision"], 0.5)
+        self.assertEqual(review["false_negative_ratio"], 0.5)
+        self.assertEqual(review["unreviewed_decision_changes"], 0)
+        self.assertEqual(
+            result["findings"]["severity_counts"]["warning"], 1
+        )
+        candidates = {item["metric"]: item for item in result["improvement_candidates"]}
+        self.assertEqual(candidates["unreviewed_decision_change"]["status"], "clear")
+        self.assertEqual(candidates["false_positive_cluster"]["status"], "insufficient_sample")
+        self.assertEqual(candidates["false_negative_cluster"]["status"], "clear")
+
+
+    def test_false_positive_cluster_requires_same_detectable_category(self) -> None:
+        records: list[dict[str, object]] = []
+        for index, category in enumerate(("checkout_identity", "remote_freshness", "working_tree_state"), 1):
+            evaluation = f"{index:064x}"
+            records.extend(
+                [
+                    _event("reposkop-evaluation-requested", evaluation, "1"),
+                    _event(
+                        "reposkop-decision-applied",
+                        evaluation,
+                        "2",
+                        final_decision="block",
+                        decision_changed=True,
+                    ),
+                    _event(
+                        "reposkop-execution-attestation-blocked",
+                        evaluation,
+                        "3",
+                    ),
+                    _event(
+                        "reposkop-review-classification-recorded",
+                        evaluation,
+                        "4",
+                        classification="false_positive",
+                        detectable_category=category,
+                        reason_codes=["shared_reason"],
+                        review_sequence=1,
+                    ),
+                ]
+            )
+        result = effectiveness.project_records(records)
+        candidates = {
+            item["metric"]: item
+            for item in result["improvement_candidates"]
+        }
+        candidate = candidates["false_positive_cluster"]
+        self.assertEqual(candidate["status"], "clear")
+        self.assertEqual(candidate["observed"]["max_category_count"], 1)
+        self.assertEqual(
+            result["review"]["detectable_category_counts"]["false_positive"],
+            {
+                "checkout_identity": 1,
+                "remote_freshness": 1,
+                "working_tree_state": 1,
+            },
+        )
+
 
     def test_runtime_regression_candidate_uses_sufficient_sample(self) -> None:
         records: list[dict[str, object]] = []
