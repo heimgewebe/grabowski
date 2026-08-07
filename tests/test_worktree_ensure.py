@@ -176,6 +176,17 @@ class WorktreeEnsureTests(unittest.TestCase):
                     self._ensure(parameters)
                 self.assertFalse(Path(str(parameters["target_path"])).exists())
 
+    def test_creation_rejects_automation_source_without_terminal_evidence_contract(self) -> None:
+        parameters = self._parameters(key="automation-source-rejected")
+        parameters["source_kind"] = "automation"
+        parameters["source_id"] = "bureau-frontier-entblockung-20260806T1519Z"
+        with self.assertRaisesRegex(
+            worktree_ensure.WorktreeEnsurePreflight,
+            "no immutable terminal evidence observer",
+        ):
+            self._ensure(parameters)
+        self.assertFalse(Path(str(parameters["target_path"])).exists())
+
     def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
         first = self._parameters(
             key="limit-first",
