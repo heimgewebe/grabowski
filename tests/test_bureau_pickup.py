@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -530,16 +531,38 @@ class BureauPickupTests(unittest.TestCase):
         }
 
     @staticmethod
-    def coordinated_status(intent, state="assigned", blocking=False):
+    def utc_heartbeat(age_seconds: int = 30) -> str:
+        moment = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def coordinated_status(
+        intent,
+        state="assigned",
+        blocking=False,
+        *,
+        heartbeat_at=None,
+        include_heartbeat=False,
+        external=None,
+    ):
         keys = intent["required_resource_keys"]
+        run = {
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "worker_id": intent["worker_id"],
+            "state": state,
+        }
+        if include_heartbeat or heartbeat_at is not None:
+            run["heartbeat_at"] = (
+                heartbeat_at
+                if heartbeat_at is not None
+                else BureauPickupTests.utc_heartbeat()
+            )
+        if external:
+            run.update(external)
         return {
             "status": "coordinated",
-            "run": {
-                "run_id": intent["run_id"],
-                "task_id": intent["task_id"],
-                "worker_id": intent["worker_id"],
-                "state": state,
-            },
+            "run": run,
             "claim_intent_sha256": intent["intent_sha256"],
             "release": {
                 "required": bool(keys),
@@ -549,6 +572,17 @@ class BureauPickupTests(unittest.TestCase):
             },
             "blocking": blocking,
         }
+
+    def bound_coordinated_status(
+        self, intent, state="assigned", blocking=False, **kwargs
+    ):
+        return self.coordinated_status(
+            intent,
+            state=state,
+            blocking=blocking,
+            include_heartbeat=True,
+            **kwargs,
+        )
 
     def test_execute_claims_after_exact_lease_acquisition(self) -> None:
         intent = self.intent()
@@ -2220,6 +2254,78 @@ class BureauPickupTests(unittest.TestCase):
                 pickup.grabowski_bureau_pickup_release(intent["run_id"])
         release.assert_not_called()
 
+    def test_release_allows_renewed_lease_with_same_metadata(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        renewed = dict(lease)
+        renewed["updated_at_unix"] = lease["updated_at_unix"] + 60
+        renewed["expires_at_unix"] = lease["expires_at_unix"] + 300
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[renewed, None]
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [renewed]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("released", result["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
+    def test_release_allows_reacquired_lease_with_same_lineage(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        reacquired = dict(lease)
+        reacquired["acquired_at_unix"] = lease["expires_at_unix"] + 1
+        reacquired["updated_at_unix"] = reacquired["acquired_at_unix"]
+        reacquired["expires_at_unix"] = reacquired["acquired_at_unix"] + 300
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent),
+            ),
+            mock.patch.object(
+                pickup.resources, "inspect_resource", side_effect=[reacquired, None]
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [reacquired]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        self.assertEqual("released", result["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
+    def test_release_rejects_unknown_run_state(self) -> None:
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        self.create_acquisition_journal(intent, lease)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value=self.terminal_status(intent, state="weird-state"),
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaisesRegex(pickup.BureauPickupError, "run-not-terminal"):
+                pickup.grabowski_bureau_pickup_release(intent["run_id"])
+        release.assert_not_called()
+
     def test_release_rejects_acquisition_mode_drift(self) -> None:
         intent = self.intent()
         key = intent["required_resource_keys"][0]
@@ -2641,7 +2747,7 @@ class BureauPickupTests(unittest.TestCase):
             "run": {"run_id": intent["run_id"], "state": "assigned"},
             "envelope": {"claim_intent": intent},
         }
-        blocking = self.coordinated_status(intent, blocking=True)
+        blocking = self.bound_coordinated_status(intent, blocking=True)
         blocking["lease"] = {
             "status": "active-binding-drift",
             "error": {
@@ -2682,7 +2788,9 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_execute(request)
         self.assertEqual("existing-assignment", result["status"])
-        self.assertEqual(acquisition["acquisition_sha256"], result["acquisition_sha256"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
         acquire.assert_called_once()
         release.assert_not_called()
         self.assertTrue((run_dir / "lease-reacquire.json").is_file())
@@ -2727,9 +2835,7 @@ class BureauPickupTests(unittest.TestCase):
                 f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
             )
             for key in group["resource_keys"]:
-                original = self.lease(
-                    key, intent["lease_owner_id"], metadata_sha256
-                )
+                original = self.lease(key, intent["lease_owner_id"], metadata_sha256)
                 original["purpose"] = purpose
                 originals.append(original)
                 leases.append(
@@ -2759,7 +2865,7 @@ class BureauPickupTests(unittest.TestCase):
         }
         acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
         run_dir = pickup._run_directory(intent["run_id"])
-        blocking = self.coordinated_status(intent, blocking=True)
+        blocking = self.bound_coordinated_status(intent, blocking=True)
         blocking["lease"] = {
             "status": "active-binding-drift",
             "error": {
@@ -2768,9 +2874,7 @@ class BureauPickupTests(unittest.TestCase):
             },
         }
         with (
-            mock.patch.object(
-                pickup.resources, "inspect_resource", return_value=None
-            ),
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
             mock.patch.object(
                 pickup.resources,
                 "acquire_resources",
@@ -2828,9 +2932,7 @@ class BureauPickupTests(unittest.TestCase):
             )
             group_leases = []
             for key in group["resource_keys"]:
-                original = self.lease(
-                    key, intent["lease_owner_id"], metadata_sha256
-                )
+                original = self.lease(key, intent["lease_owner_id"], metadata_sha256)
                 original["purpose"] = purpose
                 originals.append(original)
                 group_leases.append({**original})
@@ -2852,7 +2954,7 @@ class BureauPickupTests(unittest.TestCase):
         }
         acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
         run_dir = pickup._run_directory(intent["run_id"])
-        blocking = self.coordinated_status(intent, blocking=True)
+        blocking = self.bound_coordinated_status(intent, blocking=True)
         blocking["lease"] = {
             "status": "active-binding-drift",
             "error": {
@@ -2861,9 +2963,7 @@ class BureauPickupTests(unittest.TestCase):
             },
         }
         with (
-            mock.patch.object(
-                pickup.resources, "inspect_resource", return_value=None
-            ),
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
             mock.patch.object(
                 pickup.resources,
                 "acquire_resources",
@@ -2944,7 +3044,7 @@ class BureauPickupTests(unittest.TestCase):
             "run": {"run_id": intent["run_id"], "state": "assigned"},
             "envelope": {"claim_intent": intent},
         }
-        blocking = self.coordinated_status(intent, blocking=True)
+        blocking = self.bound_coordinated_status(intent, blocking=True)
         blocking["lease"] = {
             "status": "active-binding-drift",
             "error": {
@@ -2974,8 +3074,14 @@ class BureauPickupTests(unittest.TestCase):
                 pickup.resources,
                 "acquire_resources",
                 side_effect=[
-                    {"owner_id": intent["lease_owner_id"], "leases": [by_key[repo_key]]},
-                    {"owner_id": intent["lease_owner_id"], "leases": [by_key[path_key]]},
+                    {
+                        "owner_id": intent["lease_owner_id"],
+                        "leases": [by_key[repo_key]],
+                    },
+                    {
+                        "owner_id": intent["lease_owner_id"],
+                        "leases": [by_key[path_key]],
+                    },
                 ],
             ) as acquire,
             mock.patch.object(pickup.resources, "release_resources") as release,
@@ -2988,9 +3094,13 @@ class BureauPickupTests(unittest.TestCase):
             run_dir / "lease-reacquire.json", label="lease reacquire"
         )
         self.assertEqual(keys, receipt["resource_keys"])
-        self.assertEqual([repo_key, "other"], [item["group"] for item in receipt["groups"]])
+        self.assertEqual(
+            [repo_key, "other"], [item["group"] for item in receipt["groups"]]
+        )
 
-    def test_runtime_drift_retry_replays_exact_journal_and_reacquires_missing_lease(self) -> None:
+    def test_runtime_drift_retry_replays_exact_journal_and_reacquires_missing_lease(
+        self,
+    ) -> None:
         request = self.request()
         normalized = pickup._normalize_request(request)
         intent = self.intent()
@@ -3012,7 +3122,7 @@ class BureauPickupTests(unittest.TestCase):
                 }
             },
         }
-        blocking = self.coordinated_status(intent, blocking=True)
+        blocking = self.bound_coordinated_status(intent, blocking=True)
         blocking["lease"] = {
             "status": "active-binding-drift",
             "error": {
@@ -3050,7 +3160,9 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_execute(request)
         self.assertEqual("existing-assignment", result["status"])
-        self.assertEqual(acquisition["acquisition_sha256"], result["acquisition_sha256"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
         self.assertEqual(3, invoke.call_count)
         self.assertIn("claim-intent", invoke.call_args_list[0].args[0])
         self.assertIn("claim-coordination-status", invoke.call_args_list[1].args[0])
@@ -3215,7 +3327,7 @@ class BureauPickupTests(unittest.TestCase):
                 "_invoke_bureau",
                 side_effect=[
                     existing,
-                    self.coordinated_status(intent, blocking=True),
+                    self.bound_coordinated_status(intent, blocking=True),
                 ],
             ),
             mock.patch.object(pickup.resources, "acquire_resources") as acquire,
@@ -3246,7 +3358,7 @@ class BureauPickupTests(unittest.TestCase):
             "run": {"run_id": intent["run_id"], "state": "assigned"},
             "envelope": {"claim_intent": intent},
         }
-        blocking = self.coordinated_status(intent, blocking=True)
+        blocking = self.bound_coordinated_status(intent, blocking=True)
         blocking["lease"] = {
             "status": "active-binding-drift",
             "error": {"code": "lease-metadata-binding-mismatch"},
@@ -3282,7 +3394,9 @@ class BureauPickupTests(unittest.TestCase):
         ):
             result = pickup.grabowski_bureau_pickup_execute(request)
         self.assertEqual("existing-assignment", result["status"])
-        self.assertEqual(acquisition["acquisition_sha256"], result["acquisition_sha256"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
         rebind.assert_called_once()
         acquire.assert_not_called()
         release.assert_not_called()
@@ -3515,6 +3629,665 @@ class BureauPickupTests(unittest.TestCase):
             result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
         self.assertTrue(result["journal_available"])
         self.assertIn("claim-coordination-status", invoke.call_args.args[0])
+        self.assertIn("execution_binding", result)
+        self.assertFalse(result["execution_binding"]["actively_bound"])
+    def _repair_fixture(
+        self, *, heartbeat_at=None, include_heartbeat=False, external=None
+    ):
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        purpose = f"Bureau coordinated pickup {intent['run_id']} group other"
+        original = self.lease(key, intent["lease_owner_id"])
+        original["purpose"] = purpose
+        request = pickup._normalize_request(self.request())
+        acquisition = {
+            "schema_version": 1,
+            "owner_id": intent["lease_owner_id"],
+            "task_id": intent["task_id"],
+            "run_id": intent["run_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "resource_keys": intent["required_resource_keys"],
+            "leases": [original],
+            "groups": [],
+        }
+        acquisition["acquisition_sha256"] = pickup._sha256(acquisition)
+        run_dir = pickup._run_directory(intent["run_id"])
+        blocking = self.coordinated_status(
+            intent,
+            blocking=True,
+            heartbeat_at=heartbeat_at,
+            include_heartbeat=include_heartbeat,
+            external=external,
+        )
+        blocking["lease"] = {
+            "status": "active-binding-drift",
+            "error": {
+                "code": "lease-expired",
+                "details": {
+                    "resource_key": key,
+                    "expires_at_unix": original["expires_at_unix"],
+                },
+            },
+        }
+        return intent, request, acquisition, run_dir, blocking, original, key
+
+    def test_stale_assigned_blocks_lease_reacquire(self) -> None:
+        intent, request, acquisition, run_dir, blocking, _original, _key = (
+            self._repair_fixture(
+                heartbeat_at=self.utc_heartbeat(
+                    pickup.EXECUTION_HEARTBEAT_MAX_AGE_SECONDS + 120
+                ),
+                include_heartbeat=True,
+            )
+        )
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup._repair_existing_assignment_lease_binding(
+                    blocking, intent, request, acquisition, run_dir
+                )
+        self.assertEqual(
+            "existing-assignment-execution-not-bound", raised.exception.code
+        )
+        self.assertIn("heartbeat_stale", raised.exception.details["reason_codes"])
+        self.assertEqual(intent["run_id"], raised.exception.details["run_id"])
+        self.assertEqual("assigned", raised.exception.details["state"])
+        self.assertIn("does_not_establish", raised.exception.details)
+        acquire.assert_not_called()
+
+    def test_fresh_internal_heartbeat_allows_reacquire(self) -> None:
+        intent, request, acquisition, run_dir, blocking, original, key = (
+            self._repair_fixture(include_heartbeat=True)
+        )
+        reacquired = {
+            **original,
+            "acquired_at_unix": original["expires_at_unix"] + 1,
+            "updated_at_unix": original["expires_at_unix"] + 1,
+            "expires_at_unix": original["expires_at_unix"] + 301,
+        }
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": [reacquired],
+                    "preserved": [],
+                },
+            ) as acquire,
+        ):
+            repaired = pickup._repair_existing_assignment_lease_binding(
+                blocking, intent, request, acquisition, run_dir
+            )
+        self.assertTrue(repaired)
+        acquire.assert_called_once()
+        self.assertTrue((run_dir / "lease-reacquire.json").is_file())
+
+    def test_malformed_and_future_heartbeat_block_reacquire(self) -> None:
+        for heartbeat_at, reason in (
+            ("not-a-timestamp", "heartbeat_malformed"),
+            (
+                (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "heartbeat_future",
+            ),
+        ):
+            intent, request, acquisition, run_dir, blocking, _original, _key = (
+                self._repair_fixture(heartbeat_at=heartbeat_at, include_heartbeat=True)
+            )
+            with mock.patch.object(pickup.resources, "acquire_resources") as acquire:
+                with self.assertRaises(pickup.BureauPickupError) as raised:
+                    pickup._repair_existing_assignment_lease_binding(
+                        blocking, intent, request, acquisition, run_dir
+                    )
+            self.assertEqual(
+                "existing-assignment-execution-not-bound", raised.exception.code
+            )
+            self.assertIn(reason, raised.exception.details["reason_codes"])
+            self.assertIsNotNone(
+                raised.exception.details.get("heartbeat_parse_error")
+                or raised.exception.details.get("heartbeat_age_seconds")
+            )
+            acquire.assert_not_called()
+
+    def test_incomplete_external_binding_blocks_reacquire(self) -> None:
+        intent, request, acquisition, run_dir, blocking, _original, _key = (
+            self._repair_fixture(
+                include_heartbeat=True,
+                external={
+                    "external_system": "tmux",
+                    "external_id": None,
+                    "external_state": "running",
+                },
+            )
+        )
+        with mock.patch.object(pickup.resources, "acquire_resources") as acquire:
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup._repair_existing_assignment_lease_binding(
+                    blocking, intent, request, acquisition, run_dir
+                )
+        self.assertEqual(
+            "existing-assignment-execution-not-bound", raised.exception.code
+        )
+        self.assertIn(
+            "external_binding_incomplete", raised.exception.details["reason_codes"]
+        )
+        self.assertIn("external_id", raised.exception.details["missing_bindings"])
+        acquire.assert_not_called()
+
+    def test_complete_fresh_external_binding_allows_reacquire(self) -> None:
+        intent, request, acquisition, run_dir, blocking, original, _key = (
+            self._repair_fixture(
+                include_heartbeat=True,
+                external={
+                    "external_system": "tmux",
+                    "external_id": "session-1",
+                    "external_state": "running",
+                },
+            )
+        )
+        reacquired = {
+            **original,
+            "acquired_at_unix": original["expires_at_unix"] + 1,
+            "updated_at_unix": original["expires_at_unix"] + 1,
+            "expires_at_unix": original["expires_at_unix"] + 301,
+        }
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": [reacquired],
+                    "preserved": [],
+                },
+            ) as acquire,
+        ):
+            repaired = pickup._repair_existing_assignment_lease_binding(
+                blocking, intent, request, acquisition, run_dir
+            )
+        self.assertTrue(repaired)
+        acquire.assert_called_once()
+
+    def test_verifying_with_succeeded_external_allows_reacquire(self) -> None:
+        intent, request, acquisition, run_dir, blocking, original, _key = (
+            self._repair_fixture(
+                include_heartbeat=True,
+                external={
+                    "external_system": "tmux",
+                    "external_id": "session-1",
+                    "external_state": "succeeded",
+                },
+            )
+        )
+        blocking["run"]["state"] = "verifying"
+        reacquired = {
+            **original,
+            "acquired_at_unix": original["expires_at_unix"] + 1,
+            "updated_at_unix": original["expires_at_unix"] + 1,
+            "expires_at_unix": original["expires_at_unix"] + 301,
+        }
+        with (
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=None),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": [reacquired],
+                    "preserved": [],
+                },
+            ) as acquire,
+        ):
+            repaired = pickup._repair_existing_assignment_lease_binding(
+                blocking, intent, request, acquisition, run_dir
+            )
+        self.assertTrue(repaired)
+        acquire.assert_called_once()
+
+    def test_invalid_or_inconsistent_external_state_blocks_reacquire(self) -> None:
+        cases = (
+            (
+                "assigned",
+                "crashed",
+                "external_state_invalid",
+            ),
+            (
+                "assigned",
+                "succeeded",
+                "external_state_inconsistent",
+            ),
+            (
+                "verifying",
+                "running",
+                "external_state_inconsistent",
+            ),
+            (
+                "verifying",
+                "queued",
+                "external_state_inconsistent",
+            ),
+        )
+        for run_state, external_state, reason in cases:
+            intent, request, acquisition, run_dir, blocking, _original, _key = (
+                self._repair_fixture(
+                    include_heartbeat=True,
+                    external={
+                        "external_system": "tmux",
+                        "external_id": "session-1",
+                        "external_state": external_state,
+                    },
+                )
+            )
+            blocking["run"]["state"] = run_state
+            with mock.patch.object(pickup.resources, "acquire_resources") as acquire:
+                with self.assertRaises(pickup.BureauPickupError) as raised:
+                    pickup._repair_existing_assignment_lease_binding(
+                        blocking, intent, request, acquisition, run_dir
+                    )
+            self.assertEqual(
+                "existing-assignment-execution-not-bound", raised.exception.code
+            )
+            self.assertIn(reason, raised.exception.details["reason_codes"])
+            self.assertEqual(
+                "attention_required",
+                raised.exception.details["execution_binding"]["classification"],
+            )
+            acquire.assert_not_called()
+
+    def test_unknown_run_state_is_not_terminal_and_attention_required(self) -> None:
+        binding = pickup._classify_execution_binding(
+            {
+                "run_id": "run-unknown",
+                "state": "weird-state",
+                "worker_id": "worker-1",
+                "heartbeat_at": self.utc_heartbeat(10),
+            }
+        )
+        self.assertFalse(pickup._run_is_terminal({"state": "weird-state"}))
+        self.assertFalse(pickup._run_is_terminal({"state": "running"}))
+        self.assertTrue(pickup._run_is_terminal({"state": "failed"}))
+        self.assertTrue(pickup._run_is_terminal({"state": "succeeded"}))
+        self.assertTrue(pickup._run_is_terminal({"state": "cancelled"}))
+        self.assertTrue(pickup._run_is_terminal({"state": "orphaned"}))
+        self.assertEqual("attention_required", binding["classification"])
+        self.assertIn("state_unknown", binding["reason_codes"])
+        self.assertFalse(binding["actively_bound"])
+
+    def test_status_projects_execution_binding(self) -> None:
+        intent = self.intent()
+        stale = self.coordinated_status(
+            intent,
+            heartbeat_at=self.utc_heartbeat(
+                pickup.EXECUTION_HEARTBEAT_MAX_AGE_SECONDS + 60
+            ),
+            include_heartbeat=True,
+        )
+        with mock.patch.object(pickup.bureau, "_invoke_bureau", return_value=stale):
+            result = pickup.grabowski_bureau_pickup_status(intent["run_id"])
+        binding = result["execution_binding"]
+        self.assertEqual("stale", binding["classification"])
+        self.assertFalse(binding["actively_bound"])
+        self.assertIn("heartbeat_stale", binding["reason_codes"])
+        self.assertEqual(intent["run_id"], binding["run_id"])
+        self.assertIn("does_not_establish", binding)
+
+    def _orphan_setup(
+        self, *, state="assigned", heartbeat_age=3600, foreign_lease=False
+    ):
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        normalized = pickup._normalize_request(self.request())
+        self.write_registry_bound_request(run_dir, normalized)
+        coordination = self.coordinated_status(
+            intent,
+            state=state,
+            heartbeat_at=self.utc_heartbeat(heartbeat_age),
+            include_heartbeat=True,
+        )
+        registry_sha = self.default_registry_binding["identity"]["binding_sha256"]
+        request = {
+            "run_id": intent["run_id"],
+            "expected_registry_binding_sha256": registry_sha,
+            "expected_coordination_sha256": pickup._sha256(coordination),
+            "expected_lease_sha256": acquisition["acquisition_sha256"],
+        }
+        owner_lease = lease
+        if foreign_lease:
+            owner_lease = self.lease(key, "bureau-run:foreign")
+        return intent, run_dir, acquisition, coordination, request, owner_lease, key
+
+    def test_orphan_reconcile_success(self) -> None:
+        intent, run_dir, _acq, coordination, request, lease, key = self._orphan_setup()
+        terminal = self.coordinated_status(intent, state="failed")
+        workspace = self.root / "dirty-worktree"
+        workspace.mkdir()
+        dirty = workspace / "note.txt"
+        dirty.write_text("preserve-me", encoding="utf-8")
+        fail_result = {
+            "run_id": intent["run_id"],
+            "state": "failed",
+            "error": pickup.ORPHAN_RECONCILE_ERROR,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, fail_result, terminal, terminal],
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", result["status"])
+        self.assertEqual(intent["run_id"], result["run_id"])
+        self.assertTrue((run_dir / "orphan-reconcile.json").is_file())
+        self.assertTrue((run_dir / "terminal-readback.json").is_file())
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        fail_argv = invoke.call_args_list[1].args[0]
+        self.assertIn("fail", fail_argv)
+        self.assertIn(intent["run_id"], fail_argv)
+        self.assertNotIn("--force", fail_argv)
+        self.assertEqual("preserve-me", dirty.read_text(encoding="utf-8"))
+        self.assertTrue(workspace.is_dir())
+
+    def test_orphan_reconcile_digest_drift_is_no_op(self) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, _key = (
+            self._orphan_setup()
+        )
+        drifted = {
+            **coordination,
+            "claim_intent_sha256": "f" * 64,
+        }
+        cases = [
+            (
+                {
+                    **request,
+                    "expected_registry_binding_sha256": "a" * 64,
+                },
+                "orphan-reconcile-registry-digest-mismatch",
+            ),
+            (
+                {
+                    **request,
+                    "expected_lease_sha256": "b" * 64,
+                },
+                "orphan-reconcile-lease-digest-mismatch",
+            ),
+            (
+                request,
+                "orphan-reconcile-coordination-digest-mismatch",
+            ),
+        ]
+        # registry/lease checked before invoke; coordination after status read
+        with mock.patch.object(
+            pickup.bureau, "_invoke_bureau", return_value=drifted
+        ) as invoke:
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(cases[0][0])
+            self.assertEqual(cases[0][1], raised.exception.code)
+            invoke.assert_not_called()
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(cases[1][0])
+            self.assertEqual(cases[1][1], raised.exception.code)
+            invoke.assert_not_called()
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(cases[2][0])
+            self.assertEqual(cases[2][1], raised.exception.code)
+            self.assertEqual(1, invoke.call_count)
+
+    def test_orphan_reconcile_rejects_foreign_lease(self) -> None:
+        intent, _run_dir, _acq, coordination, request, foreign, _key = (
+            self._orphan_setup(foreign_lease=True)
+        )
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=coordination
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=foreign
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("orphan-reconcile-foreign-lease", raised.exception.code)
+        # only status read; fail never starts
+        self.assertEqual(1, invoke.call_count)
+        self.assertIn("claim-coordination-status", invoke.call_args.args[0])
+        release.assert_not_called()
+
+    def test_orphan_reconcile_preserves_dirty_state(self) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, _key = (
+            self._orphan_setup()
+        )
+        worktree = self.root / "bureau-worktree"
+        worktree.mkdir()
+        branch_marker = worktree / ".branch"
+        branch_marker.write_text("feature/dirty", encoding="utf-8")
+        (worktree / "wip.py").write_text("print('dirty')\n", encoding="utf-8")
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {"run_id": intent["run_id"], "state": "failed"}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, fail_result, terminal, terminal],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ),
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", result["status"])
+        self.assertEqual("feature/dirty", branch_marker.read_text(encoding="utf-8"))
+        self.assertEqual("print('dirty')\n", (worktree / "wip.py").read_text())
+        self.assertIn("dirty worktree content", result["receipt"]["preserves"])
+
+    def test_orphan_reconcile_response_loss_is_outcome_unknown(self) -> None:
+        intent, run_dir, _acq, coordination, request, lease, _key = self._orphan_setup()
+        unknown = {
+            "kind": "grabowski_bureau_intake_adapter_failure",
+            "code": "bureau-runtime-timeout",
+            "effect_started": True,
+            "ambiguity": True,
+            "required_readback": [f"bureau_run:{intent['run_id']}"],
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, unknown],
+            ),
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=lease),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("outcome_unknown", result["status"])
+        self.assertTrue(result["readback_required"])
+        self.assertIn(f"bureau_run:{intent['run_id']}", result["required_readback"])
+        self.assertTrue((run_dir / "orphan-fail-unknown.json").is_file())
+        release.assert_not_called()
+
+    def test_orphan_reconcile_idempotent_terminal_readback(self) -> None:
+        intent, run_dir, _acq, coordination, request, lease, key = self._orphan_setup()
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {"run_id": intent["run_id"], "state": "failed"}
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, fail_result, terminal, terminal],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ),
+        ):
+            first = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", first["status"])
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            second = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("already-reconciled", second["status"])
+        invoke.assert_not_called()
+        release.assert_not_called()
+        self.assertEqual(
+            first["receipt"]["receipt_sha256"],
+            second["receipt"]["receipt_sha256"],
+        )
+
+    def test_orphan_reconcile_rejects_renewed_lease_same_metadata(self) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, _key = (
+            self._orphan_setup()
+        )
+        renewed = dict(lease)
+        renewed["updated_at_unix"] = lease["updated_at_unix"] + 120
+        renewed["expires_at_unix"] = lease["expires_at_unix"] + 600
+        self.assertEqual(lease["metadata_sha256"], renewed["metadata_sha256"])
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=coordination
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources, "inspect_resource", return_value=renewed
+            ),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("orphan-reconcile-lease-metadata-drift", raised.exception.code)
+        self.assertEqual(1, invoke.call_count)
+        self.assertIn("claim-coordination-status", invoke.call_args.args[0])
+        for call in invoke.call_args_list:
+            self.assertNotIn("fail", call.args[0])
+        release.assert_not_called()
+
+    def test_orphan_reconcile_unknown_state_is_attention_fail_closed(self) -> None:
+        intent, _run_dir, _acq, _coordination, request, lease, _key = (
+            self._orphan_setup(state="weird-state")
+        )
+        coordination = self.coordinated_status(
+            intent,
+            state="weird-state",
+            heartbeat_at=self.utc_heartbeat(3600),
+            include_heartbeat=True,
+        )
+        request = {
+            **request,
+            "expected_coordination_sha256": pickup._sha256(coordination),
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=coordination
+            ) as invoke,
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual(
+            "orphan-reconcile-execution-attention-required", raised.exception.code
+        )
+        self.assertIn(
+            "state_unknown",
+            raised.exception.details["execution_binding"]["reason_codes"],
+        )
+        self.assertEqual(1, invoke.call_count)
+        self.assertIn("claim-coordination-status", invoke.call_args.args[0])
+        for call in invoke.call_args_list:
+            self.assertNotIn("fail", call.args[0])
+        release.assert_not_called()
+
+    def test_orphan_reconcile_terminal_digest_drift_blocks_release(self) -> None:
+        intent, _run_dir, _acq, _coordination, request, lease, _key = (
+            self._orphan_setup()
+        )
+        terminal = self.coordinated_status(intent, state="failed")
+        stale_expected = "c" * 64
+        request = {
+            **request,
+            "expected_coordination_sha256": stale_expected,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau, "_invoke_bureau", return_value=terminal
+            ) as invoke,
+            mock.patch.object(pickup.resources, "inspect_resource", return_value=lease),
+            mock.patch.object(pickup.resources, "release_resources") as release,
+        ):
+            with self.assertRaises(pickup.BureauPickupError) as raised:
+                pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual(
+            "orphan-reconcile-coordination-digest-mismatch", raised.exception.code
+        )
+        self.assertEqual(stale_expected, raised.exception.details["expected"])
+        self.assertEqual(1, invoke.call_count)
+        self.assertIn("claim-coordination-status", invoke.call_args.args[0])
+        for call in invoke.call_args_list:
+            self.assertNotIn("fail", call.args[0])
+        release.assert_not_called()
+
+    def test_orphan_reconcile_already_terminal_accepts_current_digest(self) -> None:
+        intent, run_dir, _acq, _coordination, request, lease, key = self._orphan_setup()
+        terminal = self.coordinated_status(intent, state="failed")
+        request = {
+            **request,
+            "expected_coordination_sha256": pickup._sha256(terminal),
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[terminal, terminal],
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", result["status"])
+        self.assertTrue((run_dir / "orphan-reconcile.json").is_file())
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        for call in invoke.call_args_list:
+            self.assertNotIn("fail", call.args[0])
+
 
 
 if __name__ == "__main__":

@@ -326,6 +326,21 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="bureau_pickup_release",
     ),
+    "bureau-pickup-orphan-reconcile": GripSpec(
+        name="bureau-pickup-orphan-reconcile",
+        version="1.0",
+        summary="Terminalize exactly one unbound coordinated pickup and release only its unchanged owner-bound leases.",
+        effect=MUTATING,
+        required_parameters=("request",),
+        acceptance_ids=(
+            "typed-request",
+            "run-id-bound",
+            "digest-cas-bound",
+            "terminal-or-readback-explicit",
+            "terminal-preservation-or-readback",
+        ),
+        runner="bureau_pickup_orphan_reconcile",
+    ),
     "connector-snapshot-bind": GripSpec(
         name="connector-snapshot-bind",
         version="1.1",
@@ -546,6 +561,7 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "bureau-pickup-execute",
         "bureau-pickup-status",
         "bureau-pickup-release",
+        "bureau-pickup-orphan-reconcile",
         "connector-snapshot-bind",
         "transport-roundtrip",
         "convergence-assess",
@@ -583,6 +599,7 @@ GRIP_SURFACE_TARGETS = {
     "bureau-pickup-execute": "one Registry-root-bound coordinated Bureau pickup execution",
     "bureau-pickup-status": "one coordinated Bureau pickup status and lease projection",
     "bureau-pickup-release": "one terminal coordinated pickup lease release",
+    "bureau-pickup-orphan-reconcile": "one exact unbound coordinated pickup reconciliation",
     "connector-snapshot-bind": "one connector client snapshot receipt",
     "transport-roundtrip": "one client-scope and runtime-bound transport roundtrip",
     "convergence-assess": "one hash-bound convergence closure assessment",
@@ -622,6 +639,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
     "reposkop-review-classification": (
         "re-read the exact evaluation and latest review audit reference; revisions must "
         "supersede the latest review and may not rewrite prior evidence"
+    ),
+    "bureau-pickup-orphan-reconcile": (
+        "read bureau-pickup-status for the exact run; on outcome_unknown perform the named "
+        "required readback before any retry; never substitute generic fail, release or force-release"
     ),
     "transport-roundtrip": (
         "run action=begin with the exact target_tool_name and target_arguments, then "
@@ -2829,6 +2850,126 @@ def _run_bureau_pickup_release(
         return {
             "receipt_status": "failed",
             "error": "bureau pickup release returned an invalid post-state",
+            "adapter_output": output,
+        }
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_bureau_pickup_orphan_reconcile(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    request = parameters.get("request")
+    if not isinstance(request, dict):
+        _check(receipt, "typed-request", "fail", "request must be an object")
+        raise GripPreflightError("request must be an object")
+    _check(receipt, "typed-request", "pass", "typed orphan reconcile request")
+    pickup = _bureau_pickup_module()
+    try:
+        output = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+    except ValueError as exc:
+        _check(receipt, "digest-cas-bound", "fail", str(exc))
+        raise GripPreflightError(str(exc)) from exc
+    except pickup.BureauPickupError as exc:
+        _check(receipt, "digest-cas-bound", "fail", exc.code)
+        return _bureau_pickup_error_output(
+            exc,
+            receipt_status="blocked",
+            blocked_reason="bureau_pickup_orphan_reconcile_rejected",
+        )
+
+    run_id = request.get("run_id")
+    status = output.get("status")
+    run_matches = isinstance(run_id, str) and output.get("run_id") == run_id
+    terminal = status in {"reconciled", "already-reconciled"}
+    unknown = status == "outcome_unknown"
+    digest_fields = (
+        "expected_registry_binding_sha256",
+        "expected_coordination_sha256",
+        "expected_lease_sha256",
+    )
+    digest_bound = unknown or all(
+        output.get(field) == request.get(field) for field in digest_fields
+    )
+    required_readback = output.get("required_readback")
+    unknown_valid = (
+        unknown
+        and output.get("readback_required") is True
+        and isinstance(required_readback, list)
+        and f"bureau_run:{run_id}" in required_readback
+    )
+    reconcile_receipt = output.get("receipt")
+    preserves = (
+        reconcile_receipt.get("preserves")
+        if isinstance(reconcile_receipt, dict)
+        else None
+    )
+    preservation_valid = (
+        terminal
+        and isinstance(reconcile_receipt, dict)
+        and reconcile_receipt.get("status") == "reconciled"
+        and reconcile_receipt.get("run_id") == run_id
+        and isinstance(preserves, list)
+        and set(preserves)
+        == {"dirty worktree content", "branch identity", "unrelated leases"}
+    )
+    if status == "reconciled":
+        release = output.get("release")
+        release_valid = isinstance(release, dict) and release.get("status") in {
+            "released",
+            "already-released",
+        }
+    elif status == "already-reconciled":
+        release_valid = isinstance(reconcile_receipt, dict) and reconcile_receipt.get(
+            "release_status"
+        ) in {"released", "already-released"}
+    else:
+        release_valid = False
+    terminal_valid = terminal and release_valid and preservation_valid
+
+    _check(receipt, "run-id-bound", "pass" if run_matches else "fail", str(output.get("run_id")))
+    _check(
+        receipt,
+        "digest-cas-bound",
+        "pass" if digest_bound else "fail",
+        str(request.get("expected_coordination_sha256") or "missing"),
+    )
+    _check(
+        receipt,
+        "terminal-or-readback-explicit",
+        "pass" if terminal_valid or unknown_valid else "fail",
+        str(status or "missing"),
+    )
+    _check(
+        receipt,
+        "terminal-preservation-or-readback",
+        "pass" if preservation_valid or unknown_valid else "fail",
+        "preserved"
+        if preservation_valid
+        else "readback-required"
+        if unknown_valid
+        else "missing",
+    )
+    if not run_matches or not digest_bound:
+        return {
+            "receipt_status": "failed",
+            "error": "bureau pickup orphan reconcile returned an invalid binding",
+            "adapter_output": output,
+        }
+    if unknown_valid:
+        return {
+            **output,
+            "receipt_status": "blocked",
+            "decision": "blocked",
+            "blocked_reasons": ["bureau_pickup_orphan_reconcile_readback_required"],
+        }
+    if not terminal_valid:
+        return {
+            "receipt_status": "failed",
+            "error": "bureau pickup orphan reconcile returned an invalid post-state",
             "adapter_output": output,
         }
     return {**output, "receipt_status": "passed"}
@@ -8444,6 +8585,7 @@ _RUNNERS = {
     "bureau_pickup_execute": _run_bureau_pickup_execute,
     "bureau_pickup_status": _run_bureau_pickup_status,
     "bureau_pickup_release": _run_bureau_pickup_release,
+    "bureau_pickup_orphan_reconcile": _run_bureau_pickup_orphan_reconcile,
     "connector_snapshot_bind": _run_connector_snapshot_bind,
     "transport_roundtrip": _run_transport_roundtrip,
     "convergence_assess": _run_convergence_assess,
