@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -74,6 +75,61 @@ class FakeRunner:
 
 
 class ConvergenceTests(unittest.TestCase):
+    def _bundle(self, root: Path, head: str, cells: list[dict[str, object]] | None = None):
+        bundle_root = root / "bundles"
+        bundle_dir = bundle_root / head
+        bundle_dir.mkdir(parents=True)
+        wheel = bundle_dir / "regelkreis-test-py3-none-any.whl"
+        profile = {
+            "schema_version": 2,
+            "profile_id": "resilience-matrix-v2",
+            "description": "test",
+            "cells": cells or [
+                {
+                    "cell_id": "R2-foundational",
+                    "change_risk": "R2",
+                    "target_criticality": "foundational",
+                    "required_effects": ["merge", "deployment"],
+                    "required_verifications": ["tests", "runtime_identity", "recovery"],
+                    "required_closure_fields": ["bureau_task_ref", "recovery_evidence"],
+                    "requires_resilience_evidence": True,
+                    "requires_independent_recovery": True,
+                }
+            ],
+        }
+        profile_bytes = json.dumps(
+            profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        cli = (
+            "import json\n"
+            "def main():\n"
+            "    value = {\"assessment_id\": \"bundle-test\", \"blocked_by\": [], \"conflicts\": [], \"missing_evidence\": [], \"profile_sha256\": \"b\" * 64, \"schema_version\": 2, \"status\": \"terminally_closed\", \"change_risk\": \"R2\", \"target_criticality\": \"foundational\", \"profile_id\": \"resilience-matrix-v2\", \"profile_cell_id\": \"R2-foundational\"}\n"
+            "    print(json.dumps(value, sort_keys=True))\n"
+            "    return 0\n"
+            "if __name__ == \"__main__\":\n"
+            "    raise SystemExit(main())\n"
+        )
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("regelkreis/__init__.py", "")
+            archive.writestr("regelkreis/cli.py", cli)
+            archive.writestr("regelkreis/contracts/protocol/dummy.json", "{}")
+            archive.writestr(convergence.RESILIENCE_PROFILE_MEMBER, profile_bytes)
+        wheel_bytes = wheel.read_bytes()
+        manifest = {
+            "schema_version": convergence.BUNDLE_SCHEMA_VERSION,
+            "kind": convergence.BUNDLE_KIND,
+            "protocol_head": head,
+            "wheel_filename": wheel.name,
+            "wheel_sha256": hashlib.sha256(wheel_bytes).hexdigest(),
+            "profile_member": convergence.RESILIENCE_PROFILE_MEMBER,
+            "profile_sha256": hashlib.sha256(profile_bytes).hexdigest(),
+        }
+        (bundle_dir / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        return bundle_root, manifest
+
     def _fixture(self):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
@@ -212,6 +268,142 @@ class ConvergenceTests(unittest.TestCase):
                     },
                     FakeRunner(head=head, dirty=True),
                 )
+
+    def test_immutable_bundle_allows_assessment_without_protocol_checkout(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        head = "c" * 40
+        bundle_root, _manifest = self._bundle(root, head)
+        request = root / "request.json"
+        request.write_text("{}\n", encoding="utf-8")
+        digest = hashlib.sha256(request.read_bytes()).hexdigest()
+        missing_repo = root / "missing-protocol-checkout"
+        with patch.dict(
+            os.environ,
+            {
+                "GRABOWSKI_CONVERGENCE_BUNDLE_ROOT": str(bundle_root),
+                "GRABOWSKI_CONVERGENCE_PROTOCOL_REPO": str(missing_repo),
+            },
+            clear=False,
+        ):
+            result = convergence.assess(
+                {
+                    "request_path": str(request),
+                    "expected_request_sha256": digest,
+                    "expected_protocol_head": head,
+                },
+                FakeRunner(head=head, dirty=True),
+            )
+        self.assertTrue(result["closure_allowed"])
+        self.assertEqual(result["protocol_source"], "immutable_bundle")
+        self.assertIsNone(result["protocol_repo"])
+        self.assertEqual(result["protocol_head"], head)
+        self.assertRegex(result["bundle_identity_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(result["contracts_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_bundle_root_final_symlink_is_rejected(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        head = "c" * 40
+        real_root, _manifest = self._bundle(root, head)
+        alias = root / "bundle-alias"
+        alias.symlink_to(real_root, target_is_directory=True)
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_CONVERGENCE_BUNDLE_ROOT": str(alias)},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                convergence.ConvergenceInputError,
+                "bundle root must be a real directory",
+            ):
+                convergence.build_system_convergence_plan(
+                    {
+                        "change_risk": "R2",
+                        "target_criticality": "essential",
+                        "expected_protocol_head": head,
+                    }
+                )
+
+    def test_risk_adaptive_plan_uses_pinned_profile_without_blanket_low_risk_gate(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        head = "d" * 40
+        cells = []
+        for risk, criticality in [
+            ("R1", "unknown"),
+            ("R2", "essential"),
+            ("R2", "unknown"),
+            ("R3", "optional"),
+        ]:
+            cells.append(
+                {
+                    "cell_id": f"{risk}-{criticality}",
+                    "change_risk": risk,
+                    "target_criticality": criticality,
+                    "required_effects": ["merge"],
+                    "required_verifications": ["tests"],
+                    "required_closure_fields": [],
+                    "requires_resilience_evidence": risk in {"R2", "R3"},
+                    "requires_independent_recovery": False,
+                }
+            )
+        bundle_root, _manifest = self._bundle(root, head, cells)
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_CONVERGENCE_BUNDLE_ROOT": str(bundle_root)},
+            clear=False,
+        ):
+            r1_unknown = convergence.build_system_convergence_plan(
+                {
+                    "change_risk": "R1",
+                    "target_criticality": "unknown",
+                    "expected_protocol_head": head,
+                }
+            )
+            r2_essential = convergence.build_system_convergence_plan(
+                {
+                    "change_risk": "R2",
+                    "target_criticality": "essential",
+                    "expected_protocol_head": head,
+                }
+            )
+            r2_unknown = convergence.build_system_convergence_plan(
+                {
+                    "change_risk": "R2",
+                    "target_criticality": "unknown",
+                    "expected_protocol_head": head,
+                }
+            )
+            r3_optional = convergence.build_system_convergence_plan(
+                {
+                    "change_risk": "R3",
+                    "target_criticality": "optional",
+                    "expected_protocol_head": head,
+                }
+            )
+        self.assertEqual(r1_unknown["systemic_closure_gate"], "not_required")
+        self.assertFalse(r1_unknown["hard_gate_required"])
+        self.assertFalse(r1_unknown["criticality_resolution_required"])
+        self.assertEqual(r2_essential["systemic_closure_gate"], "hard")
+        self.assertTrue(r2_essential["hard_gate_required"])
+        self.assertEqual(r2_unknown["systemic_closure_gate"], "classification_required")
+        self.assertTrue(r2_unknown["criticality_resolution_required"])
+        self.assertIsNone(r2_unknown["hard_gate_required"])
+        self.assertEqual(r3_optional["systemic_closure_gate"], "hard")
+        self.assertTrue(r3_optional["hard_gate_required"])
+        self.assertTrue(all(not plan["admission_blocking"] for plan in [r1_unknown, r2_essential, r2_unknown, r3_optional]))
+
+    def test_unclassified_plan_is_deterministic_and_nonblocking(self):
+        first = convergence.build_system_convergence_plan(None)
+        second = convergence.build_system_convergence_plan(None)
+        self.assertEqual(first, second)
+        self.assertEqual(first["status"], "unclassified")
+        self.assertFalse(first["admission_blocking"])
+        self.assertEqual(first["systemic_closure_gate"], "undetermined")
 
     def test_grip_exposes_terminal_gate(self):
         terminal = {

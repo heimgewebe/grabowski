@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterator
 import grabowski_checkouts as checkouts
 import grabowski_operator_core as operator
 import grabowski_resources as resources
+import grabowski_work_admission as work_admission
 import grabowski_worktree_ensure as worktree_ensure
 
 mcp = operator.mcp
@@ -262,6 +263,9 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
         raise ValueError("ttl_seconds must be between 120 and 86400")
     idempotency_key = _text(parameters.get("idempotency_key"), "idempotency_key", pattern=IDEMPOTENCY_RE)
+    system_convergence_plan = work_admission.plan_system_convergence(
+        parameters.get("system_convergence")
+    )
     requested = parameters.get("resource_keys") or []
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise ValueError("resource_keys must be a list of strings")
@@ -293,6 +297,7 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         "retention_until_unix": retention,
         "resource_keys": resource_keys,
         "idempotency_key": idempotency_key,
+        "system_convergence_plan": system_convergence_plan,
     }
     if writer_argv is not None:
         identity["scoped_writer_command"] = {
@@ -778,6 +783,7 @@ def grabowski_work_acquire(
     scoped_writer_actor: str | None = None,
     scoped_writer_argv: list[str] | None = None,
     scoped_writer_runtime_seconds: int = 7200,
+    system_convergence: dict[str, Any] | None = None,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
 ) -> dict[str, Any]:
@@ -809,6 +815,7 @@ def grabowski_work_acquire(
             "write_paths": write_paths,
             "scoped_writer_argv": scoped_writer_argv,
             "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
+            "system_convergence": system_convergence,
             "artifact_class": artifact_class,
             "ttl_seconds": ttl_seconds,
         },
