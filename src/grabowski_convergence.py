@@ -1,18 +1,33 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
+import tempfile
 from typing import Any, Callable
+import zipfile
 
 
 SCHEMA_VERSION = 1
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_EXECUTABLE_BYTES = 1024 * 1024
+MAX_BUNDLE_BYTES = 16 * 1024 * 1024
+MAX_BUNDLE_MANIFEST_BYTES = 64 * 1024
+MAX_PROFILE_BYTES = 2 * 1024 * 1024
+MAX_CONTRACT_TREE_BYTES = 4 * 1024 * 1024
+BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_KIND = "grabowski.convergence_runtime_bundle"
+RESILIENCE_PROFILE_MEMBER = "regelkreis/contracts/profiles/resilience.v2.json"
+ALLOWED_CHANGE_RISKS = frozenset({"R0", "R1", "R2", "R3"})
+ALLOWED_TARGET_CRITICALITIES = frozenset(
+    {"optional", "supporting", "essential", "foundational", "unknown"}
+)
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 ALLOWED_STATUSES = frozenset(
@@ -79,6 +94,351 @@ def _protocol_executable(repo: Path) -> Path:
     if not value.is_absolute():
         raise ConvergenceInputError("convergence executable must be absolute")
     return value
+
+
+def _bundle_root() -> Path:
+    configured = os.environ.get("GRABOWSKI_CONVERGENCE_BUNDLE_ROOT")
+    value = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".local" / "share" / "grabowski" / "convergence-bundles"
+    )
+    if not value.is_absolute():
+        raise ConvergenceInputError("convergence bundle root must be absolute")
+    return value.absolute()
+
+
+def _bundle_manifest_path(expected_head: str) -> Path:
+    return _bundle_root() / expected_head / "manifest.json"
+
+
+def _json_object(data: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConvergenceInputError(f"{label} is not valid UTF-8 JSON") from exc
+    if not isinstance(value, dict):
+        raise ConvergenceInputError(f"{label} must contain a JSON object")
+    return value
+
+
+def _read_profile_from_wheel(wheel_bytes: bytes, member: str) -> tuple[dict[str, Any], bytes]:
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel_bytes)) as archive:
+            matches = [item for item in archive.infolist() if item.filename == member]
+            if len(matches) != 1:
+                raise ConvergenceInputError(
+                    "convergence wheel must contain exactly one resilience profile member"
+                )
+            info = matches[0]
+            if info.is_dir() or info.file_size <= 0 or info.file_size > MAX_PROFILE_BYTES:
+                raise ConvergenceInputError("convergence resilience profile size is invalid")
+            profile_bytes = archive.read(info)
+    except zipfile.BadZipFile as exc:
+        raise ConvergenceInputError("convergence wheel is not a valid zip archive") from exc
+    if len(profile_bytes) != info.file_size:
+        raise ConvergenceInputError("convergence resilience profile read is incomplete")
+    profile = _json_object(profile_bytes, label="convergence resilience profile")
+    if (
+        profile.get("schema_version") != 2
+        or profile.get("profile_id") != "resilience-matrix-v2"
+        or not isinstance(profile.get("cells"), list)
+    ):
+        raise ConvergenceInputError("convergence resilience profile contract mismatch")
+    return profile, profile_bytes
+
+
+def _materialize_contract_root(wheel_bytes: bytes, target: Path) -> str:
+    contract_prefix = "regelkreis/contracts/"
+    total = 0
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        with zipfile.ZipFile(io.BytesIO(wheel_bytes)) as archive:
+            for info in archive.infolist():
+                if info.is_dir() or not info.filename.startswith(contract_prefix):
+                    continue
+                relative = info.filename.removeprefix(contract_prefix)
+                parts = Path(relative).parts
+                if (
+                    len(parts) != 2
+                    or parts[0] not in {"protocol", "profiles"}
+                    or not parts[1].endswith(".json")
+                    or Path(relative).is_absolute()
+                    or ".." in parts
+                    or relative in seen
+                ):
+                    raise ConvergenceInputError(
+                        "convergence wheel contract member path is invalid"
+                    )
+                if info.file_size <= 0 or total + info.file_size > MAX_CONTRACT_TREE_BYTES:
+                    raise ConvergenceInputError(
+                        "convergence wheel contract tree exceeds the accepted bound"
+                    )
+                data = archive.read(info)
+                if len(data) != info.file_size:
+                    raise ConvergenceInputError(
+                        "convergence wheel contract member read is incomplete"
+                    )
+                destination = target.joinpath(*parts)
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                    0o600,
+                )
+                try:
+                    view = memoryview(data)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise ConvergenceExecutionError(
+                                "short convergence contract materialization write"
+                            )
+                        view = view[written:]
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                total += len(data)
+                seen.add(relative)
+                records.append(
+                    {
+                        "path": relative,
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                        "bytes": len(data),
+                    }
+                )
+    except zipfile.BadZipFile as exc:
+        raise ConvergenceInputError("convergence wheel is not a valid zip archive") from exc
+    if not any(record["path"].startswith("protocol/") for record in records):
+        raise ConvergenceInputError("convergence wheel has no protocol contracts")
+    if not any(record["path"].startswith("profiles/") for record in records):
+        raise ConvergenceInputError("convergence wheel has no evidence profiles")
+    return hashlib.sha256(
+        json.dumps(
+            sorted(records, key=lambda item: item["path"]),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _load_runtime_bundle(expected_head: str) -> dict[str, Any] | None:
+    expected_head = _validate_git_oid(expected_head, label="expected_protocol_head")
+    manifest_path = _bundle_manifest_path(expected_head)
+    if not os.path.lexists(manifest_path):
+        return None
+    bundle_dir = manifest_path.parent
+    try:
+        root_info = _bundle_root().lstat()
+        dir_info = bundle_dir.lstat()
+    except OSError as exc:
+        raise ConvergenceInputError(f"convergence bundle path cannot be inspected: {exc}") from exc
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise ConvergenceInputError("convergence bundle root must be a real directory")
+    if not stat.S_ISDIR(dir_info.st_mode) or stat.S_ISLNK(dir_info.st_mode):
+        raise ConvergenceInputError("convergence bundle directory must be a real directory")
+
+    manifest_bytes = _read_regular_file(
+        manifest_path, maximum=MAX_BUNDLE_MANIFEST_BYTES, label="convergence bundle manifest"
+    )
+    manifest = _json_object(manifest_bytes, label="convergence bundle manifest")
+    required = {
+        "schema_version",
+        "kind",
+        "protocol_head",
+        "wheel_filename",
+        "wheel_sha256",
+        "profile_member",
+        "profile_sha256",
+    }
+    if set(manifest) != required:
+        raise ConvergenceInputError("convergence bundle manifest fields are invalid")
+    if (
+        manifest.get("schema_version") != BUNDLE_SCHEMA_VERSION
+        or manifest.get("kind") != BUNDLE_KIND
+        or manifest.get("protocol_head") != expected_head
+    ):
+        raise ConvergenceInputError("convergence bundle manifest identity mismatch")
+    wheel_filename = manifest.get("wheel_filename")
+    if (
+        not isinstance(wheel_filename, str)
+        or not wheel_filename.endswith(".whl")
+        or Path(wheel_filename).name != wheel_filename
+    ):
+        raise ConvergenceInputError("convergence bundle wheel filename is invalid")
+    wheel_sha256 = _validate_sha256(manifest.get("wheel_sha256"), label="wheel_sha256")
+    profile_sha256 = _validate_sha256(manifest.get("profile_sha256"), label="profile_sha256")
+    if manifest.get("profile_member") != RESILIENCE_PROFILE_MEMBER:
+        raise ConvergenceInputError("convergence bundle profile member is unsupported")
+
+    wheel_path = bundle_dir / wheel_filename
+    wheel_bytes = _read_regular_file(
+        wheel_path, maximum=MAX_BUNDLE_BYTES, label="convergence wheel"
+    )
+    if hashlib.sha256(wheel_bytes).hexdigest() != wheel_sha256:
+        raise ConvergenceInputError("convergence wheel SHA-256 mismatch")
+    profile, profile_bytes = _read_profile_from_wheel(
+        wheel_bytes, RESILIENCE_PROFILE_MEMBER
+    )
+    if hashlib.sha256(profile_bytes).hexdigest() != profile_sha256:
+        raise ConvergenceInputError("convergence resilience profile SHA-256 mismatch")
+    identity_sha256 = hashlib.sha256(
+        manifest_bytes + b"\0" + wheel_bytes
+    ).hexdigest()
+    return {
+        "manifest_path": str(manifest_path),
+        "bundle_dir": str(bundle_dir),
+        "protocol_head": expected_head,
+        "wheel_path": str(wheel_path),
+        "wheel_sha256": wheel_sha256,
+        "profile_sha256": profile_sha256,
+        "profile": profile,
+        "wheel_bytes": wheel_bytes,
+        "identity_sha256": identity_sha256,
+    }
+
+
+def _system_plan_material(context: dict[str, Any] | None) -> dict[str, Any]:
+    if context is None:
+        return {
+            "schema_version": 1,
+            "kind": "grabowski.system_convergence_plan",
+            "status": "unclassified",
+            "change_risk": None,
+            "target_criticality": None,
+            "protocol_head": None,
+            "profile_id": None,
+            "profile_cell_id": None,
+            "profile_sha256": None,
+            "protocol_source": None,
+            "required_effects": [],
+            "required_verifications": [],
+            "required_closure_fields": [],
+            "requires_resilience_evidence": None,
+            "requires_independent_recovery": None,
+            "systemic_closure_gate": "undetermined",
+            "hard_gate_required": None,
+            "criticality_resolution_required": False,
+            "admission_blocking": False,
+            "next_action": "classify change risk before claiming high-risk systemic convergence",
+            "does_not_establish": [
+                "task state",
+                "execution authority",
+                "merge authorization",
+                "deployment truth",
+                "systemic convergence",
+            ],
+        }
+    if not isinstance(context, dict):
+        raise ConvergenceInputError("system_convergence must be an object or null")
+    required = {"change_risk", "target_criticality", "expected_protocol_head"}
+    if set(context) != required:
+        raise ConvergenceInputError("system_convergence fields are invalid")
+    change_risk = context.get("change_risk")
+    target_criticality = context.get("target_criticality")
+    if change_risk not in ALLOWED_CHANGE_RISKS:
+        raise ConvergenceInputError("change_risk must be one of R0, R1, R2, R3")
+    if target_criticality not in ALLOWED_TARGET_CRITICALITIES:
+        raise ConvergenceInputError("target_criticality is unsupported")
+    expected_head = _validate_git_oid(
+        context.get("expected_protocol_head"), label="expected_protocol_head"
+    )
+    bundle = _load_runtime_bundle(expected_head)
+    if bundle is None:
+        raise ConvergenceExecutionError(
+            "immutable convergence runtime bundle is unavailable for the requested protocol head"
+        )
+    cells = bundle["profile"]["cells"]
+    matches = [
+        cell
+        for cell in cells
+        if isinstance(cell, dict)
+        and cell.get("change_risk") == change_risk
+        and cell.get("target_criticality") == target_criticality
+    ]
+    if len(matches) != 1:
+        raise ConvergenceExecutionError(
+            "convergence resilience profile does not contain exactly one requested matrix cell"
+        )
+    cell = matches[0]
+    for field in ("required_effects", "required_verifications", "required_closure_fields"):
+        value = cell.get(field)
+        if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+            raise ConvergenceExecutionError(f"convergence profile cell field {field} is invalid")
+    for field in ("requires_resilience_evidence", "requires_independent_recovery"):
+        if not isinstance(cell.get(field), bool):
+            raise ConvergenceExecutionError(f"convergence profile cell field {field} is invalid")
+    cell_id = cell.get("cell_id")
+    if not isinstance(cell_id, str) or not cell_id:
+        raise ConvergenceExecutionError("convergence profile cell id is invalid")
+
+    criticality_resolution_required = (
+        change_risk in {"R2", "R3"} and target_criticality == "unknown"
+    )
+    if criticality_resolution_required:
+        systemic_closure_gate = "classification_required"
+        hard_gate_required: bool | None = True if change_risk == "R3" else None
+    elif change_risk == "R3" or (
+        change_risk == "R2" and target_criticality in {"essential", "foundational"}
+    ):
+        systemic_closure_gate = "hard"
+        hard_gate_required = True
+    elif change_risk == "R2":
+        systemic_closure_gate = "assessment_required"
+        hard_gate_required = False
+    else:
+        systemic_closure_gate = "not_required"
+        hard_gate_required = False
+
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.system_convergence_plan",
+        "status": "planned",
+        "change_risk": change_risk,
+        "target_criticality": target_criticality,
+        "protocol_head": expected_head,
+        "profile_id": bundle["profile"]["profile_id"],
+        "profile_cell_id": cell_id,
+        "profile_sha256": bundle["profile_sha256"],
+        "protocol_source": "immutable_bundle",
+        "bundle_identity_sha256": bundle["identity_sha256"],
+        "wheel_sha256": bundle["wheel_sha256"],
+        "required_effects": list(cell["required_effects"]),
+        "required_verifications": list(cell["required_verifications"]),
+        "required_closure_fields": list(cell["required_closure_fields"]),
+        "requires_resilience_evidence": cell["requires_resilience_evidence"],
+        "requires_independent_recovery": cell["requires_independent_recovery"],
+        "systemic_closure_gate": systemic_closure_gate,
+        "hard_gate_required": hard_gate_required,
+        "criticality_resolution_required": criticality_resolution_required,
+        "admission_blocking": False,
+        "next_action": (
+            "resolve target criticality before systemic closure"
+            if criticality_resolution_required
+            else "collect the planned evidence and require terminally_closed before systemic closure"
+            if systemic_closure_gate == "hard"
+            else "collect the planned evidence; ordinary delivery may close independently of systemic convergence"
+            if systemic_closure_gate == "assessment_required"
+            else "use ordinary delivery closeout; no universal convergence gate is required"
+        ),
+        "does_not_establish": [
+            "task state",
+            "execution authority",
+            "merge authorization",
+            "deployment truth",
+            "evidence satisfaction",
+            "systemic convergence",
+        ],
+    }
+
+
+def build_system_convergence_plan(
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    material = _system_plan_material(context)
+    return {**material, "plan_sha256": _sha256_canonical(material)}
 
 
 def _validate_sha256(value: Any, *, label: str) -> str:
@@ -233,7 +593,12 @@ def _validate_assessment(value: Any, returncode: int) -> dict[str, Any]:
     return value
 
 
-def _default_evaluator_runner(cwd: Path, argv: list[str]) -> dict[str, Any]:
+def _default_evaluator_runner(
+    cwd: Path,
+    argv: list[str],
+    *,
+    extra_environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
     env = {
         "HOME": str(Path.home()),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
@@ -241,6 +606,8 @@ def _default_evaluator_runner(cwd: Path, argv: list[str]) -> dict[str, Any]:
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "PYTHONNOUSERSITE": "1",
     }
+    if extra_environment:
+        env.update(extra_environment)
     try:
         completed = subprocess.run(
             argv,
@@ -274,17 +641,59 @@ def assess(
     request_path, request_bytes = _read_bound_request(
         parameters.get("request_path"), expected_request_sha256
     )
-    repo = _protocol_repo()
-    executable = _protocol_executable(repo)
-    observed_head, executable_sha256 = _validate_protocol_identity(
-        runner, repo, executable, expected_protocol_head
-    )
-    result = _run_checked(
-        evaluator_runner or _default_evaluator_runner,
-        repo,
-        [str(executable), "evaluate", str(request_path)],
-        label="convergence evaluation",
-    )
+    bundle = _load_runtime_bundle(expected_protocol_head)
+    temporary_contract_root = None
+    if bundle is not None:
+        protocol_source = "immutable_bundle"
+        repo: Path | None = None
+        observed_head = expected_protocol_head
+        executable_sha256 = bundle["wheel_sha256"]
+        evaluation_cwd = Path(bundle["bundle_dir"])
+        temporary_contract_root = tempfile.TemporaryDirectory(
+            prefix="grabowski-convergence-contracts-"
+        )
+        materialized_contract_root = Path(temporary_contract_root.name)
+        contracts_sha256 = _materialize_contract_root(
+            bundle["wheel_bytes"], materialized_contract_root
+        )
+        evaluation_argv = [
+            sys.executable,
+            "-m",
+            "regelkreis.cli",
+            "evaluate",
+            str(request_path),
+            "--contract-root",
+            str(materialized_contract_root),
+        ]
+        if evaluator_runner is None:
+            def selected_runner(cwd: Path, argv: list[str]) -> dict[str, Any]:
+                return _default_evaluator_runner(
+                    cwd,
+                    argv,
+                    extra_environment={"PYTHONPATH": bundle["wheel_path"]},
+                )
+        else:
+            selected_runner = evaluator_runner
+    else:
+        protocol_source = "verified_checkout"
+        repo = _protocol_repo()
+        executable = _protocol_executable(repo)
+        observed_head, executable_sha256 = _validate_protocol_identity(
+            runner, repo, executable, expected_protocol_head
+        )
+        evaluation_cwd = repo
+        evaluation_argv = [str(executable), "evaluate", str(request_path)]
+        selected_runner = evaluator_runner or _default_evaluator_runner
+    try:
+        result = _run_checked(
+            selected_runner,
+            evaluation_cwd,
+            evaluation_argv,
+            label="convergence evaluation",
+        )
+    finally:
+        if temporary_contract_root is not None:
+            temporary_contract_root.cleanup()
     if result["returncode"] not in set(STATUS_EXIT_CODES.values()):
         detail = result["stderr"].strip() or f"unexpected exit code {result['returncode']}"
         raise ConvergenceExecutionError(f"convergence evaluation failed: {detail}")
@@ -293,21 +702,37 @@ def assess(
     except json.JSONDecodeError as exc:
         raise ConvergenceExecutionError("convergence evaluator returned invalid JSON") from exc
     assessment = _validate_assessment(parsed, result["returncode"])
-    post_head, post_executable_sha256 = _validate_protocol_identity(
-        runner, repo, executable, expected_protocol_head
-    )
-    if post_head != observed_head or post_executable_sha256 != executable_sha256:
-        raise ConvergenceExecutionError(
-            "convergence protocol identity changed during evaluation"
+    if bundle is not None:
+        post_bundle = _load_runtime_bundle(expected_protocol_head)
+        if (
+            post_bundle is None
+            or post_bundle["identity_sha256"] != bundle["identity_sha256"]
+            or post_bundle["wheel_sha256"] != executable_sha256
+        ):
+            raise ConvergenceExecutionError(
+                "convergence runtime bundle identity changed during evaluation"
+            )
+    else:
+        assert repo is not None
+        post_head, post_executable_sha256 = _validate_protocol_identity(
+            runner, repo, executable, expected_protocol_head
         )
+        if post_head != observed_head or post_executable_sha256 != executable_sha256:
+            raise ConvergenceExecutionError(
+                "convergence protocol identity changed during evaluation"
+            )
     closure_allowed = assessment["status"] == "terminally_closed"
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "grabowski.convergence_assessment",
         "request_path": str(request_path),
         "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
-        "protocol_repo": str(repo),
+        "protocol_repo": str(repo) if repo is not None else None,
         "protocol_head": observed_head,
+        "protocol_source": protocol_source,
+        "bundle_manifest_path": (bundle["manifest_path"] if bundle is not None else None),
+        "bundle_identity_sha256": (bundle["identity_sha256"] if bundle is not None else None),
+        "contracts_sha256": (contracts_sha256 if bundle is not None else None),
         "executable_sha256": executable_sha256,
         "assessment": assessment,
         "closure_allowed": closure_allowed,

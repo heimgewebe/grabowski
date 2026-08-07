@@ -177,6 +177,58 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertTrue(result["read_only"])
         self.assertEqual(len(result["assessment_sha256"]), 64)
 
+    def test_work_admission_always_projects_non_authoritative_system_convergence_plan(self) -> None:
+        result = self._assess([self._main()])
+        plan = result["system_convergence_plan"]
+        self.assertEqual(plan["status"], "unclassified")
+        self.assertFalse(plan["admission_blocking"])
+        self.assertEqual(plan["systemic_closure_gate"], "undetermined")
+        self.assertIn("systemic convergence completion", result["does_not_establish"])
+
+    def test_supplied_risk_plan_is_attached_without_becoming_admission_authority(self) -> None:
+        expected = {
+            "schema_version": 1,
+            "kind": "grabowski.system_convergence_plan",
+            "status": "planned",
+            "systemic_closure_gate": "hard",
+            "hard_gate_required": True,
+            "admission_blocking": False,
+            "plan_sha256": "c" * 64,
+        }
+        context = {
+            "change_risk": "R2",
+            "target_criticality": "essential",
+            "expected_protocol_head": "d" * 40,
+        }
+        seen = []
+        def planner(value):
+            seen.append(value)
+            return expected
+        result = self._assess(
+            [self._main()],
+            system_convergence=context,
+            convergence_planner=planner,
+        )
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["system_convergence_plan"], expected)
+        self.assertEqual(seen, [context])
+
+    def test_missing_runtime_bundle_does_not_block_work_admission(self) -> None:
+        def unavailable(_value):
+            raise admission.convergence.ConvergenceExecutionError("bundle absent")
+        result = self._assess(
+            [self._main()],
+            system_convergence={
+                "change_risk": "R3",
+                "target_criticality": "foundational",
+                "expected_protocol_head": "d" * 40,
+            },
+            convergence_planner=unavailable,
+        )
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["system_convergence_plan"]["status"], "unavailable")
+        self.assertFalse(result["system_convergence_plan"]["admission_blocking"])
+
     def test_dirty_or_foreign_live_work_blocks_fail_closed(self) -> None:
         dirty = self._assess(
             [self._main(), self._linked(state="retained", dirty=True, owner="owner-a")]
