@@ -367,13 +367,15 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "transport-roundtrip": GripSpec(
         name="transport-roundtrip",
-        version="2.0",
+        version="2.1",
         summary=(
             "Issue a private exact-target challenge or atomically execute its target. "
-            "action=begin requires target_tool_name and target_arguments; action=execute "
-            "requires the returned challenge plus the unchanged target. action=ack remains "
-            "available only for a stable client-declared scope and is fail-closed for "
-            "shared_unlabeled callers."
+            "action=begin requires target_tool_name and target_arguments. On the MCP "
+            "surface, action=execute can use only the returned challenge when the exact "
+            "target was retained by the immediately preceding shared_unlabeled mutation "
+            "attempt; explicit unchanged target fields remain supported for compatibility. "
+            "action=ack remains available only for a stable client-declared scope and is "
+            "fail-closed for shared_unlabeled callers."
         ),
         effect=MUTATING,
         required_parameters=("action",),
@@ -645,11 +647,12 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
         "required readback before any retry; never substitute generic fail, release or force-release"
     ),
     "transport-roundtrip": (
-        "run action=begin with the exact target_tool_name and target_arguments, then "
-        "action=execute with the private challenge and unchanged target; the server "
-        "reserves, consumes and dispatches through the normal central gate in one bounded "
-        "operation. After an ambiguous target result, read back the target before any new "
-        "challenge; no transport receipt grants retry authority"
+        "invoke the mutating MCP target normally; for shared_unlabeled callers, continue "
+        "with action=execute and the returned challenge only while the server-retained "
+        "target is fresh. Explicit action=begin plus unchanged target fields remains the "
+        "compatibility path. The server reserves, consumes and dispatches through the "
+        "normal central gate in one bounded operation. After an ambiguous target result, "
+        "read back the target before any new challenge; no transport receipt grants retry authority"
     ),
 }
 # Conditional requirements cannot be expressed as static required_parameters,
@@ -658,8 +661,9 @@ GRIP_CONDITIONAL_PRECONDITIONS = {
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
         "an unbound begin is refused fail-closed",
-        "action=execute requires challenge_receipt_sha256, target_tool_name and "
-        "target_arguments together and dispatches the target through the normal MCP gate",
+        "action=execute requires challenge_receipt_sha256; the MCP wrapper may inject the "
+        "fresh server-retained exact target, otherwise target_tool_name and target_arguments "
+        "must be supplied together for compatibility",
         "action=ack requires challenge_receipt_sha256 and must not carry target fields; "
         "shared_unlabeled callers are refused and must use action=execute",
     ),

@@ -969,5 +969,53 @@ class UnboundVerificationAuthorizesNothingTests(_TransportHarness):
             )
 
 
+    def test_cancel_pending_execution_challenge_establishes_safe_retry(self) -> None:
+        begun = self.begin(scope=SHARED_SCOPE)
+        challenge = begun["challenge_receipt_sha256"]
+        cancelled = roundtrip.cancel_pending_execution_challenge(
+            client_scope=SHARED_SCOPE,
+            challenge_receipt_sha256=challenge,
+            runtime_binding=BINDING,
+            now_unix=101,
+        )
+        self.assertEqual(cancelled["state"], "cancelled_pending")
+        self.assertTrue(cancelled["cancelled"])
+        self.assertFalse(cancelled["effect_possible"])
+        with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
+            self.reserve(challenge, now=102)
+
+    def test_cancel_pending_execution_challenge_refuses_reserved_target(self) -> None:
+        begun = self.begin(scope=SHARED_SCOPE)
+        challenge = begun["challenge_receipt_sha256"]
+        self.reserve(challenge, now=101)
+        refused = roundtrip.cancel_pending_execution_challenge(
+            client_scope=SHARED_SCOPE,
+            challenge_receipt_sha256=challenge,
+            runtime_binding=BINDING,
+            now_unix=102,
+        )
+        self.assertEqual(refused["state"], "reserved")
+        self.assertFalse(refused["cancelled"])
+        self.assertTrue(refused["effect_possible"])
+        consumed, _ = self.consume_reserved(challenge, now=103)
+        self.assertEqual(consumed["state"], "consumed")
+
+    def test_cancel_pending_execution_challenge_marks_consumed_target_ambiguous(self) -> None:
+        begun = self.begin(scope=SHARED_SCOPE)
+        challenge = begun["challenge_receipt_sha256"]
+        self.reserve(challenge, now=101)
+        self.consume_reserved(challenge, now=102)
+        refused = roundtrip.cancel_pending_execution_challenge(
+            client_scope=SHARED_SCOPE,
+            challenge_receipt_sha256=challenge,
+            runtime_binding=BINDING,
+            now_unix=103,
+        )
+        self.assertEqual(refused["state"], "consumed")
+        self.assertFalse(refused["cancelled"])
+        self.assertTrue(refused["effect_possible"])
+        self.assertIn("readback", refused["recommended_next_action"])
+
+
 if __name__ == "__main__":
     unittest.main()
