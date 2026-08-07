@@ -2938,6 +2938,86 @@ class TaskTests(unittest.TestCase):
         self.assertIsNone(tasks.resources.inspect_resource(unrelated_key))
         self.assertIsNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
+    def test_admitted_feature_branch_can_enter_reposkop_control_without_attestation_run(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        base = tasks.reposkop_effectiveness.classify_task_effect(
+            transport="local",
+            argv=argv,
+            mutating_workspace=str(self.root),
+        )
+        control_key = next(
+            f"{index:024x}"
+            for index in range(1, 256)
+            if tasks.reposkop_effectiveness.select_prospective_policy(
+                base, sampling_key=f"{index:024x}", admission_verified=True
+            )["reposkop_cohort"]
+            == "prospective_control"
+        )
+        fake_uuid = types.SimpleNamespace(hex=control_key + "0" * 8)
+        tasks.resources.work_admission.require_repository_admission.return_value = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_admission",
+            "repository": str(self.root),
+            "decision": "allow",
+            "assessment_sha256": "a" * 64,
+            "read_only": True,
+        }
+        with patch.object(tasks.uuid, "uuid4", return_value=fake_uuid), patch.object(
+            tasks, "_workspace_scope_identity", return_value=("1" * 40, "feat/test-control")
+        ), patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        classification = result["task_effect_classification"]
+        self.assertEqual(classification["reposkop_cohort"], "prospective_control")
+        self.assertEqual(classification["reposkop_policy"], "not_required")
+        self.assertIs(classification["prospective_admission_verified"], True)
+        self.reposkop_attestation_mock.assert_not_called()
+        attestation = result["reposkop_execution_attestation"]
+        self.assertIsNotNone(attestation)
+        self.assertIs(attestation["reposkop_execution_skipped"], True)
+        self.assertIs(attestation["required"], False)
+        self.assertEqual(attestation["status"], "skipped_control")
+        self.assertEqual(attestation["task_id"], control_key)
+        self.assertRegex(attestation["decision_audit_ref"], r"^audit-record-sha256:[0-9a-f]{64}$")
+        self.assertIs(result["audit"]["reposkop_execution_attestation_required"], False)
+        self.assertEqual(result["audit"]["reposkop_cohort"], "prospective_control")
+        self.assertIsNotNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
+
+    def test_main_branch_and_exact_path_writers_remain_reposkop_required(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        tasks.resources.work_admission.require_repository_admission.return_value = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_admission",
+            "repository": str(self.root),
+            "decision": "allow",
+            "assessment_sha256": "a" * 64,
+            "read_only": True,
+        }
+        with patch.object(
+            tasks, "_workspace_scope_identity", return_value=("1" * 40, "main")
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 158}
+        ):
+            main_result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+        self.assertEqual(main_result["task_effect_classification"]["reposkop_policy"], "required")
+        self.assertEqual(main_result["task_effect_classification"]["reposkop_cohort"], "risk_required")
+
     def test_mutating_agent_reposkop_failure_releases_lease_before_launch(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         self.reposkop_attestation_mock.side_effect = RuntimeError(

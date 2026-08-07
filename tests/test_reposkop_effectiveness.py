@@ -89,6 +89,60 @@ class ReposkopEffectivenessTests(unittest.TestCase):
                 self.assertEqual(result["reposkop_policy"], "required")
                 self.assertEqual(result["agent_executable"], executable)
 
+    def test_prospective_policy_splits_only_admitted_workspace_writers(self) -> None:
+        base = effectiveness.classify_task_effect(
+            transport="local",
+            argv=["/opt/codex", "exec", "--sandbox", "workspace-write"],
+            mutating_workspace="/repo",
+        )
+        self.assertEqual(base["reposkop_cohort"], "risk_required")
+        not_admitted = effectiveness.select_prospective_policy(
+            base, sampling_key="not-admitted", admission_verified=False
+        )
+        self.assertEqual(not_admitted["reposkop_policy"], "required")
+        self.assertEqual(not_admitted["reposkop_cohort"], "risk_required")
+
+        assignments = [
+            effectiveness.select_prospective_policy(
+                base, sampling_key=f"task-{index}", admission_verified=True
+            )
+            for index in range(32)
+        ]
+        cohorts = {item["reposkop_cohort"] for item in assignments}
+        self.assertEqual(cohorts, {"prospective_sample", "prospective_control"})
+        control = next(
+            item for item in assignments if item["reposkop_cohort"] == "prospective_control"
+        )
+        sample = next(
+            item for item in assignments if item["reposkop_cohort"] == "prospective_sample"
+        )
+        self.assertEqual(control["reposkop_policy"], "not_required")
+        self.assertEqual(sample["reposkop_policy"], "required")
+        self.assertEqual(control["sampling_modulus"], 4)
+        replay = effectiveness.select_prospective_policy(
+            base, sampling_key="task-1", admission_verified=True
+        )
+        self.assertEqual(
+            replay,
+            effectiveness.select_prospective_policy(
+                base, sampling_key="task-1", admission_verified=True
+            ),
+        )
+
+    def test_repository_write_never_enters_prospective_control(self) -> None:
+        base = effectiveness.classify_task_effect(
+            transport="local",
+            argv=["/opt/codex", "exec", "--sandbox", "workspace-write"],
+            mutating_workspace="/repo",
+            explicit_effect_profile="repository_write",
+        )
+        selected = effectiveness.select_prospective_policy(
+            base, sampling_key="repository-write", admission_verified=True
+        )
+        self.assertEqual(selected["reposkop_policy"], "required")
+        self.assertEqual(selected["reposkop_cohort"], "repository_write_required")
+        self.assertIsNone(selected["sampling_bucket"])
+
     def test_agent_read_only_modes_do_not_require_reposkop(self) -> None:
         cases = [
             ["/opt/codex", "exec", "--sandbox", "read-only"],
@@ -723,6 +777,121 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(candidates["false_positive_cluster"]["status"], "insufficient_sample")
         self.assertEqual(candidates["false_negative_cluster"]["status"], "clear")
 
+
+    def test_prospective_control_rejects_impossible_positive_review(self) -> None:
+        evaluation = "e" * 64
+        decision_ref = _ref("d")
+        outcome_ref = _ref("e")
+        records = [
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "d",
+                task_id="task-control",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                final_decision="allow",
+                decision_changed=False,
+                reposkop_execution_skipped=True,
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "e",
+                task_id="task-control",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                terminal_state="completed",
+            ),
+        ]
+        base = {
+            "evaluation_id": evaluation,
+            "reviewer": "operator:reviewer",
+            "scope": "repository",
+            "detectable_category": "not_applicable",
+            "reason_codes": ["prospective_control"],
+            "evidence_refs": [decision_ref, outcome_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+        with patch.object(
+            effectiveness, "_review_records", return_value=(records, {})
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewInputError,
+            "prospective control decisions",
+        ):
+            effectiveness.record_review_classification(
+                {**base, "classification": "beneficial_context"}
+            )
+
+    def test_projection_counts_prospective_control_false_negative(self) -> None:
+        sample = "4" * 64
+        control = "5" * 64
+        records = [
+            _event(
+                "reposkop-evaluation-requested",
+                sample,
+                "1",
+                reposkop_cohort="prospective_sample",
+                policy_version=3,
+            ),
+            _event(
+                "reposkop-evaluation-completed",
+                sample,
+                "2",
+                reposkop_cohort="prospective_sample",
+                policy_version=3,
+                duration_ms=10,
+            ),
+            _event(
+                "reposkop-decision-applied",
+                sample,
+                "3",
+                reposkop_cohort="prospective_sample",
+                policy_version=3,
+                final_decision="allow",
+            ),
+            _event(
+                "reposkop-decision-applied",
+                control,
+                "4",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                policy_version=3,
+                final_decision="allow",
+                reposkop_execution_skipped=True,
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                control,
+                "5",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                policy_version=3,
+                terminal_state="failed",
+            ),
+            _event(
+                "reposkop-review-classification-recorded",
+                control,
+                "6",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                policy_version=3,
+                classification="false_negative",
+                detectable_category="working_tree_state",
+                reason_codes=["later_repository_failure"],
+                review_sequence=1,
+            ),
+        ]
+        result = effectiveness.project_records(records)
+        self.assertEqual(result["prospective"]["sample_required"], 1)
+        self.assertEqual(result["prospective"]["control_allowed_without_reposkop"], 1)
+        self.assertEqual(result["prospective"]["control_reviewed"], 1)
+        self.assertEqual(result["prospective"]["control_false_negatives"], 1)
+        self.assertEqual(result["prospective"]["control_terminal_outcomes"], 1)
+        self.assertEqual(result["review"]["false_negatives"], 1)
+        self.assertEqual(result["review"]["reviewed_evaluations"], 1)
+        self.assertEqual(result["review"]["unreviewed_evaluations"], 1)
 
     def test_false_positive_cluster_requires_same_detectable_category(self) -> None:
         records: list[dict[str, object]] = []

@@ -28,14 +28,23 @@ EffectProfile = Literal[
     "unknown",
 ]
 ReposkopPolicy = Literal["required", "not_required"]
+ReposkopCohort = Literal[
+    "not_applicable",
+    "risk_required",
+    "repository_write_required",
+    "prospective_sample",
+    "prospective_control",
+]
 EFFECT_PROFILES = frozenset(get_args(EffectProfile))
 REPOSKOP_POLICIES = frozenset(get_args(ReposkopPolicy))
 AGENT_EXECUTABLES = frozenset(
     {"agy", "claude", "cline", "codex", "grok", "grok-cli", "opencode", "openhands"}
 )
 READ_ONLY_AGENT_MODES = frozenset({"plan", "read-only"})
-POLICY_VERSION = 2
+POLICY_VERSION = 3
 SURFACE = "task_start"
+PROSPECTIVE_SAMPLE_MODULUS = 4
+PROSPECTIVE_SAMPLE_BUCKET = 0
 MAX_SCAN_LIMIT = 50_000
 DEFAULT_SCAN_LIMIT = 10_000
 MAX_SAMPLE_REFS = 20
@@ -145,6 +154,7 @@ def classify_task_effect(
             "surface": SURFACE,
             "effect_profile": profile,
             "reposkop_policy": "not_required",
+            "reposkop_cohort": "not_applicable",
             "agent_executable": None,
             "classification_source": "explicit" if explicit is not None else "legacy_default_unknown",
         }
@@ -161,6 +171,7 @@ def classify_task_effect(
             "surface": SURFACE,
             "effect_profile": derived,
             "reposkop_policy": "not_required",
+            "reposkop_cohort": "not_applicable",
             "agent_executable": executable,
             "classification_source": "explicit" if explicit is not None else "agent_command",
         }
@@ -176,6 +187,7 @@ def classify_task_effect(
             "surface": SURFACE,
             "effect_profile": "read_only",
             "reposkop_policy": "not_required",
+            "reposkop_cohort": "not_applicable",
             "agent_executable": executable,
             "classification_source": "explicit" if explicit is not None else "agent_command",
         }
@@ -193,9 +205,78 @@ def classify_task_effect(
         "surface": SURFACE,
         "effect_profile": profile,
         "reposkop_policy": "required",
+        "reposkop_cohort": (
+            "repository_write_required"
+            if profile == "repository_write"
+            else "risk_required"
+        ),
         "agent_executable": executable,
         "classification_source": "explicit" if explicit is not None else "agent_command",
     }
+
+
+def select_prospective_policy(
+    classification: dict[str, Any],
+    *,
+    sampling_key: str,
+    admission_verified: bool,
+) -> dict[str, Any]:
+    """Select one deterministic v3 sample/control cohort after repository admission.
+
+    Only workspace-scoped local writers with a separately verified broad-repository
+    admission are eligible for the control arm. Everything else retains the
+    fail-closed required posture selected by ``classify_task_effect``.
+    """
+    if not isinstance(classification, dict):
+        raise ValueError("classification must be an object")
+    if not isinstance(admission_verified, bool):
+        raise ValueError("admission_verified must be a boolean")
+    if not isinstance(sampling_key, str) or not sampling_key.strip():
+        raise ValueError("sampling_key must be non-empty text")
+    result = dict(classification)
+    result.setdefault(
+        "reposkop_cohort",
+        "risk_required"
+        if result.get("reposkop_policy") == "required"
+        else "not_applicable",
+    )
+    result.update(
+        {
+            "prospective_admission_verified": admission_verified,
+            "sampling_modulus": None,
+            "sampling_bucket": None,
+            "sampling_key_sha256": None,
+        }
+    )
+    if (
+        result.get("reposkop_policy") != "required"
+        or result.get("effect_profile") != "workspace_write"
+        or not admission_verified
+    ):
+        return result
+    key_sha256 = hashlib.sha256(sampling_key.encode("utf-8")).hexdigest()
+    assignment_sha256 = _sha256_json(
+        {
+            "policy_version": POLICY_VERSION,
+            "surface": result.get("surface"),
+            "sampling_key_sha256": key_sha256,
+            "modulus": PROSPECTIVE_SAMPLE_MODULUS,
+        }
+    )
+    bucket = int(assignment_sha256[:16], 16) % PROSPECTIVE_SAMPLE_MODULUS
+    sampled = bucket == PROSPECTIVE_SAMPLE_BUCKET
+    result.update(
+        {
+            "reposkop_policy": "required" if sampled else "not_required",
+            "reposkop_cohort": (
+                "prospective_sample" if sampled else "prospective_control"
+            ),
+            "sampling_modulus": PROSPECTIVE_SAMPLE_MODULUS,
+            "sampling_bucket": bucket,
+            "sampling_key_sha256": key_sha256,
+        }
+    )
+    return result
 
 
 def evaluation_id(
@@ -941,6 +1022,15 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
     final_decision = decision.get("final_decision")
     if final_decision not in {"allow", "block"}:
         raise ReposkopReviewIntegrityError("Reposkop decision outcome is unsupported")
+    decision_cohort = decision.get("reposkop_cohort")
+    if decision_cohort == "prospective_control" and classification not in {
+        "neutral",
+        "false_negative",
+        "unresolved",
+    }:
+        raise ReposkopReviewInputError(
+            "prospective control decisions may only be neutral, false_negative or unresolved"
+        )
     if classification in {"confirmed_prevention", "false_positive", "operational_failure"} and final_decision != "block":
         raise ReposkopReviewInputError(
             f"classification={classification} requires a blocked evaluation"
@@ -1149,7 +1239,35 @@ def project_records(
         if isinstance(state, str):
             projection_states[state] = projection_states.get(state, 0) + 1
 
-    reviewed_ids = required_ids & set(reviews)
+    prospective_control_ids = {
+        evaluation
+        for evaluation, decision in decisions.items()
+        if decision.get("reposkop_cohort") == "prospective_control"
+        and decision.get("final_decision") == "allow"
+    }
+    prospective_sample_ids = {
+        evaluation
+        for evaluation in required_ids
+        if (decisions.get(evaluation) or attempts.get(evaluation, {})).get(
+            "reposkop_cohort"
+        ) == "prospective_sample"
+    }
+    risk_required_ids = {
+        evaluation
+        for evaluation in required_ids
+        if (decisions.get(evaluation) or attempts.get(evaluation, {})).get(
+            "reposkop_cohort"
+        ) == "risk_required"
+    }
+    repository_write_required_ids = {
+        evaluation
+        for evaluation in required_ids
+        if (decisions.get(evaluation) or attempts.get(evaluation, {})).get(
+            "reposkop_cohort"
+        ) == "repository_write_required"
+    }
+    reviewable_ids = required_ids | prospective_control_ids
+    reviewed_ids = reviewable_ids & set(reviews)
     review_counts = {name: 0 for name in sorted(REVIEW_CLASSIFICATIONS)}
     review_evidence_refs: dict[str, list[str]] = {name: [] for name in REVIEW_CLASSIFICATIONS}
     review_reason_clusters: dict[str, dict[str, int]] = {
@@ -1384,8 +1502,10 @@ def project_records(
         },
         "review": {
             "reviewed_evaluations": len(reviewed_ids),
-            "unreviewed_evaluations": len(required_ids - reviewed_ids),
-            "review_coverage_ratio": len(reviewed_ids) / required_count if required_count else None,
+            "unreviewed_evaluations": len(reviewable_ids - reviewed_ids),
+            "review_coverage_ratio": (
+                len(reviewed_ids) / len(reviewable_ids) if reviewable_ids else None
+            ),
             "classification_counts": review_counts,
             "confirmed_preventions": confirmed_preventions,
             "false_positives": false_positives,
@@ -1409,6 +1529,30 @@ def project_records(
                     review_category_clusters.items()
                 )
             },
+        },
+        "prospective": {
+            "sample_required": len(prospective_sample_ids),
+            "control_allowed_without_reposkop": len(prospective_control_ids),
+            "risk_required": len(risk_required_ids),
+            "repository_write_required": len(repository_write_required_ids),
+            "control_reviewed": len(prospective_control_ids & reviewed_ids),
+            "control_false_negatives": sum(
+                1
+                for evaluation in prospective_control_ids
+                if reviews.get(evaluation, {}).get("classification") == "false_negative"
+            ),
+            "sample_confirmed_preventions": sum(
+                1
+                for evaluation in prospective_sample_ids
+                if reviews.get(evaluation, {}).get("classification")
+                == "confirmed_prevention"
+            ),
+            "control_terminal_outcomes": len(prospective_control_ids & set(outcomes)),
+            "control_terminal_successes": sum(
+                1
+                for evaluation in prospective_control_ids & set(outcomes)
+                if outcomes[evaluation].get("terminal_state") == "completed"
+            ),
         },
         "duration_ms": {
             "sample_size": len(durations),
@@ -1505,6 +1649,7 @@ def record_task_outcome(
         "task_id": task_id,
         "effect_profile": attestation.get("effect_profile"),
         "reposkop_policy": attestation.get("reposkop_policy"),
+        "reposkop_cohort": attestation.get("reposkop_cohort"),
         "surface": attestation.get("surface"),
         "agent_executable": attestation.get("agent_executable"),
         "policy_version": attestation.get("policy_version"),
