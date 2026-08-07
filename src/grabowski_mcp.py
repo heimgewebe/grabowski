@@ -5305,6 +5305,9 @@ def _operator_system_overview(
         )
 
     snapshot_observable = bool(client_snapshot.get("observable"))
+    platform_connector_snapshot_observable = bool(
+        client_snapshot.get("platform_connector_snapshot_observable")
+    )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
@@ -5318,7 +5321,7 @@ def _operator_system_overview(
     operator_ready = (
         runtime_healthy
         and coding_agent_catalog_ready
-        and snapshot_observable
+        and platform_connector_snapshot_observable
         and truth_model_ready
         and components_observable
     )
@@ -5331,6 +5334,13 @@ def _operator_system_overview(
             client_snapshot.get(
                 "recommended_next_action",
                 "bind the current connector client snapshot",
+            )
+        )
+    elif not platform_connector_snapshot_observable:
+        next_action = str(
+            client_snapshot.get(
+                "recommended_next_action",
+                "bind a platform connector snapshot to establish published tool visibility",
             )
         )
     elif not tasks.get("available"):
@@ -5417,7 +5427,7 @@ def _operator_system_overview(
         "readiness": {
             "runtime_ready": runtime_healthy,
             "coding_agent_catalog_ready": coding_agent_catalog_ready,
-            "connector_snapshot_ready": snapshot_observable,
+            "connector_snapshot_ready": platform_connector_snapshot_observable,
             "truth_model_ready": truth_model_ready,
             "components_observable": components_observable,
         },
@@ -5426,6 +5436,8 @@ def _operator_system_overview(
         "connector": {
             "state": client_snapshot.get("state"),
             "observable": snapshot_observable,
+            "platform_snapshot_observable": platform_connector_snapshot_observable,
+            "server_loopback_observable": client_snapshot.get("server_loopback_observable"),
             "fresh": client_snapshot.get("fresh"),
             "matched": client_snapshot.get("matched"),
             "verification_model": client_snapshot.get("verification_model"),

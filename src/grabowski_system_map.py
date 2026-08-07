@@ -42,6 +42,9 @@ def build_component_map(
     )
     obligation_attention = int(obligations.get("attention_count") or 0)
     active_leases = int(leases.get("active_count") or 0)
+    connector_observable = bool(
+        client_snapshot.get("platform_connector_snapshot_observable")
+    )
     components = [
         {
             "id": "grabowski",
@@ -56,17 +59,21 @@ def build_component_map(
             "role": "ChatGPT-to-runtime transport binding",
             "authority": "client snapshot handshake",
             "signal": overview_signal(
-                observable=bool(client_snapshot.get("observable")),
+                observable=connector_observable,
                 healthy=(
                     bool(client_snapshot.get("matched"))
-                    if client_snapshot.get("observable")
+                    if connector_observable
                     else None
                 ),
             ),
-            "observed": bool(client_snapshot.get("observable")),
+            "observed": connector_observable,
             "evidence": {
                 "fresh": client_snapshot.get("fresh"),
                 "matched": client_snapshot.get("matched"),
+                "platform_connector_snapshot_observable": connector_observable,
+                "server_loopback_observable": client_snapshot.get(
+                    "server_loopback_observable"
+                ),
             },
         },
         {
