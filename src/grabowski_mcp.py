@@ -94,7 +94,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "convergence-before-high-risk-closure",
-        "Before marking deployment, runtime, security, data, or irreversible work completed, call grip_run with convergence-assess on a hash-bound request and require terminally_closed; bind the resulting receipt into the completion evidence. A nonterminal assessment blocks completion but grants no mutation authority.",
+        "Bind a risk-adaptive system_convergence_plan at work admission when classification evidence is available. Ordinary work or delivery closeout is not itself a systemic-convergence claim. Before claiming systemic convergence, resolve target criticality when the plan says classification_required; when systemic_closure_gate=hard, call grip_run with convergence-assess on a hash-bound request and require terminally_closed, binding its receipt into the systemic completion evidence. A nonterminal assessment blocks only the systemic-convergence claim and grants no mutation authority.",
     ),
     (
         "no-authority-escalation",
