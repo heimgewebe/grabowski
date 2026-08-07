@@ -499,6 +499,65 @@ class ConsumerSurfaceTests(unittest.TestCase):
             overview["source_registry"]["repobrief"]["display_name"],
         )
 
+
+    def test_operator_system_overview_requires_platform_connector_observation(self) -> None:
+        fake_tasks = SimpleNamespace(
+            grabowski_task_list=lambda **_kwargs: {
+                "state_counts": {},
+                "projection_counts": {},
+                "projection_counts_overlap": False,
+                "unknown_state_count": 0,
+                "state_counts_complete": True,
+            }
+        )
+        fake_resources = SimpleNamespace(count_resources=lambda **_kwargs: 0)
+        fake_obligations = SimpleNamespace(
+            list_obligations=lambda _parameters: {
+                "record_count": 0,
+                "integrity_errors": [],
+                "scan_truncated": False,
+            }
+        )
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "grabowski_tasks": fake_tasks,
+                "grabowski_resources": fake_resources,
+                "grabowski_operator_obligation": fake_obligations,
+            },
+        ):
+            overview = grabowski_mcp._operator_system_overview(
+                runtime_healthy=True,
+                coding_agent_catalog={"ready": True, "source": "deployment_catalog"},
+                client_snapshot={
+                    "state": "matched",
+                    "observable": True,
+                    "fresh": True,
+                    "matched": True,
+                    "platform_connector_snapshot_observable": False,
+                    "server_loopback_observable": True,
+                    "recommended_next_action": (
+                        "bind a platform connector snapshot to establish published tool visibility"
+                    ),
+                    "verification_model": "client-declared-server-compared-v1",
+                },
+            )
+
+        self.assertFalse(overview["operator_ready"])
+        self.assertFalse(overview["readiness"]["connector_snapshot_ready"])
+        self.assertTrue(overview["connector"]["observable"])
+        self.assertFalse(overview["connector"]["platform_snapshot_observable"])
+        self.assertEqual(
+            "bind a platform connector snapshot to establish published tool visibility",
+            overview["recommended_next_action"],
+        )
+        connector = next(
+            item for item in overview["component_map"]["components"]
+            if item["id"] == "connector"
+        )
+        self.assertEqual("unknown", connector["signal"])
+        self.assertFalse(connector["observed"])
+
     def test_operator_system_overview_prioritizes_invalid_coding_catalog(self) -> None:
         fake_tasks = SimpleNamespace(
             grabowski_task_list=lambda **_kwargs: {
