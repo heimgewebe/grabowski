@@ -161,3 +161,9 @@ Retention ist owner-gebunden. Solange die Retention aktiv ist, darf Cleanup nur
 vom gleichen `owner_id` geplant und angewendet werden. Resource-Leases sind
 kurzlebige Kollisionskontrolle; der durable Retention-Owner steht in der
 Checkout-Lifecycle-Datenbank.
+
+## Terminal evidence source contract
+
+Managed checkout creation now accepts only lifecycle source kinds with a concrete immutable terminal-evidence observer: `bureau_task`, `operator_obligation`, `thread_focus`, and `github_issue`. Producers must bind one of these evidence-bearing sources before `worktree_ensure` creates a checkout.
+
+`source.kind=automation` is intentionally not inferred terminal from checkout absence, retention expiry, missing leases, a merged base commit, or a successful worktree-creation receipt. Historical automation bindings therefore remain visible and fail closed until an immutable source-id- and outcome-bound terminal receipt contract exists. This restriction does not authorize archive, cleanup, branch deletion, ref deletion, or rewriting historical lifecycle evidence.

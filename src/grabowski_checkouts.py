@@ -62,6 +62,7 @@ LIFECYCLE_PHASES = frozenset(
 TERMINAL_RECONCILIATION_SCHEMA_VERSION = 1
 TERMINAL_RECONCILIATION_PREVIEW_TTL_SECONDS = 15 * 60
 TERMINAL_RECONCILIATION_CONFIRMATION = "record-external-terminal-missing"
+TERMINAL_EVIDENCE_SOURCE_KINDS = frozenset({"bureau_task", "operator_obligation", "thread_focus", "github_issue"})
 ARTIFACT_CLASS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
 SOURCE_KIND_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}\Z")
 SOURCE_ID_RE = re.compile(r"[^\x00-\x1f\x7f]{1,256}\Z")
@@ -602,6 +603,11 @@ def _reserve_checkout_lifecycle(
     owner = _owner(owner_id)
     normalized_purpose = _purpose(purpose)
     source_kind, source_id = _source_binding(source_kind, source_id)
+    if source_kind not in TERMINAL_EVIDENCE_SOURCE_KINDS:
+        raise ValueError(
+            f"source_kind={source_kind} has no immutable terminal evidence observer; "
+            "managed checkout creation requires an evidence-bearing source"
+        )
     artifact = _artifact_class(artifact_class)
     until = _retention_until(retention_until_unix)
     common_dir = _safe_path(repo_common_dir, must_exist=True)

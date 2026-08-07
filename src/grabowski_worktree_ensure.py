@@ -253,6 +253,11 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
 
         purpose = checkouts._purpose(purpose)
         source_kind, source_id = checkouts._source_binding(source_kind, source_id)
+        if source_kind not in checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS:
+            raise WorktreeEnsurePreflight(
+                f"source_kind={source_kind} has no immutable terminal evidence observer; "
+                "bind a supported evidence-bearing source before creating the checkout"
+            )
         artifact_class = checkouts._artifact_class(artifact_class)
         retention_until_unix = checkouts._retention_until(retention_until_unix)
         identity_supersession = checkout_identity.normalize_supersession(
