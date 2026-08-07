@@ -5017,10 +5017,10 @@ def grabowski_resource_reconcile_obsolete_path_leases(
 def scoped_repository_resource_root(resource_key: str) -> str | None:
     """Return an existing Git root for one unambiguous scoped repo key.
 
-    Repository paths may themselves contain ``:branch:`` or ``:operation:``.
-    An existing full path is therefore always broad. A non-existing full path
-    is treated as scoped only when exactly one marker split resolves to an
-    existing checkout root with a .git entry; ambiguous inputs fail closed.
+    Repository paths may themselves contain ``:branch:``, ``:operation:`` or
+    ``:tag:``. An existing full path is therefore always broad. A non-existing
+    full path is treated as scoped only when exactly one marker split resolves
+    to an existing checkout root with a .git entry; ambiguous inputs fail closed.
     """
     if not resource_key.startswith("repo:"):
         return None
@@ -5028,7 +5028,7 @@ def scoped_repository_resource_root(resource_key: str) -> str | None:
     if os.path.lexists(value):
         return None
     candidates: set[str] = set()
-    for marker in (":branch:", ":operation:"):
+    for marker in (":branch:", ":operation:", ":tag:"):
         start = 0
         while True:
             index = value.find(marker, start)

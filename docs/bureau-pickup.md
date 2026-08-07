@@ -27,7 +27,7 @@ The MCP input remains one top-level `request` object, preserving existing Python
 5. writes immutable private request and intent artifacts;
 6. acquires Bureau resources, broad repository resources and remaining resources in explicit groups under `bureau-run:<run_id>`;
 7. binds every lease metadata set to `task_id`, `run_id` and `claim_intent_sha256`;
-8. requires a complete Grabowski scope manifest for every broad repository lease, while self-scoped `repo:<checkout>:branch:<name>` and `repo:<checkout>:operation:<name>` keys remain authoritative and carry no scope manifest;
+8. requires a complete Grabowski scope manifest for every broad repository lease, while self-scoped `repo:<checkout>:branch:<name>`, `repo:<checkout>:operation:<name>` and `repo:<checkout>:tag:<name>` keys remain authoritative and carry no scope manifest;
 9. commits the exact intent and live lease binding through the same Bureau root, optionally creating the planned workspace;
 10. reads the canonical Bureau run through the same root after any unclear commit result;
 11. compensates all acquired leases when the commit is authoritatively known not to have started or Bureau authoritatively reports that the run does not exist;

@@ -2587,21 +2587,23 @@ class ResourceTests(unittest.TestCase):
 
     def test_public_tool_preserves_self_scoped_repository_lease(self) -> None:
         (self.root / ".git").write_text("gitdir: /tmp/public-scoped-repo\n")
-        key = f"repo:{self.root}:branch:feat/scoped"
-        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
-            resources.base, "_append_audit"
-        ):
-            result = resources.grabowski_resource_acquire(
-                "owner-a",
-                [key],
-                "scoped branch work",
-                60,
-            )
-        self.assertEqual(result["leases"][0]["resource_key"], key)
+        for index, suffix in enumerate(("branch:feat/scoped", "operation:deploy", "tag:release-v1")):
+            with self.subTest(suffix=suffix):
+                key = f"repo:{self.root}:{suffix}"
+                with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+                    resources.base, "_append_audit"
+                ):
+                    result = resources.grabowski_resource_acquire(
+                        f"owner-{index}",
+                        [key],
+                        "self-scoped repository work",
+                        60,
+                    )
+                self.assertEqual(result["leases"][0]["resource_key"], key)
 
     def test_scoped_repository_resource_root_scans_multiple_markers(self) -> None:
         (self.root / ".git").write_text("gitdir: /tmp/multi-marker-repo\n")
-        key = f"repo:{self.root}:branch:feat/work:operation:deploy"
+        key = f"repo:{self.root}:branch:feat/work:operation:deploy:tag:release-v1"
         self.assertEqual(resources.scoped_repository_resource_root(key), str(self.root))
 
     def test_public_tool_rejects_manifest_on_self_scoped_repository_lease(self) -> None:
@@ -2623,8 +2625,16 @@ class ResourceTests(unittest.TestCase):
                     },
                 )
 
+    def test_scoped_repository_resource_root_rejects_ambiguous_marker_roots(self) -> None:
+        (self.root / ".git").write_text("gitdir: /tmp/outer-marker-repo\n")
+        nested = Path(f"{self.root}:branch:child")
+        nested.mkdir()
+        (nested / ".git").write_text("gitdir: /tmp/nested-marker-repo\n")
+        key = f"repo:{nested}:tag:release-v1"
+        self.assertIsNone(resources.scoped_repository_resource_root(key))
+
     def test_public_tool_treats_existing_marker_paths_as_broad(self) -> None:
-        for marker in ("branch", "operation"):
+        for marker in ("branch", "operation", "tag"):
             with self.subTest(marker=marker):
                 repository = self.root / f"repo:{marker}:literal"
                 repository.mkdir()
