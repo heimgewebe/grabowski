@@ -662,12 +662,16 @@ def _deployment_admission_active_tool_calls() -> int:
 def _deployment_admission_register_tool_call(
     tool_name: Any,
     kind: str,
+    *,
+    drain_blocking: bool = True,
 ) -> str:
     if kind not in {
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
     }:
         raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
+    if not isinstance(drain_blocking, bool):
+        raise ValueError("deployment admission drain_blocking must be boolean")
     name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
     name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
@@ -693,6 +697,7 @@ def _deployment_admission_register_tool_call(
             "identity": identity,
             "tool_name": name,
             "kind": kind,
+            "drain_blocking": drain_blocking,
             "started_at_unix": time.time(),
             "started_monotonic": time.monotonic(),
         }
@@ -734,6 +739,7 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
                 "identity": entry["identity"],
                 "tool_name": entry["tool_name"],
                 "kind": entry["kind"],
+                "drain_blocking": entry.get("drain_blocking") is not False,
                 "started_at_unix": entry["started_at_unix"],
                 "age_seconds": age_seconds,
             }
@@ -764,6 +770,12 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     return {
         **_read_deployment_admission_marker(),
         "active_tool_calls": len(registry),
+        "drain_blocking_tool_calls": sum(
+            entry.get("drain_blocking") is not False for entry in registry.values()
+        ),
+        "read_only_active_tool_calls": sum(
+            entry.get("drain_blocking") is False for entry in registry.values()
+        ),
         "active_tool_call_registry_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
         ),
@@ -885,12 +897,20 @@ def _install_deployment_admission_gate() -> None:
                     return await asyncio.wrap_future(worker_future, loop=loop)
                 return await original(*args, **kwargs)
 
+        read_only_hint = _tool_read_only_hint(tool)
         kind = (
             _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC
             if tool is not None and getattr(tool, "is_async", True) is False
             else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
         )
-        identity = _deployment_admission_register_tool_call(tool_name, kind)
+        identity = _deployment_admission_register_tool_call(
+            tool_name,
+            kind,
+            drain_blocking=(
+                read_only_hint is not True
+                or tool_name == deployment_observer.OPERATION
+            ),
+        )
         release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()
