@@ -3007,6 +3007,9 @@ def wait_for_operator_deployment_admission(
         else:
             last = observed
             active_calls = observed.get("active_tool_calls")
+            drain_blocking_calls = observed.get(
+                "drain_blocking_tool_calls", active_calls
+            )
             valid = (
                 observed.get("valid") is True
                 and observed.get("active") is True
@@ -3019,6 +3022,9 @@ def wait_for_operator_deployment_admission(
                 and isinstance(active_calls, int)
                 and not isinstance(active_calls, bool)
                 and active_calls >= 0
+                and isinstance(drain_blocking_calls, int)
+                and not isinstance(drain_blocking_calls, bool)
+                and 0 <= drain_blocking_calls <= active_calls
             )
             if not valid:
                 core.fail(
@@ -3026,7 +3032,9 @@ def wait_for_operator_deployment_admission(
                     phase="operator-admission-drain",
                     details={"observation": observed},
                 )
-            consecutive_idle = consecutive_idle + 1 if active_calls == 0 else 0
+            consecutive_idle = (
+                consecutive_idle + 1 if drain_blocking_calls == 0 else 0
+            )
             if consecutive_idle >= OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES:
                 return {
                     "supported": True,
@@ -3051,6 +3059,14 @@ def verify_operator_deployment_admission(
     marker: dict[str, Any],
 ) -> dict[str, Any]:
     observed = _operator_admission_observation()
+    active_calls = (
+        observed.get("active_tool_calls") if isinstance(observed, dict) else None
+    )
+    drain_blocking_calls = (
+        observed.get("drain_blocking_tool_calls", active_calls)
+        if isinstance(observed, dict)
+        else None
+    )
     if (
         observed is None
         or observed.get("valid") is not True
@@ -3060,7 +3076,13 @@ def verify_operator_deployment_admission(
         or observed.get("expected_head") != marker.get("expected_head")
         or observed.get("source_identity_sha256")
         != marker.get("source_identity_sha256")
-        or observed.get("active_tool_calls") != 0
+        or not isinstance(active_calls, int)
+        or isinstance(active_calls, bool)
+        or active_calls < 0
+        or not isinstance(drain_blocking_calls, int)
+        or isinstance(drain_blocking_calls, bool)
+        or not 0 <= drain_blocking_calls <= active_calls
+        or drain_blocking_calls != 0
     ):
         core.fail(
             "Operator-Admission-Finalprüfung scheiterte",

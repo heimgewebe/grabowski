@@ -2252,6 +2252,91 @@ class DeploymentAdmissionTests(unittest.TestCase):
         self.assertEqual(3, proof["attempts"])
         self.assertEqual(0, proof["observation"]["active_tool_calls"])
 
+    def test_operator_admission_ignores_observed_read_only_calls(self) -> None:
+        marker = self.marker()
+        observations = [
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                "token": marker["token"],
+                "expected_head": marker["expected_head"],
+                "source_identity_sha256": marker["source_identity_sha256"],
+                "active_tool_calls": 1,
+                "drain_blocking_tool_calls": 0,
+                "read_only_active_tool_calls": 1,
+            },
+            {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                "token": marker["token"],
+                "expected_head": marker["expected_head"],
+                "source_identity_sha256": marker["source_identity_sha256"],
+                "active_tool_calls": 1,
+                "drain_blocking_tool_calls": 0,
+                "read_only_active_tool_calls": 1,
+            },
+        ]
+        with (
+            mock.patch.object(
+                dual, "_operator_admission_observation", side_effect=observations
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker, timeout_seconds=5
+            )
+        self.assertTrue(proof["supported"])
+        self.assertEqual(2, proof["attempts"])
+        self.assertEqual(1, proof["observation"]["active_tool_calls"])
+        self.assertEqual(0, proof["observation"]["drain_blocking_tool_calls"])
+
+    def test_operator_admission_rejects_invalid_blocking_count(self) -> None:
+        marker = self.marker()
+        invalid = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": marker["token"],
+            "expected_head": marker["expected_head"],
+            "source_identity_sha256": marker["source_identity_sha256"],
+            "active_tool_calls": 1,
+            "drain_blocking_tool_calls": 2,
+        }
+        with mock.patch.object(
+            dual, "_operator_admission_observation", return_value=invalid
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.wait_for_operator_deployment_admission(
+                    marker, timeout_seconds=5
+                )
+        self.assertEqual("operator-admission-drain", raised.exception.phase)
+
+    def test_operator_admission_final_guard_accepts_read_only_activity(self) -> None:
+        marker = self.marker()
+        observed = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": marker["token"],
+            "expected_head": marker["expected_head"],
+            "source_identity_sha256": marker["source_identity_sha256"],
+            "active_tool_calls": 3,
+            "drain_blocking_tool_calls": 0,
+            "read_only_active_tool_calls": 3,
+        }
+        with mock.patch.object(
+            dual, "_operator_admission_observation", return_value=observed
+        ):
+            self.assertEqual(
+                observed, dual.verify_operator_deployment_admission(marker)
+            )
+
     def test_admission_drain_accepts_balanced_progress_but_not_unfinished_work(
         self,
     ) -> None:

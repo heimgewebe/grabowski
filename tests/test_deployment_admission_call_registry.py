@@ -34,6 +34,7 @@ SAMPLE_ENTRY_KEYS = {
     "identity",
     "tool_name",
     "kind",
+    "drain_blocking",
     "started_at_unix",
     "age_seconds",
 }
@@ -41,6 +42,7 @@ REGISTRY_ENTRY_KEYS = {
     "identity",
     "tool_name",
     "kind",
+    "drain_blocking",
     "started_at_unix",
     "started_monotonic",
 }
@@ -86,6 +88,16 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
             self.assertTrue(
                 operator._deployment_admission_release_tool_call(replacement)
             )
+
+    def test_registry_rejects_non_boolean_drain_classification(self) -> None:
+        operator = _load_operator_module()
+        with self.assertRaisesRegex(ValueError, "drain_blocking must be boolean"):
+            operator._deployment_admission_register_tool_call(
+                "read",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                drain_blocking=1,
+            )
+        self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
     def test_registry_retries_opaque_identity_collision(self) -> None:
         operator = _load_operator_module()
@@ -147,6 +159,7 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(
             operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC, entry["kind"]
         )
+        self.assertTrue(entry["drain_blocking"])
         self.assertIsInstance(entry["started_at_unix"], float)
         self.assertIsInstance(entry["started_monotonic"], float)
         payload = json.dumps(entry)
@@ -207,6 +220,8 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         total = sync_count + async_count
         snapshot = operator._deployment_admission_snapshot()
         self.assertEqual(total, snapshot["active_tool_calls"])
+        self.assertEqual(total, snapshot["drain_blocking_tool_calls"])
+        self.assertEqual(0, snapshot["read_only_active_tool_calls"])
         self.assertEqual(
             {
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC: sync_count,
@@ -264,6 +279,8 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         operator = _load_operator_module()
         snapshot = operator._deployment_admission_snapshot()
         self.assertEqual(0, snapshot["active_tool_calls"])
+        self.assertEqual(0, snapshot["drain_blocking_tool_calls"])
+        self.assertEqual(0, snapshot["read_only_active_tool_calls"])
         self.assertEqual(
             operator._DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX,
             snapshot["active_tool_call_registry_max"],
@@ -371,6 +388,9 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
                 {operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC: 1},
                 snapshot["active_tool_calls_by_kind"],
             )
+            self.assertEqual(0, snapshot["drain_blocking_tool_calls"])
+            self.assertEqual(1, snapshot["read_only_active_tool_calls"])
+            self.assertFalse(snapshot["active_tool_calls_sample"][0]["drain_blocking"])
             call.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await call
@@ -410,6 +430,9 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             self.assertEqual(
                 {"read": 1}, snapshot["active_tool_calls_by_tool_name"]
             )
+            self.assertEqual(0, snapshot["drain_blocking_tool_calls"])
+            self.assertEqual(1, snapshot["read_only_active_tool_calls"])
+            self.assertFalse(snapshot["active_tool_calls_sample"][0]["drain_blocking"])
             call.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await call
