@@ -1405,6 +1405,81 @@ class BureauPickupTests(unittest.TestCase):
             self.assertRegex(summary["sha256"], r"^[0-9a-f]{64}$")
         self.assertNotIn(oversized, json.dumps(rejection.details))
 
+    def test_self_scoped_repository_keys_skip_scope_manifest_without_workspace(self) -> None:
+        repository = self.root / "repository"
+        repository.mkdir()
+        (repository / ".git").mkdir()
+
+        for index, suffix in enumerate(("branch:topic", "operation:deploy"), start=1):
+            with self.subTest(suffix=suffix):
+                key = f"repo:{repository}:{suffix}"
+                intent = self.intent([key])
+                intent["run_id"] = f"BUR-RUN-20260724T12000{index}Z-0123456789"
+                intent["lease_owner_id"] = f"bureau-run:{intent['run_id']}"
+                request = pickup._normalize_request(
+                    self.request(create_workspace=False)
+                )
+                lease = self.lease(key, intent["lease_owner_id"])
+                run_dir = pickup._run_directory(intent["run_id"])
+                with mock.patch.object(
+                    pickup.resources,
+                    "acquire_resources",
+                    return_value={
+                        "owner_id": intent["lease_owner_id"],
+                        "leases": [lease],
+                    },
+                ) as acquire:
+                    pickup._acquire_groups(intent, request, run_dir)
+
+                metadata = acquire.call_args.kwargs["metadata"]
+                self.assertNotIn("scope_manifest", metadata)
+                self.assertNotIn("scope_manifest_complete", metadata)
+                self.assertEqual([key], acquire.call_args.args[1])
+
+    def test_broad_repository_scope_manifest_is_preserved_without_workspace(self) -> None:
+        repository = self.root / "repository"
+        key = f"repo:{repository}"
+        intent = self.intent([key])
+        scope = {
+            "schema_version": 1,
+            "repository": str(repository),
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-branch",
+            "worktree": str(repository),
+            "effects": ["write"],
+            "paths": [str(repository)],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        request = pickup._normalize_request(
+            self.request(
+                create_workspace=False,
+                repository_scope_manifests={key: scope},
+            )
+        )
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir = pickup._run_directory(intent["run_id"])
+        with mock.patch.object(
+            pickup.resources,
+            "acquire_resources",
+            return_value={
+                "owner_id": intent["lease_owner_id"],
+                "leases": [lease],
+            },
+        ) as acquire:
+            pickup._acquire_groups(intent, request, run_dir)
+
+        metadata = acquire.call_args.kwargs["metadata"]
+        self.assertTrue(metadata["scope_manifest_complete"])
+        self.assertEqual(str(repository), metadata["scope_manifest"]["repository"])
+
     def test_repository_scope_is_derived_from_bound_workspace(self) -> None:
         key = "repo:/tmp/repository"
         intent = self.intent([key])
