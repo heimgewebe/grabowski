@@ -89,6 +89,8 @@ class FakeGit:
         push_config_entries: list[tuple[str, str]] | None = None,
         configured_urls: list[str] | None = None,
         effective_push_urls: list[str] | None = None,
+        configured_upstream_remote: str | None = None,
+        configured_upstream_merge: str | None = None,
     ):
         self.branch = branch
         self.dirty = dirty
@@ -100,6 +102,8 @@ class FakeGit:
             configured_urls or ["git@github.com:heimgewebe/grabowski.git"]
         )
         self.effective_push_urls = list(effective_push_urls or self.configured_urls)
+        self.configured_upstream_remote = configured_upstream_remote
+        self.configured_upstream_merge = configured_upstream_merge
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, repo: Path, argv: list[str]) -> dict[str, object]:
@@ -110,6 +114,14 @@ class FakeGit:
             return {"returncode": 0, "stdout": self.branch, "stderr": ""}
         if argv == ["rev-parse", "HEAD"]:
             return {"returncode": 0, "stdout": self.head, "stderr": ""}
+        if argv == ["config", "--get", f"branch.{self.branch}.remote"]:
+            if self.configured_upstream_remote is None:
+                return {"returncode": 1, "stdout": "", "stderr": ""}
+            return {"returncode": 0, "stdout": self.configured_upstream_remote, "stderr": ""}
+        if argv == ["config", "--get", f"branch.{self.branch}.merge"]:
+            if self.configured_upstream_merge is None:
+                return {"returncode": 1, "stdout": "", "stderr": ""}
+            return {"returncode": 0, "stdout": self.configured_upstream_merge, "stderr": ""}
         if len(argv) == 3 and argv[:2] == ["config", "--get-regexp"]:
             if not self.push_config_entries:
                 return {"returncode": 1, "stdout": "", "stderr": ""}
@@ -2487,6 +2499,28 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual(64, len(receipt["receipt_sha256"]))
         self.assertEqual(64, len(receipt["output_sha256"]))
 
+    def test_repo_orient_recovers_configured_upstream_without_tracking_ref(self) -> None:
+        branch = "feat/single-branch"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "repo-orient",
+                {"repo": tmp, "expected_branch": branch},
+                command_runner=FakeGit(
+                    branch=branch,
+                    dirty=False,
+                    upstream=None,
+                    configured_upstream_remote="origin",
+                    configured_upstream_merge=f"refs/heads/{branch}",
+                ),
+            )
+
+        output = result["output"]
+        self.assertEqual(f"origin/{branch}", output["upstream"])
+        self.assertEqual("branch-config", output["upstream_source"])
+        self.assertFalse(output["upstream_ref_materialized"])
+        self.assertEqual("origin", output["upstream_remote"])
+        self.assertEqual(f"refs/heads/{branch}", output["upstream_merge_ref"])
+
     def test_pr_check_readiness_summarizes_work_branch_and_blocks_without_self_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             result = grips.run_grip(
@@ -2503,6 +2537,73 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["work_branch"])
         self.assertEqual("pass", checks["upstream"])
         self.assertEqual("pass", checks["cleanliness"])
+
+    def test_pr_check_readiness_accepts_configured_upstream_without_tracking_ref(self) -> None:
+        branch = "feat/single-branch"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-check-readiness",
+                {
+                    "repo": tmp,
+                    "expected_diff_sha256": "0" * 64,
+                    "self_review_audit": _self_review_audit(),
+                },
+                command_runner=FakeGit(
+                    branch=branch,
+                    dirty=False,
+                    upstream=None,
+                    configured_upstream_remote="origin",
+                    configured_upstream_merge=f"refs/heads/{branch}",
+                ),
+            )
+
+        self.assertTrue(result["output"]["ready"])
+        self.assertNotIn("no upstream configured", result["output"]["warnings"])
+        self.assertEqual("branch-config", result["output"]["orientation"]["upstream_source"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("pass", checks["upstream"])
+
+    def test_pr_check_readiness_rejects_configured_branch_with_unknown_remote(self) -> None:
+        branch = "feat/ghost-remote"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-check-readiness",
+                {
+                    "repo": tmp,
+                    "expected_diff_sha256": "0" * 64,
+                    "self_review_audit": _self_review_audit(),
+                },
+                command_runner=FakeGit(
+                    branch=branch,
+                    dirty=False,
+                    upstream=None,
+                    configured_upstream_remote="ghost",
+                    configured_upstream_merge=f"refs/heads/{branch}",
+                ),
+            )
+
+        self.assertFalse(result["output"]["ready"])
+        self.assertIn("no upstream configured", result["output"]["warnings"])
+        self.assertEqual("none", result["output"]["orientation"]["upstream_source"])
+        self.assertEqual("ghost", result["output"]["orientation"]["upstream_remote"])
+
+    def test_pr_check_readiness_still_rejects_missing_upstream_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            result = grips.run_grip(
+                "pr-check-readiness",
+                {
+                    "repo": tmp,
+                    "expected_diff_sha256": "0" * 64,
+                    "self_review_audit": _self_review_audit(),
+                },
+                command_runner=FakeGit(branch="feat/no-upstream", dirty=False, upstream=None),
+            )
+
+        self.assertFalse(result["output"]["ready"])
+        self.assertIn("no upstream configured", result["output"]["warnings"])
+        self.assertEqual("none", result["output"]["orientation"]["upstream_source"])
+        checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
+        self.assertEqual("warn", checks["upstream"])
 
     def test_pr_check_readiness_blocks_failed_required_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
