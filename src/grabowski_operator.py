@@ -77,6 +77,7 @@ _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX = 4096
 _DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX = 8
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX = 16
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX = 32
+_DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-true-is-read-only-v1"
 _DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS = 128
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC = "sync"
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC = "async"
@@ -662,12 +663,16 @@ def _deployment_admission_active_tool_calls() -> int:
 def _deployment_admission_register_tool_call(
     tool_name: Any,
     kind: str,
+    *,
+    effect_bearing: bool = True,
 ) -> str:
     if kind not in {
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
         _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC,
     }:
         raise ValueError(f"unknown deployment admission execution kind: {kind!r}")
+    if not isinstance(effect_bearing, bool):
+        raise ValueError("deployment admission effect classification must be boolean")
     name = tool_name if isinstance(tool_name, str) and tool_name else "unnamed"
     name = name[:_DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS]
     with _DEPLOYMENT_ADMISSION_LOCK:
@@ -693,6 +698,7 @@ def _deployment_admission_register_tool_call(
             "identity": identity,
             "tool_name": name,
             "kind": kind,
+            "effect_bearing": effect_bearing,
             "started_at_unix": time.time(),
             "started_monotonic": time.monotonic(),
         }
@@ -721,6 +727,8 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     now_monotonic = time.monotonic()
     by_kind: dict[str, int] = {}
     by_tool_name: dict[str, int] = {}
+    active_effect_bearing_tool_calls = 0
+    active_read_only_tool_calls = 0
     sample: list[dict[str, Any]] = []
     oldest_age_seconds: float | None = None
     for entry in registry.values():
@@ -728,12 +736,17 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
         by_tool_name[entry["tool_name"]] = (
             by_tool_name.get(entry["tool_name"], 0) + 1
         )
+        if entry["effect_bearing"]:
+            active_effect_bearing_tool_calls += 1
+        else:
+            active_read_only_tool_calls += 1
         age_seconds = max(0.0, now_monotonic - entry["started_monotonic"])
         sample.append(
             {
                 "identity": entry["identity"],
                 "tool_name": entry["tool_name"],
                 "kind": entry["kind"],
+                "effect_bearing": entry["effect_bearing"],
                 "started_at_unix": entry["started_at_unix"],
                 "age_seconds": age_seconds,
             }
@@ -764,6 +777,9 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
     return {
         **_read_deployment_admission_marker(),
         "active_tool_calls": len(registry),
+        "active_effect_bearing_tool_calls": active_effect_bearing_tool_calls,
+        "active_read_only_tool_calls": active_read_only_tool_calls,
+        "effect_classification": _DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION,
         "active_tool_call_registry_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
         ),
@@ -890,7 +906,11 @@ def _install_deployment_admission_gate() -> None:
             if tool is not None and getattr(tool, "is_async", True) is False
             else _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
         )
-        identity = _deployment_admission_register_tool_call(tool_name, kind)
+        identity = _deployment_admission_register_tool_call(
+            tool_name,
+            kind,
+            effect_bearing=_tool_read_only_hint(tool) is not True,
+        )
         release_in_finally = True
         try:
             marker = _read_deployment_admission_marker()

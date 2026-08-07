@@ -2058,15 +2058,15 @@ class DeploymentAdmissionTests(unittest.TestCase):
 
     def test_marker_lifetime_covers_forward_and_recovery_windows(self) -> None:
         self.assertEqual(
-            1080,
+            1340,
             dual._operator_admission_marker_lifetime_seconds(40),
         )
         self.assertEqual(
-            1200,
+            1440,
             dual._operator_admission_marker_lifetime_seconds(60),
         )
         self.assertEqual(
-            1560,
+            1740,
             dual._operator_admission_marker_lifetime_seconds(120),
         )
         with self.assertRaises(core.DeployError) as raised:
@@ -2099,7 +2099,7 @@ class DeploymentAdmissionTests(unittest.TestCase):
                 metadata = marker_path.stat()
                 self.assertEqual(0o600, metadata.st_mode & 0o777)
                 self.assertEqual("f" * 64, marker["token"])
-                self.assertEqual(1180, marker["expires_at_unix"])
+                self.assertEqual(1440, marker["expires_at_unix"])
                 self.assertEqual(marker, json.loads(marker_path.read_text()))
                 dual.release_operator_deployment_admission(marker)
                 self.assertFalse(marker_path.exists())
@@ -2249,8 +2249,91 @@ class DeploymentAdmissionTests(unittest.TestCase):
                 marker, timeout_seconds=5
             )
         self.assertTrue(proof["supported"])
+        self.assertFalse(proof["effect_aware"])
+        self.assertEqual(dual.OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS, proof["drain_timeout_seconds"])
         self.assertEqual(3, proof["attempts"])
         self.assertEqual(0, proof["observation"]["active_tool_calls"])
+
+    def test_operator_admission_effect_aware_wait_ignores_existing_read_only_calls(self) -> None:
+        marker = self.marker()
+
+        def observed(effect: int, read_only: int) -> dict[str, object]:
+            return {
+                "valid": True,
+                "active": True,
+                "state": "active",
+                "admission_gate_installed": True,
+                "token": marker["token"],
+                "expected_head": marker["expected_head"],
+                "source_identity_sha256": marker["source_identity_sha256"],
+                "active_tool_calls": effect + read_only,
+                "active_effect_bearing_tool_calls": effect,
+                "active_read_only_tool_calls": read_only,
+                "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+            }
+
+        observations = [
+            observed(1, 2),
+            observed(0, 2),
+            observed(0, 2),
+        ]
+        with (
+            mock.patch.object(
+                dual, "_operator_admission_observation", side_effect=observations
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            proof = dual.wait_for_operator_deployment_admission(
+                marker, timeout_seconds=5
+            )
+        self.assertTrue(proof["supported"])
+        self.assertTrue(proof["effect_aware"])
+        self.assertEqual(0, proof["blocking_tool_calls"])
+        self.assertEqual(2, proof["active_tool_calls"])
+        self.assertEqual(2, proof["active_read_only_tool_calls"])
+        self.assertEqual(5, proof["drain_timeout_seconds"])
+        self.assertEqual(3, proof["attempts"])
+
+    def test_operator_admission_effect_counts_fail_closed_on_inconsistent_contract(self) -> None:
+        malformed = {
+            "active_tool_calls": 2,
+            "active_effect_bearing_tool_calls": 0,
+            "active_read_only_tool_calls": 1,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+        }
+        with self.assertRaises(core.DeployError) as raised:
+            dual._operator_admission_call_counts(malformed)
+        self.assertEqual("operator-admission-drain", raised.exception.phase)
+
+    def test_operator_admission_final_guard_allows_only_read_only_residual_calls(self) -> None:
+        marker = self.marker()
+        observed = {
+            "valid": True,
+            "active": True,
+            "state": "active",
+            "admission_gate_installed": True,
+            "token": marker["token"],
+            "expected_head": marker["expected_head"],
+            "source_identity_sha256": marker["source_identity_sha256"],
+            "active_tool_calls": 3,
+            "active_effect_bearing_tool_calls": 0,
+            "active_read_only_tool_calls": 3,
+            "effect_classification": dual.OPERATOR_ADMISSION_EFFECT_CLASSIFICATION,
+        }
+        with mock.patch.object(
+            dual, "_operator_admission_observation", return_value=observed
+        ):
+            result = dual.verify_operator_deployment_admission(marker)
+        self.assertEqual(0, result["admission_call_counts"]["blocking_tool_calls"])
+        blocked = dict(observed)
+        blocked["active_effect_bearing_tool_calls"] = 1
+        blocked["active_read_only_tool_calls"] = 2
+        with mock.patch.object(
+            dual, "_operator_admission_observation", return_value=blocked
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.verify_operator_deployment_admission(marker)
+        self.assertEqual("operator-admission-final-guard", raised.exception.phase)
 
     def test_admission_drain_accepts_balanced_progress_but_not_unfinished_work(
         self,

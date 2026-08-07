@@ -30,10 +30,19 @@ def _async_tool() -> types.SimpleNamespace:
     )
 
 
+def _async_mutating_tool() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        is_async=True,
+        context_kwarg=None,
+        annotations=types.SimpleNamespace(readOnlyHint=False),
+    )
+
+
 SAMPLE_ENTRY_KEYS = {
     "identity",
     "tool_name",
     "kind",
+    "effect_bearing",
     "started_at_unix",
     "age_seconds",
 }
@@ -41,6 +50,7 @@ REGISTRY_ENTRY_KEYS = {
     "identity",
     "tool_name",
     "kind",
+    "effect_bearing",
     "started_at_unix",
     "started_monotonic",
 }
@@ -147,6 +157,7 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(
             operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC, entry["kind"]
         )
+        self.assertTrue(entry["effect_bearing"])
         self.assertIsInstance(entry["started_at_unix"], float)
         self.assertIsInstance(entry["started_monotonic"], float)
         payload = json.dumps(entry)
@@ -179,6 +190,30 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         entry = operator._deployment_admission_active_registry_snapshot()[sensitive]
         self.assertEqual("unnamed", entry["tool_name"])
 
+    def test_registry_tracks_explicit_read_only_without_weakening_default(self) -> None:
+        operator = _load_operator_module()
+        read_only = operator._deployment_admission_register_tool_call(
+            "read",
+            operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+            effect_bearing=False,
+        )
+        conservative = operator._deployment_admission_register_tool_call(
+            "unknown", operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC
+        )
+        snapshot = operator._deployment_admission_snapshot()
+        self.assertEqual(2, snapshot["active_tool_calls"])
+        self.assertEqual(1, snapshot["active_effect_bearing_tool_calls"])
+        self.assertEqual(1, snapshot["active_read_only_tool_calls"])
+        entries = operator._deployment_admission_active_registry_snapshot()
+        self.assertFalse(entries[read_only]["effect_bearing"])
+        self.assertTrue(entries[conservative]["effect_bearing"])
+        with self.assertRaisesRegex(ValueError, "classification must be boolean"):
+            operator._deployment_admission_register_tool_call(
+                "bad",
+                operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC,
+                effect_bearing=1,
+            )
+
     def test_snapshot_clamps_negative_monotonic_age(self) -> None:
         operator = _load_operator_module()
         with patch.object(operator.time, "monotonic", side_effect=[100.0, 90.0]):
@@ -207,6 +242,11 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         total = sync_count + async_count
         snapshot = operator._deployment_admission_snapshot()
         self.assertEqual(total, snapshot["active_tool_calls"])
+        self.assertEqual(total, snapshot["active_effect_bearing_tool_calls"])
+        self.assertEqual(0, snapshot["active_read_only_tool_calls"])
+        self.assertEqual(
+            "readOnlyHint-true-is-read-only-v1", snapshot["effect_classification"]
+        )
         self.assertEqual(
             {
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC: sync_count,
@@ -264,6 +304,11 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         operator = _load_operator_module()
         snapshot = operator._deployment_admission_snapshot()
         self.assertEqual(0, snapshot["active_tool_calls"])
+        self.assertEqual(0, snapshot["active_effect_bearing_tool_calls"])
+        self.assertEqual(0, snapshot["active_read_only_tool_calls"])
+        self.assertEqual(
+            "readOnlyHint-true-is-read-only-v1", snapshot["effect_classification"]
+        )
         self.assertEqual(
             operator._DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX,
             snapshot["active_tool_call_registry_max"],
@@ -349,6 +394,40 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             )
         self.assertEqual(0, operator._deployment_admission_active_tool_calls())
 
+    def test_gate_mutating_annotation_is_effect_bearing(self) -> None:
+        operator = _load_operator_module()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def effect_call(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return {"called": True}
+
+        operator.mcp._tool_manager.call_tool = effect_call
+        operator.mcp._tool_manager.get_tool = lambda _name: _async_mutating_tool()
+
+        async def exercise() -> None:
+            call = asyncio.create_task(operator.mcp._tool_manager.call_tool("write", {}))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            snapshot = operator._deployment_admission_snapshot()
+            self.assertEqual(1, snapshot["active_tool_calls"])
+            self.assertEqual(1, snapshot["active_effect_bearing_tool_calls"])
+            self.assertEqual(0, snapshot["active_read_only_tool_calls"])
+            self.assertEqual(
+                operator._DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION,
+                snapshot["effect_classification"],
+            )
+            release.set()
+            await call
+            self.assertEqual(0, operator._deployment_admission_active_tool_calls())
+
+        with patch.object(
+            operator, "_require_transport_roundtrip_for_tool", return_value=None
+        ):
+            operator._configure_http_runtime()
+            asyncio.run(exercise())
+
     def test_gate_async_tool_cancellation_releases_by_identity(self) -> None:
         operator = _load_operator_module()
 
@@ -367,6 +446,8 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             await asyncio.sleep(0.05)
             self.assertEqual(1, operator._deployment_admission_active_tool_calls())
             snapshot = operator._deployment_admission_snapshot()
+            self.assertEqual(0, snapshot["active_effect_bearing_tool_calls"])
+            self.assertEqual(1, snapshot["active_read_only_tool_calls"])
             self.assertEqual(
                 {operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC: 1},
                 snapshot["active_tool_calls_by_kind"],
@@ -403,6 +484,8 @@ class DeploymentAdmissionGateTests(unittest.TestCase):
             self.assertTrue(started_ok)
             self.assertEqual(1, operator._deployment_admission_active_tool_calls())
             snapshot = operator._deployment_admission_snapshot()
+            self.assertEqual(0, snapshot["active_effect_bearing_tool_calls"])
+            self.assertEqual(1, snapshot["active_read_only_tool_calls"])
             self.assertEqual(
                 {operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC: 1},
                 snapshot["active_tool_calls_by_kind"],

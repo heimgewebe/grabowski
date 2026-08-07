@@ -261,6 +261,12 @@ OPERATOR_ADMISSION_MARKER_KEYS = frozenset(
 )
 OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 1800
 OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
+# Bootstrap only: runtimes predating effect-aware admission expose only the
+# total active-call count. The marker already stops new calls, so waiting
+# longer here merely lets pre-existing work finish. Once the running runtime
+# exposes effect-aware counts, the normal caller timeout applies again.
+OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS = 300
+OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-true-is-read-only-v1"
 OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS = 6
 OPERATOR_ADMISSION_STOP_OPERATIONS = 6
 OPERATOR_ADMISSION_START_OPERATIONS = 4
@@ -2610,8 +2616,12 @@ def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
                 "maximum_timeout_seconds": OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
             },
         )
+    bootstrap_extra_seconds = max(
+        0, OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS - timeout_seconds
+    )
     required = (
         timeout_seconds * OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS
+        + bootstrap_extra_seconds
         + OPERATOR_ADMISSION_STOP_OPERATIONS
         * 2
         * core.TIMEOUTS["service_stop"]
@@ -2947,6 +2957,60 @@ def _operator_admission_observation() -> dict[str, Any] | None:
     return value
 
 
+def _operator_admission_call_counts(
+    observed: dict[str, Any], *, phase: str = "operator-admission-drain"
+) -> dict[str, Any]:
+    active_calls = observed.get("active_tool_calls")
+    if (
+        not isinstance(active_calls, int)
+        or isinstance(active_calls, bool)
+        or active_calls < 0
+    ):
+        core.fail(
+            "Operator-Admission-Readback enthält keine gültige aktive Call-Zahl",
+            phase=phase,
+            details={"observation": observed},
+        )
+    effect_calls = observed.get("active_effect_bearing_tool_calls")
+    read_only_calls = observed.get("active_read_only_tool_calls")
+    classification = observed.get("effect_classification")
+    effect_fields_present = (
+        effect_calls is not None
+        or read_only_calls is not None
+        or classification is not None
+    )
+    if not effect_fields_present:
+        return {
+            "effect_aware": False,
+            "active_tool_calls": active_calls,
+            "blocking_tool_calls": active_calls,
+            "active_effect_bearing_tool_calls": None,
+            "active_read_only_tool_calls": None,
+        }
+    if (
+        classification != OPERATOR_ADMISSION_EFFECT_CLASSIFICATION
+        or not isinstance(effect_calls, int)
+        or isinstance(effect_calls, bool)
+        or effect_calls < 0
+        or not isinstance(read_only_calls, int)
+        or isinstance(read_only_calls, bool)
+        or read_only_calls < 0
+        or effect_calls + read_only_calls != active_calls
+    ):
+        core.fail(
+            "Operator-Admission-Effektklassifikation ist inkonsistent",
+            phase=phase,
+            details={"observation": observed},
+        )
+    return {
+        "effect_aware": True,
+        "active_tool_calls": active_calls,
+        "blocking_tool_calls": effect_calls,
+        "active_effect_bearing_tool_calls": effect_calls,
+        "active_read_only_tool_calls": read_only_calls,
+    }
+
+
 def wait_for_operator_deployment_admission(
     marker: dict[str, Any], *, timeout_seconds: int
 ) -> dict[str, Any]:
@@ -2995,7 +3059,13 @@ def wait_for_operator_deployment_admission(
                 ],
             }
         break
-    deadline = time.monotonic() + timeout_seconds
+    initial_counts = _operator_admission_call_counts(first)
+    drain_timeout_seconds = (
+        timeout_seconds
+        if initial_counts["effect_aware"]
+        else max(timeout_seconds, OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS)
+    )
+    deadline = time.monotonic() + drain_timeout_seconds
     consecutive_idle = 0
     attempts = 0
     last = first
@@ -3006,7 +3076,9 @@ def wait_for_operator_deployment_admission(
             consecutive_idle = 0
         else:
             last = observed
-            active_calls = observed.get("active_tool_calls")
+            call_counts = _operator_admission_call_counts(observed)
+            active_calls = call_counts["active_tool_calls"]
+            blocking_calls = call_counts["blocking_tool_calls"]
             valid = (
                 observed.get("valid") is True
                 and observed.get("active") is True
@@ -3016,9 +3088,6 @@ def wait_for_operator_deployment_admission(
                 and observed.get("expected_head") == marker.get("expected_head")
                 and observed.get("source_identity_sha256")
                 == marker.get("source_identity_sha256")
-                and isinstance(active_calls, int)
-                and not isinstance(active_calls, bool)
-                and active_calls >= 0
             )
             if not valid:
                 core.fail(
@@ -3026,10 +3095,15 @@ def wait_for_operator_deployment_admission(
                     phase="operator-admission-drain",
                     details={"observation": observed},
                 )
-            consecutive_idle = consecutive_idle + 1 if active_calls == 0 else 0
+            consecutive_idle = consecutive_idle + 1 if blocking_calls == 0 else 0
             if consecutive_idle >= OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES:
                 return {
                     "supported": True,
+                    "effect_aware": call_counts["effect_aware"],
+                    "blocking_tool_calls": blocking_calls,
+                    "active_tool_calls": active_calls,
+                    "active_read_only_tool_calls": call_counts["active_read_only_tool_calls"],
+                    "drain_timeout_seconds": drain_timeout_seconds,
                     "probe_attempts": probe_attempts,
                     "transport_retries": transport_retries,
                     "attempts": attempts,
@@ -3043,7 +3117,12 @@ def wait_for_operator_deployment_admission(
     core.fail(
         "Operator-Admission wurde nicht rechtzeitig leer",
         phase="operator-admission-drain",
-        details={"attempts": attempts, "last_observation": last},
+        details={
+            "attempts": attempts,
+            "drain_timeout_seconds": drain_timeout_seconds,
+            "bootstrap_mode": not initial_counts["effect_aware"],
+            "last_observation": last,
+        },
     )
 
 
@@ -3051,6 +3130,13 @@ def verify_operator_deployment_admission(
     marker: dict[str, Any],
 ) -> dict[str, Any]:
     observed = _operator_admission_observation()
+    call_counts = (
+        _operator_admission_call_counts(
+            observed, phase="operator-admission-final-guard"
+        )
+        if isinstance(observed, dict)
+        else None
+    )
     if (
         observed is None
         or observed.get("valid") is not True
@@ -3060,14 +3146,15 @@ def verify_operator_deployment_admission(
         or observed.get("expected_head") != marker.get("expected_head")
         or observed.get("source_identity_sha256")
         != marker.get("source_identity_sha256")
-        or observed.get("active_tool_calls") != 0
+        or call_counts is None
+        or call_counts["blocking_tool_calls"] != 0
     ):
         core.fail(
             "Operator-Admission-Finalprüfung scheiterte",
             phase="operator-admission-final-guard",
-            details={"observation": observed},
+            details={"observation": observed, "call_counts": call_counts},
         )
-    return observed
+    return {**observed, "admission_call_counts": call_counts}
 
 
 def _tunnel_drain_counter_snapshot(observed: dict[str, float]) -> dict[str, float]:
