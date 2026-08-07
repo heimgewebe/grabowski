@@ -302,6 +302,9 @@ class CentralTransportGateTests(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("target_tool_name=write", message)
         self.assertIn("exact unchanged target_arguments", message)
+        self.assertIn("original target call", message)
+        self.assertIn("preserve omitted optional fields exactly", message)
+        self.assertIn("do not materialize default-valued fields", message)
         self.assertIn("do not retry the target separately", message)
         self.assertNotIn("action=ack", message)
         consume_verified.assert_called_once_with(
