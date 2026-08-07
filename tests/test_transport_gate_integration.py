@@ -238,8 +238,14 @@ class TransportGripIntegrationTests(unittest.TestCase):
             observed.append((name, allow_mutation))
             return {"status": "passed"}
 
-        with mock.patch.object(base, "_require_capability"), mock.patch.object(
-            base, "_grip_run_core", side_effect=fake_core
+        with (
+            mock.patch.object(base, "_require_capability"),
+            mock.patch.object(base, "_grip_run_core", side_effect=fake_core),
+            mock.patch.object(
+                base,
+                "_validate_transport_roundtrip_target_tool",
+                return_value="grabowski_terminal_run",
+            ),
         ):
             result = asyncio.run(
                 base._grip_run_mcp(
@@ -289,6 +295,11 @@ class TransportGripIntegrationTests(unittest.TestCase):
                 base, "_transport_roundtrip_runtime_binding", return_value=BINDING
             ),
             mock.patch.object(base, "_grip_run_core", side_effect=fake_core),
+            mock.patch.object(
+                base,
+                "_validate_transport_roundtrip_target_tool",
+                return_value="grabowski_terminal_run",
+            ),
         ):
             result = asyncio.run(
                 base._grip_run_mcp(
@@ -427,7 +438,7 @@ class TransportGripIntegrationTests(unittest.TestCase):
         finally:
             base._discard_pending_transport_target(challenge)
 
-    def test_retained_target_pool_has_aggregate_memory_bound(self) -> None:
+    def test_retained_target_pool_evicts_oldest_pending_for_memory_bound(self) -> None:
         base = _load_grabowski_mcp()
         first = {"payload": "a" * 64}
         second = {"payload": "b" * 64}
@@ -445,15 +456,51 @@ class TransportGripIntegrationTests(unittest.TestCase):
                 client_scope=SHARED_SCOPE,
                 runtime_binding=BINDING,
             )
-            with self.assertRaisesRegex(RuntimeError, "memory bound is full"):
-                base._retain_pending_transport_target(
-                    "2" * 64,
-                    tool_name="write",
-                    target_arguments=second,
-                    arguments_sha256=roundtrip.canonical_arguments_sha256(second),
-                    client_scope=SHARED_SCOPE,
-                    runtime_binding=BINDING,
+            base._retain_pending_transport_target(
+                "2" * 64,
+                tool_name="write",
+                target_arguments=second,
+                arguments_sha256=roundtrip.canonical_arguments_sha256(second),
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+            )
+            with self.assertRaisesRegex(RuntimeError, "missing or expired"):
+                base._claim_pending_transport_target(
+                    "1" * 64, client_scope=SHARED_SCOPE, runtime_binding=BINDING
                 )
+            claimed = base._claim_pending_transport_target(
+                "2" * 64, client_scope=SHARED_SCOPE, runtime_binding=BINDING
+            )
+            self.assertEqual(claimed["target_arguments"], second)
+
+    def test_retained_target_pool_never_evicts_inflight_target(self) -> None:
+        base = _load_grabowski_mcp()
+        first = {"payload": "a"}
+        second = {"payload": "b"}
+        with mock.patch.object(base, "_RETAINED_TRANSPORT_TARGET_MAX", 1):
+            base._retain_pending_transport_target(
+                "1" * 64,
+                tool_name="write",
+                target_arguments=first,
+                arguments_sha256=roundtrip.canonical_arguments_sha256(first),
+                client_scope=SHARED_SCOPE,
+                runtime_binding=BINDING,
+            )
+            base._claim_pending_transport_target(
+                "1" * 64, client_scope=SHARED_SCOPE, runtime_binding=BINDING
+            )
+            try:
+                with self.assertRaisesRegex(RuntimeError, "only in-flight targets"):
+                    base._retain_pending_transport_target(
+                        "2" * 64,
+                        tool_name="write",
+                        target_arguments=second,
+                        arguments_sha256=roundtrip.canonical_arguments_sha256(second),
+                        client_scope=SHARED_SCOPE,
+                        runtime_binding=BINDING,
+                    )
+            finally:
+                base._discard_pending_transport_target("1" * 64)
 
     def test_mcp_handshake_exemption_does_not_leak_to_other_grips(self) -> None:
         base = _load_grabowski_mcp()
