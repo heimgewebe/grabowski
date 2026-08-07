@@ -1410,7 +1410,7 @@ class BureauPickupTests(unittest.TestCase):
         repository.mkdir()
         (repository / ".git").mkdir()
 
-        for index, suffix in enumerate(("branch:topic", "operation:deploy"), start=1):
+        for index, suffix in enumerate(("branch:topic", "operation:deploy", "tag:release-v1"), start=1):
             with self.subTest(suffix=suffix):
                 key = f"repo:{repository}:{suffix}"
                 intent = self.intent([key])
