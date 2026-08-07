@@ -2672,6 +2672,44 @@ def _workspace_scope_identity(workspace: str) -> tuple[str, str]:
     return head, branch
 
 
+def _reposkop_prospective_admission_verified(
+    *,
+    lease_result: dict[str, Any] | None,
+    repository_scope_manifest: dict[str, Any] | None,
+    workspace: str | None,
+) -> bool:
+    if (
+        not isinstance(lease_result, dict)
+        or not isinstance(repository_scope_manifest, dict)
+        or not isinstance(workspace, str)
+        or repository_scope_manifest.get("repository") != workspace
+        or repository_scope_manifest.get("worktree") != workspace
+    ):
+        return False
+    head = repository_scope_manifest.get("head")
+    branch = repository_scope_manifest.get("branch")
+    if (
+        not isinstance(head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None
+        or set(head) == {"0"}
+        or not isinstance(branch, str)
+        or not branch
+        or branch in {"main", "master", "unversioned"}
+        or branch.startswith("detached/")
+    ):
+        return False
+    evidence = lease_result.get("work_admission")
+    if not isinstance(evidence, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("repository") == workspace
+        and item.get("decision") == "allow"
+        and item.get("read_only") is True
+        for item in evidence
+    )
+
+
 def _whole_repository_scope_manifest(
     resource_key: str, task_id: str
 ) -> dict[str, Any]:
@@ -6071,9 +6109,11 @@ def grabowski_task_start(
 
     Direct local write-capable agent CLIs receive an implicit repository lease
     unless the caller supplies an explicit path or repository scope. Before any new
-    local writer process starts, its exact checkout receives a task- and execution-bound
-    Reposkop attestation while the task resource lease is held. Every task-owned broad
-    repository lease carries a complete whole-repository scope manifest.
+    local writer process starts, its exact checkout first passes the repository admission
+    bound to its task resource lease. Reposkop v3 then keeps risky/exact-path/repository
+    writes fail-closed while deterministically sampling clean admitted workspace writes;
+    the remaining admitted writers form an audit-bound prospective control cohort. Every
+    task-owned broad repository lease carries a complete whole-repository scope manifest.
     An exact already-active execution identity is reused instead of launching
     another process, even when no explicit operation identity was supplied.
     """
@@ -6436,6 +6476,18 @@ def grabowski_task_start(
             ),
             metadata=lease_metadata,
         )
+    if mutating_agent_workspace is not None:
+        task_effect_classification = (
+            reposkop_effectiveness.select_prospective_policy(
+                task_effect_classification,
+                sampling_key=task_id,
+                admission_verified=_reposkop_prospective_admission_verified(
+                    lease_result=lease_result,
+                    repository_scope_manifest=repository_scope_manifest,
+                    workspace=mutating_agent_workspace,
+                ),
+            )
+        )
     reposkop_execution_attestation: dict[str, Any] | None = None
     reposkop_requested_audit_ref: str | None = None
     reposkop_completed_audit_ref: str | None = None
@@ -6447,6 +6499,15 @@ def grabowski_task_start(
             "task_id": task_id,
             "effect_profile": task_effect_classification["effect_profile"],
             "reposkop_policy": task_effect_classification["reposkop_policy"],
+            "reposkop_cohort": task_effect_classification.get("reposkop_cohort"),
+            "prospective_admission_verified": task_effect_classification.get(
+                "prospective_admission_verified"
+            ),
+            "sampling_modulus": task_effect_classification.get("sampling_modulus"),
+            "sampling_bucket": task_effect_classification.get("sampling_bucket"),
+            "sampling_key_sha256": task_effect_classification.get(
+                "sampling_key_sha256"
+            ),
             "surface": task_effect_classification["surface"],
             "agent_executable": task_effect_classification.get(
                 "agent_executable"
@@ -6595,7 +6656,7 @@ def grabowski_task_start(
                         "final_decision": "allow",
                         "decision_changed": False,
                         "action": "task_start_allowed",
-                        "rule_ids": ["reposkop-policy-v2"],
+                        "rule_ids": ["reposkop-policy-v3"],
                         "decision_reason_codes": (
                             reposkop_effectiveness.decision_reason_codes(
                                 finding_summary,
@@ -6654,7 +6715,7 @@ def grabowski_task_start(
                                 "action": (
                                     "blocked_before_task_record"
                                 ),
-                                "rule_ids": ["reposkop-policy-v2"],
+                                "rule_ids": ["reposkop-policy-v3"],
                                 "failure_class": type(exc).__name__,
                                 "failure_category": failure[
                                     "failure_category"
@@ -6739,6 +6800,71 @@ def grabowski_task_start(
             raise RuntimeError(
                 "Reposkop execution attestation failed before task launch"
             ) from exc
+    elif task_effect_classification.get("reposkop_cohort") == "prospective_control":
+        if (
+            mutating_agent_workspace is None
+            or reposkop_event_identity is None
+            or lease_result is None
+        ):
+            raise RuntimeError("prospective Reposkop control lacks bound admission evidence")
+        admission_evidence = lease_result.get("work_admission")
+        if not _reposkop_prospective_admission_verified(
+            lease_result=lease_result,
+            repository_scope_manifest=repository_scope_manifest,
+            workspace=mutating_agent_workspace,
+        ):
+            raise RuntimeError("prospective Reposkop control lost repository admission")
+        admission_sha256 = _sha256_json(admission_evidence)
+        reposkop_decision_audit_ref = reposkop_effectiveness.append_event(
+            {
+                "timestamp_unix": _now(),
+                "operation": "reposkop-decision-applied",
+                **reposkop_event_identity,
+                "baseline_decision": "allow_without_reposkop",
+                "final_decision": "allow",
+                "decision_changed": False,
+                "action": "task_start_allowed_without_reposkop",
+                "reposkop_execution_skipped": True,
+                "admission_evidence_sha256": admission_sha256,
+                "rule_ids": ["reposkop-policy-v3-prospective-control"],
+                "decision_reason_codes": [
+                    "prospective_control",
+                    "repository_admission_verified",
+                    "reposkop_execution_skipped",
+                ],
+            }
+        )
+        control_material = {
+            "schema_version": 1,
+            "kind": REPOSKOP_EXECUTION_ATTESTATION_KIND,
+            "policy_version": task_effect_classification["policy_version"],
+            "required": False,
+            "status": "skipped_control",
+            "task_id": task_id,
+            "lease_owner_id": lease_owner,
+            "workspace_lease_resource_keys": workspace_lease_resource_keys,
+            "workspace_lease_resource_keys_sha256": _sha256_json(
+                workspace_lease_resource_keys
+            ),
+            "workspace": mutating_agent_workspace,
+            "argv_sha256": argv_sha256,
+            "execution_identity_sha256": execution_identity["identity_sha256"],
+            "evaluation_id": reposkop_evaluation_id,
+            "effect_profile": task_effect_classification["effect_profile"],
+            "reposkop_policy": task_effect_classification["reposkop_policy"],
+            "reposkop_cohort": task_effect_classification.get("reposkop_cohort"),
+            "surface": task_effect_classification["surface"],
+            "agent_executable": task_effect_classification.get("agent_executable"),
+            "checkout_binding_sha256": reposkop_checkout_binding_sha256,
+            "decision_audit_ref": reposkop_decision_audit_ref,
+            "admission_evidence_sha256": admission_sha256,
+            "reposkop_execution_skipped": True,
+            "effect_authorized": False,
+        }
+        reposkop_execution_attestation = {
+            **control_material,
+            "execution_binding_sha256": _sha256_json(control_material),
+        }
     record = {
         "task_id": task_id,
         "host": host,
@@ -6907,6 +7033,15 @@ def grabowski_task_start(
         "routing_shadow_capture": routing_shadow_capture,
         "effect_profile": task_effect_classification["effect_profile"],
         "reposkop_policy": task_effect_classification["reposkop_policy"],
+        "reposkop_cohort": task_effect_classification.get("reposkop_cohort"),
+        "prospective_admission_verified": task_effect_classification.get(
+            "prospective_admission_verified"
+        ),
+        "sampling_modulus": task_effect_classification.get("sampling_modulus"),
+        "sampling_bucket": task_effect_classification.get("sampling_bucket"),
+        "sampling_key_sha256": task_effect_classification.get(
+            "sampling_key_sha256"
+        ),
         "surface": task_effect_classification["surface"],
         "agent_executable": task_effect_classification.get(
             "agent_executable"
@@ -6933,14 +7068,14 @@ def grabowski_task_start(
             else None
         ),
         "reposkop_usage_key_sha256": (
-            reposkop_execution_attestation["usage_key_sha256"]
+            reposkop_execution_attestation.get("usage_key_sha256")
             if reposkop_execution_attestation is not None
             else None
         ),
         "reposkop_workspace_lease_resource_keys": (
-            reposkop_execution_attestation[
-                "workspace_lease_resource_keys"
-            ]
+            reposkop_execution_attestation.get(
+                "workspace_lease_resource_keys", []
+            )
             if reposkop_execution_attestation is not None
             else []
         ),
