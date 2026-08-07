@@ -11,6 +11,7 @@ NAMES = [
     "grabowski_bureau_candidate_assess",
     "grabowski_secret_reveal",
     "grabowski_task_start",
+    "grip_run",
 ]
 
 
@@ -30,6 +31,9 @@ def _sentinel_schemas() -> dict[str, dict[str, object]]:
             contract.REQUIRED_SCHEMA_PROPERTIES[
                 "grabowski_bureau_candidate_assess"
             ]
+        ),
+        "grip_run": _object_schema(
+            contract.REQUIRED_SCHEMA_PROPERTIES["grip_run"]
         ),
         "grabowski_secret_reveal": _object_schema({"path"}),
         "grabowski_task_start": _object_schema(
@@ -61,7 +65,7 @@ class ConnectorContractTests(unittest.TestCase):
         self.assertEqual(set(schemas), contract.REQUIRED_SCHEMA_SENTINELS)
         self.assertEqual(metadata["name_count"], len(NAMES))
         self.assertEqual(metadata["names_sha256"], contract.fingerprint(NAMES))
-        self.assertEqual(metadata["schema_coverage_count"], 3)
+        self.assertEqual(metadata["schema_coverage_count"], 4)
         self.assertLessEqual(
             metadata["artifact_bytes"], contract.MAX_OBSERVED_ARTIFACT_BYTES
         )
@@ -117,6 +121,36 @@ class ConnectorContractTests(unittest.TestCase):
             ],
         )
 
+    def test_grip_run_allow_mutation_is_a_concrete_negative_probe(self) -> None:
+        runtime_schemas = _sentinel_schemas()
+        observed_schemas = copy.deepcopy(runtime_schemas)
+        del observed_schemas["grip_run"]["properties"]["allow_mutation"]
+
+        result = contract.probe_contract(
+            NAMES,
+            observed_schemas,
+            NAMES,
+            runtime_schemas,
+            NAMES,
+        )
+
+        self.assertFalse(result["matches"])
+        self.assertFalse(result["schema_contract_matches"])
+        self.assertEqual(
+            [
+                item
+                for item in result["required_schema_property_mismatches"]
+                if item["tool"] == "grip_run" and item["source"] == "connector"
+            ],
+            [
+                {
+                    "tool": "grip_run",
+                    "source": "connector",
+                    "missing_properties": ["allow_mutation"],
+                }
+            ],
+        )
+
     def test_each_task_start_identity_field_is_a_concrete_negative_probe(self) -> None:
         runtime_schemas = _sentinel_schemas()
         for field in sorted(
@@ -153,7 +187,7 @@ class ConnectorContractTests(unittest.TestCase):
     def test_missing_duplicate_and_extra_schema_entries_fail_closed(self) -> None:
         schemas = _sentinel_schemas()
         missing = contract.probe_contract(
-            NAMES[:-1],
+            [name for name in NAMES if name != "grabowski_task_start"],
             schemas,
             NAMES,
             schemas,
@@ -212,7 +246,7 @@ class ConnectorContractTests(unittest.TestCase):
         )
         self.assertTrue(result["matches"])
 
-    def test_runtime_export_keeps_only_three_schema_objects(self) -> None:
+    def test_runtime_export_keeps_only_four_schema_objects(self) -> None:
         schemas = _sentinel_schemas()
         runtime_tools = [
             {

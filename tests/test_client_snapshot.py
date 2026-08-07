@@ -80,6 +80,15 @@ class ClientSnapshotTests(unittest.TestCase):
                     )
                 },
             },
+            "grip_run": {
+                "type": "object",
+                "properties": {
+                    name: {"type": "string", "default": ""}
+                    for name in sorted(
+                        connector_contract.REQUIRED_SCHEMA_PROPERTIES["grip_run"]
+                    )
+                },
+            },
             "grabowski_secret_reveal": {
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
@@ -99,6 +108,7 @@ class ClientSnapshotTests(unittest.TestCase):
         names = [
             "alpha",
             "grabowski_bureau_candidate_assess",
+            "grip_run",
             "grabowski_secret_reveal",
             "grabowski_task_start",
         ]
@@ -450,6 +460,7 @@ class ClientSnapshotTests(unittest.TestCase):
         tools = [
             Tool("zeta"),
             Tool("grabowski_task_start", schemas["grabowski_task_start"]),
+            Tool("grip_run", schemas["grip_run"]),
             Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
             Tool(
                 "grabowski_bureau_candidate_assess",
@@ -467,7 +478,7 @@ class ClientSnapshotTests(unittest.TestCase):
             sorted(observed_schemas),
             sorted(connector_contract.REQUIRED_SCHEMA_SENTINELS),
         )
-        self.assertEqual(metadata["schema_coverage_count"], 3)
+        self.assertEqual(metadata["schema_coverage_count"], 4)
         self.assertLessEqual(
             metadata["artifact_bytes"],
             connector_contract.MAX_OBSERVED_ARTIFACT_BYTES,
@@ -487,6 +498,7 @@ class ClientSnapshotTests(unittest.TestCase):
             snapshot._mixed_observed_tool_artifact(
                 [
                     Tool("grabowski_task_start"),
+                    Tool("grip_run", {}),
                     Tool("grabowski_secret_reveal", {}),
                     Tool("grabowski_bureau_candidate_assess", {}),
                 ]
@@ -521,6 +533,7 @@ class ClientSnapshotTests(unittest.TestCase):
                 schemas["grabowski_bureau_candidate_assess"],
             ),
             Tool("grabowski_secret_reveal", schemas["grabowski_secret_reveal"]),
+            Tool("grip_run", schemas["grip_run"]),
             Tool("grabowski_task_start", schemas["grabowski_task_start"]),
             Tool("zeta"),
         ]
@@ -639,7 +652,7 @@ class ClientSnapshotTests(unittest.TestCase):
                 )
             )
             self.assertTrue(result["schema_contract_matches"])
-            self.assertEqual(result["schema_coverage_count"], 3)
+            self.assertEqual(result["schema_coverage_count"], 4)
             self.assertEqual(
                 result["transport_verification_receipt_sha256"],
                 "f" * 64,
