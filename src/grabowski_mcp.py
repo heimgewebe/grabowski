@@ -260,6 +260,7 @@ def _retain_pending_transport_target(
         "client_scope_sha256": scope_sha256,
         "runtime_binding_sha256": binding_sha256,
         "claim_state": "pending",
+        "created_at_monotonic": now_monotonic,
         "expires_at_monotonic": (
             now_monotonic + grabowski_transport_roundtrip.CHALLENGE_TTL_SECONDS
         ),
@@ -285,14 +286,33 @@ def _retain_pending_transport_target(
                 "claim_state": existing.get("claim_state", "pending"),
                 "replayed": True,
             }
-        if len(_RETAINED_TRANSPORT_TARGETS) >= _RETAINED_TRANSPORT_TARGET_MAX:
-            raise RuntimeError("retained transport target pool is full")
         retained_bytes = sum(
             int(item.get("arguments_bytes", 0))
             for item in _RETAINED_TRANSPORT_TARGETS.values()
         )
-        if retained_bytes + arguments_bytes > _RETAINED_TRANSPORT_TARGET_TOTAL_MAX_BYTES:
-            raise RuntimeError("retained transport target pool memory bound is full")
+        while (
+            len(_RETAINED_TRANSPORT_TARGETS) >= _RETAINED_TRANSPORT_TARGET_MAX
+            or retained_bytes + arguments_bytes
+            > _RETAINED_TRANSPORT_TARGET_TOTAL_MAX_BYTES
+        ):
+            evictable = sorted(
+                (
+                    (challenge, item)
+                    for challenge, item in _RETAINED_TRANSPORT_TARGETS.items()
+                    if item.get("claim_state") == "pending"
+                ),
+                key=lambda pair: (
+                    float(pair[1].get("created_at_monotonic", 0.0)),
+                    pair[0],
+                ),
+            )
+            if not evictable:
+                raise RuntimeError(
+                    "retained transport target pool contains only in-flight targets"
+                )
+            evicted_challenge, evicted = evictable[0]
+            _RETAINED_TRANSPORT_TARGETS.pop(evicted_challenge, None)
+            retained_bytes -= int(evicted.get("arguments_bytes", 0))
         _RETAINED_TRANSPORT_TARGETS[challenge_receipt_sha256] = entry
     return {
         "challenge_receipt_sha256": challenge_receipt_sha256,
@@ -10564,20 +10584,25 @@ def _transport_tool_result_error(value: Any) -> dict[str, Any] | None:
     }
 
 
+def _validate_transport_roundtrip_target_tool(tool_name: Any) -> str:
+    if not isinstance(tool_name, str) or not tool_name or tool_name.strip() != tool_name:
+        raise ValueError("transport target tool name is invalid")
+    tool = mcp._tool_manager.get_tool(tool_name)
+    if tool is None:
+        raise ValueError(f"unknown transport target tool: {tool_name}")
+    annotations = getattr(tool, "annotations", None)
+    if getattr(annotations, "readOnlyHint", None) is not False:
+        raise ValueError(f"transport target must be explicitly mutating: {tool_name}")
+    return tool_name
+
+
 async def _dispatch_atomic_transport_target(
     target_tool_name: str,
     target_arguments: dict[str, Any],
     challenge_receipt_sha256: str,
     ctx: Context | None,
 ) -> dict[str, Any]:
-    tool = mcp._tool_manager.get_tool(target_tool_name)
-    if tool is None:
-        raise RuntimeError(f"unknown atomic transport target: {target_tool_name}")
-    annotations = getattr(tool, "annotations", None)
-    if bool(getattr(annotations, "readOnlyHint", False)):
-        raise ValueError(
-            f"atomic transport target must be mutating: {target_tool_name}"
-        )
+    _validate_transport_roundtrip_target_tool(target_tool_name)
     with grabowski_transport_roundtrip.execution_capability(
         challenge_receipt_sha256
     ) as execution_session:
@@ -10625,6 +10650,18 @@ async def _grip_run_mcp(
     _require_capability("terminal_execute")
     effective_parameters = parameters
     retained_claim_challenge: str | None = None
+    if name == "transport-roundtrip" and isinstance(parameters, dict):
+        if parameters.get("action") == "begin":
+            try:
+                _validate_transport_roundtrip_target_tool(
+                    parameters.get("target_tool_name")
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                return grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(parameters),
+                    f"transport target validation failed: {exc}",
+                )
     if (
         name == "transport-roundtrip"
         and isinstance(parameters, dict)

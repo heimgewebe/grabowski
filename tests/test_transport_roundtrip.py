@@ -345,7 +345,12 @@ class TransportRoundtripTests(_TransportHarness):
             client_scope=SHARED_SCOPE, runtime_binding=BINDING, now_unix=101
         )
         self.assertEqual(status["pending_challenge_count"], 2)
+        self.assertEqual(status["state"], "pooled")
         self.assertIsNone(status["challenge_receipt_sha256"])
+        self.assertIsNone(status["target_tool_name"])
+        self.assertIsNone(status["target_arguments_sha256"])
+        self.assertIsNone(status["last_consumption_receipt_sha256"])
+        self.assertIsNone(status["last_consumed_tool_name"])
         with self.assertRaises(roundtrip.TransportAtomicExecutionRequired):
             self.acknowledge(
                 first["challenge_receipt_sha256"], scope=SHARED_SCOPE
@@ -570,21 +575,30 @@ class TransportRoundtripTests(_TransportHarness):
             )
         self.assertNotEqual(replacement["challenge_receipt_sha256"], verified["verification_receipt_sha256"])
 
-    def test_shared_pending_pool_is_bounded_and_prunes_stale_entries(self) -> None:
+    def test_shared_pending_pool_evicts_oldest_effect_free_challenge(self) -> None:
         with mock.patch.object(roundtrip, "MAX_SHARED_PENDING_CHALLENGES", 2):
-            self.begin(
-                scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "1")
+            first_intent = self.intent("w", "1")
+            second_intent = self.intent("w", "2")
+            third_intent = self.intent("w", "3")
+            first = self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=first_intent
             )
-            self.begin(
-                scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "2")
+            second = self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=second_intent
             )
-            with self.assertRaisesRegex(
-                roundtrip.TransportRoundtripRequired,
-                "pending challenge pool is full",
-            ):
-                self.begin(
-                    scope=SHARED_SCOPE, now=100, mutation_intent=self.intent("w", "3")
-                )
+            third = self.begin(
+                scope=SHARED_SCOPE, now=100, mutation_intent=third_intent
+            )
+            self.assertEqual(third["pending_challenge_count"], 2)
+            path = roundtrip._state_path(roundtrip.client_scope_sha256(SHARED_SCOPE))
+            state = json.loads(path.read_text(encoding="utf-8"))
+            hashes = {item["receipt_sha256"] for item in state["pending_challenges"]}
+            self.assertIn(third["challenge_receipt_sha256"], hashes)
+            older = {
+                first["challenge_receipt_sha256"],
+                second["challenge_receipt_sha256"],
+            }
+            self.assertEqual(len(hashes & older), 1)
             refreshed = self.begin(
                 scope=SHARED_SCOPE,
                 now=100 + roundtrip.CHALLENGE_TTL_SECONDS + 1,
@@ -664,7 +678,8 @@ class TransportRoundtripTests(_TransportHarness):
         begun = self.begin(scope=SHARED_SCOPE)
         self.assertIn("action=execute", begun["recommended_next_action"])
         self.assertNotIn("action=ack", begun["recommended_next_action"])
-        self.assertIn("unchanged target_arguments", begun["recommended_next_action"])
+        self.assertIn("challenge_receipt_sha256", begun["recommended_next_action"])
+        self.assertNotIn("unchanged target_arguments", begun["recommended_next_action"])
         reserved = self.reserve(begun["challenge_receipt_sha256"])
         consumed, _ = self.consume_reserved(begun["challenge_receipt_sha256"])
         self.assertEqual(reserved["client_scope_kind"], "shared_unlabeled")
@@ -983,6 +998,24 @@ class UnboundVerificationAuthorizesNothingTests(_TransportHarness):
         self.assertFalse(cancelled["effect_possible"])
         with self.assertRaisesRegex(roundtrip.TransportRoundtripError, "missing"):
             self.reserve(challenge, now=102)
+
+    def test_expired_execution_reservation_can_be_safely_cancelled(self) -> None:
+        begun = self.begin(scope=SHARED_SCOPE, now=100)
+        challenge = begun["challenge_receipt_sha256"]
+        reserved = self.reserve(challenge, now=101)
+        self.assertEqual(
+            reserved["verification_expires_at_unix"],
+            101 + roundtrip.EXECUTION_RESERVATION_TTL_SECONDS,
+        )
+        cancelled = roundtrip.cancel_pending_execution_challenge(
+            client_scope=SHARED_SCOPE,
+            challenge_receipt_sha256=challenge,
+            runtime_binding=BINDING,
+            now_unix=132,
+        )
+        self.assertEqual(cancelled["state"], "cancelled_expired_reservation")
+        self.assertTrue(cancelled["cancelled"])
+        self.assertFalse(cancelled["effect_possible"])
 
     def test_cancel_pending_execution_challenge_refuses_reserved_target(self) -> None:
         begun = self.begin(scope=SHARED_SCOPE)

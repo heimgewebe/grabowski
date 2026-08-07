@@ -22,8 +22,9 @@ VERIFICATION_KIND = "grabowski_transport_roundtrip_verification"
 CONSUMPTION_KIND = "grabowski_transport_roundtrip_consumption"
 CHALLENGE_TTL_SECONDS = 300
 VERIFICATION_TTL_SECONDS = 900
+EXECUTION_RESERVATION_TTL_SECONDS = 30
 CLOCK_SKEW_SECONDS = 30
-MAX_STATE_BYTES = 128 * 1024
+MAX_STATE_BYTES = 512 * 1024
 MAX_SHARED_PENDING_CHALLENGES = 32
 MAX_SHARED_VERIFIED_RECEIPTS = 32
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-roundtrip"
@@ -134,13 +135,11 @@ def _execution_capability_sha256(challenge_receipt_sha256: Any) -> str:
 def execution_capability(
     challenge_receipt_sha256: str,
 ) -> Iterator[dict[str, Any]]:
-    """Bind one challenge-derived bearer capability to an in-process dispatch.
+    """Bind one challenge-derived in-process ownership tag to dispatch.
 
-    The plaintext challenge never enters target arguments or durable state. Its
-    digest is matched by consume_verified() through this ContextVar, so an
-    unrelated caller with the same tool and arguments cannot spend the
-    reservation. Nested atomic executions are refused to keep ownership
-    unambiguous.
+    The digest is deterministic from the challenge, so it is not a secret or
+    authentication factor. Authority comes from the private ContextVar that a
+    remote caller cannot inject into a target invocation.
     """
 
     capability_sha256 = _execution_capability_sha256(challenge_receipt_sha256)
@@ -186,12 +185,9 @@ def execution_capability_snapshot(session: Any) -> dict[str, str | None]:
     }
 
 
-def _record_execution_consumption(
-    *,
-    capability_sha256: str,
-    verification_receipt_sha256: str,
-    consumption_receipt_sha256: str,
-) -> None:
+def _require_execution_consumption_owner(
+    *, capability_sha256: str
+) -> dict[str, Any]:
     session = _EXECUTION_CONTEXT.get()
     if not isinstance(session, dict):
         raise TransportExecutionCapabilityRequired(
@@ -207,9 +203,17 @@ def _record_execution_consumption(
         raise TransportExecutionCapabilityMismatch(
             "transport execution capability has already been consumed"
         )
+    return session
+
+
+def _record_execution_consumption(
+    session: dict[str, Any],
+    *,
+    verification_receipt_sha256: str,
+    consumption_receipt_sha256: str,
+) -> None:
     session["verification_receipt_sha256"] = verification_receipt_sha256
     session["consumption_receipt_sha256"] = consumption_receipt_sha256
-
 
 def canonical_arguments_sha256(arguments: Any) -> str:
     if not isinstance(arguments, dict):
@@ -917,12 +921,17 @@ def _new_verification(
     mutation_intent: dict[str, str] | None,
     execution_capability_sha256: str | None = None,
 ) -> dict[str, Any]:
+    ttl_seconds = (
+        EXECUTION_RESERVATION_TTL_SECONDS
+        if execution_capability_sha256 is not None
+        else VERIFICATION_TTL_SECONDS
+    )
     verification = _receipt_base(
         kind=VERIFICATION_KIND,
         scope=scope,
         runtime_binding=runtime_binding,
         created_at_unix=timestamp,
-        expires_at_unix=timestamp + VERIFICATION_TTL_SECONDS,
+        expires_at_unix=timestamp + ttl_seconds,
     )
     verification.update(
         {
@@ -979,9 +988,9 @@ def _pending_challenge_next_action(scope: dict[str, str]) -> str:
     """Return an executable next step for the caller's actual scope."""
     if _is_shared_pool(scope):
         return (
-            "call grip_run for transport-roundtrip with action=execute, the exact "
-            "challenge_receipt_sha256, target_tool_name, and unchanged "
-            "target_arguments; do not retry the target separately"
+            "call grip_run for transport-roundtrip with action=execute and the exact "
+            "challenge_receipt_sha256; the server retains the exact target briefly; "
+            "do not retry the target separately"
         )
     return (
         "call grip_run for transport-roundtrip with action=ack and the "
@@ -1019,6 +1028,7 @@ def _projection(
         key=_receipt_order,
     )
     consumption = state.get("last_consumption_receipt")
+    shared = _is_shared_pool(scope)
     selected_pending_current = (
         selected_pending if selected_pending in pending_current else None
     )
@@ -1037,9 +1047,16 @@ def _projection(
         state_name = "challenge_pending"
         gate_open = False
         next_action = _pending_challenge_next_action(scope)
+    elif shared and (verified_current or pending_current):
+        projected_pending = None
+        projected_verified = None
+        state_name = "pooled"
+        gate_open = False
+        next_action = (
+            "continue only with the caller-owned challenge; pooled shared state "
+            "does not project another caller's target"
+        )
     elif verified_current:
-        # _current_receipts already dropped every unbound receipt, so no second
-        # filter is needed here.
         projected_pending = pending_current[0] if pending_current else None
         projected_verified = verified_current[0]
         state_name, gate_open, next_action = _verified_projection(projected_verified)
@@ -1091,7 +1108,6 @@ def _projection(
         next_action = (
             "invoke exactly one bound mutating tool: " + projected_intent["tool_name"]
         )
-    shared = _is_shared_pool(scope)
     does_not_establish = [
         "authenticated client identity",
         "application-level success of a mutating tool",
@@ -1175,10 +1191,14 @@ def _projection(
             else None
         ),
         "last_consumption_receipt_sha256": (
-            consumption.get("receipt_sha256") if isinstance(consumption, dict) else None
+            consumption.get("receipt_sha256")
+            if isinstance(consumption, dict) and not shared
+            else None
         ),
         "last_consumed_tool_name": (
-            consumption.get("tool_name") if isinstance(consumption, dict) else None
+            consumption.get("tool_name")
+            if isinstance(consumption, dict) and not shared
+            else None
         ),
         "runtime_binding_sha256": _sha256_json(runtime_binding),
         "recommended_next_action": next_action,
@@ -1247,10 +1267,11 @@ def begin(
                     replayed=True,
                     selected_pending=matching_pending[0],
                 )
-        if _is_shared_pool(scope) and len(pending) >= MAX_SHARED_PENDING_CHALLENGES:
-            raise TransportRoundtripRequired(
-                "shared transport pending challenge pool is full"
-            )
+        if shared and len(pending) >= MAX_SHARED_PENDING_CHALLENGES:
+            # Pending challenges have admitted no effect. Evict the oldest one
+            # rather than wedging every shared caller for the full challenge TTL.
+            keep = max(0, MAX_SHARED_PENDING_CHALLENGES - 1)
+            pending = pending[-keep:] if keep else []
         previous = verified[-1] if verified else None
         challenge = _new_challenge(
             scope=scope,
@@ -1582,8 +1603,37 @@ def cancel_pending_execution_challenge(
             loaded["verified_receipts"], challenge_hash
         )
         if verification is not None:
+            if _receipt_is_current(
+                verification, runtime_binding=binding, now_unix=timestamp
+            ):
+                return {
+                    "state": "reserved",
+                    "cancelled": False,
+                    "effect_possible": True,
+                    "challenge_receipt_sha256": challenge_hash,
+                    "recommended_next_action": (
+                        "perform target-specific readback before any retry"
+                    ),
+                }
+            if verification.get("runtime_binding") == binding:
+                remaining_verified = [
+                    item
+                    for item in loaded["verified_receipts"]
+                    if item.get("challenge_receipt_sha256") != challenge_hash
+                ]
+                state = {**loaded, "verified_receipts": remaining_verified}
+                _write_private_json(_state_path(_sha256_json(scope)), state)
+                return {
+                    "state": "cancelled_expired_reservation",
+                    "cancelled": True,
+                    "effect_possible": False,
+                    "challenge_receipt_sha256": challenge_hash,
+                    "recommended_next_action": (
+                        "retry the original target call to obtain a new challenge"
+                    ),
+                }
             return {
-                "state": "reserved",
+                "state": "runtime_mismatch",
                 "cancelled": False,
                 "effect_possible": True,
                 "challenge_receipt_sha256": challenge_hash,
@@ -1794,6 +1844,11 @@ def consume_verified(
             verified = unreserved[0]
         verification_intent = _receipt_mutation_intent(verified)
         reserved_capability_sha256 = _receipt_execution_capability_sha256(verified)
+        execution_session = None
+        if reserved_capability_sha256 is not None:
+            execution_session = _require_execution_consumption_owner(
+                capability_sha256=reserved_capability_sha256
+            )
         consumption = _receipt_base(
             kind=CONSUMPTION_KIND,
             scope=scope,
@@ -1828,9 +1883,9 @@ def consume_verified(
             "last_consumption_receipt": consumption,
         }
         _write_private_json(_state_path(_sha256_json(scope)), state)
-        if reserved_capability_sha256 is not None:
+        if execution_session is not None:
             _record_execution_consumption(
-                capability_sha256=reserved_capability_sha256,
+                execution_session,
                 verification_receipt_sha256=str(verified["receipt_sha256"]),
                 consumption_receipt_sha256=str(consumption["receipt_sha256"]),
             )

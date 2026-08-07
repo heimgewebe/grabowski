@@ -16,14 +16,14 @@ When `_meta.client_id` is absent, the production stateless HTTP transport uses t
 
 The normal path is deliberately two-step and keeps the first target call effect-free:
 
-1. Invoke the mutating MCP tool normally. Central admission computes the exact tool name and canonical argument hash, creates a challenge, and retains an exact JSON copy of the target **in process memory only** for at most the challenge lifetime. No domain effect is admitted.
+1. Invoke the mutating MCP tool normally. Central admission computes the exact tool name and canonical argument hash, creates a challenge, and retains an exact JSON copy of the target **in process memory only** while that pending challenge remains retained. No domain effect is admitted. Pending entries may be evicted under bounded-pool pressure because they have admitted no effect.
 2. Call `grip_run` → `transport-roundtrip` with `action=execute` and only the returned `challenge_receipt_sha256`. The MCP wrapper claims the retained target and injects its exact tool name and arguments server-side.
-3. The transport layer reserves that challenge for the injected exact target and dispatches it under a challenge-derived in-process execution capability.
+3. The transport layer reserves that challenge for the injected exact target and dispatches it under a challenge-derived in-process ownership tag. The tag is deterministic and is not an authentication secret; authority comes from the private execution context.
 4. Central admission consumes the reservation before the domain effect. The retained target is single-claim and cannot be reused for a second minimal execute.
 
 This removes the client-visible mutation-inside-mutation payload without collapsing the two-step response proof. The client no longer has to resend `target_tool_name` or `target_arguments` merely to complete a shared-scope challenge.
 
-If the process restarts, the retained target expires, the retention pool fills, or the target exceeds its bounded memory size, the original target call still has admitted no effect. That fact alone is not enough to authorize replay after an `execute` attempt: an execute may already have reserved or consumed the challenge. When retained state is missing, the server atomically cancels the durable challenge only if it is still pending and unreserved. Only that successful cancellation proves a fresh retry is safe. Reserved, consumed, runtime-mismatched, or otherwise unknown state requires target-specific readback before any retry. The compatibility path remains available: explicit `action=begin` with `target_tool_name` and `target_arguments`, followed by `action=execute` carrying the challenge and the unchanged target.
+If the process restarts, the retained target expires or is safely evicted, or the target exceeds its bounded per-object size, the original target call still has admitted no effect. That fact alone is not enough to authorize replay after an `execute` attempt: an execute may already have reserved or consumed the challenge. When retained state is missing, the server atomically cancels the durable challenge only if it is still pending and unreserved. Only that successful cancellation proves a fresh retry is safe. Reserved, consumed, runtime-mismatched, or otherwise unknown state requires target-specific readback before any retry. The compatibility path remains available: explicit `action=begin` with `target_tool_name` and `target_arguments`, followed by `action=execute` carrying the challenge and the unchanged target.
 
 ## Stable client-declared scope
 
@@ -33,9 +33,9 @@ A stable client-declared scope may use `action=begin`, then `action=ack`, then i
 
 Each durable transport receipt binds the scope kind and hash, release id, full repository head, registered tool-name hash, agent-instruction hash, timestamps, receipt chain, and canonical receipt hash. The consumption receipt additionally binds the mutating tool name and canonical argument SHA-256. Release, head, catalog, instruction, time, receipt, file-owner, permission, symlink, or hardlink drift closes the gate.
 
-Challenges expire after five minutes. Completed verification expires after fifteen minutes but is single-use. Consumption is serialized under the same private state lock. The stateless shared scope is capped at 32 pending challenges and 32 verified receipts. The in-memory retained-target pool is capped to the same pending count, each retained argument object is bounded to 4 MiB, and aggregate canonical retained argument bytes are capped at 16 MiB.
+Challenges expire after five minutes. Stable client-declared verifications expire after fifteen minutes and are single-use. Shared atomic execution reservations expire after 30 seconds; an expired reservation still present in durable state proves it was never consumed, so it can be removed under the state lock and retried with a fresh challenge. Consumption is serialized under the same private state lock. The stateless shared scope is capped at 32 pending challenges and 32 verified receipts. When the pending challenge pool is full, the oldest still-pending effect-free challenge is evicted instead of blocking all callers. The in-memory retained-target pool is capped to the same pending count, each retained argument object is bounded to 4 MiB, and aggregate canonical retained argument bytes are capped at 16 MiB; bounded pressure evicts only still-pending targets and never an in-flight claim.
 
-Durable handshake state lives below `~/.local/state/grabowski/transport-roundtrip/` with a private directory, private regular files, bounded JSON, serialized writers, atomic replacement, and file plus directory synchronization. Retained raw target arguments are **not** written there; they exist only in the serving process until claimed or expired.
+Durable handshake state lives below `~/.local/state/grabowski/transport-roundtrip/` with a private directory, private regular files, a 512 KiB per-scope JSON bound, serialized writers, atomic replacement, and file plus directory synchronization. Retained raw target arguments are **not** written there; they exist only in the serving process until claimed or expired.
 
 Self-hashes detect corruption and inconsistent rewriting. They do not claim resistance to code already running as the same operating-system user.
 
@@ -46,13 +46,13 @@ Self-hashes detect corruption and inconsistent rewriting. They do not claim resi
 - `readOnlyHint=false`: fresh exact verification is atomically consumed;
 - missing or malformed `readOnlyHint`: reject before tool effect.
 
-The complete runtime inventory must classify every public tool explicitly.
+The complete runtime inventory must classify every public tool explicitly. Explicit `action=begin` on the MCP surface validates that its named target exists and declares `readOnlyHint=false` before it is allowed to occupy transport state.
 
 ## Failure semantics
 
 The gate proves that a challenge response was received before one admitted mutation. It does not prove the result of that mutation or exclude response loss afterwards. A timeout or 502 after execution therefore still requires the tool-specific status, target readback, operation identity, or reconciliation path. A new challenge never authorizes blind replay.
 
-A missing retained target is not by itself safe-retry evidence. The server may authorize a fresh retry only by atomically removing the exact challenge while it is still pending and unreserved. If the challenge is reserved, consumed, belongs to another runtime, cannot be found, or cannot be inspected, the outcome is treated as potentially ambiguous and requires target-specific readback. During an in-process execute, the retained entry is marked claimed until dispatch returns, so a concurrent duplicate cannot cancel the challenge out from under the active call.
+A missing retained target is not by itself safe-retry evidence. Shared pooled status reports expose aggregate counts without projecting another unlabeled caller's target tool, argument digest, or last-consumption identity. The server may authorize a fresh retry only by atomically removing the exact challenge while it is still pending and unreserved. If the challenge is reserved, consumed, belongs to another runtime, cannot be found, or cannot be inspected, the outcome is treated as potentially ambiguous and requires target-specific readback. During an in-process execute, the retained entry is marked claimed until dispatch returns, so a concurrent duplicate cannot cancel the challenge out from under the active call.
 
 ## Cutover evidence
 
