@@ -19,6 +19,12 @@ REQUIRED_SCHEMA_PROPERTIES = {
         "selector",
         "task_id",
     },
+    "grip_run": {
+        "allow_mutation",
+        "name",
+        "parameters",
+        "profile",
+    },
     "grabowski_task_start": {
         "force_new_reason",
         "operation_identity",

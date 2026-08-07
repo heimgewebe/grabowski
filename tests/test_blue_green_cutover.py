@@ -96,6 +96,7 @@ NAMES = [
     "grabowski_bureau_candidate_assess",
     "grabowski_secret_reveal",
     "grabowski_task_start",
+    "grip_run",
 ]
 
 
@@ -119,6 +120,9 @@ def _sentinel_schemas() -> dict[str, dict[str, object]]:
         "grabowski_secret_reveal": _object_schema({"path"}),
         "grabowski_task_start": _object_schema(
             contract.REQUIRED_SCHEMA_PROPERTIES["grabowski_task_start"]
+        ),
+        "grip_run": _object_schema(
+            contract.REQUIRED_SCHEMA_PROPERTIES["grip_run"]
         ),
     }
 

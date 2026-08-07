@@ -225,6 +225,68 @@ class TransportGripIntegrationTests(unittest.TestCase):
         self.assertTrue(executed["output"]["target_result"]["called"])
         self.assertIsNotNone(executed["output"]["consumption_receipt_sha256"])
 
+    def test_mcp_handshake_does_not_depend_on_client_mutation_flag(self) -> None:
+        base = _load_grabowski_mcp()
+        observed: list[tuple[str, bool]] = []
+
+        def fake_core(
+            name, parameters, profile, allow_mutation, ctx, **_kwargs
+        ):
+            observed.append((name, allow_mutation))
+            return {"status": "passed"}
+
+        with mock.patch.object(base, "_require_capability"), mock.patch.object(
+            base, "_grip_run_core", side_effect=fake_core
+        ):
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "transport-roundtrip",
+                    {"action": "begin"},
+                    allow_mutation=False,
+                )
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(observed, [("transport-roundtrip", True)])
+
+    def test_mcp_handshake_exemption_does_not_leak_to_other_grips(self) -> None:
+        base = _load_grabowski_mcp()
+        observed: list[bool] = []
+
+        def fake_core(
+            name, parameters, profile, allow_mutation, ctx, **_kwargs
+        ):
+            observed.append(allow_mutation)
+            return {"status": "passed", "name": name}
+
+        self.assertFalse(
+            base._mcp_effective_grip_mutation_permission(
+                "worktree-ensure", False
+            )
+        )
+        self.assertTrue(
+            base._mcp_effective_grip_mutation_permission(
+                "worktree-ensure", True
+            )
+        )
+        with base.grabowski_transport_roundtrip.execution_capability("a" * 64):
+            self.assertFalse(
+                base._mcp_effective_grip_mutation_permission(
+                    "worktree-ensure", False
+                )
+            )
+        with mock.patch.object(base, "_require_capability"), mock.patch.object(
+            base, "_grip_run_core", side_effect=fake_core
+        ):
+            result = asyncio.run(
+                base._grip_run_mcp(
+                    "worktree-ensure", {}, allow_mutation=False
+                )
+            )
+
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(observed, [False])
+
     def test_grip_requires_mutation_permission_and_rejects_extra_fields(self) -> None:
         denied = grips.grip_run(
             "transport-roundtrip",

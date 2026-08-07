@@ -1684,10 +1684,23 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 "task_id": {"type": "string", "default": ""},
             },
         }
+        grip_run_schema = {
+            "type": "object",
+            "properties": {
+                "allow_mutation": {"type": "boolean", "default": False},
+                "name": {"type": "string"},
+                "parameters": {
+                    "anyOf": [{"type": "object"}, {"type": "null"}],
+                    "default": None,
+                },
+                "profile": {"type": "string", "default": "operator"},
+            },
+        }
         sentinel_schemas = {
             "grabowski_bureau_candidate_assess": candidate_assess_schema,
             "grabowski_secret_reveal": runtime_schema,
             "grabowski_task_start": task_start_schema,
+            "grip_run": grip_run_schema,
         }
         runtime_tools = [
             {
@@ -1819,6 +1832,7 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
                 "grabowski_bureau_candidate_assess",
                 "grabowski_secret_reveal",
                 "grabowski_task_start",
+                "grip_run",
             ],
         )
 
