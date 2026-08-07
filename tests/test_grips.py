@@ -981,9 +981,8 @@ class GripFoundationTests(unittest.TestCase):
             "durable_receipt_path": "/tmp/work-acquire-lane.json",
         }
 
-        with patch.object(
-            grips.grabowski_work_acquire,
-            "grabowski_work_acquire",
+        with patch(
+            "grabowski_work_acquire.grabowski_work_acquire",
             return_value=lane,
         ) as acquire:
             result = grips.grip_run("work-acquire", parameters, allow_mutation=True)

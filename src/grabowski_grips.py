@@ -20,7 +20,6 @@ import grabowski_convergence
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
 import grabowski_operator_obligation
-import grabowski_work_acquire
 import grabowski_worktree_ensure
 import grabowski_merge_guard
 
@@ -3760,7 +3759,8 @@ def _run_work_acquire(
 ) -> dict[str, Any]:
     del spec, runner
     try:
-        output = grabowski_work_acquire.grabowski_work_acquire(**parameters)
+        work_acquire = __import__("grabowski_work_acquire")
+        output = work_acquire.grabowski_work_acquire(**parameters)
     except (TypeError, ValueError) as exc:
         _check(receipt, "work_acquire_preflight", "fail", str(exc))
         raise GripPreflightError(str(exc)) from exc

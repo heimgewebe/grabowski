@@ -331,6 +331,54 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(ensure.call_count, 1)
         release.assert_not_called()
 
+    def test_writer_starting_crash_window_fails_closed_without_second_launch(self) -> None:
+        params = self.parameters()
+        params["scoped_writer_argv"] = ["writer", "--once"]
+        params["scoped_writer_runtime_seconds"] = 600
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        self.state.mkdir(mode=0o700)
+        receipt_path = self.state / f"{inputs['lane_id']}.json"
+        work_acquire._write_state(
+            receipt_path,
+            {
+                "kind": work_acquire.LANE_KIND,
+                "schema_version": work_acquire.SCHEMA_VERSION,
+                "lane_id": inputs["lane_id"],
+                "inputs_sha256": work_acquire._sha(inputs),
+                "inputs": inputs,
+                "attempt_count": 1,
+                "created_at_unix": int(time.time()),
+                "updated_at_unix": int(time.time()),
+                "state": "writer_starting",
+                "decision": "EXECUTE",
+                "writer_start": {"state": "starting"},
+                "next_action": "start_scoped_writer",
+            },
+        )
+        acquire = Mock()
+        ensure = Mock()
+        start = Mock()
+        result = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+            start_writer_fn=start,
+        )
+        self.assertEqual(result["state"], "outcome_unknown")
+        self.assertEqual(result["decision"], "HARD_BLOCK")
+        self.assertEqual(
+            result["next_action"], "readback_scoped_writer_before_retry"
+        )
+        self.assertEqual(result["writer_start"]["state"], "outcome_unknown")
+        self.assertTrue(result["replayed"])
+        acquire.assert_not_called()
+        ensure.assert_not_called()
+        start.assert_not_called()
+
     def test_scoped_writer_argv_requires_scoped_writer_actor(self) -> None:
         params = self.parameters()
         params["scoped_writer_actor"] = None

@@ -361,15 +361,31 @@ def acquire_work(
         existing_writer_start = (
             existing.get("writer_start") if isinstance(existing, dict) else None
         )
-        if (
+        ambiguous_writer_start = (
             writer_argv is not None
             and existing is not None
-            and existing.get("state") == "outcome_unknown"
+            and existing_writer_job is None
+            and existing.get("state") in {"writer_starting", "outcome_unknown"}
             and isinstance(existing_writer_start, dict)
-            and existing_writer_start.get("state") == "outcome_unknown"
-        ):
+            and existing_writer_start.get("state") in {"starting", "outcome_unknown"}
+        )
+        if ambiguous_writer_start:
+            record = _write_state(
+                receipt_path,
+                {
+                    **existing,
+                    "state": "outcome_unknown",
+                    "decision": "HARD_BLOCK",
+                    "updated_at_unix": int(time.time()),
+                    "writer_start": {
+                        **existing_writer_start,
+                        "state": "outcome_unknown",
+                    },
+                    "next_action": "readback_scoped_writer_before_retry",
+                },
+            )
             return {
-                **existing,
+                **record,
                 "durable_receipt_path": str(receipt_path),
                 "replayed": True,
             }
