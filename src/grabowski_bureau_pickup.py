@@ -1700,6 +1700,17 @@ def _acquisition_groups(
             }
         )
     for key in repo_keys:
+        if resources.scoped_repository_resource_root(key) is not None:
+            groups.append(
+                {
+                    "name": key,
+                    "resource_keys": [key],
+                    "metadata": _lease_metadata(intent, group=key),
+                    "nonconflict_proof": request["nonconflict_proofs"].get(key),
+                    "ttl_seconds": request["lease_ttl_seconds"],
+                }
+            )
+            continue
         scope = request["repository_scope_manifests"].get(key)
         if scope is None:
             if not request["create_workspace"]:
