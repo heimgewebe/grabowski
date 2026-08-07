@@ -82,7 +82,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "transport-roundtrip-before-mutation",
-        "Before every mutating MCP call, run grip_run transport-roundtrip action=begin with the exact target_tool_name and target_arguments. For shared_unlabeled callers, continue with action=execute carrying the returned challenge and the unchanged target so reservation, consumption, and dispatch are atomic. A stable client-declared scope may action=ack and then invoke the unchanged target once. A later ambiguous mutation still requires target readback before retry.",
+        "Invoke a mutating MCP tool normally. If a shared_unlabeled call returns a fresh transport challenge, continue with grip_run transport-roundtrip action=execute carrying only challenge_receipt_sha256; the server retains the exact target briefly and atomically binds reservation, consumption, and dispatch. A stable client-declared scope may action=ack and then invoke the unchanged target once. Explicit action=begin with target_tool_name and target_arguments remains available for compatibility. A later ambiguous mutation still requires target readback before retry.",
     ),
     (
         "typed-operation-preference",
@@ -139,6 +139,245 @@ AGENT_INSTRUCTIONS_SHA256 = hashlib.sha256(
     AGENT_INSTRUCTIONS.encode("utf-8")
 ).hexdigest()
 
+
+_RETAINED_TRANSPORT_TARGET_MAX = grabowski_transport_roundtrip.MAX_SHARED_PENDING_CHALLENGES
+_RETAINED_TRANSPORT_TARGET_MAX_BYTES = 4 * 1024 * 1024
+_RETAINED_TRANSPORT_TARGET_TOTAL_MAX_BYTES = 16 * 1024 * 1024
+_RETAINED_TRANSPORT_TARGET_LOCK = threading.Lock()
+_RETAINED_TRANSPORT_TARGETS: dict[str, dict[str, Any]] = {}
+
+
+class _RetainedTransportTargetMissing(RuntimeError):
+    pass
+
+
+class _RetainedTransportTargetInFlight(RuntimeError):
+    pass
+
+
+def _canonical_transport_target_copy(value: Any) -> tuple[dict[str, Any], int]:
+    if not isinstance(value, dict):
+        raise ValueError("retained transport target arguments must be an object")
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("retained transport target arguments are not canonical JSON") from exc
+    if len(encoded) > _RETAINED_TRANSPORT_TARGET_MAX_BYTES:
+        raise ValueError("retained transport target arguments exceed the per-target memory bound")
+    cloned = json.loads(encoded.decode("utf-8"))
+    if not isinstance(cloned, dict):
+        raise ValueError("retained transport target arguments must remain an object")
+    return cloned, len(encoded)
+
+
+def _transport_runtime_binding_sha256(value: Any) -> str:
+    binding = grabowski_transport_roundtrip.validate_runtime_binding(value)
+    encoded = json.dumps(
+        binding,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _prune_retained_transport_targets_locked(now_monotonic: float) -> None:
+    expired = [
+        challenge
+        for challenge, entry in _RETAINED_TRANSPORT_TARGETS.items()
+        if float(entry["expires_at_monotonic"]) <= now_monotonic
+    ]
+    for challenge in expired:
+        _RETAINED_TRANSPORT_TARGETS.pop(challenge, None)
+
+
+def _validated_retained_transport_target_locked(
+    challenge_receipt_sha256: str,
+    *,
+    client_scope: dict[str, Any],
+    runtime_binding: dict[str, Any],
+) -> dict[str, Any] | None:
+    scope_sha256 = grabowski_transport_roundtrip.client_scope_sha256(client_scope)
+    binding_sha256 = _transport_runtime_binding_sha256(runtime_binding)
+    entry = _RETAINED_TRANSPORT_TARGETS.get(challenge_receipt_sha256)
+    if entry is None:
+        return None
+    if entry.get("client_scope_sha256") != scope_sha256:
+        raise RuntimeError("retained transport target belongs to another client scope")
+    if entry.get("runtime_binding_sha256") != binding_sha256:
+        raise RuntimeError("retained transport target belongs to another runtime")
+    if grabowski_transport_roundtrip.canonical_arguments_sha256(
+        entry["target_arguments"]
+    ) != entry.get("arguments_sha256"):
+        _RETAINED_TRANSPORT_TARGETS.pop(challenge_receipt_sha256, None)
+        raise RuntimeError("retained transport target failed its argument hash check")
+    return entry
+
+
+def _retain_pending_transport_target(
+    challenge_receipt_sha256: str,
+    *,
+    tool_name: str,
+    target_arguments: dict[str, Any],
+    arguments_sha256: str,
+    client_scope: dict[str, Any],
+    runtime_binding: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(challenge_receipt_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", challenge_receipt_sha256
+    ) is None:
+        raise ValueError("retained transport challenge must be a lowercase SHA-256")
+    if (
+        not isinstance(tool_name, str)
+        or not tool_name
+        or tool_name.strip() != tool_name
+        or len(tool_name.encode("utf-8")) > 256
+    ):
+        raise ValueError("retained transport target tool name is invalid")
+    cloned_arguments, arguments_bytes = _canonical_transport_target_copy(target_arguments)
+    canonical_sha256 = grabowski_transport_roundtrip.canonical_arguments_sha256(
+        cloned_arguments
+    )
+    if canonical_sha256 != arguments_sha256:
+        raise ValueError("retained transport target argument hash mismatch")
+    scope = grabowski_transport_roundtrip.validate_client_scope(client_scope)
+    binding = grabowski_transport_roundtrip.validate_runtime_binding(runtime_binding)
+    scope_sha256 = grabowski_transport_roundtrip.client_scope_sha256(scope)
+    binding_sha256 = _transport_runtime_binding_sha256(binding)
+    now_monotonic = time.monotonic()
+    entry = {
+        "tool_name": tool_name,
+        "target_arguments": cloned_arguments,
+        "arguments_sha256": canonical_sha256,
+        "arguments_bytes": arguments_bytes,
+        "client_scope_sha256": scope_sha256,
+        "runtime_binding_sha256": binding_sha256,
+        "claim_state": "pending",
+        "expires_at_monotonic": (
+            now_monotonic + grabowski_transport_roundtrip.CHALLENGE_TTL_SECONDS
+        ),
+    }
+    with _RETAINED_TRANSPORT_TARGET_LOCK:
+        _prune_retained_transport_targets_locked(now_monotonic)
+        existing = _RETAINED_TRANSPORT_TARGETS.get(challenge_receipt_sha256)
+        if existing is not None:
+            comparable = (
+                "tool_name",
+                "target_arguments",
+                "arguments_sha256",
+                "client_scope_sha256",
+                "runtime_binding_sha256",
+            )
+            if any(existing.get(key) != entry.get(key) for key in comparable):
+                raise RuntimeError("retained transport challenge is already bound elsewhere")
+            return {
+                "challenge_receipt_sha256": challenge_receipt_sha256,
+                "target_tool_name": tool_name,
+                "target_arguments_sha256": canonical_sha256,
+                "arguments_bytes": arguments_bytes,
+                "claim_state": existing.get("claim_state", "pending"),
+                "replayed": True,
+            }
+        if len(_RETAINED_TRANSPORT_TARGETS) >= _RETAINED_TRANSPORT_TARGET_MAX:
+            raise RuntimeError("retained transport target pool is full")
+        retained_bytes = sum(
+            int(item.get("arguments_bytes", 0))
+            for item in _RETAINED_TRANSPORT_TARGETS.values()
+        )
+        if retained_bytes + arguments_bytes > _RETAINED_TRANSPORT_TARGET_TOTAL_MAX_BYTES:
+            raise RuntimeError("retained transport target pool memory bound is full")
+        _RETAINED_TRANSPORT_TARGETS[challenge_receipt_sha256] = entry
+    return {
+        "challenge_receipt_sha256": challenge_receipt_sha256,
+        "target_tool_name": tool_name,
+        "target_arguments_sha256": canonical_sha256,
+        "arguments_bytes": arguments_bytes,
+        "claim_state": "pending",
+        "replayed": False,
+    }
+
+
+def _claim_pending_transport_target(
+    challenge_receipt_sha256: str,
+    *,
+    client_scope: dict[str, Any],
+    runtime_binding: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(challenge_receipt_sha256, str) or re.fullmatch(
+        r"[0-9a-f]{64}", challenge_receipt_sha256
+    ) is None:
+        raise ValueError("retained transport challenge must be a lowercase SHA-256")
+    now_monotonic = time.monotonic()
+    with _RETAINED_TRANSPORT_TARGET_LOCK:
+        _prune_retained_transport_targets_locked(now_monotonic)
+        entry = _validated_retained_transport_target_locked(
+            challenge_receipt_sha256,
+            client_scope=client_scope,
+            runtime_binding=runtime_binding,
+        )
+        if entry is None:
+            raise _RetainedTransportTargetMissing(
+                "retained transport target is missing or expired"
+            )
+        if entry.get("claim_state") == "claimed":
+            raise _RetainedTransportTargetInFlight(
+                "retained transport target is already claimed and may be in flight"
+            )
+        entry["claim_state"] = "claimed"
+        claimed = dict(entry)
+    return {
+        "target_tool_name": claimed["tool_name"],
+        "target_arguments": claimed["target_arguments"],
+        "target_arguments_sha256": claimed["arguments_sha256"],
+    }
+
+
+def _claim_explicit_retained_transport_target_if_exact(
+    challenge_receipt_sha256: str,
+    *,
+    tool_name: Any,
+    target_arguments: Any,
+    client_scope: dict[str, Any],
+    runtime_binding: dict[str, Any],
+) -> bool:
+    if not isinstance(tool_name, str) or not isinstance(target_arguments, dict):
+        return False
+    now_monotonic = time.monotonic()
+    with _RETAINED_TRANSPORT_TARGET_LOCK:
+        _prune_retained_transport_targets_locked(now_monotonic)
+        entry = _validated_retained_transport_target_locked(
+            challenge_receipt_sha256,
+            client_scope=client_scope,
+            runtime_binding=runtime_binding,
+        )
+        if entry is None:
+            return False
+        if (
+            entry.get("tool_name") != tool_name
+            or entry.get("arguments_sha256")
+            != grabowski_transport_roundtrip.canonical_arguments_sha256(target_arguments)
+        ):
+            return False
+        if entry.get("claim_state") == "claimed":
+            raise _RetainedTransportTargetInFlight(
+                "retained transport target is already claimed and may be in flight"
+            )
+        entry["claim_state"] = "claimed"
+        return True
+
+
+def _discard_pending_transport_target(challenge_receipt_sha256: Any) -> bool:
+    if not isinstance(challenge_receipt_sha256, str):
+        return False
+    with _RETAINED_TRANSPORT_TARGET_LOCK:
+        return _RETAINED_TRANSPORT_TARGETS.pop(challenge_receipt_sha256, None) is not None
 
 def _agent_instructions_metadata() -> dict[str, Any]:
     return {
@@ -10384,6 +10623,105 @@ async def _grip_run_mcp(
     """Run one allowlisted Grabowski grip and return its receipt-bound result."""
 
     _require_capability("terminal_execute")
+    effective_parameters = parameters
+    retained_claim_challenge: str | None = None
+    if (
+        name == "transport-roundtrip"
+        and isinstance(parameters, dict)
+        and parameters.get("action") == "execute"
+    ):
+        challenge = parameters.get("challenge_receipt_sha256")
+        has_tool = "target_tool_name" in parameters
+        has_arguments = "target_arguments" in parameters
+        if isinstance(challenge, str) and not has_tool and not has_arguments:
+            client_scope = _transport_roundtrip_client_scope(ctx)
+            runtime_binding = _transport_roundtrip_runtime_binding()
+            try:
+                retained = _claim_pending_transport_target(
+                    challenge,
+                    client_scope=client_scope,
+                    runtime_binding=runtime_binding,
+                )
+            except _RetainedTransportTargetInFlight as exc:
+                return grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(parameters),
+                    f"retained transport target is in flight: {exc}; do not retry the "
+                    "original target; perform target-specific readback if the first "
+                    "execute response is ambiguous",
+                )
+            except _RetainedTransportTargetMissing:
+                try:
+                    recovery = (
+                        grabowski_transport_roundtrip.cancel_pending_execution_challenge(
+                            client_scope=client_scope,
+                            challenge_receipt_sha256=challenge,
+                            runtime_binding=runtime_binding,
+                        )
+                    )
+                except (
+                    grabowski_transport_roundtrip.TransportRoundtripError,
+                    OSError,
+                    TypeError,
+                    ValueError,
+                ) as recovery_exc:
+                    recovery = {
+                        "state": f"recovery_error:{type(recovery_exc).__name__}",
+                        "cancelled": False,
+                        "effect_possible": True,
+                    }
+                if recovery.get("cancelled") is True:
+                    return grabowski_grips._blocked_surface_receipt(
+                        name,
+                        dict(parameters),
+                        "retained transport target is missing or expired; its still-pending "
+                        "challenge was atomically cancelled before any reservation, so the "
+                        "original target call admitted no effect; retry the original target "
+                        "to obtain a new challenge",
+                    )
+                return grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(parameters),
+                    "retained transport target is missing or expired and the challenge "
+                    f"cannot be proven unused (state={recovery.get('state', 'unknown')}); "
+                    "the target outcome may be unknown, so perform target-specific readback "
+                    "before any retry",
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                return grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(parameters),
+                    f"retained transport target is invalid: {exc}; do not retry blindly; "
+                    "perform target-specific readback before any retry",
+                )
+            retained_claim_challenge = challenge
+            effective_parameters = {
+                **parameters,
+                "target_tool_name": retained["target_tool_name"],
+                "target_arguments": retained["target_arguments"],
+            }
+        elif isinstance(challenge, str) and has_tool and has_arguments:
+            try:
+                if _claim_explicit_retained_transport_target_if_exact(
+                    challenge,
+                    tool_name=parameters.get("target_tool_name"),
+                    target_arguments=parameters.get("target_arguments"),
+                    client_scope=_transport_roundtrip_client_scope(ctx),
+                    runtime_binding=_transport_roundtrip_runtime_binding(),
+                ):
+                    retained_claim_challenge = challenge
+            except _RetainedTransportTargetInFlight as exc:
+                return grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(parameters),
+                    f"retained transport target is already in flight: {exc}",
+                )
+            except (RuntimeError, TypeError, ValueError) as exc:
+                return grabowski_grips._blocked_surface_receipt(
+                    name,
+                    dict(parameters),
+                    f"retained transport target validation failed: {exc}",
+                )
     effective_allow_mutation = _mcp_effective_grip_mutation_permission(
         name, allow_mutation
     )
@@ -10405,16 +10743,21 @@ async def _grip_run_mcp(
         )
         return future.result()
 
-    return await asyncio.to_thread(
-        lambda: _grip_run_core(
-            name,
-            parameters,
-            profile,
-            effective_allow_mutation,
-            ctx,
-            transport_target_dispatcher=target_dispatcher,
-        )
-    )
+    def run_core() -> dict[str, Any]:
+        try:
+            return _grip_run_core(
+                name,
+                effective_parameters,
+                profile,
+                effective_allow_mutation,
+                ctx,
+                transport_target_dispatcher=target_dispatcher,
+            )
+        finally:
+            if retained_claim_challenge is not None:
+                _discard_pending_transport_target(retained_claim_challenge)
+
+    return await asyncio.to_thread(run_core)
 
 
 @mcp.tool(name="grabowski_task_archive_list", annotations=READ_ANNOTATIONS)
