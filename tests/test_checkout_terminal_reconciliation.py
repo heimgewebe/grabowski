@@ -110,19 +110,26 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
     ) -> dict[str, object]:
         common_dir = self._common_dir()
         retained_until = int(time.time()) + 3600
-        binding = checkouts._reserve_checkout_lifecycle(
-            repo_common_dir=common_dir,
-            repo_path=self.repo,
-            checkout_path=self.checkout,
-            owner_id="owner-a",
-            purpose="terminal reconciliation fixture",
-            source_kind=source_kind,
-            source_id=source_id,
-            artifact_class="implementation_worktree",
-            retention_until_unix=retained_until,
-            expected_head=self.head,
-            expected_branch="topic",
+        supported_kinds = checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS
+        fixture_kinds = (
+            supported_kinds | {source_kind}
+            if source_kind not in supported_kinds
+            else supported_kinds
         )
+        with patch.object(checkouts, "TERMINAL_EVIDENCE_SOURCE_KINDS", fixture_kinds):
+            binding = checkouts._reserve_checkout_lifecycle(
+                repo_common_dir=common_dir,
+                repo_path=self.repo,
+                checkout_path=self.checkout,
+                owner_id="owner-a",
+                purpose="terminal reconciliation fixture",
+                source_kind=source_kind,
+                source_id=source_id,
+                artifact_class="implementation_worktree",
+                retention_until_unix=retained_until,
+                expected_head=self.head,
+                expected_branch="topic",
+            )
         checkouts._upsert_retention(
             checkout_key=str(binding["checkout_key"]),
             repo_common_dir=common_dir,
@@ -351,8 +358,24 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual("terminal", decision["hygiene_mark"])
         self.assertNotIn("cleanup", decision["state"])
 
+    def test_automation_source_fails_closed_without_absence_inference(self) -> None:
+        binding = self._missing_binding(
+            source_kind="automation",
+            source_id="bureau-frontier-entblockung-20260806T1519Z",
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "automation checkout lifecycle source has no immutable terminal evidence contract",
+        ):
+            reconciliation.preview(str(binding["checkout_key"]))
+        after = checkouts._lifecycle_bindings([str(binding["checkout_key"])])[
+            str(binding["checkout_key"])
+        ]
+        self.assertEqual("active", after["phase"])
+        self.assertIsNone(reconciliation._record(str(binding["checkout_key"])))
+
     def test_source_dispatch_covers_all_supported_kinds(self) -> None:
-        for kind in ("bureau_task", "operator_obligation", "thread_focus", "github_issue"):
+        for kind in sorted(checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS):
             source_id = f"source-{kind}"
             core = {
                 "schema_version": 1,

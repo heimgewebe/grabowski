@@ -201,8 +201,15 @@ def source_terminal_evidence(binding: dict[str, Any]) -> dict[str, Any]:
     source_id = source.get("id")
     if not isinstance(kind, str) or not isinstance(source_id, str):
         raise RuntimeError("checkout lifecycle source binding is invalid")
+    if frozenset(_OBSERVERS) != checkouts.TERMINAL_EVIDENCE_SOURCE_KINDS:
+        raise RuntimeError("checkout terminal evidence observer contract drift")
     observer = _OBSERVERS.get(kind)
     if observer is None:
+        if kind == "automation":
+            raise RuntimeError(
+                "automation checkout lifecycle source has no immutable terminal evidence contract; "
+                "checkout absence, retention expiry and lease absence do not establish terminality"
+            )
         raise RuntimeError(f"unsupported checkout lifecycle source kind: {kind}")
     evidence = observer(source_id)
     if evidence.get("kind") != kind or evidence.get("source_id") != source_id:
