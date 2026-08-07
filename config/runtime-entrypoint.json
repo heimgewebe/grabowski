@@ -86,6 +86,8 @@
     "grabowski_juno_status",
     "grabowski_juno_pair",
     "grabowski_juno_run",
+    "ipad_native_permission_status",
+    "ipad_native_permission_request",
     "ipad_capability_manifest",
     "ipad_storage_inventory",
     "ipad_storage_grant_status",

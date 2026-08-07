@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "59af47eff107866ebb8d2d6a452658a8e1608a661a67d4cd0cab73b2bd3240bf",
+  "capability_source_sha256": "ffa9803354b796a8457cc0127ada83b924c814d26ca0b55476d272dcc5f72c93",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "46ba648f01da42196e1977b25715aa1c2debf08a7a46937fb5e1bf414836bb1a",
+  "contract_sha256": "cd665fbc8e11ba2729360eb4a13dcc3fb7446ae8c465dfb6a9d720eefa333a71",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1059,6 +1059,35 @@
       "reversibility": "job-dependent-with-local-stop-switch",
       "risk_class": "high",
       "tool": "grabowski_juno_run"
+    },
+    {
+      "category": "device-worker",
+      "description": "Read bounded native iPad permission states without reading private content.",
+      "effects": [
+        "device-job-execute",
+        "receipt-create"
+      ],
+      "id": "ipad_native_permission_status",
+      "purpose": "Read bounded native iPad permission states without reading private content.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_native_permission_status"
+    },
+    {
+      "category": "device-worker",
+      "description": "Request one allowlisted native iPad permission and return only status readback.",
+      "effects": [
+        "device-job-execute",
+        "device-permission-request",
+        "receipt-create"
+      ],
+      "id": "ipad_native_permission_request",
+      "purpose": "Request one allowlisted native iPad permission with foreground and post-readback gates.",
+      "read_only": false,
+      "reversibility": "manual-permission-change-in-ipados-settings",
+      "risk_class": "high",
+      "tool": "ipad_native_permission_request"
     },
     {
       "category": "device-storage",

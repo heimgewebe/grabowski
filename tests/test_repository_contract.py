@@ -179,12 +179,14 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 187)
+        self.assertEqual(len(tools), 189)
         self.assertTrue(
             {
                 "grabowski_juno_status",
                 "grabowski_juno_pair",
                 "grabowski_juno_run",
+                "ipad_native_permission_status",
+                "ipad_native_permission_request",
             }.issubset(tools)
         )
         legacy_tools = {

@@ -237,5 +237,108 @@ class JunoToolIntegrationTests(unittest.TestCase):
             redirect_thread.join(timeout=3)
 
 
+    def test_native_permission_status_is_typed_and_content_free(self) -> None:
+        sample = {
+            "schema_version": 1,
+            "kind": "ipad_native_permission_status",
+            "verification_time": "2026-08-07T20:00:00+00:00",
+            "permissions": {
+                "camera": {"authorization": 3},
+                "microphone": {"authorization": 3},
+                "photos_read_write": {"authorization": 3},
+                "notifications": {"authorization": 2, "alert": 2, "badge": 2, "sound": 2},
+                "location_when_in_use": {"authorization": 0, "services_enabled": True},
+            },
+            "does_not_establish": ["location_coordinates"],
+        }
+        fake = {
+            "job_id": "job-mcp-native-status",
+            "status": {"state": "succeeded", "result": sample},
+        }
+        with patch.object(bridge, "grabowski_juno_run", return_value=fake) as run:
+            result = bridge.ipad_native_permission_status(
+                expected_started_at=self.started_at,
+                session_escalation=self.escalation(),
+            )
+        self.assertEqual(result["status"]["result"], sample)
+        self.assertEqual(run.call_count, 1)
+        code = run.call_args.kwargs["code"]
+        self.assertIn("ipad_native_permission_status", code)
+        for forbidden in ("PHAsset", "UIPasteboard", "latitude", "longitude", "CNContact", "Safari"):
+            self.assertNotIn(forbidden, code)
+        self.assertTrue(Path(result["receipt"]["path"]).is_file())
+
+    def test_native_permission_request_rejects_unallowlisted_capability_before_job(self) -> None:
+        with patch.object(bridge, "grabowski_juno_run") as run:
+            with self.assertRaisesRegex(ValueError, "capability must be one of"):
+                bridge.ipad_native_permission_request(
+                    capability="location_always",
+                    expected_started_at=self.started_at,
+                    session_escalation=self.escalation(),
+                )
+        run.assert_not_called()
+
+    def test_native_permission_request_accepts_already_determined_readback(self) -> None:
+        sample = {
+            "schema_version": 1,
+            "kind": "ipad_native_permission_request",
+            "verification_time": "2026-08-07T20:00:00+00:00",
+            "capability": "camera",
+            "state": "already_determined",
+            "foreground_verified": False,
+            "pre_status": {"authorization": 3},
+            "post_status": {"authorization": 3},
+        }
+        fake = {
+            "job_id": "job-mcp-native-request",
+            "status": {"state": "succeeded", "result": sample},
+        }
+        with patch.object(bridge, "grabowski_juno_run", return_value=fake):
+            result = bridge.ipad_native_permission_request(
+                capability="camera",
+                expected_started_at=self.started_at,
+                session_escalation=self.escalation(),
+            )
+        self.assertEqual(result["status"]["result"]["state"], "already_determined")
+        self.assertTrue(Path(result["receipt"]["path"]).is_file())
+
+    def test_native_permission_semantic_validation_rejects_extra_top_level_fields(self) -> None:
+        request = {"schema_version": 1, "operation": "status"}
+        sample = {
+            "schema_version": 1,
+            "kind": "ipad_native_permission_status",
+            "verification_time": "now",
+            "permissions": {
+                "camera": {"authorization": 3},
+                "microphone": {"authorization": 3},
+                "photos_read_write": {"authorization": 3},
+                "notifications": {"authorization": 2, "alert": 2, "badge": 2, "sound": 2},
+                "location_when_in_use": {"authorization": 0, "services_enabled": True},
+            },
+            "does_not_establish": [],
+            "content": "must-not-cross-host-boundary",
+        }
+        with self.assertRaisesRegex(RuntimeError, "unexpected top-level fields"):
+            bridge._validate_native_permission_result(request, sample)
+
+    def test_native_permission_semantic_validation_rejects_extra_status_fields(self) -> None:
+        request = {"schema_version": 1, "operation": "status"}
+        sample = {
+            "schema_version": 1,
+            "kind": "ipad_native_permission_status",
+            "verification_time": "now",
+            "permissions": {
+                "camera": {"authorization": 3, "content": "forbidden"},
+                "microphone": {"authorization": 3},
+                "photos_read_write": {"authorization": 3},
+                "notifications": {"authorization": 2, "alert": 2, "badge": 2, "sound": 2},
+                "location_when_in_use": {"authorization": 0, "services_enabled": True},
+            },
+            "does_not_establish": [],
+        }
+        with self.assertRaisesRegex(RuntimeError, "unexpected fields"):
+            bridge._validate_native_permission_result(request, sample)
+
+
 if __name__ == "__main__":
     unittest.main()

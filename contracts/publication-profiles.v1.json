@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "46ba648f01da42196e1977b25715aa1c2debf08a7a46937fb5e1bf414836bb1a"
+    "sha256": "cd665fbc8e11ba2729360eb4a13dcc3fb7446ae8c465dfb6a9d720eefa333a71"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "1dd47264064795cd0879686a8b5ded8df062f2901b1ed65d39a9910d64476ff8"
+    "sha256": "674a14f4b895118c42dd3f9fed7578dc4a4703feeb71e05825bae2404bd2f130"
   },
   "counts": {
     "core": 22,
-    "full": 187,
-    "operator": 172
+    "full": 189,
+    "operator": 174
   },
   "profiles": {
     "core": [
@@ -124,6 +124,8 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_native_permission_status",
+      "ipad_native_permission_request",
       "ipad_capability_manifest",
       "ipad_storage_inventory",
       "ipad_storage_grant_status",
@@ -300,6 +302,8 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_native_permission_status",
+      "ipad_native_permission_request",
       "ipad_capability_manifest",
       "ipad_storage_inventory",
       "ipad_storage_grant_status",
