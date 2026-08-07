@@ -3246,6 +3246,78 @@ class BureauPickupTests(unittest.TestCase):
         release.assert_not_called()
         self.assertTrue((run_dir / "lease-reacquire.json").is_file())
 
+    def test_runtime_drift_retry_skips_stale_missing_registry_root_journal(self) -> None:
+        request = self.request(registry_root=str(self.registry_root))
+        normalized = pickup._normalize_request(request)
+        intent = self.intent()
+        key = intent["required_resource_keys"][0]
+        lease = self.lease(key, intent["lease_owner_id"])
+        run_dir, acquisition = self.create_acquisition_journal(intent, lease)
+        self.write_registry_bound_request(run_dir, normalized)
+        pickup._write_bound_json(run_dir / "intent.json", intent)
+
+        stale_root = self.root / "stale-registry-root"
+        stale_root.mkdir()
+        stale_request = pickup._normalize_request(
+            self.request(registry_root=str(stale_root))
+        )
+        stale_binding = pickup._explicit_registry_binding(str(stale_root))
+        stale_intent = {
+            **intent,
+            "run_id": "BUR-RUN-20260725T120000Z-1111111111",
+            "lease_owner_id": "bureau-run:BUR-RUN-20260725T120000Z-1111111111",
+            "intent_sha256": "5" * 64,
+        }
+        stale_run_dir = pickup._run_directory(stale_intent["run_id"])
+        self.write_registry_bound_request(
+            stale_run_dir, stale_request, stale_binding
+        )
+        stale_root.rmdir()
+
+        runtime_drift = {
+            "status": "stale-runtime-blocked",
+            "code": "stale-runtime-blocked",
+            "runtime_identity": {
+                "compatibility": {
+                    "status": "incompatible",
+                    "reason_codes": ["missing-runtime-capabilities"],
+                    "mutation_allowed": False,
+                }
+            },
+        }
+        coordinated = self.coordinated_status(intent)
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[runtime_drift, coordinated],
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(request)
+
+        self.assertEqual("existing-assignment", result["status"])
+        self.assertEqual(
+            acquisition["acquisition_sha256"], result["acquisition_sha256"]
+        )
+        self.assertEqual(2, invoke.call_count)
+        acquire.assert_not_called()
+
+    def test_missing_explicit_registry_root_is_rejected_before_any_effect(self) -> None:
+        missing = self.root / "missing-explicit-registry"
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "registry_root must resolve to an existing directory"
+            ):
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(registry_root=str(missing))
+                )
+        invoke.assert_not_called()
+        acquire.assert_not_called()
+
     def test_request_binding_mismatch_replays_exact_journal(self) -> None:
         request = self.request()
         normalized = pickup._normalize_request(request)
