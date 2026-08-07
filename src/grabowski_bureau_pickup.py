@@ -2222,6 +2222,13 @@ def _journaled_existing_assignment_after_claim_rejection(
             if Path(request["coordination_root"]) != _legacy_coordination_root():
                 continue
             stored_payload["coordination_root"] = request["coordination_root"]
+        if "registry_root" in stored_payload:
+            try:
+                _normalize_registry_root(stored_payload["registry_root"])
+            except ValueError as exc:
+                if isinstance(exc.__cause__, (FileNotFoundError, NotADirectoryError)):
+                    continue
+                raise
         stored_request = _normalize_request(
             stored_payload, allow_internal_bindings=True
         )
