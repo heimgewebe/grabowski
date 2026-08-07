@@ -972,6 +972,7 @@ def _classify_record(
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = "decision_without_eligible_outcome"
         return base
+    non_actionable = _non_actionable_failure_class(record, None)
     outcome: dict[str, Any] | None = None
     try:
         outcome, outcome_receipt_sha256, outcome_file_sha256 = _read_valid_outcome(
@@ -979,11 +980,14 @@ def _classify_record(
             expected_receipt_sha256=None,
         )
         base["outcome_receipt_sha256"] = outcome_receipt_sha256
+        non_actionable = _non_actionable_failure_class(record, outcome)
     except (FileNotFoundError, OSError, TaskAttentionError, TaskAttentionInputError) as exc:
+        if non_actionable is not None:
+            base["classification"] = non_actionable
+            return base
         base["classification"] = "invalid_evidence"
         base["evidence_error"] = type(exc).__name__
         return base
-    non_actionable = _non_actionable_failure_class(record, outcome)
     if non_actionable is not None:
         base["classification"] = non_actionable
     if not include_decisions:

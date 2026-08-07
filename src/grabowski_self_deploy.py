@@ -925,8 +925,10 @@ def _write_deploy_index(
     return payload
 
 
-def _bootstrap_deploy_index(jobs_root: Path, repository: Path) -> dict[str, Any]:
-    expected_runner = str(repository / RUNNER_RELATIVE_PATH)
+def _bootstrap_deploy_index(
+    jobs_root: Path,
+    _repository: Path | None = None,
+) -> dict[str, Any]:
     entries = sorted(
         (entry for entry in jobs_root.iterdir() if _durable_job_unit(entry.name)),
         key=lambda path: path.name,
@@ -944,20 +946,26 @@ def _bootstrap_deploy_index(jobs_root: Path, repository: Path) -> dict[str, Any]
         candidate_command = metadata.get("argv")
         if not isinstance(candidate_command, list) or not all(isinstance(item, str) for item in candidate_command):
             raise RuntimeError(f"durable job argv is malformed: {entry.name}")
-        if (
+        references_self_deploy = (
             len(candidate_command) >= 2
             and candidate_command[0] == "/usr/bin/python3"
-            and candidate_command[1] == expected_runner
+            and candidate_command[1].endswith(f"/{RUNNER_RELATIVE_PATH}")
+        )
+        if (
+            references_self_deploy
             and metadata.get("final_status") not in TERMINAL_JOB_STATUSES
         ):
             units.append(entry.name)
     return _write_deploy_index(jobs_root, units=units, pending_unit=None)
 
 
-def _deploy_index(jobs_root: Path, repository: Path) -> dict[str, Any]:
+def _deploy_index(
+    jobs_root: Path,
+    _repository: Path | None = None,
+) -> dict[str, Any]:
     index = _read_deploy_index(jobs_root)
     if index is None:
-        index = _bootstrap_deploy_index(jobs_root, repository)
+        index = _bootstrap_deploy_index(jobs_root)
     pending = index["pending_unit"]
     if pending is not None:
         pending_entry = jobs_root / pending
@@ -995,13 +1003,16 @@ def _validated_deploy_job_receipt(entry: Path, metadata: dict[str, Any]) -> dict
     }
 
 
-def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[str, Any] | None:
-    expected_identity = _deploy_identity(command)
-    if expected_identity is None:
+def _matching_inflight_deploy_job(command: list[str], _repository: Path) -> dict[str, Any] | None:
+    expected_fields = _deploy_command_fields(command)
+    if expected_fields is None:
         raise ValueError("runtime deploy command identity is invalid")
-    expected_runner = str(repository / RUNNER_RELATIVE_PATH)
+    expected_target = (
+        expected_fields["canonical_repository"],
+        expected_fields["expected_head"],
+    )
     jobs_root = operator._jobs_root()
-    index = _deploy_index(jobs_root, repository)
+    index = _deploy_index(jobs_root)
     entries = [jobs_root / unit for unit in index["units"]]
 
     matches: list[dict[str, Any]] = []
@@ -1018,16 +1029,16 @@ def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[
             isinstance(item, str) for item in candidate_command
         ):
             raise RuntimeError(f"durable job argv is malformed: {entry.name}")
-        references_self_deploy = (
-            len(candidate_command) >= 2
-            and candidate_command[0] == "/usr/bin/python3"
-            and candidate_command[1] == expected_runner
-        )
-        if not references_self_deploy:
-            continue
         candidate_fields = _deploy_command_fields(candidate_command)
-        candidate_identity = _deploy_identity(candidate_command)
-        if candidate_fields is None or candidate_identity is None or metadata.get("cwd") != str(repository):
+        if candidate_fields is None:
+            raise RuntimeError(f"self deploy job metadata is malformed: {entry.name}")
+        candidate_repository = Path(candidate_fields["repository"])
+        candidate_runner = str(candidate_repository / RUNNER_RELATIVE_PATH)
+        if (
+            candidate_command[0] != "/usr/bin/python3"
+            or candidate_command[1] != candidate_runner
+            or metadata.get("cwd") != str(candidate_repository)
+        ):
             raise RuntimeError(f"self deploy job metadata is malformed: {entry.name}")
         argv_sha256 = metadata.get("argv_sha256")
         if argv_sha256 != _deploy_command_sha256(candidate_command):
@@ -1043,7 +1054,15 @@ def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[
             raise RuntimeError(
                 f"self deploy job has an uncertain non-reusable outcome: {entry.name} ({final_status})"
             )
-        if candidate_identity != expected_identity:
+        candidate_target = (
+            candidate_fields["canonical_repository"],
+            candidate_fields["expected_head"],
+        )
+        if candidate_target[0] != expected_target[0]:
+            raise RuntimeError(
+                f"another Grabowski self deploy is already running for a different canonical repository: {entry.name}"
+            )
+        if candidate_target[1] != expected_target[1]:
             raise RuntimeError(
                 f"another Grabowski self deploy is already running for a different head: {entry.name}"
             )
@@ -1053,6 +1072,7 @@ def _matching_inflight_deploy_job(command: list[str], repository: Path) -> dict[
                 "unit": entry.name,
                 "argv_sha256": argv_sha256,
                 "delay_seconds": int(candidate_fields["delay_seconds"]),
+                "source_identity_sha256": candidate_fields["source_identity_sha256"],
                 **receipt_paths,
                 "final_status": final_status,
             }
@@ -1090,6 +1110,14 @@ def _schedule_result(
         "delay_seconds": effective_delay_seconds,
         "source_identity": source_identity,
         "source_identity_sha256": source_identity["identity_sha256"],
+        "effective_source_identity_sha256": job.get(
+            "source_identity_sha256", source_identity["identity_sha256"]
+        ),
+        "reused_across_source_identity": (
+            already_scheduled
+            and job.get("source_identity_sha256", source_identity["identity_sha256"])
+            != source_identity["identity_sha256"]
+        ),
         "unit": job["unit"],
         "argv_sha256": job["argv_sha256"],
         "metadata_path": job["metadata_path"],
@@ -1389,6 +1417,16 @@ def grabowski_runtime_deploy_schedule(
                 "argv_sha256": existing["argv_sha256"],
                 "final_status": existing["final_status"],
                 "source_identity_sha256": source_identity["identity_sha256"],
+                "effective_source_identity_sha256": existing.get(
+                    "source_identity_sha256", source_identity["identity_sha256"]
+                ),
+                "reused_across_source_identity": (
+                    existing.get(
+                        "source_identity_sha256",
+                        source_identity["identity_sha256"],
+                    )
+                    != source_identity["identity_sha256"]
+                ),
             }
             base._append_audit(observed)
             return _schedule_result(
@@ -1412,7 +1450,7 @@ def grabowski_runtime_deploy_schedule(
         }
         base._append_audit(intent)
         jobs_root = operator._jobs_root()
-        index = _deploy_index(jobs_root, repository)
+        index = _deploy_index(jobs_root)
         reserved_unit = DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
         _write_deploy_index(
             jobs_root,

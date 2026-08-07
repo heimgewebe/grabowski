@@ -218,6 +218,14 @@ def build_plan(
     return {**material, "plan_sha256": _sha256(material)}
 
 
+def _validate_receipt_integrity(receipt: Mapping[str, Any]) -> None:
+    receipt_material = dict(receipt)
+    receipt_material.pop("replayed", None)
+    receipt_sha256 = receipt_material.pop("receipt_sha256", None)
+    if not isinstance(receipt_sha256, str) or receipt_sha256 != _sha256(receipt_material):
+        raise LaneRescueInputError("execution receipt integrity mismatch")
+
+
 def _replay(
     prior_receipt: Mapping[str, Any] | None,
     plan_sha256: str,
@@ -226,6 +234,7 @@ def _replay(
         return None
     if not isinstance(prior_receipt, Mapping):
         raise LaneRescueInputError("prior_receipt must be a mapping")
+    _validate_receipt_integrity(prior_receipt)
     if prior_receipt.get("plan_sha256") != plan_sha256:
         raise LaneRescueInputError("prior receipt is bound to another rescue plan")
     if prior_receipt.get("status") not in REPLAY_SAFE_STATUSES:
@@ -427,11 +436,7 @@ def finalize(
         raise LaneRescueInputError("requesting owner does not match the lane owner")
     if not isinstance(execution_receipt, Mapping) or execution_receipt.get("kind") != RECEIPT_KIND:
         raise LaneRescueInputError("execution receipt has an invalid kind")
-    receipt_material = dict(execution_receipt)
-    receipt_material.pop("replayed", None)
-    receipt_sha256 = receipt_material.pop("receipt_sha256", None)
-    if not isinstance(receipt_sha256, str) or receipt_sha256 != _sha256(receipt_material):
-        raise LaneRescueInputError("execution receipt integrity mismatch")
+    _validate_receipt_integrity(execution_receipt)
     if execution_receipt.get("lane_id") != observation.lane_id:
         raise LaneRescueInputError("readback lane does not match the execution receipt")
 

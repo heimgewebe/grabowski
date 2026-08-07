@@ -94,6 +94,23 @@ class LaneRescueEdgeTests(unittest.TestCase):
         self.assertEqual(receipt["error_class"], "INVALID_ADAPTER_RESULT")
         self.assertFalse(receipt["retry_authorized"])
 
+    def test_replay_rejects_tampered_prior_receipt(self) -> None:
+        plan = _plan()
+        adapters = {
+            "commit": lambda payload: {"receipt_sha256": "f" * 64},
+            "create_pr": lambda payload: {"receipt_sha256": "1" * 64},
+        }
+        receipt = rescue.execute_plan(plan, actor_owner_id=OWNER, adapters=adapters)
+        tampered = dict(receipt)
+        tampered["status"] = "terminal"
+        with self.assertRaisesRegex(rescue.LaneRescueInputError, "integrity"):
+            rescue.execute_plan(
+                plan,
+                actor_owner_id=OWNER,
+                adapters=adapters,
+                prior_receipt=tampered,
+            )
+
     def test_finalize_rejects_tampered_execution_receipt(self) -> None:
         plan = _plan()
         receipt = rescue.execute_plan(
