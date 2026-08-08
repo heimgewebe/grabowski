@@ -187,6 +187,19 @@ class WorktreeEnsureTests(unittest.TestCase):
             self._ensure(parameters)
         self.assertFalse(Path(str(parameters["target_path"])).exists())
 
+
+    def test_work_lane_source_is_accepted_as_terminal_evidence_capable(self) -> None:
+        parameters = self._parameters(
+            key="work-lane-source",
+            branch="feat/work-lane-source",
+            target=self.worktree_root / "work-lane-source",
+        )
+        parameters["source_kind"] = "work_lane"
+        parameters["source_id"] = "a" * 32
+        created = self._ensure(parameters)
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertEqual(created["lifecycle"]["source"], {"kind": "work_lane", "id": "a" * 32})
+
     def test_real_git_toplevel_output_with_trailing_newline_is_accepted(self) -> None:
         parameters = self._parameters(
             key="real-git-root-newline",
