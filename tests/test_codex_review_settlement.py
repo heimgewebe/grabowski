@@ -200,6 +200,32 @@ def codex_thread(
     }
 
 
+def codex_reply_thread(*, resolved: bool) -> dict:
+    return {
+        "id": "PRRT_kwDOreply",
+        "isResolved": resolved,
+        "comments": connection(
+            [
+                {
+                    "databaseId": 3101,
+                    "createdAt": "2026-07-26T07:59:00Z",
+                    "author": {"login": "untrusted-bot"},
+                    "commit": {"oid": "d" * 40},
+                    "pullRequestReview": {"databaseId": 1999},
+                },
+                {
+                    "databaseId": 3102,
+                    "createdAt": REVIEW_TIME,
+                    "author": {"login": "chatgpt-codex-connector[bot]"},
+                    "commit": {"oid": HEAD},
+                    "pullRequestReview": {"databaseId": 2001},
+                },
+            ],
+            hasNextPage=False,
+        ),
+    }
+
+
 class CodexReviewSettlementTests(unittest.TestCase):
     def evaluate(self, state: dict, *, required: bool = True) -> dict:
         with mock.patch.object(settlement, "_live_state", return_value=deepcopy(state)):
@@ -667,6 +693,104 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertEqual("optional_review_findings", result["status_code"])
         self.assertFalse(result["settled"])
         self.assertEqual(1, result["unresolved_thread_count"])
+
+    def test_optional_pending_review_does_not_mask_changes_requested(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    review_id=2001,
+                    submitted_at=REVIEW_TIME,
+                ),
+                codex_review(
+                    state="PENDING",
+                    review_id=2002,
+                    submitted_at=None,
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertEqual(
+            "CHANGES_REQUESTED", result["evidence"]["completion"]["state"]
+        )
+        self.assertTrue(
+            any("Codex review state is blocking" in item for item in result["errors"])
+        )
+
+    def test_optional_pending_review_after_superseded_blocker_stays_non_blocking(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    state="CHANGES_REQUESTED",
+                    review_id=2001,
+                    submitted_at="2026-07-26T08:00:30Z",
+                ),
+                codex_review(
+                    state="APPROVED",
+                    review_id=2002,
+                    submitted_at="2026-07-26T08:00:45Z",
+                ),
+                codex_review(
+                    state="PENDING",
+                    review_id=2003,
+                    submitted_at=None,
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_review_pending", result["status_code"])
+        self.assertEqual("PENDING", result["evidence"]["completion"]["state"])
+        self.assertEqual([], result["errors"])
+
+    def test_current_head_codex_reply_thread_is_part_of_settlement_set(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection([codex_review()], hasPreviousPage=False)
+        state["reviewThreads"] = connection(
+            [codex_reply_thread(resolved=False)], hasNextPage=False
+        )
+
+        result = self.evaluate(state)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual(1, result["unresolved_thread_count"])
+        self.assertEqual(["PRRT_kwDOreply"], result["evidence"]["thread_ids"])
+        self.assertEqual(1, result["finding_count"])
+
+        state["reviewThreads"] = connection(
+            [codex_reply_thread(resolved=True)], hasNextPage=False
+        )
+        settled = self.evaluate(state)
+        self.assertEqual("pass", settled["status"])
+        self.assertTrue(settled["settled"])
+        self.assertEqual(["PRRT_kwDOreply"], settled["evidence"]["thread_ids"])
+        self.assertEqual([], settled["evidence"]["unresolved_thread_ids"])
+
+    def test_codex_reply_on_untrusted_root_is_not_unsolicited_global_debt(self) -> None:
+        state = base_state()
+        state["reviewThreads"] = connection(
+            [codex_reply_thread(resolved=False)], hasNextPage=False
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_not_requested", result["status_code"])
+        self.assertEqual(0, result["finding_count"])
+        self.assertEqual(0, result["unresolved_thread_count"])
 
     def test_optional_blocking_review_is_terminal_merge_debt(self) -> None:
         state = base_state()
