@@ -206,6 +206,25 @@ class JunoBluetoothHostTests(unittest.TestCase):
         self.assertNotIn("writeValue", source)
         self.assertNotIn("setNotifyValue", source)
 
+    def test_read_discovery_targets_requested_uuids_before_output_caps(self) -> None:
+        source = bluetooth._BLUETOOTH_JOB_SOURCE
+        self.assertIn('CBUUID = ObjCClass("CBUUID")', source)
+        self.assertIn('_gatt_uuid_array([_REQUEST["service_uuid"]])', source)
+        self.assertIn('_gatt_uuid_array(_REQUEST["characteristic_uuids"])', source)
+
+        target_lookup = source.index("target_service = next(")
+        service_cap = source.index("services = services[:MAX_SERVICES]", target_lookup)
+        self.assertLess(target_lookup, service_cap)
+
+        requested_selection = source.index(
+            'requested_characteristics = set(_REQUEST["characteristic_uuids"])'
+        )
+        characteristic_cap = source.index(
+            "selected_values = values[:MAX_CHARACTERISTICS_PER_SERVICE]",
+            requested_selection,
+        )
+        self.assertLess(requested_selection, characteristic_cap)
+
     def test_read_result_is_exact_target_bounded_and_digest_bound(self) -> None:
         request = {
             "schema_version": 1,

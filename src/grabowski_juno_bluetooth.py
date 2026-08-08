@@ -206,7 +206,17 @@ ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/CoreBluetooth.framework/CoreBluetooth"
 )
 CBCentralManager = ObjCClass("CBCentralManager")
+CBUUID = ObjCClass("CBUUID")
+NSMutableArray = ObjCClass("NSMutableArray")
 UIApplication = ObjCClass("UIApplication")
+
+
+def _gatt_uuid_array(values):
+    result = NSMutableArray.array()
+    for value in values:
+        result.addObject_(CBUUID.UUIDWithString_(value))
+    return result
+
 
 _devices = {}
 _inspect = {
@@ -303,7 +313,12 @@ class __DELEGATE_CLASS__(NSObject):
         _inspect["target"] = peripheral
         peripheral.delegate = self
         try:
-            peripheral.discoverServices_(None)
+            if _REQUEST.get("operation") == "read":
+                peripheral.discoverServices_(
+                    _gatt_uuid_array([_REQUEST["service_uuid"]])
+                )
+            else:
+                peripheral.discoverServices_(None)
         except Exception as exc:
             detail = _bounded_text(exc) or "unknown"
             _inspect["errors"].append("discover_services:" + detail)
@@ -345,7 +360,6 @@ class __DELEGATE_CLASS__(NSObject):
             _mark_unresolved_reads("discovery_error", detail)
             _inspect["finished"] = True
             return
-        services = services[:MAX_SERVICES]
         if _REQUEST.get("operation") == "read":
             target_uuid = _REQUEST["service_uuid"]
             target_service = next(
@@ -366,7 +380,10 @@ class __DELEGATE_CLASS__(NSObject):
                 {"uuid": target_uuid, "characteristics": None}
             ]
             try:
-                peripheral.discoverCharacteristics_forService_(None, target_service)
+                peripheral.discoverCharacteristics_forService_(
+                    _gatt_uuid_array(_REQUEST["characteristic_uuids"]),
+                    target_service,
+                )
             except Exception as exc:
                 detail = _bounded_text(exc) or "unknown"
                 _inspect["errors"].append(
@@ -377,6 +394,7 @@ class __DELEGATE_CLASS__(NSObject):
                 _inspect["finished"] = True
             return
 
+        services = services[:MAX_SERVICES]
         _inspect["services"] = [
             {"uuid": _bounded_text(service.UUID), "characteristics": None}
             for service in services
@@ -451,7 +469,19 @@ class __DELEGATE_CLASS__(NSObject):
                     _inspect["finished"] = True
                     return
                 values = []
-            for characteristic in values[:MAX_CHARACTERISTICS_PER_SERVICE]:
+            if (
+                _REQUEST.get("operation") == "read"
+                and service_uuid == _REQUEST.get("service_uuid")
+            ):
+                requested_characteristics = set(_REQUEST["characteristic_uuids"])
+                selected_values = [
+                    characteristic
+                    for characteristic in values
+                    if _bounded_text(characteristic.UUID) in requested_characteristics
+                ]
+            else:
+                selected_values = values[:MAX_CHARACTERISTICS_PER_SERVICE]
+            for characteristic in selected_values:
                 characteristic_uuid = _bounded_text(characteristic.UUID)
                 try:
                     properties = int(characteristic.properties)
