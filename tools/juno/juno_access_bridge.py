@@ -31,7 +31,7 @@ MAX_RESULTS = 25
 MAX_SCAN_SECONDS = 10.0
 MAX_MOTION_TIMEOUT_SECONDS = 5.0
 MAX_LOCATION_TIMEOUT_SECONDS = 8.0
-MAX_MIC_SECONDS = 30.0
+MAX_MIC_SECONDS = 15.0
 RETENTION_LIMIT = 128
 ALLOWED_URL_SCHEMES = frozenset({"https", "http", "mailto", "maps", "shortcuts", "rm-juno"})
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -148,6 +148,16 @@ def _identifier(request: dict[str, Any], name: str = "identifier") -> str:
     if not IDENTIFIER_RE.fullmatch(value):
         raise ValueError(f"{name} has invalid characters")
     return value
+
+
+def _bind_objc_delegate_method(function: Any, objc: Any) -> Any:
+    # Rubicon derives Objective-C method signatures from annotations.
+    # typing.Any is not a ctypes-compatible native type, so dynamic delegate
+    # methods are rebound to ObjCInstance only at runtime.
+    argument_names = function.__code__.co_varnames[: function.__code__.co_argcount]
+    function.__annotations__ = {name: objc.ObjCInstance for name in argument_names}
+    function.__annotations__["return"] = type(None)
+    return function
 
 
 def _retain(value: Any) -> Any:
@@ -424,44 +434,34 @@ def _motion_sample(request: dict[str, Any], _workspace: Path | None) -> dict[str
     if auth != 3:
         raise RuntimeError(f"motion authorization is not granted; status={auth}")
     manager = _retain(objc.ObjCClass("CMMotionManager").alloc().init())
-    if not bool(_zero(manager.accelerometerAvailable)):
+    if not _native_bool_property(manager, "accelerometerAvailable", "isAccelerometerAvailable"):
         _release(manager)
         raise RuntimeError("accelerometer is unavailable")
-    queue = _zero(objc.ObjCClass("NSOperationQueue").mainQueue)
-    done = threading.Event()
-    holder: dict[str, Any] = {}
-    def completed(data_ptr: int, error_ptr: int) -> None:
-        if holder:
-            return
-        if error_ptr:
-            holder["error"] = True
-        elif data_ptr:
-            data = _obj(data_ptr)
-            acceleration = _zero(data.acceleration)
-            holder["sample"] = {
-                "x": float(acceleration.x),
-                "y": float(acceleration.y),
-                "z": float(acceleration.z),
-                "timestamp": float(_zero(data.timestamp)),
-            }
-        done.set()
-    block = _retain(objc.Block(completed, None, ctypes.c_void_p, ctypes.c_void_p))
-    def start() -> None:
-        manager.startAccelerometerUpdatesToQueue_withHandler_(queue, block)
-    def stop() -> None:
-        manager.stopAccelerometerUpdates()
     try:
-        _on_main(start)
-        if not done.wait(timeout):
+        _on_main(manager.startAccelerometerUpdates)
+        deadline = time.monotonic() + timeout
+        data = None
+        while time.monotonic() < deadline:
+            data = _zero(manager.accelerometerData)
+            if data is not None:
+                break
+            time.sleep(0.05)
+        if data is None:
             raise RuntimeError("motion sample timed out")
-        if holder.get("error") or "sample" not in holder:
-            raise RuntimeError("motion sample failed")
-        return _result("motion_sample", sample=holder["sample"])
+        acceleration = _zero(data.acceleration)
+        return _result(
+            "motion_sample",
+            sample={
+                "x": float(acceleration.field_0),
+                "y": float(acceleration.field_1),
+                "z": float(acceleration.field_2),
+                "timestamp": float(_zero(data.timestamp)),
+            },
+        )
     finally:
         try:
-            _on_main(stop)
+            _on_main(manager.stopAccelerometerUpdates)
         finally:
-            _release(block)
             _release(manager)
 
 
@@ -516,8 +516,10 @@ def _bluetooth_scan(request: dict[str, Any], _workspace: Path | None) -> dict[st
         "GrabowskiBluetoothDelegate_" + uuid.uuid4().hex,
         superclass=objc.ObjCClass("NSObject"),
         methods=[
-            centralManagerDidUpdateState_,
-            centralManager_didDiscoverPeripheral_advertisementData_RSSI_,
+            _bind_objc_delegate_method(centralManagerDidUpdateState_, objc),
+            _bind_objc_delegate_method(
+                centralManager_didDiscoverPeripheral_advertisementData_RSSI_, objc
+            ),
         ],
     )
     delegate = _retain(Delegate.alloc().init())
@@ -686,58 +688,44 @@ def _location_one_shot(request: dict[str, Any], _workspace: Path | None) -> dict
     auth = int(_zero(Manager.authorizationStatus))
     if auth not in {3, 4}:
         raise RuntimeError(f"location authorization is not granted; status={auth}")
-    holder: dict[str, Any] = {}
-    done = threading.Event()
-
-    def locationManager_didUpdateLocations_(self: Any, manager: Any, locations: Any) -> None:
+    manager = _retain(Manager.alloc().init())
+    try:
         try:
-            array = _obj(locations)
-            location = _zero(array.lastObject)
-            coordinate = _zero(location.coordinate)
-            holder["location"] = {
-                "latitude": round(float(coordinate.latitude), 6),
-                "longitude": round(float(coordinate.longitude), 6),
+            manager.setDesiredAccuracy_(100.0)
+        except Exception:
+            pass
+        _on_main(manager.startUpdatingLocation)
+        deadline = time.monotonic() + timeout
+        location = None
+        while time.monotonic() < deadline:
+            candidate = _zero(manager.location)
+            if candidate is not None:
+                try:
+                    if float(_zero(candidate.horizontalAccuracy)) >= 0:
+                        location = candidate
+                        break
+                except Exception:
+                    location = candidate
+                    break
+            time.sleep(0.1)
+        if location is None:
+            raise RuntimeError("location request timed out")
+        coordinate = _zero(location.coordinate)
+        return _result(
+            "location_one_shot",
+            location={
+                "latitude": round(float(coordinate.field_0), 6),
+                "longitude": round(float(coordinate.field_1), 6),
                 "horizontal_accuracy_m": round(float(_zero(location.horizontalAccuracy)), 2),
                 "altitude_m": round(float(_zero(location.altitude)), 2),
                 "timestamp": _date_text(_zero(location.timestamp)),
-            }
-        except Exception as exc:
-            holder["error"] = type(exc).__name__
-        finally:
-            done.set()
-
-    def locationManager_didFailWithError_(self: Any, manager: Any, error: Any) -> None:
-        holder["error"] = "location_manager_error"
-        done.set()
-
-    Delegate = objc.create_objc_class(
-        "GrabowskiLocationDelegate_" + uuid.uuid4().hex,
-        superclass=objc.ObjCClass("NSObject"),
-        methods=[locationManager_didUpdateLocations_, locationManager_didFailWithError_],
-    )
-    delegate = _retain(Delegate.alloc().init())
-    manager = _retain(Manager.alloc().init())
-    manager.setDelegate_(delegate)
-    def invoke() -> None:
-        manager.requestLocation()
-    try:
-        _on_main(invoke)
-        if not done.wait(timeout):
-            raise RuntimeError("location request timed out")
-        if "location" not in holder:
-            raise RuntimeError(f"location request failed: {holder.get('error', 'unknown')}")
-        return _result("location_one_shot", location=holder["location"])
+            },
+        )
     finally:
         try:
             _on_main(manager.stopUpdatingLocation)
-        except Exception:
-            pass
-        try:
-            manager.setDelegate_(None)
-        except Exception:
-            pass
-        _release(manager)
-        _release(delegate)
+        finally:
+            _release(manager)
 
 
 def _photos_latest_metadata(request: dict[str, Any], _workspace: Path | None) -> dict[str, Any]:
@@ -804,42 +792,65 @@ def _mic_record_short(request: dict[str, Any], workspace: Path | None) -> dict[s
     auth = int(objc.ObjCClass("AVCaptureDevice").authorizationStatusForMediaType_("soun"))
     if auth != 3:
         raise RuntimeError(f"microphone authorization is not granted; status={auth}")
-    url = objc.ObjCClass("NSURL").fileURLWithPath_(str(target))
-    settings = objc.ns(
-        {
-            "AVFormatIDKey": 1819304813,
-            "AVSampleRateKey": 44100.0,
-            "AVNumberOfChannelsKey": 1,
-            "AVLinearPCMBitDepthKey": 16,
-            "AVLinearPCMIsFloatKey": False,
-            "AVLinearPCMIsBigEndianKey": False,
-        }
-    )
-    recorder = objc.ObjCClass("AVAudioRecorder").alloc().initWithURL_settings_error_(url, settings, None)
-    if isinstance(recorder, tuple):
-        recorder = recorder[0]
-    if recorder is None:
-        raise RuntimeError("AVAudioRecorder could not be created")
-    if not bool(recorder.prepareToRecord()):
-        raise RuntimeError("audio recorder preparation failed")
-    def start() -> None:
-        if not bool(recorder.recordForDuration_(duration)):
+    audio_session = _zero(objc.ObjCClass("AVAudioSession").sharedInstance)
+
+    def bool_result(value: Any) -> bool:
+        if isinstance(value, tuple):
+            value = value[0]
+        return bool(value)
+
+    if not bool_result(audio_session.setCategory_error_("AVAudioSessionCategoryRecord", None)):
+        raise RuntimeError("audio session record category could not be set")
+    if not bool_result(audio_session.setActive_error_(True, None)):
+        raise RuntimeError("audio session could not be activated")
+    try:
+        url = objc.ObjCClass("NSURL").fileURLWithPath_(str(target))
+        settings = objc.ns(
+            {
+                "AVFormatIDKey": 1819304813,
+                "AVSampleRateKey": 44100.0,
+                "AVNumberOfChannelsKey": 1,
+                "AVLinearPCMBitDepthKey": 16,
+                "AVLinearPCMIsFloatKey": False,
+                "AVLinearPCMIsBigEndianKey": False,
+            }
+        )
+        recorder = objc.ObjCClass("AVAudioRecorder").alloc().initWithURL_settings_error_(url, settings, None)
+        if isinstance(recorder, tuple):
+            recorder = recorder[0]
+        if recorder is None:
+            raise RuntimeError("AVAudioRecorder could not be created")
+        if not bool(recorder.prepareToRecord()):
+            raise RuntimeError("audio recorder preparation failed")
+        started = {"ok": False}
+
+        def start() -> None:
+            started["ok"] = bool(recorder.recordForDuration_(duration))
+
+        _on_main(start)
+        if not started["ok"]:
             raise RuntimeError("audio recorder did not start")
-    _on_main(start)
-    deadline = time.monotonic() + duration + 2.0
-    while time.monotonic() < deadline and bool(_zero(recorder.recording)):
-        time.sleep(0.1)
-    if bool(_zero(recorder.recording)):
-        recorder.stop()
-        raise RuntimeError("audio recorder exceeded duration bound")
-    if not target.is_file():
-        raise RuntimeError("audio recorder produced no file")
-    return _result(
-        "mic_record_short",
-        relative_path=relative_path,
-        size=target.stat().st_size,
-        duration_seconds=duration,
-    )
+        deadline = time.monotonic() + duration + 2.0
+        while time.monotonic() < deadline and _native_bool_property(
+            recorder, "recording", "isRecording"
+        ):
+            time.sleep(0.1)
+        if _native_bool_property(recorder, "recording", "isRecording"):
+            recorder.stop()
+            raise RuntimeError("audio recorder exceeded duration bound")
+        if not target.is_file():
+            raise RuntimeError("audio recorder produced no file")
+        return _result(
+            "mic_record_short",
+            relative_path=relative_path,
+            size=target.stat().st_size,
+            duration_seconds=duration,
+        )
+    finally:
+        try:
+            audio_session.setActive_error_(False, None)
+        except Exception:
+            pass
 
 
 def _write_bytes_create_only(target: Path, payload: bytes) -> None:
@@ -934,7 +945,9 @@ def _camera_photo_workspace(request: dict[str, Any], workspace: Path | None) -> 
     Delegate = objc.create_objc_class(
         "GrabowskiPhotoCaptureDelegate_" + uuid.uuid4().hex,
         superclass=objc.ObjCClass("NSObject"),
-        methods=[captureOutput_didFinishProcessingPhoto_error_],
+        methods=[
+            _bind_objc_delegate_method(captureOutput_didFinishProcessingPhoto_error_, objc)
+        ],
         **options,
     )
     delegate = _retain(Delegate.alloc().init())
