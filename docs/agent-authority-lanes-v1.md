@@ -34,6 +34,8 @@ Model identity affects route selection and quality estimates. It does not define
 4. reusing or creating the exact isolated worktree through the existing worktree contract,
 5. persisting a private integrity-bound lane receipt.
 
+For a direct owner-authorized mandate, the original `direct` source remains in the lane identity. The checkout lifecycle is bound internally to `work_lane:<lane_id>`, a server-generated durable source. It is not a ChatGPT thread, MCP session or model identity. Checkout terminal reconciliation accepts that source only after an explicit terminal closeout assessment is bound into the integrity-checked lane receipt; until then cleanup remains fail-closed. Existing Bureau, operator-obligation, thread-focus and GitHub-issue sources keep their own lifecycle binding unchanged.
+
 A missing owner lease or worktree is an auto-preparation condition, not a reason for an unchanged retry. A live foreign overlap remains fail-closed.
 
 The resource store, worktree lifecycle store, task store and audit chain remain authoritative. The lane receipt references them and does not create a second lifecycle truth.

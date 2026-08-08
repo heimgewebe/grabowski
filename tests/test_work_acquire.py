@@ -40,7 +40,7 @@ class WorkAcquireTests(unittest.TestCase):
 
     def parameters(self) -> dict[str, object]:
         return {
-            "source_kind": "direct-user",
+            "source_kind": "direct",
             "source_id": "chat:authority-p0",
             "controller_actor": "chatgpt:controller",
             "scoped_writer_actor": "agent:writer",
@@ -103,10 +103,66 @@ class WorkAcquireTests(unittest.TestCase):
         ensure_parameters = ensure.call_args.args[0]
         self.assertIs(ensure_parameters["reposkop_required"], True)
         self.assertIsNone(ensure_parameters["system_convergence"])
+        self.assertEqual(ensure_parameters["source_kind"], "work_lane")
+        self.assertEqual(ensure_parameters["source_id"], result["lane_id"])
+        self.assertEqual(result["inputs"]["source"], {"kind": "direct", "id": "chat:authority-p0"})
+        self.assertEqual(result["lifecycle_source"], {"kind": "work_lane", "id": result["lane_id"]})
+        self.assertEqual(result["authority"]["lifecycle_source"], result["lifecycle_source"])
         self.assertEqual(
             ensure_parameters["system_convergence_plan_sha256"],
             result["inputs"]["system_convergence_plan"]["plan_sha256"],
         )
+
+
+    def test_legacy_direct_user_source_uses_lane_lifecycle_evidence(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "direct-user"
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {"target_registered": True, "target_path_exists": True},
+            }
+        )
+        result = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=self.acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        ensure_parameters = ensure.call_args.args[0]
+        self.assertEqual(result["inputs"]["source"]["kind"], "direct-user")
+        self.assertEqual(ensure_parameters["source_kind"], "work_lane")
+        self.assertEqual(ensure_parameters["source_id"], result["lane_id"])
+
+    def test_existing_evidence_source_remains_checkout_lifecycle_source(self) -> None:
+        params = self.parameters()
+        params["source_kind"] = "operator_obligation"
+        params["source_id"] = "goo-agent-fabric-existing"
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {"target_registered": True, "target_path_exists": True},
+            }
+        )
+        result = work_acquire.acquire_work(
+            params,
+            acquire_resources_fn=self.acquire,
+            release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(),
+            ensure_worktree_fn=ensure,
+            runner=Mock(),
+        )
+        ensure_parameters = ensure.call_args.args[0]
+        self.assertEqual(
+            result["lifecycle_source"],
+            {"kind": "operator_obligation", "id": "goo-agent-fabric-existing"},
+        )
+        self.assertEqual(ensure_parameters["source_kind"], "operator_obligation")
+        self.assertEqual(ensure_parameters["source_id"], "goo-agent-fabric-existing")
 
     def test_supplied_system_convergence_plan_is_bound_into_lane_identity(self) -> None:
         planned = {
