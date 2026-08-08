@@ -558,7 +558,7 @@ class CodexReviewSettlementTests(unittest.TestCase):
         cases = [
             (optional, False, "pass", "optional_not_requested", 0, "success"),
             (required, True, "pending", "required_request_missing", 3, "pending"),
-            (findings, False, "pass", "optional_review_findings", 0, "success"),
+            (findings, False, "block", "optional_review_findings", 2, "failure"),
             (blocked, False, "block", "visibility_blocked", 2, "failure"),
         ]
         for state, required_flag, status, code, exit_code, github_state in cases:
@@ -609,7 +609,7 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertTrue(result["request_present"])
         self.assertFalse(result["completion_present"])
 
-    def test_optional_blocking_review_remains_visible_without_merge_block(self) -> None:
+    def test_optional_blocking_review_is_terminal_merge_debt(self) -> None:
         state = base_state()
         state["comments"] = connection([request_comment()], hasPreviousPage=False)
         state["reviews"] = connection(
@@ -619,8 +619,9 @@ class CodexReviewSettlementTests(unittest.TestCase):
 
         result = self.evaluate(state, required=False)
 
-        self.assertEqual("pass", result["status"])
+        self.assertEqual("block", result["status"])
         self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertEqual("failure", result["github_state"])
         self.assertFalse(result["settled"])
         self.assertIn("Codex review state is blocking", result["errors"][0])
 

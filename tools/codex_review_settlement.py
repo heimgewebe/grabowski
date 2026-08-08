@@ -119,10 +119,10 @@ SETTLEMENT_STATUS_CONTRACT = {
         "description": "Optional Codex review pending; merge gate unaffected",
     },
     "optional_review_findings": {
-        "status": "pass",
-        "exit_code": 0,
-        "github_state": "success",
-        "description": "Optional Codex findings remain advisory",
+        "status": "block",
+        "exit_code": 2,
+        "github_state": "failure",
+        "description": "Existing Codex findings require settlement before merge",
     },
     "required_request_missing": {
         "status": "pending",
@@ -1032,7 +1032,7 @@ def evaluate(
         status, status_code = (
             ("block", "required_review_blocked")
             if required
-            else ("pass", "optional_review_findings")
+            else ("block", "optional_review_findings")
         )
     elif completion is not None:
         status, status_code = "pass", "review_settled"

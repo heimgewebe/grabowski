@@ -27,6 +27,15 @@ _CODEX_REVIEW_ACTORS = frozenset({
     "chatgpt-codex-connector",
     "chatgpt-codex-connector[bot]",
 })
+_CLAUDE_REVIEW_ACTORS = frozenset({
+    "claude",
+    "claude[bot]",
+    "claude-code",
+    "claude-code[bot]",
+    "anthropic",
+    "anthropic[bot]",
+})
+_TRUSTED_REVIEW_FINDING_ACTORS = _CODEX_REVIEW_ACTORS | _CLAUDE_REVIEW_ACTORS
 _CODEX_REQUEST_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 _CODEX_REQUEST_RE = re.compile(
     r"<!--\s*grabowski-codex-review-request:v1\s*(\{.*?\})\s*-->",
@@ -58,6 +67,16 @@ _CODEX_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
+      reviews(last: 100) {
+        nodes {
+          databaseId
+          state
+          submittedAt
+          author { login }
+          commit { oid }
+        }
+        pageInfo { hasPreviousPage }
+      }
       reviewThreads(first: 100) {
         nodes {
           id
@@ -1453,6 +1472,323 @@ class CaptainMergeGuardRunner:
             return None
         return [dict(item) for item in pages[0]]
 
+    def _review_thread_sets(
+        self,
+        threads_payload: Any,
+        *,
+        head_sha: str,
+        errors: list[str],
+    ) -> dict[str, Any]:
+        trusted_thread_ids: list[str] = []
+        unresolved_trusted_thread_ids: list[str] = []
+        codex_current_thread_ids: list[str] = []
+        unresolved_codex_current_thread_ids: list[str] = []
+        trusted_actors: set[str] = set()
+        trusted_comments: list[dict[str, Any]] = []
+        trusted_reviews: list[dict[str, Any]] = []
+        outstanding_review_ids: list[int] = []
+        if not isinstance(threads_payload, dict):
+            errors.append("merge_guard_review_findings_payload_invalid")
+            return {
+                "trusted_thread_ids": [],
+                "unresolved_trusted_thread_ids": [],
+                "codex_current_thread_ids": [],
+                "unresolved_codex_current_thread_ids": [],
+                "trusted_actors": [],
+                "trusted_comments": [],
+                "trusted_reviews": [],
+                "outstanding_review_ids": [],
+            }
+        try:
+            pull_request = threads_payload["data"]["repository"]["pullRequest"]
+        except (KeyError, TypeError):
+            pull_request = None
+        if not isinstance(pull_request, dict):
+            errors.append("merge_guard_review_findings_pull_request_shape_invalid")
+            return {
+                "trusted_thread_ids": [],
+                "unresolved_trusted_thread_ids": [],
+                "codex_current_thread_ids": [],
+                "unresolved_codex_current_thread_ids": [],
+                "trusted_actors": [],
+                "trusted_comments": [],
+                "trusted_reviews": [],
+                "outstanding_review_ids": [],
+            }
+
+        reviews_connection = pull_request.get("reviews")
+        if not isinstance(reviews_connection, dict):
+            errors.append("merge_guard_review_findings_reviews_shape_invalid")
+        else:
+            review_page = reviews_connection.get("pageInfo")
+            review_nodes = reviews_connection.get("nodes")
+            if (
+                not isinstance(review_page, dict)
+                or review_page.get("hasPreviousPage") is not False
+            ):
+                errors.append("merge_guard_review_findings_reviews_truncated")
+            if not isinstance(review_nodes, list):
+                errors.append("merge_guard_review_findings_reviews_nodes_invalid")
+            else:
+                for item in review_nodes:
+                    if not isinstance(item, dict):
+                        errors.append("merge_guard_review_finding_review_invalid")
+                        continue
+                    actor = _github_actor(item.get("author"))
+                    if actor not in _TRUSTED_REVIEW_FINDING_ACTORS:
+                        continue
+                    state = str(item.get("state") or "").upper()
+                    if state not in {"CHANGES_REQUESTED", "APPROVED"}:
+                        continue
+                    review_id = item.get("databaseId")
+                    submitted = _github_datetime(item.get("submittedAt"))
+                    commit = item.get("commit")
+                    commit_sha = commit.get("oid") if isinstance(commit, dict) else None
+                    if (
+                        isinstance(review_id, bool)
+                        or not isinstance(review_id, int)
+                        or review_id <= 0
+                    ):
+                        errors.append("merge_guard_review_finding_review_id_invalid")
+                        continue
+                    if submitted is None:
+                        if state == "CHANGES_REQUESTED":
+                            errors.append(
+                                "merge_guard_review_finding_review_time_invalid"
+                            )
+                        continue
+                    trusted_actors.add(actor)
+                    trusted_reviews.append(
+                        {
+                            "id": review_id,
+                            "actor": actor,
+                            "actor_key": actor.removesuffix("[bot]"),
+                            "state": state,
+                            "submitted": submitted,
+                            "commit_sha": commit_sha,
+                        }
+                    )
+        trusted_reviews.sort(key=lambda item: (item["submitted"], item["id"]))
+        reviews_by_actor: dict[str, list[dict[str, Any]]] = {}
+        for item in trusted_reviews:
+            reviews_by_actor.setdefault(str(item["actor_key"]), []).append(item)
+        for actor_reviews in reviews_by_actor.values():
+            blockers = [
+                item for item in actor_reviews if item["state"] == "CHANGES_REQUESTED"
+            ]
+            if not blockers:
+                continue
+            latest_blocker = blockers[-1]
+            if not any(
+                item["state"] == "APPROVED"
+                and (item["submitted"], item["id"])
+                > (latest_blocker["submitted"], latest_blocker["id"])
+                for item in actor_reviews
+            ):
+                outstanding_review_ids.append(int(latest_blocker["id"]))
+
+        connection = pull_request.get("reviewThreads")
+        if not isinstance(connection, dict):
+            errors.append("merge_guard_codex_threads_shape_invalid")
+        else:
+            page_info = connection.get("pageInfo")
+            nodes = connection.get("nodes")
+            if not isinstance(page_info, dict) or page_info.get("hasNextPage") is not False:
+                errors.append("merge_guard_codex_threads_truncated")
+            if not isinstance(nodes, list):
+                errors.append("merge_guard_codex_threads_nodes_invalid")
+            else:
+                for thread in nodes:
+                    if not isinstance(thread, dict):
+                        errors.append("merge_guard_codex_thread_invalid")
+                        continue
+                    thread_id = thread.get("id")
+                    comments = thread.get("comments")
+                    if not isinstance(thread_id, str) or not thread_id:
+                        errors.append("merge_guard_codex_thread_id_invalid")
+                        continue
+                    if not isinstance(comments, dict):
+                        errors.append("merge_guard_codex_thread_comments_invalid")
+                        continue
+                    page = comments.get("pageInfo")
+                    comment_nodes = comments.get("nodes")
+                    if not isinstance(page, dict) or page.get("hasNextPage") is not False:
+                        errors.append(
+                            f"merge_guard_codex_thread_comments_truncated:{thread_id}"
+                        )
+                        continue
+                    if not isinstance(comment_nodes, list) or not comment_nodes:
+                        errors.append(
+                            f"merge_guard_codex_thread_comments_invalid:{thread_id}"
+                        )
+                        continue
+                    root = comment_nodes[0]
+                    trusted_root = False
+                    if isinstance(root, dict):
+                        root_actor = _github_actor(root.get("author"))
+                        trusted_root = root_actor in _TRUSTED_REVIEW_FINDING_ACTORS
+                        if trusted_root:
+                            trusted_actors.add(root_actor)
+                    if trusted_root:
+                        trusted_thread_ids.append(thread_id)
+                        unresolved = thread.get("isResolved") is not True
+                        if unresolved:
+                            unresolved_trusted_thread_ids.append(thread_id)
+                        root_id = root.get("databaseId") if isinstance(root, dict) else None
+                        root_created = (
+                            _github_datetime(root.get("createdAt"))
+                            if isinstance(root, dict)
+                            else None
+                        )
+                        root_commit = root.get("commit") if isinstance(root, dict) else None
+                        root_commit_sha = (
+                            root_commit.get("oid")
+                            if isinstance(root_commit, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(root_id, int)
+                            and not isinstance(root_id, bool)
+                            and root_id > 0
+                            and root_created is not None
+                        ):
+                            trusted_comments.append(
+                                {
+                                    "thread_id": thread_id,
+                                    "comment_id": root_id,
+                                    "actor": _github_actor(root.get("author")),
+                                    "commit_sha": root_commit_sha,
+                                }
+                            )
+                        elif unresolved:
+                            if (
+                                isinstance(root_id, bool)
+                                or not isinstance(root_id, int)
+                                or root_id <= 0
+                            ):
+                                errors.append(
+                                    f"merge_guard_review_finding_comment_id_invalid:{thread_id}"
+                                )
+                            if root_created is None:
+                                errors.append(
+                                    f"merge_guard_review_finding_created_at_invalid:{thread_id}"
+                                )
+                    codex_current_match = False
+                    for comment in comment_nodes:
+                        if not isinstance(comment, dict):
+                            continue
+                        actor = _github_actor(comment.get("author"))
+                        commit = comment.get("commit")
+                        commit_sha = commit.get("oid") if isinstance(commit, dict) else None
+                        created = _github_datetime(comment.get("createdAt"))
+                        if (
+                            actor in _CODEX_REVIEW_ACTORS
+                            and commit_sha == head_sha
+                            and created is not None
+                        ):
+                            codex_current_match = True
+                    if codex_current_match:
+                        codex_current_thread_ids.append(thread_id)
+                        if thread.get("isResolved") is not True:
+                            unresolved_codex_current_thread_ids.append(thread_id)
+        trusted_comments.sort(
+            key=lambda item: (item["thread_id"], item["comment_id"], item["actor"])
+        )
+        trusted_review_receipts = [
+            {
+                "id": item["id"],
+                "actor": item["actor"],
+                "state": item["state"],
+                "submitted_at": item["submitted"].isoformat(),
+                "commit_sha": item["commit_sha"],
+            }
+            for item in trusted_reviews
+        ]
+        return {
+            "trusted_thread_ids": sorted(set(trusted_thread_ids)),
+            "unresolved_trusted_thread_ids": sorted(
+                set(unresolved_trusted_thread_ids)
+            ),
+            "codex_current_thread_ids": sorted(set(codex_current_thread_ids)),
+            "unresolved_codex_current_thread_ids": sorted(
+                set(unresolved_codex_current_thread_ids)
+            ),
+            "trusted_actors": sorted(trusted_actors),
+            "trusted_comments": trusted_comments,
+            "trusted_reviews": trusted_review_receipts,
+            "outstanding_review_ids": sorted(set(outstanding_review_ids)),
+        }
+
+    def _query_review_thread_sets(
+        self,
+        bindings: dict[str, Any],
+        *,
+        observations: list[dict[str, Any]],
+        errors: list[str],
+    ) -> dict[str, Any]:
+        repository = str(bindings.get("repository", "")).lower()
+        pr_number = int(bindings.get("pull_request", 0))
+        head_sha = str(bindings.get("head_sha", ""))
+        owner, separator, name = repository.partition("/")
+        if not owner or separator != "/" or not name:
+            errors.append("merge_guard_review_findings_repository_invalid")
+            return self._review_thread_sets(None, head_sha=head_sha, errors=errors)
+        threads_payload = self._codex_api_json(
+            [
+                "api",
+                "graphql",
+                "-f",
+                f"query={_CODEX_THREADS_QUERY}",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={pr_number}",
+            ],
+            label="threads",
+            observations=observations,
+            errors=errors,
+        )
+        return self._review_thread_sets(
+            threads_payload,
+            head_sha=head_sha,
+            errors=errors,
+        )
+
+    def _apply_existing_review_finding_debt(
+        self,
+        receipt: dict[str, Any],
+        thread_sets: dict[str, Any],
+        errors: list[str],
+    ) -> None:
+        trusted_thread_ids = list(thread_sets["trusted_thread_ids"])
+        unresolved = list(thread_sets["unresolved_trusted_thread_ids"])
+        trusted_comments = list(thread_sets["trusted_comments"])
+        trusted_reviews = list(thread_sets["trusted_reviews"])
+        outstanding_review_ids = list(thread_sets["outstanding_review_ids"])
+        blocked = bool(unresolved or outstanding_review_ids)
+        receipt["existing_review_findings"] = {
+            "trusted_actors": list(thread_sets["trusted_actors"]),
+            "thread_count": len(trusted_thread_ids),
+            "thread_ids_sha256": _sha256_json(trusted_thread_ids),
+            "comment_count": len(trusted_comments),
+            "comments_sha256": _sha256_json(trusted_comments),
+            "unresolved_thread_count": len(unresolved),
+            "unresolved_thread_ids_sha256": _sha256_json(unresolved),
+            "review_count": len(trusted_reviews),
+            "reviews_sha256": _sha256_json(trusted_reviews),
+            "outstanding_review_count": len(outstanding_review_ids),
+            "outstanding_review_ids_sha256": _sha256_json(
+                outstanding_review_ids
+            ),
+            "status": "blocked" if blocked else "clear",
+        }
+        if unresolved:
+            errors.append("merge_guard_review_findings_unresolved_threads_present")
+        if outstanding_review_ids:
+            errors.append("merge_guard_review_findings_changes_requested_present")
+
     def _revalidate_codex_review(
         self,
         bindings: dict[str, Any],
@@ -1500,12 +1836,24 @@ class CaptainMergeGuardRunner:
             receipt["status"] = "blocked"
             return errors
         if not required and exception is None:
+            thread_sets = self._query_review_thread_sets(
+                bindings,
+                observations=observations,
+                errors=errors,
+            )
+            self._apply_existing_review_finding_debt(receipt, thread_sets, errors)
             diagnostic_present = evidence is not None
-            receipt["status"] = "not_required"
+            receipt["status"] = "blocked" if errors else "not_required"
             receipt["diagnostic_evidence_present"] = diagnostic_present
             receipt["diagnostic_evidence_ignored_for_authority"] = diagnostic_present
             return errors
         if exception is not None:
+            thread_sets = self._query_review_thread_sets(
+                bindings,
+                observations=observations,
+                errors=errors,
+            )
+            self._apply_existing_review_finding_debt(receipt, thread_sets, errors)
             if not isinstance(exception, dict):
                 errors.append("merge_guard_codex_exception_malformed")
             else:
@@ -1527,11 +1875,8 @@ class CaptainMergeGuardRunner:
             receipt["status"] = "blocked" if errors else "exception_current"
             return errors
         if evidence is None:
-            if required:
-                errors.append("merge_guard_codex_evidence_missing")
-                receipt["status"] = "blocked"
-            else:
-                receipt["status"] = "not_required"
+            errors.append("merge_guard_codex_evidence_missing")
+            receipt["status"] = "blocked"
             return errors
         if not isinstance(evidence, dict):
             errors.append("merge_guard_codex_evidence_malformed")
@@ -1971,89 +2316,16 @@ class CaptainMergeGuardRunner:
         ):
             errors.append("merge_guard_codex_completion_predates_request")
 
-        owner, _, name = repository.partition("/")
-        threads_payload = self._codex_api_json(
-            [
-                "api",
-                "graphql",
-                "-f",
-                f"query={_CODEX_THREADS_QUERY}",
-                "-F",
-                f"owner={owner}",
-                "-F",
-                f"name={name}",
-                "-F",
-                f"number={pr_number}",
-            ],
-            label="threads",
+        thread_sets = self._query_review_thread_sets(
+            bindings,
             observations=observations,
             errors=errors,
         )
-        thread_ids: list[str] = []
-        unresolved_thread_ids: list[str] = []
-        if isinstance(threads_payload, dict):
-            try:
-                connection = threads_payload["data"]["repository"]["pullRequest"][
-                    "reviewThreads"
-                ]
-            except (KeyError, TypeError):
-                connection = None
-            if not isinstance(connection, dict):
-                errors.append("merge_guard_codex_threads_shape_invalid")
-            else:
-                page_info = connection.get("pageInfo")
-                nodes = connection.get("nodes")
-                if not isinstance(page_info, dict) or page_info.get("hasNextPage") is not False:
-                    errors.append("merge_guard_codex_threads_truncated")
-                if not isinstance(nodes, list):
-                    errors.append("merge_guard_codex_threads_nodes_invalid")
-                else:
-                    for thread in nodes:
-                        if not isinstance(thread, dict):
-                            errors.append("merge_guard_codex_thread_invalid")
-                            continue
-                        thread_id = thread.get("id")
-                        comments = thread.get("comments")
-                        if not isinstance(thread_id, str) or not thread_id:
-                            errors.append("merge_guard_codex_thread_id_invalid")
-                            continue
-                        if not isinstance(comments, dict):
-                            errors.append("merge_guard_codex_thread_comments_invalid")
-                            continue
-                        page = comments.get("pageInfo")
-                        comment_nodes = comments.get("nodes")
-                        if not isinstance(page, dict) or page.get("hasNextPage") is not False:
-                            errors.append(
-                                f"merge_guard_codex_thread_comments_truncated:{thread_id}"
-                            )
-                            continue
-                        if not isinstance(comment_nodes, list):
-                            errors.append(
-                                f"merge_guard_codex_thread_comments_invalid:{thread_id}"
-                            )
-                            continue
-                        matched = False
-                        for comment in comment_nodes:
-                            if not isinstance(comment, dict):
-                                continue
-                            actor = _github_actor(comment.get("author"))
-                            commit = comment.get("commit")
-                            commit_sha = (
-                                commit.get("oid") if isinstance(commit, dict) else None
-                            )
-                            created = _github_datetime(comment.get("createdAt"))
-                            if (
-                                actor in _CODEX_REVIEW_ACTORS
-                                and commit_sha == head_sha
-                                and created is not None
-                            ):
-                                matched = True
-                        if matched:
-                            thread_ids.append(thread_id)
-                            if thread.get("isResolved") is not True:
-                                unresolved_thread_ids.append(thread_id)
-        thread_ids = sorted(set(thread_ids))
-        unresolved_thread_ids = sorted(set(unresolved_thread_ids))
+        self._apply_existing_review_finding_debt(receipt, thread_sets, errors)
+        thread_ids = list(thread_sets["codex_current_thread_ids"])
+        unresolved_thread_ids = list(
+            thread_sets["unresolved_codex_current_thread_ids"]
+        )
         expected_thread_ids = evidence.get("thread_ids")
         if thread_ids != expected_thread_ids:
             errors.append("merge_guard_codex_thread_set_drift")

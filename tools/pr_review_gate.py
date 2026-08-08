@@ -92,7 +92,7 @@ DERIVED_REVIEW_STATUS_NAMES = {
 }
 BASE_BOUND_REQUIRED_CHECK_NAMES = {"registry-registration-preflight/freshness"}
 TRUSTED_CODEX_ACTORS = {"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"}
-TRUSTED_CLAUDE_ACTORS = {"claude[bot]", "claude-code[bot]", "anthropic[bot]"}
+TRUSTED_CLAUDE_ACTORS = {"claude", "claude[bot]", "claude-code", "claude-code[bot]", "anthropic", "anthropic[bot]"}
 EXTERNAL_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 SELF_REVIEW_VERDICTS = {"PASS", "NEEDS_CHANGE", "BLOCK"}
 CLAUDE_CLI_REVIEW_SOURCE = "claude-cli:packet-review"

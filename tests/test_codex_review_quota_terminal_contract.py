@@ -221,7 +221,23 @@ def runner_for(evidence: dict, live: dict) -> merge_guard.CaptainMergeGuardRunne
         if label == "review":
             return deepcopy(live["review"])
         if label == "threads":
-            return deepcopy(live["threads"])
+            payload = deepcopy(live["threads"])
+            review_nodes = []
+            for item in live["reviews"]:
+                review_nodes.append(
+                    {
+                        "databaseId": item.get("id"),
+                        "state": item.get("state"),
+                        "submittedAt": item.get("submitted_at"),
+                        "author": deepcopy(item.get("user")),
+                        "commit": {"oid": item.get("commit_id")},
+                    }
+                )
+            payload["data"]["repository"]["pullRequest"]["reviews"] = {
+                "nodes": review_nodes,
+                "pageInfo": {"hasPreviousPage": False},
+            }
+            return payload
         errors.append(f"unexpected_api_label:{label}")
         return None
 
