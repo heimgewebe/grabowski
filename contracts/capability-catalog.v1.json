@@ -518,7 +518,7 @@
     },
     {
       "category": "work-coordination",
-      "description": "Atomically acquire a lane, narrow leases and an exact isolated worktree.",
+      "description": "Acquire a work lane, or persist its evidence-bound terminal closeout.",
       "effects": [
         "resource-lease",
         "git-worktree-create",

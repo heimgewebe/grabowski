@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Callable, Iterator
 
 import grabowski_checkouts as checkouts
+import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_core as operator
 import grabowski_resources as resources
 import grabowski_work_admission as work_admission
@@ -141,12 +142,60 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     return value
 
 
+def _terminal_closeout_assessment(record: dict[str, Any]) -> dict[str, Any] | None:
+    terminal = record.get("terminal_closeout")
+    if terminal is None:
+        return None
+    if not isinstance(terminal, dict) or terminal.get("schema_version") != 1 or terminal.get("kind") != "grabowski.work_lane_terminal_closeout":
+        raise RuntimeError("work-lane terminal closeout wrapper is invalid")
+    assessment = terminal.get("assessment")
+    if not isinstance(assessment, dict):
+        raise RuntimeError("work-lane terminal closeout assessment is missing")
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if (validated.get("lane_id") != record.get("lane_id")
+        or terminal.get("closeout_state") != validated.get("closeout_state")
+        or terminal.get("assessment_sha256") != validated.get("assessment_sha256")):
+        raise RuntimeError("work-lane terminal closeout binding is invalid")
+    return validated
+
+
 def _text(value: Any, label: str, *, pattern: re.Pattern[str] | None = None) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip() or "\x00" in value:
         raise ValueError(f"{label} must be trimmed non-empty text")
     if pattern is not None and pattern.fullmatch(value) is None:
         raise ValueError(f"{label} has an invalid format")
     return value
+
+
+def persist_terminal_closeout(
+    lane_id: str, assessment: dict[str, Any], *, expected_receipt_sha256: str
+) -> dict[str, Any]:
+    """CAS-persist one terminal assessment into the existing lane receipt."""
+    _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
+    _text(expected_receipt_sha256, "expected_receipt_sha256", pattern=re.compile(r"[0-9a-f]{64}\Z"))
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if validated.get("lane_id") != lane_id:
+        raise RuntimeError("terminal closeout assessment is bound to another lane")
+    wrapper = {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_terminal_closeout",
+        "closeout_state": validated["closeout_state"],
+        "assessment_sha256": validated["assessment_sha256"],
+        "assessment": validated,
+    }
+    with _lane_lock(lane_id) as receipt_path:
+        record = _read_state(receipt_path)
+        if record is None or record.get("lane_id") != lane_id:
+            raise RuntimeError("work-lane receipt is missing or bound to another lane")
+        existing = _terminal_closeout_assessment(record)
+        if existing is not None:
+            if existing["assessment_sha256"] != validated["assessment_sha256"]:
+                raise RuntimeError("work-lane already records another terminal assessment")
+            return {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
+        if record.get("receipt_sha256") != expected_receipt_sha256:
+            raise RuntimeError("work-lane terminal closeout CAS preimage changed")
+        stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
+        return {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
 
 
 def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
@@ -381,6 +430,8 @@ def acquire_work(
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
             raise RuntimeError("work-lane identity collision")
+        if existing is not None and _terminal_closeout_assessment(existing) is not None:
+            return {**existing, "durable_receipt_path": str(receipt_path), "replayed": True}
         existing_writer_job = (
             existing.get("writer_job")
             if isinstance(existing, dict) and isinstance(existing.get("writer_job"), dict)
@@ -817,9 +868,64 @@ def grabowski_work_acquire(
     system_convergence: dict[str, Any] | None = None,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
+    terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically acquire a lane, narrow leases and an exact isolated worktree."""
+    """Acquire a work lane, or persist its evidence-bound terminal closeout."""
     operator._require_operator_mutation("resource_lease", path=target_path, repo=repo)
+    parameters = {
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "controller_actor": controller_actor,
+        "controller_role": "controller",
+        "scoped_writer_actor": scoped_writer_actor,
+        "repo": repo,
+        "base_head": base_head,
+        "branch": branch,
+        "target_path": target_path,
+        "purpose": purpose,
+        "retention_until_unix": retention_until_unix,
+        "idempotency_key": idempotency_key,
+        "resource_keys": resource_keys or [],
+        "write_paths": write_paths,
+        "scoped_writer_argv": scoped_writer_argv,
+        "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
+        "system_convergence": system_convergence,
+        "artifact_class": artifact_class,
+        "ttl_seconds": ttl_seconds,
+    }
+    if terminal_closeout is not None:
+        if not isinstance(terminal_closeout, dict) or set(terminal_closeout) != {
+            "expected_receipt_sha256",
+            "observation",
+        }:
+            raise ValueError(
+                "terminal_closeout must contain exactly expected_receipt_sha256 and observation"
+            )
+        observation = terminal_closeout["observation"]
+        if not isinstance(observation, dict):
+            raise ValueError("terminal_closeout.observation must be an object")
+        inputs = _normalize(parameters)
+        try:
+            observed = lane_closeout.LaneCloseoutObservation(**observation)
+        except TypeError as exc:
+            raise ValueError(f"terminal_closeout observation shape is invalid: {exc}") from exc
+        assessment = lane_closeout.assess(
+            observed, append_audit=operator.base._append_audit
+        )
+        if assessment.get("lane_id") != inputs["lane_id"]:
+            raise RuntimeError("terminal closeout observation is bound to another lane")
+        if assessment.get("phase") != "terminal":
+            return {
+                "status": "nonterminal",
+                "persisted": False,
+                "lane_id": inputs["lane_id"],
+                "assessment": assessment,
+            }
+        return persist_terminal_closeout(
+            inputs["lane_id"],
+            assessment,
+            expected_receipt_sha256=terminal_closeout["expected_receipt_sha256"],
+        )
     operator._require_operator_capability("git_cli")
     if scoped_writer_argv is not None:
         operator._require_operator_mutation(
@@ -828,27 +934,4 @@ def grabowski_work_acquire(
             repo=repo,
             opaque_command=True,
         )
-    return acquire_work(
-        {
-            "source_kind": source_kind,
-            "source_id": source_id,
-            "controller_actor": controller_actor,
-            "controller_role": "controller",
-            "scoped_writer_actor": scoped_writer_actor,
-            "repo": repo,
-            "base_head": base_head,
-            "branch": branch,
-            "target_path": target_path,
-            "purpose": purpose,
-            "retention_until_unix": retention_until_unix,
-            "idempotency_key": idempotency_key,
-            "resource_keys": resource_keys or [],
-            "write_paths": write_paths,
-            "scoped_writer_argv": scoped_writer_argv,
-            "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
-            "system_convergence": system_convergence,
-            "artifact_class": artifact_class,
-            "ttl_seconds": ttl_seconds,
-        },
-        audit_fn=operator.base._append_audit,
-    )
+    return acquire_work(parameters, audit_fn=operator.base._append_audit)

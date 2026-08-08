@@ -220,6 +220,26 @@ class LaneRescueTests(unittest.TestCase):
         self.assertEqual(final["closeout_state"], "pr_opened")
         self.assertTrue(final["lease_release_ready"])
 
+    def test_recovery_consumes_persisted_terminal_lane_truth(self) -> None:
+        lane_id = "f" * 32
+        terminal = closeout.assess(
+            observation(lane_id=lane_id, head_sha=BASE, remote_head_sha=BASE, no_change_proven=True),
+            observed_at_unix=200,
+        )
+        receipt = {"lane_id": lane_id, "terminal_closeout": {
+            "schema_version": 1, "kind": "grabowski.work_lane_terminal_closeout",
+            "closeout_state": terminal["closeout_state"],
+            "assessment_sha256": terminal["assessment_sha256"], "assessment": terminal,
+        }}
+        plan = rescue.build_plan(
+            observation(lane_id=lane_id, git_dirty=True, ahead_commits=2, remote_head_sha=BASE),
+            lane_owner_id=OWNER, requesting_owner_id=OWNER, resource_keys=RESOURCES,
+            lane_receipt_reader=lambda _: receipt,
+        )
+        self.assertEqual(plan["mode"], "terminal")
+        self.assertEqual(plan["assessment_sha256"], terminal["assessment_sha256"])
+        self.assertEqual(plan["actions"], [])
+
     def test_owner_mismatch_is_rejected(self) -> None:
         with self.assertRaisesRegex(rescue.LaneRescueInputError, "does not match"):
             rescue.build_plan(

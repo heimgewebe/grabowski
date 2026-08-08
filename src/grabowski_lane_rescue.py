@@ -77,6 +77,25 @@ def _sha256(value: Any) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _lane_assessment(
+    observation: closeout.LaneCloseoutObservation,
+    reader: Callable[[str], Mapping[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    lane_id = observation.lane_id
+    if len(lane_id) == 32 and all(character in "0123456789abcdef" for character in lane_id):
+        import grabowski_work_acquire as work_acquire
+        record = reader(lane_id) if reader is not None else work_acquire._read_state(
+            work_acquire._state_root() / f"{lane_id}.json"
+        )
+        if record is not None:
+            if not isinstance(record, Mapping) or record.get("lane_id") != lane_id:
+                raise LaneRescueInputError("persisted lane receipt is bound to another lane")
+            terminal = work_acquire._terminal_closeout_assessment(dict(record))
+            if terminal is not None:
+                return terminal
+    return closeout.classify(observation)
+
+
 def _identity(value: Any, field: str) -> str:
     if not isinstance(value, str):
         raise LaneRescueInputError(f"{field} must be a string")
@@ -149,6 +168,7 @@ def build_plan(
     resource_keys: list[str] | tuple[str, ...],
     requested_actions: list[str] | tuple[str, ...] = (),
     controller_authorized_actions: list[str] | tuple[str, ...] = (),
+    lane_receipt_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic rescue plan without performing effects."""
 
@@ -168,7 +188,7 @@ def build_plan(
             "controller authorization is required for: " + ", ".join(forbidden)
         )
 
-    assessment = closeout.classify(observation)
+    assessment = _lane_assessment(observation, lane_receipt_reader)
     actions = _derive_actions(observation, assessment)
     for action in explicit_actions:
         if action not in actions:
@@ -194,7 +214,7 @@ def build_plan(
         "lane_owner_id": lane_owner,
         "resource_keys": normalized_resources,
         "assessment": assessment,
-        "assessment_sha256": closeout.sha256_json(assessment),
+        "assessment_sha256": assessment.get("assessment_sha256") or closeout.sha256_json(assessment),
         "mode": mode,
         "actions": actions,
         "controller_authorized_actions": sorted(authorized),
@@ -427,6 +447,7 @@ def finalize(
     *,
     lane_owner_id: str,
     requesting_owner_id: str,
+    lane_receipt_reader: Callable[[str], Mapping[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Bind a fresh readback to the rescue receipt and decide release readiness."""
 
@@ -440,7 +461,7 @@ def finalize(
     if execution_receipt.get("lane_id") != observation.lane_id:
         raise LaneRescueInputError("readback lane does not match the execution receipt")
 
-    assessment = closeout.classify(observation)
+    assessment = _lane_assessment(observation, lane_receipt_reader)
     terminal = assessment.get("phase") == "terminal"
     material = {
         "schema_version": SCHEMA_VERSION,
@@ -449,7 +470,7 @@ def finalize(
         "lane_owner_id": owner,
         "execution_receipt_sha256": execution_receipt.get("receipt_sha256"),
         "assessment": assessment,
-        "assessment_sha256": closeout.sha256_json(assessment),
+        "assessment_sha256": assessment.get("assessment_sha256") or closeout.sha256_json(assessment),
         "status": "terminal" if terminal else "readback_required",
         "closeout_state": assessment.get("closeout_state"),
         "lease_release_ready": bool(assessment.get("lease_release_ready")) if terminal else False,

@@ -47,6 +47,7 @@ if "mcp" not in sys.modules:
 import grabowski_checkouts as checkouts
 import grabowski_checkout_terminal_reconciliation as reconciliation
 import grabowski_checkout_terminal_sources as sources
+import grabowski_lane_closeout as lane_closeout
 import grabowski_work_acquire as work_acquire
 
 
@@ -411,13 +412,19 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
 
     def test_work_lane_source_accepts_bound_terminal_closeout(self) -> None:
         lane_id = "c" * 32
+        assessment = lane_closeout.assess(lane_closeout.LaneCloseoutObservation(
+            lane_id=lane_id, repository="/tmp/repo", workspace="/tmp/worktree",
+            branch="feat/example", base_revision="a" * 40, writer_state="completed",
+            task_active=False, process_active=False, lease_active=True, git_dirty=False,
+            head_sha="b" * 40, remote_head_sha="b" * 40, ahead_commits=0, behind_commits=0,
+            pr_number=1, pr_state="merged", pr_head_sha="b" * 40, merged_sha="b" * 40,
+        ), observed_at_unix=200)
         record = {
-            "lane_id": lane_id,
-            "state": "ready",
-            "receipt_sha256": "d" * 64,
+            "lane_id": lane_id, "state": "ready", "receipt_sha256": "d" * 64,
             "terminal_closeout": {
-                "closeout_state": "pr_merged",
-                "assessment_sha256": "e" * 64,
+                "schema_version": 1, "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": assessment["closeout_state"],
+                "assessment_sha256": assessment["assessment_sha256"], "assessment": assessment,
             },
         }
         with patch.object(work_acquire, "_read_state", return_value=record):
@@ -426,7 +433,7 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
         self.assertEqual(evidence["source_id"], lane_id)
         self.assertEqual(evidence["terminal_state"], "pr_merged")
         self.assertEqual(evidence["lane_receipt_sha256"], "d" * 64)
-        self.assertEqual(evidence["assessment_sha256"], "e" * 64)
+        self.assertEqual(evidence["assessment_sha256"], assessment["assessment_sha256"])
         self.assertEqual(
             evidence["evidence_sha256"],
             checkouts._sha256_json(
