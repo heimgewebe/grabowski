@@ -3217,7 +3217,7 @@
       "src/grabowski_connector_contract.py": "c0a128cbcbbc7ea906fd6edccccf986f95d531703ccb5c119576bc51bd215beb",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_context_fabric.py": "38f3d83511a8e0e6f8b8faaf43230df1466693f265f9bef70dadfe1ea3a97b95",
-      "src/grabowski_convergence.py": "238b0f5df09bb6a8a3b88802ade7aecb6c22258387e206f8dd9a492794e1e771",
+      "src/grabowski_convergence.py": "c18b249a31016a11cde4c3c4f04ba1eb5f9cb168e83a5ae9d824248711cd82b6",
       "src/grabowski_current_work.py": "96cbf7097927956443a2df9aa6ccb848570694cfeaf51d98c9a9b860f472dd10",
       "src/grabowski_current_work_surface.py": "7f8be512307ec55db4243bf427ae7a63ac8582f58896d41a31a010499c7be99d",
       "src/grabowski_deployment_observer.py": "01a9cbae636f29559c63cfe09a191d0e6ea78f5e838dc001914a6c4140be9e1c",
@@ -3226,7 +3226,7 @@
       "src/grabowski_fleet.py": "22b3afdde81ff3f0ec1b36d4f8d886bced6fdeb64c2f291f319df8a654dee20c",
       "src/grabowski_friction.py": "15137b57106c15bfac5d27b0fdb22fa7e958b06b32120217623d38abf3350d32",
       "src/grabowski_grip_orchestration.py": "04b6a9844dcaf353a5f4bb9a926cf80fc7ee4e56aab0551a936b7926703851c0",
-      "src/grabowski_grips.py": "326090f4d8eef6802fde319e405c3f2db88726fe77d954ceb0cb43a01788e0e7",
+      "src/grabowski_grips.py": "ddc90d2bc3d95256823168c8e6e0bf4380da93a7dc87be4d6fdcf1a25a8a8a79",
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "aeaae6e646638c7c1c6c516ec387bffce78170cf113cc175a627dec745ca9493",
@@ -3239,7 +3239,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "573ca21eff333700b16d8e71d30e1c89b28e95ed72465d167df5d22617a80bdc",
+      "src/grabowski_mcp.py": "d62880d182d3c89bc98c68e05b58517aa4b533ffef9ee932e1969df79ec1270b",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "c5aff396a76758a2d121e728add7b440270b00cb49fcb16137941b80370387dd",
@@ -3275,11 +3275,11 @@
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_transport_roundtrip.py": "903dc9db1747ed00e0181a49094e744cd99f6973edbf5c74458932aeaccf3e85",
-      "src/grabowski_work_acquire.py": "d1bf2614ea1dd6dcdc0d05625eedaf4a29e22260c2e0ae621b135f4352482761",
-      "src/grabowski_work_admission.py": "bb3e8998a650e3748ce5f9033fe05394a0a24e48185b823008275c1a105cdb5b",
+      "src/grabowski_work_acquire.py": "f6346e075d4d5e7fd8d9d34bce4b91f5f817937b43994df9d886ff012010ec31",
+      "src/grabowski_work_admission.py": "8e9b910e9f7a97fa8b2f4e537159b7e50de31f24e81df06b933e2f5fb24ea8c9",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "815914a20a0972210bdfd4ceb5774e2ca0d409c03858322a2fcdf8bf9219be3f",
-      "src/grabowski_worktree_ensure.py": "4ec7eecb853ab29e95e5716fe3ca3c77ae1172bc63b2a8901e041f5792336f4b"
+      "src/grabowski_worktree_ensure.py": "faa79d10d150b00c355718334df7de904567f46d42a5f881c66617a65e455ef8"
     }
   }
 }
