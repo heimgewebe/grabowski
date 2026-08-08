@@ -7802,6 +7802,63 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual("passed", result["receipt"]["status"])
 
+    def test_atomic_merge_guard_rejects_stale_approval_after_current_head_blocker(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        blocker = {
+            "id": 406,
+            "state": "CHANGES_REQUESTED",
+            "body": "current-head blocker",
+            "submitted_at": "2026-07-26T08:03:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-406",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        stale_approval = {
+            **blocker,
+            "id": 407,
+            "state": "APPROVED",
+            "submitted_at": "2026-07-26T08:04:00Z",
+            "commit_id": "c" * 40,
+        }
+        state = captain_codex_live_state(
+            view, review_pages=[[blocker, stale_approval]], threads=[]
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_review_findings_changes_requested_present",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        )
+
     def test_atomic_merge_guard_does_not_promote_trusted_reply_to_finding_debt(self) -> None:
         parameters = authorized_captain_run_parameters()
         review_evidence = parameters["review_evidence"]

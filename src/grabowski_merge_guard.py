@@ -1581,6 +1581,7 @@ class CaptainMergeGuardRunner:
             latest_blocker = blockers[-1]
             if not any(
                 item["state"] == "APPROVED"
+                and item.get("commit_sha") == head_sha
                 and (item["submitted"], item["id"])
                 > (latest_blocker["submitted"], latest_blocker["id"])
                 for item in actor_reviews

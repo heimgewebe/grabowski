@@ -175,7 +175,13 @@ def codex_review(
     }
 
 
-def codex_thread(*, resolved: bool, created_at: str = REVIEW_TIME) -> dict:
+def codex_thread(
+    *,
+    resolved: bool,
+    created_at: str = REVIEW_TIME,
+    head: str = HEAD,
+    actor: str = "chatgpt-codex-connector[bot]",
+) -> dict:
     return {
         "id": "PRRT_kwDOexample",
         "isResolved": resolved,
@@ -184,8 +190,8 @@ def codex_thread(*, resolved: bool, created_at: str = REVIEW_TIME) -> dict:
                 {
                     "databaseId": 3001,
                     "createdAt": created_at,
-                    "author": {"login": "chatgpt-codex-connector[bot]"},
-                    "commit": {"oid": HEAD},
+                    "author": {"login": actor},
+                    "commit": {"oid": head},
                     "pullRequestReview": {"databaseId": 2001},
                 }
             ],
@@ -240,6 +246,22 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertFalse(result["policy"]["external_review_required"])
         self.assertTrue(result["policy"]["self_review_required"])
         self.assertEqual("high_critical", result["policy"]["review_tier"])
+
+    def test_optional_stale_unresolved_finding_without_current_request_blocks(self) -> None:
+        state = base_state()
+        state["reviewThreads"] = connection(
+            [codex_thread(resolved=False, head="d" * 40)],
+            hasNextPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertFalse(result["request_present"])
+        self.assertEqual("block", result["status"])
+        self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertEqual(1, result["finding_count"])
+        self.assertEqual(1, result["unresolved_thread_count"])
+        self.assertFalse(result["evidence"]["all_findings_triaged"])
 
     def test_documentation_change_without_request_passes_as_not_required(self) -> None:
         result = self.evaluate(

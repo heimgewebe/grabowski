@@ -949,7 +949,7 @@ def _provider_unavailable_diagnostic(
 def _codex_threads(
     pr: dict[str, Any],
     *,
-    head_sha: str,
+    head_sha: str | None,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for thread in _list_nodes(pr.get("reviewThreads"), label="reviewThreads"):
@@ -957,29 +957,33 @@ def _codex_threads(
         if not isinstance(thread_id, str) or not thread_id.strip():
             continue
         thread_id = thread_id.strip()
-        matched_comment_ids: list[int] = []
-        for comment in _list_nodes(thread.get("comments"), label=f"thread {thread_id} comments"):
-            actor = _actor_login(comment.get("author"))
-            commit = comment.get("commit")
-            commit_sha = commit.get("oid") if isinstance(commit, dict) else None
-            created = _parse_time(comment.get("createdAt"))
-            comment_id = comment.get("databaseId")
-            if (
-                actor in TRUSTED_CODEX_ACTORS
-                and commit_sha == head_sha
-                and created is not None
-                and isinstance(comment_id, int)
-                and not isinstance(comment_id, bool)
-            ):
-                matched_comment_ids.append(comment_id)
-        if matched_comment_ids:
-            result.append(
-                {
-                    "thread_id": thread_id,
-                    "is_resolved": thread.get("isResolved") is True,
-                    "codex_comment_ids": sorted(set(matched_comment_ids)),
-                }
-            )
+        comments = _list_nodes(
+            thread.get("comments"), label=f"thread {thread_id} comments"
+        )
+        if not comments:
+            continue
+        root = comments[0]
+        actor = _actor_login(root.get("author"))
+        commit = root.get("commit")
+        commit_sha = commit.get("oid") if isinstance(commit, dict) else None
+        created = _parse_time(root.get("createdAt"))
+        comment_id = root.get("databaseId")
+        if (
+            actor not in TRUSTED_CODEX_ACTORS
+            or created is None
+            or isinstance(comment_id, bool)
+            or not isinstance(comment_id, int)
+            or (head_sha is not None and commit_sha != head_sha)
+        ):
+            continue
+        result.append(
+            {
+                "thread_id": thread_id,
+                "is_resolved": thread.get("isResolved") is True,
+                "codex_comment_ids": [comment_id],
+                "commit_sha": commit_sha,
+            }
+        )
     return sorted(result, key=lambda item: item["thread_id"])
 
 
@@ -1017,7 +1021,12 @@ def evaluate(
         else None
     )
     threads = _codex_threads(pr, head_sha=head_sha) if request is not None else []
-    unresolved = [item["thread_id"] for item in threads if not item["is_resolved"]]
+    finding_debt_threads = _codex_threads(pr, head_sha=None)
+    unresolved = [
+        item["thread_id"]
+        for item in finding_debt_threads
+        if not item["is_resolved"]
+    ]
     if completion is not None and completion["blocking_state"]:
         errors.append(f"Codex review state is blocking: {completion['state']}")
     if completion is not None and not completion["accepted_state"]:
@@ -1109,7 +1118,7 @@ def evaluate(
         "completion": completion,
         "provider_outcome": provider_outcome,
         "review_performed": review_performed,
-        "finding_count": len(threads),
+        "finding_count": len(finding_debt_threads),
         "thread_ids": thread_ids,
         "thread_ids_sha256": _sha256_json(thread_ids),
         "unresolved_thread_ids": unresolved,
@@ -1141,7 +1150,7 @@ def evaluate(
         "completion_present": completion is not None,
         "provider_outcome_present": provider_outcome is not None,
         "review_performed": review_performed,
-        "finding_count": len(threads),
+        "finding_count": len(finding_debt_threads),
         "unresolved_thread_count": len(unresolved),
         "errors": errors,
         "policy": policy,
