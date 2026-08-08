@@ -631,6 +631,43 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertTrue(result["request_present"])
         self.assertFalse(result["completion_present"])
 
+    def test_optional_pending_review_without_findings_stays_non_blocking(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [codex_review(state="PENDING", submitted_at=None)],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_review_pending", result["status_code"])
+        self.assertEqual("success", result["github_state"])
+        self.assertFalse(result["settled"])
+        self.assertFalse(result["review_performed"])
+        self.assertTrue(result["completion_present"])
+        self.assertEqual([], result["errors"])
+        self.assertEqual(0, result["unresolved_thread_count"])
+
+    def test_optional_pending_review_with_existing_finding_still_blocks(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [codex_review(state="PENDING", submitted_at=None)],
+            hasPreviousPage=False,
+        )
+        state["reviewThreads"] = connection(
+            [codex_thread(resolved=False)], hasNextPage=False
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertFalse(result["settled"])
+        self.assertEqual(1, result["unresolved_thread_count"])
+
     def test_optional_blocking_review_is_terminal_merge_debt(self) -> None:
         state = base_state()
         state["comments"] = connection([request_comment()], hasPreviousPage=False)

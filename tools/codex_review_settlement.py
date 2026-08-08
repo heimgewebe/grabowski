@@ -1027,14 +1027,27 @@ def evaluate(
         for item in finding_debt_threads
         if not item["is_resolved"]
     ]
-    if completion is not None and completion["blocking_state"]:
+    required = policy["required"]
+    optional_pending_completion = (
+        not required
+        and completion is not None
+        and completion.get("state") == "PENDING"
+    )
+    if (
+        completion is not None
+        and completion["blocking_state"]
+        and not optional_pending_completion
+    ):
         errors.append(f"Codex review state is blocking: {completion['state']}")
-    if completion is not None and not completion["accepted_state"]:
+    if (
+        completion is not None
+        and not completion["accepted_state"]
+        and not optional_pending_completion
+    ):
         errors.append(f"Codex review state is unsupported: {completion['state']}")
     if unresolved:
         errors.append(f"{len(unresolved)} Codex review thread(s) remain unresolved")
 
-    required = policy["required"]
     if visibility_errors:
         status, status_code = "block", "visibility_blocked"
     elif errors:
@@ -1043,6 +1056,8 @@ def evaluate(
             if required
             else ("block", "optional_review_findings")
         )
+    elif optional_pending_completion:
+        status, status_code = "pass", "optional_review_pending"
     elif completion is not None:
         status, status_code = "pass", "review_settled"
     elif provider_outcome is not None:
@@ -1070,12 +1085,14 @@ def evaluate(
     description = status_contract["description"]
 
     settled = (
-        status == "pass"
+        status_code == "review_settled"
         and completion is not None
         and request is not None
         and not errors
     )
-    review_performed = completion is not None
+    review_performed = (
+        completion is not None and completion.get("state") != "PENDING"
+    )
     does_not_establish = [
         "semantic_correctness_of_codex_findings",
         "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
