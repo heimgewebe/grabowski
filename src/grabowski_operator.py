@@ -77,6 +77,7 @@ _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX = 4096
 _DEPLOYMENT_ADMISSION_IDENTITY_ATTEMPTS_MAX = 8
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_SAMPLE_MAX = 16
 _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_NAME_GROUP_MAX = 32
+_DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-true-is-read-only-v1"
 _DEPLOYMENT_ADMISSION_MAX_TOOL_NAME_CHARS = 128
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC = "sync"
 _DEPLOYMENT_ADMISSION_EXECUTION_KIND_ASYNC = "async"
@@ -776,6 +777,7 @@ def _deployment_admission_snapshot() -> dict[str, Any]:
         "read_only_active_tool_calls": sum(
             entry.get("drain_blocking") is False for entry in registry.values()
         ),
+        "effect_classification": _DEPLOYMENT_ADMISSION_EFFECT_CLASSIFICATION,
         "active_tool_call_registry_max": (
             _DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX
         ),

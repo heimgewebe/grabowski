@@ -222,6 +222,7 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(total, snapshot["active_tool_calls"])
         self.assertEqual(total, snapshot["drain_blocking_tool_calls"])
         self.assertEqual(0, snapshot["read_only_active_tool_calls"])
+        self.assertEqual("readOnlyHint-true-is-read-only-v1", snapshot["effect_classification"])
         self.assertEqual(
             {
                 operator._DEPLOYMENT_ADMISSION_EXECUTION_KIND_SYNC: sync_count,
@@ -281,6 +282,7 @@ class DeploymentAdmissionCallRegistryTests(unittest.TestCase):
         self.assertEqual(0, snapshot["active_tool_calls"])
         self.assertEqual(0, snapshot["drain_blocking_tool_calls"])
         self.assertEqual(0, snapshot["read_only_active_tool_calls"])
+        self.assertEqual("readOnlyHint-true-is-read-only-v1", snapshot["effect_classification"])
         self.assertEqual(
             operator._DEPLOYMENT_ADMISSION_ACTIVE_TOOL_CALL_REGISTRY_MAX,
             snapshot["active_tool_call_registry_max"],
