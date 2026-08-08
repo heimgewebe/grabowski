@@ -88,6 +88,7 @@
     "grabowski_juno_run",
     "ipad_bluetooth_scan",
     "ipad_bluetooth_inspect",
+    "ipad_bluetooth_read",
     "ipad_native_permission_status",
     "ipad_native_permission_request",
     "ipad_capability_manifest",

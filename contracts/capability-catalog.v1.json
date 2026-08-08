@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "7014fa6bfcf39b9b324568bab50ff235a1f6e266cc4124fd3ba692fd11e24d15",
+  "capability_source_sha256": "64476052f1361131a171cf6380cad9f80974f0e5537ae9d9e3f30263e99e9812",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "f755c5db3dd4f13b46bbeaee39379f45ec3a90816ec434820b3402bf2d5bf89a",
+  "contract_sha256": "93192a0657da3c210f117deca7484cf04542bcbb8c64f106e4877a55f3f2f3e4",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1090,6 +1090,23 @@
       "reversibility": "temporary-connection-explicitly-disconnected",
       "risk_class": "medium",
       "tool": "ipad_bluetooth_inspect"
+    },
+    {
+      "category": "device-worker",
+      "description": "Read bounded values from exact readable BLE characteristics and disconnect.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-connect",
+        "device-gatt-value-read",
+        "device-private-content-return",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_read",
+      "purpose": "Read bounded raw values from exact requested readable GATT characteristics on one exact BLE identifier without writes, subscriptions, pairing requests or auth bypass.",
+      "read_only": false,
+      "reversibility": "temporary-connection-explicitly-disconnected",
+      "risk_class": "high",
+      "tool": "ipad_bluetooth_read"
     },
     {
       "category": "device-worker",

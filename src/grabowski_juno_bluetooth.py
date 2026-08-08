@@ -22,6 +22,9 @@ SCHEMA_VERSION = 1
 UUID_RE = re.compile(
     r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$"
 )
+GATT_UUID_RE = re.compile(
+    r"^(?:[0-9A-F]{4}|[0-9A-F]{8}|[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})$"
+)
 CLASS_SUFFIX_RE = re.compile(r"^[0-9a-f]{12}$")
 MIN_SCAN_SECONDS = 1
 MAX_SCAN_SECONDS = 12
@@ -30,6 +33,9 @@ MAX_DISCOVERY_SECONDS = 8
 MAX_DEVICES = 128
 MAX_SERVICES = 64
 MAX_CHARACTERISTICS_PER_SERVICE = 128
+MAX_READ_CHARACTERISTICS = 8
+MAX_VALUE_BYTES = 4_096
+MAX_TOTAL_VALUE_BYTES = 16 * 1024
 MAX_DESCRIPTION_BYTES = 4_096
 MAX_DEVICE_RESULT_BYTES = 256 * 1024
 MAX_EXPECTED_STARTED_AT_BYTES = 128
@@ -39,6 +45,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import json
 import time
 
@@ -48,6 +55,9 @@ from rubicon.objc import NSObject, ObjCClass, objc_method
 SCHEMA_VERSION = 1
 MAX_SERVICES = 64
 MAX_CHARACTERISTICS_PER_SERVICE = 128
+MAX_READ_CHARACTERISTICS = 8
+MAX_VALUE_BYTES = 4096
+MAX_TOTAL_VALUE_BYTES = 16384
 MAX_DESCRIPTION_BYTES = 4096
 
 _REQUEST = json.loads(base64.b64decode("__REQUEST_B64__").decode("utf-8"))
@@ -188,9 +198,68 @@ _inspect = {
     "connected": False,
     "disconnected": False,
     "finished": False,
+    "discovery_complete": False,
     "services": [],
+    "characteristic_objects": {},
+    "read_started": False,
+    "read_pending": set(),
+    "read_values": {},
+    "read_attempted_count": 0,
+    "read_bytes_total": 0,
     "errors": [],
 }
+
+
+def _start_characteristic_reads(peripheral):
+    if _REQUEST.get("operation") != "read" or _inspect["read_started"]:
+        return
+    _inspect["read_started"] = True
+    service_uuid = _REQUEST["service_uuid"]
+    targets = []
+    for characteristic_uuid in list(_REQUEST["characteristic_uuids"])[:MAX_READ_CHARACTERISTICS]:
+        characteristic = _inspect["characteristic_objects"].get(
+            (service_uuid, characteristic_uuid)
+        )
+        if characteristic is None:
+            _inspect["read_values"][characteristic_uuid] = {
+                "uuid": characteristic_uuid,
+                "status": "not_found",
+                "properties": None,
+            }
+            continue
+        try:
+            properties = int(characteristic.properties)
+        except Exception:
+            properties = None
+        if properties is None or not bool(properties & 0x02):
+            _inspect["read_values"][characteristic_uuid] = {
+                "uuid": characteristic_uuid,
+                "status": "not_readable",
+                "properties": properties,
+            }
+            continue
+        _inspect["read_values"][characteristic_uuid] = {
+            "uuid": characteristic_uuid,
+            "status": "pending",
+            "properties": properties,
+        }
+        _inspect["read_pending"].add(characteristic_uuid)
+        targets.append((characteristic_uuid, characteristic))
+
+    _inspect["read_attempted_count"] = len(targets)
+    for characteristic_uuid, characteristic in targets:
+        try:
+            peripheral.readValueForCharacteristic_(characteristic)
+        except Exception as exc:
+            _inspect["read_values"][characteristic_uuid] = {
+                "uuid": characteristic_uuid,
+                "status": "read_start_error",
+                "properties": _inspect["read_values"][characteristic_uuid]["properties"],
+                "error": _bounded_text(exc) or "unknown",
+            }
+            _inspect["read_pending"].discard(characteristic_uuid)
+    if not _inspect["read_pending"]:
+        _inspect["finished"] = True
 
 
 class __DELEGATE_CLASS__(NSObject):
@@ -302,13 +371,14 @@ class __DELEGATE_CLASS__(NSObject):
                 )
                 values = []
             for characteristic in values[:MAX_CHARACTERISTICS_PER_SERVICE]:
+                characteristic_uuid = _bounded_text(characteristic.UUID)
                 try:
                     properties = int(characteristic.properties)
                 except Exception:
                     properties = None
                 characteristics.append(
                     {
-                        "uuid": _bounded_text(characteristic.UUID),
+                        "uuid": characteristic_uuid,
                         "properties": properties,
                         "readable": bool(properties & 0x02) if properties is not None else None,
                         "writable_without_response": bool(properties & 0x04)
@@ -319,6 +389,10 @@ class __DELEGATE_CLASS__(NSObject):
                         "indicatable": bool(properties & 0x20) if properties is not None else None,
                     }
                 )
+                if service_uuid and characteristic_uuid:
+                    _inspect["characteristic_objects"][
+                        (service_uuid, characteristic_uuid)
+                    ] = characteristic
         for row in _inspect["services"]:
             if row["uuid"] == service_uuid:
                 row["characteristics"] = characteristics
@@ -326,6 +400,65 @@ class __DELEGATE_CLASS__(NSObject):
         if _inspect["services"] and all(
             row["characteristics"] is not None for row in _inspect["services"]
         ):
+            _inspect["discovery_complete"] = True
+            if _REQUEST.get("operation") == "read":
+                _start_characteristic_reads(peripheral)
+            else:
+                _inspect["finished"] = True
+
+    @objc_method
+    def peripheral_didUpdateValueForCharacteristic_error_(
+        self, peripheral, characteristic, error
+    ):
+        if _REQUEST.get("operation") != "read":
+            return
+        if _uuid(peripheral) != _REQUEST.get("device_id"):
+            return
+        characteristic_uuid = _bounded_text(characteristic.UUID)
+        if characteristic_uuid not in _inspect["read_pending"]:
+            return
+        current = _inspect["read_values"].get(characteristic_uuid, {})
+        properties = current.get("properties")
+        if error is not None:
+            _inspect["read_values"][characteristic_uuid] = {
+                "uuid": characteristic_uuid,
+                "status": "read_error",
+                "properties": properties,
+                "error": _bounded_text(error) or "unknown",
+            }
+        else:
+            try:
+                value = characteristic.value
+                encoded = "" if value is None else str(value.base64EncodedStringWithOptions_(0))
+                payload = base64.b64decode(encoded, validate=True) if encoded else b""
+            except Exception as exc:
+                _inspect["read_values"][characteristic_uuid] = {
+                    "uuid": characteristic_uuid,
+                    "status": "encode_error",
+                    "properties": properties,
+                    "error": _bounded_text(exc) or "unknown",
+                }
+            else:
+                projected_total = _inspect["read_bytes_total"] + len(payload)
+                if len(payload) > MAX_VALUE_BYTES or projected_total > MAX_TOTAL_VALUE_BYTES:
+                    _inspect["read_values"][characteristic_uuid] = {
+                        "uuid": characteristic_uuid,
+                        "status": "value_too_large",
+                        "properties": properties,
+                        "size": len(payload),
+                    }
+                else:
+                    _inspect["read_bytes_total"] = projected_total
+                    _inspect["read_values"][characteristic_uuid] = {
+                        "uuid": characteristic_uuid,
+                        "status": "read",
+                        "properties": properties,
+                        "value_b64": encoded,
+                        "size": len(payload),
+                        "sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+        _inspect["read_pending"].discard(characteristic_uuid)
+        if _inspect["discovery_complete"] and not _inspect["read_pending"]:
             _inspect["finished"] = True
 
 
@@ -389,10 +522,10 @@ def _run(request):
     _scan(manager, int(request["scan_seconds"]), True)
     row = _devices.get(device_id)
     if row is None:
-        return {
+        result = {
             "schema_version": SCHEMA_VERSION,
-            "kind": "ipad_bluetooth_inspect",
-            "operation": "inspect",
+            "kind": "ipad_bluetooth_" + operation,
+            "operation": operation,
             "application_state": application_state,
             "central_state": central_state,
             "bluetooth_powered_on": True,
@@ -400,18 +533,31 @@ def _run(request):
             "found": False,
             "connected": False,
             "disconnected": False,
-            "services": [],
             "errors": [],
             "writes_attempted": False,
             "pairing_requested_by_tool": False,
         }
+        if operation == "read":
+            result.update({
+                "service_uuid": request["service_uuid"],
+                "characteristic_uuids": list(request["characteristic_uuids"]),
+                "values": [
+                    {"uuid": item, "status": "not_found", "properties": None}
+                    for item in request["characteristic_uuids"]
+                ],
+                "read_attempted_count": 0,
+                "subscriptions_attempted": False,
+            })
+        else:
+            result["services"] = []
+        return result
 
     public = _public_device(row)
     if row.get("connectable") is not True:
-        return {
+        result = {
             "schema_version": SCHEMA_VERSION,
-            "kind": "ipad_bluetooth_inspect",
-            "operation": "inspect",
+            "kind": "ipad_bluetooth_" + operation,
+            "operation": operation,
             "application_state": application_state,
             "central_state": central_state,
             "bluetooth_powered_on": True,
@@ -420,11 +566,24 @@ def _run(request):
             "advertisement": public,
             "connected": False,
             "disconnected": False,
-            "services": [],
             "errors": ["device_not_connectable"],
             "writes_attempted": False,
             "pairing_requested_by_tool": False,
         }
+        if operation == "read":
+            result.update({
+                "service_uuid": request["service_uuid"],
+                "characteristic_uuids": list(request["characteristic_uuids"]),
+                "values": [
+                    {"uuid": item, "status": "not_connectable", "properties": None}
+                    for item in request["characteristic_uuids"]
+                ],
+                "read_attempted_count": 0,
+                "subscriptions_attempted": False,
+            })
+        else:
+            result["services"] = []
+        return result
 
     peripheral = row["_peripheral"]
     _inspect["target"] = peripheral
@@ -433,6 +592,16 @@ def _run(request):
         deadline = time.time() + int(request["discovery_seconds"])
         while time.time() < deadline and not _inspect["finished"]:
             time.sleep(0.05)
+        if operation == "read" and _inspect["read_pending"]:
+            for characteristic_uuid in list(_inspect["read_pending"]):
+                current = _inspect["read_values"].get(characteristic_uuid, {})
+                _inspect["read_values"][characteristic_uuid] = {
+                    "uuid": characteristic_uuid,
+                    "status": "read_timeout",
+                    "properties": current.get("properties"),
+                }
+            _inspect["read_pending"].clear()
+            _inspect["finished"] = True
     except Exception as exc:
         _inspect["errors"].append("connect_start:" + (_bounded_text(exc) or "unknown"))
     finally:
@@ -450,6 +619,35 @@ def _run(request):
                 "characteristics": service["characteristics"] or [],
             }
         )
+    if operation == "read":
+        values = [
+            _inspect["read_values"].get(
+                characteristic_uuid,
+                {"uuid": characteristic_uuid, "status": "not_found", "properties": None},
+            )
+            for characteristic_uuid in request["characteristic_uuids"]
+        ]
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "ipad_bluetooth_read",
+            "operation": "read",
+            "application_state": application_state,
+            "central_state": central_state,
+            "bluetooth_powered_on": True,
+            "device_id": device_id,
+            "found": True,
+            "advertisement": public,
+            "connected": bool(_inspect["connected"]),
+            "disconnected": bool(_inspect["disconnected"]),
+            "service_uuid": request["service_uuid"],
+            "characteristic_uuids": list(request["characteristic_uuids"]),
+            "values": values,
+            "read_attempted_count": int(_inspect["read_attempted_count"]),
+            "subscriptions_attempted": False,
+            "errors": _inspect["errors"][:32],
+            "writes_attempted": False,
+            "pairing_requested_by_tool": False,
+        }
     return {
         "schema_version": SCHEMA_VERSION,
         "kind": "ipad_bluetooth_inspect",
@@ -500,6 +698,28 @@ def _validate_uuid(value: str) -> str:
     normalized = value.strip().upper()
     if UUID_RE.fullmatch(normalized) is None:
         raise ValueError("device_id must be a canonical UUID")
+    return normalized
+
+
+def _validate_gatt_uuid(value: str, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a UUID string")
+    normalized = value.strip().upper()
+    if GATT_UUID_RE.fullmatch(normalized) is None:
+        raise ValueError(f"{label} must be a 16-bit, 32-bit, or canonical 128-bit UUID")
+    return normalized
+
+
+def _validate_characteristic_uuids(value: list[str]) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > MAX_READ_CHARACTERISTICS:
+        raise ValueError(
+            f"characteristic_uuids must contain between 1 and {MAX_READ_CHARACTERISTICS} UUIDs"
+        )
+    normalized = [
+        _validate_gatt_uuid(item, label="characteristic_uuid") for item in value
+    ]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("characteristic_uuids must be unique")
     return normalized
 
 
@@ -640,6 +860,70 @@ def _validate_device_result(request: dict[str, Any], result: Any) -> dict[str, A
         _validate_device_row(advertisement)
         if advertisement.get("id") != request["device_id"]:
             raise RuntimeError("Bluetooth inspect advertisement target mismatch")
+    if operation == "read":
+        if result.get("service_uuid") != request["service_uuid"]:
+            raise RuntimeError("Bluetooth read service target mismatch")
+        if result.get("characteristic_uuids") != request["characteristic_uuids"]:
+            raise RuntimeError("Bluetooth read characteristic target mismatch")
+        if result.get("subscriptions_attempted") is not False:
+            raise RuntimeError("Bluetooth read result does not prove no-subscription execution")
+        attempted = result.get("read_attempted_count")
+        if (
+            not isinstance(attempted, int)
+            or isinstance(attempted, bool)
+            or attempted < 0
+            or attempted > len(request["characteristic_uuids"])
+        ):
+            raise RuntimeError("Bluetooth read attempted count is invalid")
+        values = result.get("values")
+        if not isinstance(values, list):
+            raise RuntimeError("Bluetooth read values are invalid")
+        if result.get("found") and len(values) != len(request["characteristic_uuids"]):
+            raise RuntimeError("Bluetooth read values do not cover exact requested characteristics")
+        if [item.get("uuid") for item in values] != request["characteristic_uuids"]:
+            raise RuntimeError("Bluetooth read value ordering or target identity is invalid")
+        total = 0
+        statuses = {
+            "read",
+            "not_found",
+            "not_readable",
+            "not_connectable",
+            "read_error",
+            "read_timeout",
+            "read_start_error",
+            "encode_error",
+            "value_too_large",
+        }
+        for item in values:
+            if not isinstance(item, dict) or item.get("status") not in statuses:
+                raise RuntimeError("Bluetooth read value row is invalid")
+            properties = item.get("properties")
+            if properties is not None and (
+                not isinstance(properties, int) or isinstance(properties, bool) or properties < 0
+            ):
+                raise RuntimeError("Bluetooth read characteristic properties are invalid")
+            if item["status"] == "read":
+                encoded = item.get("value_b64")
+                size = item.get("size")
+                digest = item.get("sha256")
+                if not isinstance(encoded, str) or not isinstance(size, int) or isinstance(size, bool):
+                    raise RuntimeError("Bluetooth read payload metadata is invalid")
+                try:
+                    payload = base64.b64decode(encoded, validate=True)
+                except Exception as exc:
+                    raise RuntimeError("Bluetooth read payload encoding is invalid") from exc
+                if size != len(payload) or size > MAX_VALUE_BYTES:
+                    raise RuntimeError("Bluetooth read payload size is invalid")
+                if digest != _sha256_bytes(payload):
+                    raise RuntimeError("Bluetooth read payload digest mismatch")
+                total += size
+                if total > MAX_TOTAL_VALUE_BYTES:
+                    raise RuntimeError("Bluetooth read total payload exceeds bound")
+        errors = result.get("errors")
+        if not isinstance(errors, list) or len(errors) > 32 or any(not isinstance(item, str) for item in errors):
+            raise RuntimeError("Bluetooth read errors are invalid")
+        return result
+
     services = result.get("services")
     if not isinstance(services, list) or len(services) > MAX_SERVICES:
         raise RuntimeError("Bluetooth inspect service list is invalid")
@@ -710,7 +994,7 @@ def _run_typed_bluetooth_job(
                 "Bluetooth MAC addresses",
                 "precise physical distance from RSSI",
                 "background Bluetooth scan entitlement",
-                "characteristic value read authority",
+                "characteristic value read authority beyond the exact requested one-shot read",
                 "characteristic write or device-control authority",
                 "pairing or authentication bypass",
             ],
@@ -808,6 +1092,55 @@ def ipad_bluetooth_inspect(
             "Inspect one exact BLE identifier on the paired Juno iPad by connecting, "
             "enumerating GATT services and characteristic metadata, and disconnecting "
             "without reading values, writing characteristics, subscribing, or pairing."
+        ),
+        expected_started_at=expected_started_at,
+        session_escalation=session_escalation,
+    )
+
+
+@mcp.tool(name="ipad_bluetooth_read", annotations=MUTATING)
+def ipad_bluetooth_read(
+    device_id: str,
+    service_uuid: str,
+    characteristic_uuids: list[str],
+    expected_started_at: str,
+    session_escalation: dict[str, Any],
+    scan_seconds: int = 5,
+    discovery_seconds: int = 7,
+) -> dict[str, Any]:
+    """Read bounded values from exact readable BLE characteristics and disconnect."""
+    operator._require_operator_capability("terminal_execute")
+    device_id = _validate_uuid(device_id)
+    service_uuid = _validate_gatt_uuid(service_uuid, label="service_uuid")
+    characteristic_uuids = _validate_characteristic_uuids(characteristic_uuids)
+    scan_seconds = _bounded_int(
+        scan_seconds,
+        minimum=MIN_SCAN_SECONDS,
+        maximum=MAX_INSPECT_SCAN_SECONDS,
+        label="scan_seconds",
+    )
+    discovery_seconds = _bounded_int(
+        discovery_seconds,
+        minimum=1,
+        maximum=MAX_DISCOVERY_SECONDS,
+        label="discovery_seconds",
+    )
+    request = {
+        "schema_version": SCHEMA_VERSION,
+        "operation": "read",
+        "device_id": device_id,
+        "service_uuid": service_uuid,
+        "characteristic_uuids": characteristic_uuids,
+        "scan_seconds": scan_seconds,
+        "discovery_seconds": discovery_seconds,
+        "class_suffix": _new_suffix(),
+    }
+    return _run_typed_bluetooth_job(
+        request=request,
+        purpose=(
+            "Read bounded raw values from exact readable BLE characteristics on one exact "
+            "paired-Juno-visible peripheral, then disconnect without writing, subscribing, "
+            "requesting pairing, bypassing authentication, or interpreting values as commands."
         ),
         expected_started_at=expected_started_at,
         session_escalation=session_escalation,
