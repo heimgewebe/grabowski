@@ -240,6 +240,88 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertNotIn("raw_lines", summary)
         self.assertNotIn("raw_lines", classification)
 
+    def test_negated_classification_terms_do_not_hide_actionable_failures(self) -> None:
+        module = self._load_module()
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "operator_bug",
+                    "symptom": "failure is not superseded; runtime still crashes",
+                }
+            ),
+            "actionable_failure",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "this is not an expected red phase; contract validation regressed",
+                }
+            ),
+            "contract_error",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "this is not actually an expected red phase; contract validation regressed",
+                }
+            ),
+            "contract_error",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "operator_bug",
+                    "symptom": "no longer already fixed; regression returned",
+                }
+            ),
+            "actionable_failure",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "this did not fail; expected red phase",
+                }
+            ),
+            "expected_red_phase",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "operation": "this did not fail",
+                    "symptom": "expected red phase",
+                }
+            ),
+            "expected_red_phase",
+        )
+        for symptom in (
+            "this doesn't indicate an expected red phase",
+            "this didn't indicate an expected red phase",
+            "this can't be an expected red phase",
+            "this won't be an expected red phase",
+            "this shouldn’t be an expected red phase",
+            "this mustn't be an expected red phase",
+        ):
+            with self.subTest(symptom=symptom):
+                self.assertEqual(
+                    module.classify_friction_event(
+                        {"kind": "ci_contract", "symptom": symptom}
+                    ),
+                    "contract_error",
+                )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "this was not a failure, expected red phase",
+                }
+            ),
+            "expected_red_phase",
+        )
+
     def test_failure_class_config_is_consistent(self) -> None:
         module = self._load_module()
         self.assertEqual(set(module.FAILURE_CLASS_DECISIONS), module.FAILURE_CLASSES)
