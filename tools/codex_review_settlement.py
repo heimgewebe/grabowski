@@ -119,10 +119,10 @@ SETTLEMENT_STATUS_CONTRACT = {
         "description": "Optional Codex review pending; merge gate unaffected",
     },
     "optional_review_findings": {
-        "status": "pass",
-        "exit_code": 0,
-        "github_state": "success",
-        "description": "Optional Codex findings remain advisory",
+        "status": "block",
+        "exit_code": 2,
+        "github_state": "failure",
+        "description": "Existing Codex findings require settlement before merge",
     },
     "required_request_missing": {
         "status": "pending",
@@ -777,23 +777,23 @@ def _review_completion(
         return submitted, item["databaseId"]
 
     selected: dict[str, Any] | None = None
-    pending = [item for item in candidates if item["_state"] == "PENDING"]
-    if pending:
-        selected = max(pending, key=lambda item: item["databaseId"])
-    else:
-        blockers = [
-            item for item in candidates if item["_state"] == "CHANGES_REQUESTED"
+    blockers = [
+        item for item in candidates if item["_state"] == "CHANGES_REQUESTED"
+    ]
+    if blockers:
+        latest_blocker = max(blockers, key=order)
+        approvals = [
+            item
+            for item in candidates
+            if item["_state"] == "APPROVED"
+            and order(item) > order(latest_blocker)
         ]
-        if blockers:
-            latest_blocker = max(blockers, key=order)
-            approvals = [
-                item
-                for item in candidates
-                if item["_state"] == "APPROVED"
-                and order(item) > order(latest_blocker)
-            ]
-            if not approvals:
-                selected = latest_blocker
+        if not approvals:
+            selected = latest_blocker
+    if selected is None:
+        pending = [item for item in candidates if item["_state"] == "PENDING"]
+        if pending:
+            selected = max(pending, key=lambda item: item["databaseId"])
     if selected is None:
         accepted = [
             item
@@ -949,7 +949,7 @@ def _provider_unavailable_diagnostic(
 def _codex_threads(
     pr: dict[str, Any],
     *,
-    head_sha: str,
+    head_sha: str | None,
 ) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for thread in _list_nodes(pr.get("reviewThreads"), label="reviewThreads"):
@@ -957,30 +957,109 @@ def _codex_threads(
         if not isinstance(thread_id, str) or not thread_id.strip():
             continue
         thread_id = thread_id.strip()
+        comments = _list_nodes(
+            thread.get("comments"), label=f"thread {thread_id} comments"
+        )
+        if not comments:
+            continue
+
         matched_comment_ids: list[int] = []
-        for comment in _list_nodes(thread.get("comments"), label=f"thread {thread_id} comments"):
+        matched_commit_shas: list[str] = []
+        candidates = comments[:1] if head_sha is None else comments
+        for comment in candidates:
             actor = _actor_login(comment.get("author"))
             commit = comment.get("commit")
             commit_sha = commit.get("oid") if isinstance(commit, dict) else None
             created = _parse_time(comment.get("createdAt"))
             comment_id = comment.get("databaseId")
             if (
-                actor in TRUSTED_CODEX_ACTORS
-                and commit_sha == head_sha
-                and created is not None
-                and isinstance(comment_id, int)
-                and not isinstance(comment_id, bool)
+                actor not in TRUSTED_CODEX_ACTORS
+                or created is None
+                or isinstance(comment_id, bool)
+                or not isinstance(comment_id, int)
+                or (head_sha is not None and commit_sha != head_sha)
             ):
-                matched_comment_ids.append(comment_id)
-        if matched_comment_ids:
-            result.append(
-                {
-                    "thread_id": thread_id,
-                    "is_resolved": thread.get("isResolved") is True,
-                    "codex_comment_ids": sorted(set(matched_comment_ids)),
-                }
-            )
+                continue
+            matched_comment_ids.append(comment_id)
+            if isinstance(commit_sha, str):
+                matched_commit_shas.append(commit_sha)
+        if not matched_comment_ids:
+            continue
+        result.append(
+            {
+                "thread_id": thread_id,
+                "is_resolved": thread.get("isResolved") is True,
+                "codex_comment_ids": sorted(set(matched_comment_ids)),
+                "commit_shas": sorted(set(matched_commit_shas)),
+            }
+        )
     return sorted(result, key=lambda item: item["thread_id"])
+
+
+def _codex_structured_review_debt(
+    pr: dict[str, Any],
+    *,
+    head_sha: str,
+) -> tuple[list[int], list[str]]:
+    reviews: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for review in _list_nodes(pr.get("reviews"), label="reviews"):
+        actor = _actor_login(review.get("author"))
+        if actor not in TRUSTED_CODEX_ACTORS:
+            continue
+        state = str(review.get("state") or "").upper()
+        if state not in {"CHANGES_REQUESTED", "APPROVED"}:
+            continue
+        review_id = review.get("databaseId")
+        submitted = _parse_time(review.get("submittedAt"))
+        commit = review.get("commit")
+        commit_sha = commit.get("oid") if isinstance(commit, dict) else None
+        if (
+            isinstance(review_id, bool)
+            or not isinstance(review_id, int)
+            or review_id <= 0
+        ):
+            errors.append("Codex structured review id is invalid")
+            continue
+        if submitted is None:
+            if state == "CHANGES_REQUESTED":
+                errors.append(
+                    f"Codex changes-requested review {review_id} lacks a valid submission time"
+                )
+            continue
+        reviews.append(
+            {
+                "id": review_id,
+                "actor_key": actor.removesuffix("[bot]"),
+                "state": state,
+                "submitted": submitted,
+                "commit_sha": commit_sha,
+            }
+        )
+
+    reviews.sort(key=lambda item: (item["submitted"], item["id"]))
+    by_actor: dict[str, list[dict[str, Any]]] = {}
+    for review in reviews:
+        by_actor.setdefault(str(review["actor_key"]), []).append(review)
+
+    outstanding: list[int] = []
+    for actor_reviews in by_actor.values():
+        blockers = [
+            item for item in actor_reviews if item["state"] == "CHANGES_REQUESTED"
+        ]
+        if not blockers:
+            continue
+        latest_blocker = blockers[-1]
+        superseded = any(
+            item["state"] == "APPROVED"
+            and item.get("commit_sha") == head_sha
+            and (item["submitted"], item["id"])
+            > (latest_blocker["submitted"], latest_blocker["id"])
+            for item in actor_reviews
+        )
+        if not superseded:
+            outstanding.append(int(latest_blocker["id"]))
+    return sorted(set(outstanding)), errors
 
 
 def evaluate(
@@ -1017,23 +1096,59 @@ def evaluate(
         else None
     )
     threads = _codex_threads(pr, head_sha=head_sha) if request is not None else []
-    unresolved = [item["thread_id"] for item in threads if not item["is_resolved"]]
-    if completion is not None and completion["blocking_state"]:
+    finding_debt_threads = _codex_threads(pr, head_sha=None)
+    outstanding_structured_review_ids, structured_review_errors = (
+        _codex_structured_review_debt(pr, head_sha=head_sha)
+    )
+    errors.extend(structured_review_errors)
+    unresolved_current = [
+        item["thread_id"] for item in threads if not item["is_resolved"]
+    ]
+    unresolved_debt = [
+        item["thread_id"]
+        for item in finding_debt_threads
+        if not item["is_resolved"]
+    ]
+    unresolved = sorted(set(unresolved_current) | set(unresolved_debt))
+    finding_thread_ids = sorted(
+        {item["thread_id"] for item in threads}
+        | {item["thread_id"] for item in finding_debt_threads}
+    )
+    required = policy["required"]
+    optional_pending_completion = (
+        not required
+        and completion is not None
+        and completion.get("state") == "PENDING"
+    )
+    if (
+        completion is not None
+        and completion["blocking_state"]
+        and not optional_pending_completion
+    ):
         errors.append(f"Codex review state is blocking: {completion['state']}")
-    if completion is not None and not completion["accepted_state"]:
+    if (
+        completion is not None
+        and not completion["accepted_state"]
+        and not optional_pending_completion
+    ):
         errors.append(f"Codex review state is unsupported: {completion['state']}")
     if unresolved:
         errors.append(f"{len(unresolved)} Codex review thread(s) remain unresolved")
+    if outstanding_structured_review_ids:
+        errors.append(
+            f"{len(outstanding_structured_review_ids)} Codex changes-requested review(s) remain outstanding"
+        )
 
-    required = policy["required"]
     if visibility_errors:
         status, status_code = "block", "visibility_blocked"
     elif errors:
         status, status_code = (
             ("block", "required_review_blocked")
             if required
-            else ("pass", "optional_review_findings")
+            else ("block", "optional_review_findings")
         )
+    elif optional_pending_completion:
+        status, status_code = "pass", "optional_review_pending"
     elif completion is not None:
         status, status_code = "pass", "review_settled"
     elif provider_outcome is not None:
@@ -1061,12 +1176,14 @@ def evaluate(
     description = status_contract["description"]
 
     settled = (
-        status == "pass"
+        status_code == "review_settled"
         and completion is not None
         and request is not None
         and not errors
     )
-    review_performed = completion is not None
+    review_performed = (
+        completion is not None and completion.get("state") != "PENDING"
+    )
     does_not_establish = [
         "semantic_correctness_of_codex_findings",
         "absence_of_non_inline_review_findings_outside_the_bounded_review_body",
@@ -1109,12 +1226,16 @@ def evaluate(
         "completion": completion,
         "provider_outcome": provider_outcome,
         "review_performed": review_performed,
-        "finding_count": len(threads),
+        "finding_count": len(finding_thread_ids) + len(outstanding_structured_review_ids),
+        "outstanding_structured_review_ids": outstanding_structured_review_ids,
+        "outstanding_structured_review_ids_sha256": _sha256_json(
+            outstanding_structured_review_ids
+        ),
         "thread_ids": thread_ids,
         "thread_ids_sha256": _sha256_json(thread_ids),
         "unresolved_thread_ids": unresolved,
         "unresolved_thread_ids_sha256": _sha256_json(unresolved),
-        "all_findings_triaged": not unresolved,
+        "all_findings_triaged": not unresolved and not outstanding_structured_review_ids and not structured_review_errors,
         "settled": settled,
         "status": status,
         "status_code": status_code,
@@ -1141,7 +1262,8 @@ def evaluate(
         "completion_present": completion is not None,
         "provider_outcome_present": provider_outcome is not None,
         "review_performed": review_performed,
-        "finding_count": len(threads),
+        "finding_count": len(finding_thread_ids) + len(outstanding_structured_review_ids),
+        "structured_review_debt_count": len(outstanding_structured_review_ids),
         "unresolved_thread_count": len(unresolved),
         "errors": errors,
         "policy": policy,

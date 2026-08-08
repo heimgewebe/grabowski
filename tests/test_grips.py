@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import inspect
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -4078,15 +4079,28 @@ def captain_codex_live_state(
         "user": {"login": "chatgpt-codex-connector[bot]"},
         "commit_id": head,
     }
+    effective_review_pages = deepcopy(
+        review_pages if review_pages is not None else [[review]]
+    )
+    graphql_reviews = [
+        {
+            "databaseId": item.get("id"),
+            "state": item.get("state"),
+            "submittedAt": item.get("submitted_at"),
+            "author": deepcopy(item.get("user")),
+            "commit": {"oid": item.get("commit_id")},
+        }
+        for page in effective_review_pages
+        for item in page
+        if isinstance(item, dict)
+    ]
     return {
         "request_comment": request_comment,
         "request_pages": deepcopy(
             request_pages if request_pages is not None else [[request_comment]]
         ),
         "review": review,
-        "review_pages": deepcopy(
-            review_pages if review_pages is not None else [[review]]
-        ),
+        "review_pages": effective_review_pages,
         "reactions": deepcopy(reactions or []),
         "reaction_pages": deepcopy(
             reaction_pages if reaction_pages is not None else [reactions or []]
@@ -4095,13 +4109,45 @@ def captain_codex_live_state(
             "data": {
                 "repository": {
                     "pullRequest": {
+                        "reviews": {
+                            "nodes": graphql_reviews,
+                            "pageInfo": {
+                                "hasPreviousPage": len(effective_review_pages) > 1
+                            },
+                        },
                         "reviewThreads": {
                             "nodes": deepcopy(threads or []),
                             "pageInfo": {"hasNextPage": False},
-                        }
+                        },
                     }
                 }
             }
+        },
+    }
+
+
+def captain_review_finding_thread(
+    *,
+    actor: str = "chatgpt-codex-connector[bot]",
+    commit: str = CAPTAIN_HEAD,
+    resolved: bool = False,
+    thread_id: str = "PRRT_finding",
+    comment_id: int = 303,
+) -> dict[str, object]:
+    return {
+        "id": thread_id,
+        "isResolved": resolved,
+        "comments": {
+            "nodes": [
+                {
+                    "databaseId": comment_id,
+                    "createdAt": "2026-07-26T08:02:00Z",
+                    "author": {"login": actor},
+                    "commit": {"oid": commit},
+                    "pullRequestReview": {"databaseId": 202},
+                }
+            ],
+            "pageInfo": {"hasNextPage": False},
         },
     }
 
@@ -7535,7 +7581,7 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertEqual([], resources.list_resources())
 
-    def test_atomic_merge_guard_skips_codex_when_external_review_is_optional(self) -> None:
+    def test_atomic_merge_guard_allows_optional_codex_without_findings(self) -> None:
         parameters = authorized_captain_run_parameters()
         review_evidence = parameters["review_evidence"]
         assert isinstance(review_evidence, dict)
@@ -7573,8 +7619,372 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             self.assertTrue(
                 receipt["diagnostic_evidence_ignored_for_authority"]
             )
-            self.assertEqual([], receipt["observations"])
+            self.assertEqual(1, len(receipt["observations"]))
             self.assertEqual([], receipt["errors"])
+            findings = receipt["existing_review_findings"]
+            self.assertEqual("clear", findings["status"])
+            self.assertEqual(0, findings["thread_count"])
+            self.assertEqual(0, findings["unresolved_thread_count"])
+
+    def test_atomic_merge_guard_blocks_optional_codex_finding_until_resolved(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        state = captain_codex_live_state(
+            view,
+            threads=[captain_review_finding_thread()],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        guard = execution["merge_lease_guard"]
+        self.assertIn(
+            "merge_guard_review_findings_unresolved_threads_present",
+            guard["errors"],
+        )
+        findings = guard["initial_codex_review_revalidation"][
+            "existing_review_findings"
+        ]
+        self.assertEqual("blocked", findings["status"])
+        self.assertEqual(1, findings["unresolved_thread_count"])
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
+
+    def test_atomic_merge_guard_blocks_stale_claude_finding_until_resolved(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        stale_thread = captain_review_finding_thread(
+            actor="claude",
+            commit="c" * 40,
+            thread_id="PRRT_stale_claude",
+        )
+        state = captain_codex_live_state(view, threads=[stale_thread])
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_review_findings_unresolved_threads_present",
+            execution["merge_lease_guard"]["errors"],
+        )
+
+    def test_atomic_merge_guard_blocks_trusted_changes_requested_without_thread(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        review = {
+            "id": 404,
+            "state": "CHANGES_REQUESTED",
+            "body": "structured blocker",
+            "submitted_at": "2026-07-26T08:03:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-404",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": "c" * 40,
+        }
+        state = captain_codex_live_state(view, review_pages=[[review]], threads=[])
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_review_findings_changes_requested_present",
+            execution["merge_lease_guard"]["errors"],
+        )
+
+    def test_atomic_merge_guard_allows_superseded_trusted_changes_requested(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        blocker = {
+            "id": 404,
+            "state": "CHANGES_REQUESTED",
+            "body": "structured blocker",
+            "submitted_at": "2026-07-26T08:03:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-404",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": "c" * 40,
+        }
+        approval = {
+            **blocker,
+            "id": 405,
+            "state": "APPROVED",
+            "submitted_at": "2026-07-26T08:04:00Z",
+            "commit_id": CAPTAIN_HEAD,
+        }
+        state = captain_codex_live_state(
+            view, review_pages=[[blocker, approval]], threads=[]
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+        self.assertEqual("passed", result["receipt"]["status"])
+
+    def test_atomic_merge_guard_rejects_stale_approval_after_current_head_blocker(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        blocker = {
+            "id": 406,
+            "state": "CHANGES_REQUESTED",
+            "body": "current-head blocker",
+            "submitted_at": "2026-07-26T08:03:00Z",
+            "html_url": "https://github.com/heimgewebe/grabowski/pull/96#pullrequestreview-406",
+            "user": {"login": "claude-code[bot]"},
+            "commit_id": CAPTAIN_HEAD,
+        }
+        stale_approval = {
+            **blocker,
+            "id": 407,
+            "state": "APPROVED",
+            "submitted_at": "2026-07-26T08:04:00Z",
+            "commit_id": "c" * 40,
+        }
+        state = captain_codex_live_state(
+            view, review_pages=[[blocker, stale_approval]], threads=[]
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertIn(
+            "merge_guard_review_findings_changes_requested_present",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual(
+            [], [call for call in gh.calls if call[:2] == ("pr", "merge")]
+        )
+
+    def test_atomic_merge_guard_does_not_promote_trusted_reply_to_finding_debt(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        thread = captain_review_finding_thread(actor="human-reviewer")
+        thread["comments"]["nodes"].append(
+            {
+                "databaseId": 304,
+                "createdAt": "2026-07-26T08:03:00Z",
+                "author": {"login": "claude"},
+                "commit": {"oid": CAPTAIN_HEAD},
+                "pullRequestReview": {"databaseId": 202},
+            }
+        )
+        state = captain_codex_live_state(view, review_pages=[[]], threads=[thread])
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+        self.assertEqual("passed", result["receipt"]["status"])
+
+    def test_atomic_merge_guard_accepts_resolved_or_untrusted_optional_threads(self) -> None:
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        cases = {
+            "resolved_codex": captain_review_finding_thread(resolved=True),
+            "resolved_claude": captain_review_finding_thread(
+                actor="claude-code[bot]", commit="c" * 40, resolved=True
+            ),
+            "untrusted_open": captain_review_finding_thread(actor="random-review-bot"),
+        }
+        for name, thread in cases.items():
+            with self.subTest(name=name):
+                parameters = authorized_captain_run_parameters()
+                review_evidence = parameters["review_evidence"]
+                assert isinstance(review_evidence, dict)
+                review_evidence["external_review_required"] = False
+                parameters["execution_intent"] = captain_execution_intent(parameters)
+                state = captain_codex_live_state(view, threads=[thread])
+                gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+                result = grips.grip_run(
+                    "captain-run",
+                    parameters,
+                    profile="captain",
+                    allow_mutation=True,
+                    command_runner=FakeGit(),
+                    github_runner=gh,
+                )
+                self.assertEqual("passed", result["receipt"]["status"])
+
+    def test_atomic_merge_guard_blocks_optional_finding_added_before_dispatch(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        review_evidence = parameters["review_evidence"]
+        assert isinstance(review_evidence, dict)
+        review_evidence["external_review_required"] = False
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        initial = captain_codex_live_state(view, threads=[])
+        drifted = captain_codex_live_state(
+            view,
+            threads=[captain_review_finding_thread(thread_id="PRRT_late_optional")],
+        )
+        gh = FakeGh(
+            view=view,
+            diff_text=CAPTAIN_DIFF_TEXT,
+            codex_state_sequence=[initial, drifted],
+        )
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertFalse(execution["verification_passed"])
+        self.assertEqual(
+            "blocked_after_guard_revalidation_released",
+            execution["merge_lease_guard"]["status"],
+        )
+        self.assertIn(
+            "merge_guard_review_findings_unresolved_threads_present",
+            execution["merge_lease_guard"]["errors"],
+        )
+        self.assertEqual([], [call for call in gh.calls if call[:2] == ("pr", "merge")])
 
     def test_atomic_merge_guard_rejects_later_duplicate_request_as_canonical(self) -> None:
         parameters = authorized_captain_run_parameters()
@@ -9371,6 +9781,85 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("passed", passed["receipt"]["status"])
         self.assertTrue(late_component_blocked)
         self.assertIn(head_component, execution["merge_lease_guard"]["resource_keys"])
+
+    def _temporary_git_repository(
+        self, path: Path, *, remote: str = "git@github.com:heimgewebe/grabowski.git"
+    ) -> Path:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "remote", "add", "origin", remote],
+            check=True,
+        )
+        return path
+
+    def test_captain_merge_repository_falls_back_from_non_git_mcp_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            canonical = self._temporary_git_repository(home / "repos" / "grabowski")
+            outside = home / "runtime-cwd"
+            outside.mkdir()
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                resolved, source = merge_guard.resolve_captain_merge_repository(
+                    outside,
+                    repo_slug="heimgewebe/grabowski",
+                    allow_canonical_fallback=True,
+                )
+            self.assertEqual(canonical.resolve(), resolved)
+            self.assertEqual("canonical-target-fallback", source)
+
+    def test_captain_merge_repository_rejects_explicit_wrong_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self._temporary_git_repository(home / "repos" / "grabowski")
+            wrong = self._temporary_git_repository(
+                home / "other", remote="git@github.com:heimgewebe/weltgewebe.git"
+            )
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "does not match target"):
+                    merge_guard.resolve_captain_merge_repository(
+                        wrong,
+                        repo_slug="heimgewebe/grabowski",
+                        allow_canonical_fallback=False,
+                    )
+
+    def test_captain_merge_repository_rejects_noncanonical_same_remote_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self._temporary_git_repository(home / "repos" / "grabowski")
+            duplicate = self._temporary_git_repository(home / "duplicate")
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "not the canonical repository common-dir"):
+                    merge_guard.resolve_captain_merge_repository(
+                        duplicate,
+                        repo_slug="heimgewebe/grabowski",
+                        allow_canonical_fallback=False,
+                    )
+
+    def test_captain_merge_runner_records_target_bound_repository_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            canonical = self._temporary_git_repository(home / "repos" / "grabowski")
+            outside = home / "runtime-cwd"
+            outside.mkdir()
+            parameters = authorized_captain_run_parameters()
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                runner = merge_guard.CaptainMergeGuardRunner(
+                    repo_path=outside,
+                    action=captain_action(),
+                    parameters=parameters,
+                    github_runner=FakeGh(),
+                    execution_intent_sha256="f" * 64,
+                    lease_owner_id="captain-test-owner",
+                )
+            self.assertEqual(canonical.resolve(), runner.repo_path)
+            self.assertEqual(
+                "canonical-target-fallback",
+                runner.receipt["local_repository_binding"]["source"],
+            )
+            self.assertNotIn(
+                "merge_guard_local_repository_binding_invalid", runner.static_errors
+            )
 
     def test_merge_guard_resource_ids_are_collision_free_and_slash_safe(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())
