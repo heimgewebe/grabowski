@@ -26,6 +26,7 @@ ACTOR_RE = re.compile(r"[A-Za-z0-9._:@/-]{1,256}\Z")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
+DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
@@ -320,6 +321,22 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
+    source = inputs.get("source")
+    if not isinstance(source, dict):
+        raise RuntimeError("work lane source binding is missing")
+    kind = source.get("kind")
+    source_id = source.get("id")
+    if not isinstance(kind, str) or not isinstance(source_id, str):
+        raise RuntimeError("work lane source binding is invalid")
+    if kind in DIRECT_SOURCE_KINDS:
+        lane_id = inputs.get("lane_id")
+        if not isinstance(lane_id, str) or not lane_id:
+            raise RuntimeError("direct work lane identity is missing")
+        return {"kind": "work_lane", "id": lane_id}
+    return {"kind": kind, "id": source_id}
+
+
 def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
     command = ["git", "-C", str(cwd), *arguments]
     command = operator._validate_argv(command, cwd=cwd)
@@ -359,6 +376,7 @@ def acquire_work(
     writer_argv = inputs.pop("_scoped_writer_argv")
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
+    lifecycle_source = _lifecycle_source(inputs)
     with _lane_lock(lane_id) as receipt_path:
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
@@ -406,6 +424,7 @@ def acquire_work(
             "lane_id": lane_id,
             "inputs_sha256": inputs_sha256,
             "inputs": inputs,
+            "lifecycle_source": lifecycle_source,
             "attempt_count": attempt,
             "created_at_unix": existing.get("created_at_unix", int(time.time())) if existing else int(time.time()),
             "updated_at_unix": int(time.time()),
@@ -429,6 +448,7 @@ def acquire_work(
             "controller_role": "controller",
             "scoped_writer_actor": (inputs["scoped_writer"] or {}).get("actor"),
             "source": inputs["source"],
+            "lifecycle_source": lifecycle_source,
             "repo": inputs["repo"],
             "branch": inputs["branch"],
             "target_path": inputs["target_path"],
@@ -464,8 +484,8 @@ def acquire_work(
             "base_head": inputs["base_head"],
             "lease_owner_id": inputs["lease_owner_id"],
             "purpose": inputs["purpose"],
-            "source_kind": inputs["source"]["kind"],
-            "source_id": inputs["source"]["id"],
+            "source_kind": lifecycle_source["kind"],
+            "source_id": lifecycle_source["id"],
             "artifact_class": inputs["artifact_class"],
             "retention_until_unix": inputs["retention_until_unix"],
             "idempotency_key": f"work-acquire:{lane_id}",
@@ -573,6 +593,8 @@ def acquire_work(
             authority = {
                 "controller": inputs["controller"],
                 "scoped_writer": inputs["scoped_writer"],
+                "source": inputs["source"],
+                "lifecycle_source": lifecycle_source,
                 "writer_effects": [
                     "implement",
                     "test",

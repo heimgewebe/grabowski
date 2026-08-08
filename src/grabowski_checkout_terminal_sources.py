@@ -82,6 +82,43 @@ def bureau_task_terminal_evidence(source_id: str) -> dict[str, Any]:
     )
 
 
+def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
+    if not isinstance(source_id, str) or re.fullmatch(r"[0-9a-f]{32}", source_id) is None:
+        raise ValueError("work lane source id must be a 32-character lowercase hex lane id")
+    # Import lazily so checkout lifecycle observation does not create an import
+    # cycle with work acquisition. The work-lane reader verifies its own receipt.
+    import grabowski_lane_closeout as lane_closeout
+    import grabowski_work_acquire as work_acquire
+
+    record = work_acquire._read_state(
+        work_acquire._state_root() / f"{source_id}.json"
+    )
+    if not isinstance(record, dict) or record.get("lane_id") != source_id:
+        raise RuntimeError("work lane source receipt is missing or bound to another lane")
+    closeout = record.get("terminal_closeout")
+    if not isinstance(closeout, dict):
+        raise RuntimeError("work lane source has no terminal closeout evidence")
+    closeout_state = closeout.get("closeout_state")
+    if closeout_state not in lane_closeout.TERMINAL_CLOSEOUT_STATES:
+        raise RuntimeError("work lane source closeout is not terminal")
+    assessment_sha256 = closeout.get("assessment_sha256")
+    if (
+        not isinstance(assessment_sha256, str)
+        or checkouts.SHA256_RE.fullmatch(assessment_sha256) is None
+    ):
+        raise RuntimeError("work lane terminal closeout assessment digest is invalid")
+    return _terminal_evidence(
+        {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "work_lane",
+            "source_id": source_id,
+            "terminal_state": closeout_state,
+            "lane_receipt_sha256": record.get("receipt_sha256"),
+            "assessment_sha256": assessment_sha256,
+        }
+    )
+
+
 def operator_obligation_terminal_evidence(source_id: str) -> dict[str, Any]:
     status = operator_obligation.status_obligation(source_id)
     terminal = status.get("work_complete") is True or status.get("attention_class") == "historical"
@@ -190,6 +227,7 @@ _OBSERVERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "operator_obligation": operator_obligation_terminal_evidence,
     "thread_focus": thread_focus_terminal_evidence,
     "github_issue": github_issue_terminal_evidence,
+    "work_lane": work_lane_terminal_evidence,
 }
 
 
