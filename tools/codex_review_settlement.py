@@ -996,6 +996,72 @@ def _codex_threads(
     return sorted(result, key=lambda item: item["thread_id"])
 
 
+def _codex_structured_review_debt(
+    pr: dict[str, Any],
+    *,
+    head_sha: str,
+) -> tuple[list[int], list[str]]:
+    reviews: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for review in _list_nodes(pr.get("reviews"), label="reviews"):
+        actor = _actor_login(review.get("author"))
+        if actor not in TRUSTED_CODEX_ACTORS:
+            continue
+        state = str(review.get("state") or "").upper()
+        if state not in {"CHANGES_REQUESTED", "APPROVED"}:
+            continue
+        review_id = review.get("databaseId")
+        submitted = _parse_time(review.get("submittedAt"))
+        commit = review.get("commit")
+        commit_sha = commit.get("oid") if isinstance(commit, dict) else None
+        if (
+            isinstance(review_id, bool)
+            or not isinstance(review_id, int)
+            or review_id <= 0
+        ):
+            errors.append("Codex structured review id is invalid")
+            continue
+        if submitted is None:
+            if state == "CHANGES_REQUESTED":
+                errors.append(
+                    f"Codex changes-requested review {review_id} lacks a valid submission time"
+                )
+            continue
+        reviews.append(
+            {
+                "id": review_id,
+                "actor_key": actor.removesuffix("[bot]"),
+                "state": state,
+                "submitted": submitted,
+                "commit_sha": commit_sha,
+            }
+        )
+
+    reviews.sort(key=lambda item: (item["submitted"], item["id"]))
+    by_actor: dict[str, list[dict[str, Any]]] = {}
+    for review in reviews:
+        by_actor.setdefault(str(review["actor_key"]), []).append(review)
+
+    outstanding: list[int] = []
+    for actor_reviews in by_actor.values():
+        blockers = [
+            item for item in actor_reviews if item["state"] == "CHANGES_REQUESTED"
+        ]
+        if not blockers:
+            continue
+        latest_blocker = blockers[-1]
+        superseded = any(
+            item["state"] == "APPROVED"
+            and item.get("commit_sha") == head_sha
+            and (item["submitted"], item["id"])
+            > (latest_blocker["submitted"], latest_blocker["id"])
+            for item in actor_reviews
+        )
+        if not superseded:
+            outstanding.append(int(latest_blocker["id"]))
+    return sorted(set(outstanding)), errors
+
+
 def evaluate(
     repo: Path,
     repository: str,
@@ -1031,6 +1097,10 @@ def evaluate(
     )
     threads = _codex_threads(pr, head_sha=head_sha) if request is not None else []
     finding_debt_threads = _codex_threads(pr, head_sha=None)
+    outstanding_structured_review_ids, structured_review_errors = (
+        _codex_structured_review_debt(pr, head_sha=head_sha)
+    )
+    errors.extend(structured_review_errors)
     unresolved_current = [
         item["thread_id"] for item in threads if not item["is_resolved"]
     ]
@@ -1064,6 +1134,10 @@ def evaluate(
         errors.append(f"Codex review state is unsupported: {completion['state']}")
     if unresolved:
         errors.append(f"{len(unresolved)} Codex review thread(s) remain unresolved")
+    if outstanding_structured_review_ids:
+        errors.append(
+            f"{len(outstanding_structured_review_ids)} Codex changes-requested review(s) remain outstanding"
+        )
 
     if visibility_errors:
         status, status_code = "block", "visibility_blocked"
@@ -1152,12 +1226,16 @@ def evaluate(
         "completion": completion,
         "provider_outcome": provider_outcome,
         "review_performed": review_performed,
-        "finding_count": len(finding_thread_ids),
+        "finding_count": len(finding_thread_ids) + len(outstanding_structured_review_ids),
+        "outstanding_structured_review_ids": outstanding_structured_review_ids,
+        "outstanding_structured_review_ids_sha256": _sha256_json(
+            outstanding_structured_review_ids
+        ),
         "thread_ids": thread_ids,
         "thread_ids_sha256": _sha256_json(thread_ids),
         "unresolved_thread_ids": unresolved,
         "unresolved_thread_ids_sha256": _sha256_json(unresolved),
-        "all_findings_triaged": not unresolved,
+        "all_findings_triaged": not unresolved and not outstanding_structured_review_ids and not structured_review_errors,
         "settled": settled,
         "status": status,
         "status_code": status_code,
@@ -1184,7 +1262,8 @@ def evaluate(
         "completion_present": completion is not None,
         "provider_outcome_present": provider_outcome is not None,
         "review_performed": review_performed,
-        "finding_count": len(finding_thread_ids),
+        "finding_count": len(finding_thread_ids) + len(outstanding_structured_review_ids),
+        "structured_review_debt_count": len(outstanding_structured_review_ids),
         "unresolved_thread_count": len(unresolved),
         "errors": errors,
         "policy": policy,

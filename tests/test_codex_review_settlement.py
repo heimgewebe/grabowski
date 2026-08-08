@@ -694,6 +694,107 @@ class CodexReviewSettlementTests(unittest.TestCase):
         self.assertFalse(result["settled"])
         self.assertEqual(1, result["unresolved_thread_count"])
 
+    def test_optional_old_changes_requested_without_request_is_global_debt(self) -> None:
+        state = base_state()
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    head="d" * 40,
+                    state="CHANGES_REQUESTED",
+                    review_id=2301,
+                    submitted_at="2026-07-26T07:58:00Z",
+                )
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertFalse(result["request_present"])
+        self.assertEqual("block", result["status"])
+        self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertEqual(1, result["structured_review_debt_count"])
+        self.assertEqual([2301], result["evidence"]["outstanding_structured_review_ids"])
+        self.assertFalse(result["evidence"]["all_findings_triaged"])
+
+    def test_optional_pending_does_not_hide_old_structured_review_debt(self) -> None:
+        state = base_state()
+        state["comments"] = connection([request_comment()], hasPreviousPage=False)
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    head="d" * 40,
+                    state="CHANGES_REQUESTED",
+                    review_id=2301,
+                    submitted_at="2026-07-26T07:58:00Z",
+                ),
+                codex_review(
+                    state="PENDING",
+                    review_id=2302,
+                    submitted_at=None,
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual("optional_review_findings", result["status_code"])
+        self.assertEqual("PENDING", result["evidence"]["completion"]["state"])
+        self.assertEqual([2301], result["evidence"]["outstanding_structured_review_ids"])
+
+    def test_current_head_approval_supersedes_old_structured_review_debt(self) -> None:
+        state = base_state()
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    head="d" * 40,
+                    state="CHANGES_REQUESTED",
+                    review_id=2301,
+                    submitted_at="2026-07-26T07:58:00Z",
+                ),
+                codex_review(
+                    state="APPROVED",
+                    review_id=2302,
+                    submitted_at="2026-07-26T07:59:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("pass", result["status"])
+        self.assertEqual("optional_not_requested", result["status_code"])
+        self.assertEqual(0, result["structured_review_debt_count"])
+        self.assertEqual([], result["evidence"]["outstanding_structured_review_ids"])
+
+    def test_stale_approval_does_not_supersede_old_structured_review_debt(self) -> None:
+        state = base_state()
+        state["reviews"] = connection(
+            [
+                codex_review(
+                    head="d" * 40,
+                    state="CHANGES_REQUESTED",
+                    review_id=2301,
+                    submitted_at="2026-07-26T07:58:00Z",
+                ),
+                codex_review(
+                    head="d" * 40,
+                    state="APPROVED",
+                    review_id=2302,
+                    submitted_at="2026-07-26T07:59:00Z",
+                ),
+            ],
+            hasPreviousPage=False,
+        )
+
+        result = self.evaluate(state, required=False)
+
+        self.assertEqual("block", result["status"])
+        self.assertEqual([2301], result["evidence"]["outstanding_structured_review_ids"])
+
     def test_optional_pending_review_does_not_mask_changes_requested(self) -> None:
         state = base_state()
         state["comments"] = connection([request_comment()], hasPreviousPage=False)
