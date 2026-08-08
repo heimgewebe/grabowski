@@ -633,10 +633,22 @@ class WorkAcquireTests(unittest.TestCase):
             }), runner=Mock(),
         )
         assessment = self.terminal_assessment(first["lane_id"], 200)
-        audit = Mock()
+        audit_records: dict[str, str] = {}
+
+        def append_audit(event: dict[str, object]) -> str:
+            digest = "a" * 64
+            audit_records[str(event["terminal_transition_sha256"])] = digest
+            return digest
+
+        def lookup_audit(event: dict[str, object]) -> str | None:
+            return audit_records.get(str(event["terminal_transition_sha256"]))
+
+        audit = Mock(side_effect=append_audit)
+        lookup = Mock(side_effect=lookup_audit)
         stored = work_acquire.persist_terminal_closeout(
             first["lane_id"], assessment,
-            expected_receipt_sha256=first["receipt_sha256"], audit_fn=audit,
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=audit, audit_lookup_fn=lookup,
         )
         self.assertFalse(stored["replayed"])
         self.assertEqual(stored["terminal_closeout"]["assessment_sha256"], assessment["assessment_sha256"])
@@ -647,9 +659,12 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(audit_record["assessment_sha256"], assessment["assessment_sha256"])
         self.assertEqual(audit_record["receipt_sha256"], stored["receipt_sha256"])
         self.assertEqual(audit_record["expected_receipt_sha256"], first["receipt_sha256"])
+        self.assertRegex(audit_record["terminal_transition_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertEqual(stored["terminal_closeout_audit_record_sha256"], "a" * 64)
         self.assertTrue(work_acquire.persist_terminal_closeout(
             first["lane_id"], assessment,
-            expected_receipt_sha256=first["receipt_sha256"], audit_fn=audit,
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=audit, audit_lookup_fn=lookup,
         )["replayed"])
         audit.assert_called_once()
         later_same_observation = self.terminal_assessment(first["lane_id"], 201)
@@ -658,7 +673,8 @@ class WorkAcquireTests(unittest.TestCase):
         )
         self.assertTrue(work_acquire.persist_terminal_closeout(
             first["lane_id"], later_same_observation,
-            expected_receipt_sha256=first["receipt_sha256"], audit_fn=audit,
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=audit, audit_lookup_fn=lookup,
         )["replayed"])
         audit.assert_called_once()
         competing = closeout.assess(closeout.LaneCloseoutObservation(
@@ -682,6 +698,60 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertTrue(replay["replayed"])
         acquire.assert_not_called()
         ensure.assert_not_called()
+
+    def test_terminal_closeout_retry_recovers_missing_audit_after_receipt_write(self) -> None:
+        params = self.parameters()
+        first = work_acquire.acquire_work(
+            params, acquire_resources_fn=self.acquire, release_resources_fn=Mock(),
+            inspect_resource_fn=Mock(), ensure_worktree_fn=Mock(return_value={
+                "result_state": "CREATED", "durable_receipt_sha256": "b" * 64,
+                "post_state": {"target_registered": True, "target_path_exists": True},
+            }), runner=Mock(),
+        )
+        assessment = self.terminal_assessment(first["lane_id"], 200)
+        audit_records: dict[str, str] = {}
+        attempts = 0
+
+        def append_audit(event: dict[str, object]) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("audit unavailable")
+            digest = "b" * 64
+            audit_records[str(event["terminal_transition_sha256"])] = digest
+            return digest
+
+        def lookup_audit(event: dict[str, object]) -> str | None:
+            return audit_records.get(str(event["terminal_transition_sha256"]))
+
+        with self.assertRaisesRegex(OSError, "audit unavailable"):
+            work_acquire.persist_terminal_closeout(
+                first["lane_id"], assessment,
+                expected_receipt_sha256=first["receipt_sha256"],
+                audit_fn=append_audit, audit_lookup_fn=lookup_audit,
+            )
+        durable = work_acquire._read_state(self.state / f"{first['lane_id']}.json")
+        self.assertIsNotNone(durable)
+        assert durable is not None
+        self.assertEqual(
+            durable["terminal_closeout"]["expected_receipt_sha256"],
+            first["receipt_sha256"],
+        )
+        recovered = work_acquire.persist_terminal_closeout(
+            first["lane_id"], self.terminal_assessment(first["lane_id"], 201),
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=append_audit, audit_lookup_fn=lookup_audit,
+        )
+        self.assertTrue(recovered["replayed"])
+        self.assertEqual(recovered["terminal_closeout_audit_record_sha256"], "b" * 64)
+        replayed = work_acquire.persist_terminal_closeout(
+            first["lane_id"], self.terminal_assessment(first["lane_id"], 202),
+            expected_receipt_sha256=first["receipt_sha256"],
+            audit_fn=append_audit, audit_lookup_fn=lookup_audit,
+        )
+        self.assertTrue(replayed["replayed"])
+        self.assertEqual(replayed["terminal_closeout_audit_record_sha256"], "b" * 64)
+        self.assertEqual(attempts, 2)
 
     def test_terminal_closeout_rejects_stale_receipt_preimage(self) -> None:
         lane_id = "d" * 32
@@ -841,7 +911,14 @@ class WorkAcquireTests(unittest.TestCase):
         capability.assert_not_called()
         self.assertEqual(persist.call_args.args[0], lane_id)
         self.assertEqual(persist.call_args.kwargs["expected_receipt_sha256"], "e" * 64)
-        self.assertIs(persist.call_args.kwargs["audit_fn"], work_acquire.operator.base._append_audit)
+        self.assertIs(
+            persist.call_args.kwargs["audit_fn"],
+            work_acquire.operator.base._append_audit_with_digest,
+        )
+        self.assertIs(
+            persist.call_args.kwargs["audit_lookup_fn"],
+            work_acquire._find_terminal_closeout_audit,
+        )
 
     def test_mcp_entry_binds_audit_to_runtime_base(self) -> None:
         params = self.parameters()

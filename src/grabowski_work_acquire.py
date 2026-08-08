@@ -183,12 +183,87 @@ def _text(value: Any, label: str, *, pattern: re.Pattern[str] | None = None) -> 
     return value
 
 
+def _terminal_closeout_audit_event(
+    record: dict[str, Any], assessment: dict[str, Any]
+) -> dict[str, Any]:
+    terminal = record.get("terminal_closeout")
+    if not isinstance(terminal, dict):
+        raise RuntimeError("work-lane terminal closeout wrapper is missing")
+    expected_preimage = terminal.get("expected_receipt_sha256")
+    receipt_sha256 = record.get("receipt_sha256")
+    if (
+        not isinstance(expected_preimage, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_preimage) is None
+        or not isinstance(receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+    ):
+        raise RuntimeError("work-lane terminal closeout audit binding is invalid")
+    material = {
+        "operation": "work-lane-terminal-closeout",
+        "lane_id": record["lane_id"],
+        "state": "persisted",
+        "closeout_state": assessment["closeout_state"],
+        "assessment_sha256": assessment["assessment_sha256"],
+        "receipt_sha256": receipt_sha256,
+        "expected_receipt_sha256": expected_preimage,
+    }
+    return {**material, "terminal_transition_sha256": _sha(material)}
+
+
+def _find_terminal_closeout_audit(event: dict[str, Any]) -> str | None:
+    records, status = operator.base._audit_records_snapshot()
+    if not status.get("valid"):
+        raise RuntimeError("audit snapshot is invalid during terminal closeout recovery")
+    matches = [
+        record
+        for record in records
+        if all(record.get(key) == value for key, value in event.items())
+    ]
+    if len(matches) > 1:
+        raise RuntimeError("terminal closeout audit contains duplicate transition records")
+    if not matches:
+        return None
+    digest = matches[0].get("record_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RuntimeError("terminal closeout audit record digest is invalid")
+    return digest
+
+
+def _ensure_terminal_closeout_audit(
+    record: dict[str, Any],
+    assessment: dict[str, Any],
+    *,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None,
+) -> str | None:
+    if audit_fn is None:
+        if audit_lookup_fn is not None:
+            raise ValueError("audit_lookup_fn requires audit_fn")
+        return None
+    if audit_lookup_fn is None:
+        raise ValueError("audit_fn requires audit_lookup_fn for retry-safe closeout")
+    event = _terminal_closeout_audit_event(record, assessment)
+    existing = audit_lookup_fn(event)
+    if existing is not None:
+        if not isinstance(existing, str) or re.fullmatch(r"[0-9a-f]{64}", existing) is None:
+            raise RuntimeError("terminal closeout audit lookup returned an invalid digest")
+        return existing
+    appended = audit_fn(event)
+    if not isinstance(appended, str) or re.fullmatch(r"[0-9a-f]{64}", appended) is None:
+        raise RuntimeError("terminal closeout audit append returned an invalid digest")
+    readback = audit_lookup_fn(event)
+    if readback != appended:
+        raise RuntimeError("terminal closeout audit append readback mismatch")
+    return appended
+
+
 def persist_terminal_closeout(
     lane_id: str,
     assessment: dict[str, Any],
     *,
     expected_receipt_sha256: str,
-    audit_fn: Callable[[dict[str, Any]], None] | None = None,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> dict[str, Any]:
     """CAS-persist one terminal assessment into the existing lane receipt."""
     _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
@@ -201,6 +276,7 @@ def persist_terminal_closeout(
         "kind": "grabowski.work_lane_terminal_closeout",
         "closeout_state": validated["closeout_state"],
         "assessment_sha256": validated["assessment_sha256"],
+        "expected_receipt_sha256": expected_receipt_sha256,
         "assessment": validated,
     }
     with _lane_lock(lane_id) as receipt_path:
@@ -211,23 +287,22 @@ def persist_terminal_closeout(
         if existing is not None:
             if _terminal_assessment_replay_sha256(existing) != _terminal_assessment_replay_sha256(validated):
                 raise RuntimeError("work-lane already records another terminal assessment")
-            return {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
+            audit_record_sha256 = _ensure_terminal_closeout_audit(
+                record, existing, audit_fn=audit_fn, audit_lookup_fn=audit_lookup_fn
+            )
+            result = {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
+            if audit_record_sha256 is not None:
+                result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
+            return result
         if record.get("receipt_sha256") != expected_receipt_sha256:
             raise RuntimeError("work-lane terminal closeout CAS preimage changed")
         stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
         result = {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
-        if audit_fn is not None:
-            audit_fn(
-                {
-                    "operation": "work-lane-terminal-closeout",
-                    "lane_id": lane_id,
-                    "state": "persisted",
-                    "closeout_state": validated["closeout_state"],
-                    "assessment_sha256": validated["assessment_sha256"],
-                    "receipt_sha256": stored["receipt_sha256"],
-                    "expected_receipt_sha256": expected_receipt_sha256,
-                }
-            )
+        audit_record_sha256 = _ensure_terminal_closeout_audit(
+            stored, validated, audit_fn=audit_fn, audit_lookup_fn=audit_lookup_fn
+        )
+        if audit_record_sha256 is not None:
+            result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
         return result
 
 
@@ -977,7 +1052,8 @@ def grabowski_work_acquire(
             inputs["lane_id"],
             assessment,
             expected_receipt_sha256=terminal_closeout["expected_receipt_sha256"],
-            audit_fn=operator.base._append_audit,
+            audit_fn=operator.base._append_audit_with_digest,
+            audit_lookup_fn=_find_terminal_closeout_audit,
         )
     operator._require_operator_capability("git_cli")
     if scoped_writer_argv is not None:

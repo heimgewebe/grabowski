@@ -72,7 +72,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_contract_drift` | context | yes | low | Read bounded runtime-contract and capability-catalog drift. |
 | `grabowski_checkout_summary` | version-control | yes | low | Read a bounded summary of Grabowski repository worktrees. |
 | `grabowski_current_work` | operations-observability | yes | low | Project bounded current operator work from existing authoritative task, lease, checkout and worker sources without creating a second lifecycle truth. |
-| `grabowski_work_acquire` | work-coordination | no | high | Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree. |
+| `grabowski_work_acquire` | work-coordination | no | high | Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery. |
 | `grabowski_reposkop_context` | repository-observation | no | low | Run one target-bound Reposkop coherence report and persist one deduplicated create-only usage receipt. |
 | `grabowski_operator_optimization_report` | operations-observability | yes | low | Compose bounded audit, friction, execution-outcome and current-work evidence into a manual read-only optimization report. |
 | `grabowski_git_status` | version-control | yes | low | Read fixed short Git status for one allowed repository. |
