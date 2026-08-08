@@ -619,7 +619,7 @@ def _has_positive_term(haystack: str, terms: frozenset[str]) -> bool:
                 continue
             prefix = haystack[max(0, match.start() - 48):match.start()]
             if re.search(
-                r"(?:\bnot\b|\bno\b|\bnever\b|\bisn't\b|\bwasn't\b|\bwithout\b)(?:[ \t,()/-]+\w+){0,2}[ \t,()/-]*\Z",
+                r"(?:\b(?:not|no|never|without|cannot)\b|\b(?:isn|aren|wasn|weren|don|doesn|didn|hasn|haven|hadn|can|couldn|won|wouldn|shouldn|mustn|mightn|needn)['’]t\b)(?:[ \t()/-]+\w+){0,2}[ \t()/-]*\Z",
                 prefix,
             ):
                 negated_spans.append(match.span())

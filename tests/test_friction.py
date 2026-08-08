@@ -297,6 +297,30 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             ),
             "expected_red_phase",
         )
+        for symptom in (
+            "this doesn't indicate an expected red phase",
+            "this didn't indicate an expected red phase",
+            "this can't be an expected red phase",
+            "this won't be an expected red phase",
+            "this shouldn’t be an expected red phase",
+            "this mustn't be an expected red phase",
+        ):
+            with self.subTest(symptom=symptom):
+                self.assertEqual(
+                    module.classify_friction_event(
+                        {"kind": "ci_contract", "symptom": symptom}
+                    ),
+                    "contract_error",
+                )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "this was not a failure, expected red phase",
+                }
+            ),
+            "expected_red_phase",
+        )
 
     def test_failure_class_config_is_consistent(self) -> None:
         module = self._load_module()
