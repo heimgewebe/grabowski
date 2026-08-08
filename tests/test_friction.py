@@ -278,6 +278,25 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
             ),
             "actionable_failure",
         )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "symptom": "this did not fail; expected red phase",
+                }
+            ),
+            "expected_red_phase",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
+                    "kind": "ci_contract",
+                    "operation": "this did not fail",
+                    "symptom": "expected red phase",
+                }
+            ),
+            "expected_red_phase",
+        )
 
     def test_failure_class_config_is_consistent(self) -> None:
         module = self._load_module()

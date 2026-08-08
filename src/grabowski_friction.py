@@ -604,7 +604,7 @@ def _event_haystack(event: dict[str, Any]) -> str:
             value = _redacted_string(note)
             if value:
                 parts.append(value[:500])
-    return " ".join(parts).lower()
+    return "\n".join(parts).lower()
 
 
 def _has_positive_term(haystack: str, terms: frozenset[str]) -> bool:
@@ -619,7 +619,7 @@ def _has_positive_term(haystack: str, terms: frozenset[str]) -> bool:
                 continue
             prefix = haystack[max(0, match.start() - 48):match.start()]
             if re.search(
-                r"(?:\bnot\b|\bno\b|\bnever\b|\bisn't\b|\bwasn't\b|\bwithout\b)(?:\W+\w+){0,2}\W*$",
+                r"(?:\bnot\b|\bno\b|\bnever\b|\bisn't\b|\bwasn't\b|\bwithout\b)(?:[ \t,()/-]+\w+){0,2}[ \t,()/-]*\Z",
                 prefix,
             ):
                 negated_spans.append(match.span())
