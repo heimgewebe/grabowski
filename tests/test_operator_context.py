@@ -126,17 +126,67 @@ class OperatorContextTests(unittest.TestCase):
         )
         self.assertEqual(
             protocol["coding_agent_priority_semantics"],
-            "legacy_name_review_and_contrast_only",
+            "routing_preference_not_authority",
         )
         self.assertEqual(
             protocol["execution_priority_semantics"],
-            "authoritative_operator_then_advisory_helpers",
+            "routing_preference_not_model_authority",
+        )
+        self.assertEqual(
+            protocol["authority_principle"],
+            "model_identity_does_not_grant_authority",
+        )
+        self.assertEqual(
+            protocol["authority_roles"],
+            {
+                "controller": {
+                    "authoritative": True,
+                    "may_delegate": True,
+                    "owns": [
+                        "planning",
+                        "integration",
+                        "merge",
+                        "deployment",
+                        "closeout",
+                    ],
+                },
+                "scoped_writer": {
+                    "authoritative_within_lane": True,
+                    "requires": [
+                        "explicit_lane",
+                        "resource_scope",
+                        "controller_binding",
+                    ],
+                    "allowed_effects": [
+                        "implement",
+                        "test",
+                        "commit",
+                        "push",
+                        "pull_request_create_or_update",
+                    ],
+                    "forbidden_without_controller": [
+                        "merge",
+                        "deployment",
+                        "bureau_terminalization",
+                    ],
+                },
+                "reviewer": {
+                    "authoritative": False,
+                    "mode": "advisory",
+                    "read_only": True,
+                },
+                "observer": {
+                    "authoritative": False,
+                    "mode": "evidence",
+                    "read_only": True,
+                },
+            },
         )
         self.assertEqual(
             protocol["workspace_execution_model"],
             {
-                "default": "direct_operator",
-                "lane_owner": "chatgpt_operator",
+                "default": "controller_direct_or_delegated_scoped_writer",
+                "lane_owner": "controller",
                 "operator_self_serves_lanes": [
                     "captain",
                     "writer",
@@ -150,35 +200,36 @@ class OperatorContextTests(unittest.TestCase):
                 "role_evidence_isolated": True,
                 "workspace_not_universal": True,
                 "direct_operator_for": [
-                    "all_authoritative_implementation",
-                    "all_reviews",
-                    "all_task_sizes",
-                    "runtime_or_security_change",
-                    "long_or_multi_file_implementation",
-                    "parallel_or_foreign_state",
-                    "connector_or_execution_state_uncertainty",
+                    "unscoped_or_ambiguous_work",
+                    "integration",
+                    "merge",
+                    "deployment",
+                    "closeout",
+                    "recovery",
                 ],
                 "full_workspace_for": [],
-                "external_agent_delegation": "review_or_explicit_contrast_only",
+                "external_agent_delegation": "role_bound_scoped_writer_reviewer_or_observer",
                 "delegation_triggers": [
+                    "bounded_implementation_lane",
+                    "disjoint_capacity_lane",
                     "independent_review",
                     "security_or_architecture_review",
                     "explicit_contrast_request",
                     "multiple_plausible_implementations_for_comparison",
                 ],
-                "external_programming_modes": ["competitor", "contrast"],
+                "external_programming_modes": ["scoped_writer", "competitor", "contrast"],
                 "max_external_candidates": 2,
-                "external_candidate_authority": "advisory_only",
-                "external_primary_writer_forbidden": True,
+                "external_candidate_authority": "role_dependent",
+                "external_primary_writer_forbidden": False,
                 "external_primary_reviewer_forbidden": True,
-                "capacity_fallback_to_external_writer": False,
+                "capacity_fallback_to_external_writer": True,
                 "automatic_patch_apply": False,
                 "automatic_winner_selection": False,
             },
         )
         self.assertEqual(
             protocol["routing_roles"]["complex_code_task"],
-            "chatgpt_operator_direct_external_review_or_explicit_contrast",
+            "controller_or_lane_bound_scoped_writer",
         )
         self.assertIn(
             "blocked_action_protocol",
