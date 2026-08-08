@@ -5203,6 +5203,12 @@ def _runtime_tool_contract_summary(
         "platform_connector_schema_observable": bool(
             client_snapshot.get("platform_connector_schema_observable")
         ),
+        "platform_connector_snapshot_fresh": bool(
+            client_snapshot.get("platform_connector_snapshot_fresh")
+        ),
+        "platform_connector_snapshot_matched": bool(
+            client_snapshot.get("platform_connector_snapshot_matched")
+        ),
         "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
         "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
@@ -5451,8 +5457,15 @@ def _operator_system_overview(
             "freshness": "receipt-bound per operation",
         },
     }
+    component_map_snapshot = dict(client_snapshot)
+    component_map_snapshot["fresh"] = client_snapshot.get(
+        "platform_connector_snapshot_fresh"
+    )
+    component_map_snapshot["matched"] = client_snapshot.get(
+        "platform_connector_snapshot_matched"
+    )
     component_map = grabowski_system_map.build_component_map(
-        runtime_healthy=runtime_healthy, client_snapshot=client_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
+        runtime_healthy=runtime_healthy, client_snapshot=component_map_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
     )
     return {
         "schema_version": 2,
@@ -5475,6 +5488,12 @@ def _operator_system_overview(
             "platform_snapshot_observable": platform_connector_snapshot_observable,
             "platform_schema_observable": client_snapshot.get(
                 "platform_connector_schema_observable"
+            ),
+            "platform_fresh": client_snapshot.get(
+                "platform_connector_snapshot_fresh"
+            ),
+            "platform_matched": client_snapshot.get(
+                "platform_connector_snapshot_matched"
             ),
             "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
             "platform_snapshot": client_snapshot.get("platform_snapshot"),

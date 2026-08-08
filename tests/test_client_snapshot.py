@@ -342,6 +342,29 @@ class ClientSnapshotTests(unittest.TestCase):
         )
         self.assertEqual(observed["recommended_next_action"], "none")
 
+    def test_platform_match_fields_remain_paired_without_client_receipt(self) -> None:
+        artifact = self.schema_artifact()
+        self.write_platform_snapshot(artifact)
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(artifact)
+
+        observed = snapshot.snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=artifact,
+            now_unix=1_100,
+        )
+
+        self.assertEqual(observed["state"], "missing")
+        self.assertFalse(observed["observable"])
+        self.assertFalse(observed["matched"])
+        self.assertTrue(observed["platform_connector_snapshot_observable"])
+        self.assertTrue(observed["platform_connector_snapshot_fresh"])
+        self.assertTrue(observed["platform_connector_snapshot_matched"])
+        self.assertEqual(observed["platform_evidence_state"], "matched")
+
     def test_platform_snapshot_missing_grip_run_allow_mutation_fails_closed(self) -> None:
         runtime_artifact = self.schema_artifact()
         platform_artifact = json.loads(json.dumps(runtime_artifact))
