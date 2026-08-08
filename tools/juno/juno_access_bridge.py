@@ -58,6 +58,8 @@ OPERATIONS = {
     "vision_ocr_workspace_image": {"private": True, "foreground": False},
     "vision_barcodes_workspace_image": {"private": True, "foreground": False},
     "shortcut_run": {"private": False, "foreground": True},
+    "share_workspace_file": {"private": True, "foreground": True},
+    "share_text": {"private": False, "foreground": True},
 }
 
 
@@ -1055,6 +1057,128 @@ def _shortcut_run(request: dict[str, Any], workspace: Path | None) -> dict[str, 
     )
 
 
+def _top_presenter() -> Any:
+    objc = _objc()
+    app = _zero(objc.ObjCClass("UIApplication").sharedApplication)
+    connected = _zero(app.connectedScenes)
+    try:
+        scenes = _array_items(_zero(connected.allObjects), 16)
+    except Exception:
+        scenes = _array_items(connected, 16)
+    windows: list[Any] = []
+    for scene in scenes:
+        try:
+            if int(_zero(scene.activationState)) not in {0, 1}:
+                continue
+            windows.extend(_array_items(_zero(scene.windows), 32))
+        except Exception:
+            continue
+    visible = [
+        window
+        for window in windows
+        if not _native_bool_property(window, "hidden", "isHidden")
+        and float(_zero(window.alpha)) > 0
+    ]
+    key_windows = [
+        window
+        for window in visible
+        if _native_bool_property(window, "keyWindow", "isKeyWindow")
+    ]
+    chosen = key_windows[0] if key_windows else (visible[0] if visible else (windows[0] if windows else None))
+    if chosen is None:
+        raise RuntimeError("Juno has no active iPadOS window for presentation")
+    controller = _zero(chosen.rootViewController)
+    if controller is None:
+        raise RuntimeError("Juno active window has no root view controller")
+    for _ in range(20):
+        presented = _zero(controller.presentedViewController)
+        if presented is None:
+            return controller
+        controller = presented
+    raise RuntimeError("Juno presentation stack exceeds safety bound")
+
+
+def _present_share_sheet(items: list[Any]) -> dict[str, Any]:
+    objc = _objc()
+    controller_holder: dict[str, Any] = {}
+
+    def present() -> None:
+        presenter = _top_presenter()
+        Activity = objc.ObjCClass("UIActivityViewController")
+        controller = Activity.alloc().initWithActivityItems_applicationActivities_(objc.ns(items), None)
+        if controller is None:
+            raise RuntimeError("share sheet could not be created")
+        popover = _zero(controller.popoverPresentationController)
+        if popover is not None:
+            source_view = _zero(presenter.view)
+            popover.setSourceView_(source_view)
+            try:
+                popover.setSourceRect_(_zero(source_view.bounds))
+            except Exception:
+                pass
+            if hasattr(popover, "setPermittedArrowDirections_"):
+                popover.setPermittedArrowDirections_(0)
+        retained_controller = _retain(controller)
+
+        def completed(_activity_type: int, _completed: bool, _returned_items: int, _error: int) -> None:
+            _release(retained_controller)
+            _release(completion_block)
+
+        completion_block = _retain(
+            objc.Block(
+                completed,
+                None,
+                ctypes.c_void_p,
+                ctypes.c_bool,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            )
+        )
+        controller.setCompletionWithItemsHandler_(completion_block)
+        try:
+            presenter.presentViewController_animated_completion_(controller, True, None)
+        except Exception:
+            _release(completion_block)
+            _release(retained_controller)
+            raise
+        controller_holder["controller"] = retained_controller
+
+    _on_main(present)
+    return {"presented": True, "retained_until_completion": True}
+
+
+def _share_workspace_file(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
+    _private_ack(request)
+    _require_foreground()
+    relative_path = _string(request, "relative_path", max_bytes=512)
+    target = _safe_workspace_path(workspace, relative_path)
+    if not target.is_file():
+        raise FileNotFoundError("workspace file does not exist")
+    size = target.stat().st_size
+    if size < 0 or size > 512 * 1024 * 1024:
+        raise RuntimeError("workspace file exceeds share bound")
+    objc = _objc()
+    url = objc.ObjCClass("NSURL").fileURLWithPath_(str(target))
+    evidence = _present_share_sheet([url])
+    return _result(
+        "share_workspace_file",
+        relative_path=relative_path,
+        size=size,
+        **evidence,
+    )
+
+
+def _share_text(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
+    _require_foreground()
+    text = _string(request, "text", max_bytes=MAX_TEXT_BYTES, allow_empty=False)
+    evidence = _present_share_sheet([text])
+    return _result(
+        "share_text",
+        size=len(text.encode("utf-8")),
+        **evidence,
+    )
+
+
 def _native_bool_property(value: Any, *names: str) -> bool:
     last_error: Exception | None = None
     for name in names:
@@ -1100,6 +1224,8 @@ _HANDLERS = {
     "vision_ocr_workspace_image": _vision_ocr_workspace_image,
     "vision_barcodes_workspace_image": _vision_barcodes_workspace_image,
     "shortcut_run": _shortcut_run,
+    "share_workspace_file": _share_workspace_file,
+    "share_text": _share_text,
 }
 
 

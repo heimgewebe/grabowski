@@ -158,6 +158,34 @@ class JunoAccessBridgeTests(unittest.TestCase):
                     self.request("shortcut_run", name="x" * 300),
                 )
 
+    def test_share_workspace_file_requires_private_ack(self) -> None:
+        with self.assertRaisesRegex(ValueError, "private_content_ack"):
+            self.bridge.dispatch(
+                self.request("share_workspace_file", relative_path="file.txt"),
+                workspace=Path("/tmp"),
+            )
+
+    def test_share_workspace_file_path_is_bounded_before_native_ui(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(self.bridge, "_require_foreground", return_value=None):
+                with self.assertRaisesRegex(ValueError, "workspace|escapes"):
+                    self.bridge.dispatch(
+                        self.request(
+                            "share_workspace_file",
+                            relative_path="../secret.txt",
+                            private_content_ack=True,
+                        ),
+                        workspace=root,
+                    )
+
+    def test_share_text_size_is_bounded_before_native_ui(self) -> None:
+        with patch.object(self.bridge, "_require_foreground", return_value=None):
+            with self.assertRaisesRegex(ValueError, "byte bound"):
+                self.bridge.dispatch(
+                    self.request("share_text", text="x" * 20000),
+                )
+
     def test_native_bool_property_accepts_objc_is_accessor(self) -> None:
         class FakeRecorder:
             def isAvailable(self):
