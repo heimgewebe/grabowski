@@ -933,6 +933,19 @@ def grabowski_work_acquire(
             observed = lane_closeout.LaneCloseoutObservation(**observation)
         except TypeError as exc:
             raise ValueError(f"terminal_closeout observation shape is invalid: {exc}") from exc
+        expected_observation_identity = {
+            "repository": inputs["repo"],
+            "workspace": inputs["target_path"],
+            "branch": inputs["branch"],
+            "base_revision": inputs["base_head"],
+        }
+        observed_identity = {
+            field: getattr(observed, field) for field in expected_observation_identity
+        }
+        if observed_identity != expected_observation_identity:
+            raise RuntimeError(
+                "terminal closeout observation identity does not match work lane inputs"
+            )
         assessment = lane_closeout.assess(observed)
         if assessment.get("lane_id") != inputs["lane_id"]:
             raise RuntimeError("terminal closeout observation is bound to another lane")

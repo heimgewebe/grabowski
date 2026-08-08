@@ -726,6 +726,66 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(persist.call_args.args[0], lane_id)
         acquire.assert_not_called()
 
+    def test_mcp_entry_rejects_terminal_closeout_identity_mismatch(self) -> None:
+        params = self.parameters()
+        lane_id = work_acquire._normalize(params)["lane_id"]
+        observation = {
+            "lane_id": lane_id,
+            "repository": str(self.repo),
+            "workspace": str(self.target),
+            "branch": "feat/authority-p0",
+            "base_revision": SHA,
+            "writer_state": "completed",
+            "task_active": False,
+            "process_active": False,
+            "lease_active": True,
+            "git_dirty": False,
+            "head_sha": SHA,
+            "remote_head_sha": SHA,
+            "ahead_commits": 0,
+            "behind_commits": 0,
+            "no_change_proven": True,
+        }
+        mismatches = {
+            "repository": str(self.repo.parent / "other-repo"),
+            "workspace": str(self.target.parent / "other-workspace"),
+            "branch": "feat/other-lane",
+            "base_revision": "b" * 40,
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                assess = Mock()
+                persist = Mock()
+                with (
+                    patch.object(work_acquire.operator, "_require_operator_mutation"),
+                    patch.object(work_acquire.lane_closeout, "assess", assess),
+                    patch.object(work_acquire, "persist_terminal_closeout", persist),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "terminal closeout observation identity does not match work lane inputs",
+                    ),
+                ):
+                    work_acquire.grabowski_work_acquire(
+                        source_kind=str(params["source_kind"]),
+                        source_id=str(params["source_id"]),
+                        controller_actor=str(params["controller_actor"]),
+                        repo=str(params["repo"]),
+                        base_head=str(params["base_head"]),
+                        branch=str(params["branch"]),
+                        target_path=str(params["target_path"]),
+                        purpose=str(params["purpose"]),
+                        retention_until_unix=int(params["retention_until_unix"]),
+                        idempotency_key=str(params["idempotency_key"]),
+                        scoped_writer_actor=str(params["scoped_writer_actor"]),
+                        ttl_seconds=int(params["ttl_seconds"]),
+                        terminal_closeout={
+                            "expected_receipt_sha256": "e" * 64,
+                            "observation": {**observation, field: value},
+                        },
+                    )
+                assess.assert_not_called()
+                persist.assert_not_called()
+
     def test_mcp_entry_routes_terminal_closeout_without_reacquiring(self) -> None:
         params = self.parameters()
         lane_id = work_acquire._normalize(params)["lane_id"]
