@@ -703,6 +703,27 @@ def assess(
         raise ConvergenceExecutionError("convergence evaluator returned invalid JSON") from exc
     assessment = _validate_assessment(parsed, result["returncode"])
     if bundle is not None:
+        if assessment["profile_sha256"] != bundle["profile_sha256"]:
+            raise ConvergenceExecutionError(
+                "convergence evaluator profile SHA-256 does not match bundled resilience profile"
+            )
+        if assessment["schema_version"] == 2:
+            if assessment["profile_id"] != bundle["profile"]["profile_id"]:
+                raise ConvergenceExecutionError(
+                    "convergence evaluator profile id does not match bundled resilience profile"
+                )
+            matching_cells = [
+                cell
+                for cell in bundle["profile"]["cells"]
+                if isinstance(cell, dict)
+                and cell.get("change_risk") == assessment["change_risk"]
+                and cell.get("target_criticality") == assessment["target_criticality"]
+            ]
+            if len(matching_cells) != 1 or matching_cells[0].get("cell_id") != assessment["profile_cell_id"]:
+                raise ConvergenceExecutionError(
+                    "convergence evaluator profile cell does not match bundled resilience profile"
+                )
+    if bundle is not None:
         post_bundle = _load_runtime_bundle(expected_protocol_head)
         if (
             post_bundle is None
