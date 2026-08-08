@@ -263,6 +263,15 @@ class FrictionFailureRuntimeTests(unittest.TestCase):
         self.assertEqual(
             module.classify_friction_event(
                 {
+                    "kind": "ci_contract",
+                    "symptom": "this is not actually an expected red phase; contract validation regressed",
+                }
+            ),
+            "contract_error",
+        )
+        self.assertEqual(
+            module.classify_friction_event(
+                {
                     "kind": "operator_bug",
                     "symptom": "no longer already fixed; regression returned",
                 }

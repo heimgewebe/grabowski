@@ -609,13 +609,20 @@ def _event_haystack(event: dict[str, Any]) -> str:
 
 def _has_positive_term(haystack: str, terms: frozenset[str]) -> bool:
     """Return true for a matched signal unless its local wording negates it."""
-    for term in terms:
+    negated_spans: list[tuple[int, int]] = []
+    for term in sorted(terms, key=lambda value: (-len(value), value)):
         for match in re.finditer(re.escape(term), haystack):
+            if any(
+                start <= match.start() and match.end() <= end
+                for start, end in negated_spans
+            ):
+                continue
             prefix = haystack[max(0, match.start() - 48):match.start()]
             if re.search(
                 r"(?:\bnot\b|\bno\b|\bnever\b|\bisn't\b|\bwasn't\b|\bwithout\b)(?:\W+\w+){0,2}\W*$",
                 prefix,
             ):
+                negated_spans.append(match.span())
                 continue
             return True
     return False
