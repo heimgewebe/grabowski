@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import ctypes
 from datetime import datetime
+import hashlib
+import os
 import json
 from pathlib import Path
 import re
@@ -17,7 +19,7 @@ import sys
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 import uuid
 
 SCHEMA_VERSION = 1
@@ -52,6 +54,10 @@ OPERATIONS = {
     "photos_latest_metadata": {"private": True, "foreground": False},
     "mic_record_short": {"private": True, "foreground": True},
     "replaykit_status": {"private": False, "foreground": False},
+    "camera_photo_workspace": {"private": True, "foreground": True},
+    "vision_ocr_workspace_image": {"private": True, "foreground": False},
+    "vision_barcodes_workspace_image": {"private": True, "foreground": False},
+    "shortcut_run": {"private": False, "foreground": True},
 }
 
 
@@ -189,6 +195,11 @@ def _require_foreground() -> None:
 
 def _array_items(value: Any, limit: int) -> list[Any]:
     value = _obj(value)
+    try:
+        count = len(value)
+        return [value[index] for index in range(min(count, limit))]
+    except (TypeError, AttributeError, KeyError):
+        pass
     count = int(_zero(value.count))
     return [value.objectAtIndex_(index) for index in range(min(count, limit))]
 
@@ -813,6 +824,237 @@ def _mic_record_short(request: dict[str, Any], workspace: Path | None) -> dict[s
     )
 
 
+def _write_bytes_create_only(target: Path, payload: bytes) -> None:
+    if len(payload) > 64 * 1024 * 1024:
+        raise RuntimeError("binary payload exceeds bridge bound")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    parent_descriptor = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+
+def _camera_photo_workspace(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
+    _private_ack(request)
+    _require_foreground()
+    relative_path = _string(request, "relative_path", max_bytes=512)
+    target = _safe_workspace_path(workspace, relative_path)
+    if target.suffix.lower() not in {".jpg", ".jpeg"}:
+        raise ValueError("relative_path must end in .jpg or .jpeg")
+    if target.exists():
+        raise FileExistsError("camera target already exists")
+    timeout = _number(request, "timeout_seconds", minimum=2.0, maximum=12.0, default=8.0)
+    objc = _objc()
+    Device = objc.ObjCClass("AVCaptureDevice")
+    auth = int(Device.authorizationStatusForMediaType_("vide"))
+    if auth != 3:
+        raise RuntimeError(f"camera authorization is not granted; status={auth}")
+    device = Device.defaultDeviceWithMediaType_("vide")
+    if device is None:
+        raise RuntimeError("default camera is unavailable")
+    capture_input = objc.ObjCClass("AVCaptureDeviceInput").deviceInputWithDevice_error_(device, None)
+    if isinstance(capture_input, tuple):
+        capture_input = capture_input[0]
+    if capture_input is None:
+        raise RuntimeError("camera input could not be created")
+    session = _retain(objc.ObjCClass("AVCaptureSession").alloc().init())
+    output = _retain(objc.ObjCClass("AVCapturePhotoOutput").alloc().init())
+    if not bool(session.canAddInput_(capture_input)):
+        _release(output)
+        _release(session)
+        raise RuntimeError("capture session rejected camera input")
+    session.addInput_(capture_input)
+    if not bool(session.canAddOutput_(output)):
+        _release(output)
+        _release(session)
+        raise RuntimeError("capture session rejected photo output")
+    session.addOutput_(output)
+    done = threading.Event()
+    holder: dict[str, Any] = {}
+
+    def captureOutput_didFinishProcessingPhoto_error_(
+        self: Any, capture_output: Any, photo: Any, error: Any
+    ) -> None:
+        try:
+            if error:
+                holder["error"] = "capture_error"
+                return
+            photo = _obj(photo)
+            data = _zero(photo.fileDataRepresentation)
+            if data is None:
+                holder["error"] = "empty_photo_data"
+                return
+            payload = objc.nsdata_to_bytes(data)
+            if not payload:
+                holder["error"] = "empty_photo_payload"
+                return
+            holder["payload"] = bytes(payload)
+        except Exception as exc:
+            holder["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        finally:
+            done.set()
+
+    options: dict[str, Any] = {}
+    protocol = getattr(objc, "ObjCProtocol", None)
+    if protocol is not None:
+        try:
+            options["protocols"] = [protocol("AVCapturePhotoCaptureDelegate")]
+        except Exception:
+            pass
+    Delegate = objc.create_objc_class(
+        "GrabowskiPhotoCaptureDelegate_" + uuid.uuid4().hex,
+        superclass=objc.ObjCClass("NSObject"),
+        methods=[captureOutput_didFinishProcessingPhoto_error_],
+        **options,
+    )
+    delegate = _retain(Delegate.alloc().init())
+    settings = _zero(objc.ObjCClass("AVCapturePhotoSettings").photoSettings)
+    try:
+        session.startRunning()
+        output.capturePhotoWithSettings_delegate_(settings, delegate)
+        if not done.wait(timeout):
+            raise RuntimeError("camera photo capture timed out")
+        payload = holder.get("payload")
+        if not isinstance(payload, bytes):
+            raise RuntimeError(f"camera photo capture failed: {holder.get('error', 'unknown')}")
+        _write_bytes_create_only(target, payload)
+        return _result(
+            "camera_photo_workspace",
+            relative_path=relative_path,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            format="jpeg",
+        )
+    finally:
+        try:
+            session.stopRunning()
+        finally:
+            _release(delegate)
+            _release(output)
+            _release(session)
+
+
+def _workspace_image_path(request: dict[str, Any], workspace: Path | None) -> tuple[Path, str]:
+    relative_path = _string(request, "relative_path", max_bytes=512)
+    target = _safe_workspace_path(workspace, relative_path)
+    if target.suffix.lower() not in {".jpg", ".jpeg", ".png", ".heic", ".tif", ".tiff"}:
+        raise ValueError("relative_path is not an allowlisted image type")
+    if not target.is_file():
+        raise FileNotFoundError("workspace image does not exist")
+    size = target.stat().st_size
+    if size <= 0 or size > 64 * 1024 * 1024:
+        raise RuntimeError("workspace image size is outside the bridge bound")
+    return target, relative_path
+
+
+def _perform_vision_request(target: Path, request_object: Any) -> None:
+    objc = _objc()
+    url = objc.ObjCClass("NSURL").fileURLWithPath_(str(target))
+    handler = objc.ObjCClass("VNImageRequestHandler").alloc().initWithURL_options_(url, objc.ns({}))
+    result = handler.performRequests_error_(objc.ns([request_object]), None)
+    if isinstance(result, tuple):
+        result = result[0]
+    if not bool(result):
+        raise RuntimeError("Vision request failed")
+
+
+def _vision_ocr_workspace_image(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
+    _private_ack(request)
+    target, relative_path = _workspace_image_path(request, workspace)
+    max_results = _integer(request, "max_results", minimum=1, maximum=MAX_RESULTS, default=25)
+    objc = _objc()
+    recognition = objc.ObjCClass("VNRecognizeTextRequest").alloc().init()
+    if hasattr(recognition, "setRecognitionLevel_"):
+        recognition.setRecognitionLevel_(1)
+    if hasattr(recognition, "setUsesLanguageCorrection_"):
+        recognition.setUsesLanguageCorrection_(True)
+    _perform_vision_request(target, recognition)
+    observations = _zero(recognition.results)
+    output: list[dict[str, Any]] = []
+    if observations is not None:
+        for observation in _array_items(observations, max_results):
+            candidates = observation.topCandidates_(1)
+            items = _array_items(candidates, 1)
+            if not items:
+                continue
+            candidate = items[0]
+            text = str(_zero(candidate.string) or "")
+            if not text:
+                continue
+            confidence = None
+            try:
+                confidence = round(float(_zero(candidate.confidence)), 4)
+            except Exception:
+                pass
+            output.append({"text": text[:4096], "confidence": confidence})
+    return _result(
+        "vision_ocr_workspace_image",
+        relative_path=relative_path,
+        observations=output,
+    )
+
+
+def _vision_barcodes_workspace_image(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
+    _private_ack(request)
+    target, relative_path = _workspace_image_path(request, workspace)
+    max_results = _integer(request, "max_results", minimum=1, maximum=MAX_RESULTS, default=25)
+    objc = _objc()
+    detection = objc.ObjCClass("VNDetectBarcodesRequest").alloc().init()
+    _perform_vision_request(target, detection)
+    observations = _zero(detection.results)
+    output: list[dict[str, Any]] = []
+    if observations is not None:
+        for observation in _array_items(observations, max_results):
+            payload = _zero(observation.payloadStringValue)
+            symbology = _zero(observation.symbology)
+            confidence = None
+            try:
+                confidence = round(float(_zero(observation.confidence)), 4)
+            except Exception:
+                pass
+            output.append(
+                {
+                    "payload": None if payload is None else str(payload)[:4096],
+                    "symbology": None if symbology is None else str(symbology)[:128],
+                    "confidence": confidence,
+                }
+            )
+    return _result(
+        "vision_barcodes_workspace_image",
+        relative_path=relative_path,
+        observations=output,
+    )
+
+
+def _shortcut_run(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
+    _require_foreground()
+    name = _string(request, "name", max_bytes=256)
+    text = _string(request, "text", required=False, allow_empty=True, max_bytes=4096)
+    url = "shortcuts://run-shortcut?name=" + quote(name, safe="")
+    if text:
+        url += "&input=text&text=" + quote(text, safe="")
+    opened = _open_url({"schema_version": 1, "operation": "open_url", "url": url}, workspace)
+    return _result(
+        "shortcut_run",
+        name=name,
+        can_open=bool(opened.get("can_open")),
+        opened=bool(opened.get("opened")),
+        input_kind="text" if text else "none",
+    )
+
+
 def _native_bool_property(value: Any, *names: str) -> bool:
     last_error: Exception | None = None
     for name in names:
@@ -854,6 +1096,10 @@ _HANDLERS = {
     "photos_latest_metadata": _photos_latest_metadata,
     "mic_record_short": _mic_record_short,
     "replaykit_status": _replaykit_status,
+    "camera_photo_workspace": _camera_photo_workspace,
+    "vision_ocr_workspace_image": _vision_ocr_workspace_image,
+    "vision_barcodes_workspace_image": _vision_barcodes_workspace_image,
+    "shortcut_run": _shortcut_run,
 }
 
 

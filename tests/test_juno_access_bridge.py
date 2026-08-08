@@ -34,6 +34,9 @@ class JunoAccessBridgeTests(unittest.TestCase):
         self.assertEqual("capabilities", result["operation"])
         self.assertIn("contacts_search", result["operations"])
 
+    def test_array_items_supports_python_sequences(self) -> None:
+        self.assertEqual([1, 2], self.bridge._array_items([1, 2, 3], 2))
+
     def test_unknown_operation_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported operation"):
             self.bridge.dispatch(self.request("root_shell"))
@@ -106,6 +109,54 @@ class JunoAccessBridgeTests(unittest.TestCase):
         self.assertFalse(result["operations"]["notification_schedule"]["private_content_ack_required"])
         self.assertFalse(result["operations"]["replaykit_status"]["foreground_required"])
 
+
+    def test_camera_and_vision_operations_require_private_ack(self) -> None:
+        for operation in (
+            "camera_photo_workspace",
+            "vision_ocr_workspace_image",
+            "vision_barcodes_workspace_image",
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaisesRegex(ValueError, "private_content_ack"):
+                    self.bridge.dispatch(
+                        self.request(operation, relative_path="test.jpg"),
+                        workspace=Path("/tmp"),
+                    )
+
+    def test_workspace_image_path_rejects_non_image_and_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "note.txt").write_text("x")
+            with self.assertRaisesRegex(ValueError, "image type"):
+                self.bridge._workspace_image_path(
+                    self.request("vision_ocr_workspace_image", relative_path="note.txt"),
+                    root,
+                )
+            with self.assertRaisesRegex(ValueError, "workspace|escapes"):
+                self.bridge._workspace_image_path(
+                    self.request("vision_ocr_workspace_image", relative_path="../image.jpg"),
+                    root,
+                )
+
+    def test_camera_target_suffix_is_validated_before_native_import(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(self.bridge, "_require_foreground", return_value=None):
+                with self.assertRaisesRegex(ValueError, "jpg"):
+                    self.bridge.dispatch(
+                        self.request(
+                            "camera_photo_workspace",
+                            relative_path="capture.png",
+                            private_content_ack=True,
+                        ),
+                        workspace=Path(directory),
+                    )
+
+    def test_shortcut_name_bound_is_validated_before_native_open(self) -> None:
+        with patch.object(self.bridge, "_require_foreground", return_value=None):
+            with self.assertRaisesRegex(ValueError, "byte bound"):
+                self.bridge.dispatch(
+                    self.request("shortcut_run", name="x" * 300),
+                )
 
     def test_native_bool_property_accepts_objc_is_accessor(self) -> None:
         class FakeRecorder:
