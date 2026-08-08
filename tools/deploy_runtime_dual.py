@@ -261,6 +261,10 @@ OPERATOR_ADMISSION_MARKER_KEYS = frozenset(
 )
 OPERATOR_ADMISSION_MARKER_MAX_LIFETIME_SECONDS = 1800
 OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS = 120
+# Bootstrap only for marker-aware predecessor runtimes that expose total calls
+# but not the effect-aware classification added by this release.
+OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS = 300
+OPERATOR_ADMISSION_EFFECT_CLASSIFICATION = "readOnlyHint-true-is-read-only-v1"
 OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS = 6
 OPERATOR_ADMISSION_STOP_OPERATIONS = 6
 OPERATOR_ADMISSION_START_OPERATIONS = 4
@@ -2610,8 +2614,12 @@ def _operator_admission_marker_lifetime_seconds(timeout_seconds: int) -> int:
                 "maximum_timeout_seconds": OPERATOR_ADMISSION_MAX_TIMEOUT_SECONDS,
             },
         )
+    bootstrap_extra_seconds = max(
+        0, OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS - timeout_seconds
+    )
     required = (
         timeout_seconds * OPERATOR_ADMISSION_DYNAMIC_TIMEOUT_WINDOWS
+        + bootstrap_extra_seconds
         + OPERATOR_ADMISSION_STOP_OPERATIONS
         * 2
         * core.TIMEOUTS["service_stop"]
@@ -2947,6 +2955,81 @@ def _operator_admission_observation() -> dict[str, Any] | None:
     return value
 
 
+def _operator_admission_call_counts(
+    observed: dict[str, Any], *, phase: str = "operator-admission-drain"
+) -> dict[str, Any]:
+    active_calls = observed.get("active_tool_calls")
+    if (
+        not isinstance(active_calls, int)
+        or isinstance(active_calls, bool)
+        or active_calls < 0
+    ):
+        core.fail(
+            "Operator-Admission-Readback enthält keine gültige aktive Call-Zahl",
+            phase=phase,
+            details={"observation": observed},
+        )
+    blocking = observed.get("drain_blocking_tool_calls")
+    read_only = observed.get("read_only_active_tool_calls")
+    classification = observed.get("effect_classification")
+    effect_fields_present = (
+        blocking is not None or read_only is not None or classification is not None
+    )
+    if not effect_fields_present:
+        return {
+            "effect_aware": False,
+            "active_tool_calls": active_calls,
+            "blocking_tool_calls": active_calls,
+            "read_only_active_tool_calls": None,
+        }
+    # Compatibility with the immediately preceding #686 runtime: it exposes
+    # both additive counters but predates the explicit classification tag.
+    # Validate those counters, then remain conservative until the new runtime
+    # is active by treating every in-flight call as deployment-blocking.
+    if classification is None and blocking is not None and read_only is not None:
+        if (
+            not isinstance(blocking, int)
+            or isinstance(blocking, bool)
+            or blocking < 0
+            or not isinstance(read_only, int)
+            or isinstance(read_only, bool)
+            or read_only < 0
+            or blocking + read_only != active_calls
+        ):
+            core.fail(
+                "Operator-Admission-Legacy-Zähler sind inkonsistent",
+                phase=phase,
+                details={"observation": observed},
+            )
+        return {
+            "effect_aware": False,
+            "active_tool_calls": active_calls,
+            "blocking_tool_calls": active_calls,
+            "read_only_active_tool_calls": read_only,
+        }
+    if (
+        classification != OPERATOR_ADMISSION_EFFECT_CLASSIFICATION
+        or not isinstance(blocking, int)
+        or isinstance(blocking, bool)
+        or blocking < 0
+        or not isinstance(read_only, int)
+        or isinstance(read_only, bool)
+        or read_only < 0
+        or blocking + read_only != active_calls
+    ):
+        core.fail(
+            "Operator-Admission-Effektklassifikation ist inkonsistent",
+            phase=phase,
+            details={"observation": observed},
+        )
+    return {
+        "effect_aware": True,
+        "active_tool_calls": active_calls,
+        "blocking_tool_calls": blocking,
+        "read_only_active_tool_calls": read_only,
+    }
+
+
 def wait_for_operator_deployment_admission(
     marker: dict[str, Any], *, timeout_seconds: int
 ) -> dict[str, Any]:
@@ -2995,7 +3078,13 @@ def wait_for_operator_deployment_admission(
                 ],
             }
         break
-    deadline = time.monotonic() + timeout_seconds
+    initial_counts = _operator_admission_call_counts(first)
+    drain_timeout_seconds = (
+        timeout_seconds
+        if initial_counts["effect_aware"]
+        else max(timeout_seconds, OPERATOR_ADMISSION_BOOTSTRAP_DRAIN_SECONDS)
+    )
+    deadline = time.monotonic() + drain_timeout_seconds
     consecutive_idle = 0
     attempts = 0
     last = first
@@ -3006,10 +3095,9 @@ def wait_for_operator_deployment_admission(
             consecutive_idle = 0
         else:
             last = observed
-            active_calls = observed.get("active_tool_calls")
-            drain_blocking_calls = observed.get(
-                "drain_blocking_tool_calls", active_calls
-            )
+            call_counts = _operator_admission_call_counts(observed)
+            active_calls = call_counts["active_tool_calls"]
+            drain_blocking_calls = call_counts["blocking_tool_calls"]
             valid = (
                 observed.get("valid") is True
                 and observed.get("active") is True
@@ -3019,12 +3107,6 @@ def wait_for_operator_deployment_admission(
                 and observed.get("expected_head") == marker.get("expected_head")
                 and observed.get("source_identity_sha256")
                 == marker.get("source_identity_sha256")
-                and isinstance(active_calls, int)
-                and not isinstance(active_calls, bool)
-                and active_calls >= 0
-                and isinstance(drain_blocking_calls, int)
-                and not isinstance(drain_blocking_calls, bool)
-                and 0 <= drain_blocking_calls <= active_calls
             )
             if not valid:
                 core.fail(
@@ -3038,6 +3120,11 @@ def wait_for_operator_deployment_admission(
             if consecutive_idle >= OPERATOR_ADMISSION_REQUIRED_IDLE_SAMPLES:
                 return {
                     "supported": True,
+                    "effect_aware": call_counts["effect_aware"],
+                    "blocking_tool_calls": drain_blocking_calls,
+                    "active_tool_calls": active_calls,
+                    "read_only_active_tool_calls": call_counts["read_only_active_tool_calls"],
+                    "drain_timeout_seconds": drain_timeout_seconds,
                     "probe_attempts": probe_attempts,
                     "transport_retries": transport_retries,
                     "attempts": attempts,
@@ -3051,7 +3138,12 @@ def wait_for_operator_deployment_admission(
     core.fail(
         "Operator-Admission wurde nicht rechtzeitig leer",
         phase="operator-admission-drain",
-        details={"attempts": attempts, "last_observation": last},
+        details={
+            "attempts": attempts,
+            "drain_timeout_seconds": drain_timeout_seconds,
+            "bootstrap_mode": not initial_counts["effect_aware"],
+            "last_observation": last,
+        },
     )
 
 
@@ -3059,11 +3151,10 @@ def verify_operator_deployment_admission(
     marker: dict[str, Any],
 ) -> dict[str, Any]:
     observed = _operator_admission_observation()
-    active_calls = (
-        observed.get("active_tool_calls") if isinstance(observed, dict) else None
-    )
-    drain_blocking_calls = (
-        observed.get("drain_blocking_tool_calls", active_calls)
+    call_counts = (
+        _operator_admission_call_counts(
+            observed, phase="operator-admission-final-guard"
+        )
         if isinstance(observed, dict)
         else None
     )
@@ -3076,20 +3167,15 @@ def verify_operator_deployment_admission(
         or observed.get("expected_head") != marker.get("expected_head")
         or observed.get("source_identity_sha256")
         != marker.get("source_identity_sha256")
-        or not isinstance(active_calls, int)
-        or isinstance(active_calls, bool)
-        or active_calls < 0
-        or not isinstance(drain_blocking_calls, int)
-        or isinstance(drain_blocking_calls, bool)
-        or not 0 <= drain_blocking_calls <= active_calls
-        or drain_blocking_calls != 0
+        or call_counts is None
+        or call_counts["blocking_tool_calls"] != 0
     ):
         core.fail(
             "Operator-Admission-Finalprüfung scheiterte",
             phase="operator-admission-final-guard",
-            details={"observation": observed},
+            details={"observation": observed, "call_counts": call_counts},
         )
-    return observed
+    return {**observed, "admission_call_counts": call_counts}
 
 
 def _tunnel_drain_counter_snapshot(observed: dict[str, float]) -> dict[str, float]:
