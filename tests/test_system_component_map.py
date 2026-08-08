@@ -104,6 +104,25 @@ def test_server_loopback_snapshot_does_not_make_platform_connector_green() -> No
     assert result["overall_signal"] == "unknown"
 
 
+def test_stale_platform_snapshot_stays_unknown() -> None:
+    result = _component_map(
+        client_snapshot={
+            "observable": True,
+            "matched": True,
+            "fresh": False,
+            "platform_connector_snapshot_observable": True,
+            "server_loopback_observable": True,
+        }
+    )
+
+    components = {item["id"]: item for item in result["components"]}
+    connector = components["connector"]
+    assert connector["signal"] == "unknown"
+    assert connector["observed"] is False
+    assert connector["evidence"]["fresh"] is False
+    assert connector["evidence"]["platform_connector_snapshot_observable"] is True
+
+
 def test_attention_is_amber_without_becoming_health_failure() -> None:
     result = _component_map(
         tasks={

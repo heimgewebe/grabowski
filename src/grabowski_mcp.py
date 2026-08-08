@@ -5155,12 +5155,17 @@ def _runtime_tool_contract_summary(
         and isinstance(repo_head, str)
         and re.fullmatch(r"[0-9a-f]{40}", repo_head) is not None
     ):
+        try:
+            runtime_observed_tools = _runtime_connector_observed_tools()
+        except RuntimeError:
+            runtime_observed_tools = None
         client_snapshot = grabowski_client_snapshot.snapshot_status(
             expected_tool_count=len(registered),
             expected_names_sha256=registered_names_sha256,
             expected_release_id=release_id,
             expected_repo_head=repo_head,
             expected_agent_instructions_sha256=AGENT_INSTRUCTIONS_SHA256,
+            expected_runtime_tools=runtime_observed_tools,
         )
     else:
         client_snapshot = {
@@ -5192,6 +5197,19 @@ def _runtime_tool_contract_summary(
         "client_schema_snapshot_observable": bool(
             client_snapshot.get("schema_observable")
         ),
+        "platform_connector_snapshot_observable": bool(
+            client_snapshot.get("platform_connector_snapshot_observable")
+        ),
+        "platform_connector_schema_observable": bool(
+            client_snapshot.get("platform_connector_schema_observable")
+        ),
+        "platform_connector_snapshot_fresh": bool(
+            client_snapshot.get("platform_connector_snapshot_fresh")
+        ),
+        "platform_connector_snapshot_matched": bool(
+            client_snapshot.get("platform_connector_snapshot_matched")
+        ),
+        "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
         "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
     }
@@ -5318,6 +5336,21 @@ def _operator_system_overview(
     platform_connector_snapshot_observable = bool(
         client_snapshot.get("platform_connector_snapshot_observable")
     )
+    platform_connector_snapshot_fresh = bool(
+        client_snapshot.get(
+            "platform_connector_snapshot_fresh", client_snapshot.get("fresh")
+        )
+    )
+    platform_connector_snapshot_matched = bool(
+        client_snapshot.get(
+            "platform_connector_snapshot_matched", client_snapshot.get("matched")
+        )
+    )
+    platform_connector_snapshot_ready = (
+        platform_connector_snapshot_observable
+        and platform_connector_snapshot_fresh
+        and platform_connector_snapshot_matched
+    )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
@@ -5331,7 +5364,7 @@ def _operator_system_overview(
     operator_ready = (
         runtime_healthy
         and coding_agent_catalog_ready
-        and platform_connector_snapshot_observable
+        and platform_connector_snapshot_ready
         and truth_model_ready
         and components_observable
     )
@@ -5346,7 +5379,7 @@ def _operator_system_overview(
                 "bind the current connector client snapshot",
             )
         )
-    elif not platform_connector_snapshot_observable:
+    elif not platform_connector_snapshot_ready:
         next_action = str(
             client_snapshot.get(
                 "recommended_next_action",
@@ -5396,6 +5429,17 @@ def _operator_system_overview(
             ),
             "freshness": "current bounded scan",
         },
+        "platform_connector_catalog": {
+            "authority": "trusted platform connector catalog snapshot",
+            "observation_state": client_snapshot.get("platform_evidence_state"),
+            "freshness": (client_snapshot.get("platform_snapshot") or {}).get(
+                "fresh"
+            ),
+            "source": (client_snapshot.get("platform_snapshot") or {}).get("source"),
+            "trust_contract": (client_snapshot.get("platform_snapshot") or {}).get(
+                "authority"
+            ),
+        },
         "bureau": {
             "authority": "Bureau",
             "observation_state": "target_required",
@@ -5428,8 +5472,15 @@ def _operator_system_overview(
             "freshness": "receipt-bound per operation",
         },
     }
+    component_map_snapshot = dict(client_snapshot)
+    component_map_snapshot["fresh"] = client_snapshot.get(
+        "platform_connector_snapshot_fresh", client_snapshot.get("fresh")
+    )
+    component_map_snapshot["matched"] = client_snapshot.get(
+        "platform_connector_snapshot_matched", client_snapshot.get("matched")
+    )
     component_map = grabowski_system_map.build_component_map(
-        runtime_healthy=runtime_healthy, client_snapshot=client_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
+        runtime_healthy=runtime_healthy, client_snapshot=component_map_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
     )
     return {
         "schema_version": 2,
@@ -5437,7 +5488,7 @@ def _operator_system_overview(
         "readiness": {
             "runtime_ready": runtime_healthy,
             "coding_agent_catalog_ready": coding_agent_catalog_ready,
-            "connector_snapshot_ready": platform_connector_snapshot_observable,
+            "connector_snapshot_ready": platform_connector_snapshot_ready,
             "truth_model_ready": truth_model_ready,
             "components_observable": components_observable,
         },
@@ -5446,7 +5497,21 @@ def _operator_system_overview(
         "connector": {
             "state": client_snapshot.get("state"),
             "observable": snapshot_observable,
+            "external_client_snapshot_observable": client_snapshot.get(
+                "external_client_snapshot_observable"
+            ),
             "platform_snapshot_observable": platform_connector_snapshot_observable,
+            "platform_schema_observable": client_snapshot.get(
+                "platform_connector_schema_observable"
+            ),
+            "platform_fresh": client_snapshot.get(
+                "platform_connector_snapshot_fresh"
+            ),
+            "platform_matched": client_snapshot.get(
+                "platform_connector_snapshot_matched"
+            ),
+            "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
+            "platform_snapshot": client_snapshot.get("platform_snapshot"),
             "server_loopback_observable": client_snapshot.get("server_loopback_observable"),
             "fresh": client_snapshot.get("fresh"),
             "matched": client_snapshot.get("matched"),
@@ -5551,6 +5616,9 @@ def grabowski_status(
                 ),
             }
         )
+    # Platform publication evidence is surfaced explicitly in tool_contract and
+    # system_overview. Its absence must not inflate the compact operational warning
+    # channel, which is reserved for immediate runtime/action gates.
     if (
         transport_roundtrip.get("state") != "unavailable"
         and transport_roundtrip.get("mutation_gate_open") is not True
@@ -5605,6 +5673,14 @@ def grabowski_status(
                 "complete a fresh transport roundtrip before mutation",
             )
         )
+    elif not bool(client_snapshot.get("platform_connector_snapshot_observable")):
+        platform_snapshot = client_snapshot.get("platform_snapshot")
+        recommended_next_action = str(
+            (platform_snapshot if isinstance(platform_snapshot, dict) else {}).get(
+                "recommended_next_action",
+                "capture authoritative platform connector publication evidence",
+            )
+        )
     elif system_overview is not None:
         recommended_next_action = str(system_overview["recommended_next_action"])
     elif warnings:
@@ -5640,6 +5716,13 @@ def grabowski_status(
             "client_schema_snapshot_observable": tool_contract.get(
                 "client_schema_snapshot_observable"
             ),
+            "platform_connector_snapshot_observable": tool_contract.get(
+                "platform_connector_snapshot_observable"
+            ),
+            "platform_connector_schema_observable": tool_contract.get(
+                "platform_connector_schema_observable"
+            ),
+            "platform_evidence_state": tool_contract.get("platform_evidence_state"),
             "client_snapshot": client_snapshot,
             "refresh_required_when_client_count_or_hash_differs": tool_contract.get(
                 "refresh_required_when_client_count_or_hash_differs"

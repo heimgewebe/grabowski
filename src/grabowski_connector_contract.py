@@ -149,7 +149,11 @@ def probe_contract(
     runtime_names: list[str],
     runtime_schemas: dict[str, dict[str, Any]],
     contract_names: list[str],
+    *,
+    observed_source: str = "connector",
 ) -> dict[str, Any]:
+    if not isinstance(observed_source, str) or not observed_source or len(observed_source) > 64:
+        raise ConnectorContractError("observed_source must be a bounded non-empty string")
     runtime_names = sorted(runtime_names)
     contract_names = sorted(contract_names)
     schema_mismatches: list[dict[str, Any]] = []
@@ -174,7 +178,7 @@ def probe_contract(
     required_schema_property_mismatches: list[dict[str, Any]] = []
     for name, required_properties in sorted(REQUIRED_SCHEMA_PROPERTIES.items()):
         for source, schema in (
-            ("connector", observed_schemas.get(name)),
+            (observed_source, observed_schemas.get(name)),
             ("runtime", runtime_schemas.get(name)),
         ):
             properties = schema.get("properties") if isinstance(schema, dict) else None
