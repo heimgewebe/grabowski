@@ -1235,6 +1235,11 @@ def _github_actor(value: Any) -> str:
     return ""
 
 
+def _github_actor_identity(value: Any) -> str:
+    """Canonicalize GitHub bot aliases without weakening actor allowlisting."""
+    return _github_actor(value).removesuffix("[bot]")
+
+
 class CaptainMergeGuardRunner:
     def __init__(
         self,
@@ -2270,7 +2275,9 @@ class CaptainMergeGuardRunner:
                     )
                     if actor not in _CODEX_REVIEW_ACTORS:
                         errors.append("merge_guard_codex_review_actor_untrusted")
-                    if actor != str(completion.get("actor", "")).lower():
+                    if _github_actor_identity(actor) != _github_actor_identity(
+                        completion.get("actor")
+                    ):
                         errors.append("merge_guard_codex_review_actor_drift")
                     if state not in {"APPROVED", "COMMENTED"}:
                         errors.append("merge_guard_codex_review_state_blocking")
@@ -2307,7 +2314,9 @@ class CaptainMergeGuardRunner:
                     completion_time = _github_datetime(live_comment.get("created_at"))
                     if actor not in _CODEX_REVIEW_ACTORS:
                         errors.append("merge_guard_codex_clean_comment_actor_untrusted")
-                    if actor != str(completion.get("actor", "")).lower():
+                    if _github_actor_identity(actor) != _github_actor_identity(
+                        completion.get("actor")
+                    ):
                         errors.append("merge_guard_codex_clean_comment_actor_drift")
                     if not isinstance(body, str):
                         errors.append("merge_guard_codex_clean_comment_body_missing")
