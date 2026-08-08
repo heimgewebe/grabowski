@@ -56,6 +56,24 @@ class WorkAcquireTests(unittest.TestCase):
             "ttl_seconds": 1200,
         }
 
+    def store_lane(self, params: dict[str, object]) -> tuple[dict[str, object], dict[str, object]]:
+        inputs = work_acquire._normalize(params)
+        inputs.pop("_scoped_writer_argv")
+        lane_id = str(inputs["lane_id"])
+        work_acquire._private_directory(self.state)
+        receipt = work_acquire._write_state(
+            self.state / f"{lane_id}.json",
+            {
+                "kind": work_acquire.LANE_KIND,
+                "schema_version": work_acquire.SCHEMA_VERSION,
+                "lane_id": lane_id,
+                "inputs_sha256": work_acquire._sha(inputs),
+                "inputs": inputs,
+                "state": "ready",
+            },
+        )
+        return inputs, receipt
+
     @staticmethod
     def acquired(owner: str, keys: list[str]) -> dict[str, object]:
         leases = [
@@ -769,7 +787,8 @@ class WorkAcquireTests(unittest.TestCase):
         params = self.parameters()
         params["retention_until_unix"] = 100
         with patch.object(work_acquire.checkouts, "_now", return_value=50):
-            lane_id = work_acquire._normalize(params)["lane_id"]
+            stored_inputs, receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
         expected = {"lane_id": lane_id, "replayed": False}
         terminal = self.terminal_assessment(lane_id, 200)
         with (
@@ -793,7 +812,7 @@ class WorkAcquireTests(unittest.TestCase):
                 scoped_writer_actor=str(params["scoped_writer_actor"]),
                 ttl_seconds=int(params["ttl_seconds"]),
                 terminal_closeout={
-                    "expected_receipt_sha256": "e" * 64,
+                    "expected_receipt_sha256": str(receipt["receipt_sha256"]),
                     "observation": {
                         "lane_id": lane_id, "repository": str(self.repo),
                         "workspace": str(self.target), "branch": "feat/authority-p0",
@@ -885,9 +904,78 @@ class WorkAcquireTests(unittest.TestCase):
         planner.assert_not_called()
         self.assertEqual(persist.call_args.args[0], lane_id)
 
+    def test_mcp_entry_reuses_stored_path_identity_after_symlink_drift(self) -> None:
+        params = self.parameters()
+        first = self.repo / "first.py"
+        second = self.repo / "second.py"
+        first.write_text("first\n")
+        second.write_text("second\n")
+        link = self.repo / "current.py"
+        link.symlink_to(first.name)
+        params["write_paths"] = [link.name]
+        stored_inputs, receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
+        self.assertIn(f"path:{first}", stored_inputs["resource_keys"])
+        link.unlink()
+        link.symlink_to(second.name)
+        expected = {"lane_id": lane_id, "replayed": False}
+        terminal = {"lane_id": lane_id, "phase": "terminal"}
+        with (
+            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(
+                work_acquire.work_admission,
+                "plan_system_convergence",
+                side_effect=AssertionError("terminal closeout must not normalize live identity"),
+            ) as planner,
+            patch.object(work_acquire.lane_closeout, "assess", return_value=terminal),
+            patch.object(
+                work_acquire, "persist_terminal_closeout", return_value=expected
+            ) as persist,
+        ):
+            result = work_acquire.grabowski_work_acquire(
+                source_kind=str(params["source_kind"]),
+                source_id=str(params["source_id"]),
+                controller_actor=str(params["controller_actor"]),
+                repo=str(params["repo"]),
+                base_head=str(params["base_head"]),
+                branch=str(params["branch"]),
+                target_path=str(params["target_path"]),
+                purpose=str(params["purpose"]),
+                retention_until_unix=int(params["retention_until_unix"]),
+                idempotency_key=str(params["idempotency_key"]),
+                scoped_writer_actor=str(params["scoped_writer_actor"]),
+                write_paths=list(params["write_paths"]),
+                ttl_seconds=int(params["ttl_seconds"]),
+                terminal_closeout={
+                    "expected_receipt_sha256": str(receipt["receipt_sha256"]),
+                    "observation": {
+                        "lane_id": lane_id,
+                        "repository": str(self.repo),
+                        "workspace": str(self.target),
+                        "branch": "feat/authority-p0",
+                        "base_revision": SHA,
+                        "writer_state": "completed",
+                        "task_active": False,
+                        "process_active": False,
+                        "lease_active": True,
+                        "git_dirty": False,
+                        "head_sha": SHA,
+                        "remote_head_sha": SHA,
+                        "ahead_commits": 0,
+                        "behind_commits": 0,
+                        "no_change_proven": True,
+                    },
+                },
+            )
+        self.assertEqual(expected, result)
+        planner.assert_not_called()
+        self.assertEqual(persist.call_args.args[0], lane_id)
+        self.assertNotIn(f"path:{second}", stored_inputs["resource_keys"])
+
     def test_mcp_entry_rejects_terminal_closeout_identity_mismatch(self) -> None:
         params = self.parameters()
-        lane_id = work_acquire._normalize(params)["lane_id"]
+        stored_inputs, _receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
         observation = {
             "lane_id": lane_id,
             "repository": str(self.repo),
@@ -947,10 +1035,13 @@ class WorkAcquireTests(unittest.TestCase):
 
     def test_mcp_entry_routes_terminal_closeout_without_reacquiring(self) -> None:
         params = self.parameters()
-        lane_id = work_acquire._normalize(params)["lane_id"]
+        stored_inputs, receipt = self.store_lane(params)
+        lane_id = str(stored_inputs["lane_id"])
         expected = {"lane_id": lane_id, "replayed": False}
         with (
-            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(
+                work_acquire.operator, "_require_operator_mutation"
+            ) as require_mutation,
             patch.object(work_acquire.operator, "_require_operator_capability") as capability,
             patch.object(work_acquire.lane_closeout, "assess", return_value={
                 "lane_id": lane_id, "phase": "terminal"
@@ -972,7 +1063,7 @@ class WorkAcquireTests(unittest.TestCase):
                 scoped_writer_actor=str(params["scoped_writer_actor"]),
                 ttl_seconds=int(params["ttl_seconds"]),
                 terminal_closeout={
-                    "expected_receipt_sha256": "e" * 64,
+                    "expected_receipt_sha256": str(receipt["receipt_sha256"]),
                     "observation": {
                         "lane_id": lane_id, "repository": str(self.repo),
                         "workspace": str(self.target), "branch": "feat/authority-p0",
@@ -986,8 +1077,14 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(expected, result)
         acquire.assert_not_called()
         capability.assert_not_called()
+        require_mutation.assert_called_once_with(
+            "resource_lease", path=str(self.target), repo=str(self.repo)
+        )
         self.assertEqual(persist.call_args.args[0], lane_id)
-        self.assertEqual(persist.call_args.kwargs["expected_receipt_sha256"], "e" * 64)
+        self.assertEqual(
+            persist.call_args.kwargs["expected_receipt_sha256"],
+            receipt["receipt_sha256"],
+        )
         self.assertIs(
             persist.call_args.kwargs["audit_fn"],
             work_acquire.operator.base._append_audit_with_digest,

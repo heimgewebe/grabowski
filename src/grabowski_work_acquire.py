@@ -31,7 +31,6 @@ DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
-_SYSTEM_CONVERGENCE_PLAN_UNSET = object()
 
 
 class ScopedWriterStartPreflight(ValueError):
@@ -143,22 +142,120 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def _stored_system_convergence_plan(lane_id: str) -> dict[str, Any]:
+def _stored_lane_inputs(lane_id: str) -> dict[str, Any]:
     _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
     with _lane_lock(lane_id) as receipt_path:
         record = _read_state(receipt_path)
     if record is None or record.get("lane_id") != lane_id:
         raise RuntimeError("work-lane receipt is missing or bound to another lane")
     inputs = record.get("inputs")
-    if (
-        not isinstance(inputs, dict)
-        or record.get("inputs_sha256") != _sha(inputs)
-    ):
+    if not isinstance(inputs, dict) or record.get("inputs_sha256") != _sha(inputs):
         raise RuntimeError("work-lane stored inputs are invalid")
-    plan = inputs.get("system_convergence_plan")
-    if not isinstance(plan, dict):
-        raise RuntimeError("work-lane stored system convergence plan is invalid")
-    return dict(plan)
+    if inputs.get("lane_id") != lane_id or inputs.get("lease_owner_id") != f"lane:{lane_id}":
+        raise RuntimeError("work-lane stored input identity is invalid")
+    identity = {
+        key: value
+        for key, value in inputs.items()
+        if key not in {"lane_id", "lease_owner_id", "ttl_seconds"}
+    }
+    if _sha(identity)[:32] != lane_id:
+        raise RuntimeError("work-lane stored identity digest is invalid")
+    return dict(inputs)
+
+
+def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]:
+    """Bind closeout to durable lane identity without re-resolving mutable paths."""
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be an object")
+    inputs = _stored_lane_inputs(lane_id)
+
+    controller_actor = _text(
+        parameters.get("controller_actor"), "controller_actor", pattern=ACTOR_RE
+    )
+    if parameters.get("controller_role", "controller") != "controller":
+        raise ValueError("controller_role must be controller")
+    writer = parameters.get("scoped_writer_actor")
+    if writer is not None:
+        writer = _text(writer, "scoped_writer_actor", pattern=ACTOR_RE)
+        if writer == controller_actor:
+            raise ValueError("scoped_writer_actor must differ from controller_actor")
+    source_kind, source_id = checkouts._source_binding(
+        _text(parameters.get("source_kind"), "source_kind"),
+        _text(parameters.get("source_id"), "source_id"),
+    )
+    _text(parameters.get("repo"), "repo")
+    target = Path(_text(parameters.get("target_path"), "target_path")).expanduser()
+    if not target.is_absolute():
+        raise ValueError("target_path must be absolute")
+    branch = _text(parameters.get("branch"), "branch")
+    base_head = _text(parameters.get("base_head"), "base_head").lower()
+    if SHA40_RE.fullmatch(base_head) is None:
+        raise ValueError("base_head must be an exact lowercase 40-character commit")
+    purpose = checkouts._purpose(_text(parameters.get("purpose"), "purpose"))
+    artifact_class = checkouts._artifact_class(
+        parameters.get("artifact_class", "implementation-worktree")
+    )
+    retention = parameters.get("retention_until_unix")
+    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 0:
+        raise ValueError("retention_until_unix must be a non-negative integer timestamp")
+    ttl = parameters.get("ttl_seconds", 7200)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
+        raise ValueError("ttl_seconds must be between 120 and 86400")
+    idempotency_key = _text(
+        parameters.get("idempotency_key"), "idempotency_key", pattern=IDEMPOTENCY_RE
+    )
+    system_convergence = parameters.get("system_convergence")
+    if system_convergence is not None and not isinstance(system_convergence, dict):
+        raise ValueError("system_convergence must be an object or null")
+    requested = parameters.get("resource_keys") or []
+    if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
+        raise ValueError("resource_keys must be a list of strings")
+    write_paths = parameters.get("write_paths")
+    if write_paths is not None:
+        if not isinstance(write_paths, list) or len(write_paths) > MAX_WRITE_PATHS:
+            raise ValueError(
+                f"write_paths must be a list with at most {MAX_WRITE_PATHS} entries"
+            )
+        for index, item in enumerate(write_paths):
+            _text(item, f"write_paths[{index}]")
+    writer_argv = _scoped_writer_argv(parameters.get("scoped_writer_argv"), writer)
+    writer_runtime = parameters.get("scoped_writer_runtime_seconds", 7200)
+    if (
+        isinstance(writer_runtime, bool)
+        or not isinstance(writer_runtime, int)
+        or not 120 <= writer_runtime <= 86400
+    ):
+        raise ValueError(
+            "scoped_writer_runtime_seconds must be between 120 and 86400"
+        )
+    writer_command = None
+    if writer_argv is not None:
+        writer_command = {
+            "argv_sha256": _sha(writer_argv),
+            "argc": len(writer_argv),
+            "runtime_seconds": writer_runtime,
+        }
+
+    expected = {
+        "source": {"kind": source_kind, "id": source_id},
+        "controller": {"actor": controller_actor, "role": "controller"},
+        "scoped_writer": ({"actor": writer, "role": "scoped_writer"} if writer else None),
+        "base_head": base_head,
+        "branch": branch,
+        "purpose": purpose,
+        "artifact_class": artifact_class,
+        "retention_until_unix": retention,
+        "idempotency_key": idempotency_key,
+        "system_convergence": (
+            dict(system_convergence) if system_convergence is not None else None
+        ),
+        "ttl_seconds": ttl,
+        "scoped_writer_command": writer_command,
+    }
+    stored = {key: inputs.get(key) for key in expected}
+    if stored != expected:
+        raise RuntimeError("terminal closeout parameters do not match stored work lane inputs")
+    return inputs
 
 
 def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
@@ -402,10 +499,7 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize(
-    parameters: dict[str, Any],
-    *,
-    require_fresh_retention: bool = True,
-    system_convergence_plan: Any = _SYSTEM_CONVERGENCE_PLAN_UNSET,
+    parameters: dict[str, Any], *, require_fresh_retention: bool = True
 ) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("parameters must be an object")
@@ -454,14 +548,9 @@ def _normalize(
     system_convergence = parameters.get("system_convergence")
     if system_convergence is not None and not isinstance(system_convergence, dict):
         raise ValueError("system_convergence must be an object or null")
-    if system_convergence_plan is _SYSTEM_CONVERGENCE_PLAN_UNSET:
-        normalized_system_convergence_plan = work_admission.plan_system_convergence(
-            system_convergence
-        )
-    else:
-        if not isinstance(system_convergence_plan, dict):
-            raise RuntimeError("stored system convergence plan must be an object")
-        normalized_system_convergence_plan = dict(system_convergence_plan)
+    normalized_system_convergence_plan = work_admission.plan_system_convergence(
+        system_convergence
+    )
     normalized_system_convergence = (
         dict(system_convergence) if system_convergence is not None else None
     )
@@ -1016,7 +1105,6 @@ def grabowski_work_acquire(
     terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Acquire a work lane, or persist its evidence-bound terminal closeout."""
-    operator._require_operator_mutation("resource_lease", path=target_path, repo=repo)
     parameters = {
         "source_kind": source_kind,
         "source_id": source_id,
@@ -1053,13 +1141,9 @@ def grabowski_work_acquire(
             observed = lane_closeout.LaneCloseoutObservation(**observation)
         except TypeError as exc:
             raise ValueError(f"terminal_closeout observation shape is invalid: {exc}") from exc
-        stored_plan: Any = _SYSTEM_CONVERGENCE_PLAN_UNSET
-        if system_convergence is not None:
-            stored_plan = _stored_system_convergence_plan(observed.lane_id)
-        inputs = _normalize(
-            parameters,
-            require_fresh_retention=False,
-            system_convergence_plan=stored_plan,
+        inputs = _closeout_inputs(parameters, observed.lane_id)
+        operator._require_operator_mutation(
+            "resource_lease", path=inputs["target_path"], repo=inputs["repo"]
         )
         expected_observation_identity = {
             "repository": inputs["repo"],
@@ -1091,6 +1175,7 @@ def grabowski_work_acquire(
             audit_fn=operator.base._append_audit_with_digest,
             audit_lookup_fn=_find_terminal_closeout_audit,
         )
+    operator._require_operator_mutation("resource_lease", path=target_path, repo=repo)
     operator._require_operator_capability("git_cli")
     if scoped_writer_argv is not None:
         operator._require_operator_mutation(

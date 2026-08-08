@@ -99,6 +99,10 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
         raise RuntimeError("work lane source has no terminal closeout evidence")
     closeout_state = assessment["closeout_state"]
     assessment_sha256 = assessment["assessment_sha256"]
+    audit_event = work_acquire._terminal_closeout_audit_event(record, assessment)
+    audit_record_sha256 = work_acquire._find_terminal_closeout_audit(audit_event)
+    if audit_record_sha256 is None:
+        raise RuntimeError("work lane terminal closeout audit is missing")
     return _terminal_evidence(
         {
             "schema_version": SCHEMA_VERSION,
@@ -107,6 +111,7 @@ def work_lane_terminal_evidence(source_id: str) -> dict[str, Any]:
             "terminal_state": closeout_state,
             "lane_receipt_sha256": record.get("receipt_sha256"),
             "assessment_sha256": assessment_sha256,
+            "terminal_closeout_audit_record_sha256": audit_record_sha256,
         }
     )
 
