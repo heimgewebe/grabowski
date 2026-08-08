@@ -2440,6 +2440,50 @@
   },
   "kind": "repository-operator-context",
   "operating_protocol": {
+    "authority_principle": "model_identity_does_not_grant_authority",
+    "authority_roles": {
+      "controller": {
+        "authoritative": true,
+        "may_delegate": true,
+        "owns": [
+          "planning",
+          "integration",
+          "merge",
+          "deployment",
+          "closeout"
+        ]
+      },
+      "observer": {
+        "authoritative": false,
+        "mode": "evidence",
+        "read_only": true
+      },
+      "reviewer": {
+        "authoritative": false,
+        "mode": "advisory",
+        "read_only": true
+      },
+      "scoped_writer": {
+        "allowed_effects": [
+          "implement",
+          "test",
+          "commit",
+          "push",
+          "pull_request_create_or_update"
+        ],
+        "authoritative_within_lane": true,
+        "forbidden_without_controller": [
+          "merge",
+          "deployment",
+          "bureau_terminalization"
+        ],
+        "requires": [
+          "explicit_lane",
+          "resource_scope",
+          "controller_binding"
+        ]
+      }
+    },
     "coding_agent_priority": [
       "claude",
       "codex",
@@ -2448,7 +2492,7 @@
       "openhands",
       "cline"
     ],
-    "coding_agent_priority_semantics": "legacy_name_review_and_contrast_only",
+    "coding_agent_priority_semantics": "routing_preference_not_authority",
     "control_loop": [
       "typed_grabowski_tool",
       "grabowski_micro_task",
@@ -2460,8 +2504,9 @@
       "automatic_merge",
       "automatic_push",
       "automatic_deploy",
+      "model_identity_authority",
       "free_shell_as_default_path",
-      "durable_agent_autonomy",
+      "durable_agent_autonomy_without_lane_binding",
       "reposkop_report_action_approval"
     ],
     "execution_priority": [
@@ -2473,14 +2518,11 @@
       "openhands",
       "cline"
     ],
-    "execution_priority_semantics": "authoritative_operator_then_advisory_helpers",
+    "execution_priority_semantics": "routing_preference_not_model_authority",
     "name": "Operator Relay v0",
     "operator_first_for": [
       "task_decomposition",
-      "all_code_changes",
-      "tests",
       "integration",
-      "critical_self_review",
       "merge",
       "deployment",
       "closeout",
@@ -2496,48 +2538,51 @@
     ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "chatgpt_operator_direct_external_review_or_explicit_contrast",
-      "local_micro_reasoning": "chatgpt_operator_direct",
+      "complex_code_task": "controller_or_lane_bound_scoped_writer",
+      "implementation": "controller_or_lane_bound_scoped_writer",
+      "local_micro_reasoning": "controller",
       "memory_prioritization": "bureau",
-      "patch_fallback": "chatgpt_operator_direct",
+      "patch_fallback": "controller",
       "patch_file_relay": "operator_patch_relay",
-      "quick_light_reasoning": "chatgpt_operator_direct",
+      "quick_light_reasoning": "controller",
       "repo_state_context": "reposkop_target_bound_report",
-      "security_or_architecture_review": "chatgpt_operator_plus_external_independent_review",
-      "session_resume": "chatgpt_operator_direct",
+      "security_or_architecture_review": "independent_reviewer_then_controller_verification",
+      "session_resume": "controller",
       "shell_or_git_grip": "grabowski_task"
     },
-    "rule": "ChatGPT/Grabowski performs authoritative work directly at every scale. External agents are advisory reviewers or explicitly requested isolated contrast programmers only.",
+    "rule": "Authority follows explicit controller and lane-role bindings, never model identity. The controller owns planning, integration, merge, deployment and closeout; a scoped writer may implement, test, commit, push and create or update a pull request only inside its bound lane; reviewers and observers remain read-only.",
     "workspace_execution_model": {
       "automatic_patch_apply": false,
       "automatic_winner_selection": false,
-      "capacity_fallback_to_external_writer": false,
-      "default": "direct_operator",
+      "capacity_fallback_to_external_writer": true,
+      "default": "controller_direct_or_delegated_scoped_writer",
       "delegation_triggers": [
+        "bounded_implementation_lane",
+        "disjoint_capacity_lane",
         "independent_review",
         "security_or_architecture_review",
         "explicit_contrast_request",
         "multiple_plausible_implementations_for_comparison"
       ],
       "direct_operator_for": [
-        "all_authoritative_implementation",
-        "all_reviews",
-        "all_task_sizes",
-        "runtime_or_security_change",
-        "long_or_multi_file_implementation",
-        "parallel_or_foreign_state",
-        "connector_or_execution_state_uncertainty"
+        "unscoped_or_ambiguous_work",
+        "integration",
+        "merge",
+        "deployment",
+        "closeout",
+        "recovery"
       ],
-      "external_agent_delegation": "review_or_explicit_contrast_only",
-      "external_candidate_authority": "advisory_only",
+      "external_agent_delegation": "role_bound_scoped_writer_reviewer_or_observer",
+      "external_candidate_authority": "role_dependent",
       "external_primary_reviewer_forbidden": true,
-      "external_primary_writer_forbidden": true,
+      "external_primary_writer_forbidden": false,
       "external_programming_modes": [
+        "scoped_writer",
         "competitor",
         "contrast"
       ],
       "full_workspace_for": [],
-      "lane_owner": "chatgpt_operator",
+      "lane_owner": "controller",
       "max_external_candidates": 2,
       "operator_self_serves_lanes": [
         "captain",
@@ -3287,7 +3332,7 @@
       "src/grabowski_operator.py": "8c12fc5edb3efff4368759dd727b10d0709c471d600382d9ddbc67ad2e2da68c",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
-      "src/grabowski_operator_relay.py": "3f314d82bb6c3c7b91eff774b487088e25ec44372512d50936eb18f199eaa02c",
+      "src/grabowski_operator_relay.py": "2b2516dd095eddbed08f46d6b9661248efad8a8846777bef5bad802c9491cc59",
       "src/grabowski_operator_routing_shadow_capture.py": "1fa2d18cd459873eab3a2535b6e48df5363ae151a24914fbd7693020c29da5b0",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
