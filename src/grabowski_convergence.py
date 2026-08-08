@@ -712,6 +712,28 @@ def assess(
             raise ConvergenceExecutionError(
                 "convergence runtime bundle identity changed during evaluation"
             )
+        if assessment["profile_sha256"] != bundle["profile_sha256"]:
+            raise ConvergenceExecutionError(
+                "convergence evaluator profile SHA-256 does not match bundled resilience profile"
+            )
+        if assessment["schema_version"] == 2:
+            profile = bundle["profile"]
+            if assessment["profile_id"] != profile["profile_id"]:
+                raise ConvergenceExecutionError(
+                    "convergence evaluator profile id does not match bundled resilience profile"
+                )
+            matching_cells = [
+                cell
+                for cell in profile["cells"]
+                if isinstance(cell, dict)
+                and cell.get("cell_id") == assessment["profile_cell_id"]
+                and cell.get("change_risk") == assessment["change_risk"]
+                and cell.get("target_criticality") == assessment["target_criticality"]
+            ]
+            if len(matching_cells) != 1:
+                raise ConvergenceExecutionError(
+                    "convergence evaluator profile cell does not match bundled resilience profile"
+                )
     else:
         assert repo is not None
         post_head, post_executable_sha256 = _validate_protocol_identity(

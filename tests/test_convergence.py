@@ -75,7 +75,15 @@ class FakeRunner:
 
 
 class ConvergenceTests(unittest.TestCase):
-    def _bundle(self, root: Path, head: str, cells: list[dict[str, object]] | None = None):
+    def _bundle(
+        self,
+        root: Path,
+        head: str,
+        cells: list[dict[str, object]] | None = None,
+        *,
+        assessment_profile_sha256: str | None = None,
+        assessment_profile_cell_id: str = "R2-foundational",
+    ):
         bundle_root = root / "bundles"
         bundle_dir = bundle_root / head
         bundle_dir.mkdir(parents=True)
@@ -100,10 +108,12 @@ class ConvergenceTests(unittest.TestCase):
         profile_bytes = json.dumps(
             profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
+        profile_sha256 = hashlib.sha256(profile_bytes).hexdigest()
+        evaluator_profile_sha256 = assessment_profile_sha256 or profile_sha256
         cli = (
             "import json\n"
             "def main():\n"
-            "    value = {\"assessment_id\": \"bundle-test\", \"blocked_by\": [], \"conflicts\": [], \"missing_evidence\": [], \"profile_sha256\": \"b\" * 64, \"schema_version\": 2, \"status\": \"terminally_closed\", \"change_risk\": \"R2\", \"target_criticality\": \"foundational\", \"profile_id\": \"resilience-matrix-v2\", \"profile_cell_id\": \"R2-foundational\"}\n"
+            f"    value = {{\"assessment_id\": \"bundle-test\", \"blocked_by\": [], \"conflicts\": [], \"missing_evidence\": [], \"profile_sha256\": \"{evaluator_profile_sha256}\", \"schema_version\": 2, \"status\": \"terminally_closed\", \"change_risk\": \"R2\", \"target_criticality\": \"foundational\", \"profile_id\": \"resilience-matrix-v2\", \"profile_cell_id\": \"{assessment_profile_cell_id}\"}}\n"
             "    print(json.dumps(value, sort_keys=True))\n"
             "    return 0\n"
             "if __name__ == \"__main__\":\n"
@@ -122,7 +132,7 @@ class ConvergenceTests(unittest.TestCase):
             "wheel_filename": wheel.name,
             "wheel_sha256": hashlib.sha256(wheel_bytes).hexdigest(),
             "profile_member": convergence.RESILIENCE_PROFILE_MEMBER,
-            "profile_sha256": hashlib.sha256(profile_bytes).hexdigest(),
+            "profile_sha256": profile_sha256,
         }
         (bundle_dir / "manifest.json").write_text(
             json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
@@ -301,6 +311,68 @@ class ConvergenceTests(unittest.TestCase):
         self.assertEqual(result["protocol_head"], head)
         self.assertRegex(result["bundle_identity_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(result["contracts_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_immutable_bundle_rejects_assessment_from_different_profile(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        head = "c" * 40
+        bundle_root, _manifest = self._bundle(
+            root,
+            head,
+            assessment_profile_sha256="b" * 64,
+        )
+        request = root / "request.json"
+        request.write_text("{}\n", encoding="utf-8")
+        digest = hashlib.sha256(request.read_bytes()).hexdigest()
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_CONVERGENCE_BUNDLE_ROOT": str(bundle_root)},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                convergence.ConvergenceExecutionError,
+                "profile SHA-256 does not match",
+            ):
+                convergence.assess(
+                    {
+                        "request_path": str(request),
+                        "expected_request_sha256": digest,
+                        "expected_protocol_head": head,
+                    },
+                    FakeRunner(head=head),
+                )
+
+    def test_immutable_bundle_rejects_assessment_from_wrong_profile_cell(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        head = "c" * 40
+        bundle_root, _manifest = self._bundle(
+            root,
+            head,
+            assessment_profile_cell_id="R2-other",
+        )
+        request = root / "request.json"
+        request.write_text("{}\n", encoding="utf-8")
+        digest = hashlib.sha256(request.read_bytes()).hexdigest()
+        with patch.dict(
+            os.environ,
+            {"GRABOWSKI_CONVERGENCE_BUNDLE_ROOT": str(bundle_root)},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                convergence.ConvergenceExecutionError,
+                "profile cell does not match",
+            ):
+                convergence.assess(
+                    {
+                        "request_path": str(request),
+                        "expected_request_sha256": digest,
+                        "expected_protocol_head": head,
+                    },
+                    FakeRunner(head=head),
+                )
 
     def test_bundle_root_final_symlink_is_rejected(self):
         temporary = tempfile.TemporaryDirectory()
