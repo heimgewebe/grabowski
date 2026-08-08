@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -11,6 +12,7 @@ if str(SRC) not in sys.path:
 
 import grabowski_lane_closeout as closeout
 import grabowski_lane_rescue as rescue
+import grabowski_work_acquire as work_acquire
 
 
 BASE = "a" * 40
@@ -228,6 +230,7 @@ class LaneRescueTests(unittest.TestCase):
         )
         receipt = {
             "lane_id": lane_id,
+            "receipt_sha256": "d" * 64,
             "inputs": {
                 "repo": "/tmp/repo",
                 "target_path": "/tmp/lane",
@@ -235,19 +238,85 @@ class LaneRescueTests(unittest.TestCase):
                 "base_head": BASE,
             },
             "terminal_closeout": {
-                "schema_version": 1, "kind": "grabowski.work_lane_terminal_closeout",
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
                 "closeout_state": terminal["closeout_state"],
-                "assessment_sha256": terminal["assessment_sha256"], "assessment": terminal,
+                "assessment_sha256": terminal["assessment_sha256"],
+                "expected_receipt_sha256": "e" * 64,
+                "assessment": terminal,
             },
         }
-        plan = rescue.build_plan(
-            observation(lane_id=lane_id, git_dirty=True, ahead_commits=2, remote_head_sha=BASE),
-            lane_owner_id=OWNER, requesting_owner_id=OWNER, resource_keys=RESOURCES,
-            lane_receipt_reader=lambda _: receipt,
-        )
+        with patch.object(
+            work_acquire, "_find_terminal_closeout_audit", return_value="f" * 64
+        ) as audit_lookup:
+            plan = rescue.build_plan(
+                observation(
+                    lane_id=lane_id,
+                    git_dirty=True,
+                    ahead_commits=2,
+                    remote_head_sha=BASE,
+                ),
+                lane_owner_id=OWNER,
+                requesting_owner_id=OWNER,
+                resource_keys=RESOURCES,
+                lane_receipt_reader=lambda _: receipt,
+            )
+        audit_lookup.assert_called_once()
         self.assertEqual(plan["mode"], "terminal")
         self.assertEqual(plan["assessment_sha256"], terminal["assessment_sha256"])
         self.assertEqual(plan["actions"], [])
+
+    def test_recovery_rejects_persisted_terminal_truth_without_audit(self) -> None:
+        lane_id = "f" * 32
+        terminal = closeout.assess(
+            observation(
+                lane_id=lane_id,
+                head_sha=BASE,
+                remote_head_sha=BASE,
+                no_change_proven=True,
+            ),
+            observed_at_unix=200,
+        )
+        receipt = {
+            "lane_id": lane_id,
+            "receipt_sha256": "d" * 64,
+            "inputs": {
+                "repo": "/tmp/repo",
+                "target_path": "/tmp/lane",
+                "branch": "feat/test",
+                "base_head": BASE,
+            },
+            "terminal_closeout": {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": terminal["closeout_state"],
+                "assessment_sha256": terminal["assessment_sha256"],
+                "expected_receipt_sha256": "e" * 64,
+                "assessment": terminal,
+            },
+        }
+        with (
+            patch.object(
+                work_acquire, "_find_terminal_closeout_audit", return_value=None
+            ) as audit_lookup,
+            self.assertRaisesRegex(
+                rescue.LaneRescueError,
+                "terminal closeout audit is missing; retry terminal closeout",
+            ),
+        ):
+            rescue.build_plan(
+                observation(
+                    lane_id=lane_id,
+                    git_dirty=True,
+                    ahead_commits=2,
+                    remote_head_sha=BASE,
+                ),
+                lane_owner_id=OWNER,
+                requesting_owner_id=OWNER,
+                resource_keys=RESOURCES,
+                lane_receipt_reader=lambda _: receipt,
+            )
+        audit_lookup.assert_called_once()
 
     def test_recovery_rejects_persisted_terminal_truth_from_other_identity(self) -> None:
         lane_id = "f" * 32
@@ -262,6 +331,7 @@ class LaneRescueTests(unittest.TestCase):
         )
         receipt = {
             "lane_id": lane_id,
+            "receipt_sha256": "d" * 64,
             "inputs": {
                 "repo": "/tmp/repo",
                 "target_path": "/tmp/lane",
@@ -273,6 +343,7 @@ class LaneRescueTests(unittest.TestCase):
                 "kind": "grabowski.work_lane_terminal_closeout",
                 "closeout_state": terminal["closeout_state"],
                 "assessment_sha256": terminal["assessment_sha256"],
+                "expected_receipt_sha256": "e" * 64,
                 "assessment": terminal,
             },
         }
@@ -283,9 +354,12 @@ class LaneRescueTests(unittest.TestCase):
             "base_revision": "c" * 40,
         }
         for field, value in mismatches.items():
-            with self.subTest(field=field), self.assertRaisesRegex(
-                rescue.LaneRescueInputError,
-                "persisted lane receipt identity does not match observation",
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    rescue.LaneRescueInputError,
+                    "persisted lane receipt identity does not match observation",
+                ),
             ):
                 rescue.build_plan(
                     observation(lane_id=lane_id, **{field: value}),
