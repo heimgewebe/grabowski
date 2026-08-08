@@ -607,6 +607,20 @@ def _event_haystack(event: dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
+def _has_positive_term(haystack: str, terms: frozenset[str]) -> bool:
+    """Return true for a matched signal unless its local wording negates it."""
+    for term in terms:
+        for match in re.finditer(re.escape(term), haystack):
+            prefix = haystack[max(0, match.start() - 48):match.start()]
+            if re.search(
+                r"(?:\bnot\b|\bno\b|\bnever\b|\bisn't\b|\bwasn't\b|\bwithout\b)(?:\W+\w+){0,2}\W*$",
+                prefix,
+            ):
+                continue
+            return True
+    return False
+
+
 def _bounded_event(event: dict[str, Any]) -> dict[str, Any]:
     notes = event.get("notes")
     closeout = event.get("closeout") if isinstance(event.get("closeout"), dict) else None
@@ -1452,9 +1466,9 @@ def classify_friction_event(event: dict[str, Any]) -> str:
     if not isinstance(event, dict):
         return "unknown"
     haystack = _event_haystack(event)
-    if any(term in haystack for term in SUPERSEDED_TERMS):
+    if _has_positive_term(haystack, SUPERSEDED_TERMS):
         return "superseded"
-    if any(term in haystack for term in EXPECTED_RED_PHASE_TERMS):
+    if _has_positive_term(haystack, EXPECTED_RED_PHASE_TERMS):
         return "expected_red_phase"
     if _looks_like_connector_transport(event, haystack):
         return "connector_transport"
