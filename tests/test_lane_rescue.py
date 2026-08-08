@@ -226,11 +226,20 @@ class LaneRescueTests(unittest.TestCase):
             observation(lane_id=lane_id, head_sha=BASE, remote_head_sha=BASE, no_change_proven=True),
             observed_at_unix=200,
         )
-        receipt = {"lane_id": lane_id, "terminal_closeout": {
-            "schema_version": 1, "kind": "grabowski.work_lane_terminal_closeout",
-            "closeout_state": terminal["closeout_state"],
-            "assessment_sha256": terminal["assessment_sha256"], "assessment": terminal,
-        }}
+        receipt = {
+            "lane_id": lane_id,
+            "inputs": {
+                "repo": "/tmp/repo",
+                "target_path": "/tmp/lane",
+                "branch": "feat/test",
+                "base_head": BASE,
+            },
+            "terminal_closeout": {
+                "schema_version": 1, "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": terminal["closeout_state"],
+                "assessment_sha256": terminal["assessment_sha256"], "assessment": terminal,
+            },
+        }
         plan = rescue.build_plan(
             observation(lane_id=lane_id, git_dirty=True, ahead_commits=2, remote_head_sha=BASE),
             lane_owner_id=OWNER, requesting_owner_id=OWNER, resource_keys=RESOURCES,
@@ -239,6 +248,52 @@ class LaneRescueTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "terminal")
         self.assertEqual(plan["assessment_sha256"], terminal["assessment_sha256"])
         self.assertEqual(plan["actions"], [])
+
+    def test_recovery_rejects_persisted_terminal_truth_from_other_identity(self) -> None:
+        lane_id = "f" * 32
+        terminal = closeout.assess(
+            observation(
+                lane_id=lane_id,
+                head_sha=BASE,
+                remote_head_sha=BASE,
+                no_change_proven=True,
+            ),
+            observed_at_unix=200,
+        )
+        receipt = {
+            "lane_id": lane_id,
+            "inputs": {
+                "repo": "/tmp/repo",
+                "target_path": "/tmp/lane",
+                "branch": "feat/test",
+                "base_head": BASE,
+            },
+            "terminal_closeout": {
+                "schema_version": 1,
+                "kind": "grabowski.work_lane_terminal_closeout",
+                "closeout_state": terminal["closeout_state"],
+                "assessment_sha256": terminal["assessment_sha256"],
+                "assessment": terminal,
+            },
+        }
+        mismatches = {
+            "repository": "/tmp/other-repo",
+            "workspace": "/tmp/other-lane",
+            "branch": "feat/other",
+            "base_revision": "c" * 40,
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field), self.assertRaisesRegex(
+                rescue.LaneRescueInputError,
+                "persisted lane receipt identity does not match observation",
+            ):
+                rescue.build_plan(
+                    observation(lane_id=lane_id, **{field: value}),
+                    lane_owner_id=OWNER,
+                    requesting_owner_id=OWNER,
+                    resource_keys=RESOURCES,
+                    lane_receipt_reader=lambda _: receipt,
+                )
 
     def test_owner_mismatch_is_rejected(self) -> None:
         with self.assertRaisesRegex(rescue.LaneRescueInputError, "does not match"):

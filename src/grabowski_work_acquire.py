@@ -184,7 +184,11 @@ def _text(value: Any, label: str, *, pattern: re.Pattern[str] | None = None) -> 
 
 
 def persist_terminal_closeout(
-    lane_id: str, assessment: dict[str, Any], *, expected_receipt_sha256: str
+    lane_id: str,
+    assessment: dict[str, Any],
+    *,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """CAS-persist one terminal assessment into the existing lane receipt."""
     _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
@@ -211,7 +215,20 @@ def persist_terminal_closeout(
         if record.get("receipt_sha256") != expected_receipt_sha256:
             raise RuntimeError("work-lane terminal closeout CAS preimage changed")
         stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
-        return {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
+        result = {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
+        if audit_fn is not None:
+            audit_fn(
+                {
+                    "operation": "work-lane-terminal-closeout",
+                    "lane_id": lane_id,
+                    "state": "persisted",
+                    "closeout_state": validated["closeout_state"],
+                    "assessment_sha256": validated["assessment_sha256"],
+                    "receipt_sha256": stored["receipt_sha256"],
+                    "expected_receipt_sha256": expected_receipt_sha256,
+                }
+            )
+        return result
 
 
 def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
@@ -960,6 +977,7 @@ def grabowski_work_acquire(
             inputs["lane_id"],
             assessment,
             expected_receipt_sha256=terminal_closeout["expected_receipt_sha256"],
+            audit_fn=operator.base._append_audit,
         )
     operator._require_operator_capability("git_cli")
     if scoped_writer_argv is not None:

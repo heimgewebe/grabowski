@@ -633,22 +633,34 @@ class WorkAcquireTests(unittest.TestCase):
             }), runner=Mock(),
         )
         assessment = self.terminal_assessment(first["lane_id"], 200)
+        audit = Mock()
         stored = work_acquire.persist_terminal_closeout(
-            first["lane_id"], assessment, expected_receipt_sha256=first["receipt_sha256"]
+            first["lane_id"], assessment,
+            expected_receipt_sha256=first["receipt_sha256"], audit_fn=audit,
         )
         self.assertFalse(stored["replayed"])
         self.assertEqual(stored["terminal_closeout"]["assessment_sha256"], assessment["assessment_sha256"])
+        audit.assert_called_once()
+        audit_record = audit.call_args.args[0]
+        self.assertEqual(audit_record["operation"], "work-lane-terminal-closeout")
+        self.assertEqual(audit_record["lane_id"], first["lane_id"])
+        self.assertEqual(audit_record["assessment_sha256"], assessment["assessment_sha256"])
+        self.assertEqual(audit_record["receipt_sha256"], stored["receipt_sha256"])
+        self.assertEqual(audit_record["expected_receipt_sha256"], first["receipt_sha256"])
         self.assertTrue(work_acquire.persist_terminal_closeout(
-            first["lane_id"], assessment, expected_receipt_sha256=first["receipt_sha256"]
+            first["lane_id"], assessment,
+            expected_receipt_sha256=first["receipt_sha256"], audit_fn=audit,
         )["replayed"])
+        audit.assert_called_once()
         later_same_observation = self.terminal_assessment(first["lane_id"], 201)
         self.assertNotEqual(
             assessment["assessment_sha256"], later_same_observation["assessment_sha256"]
         )
         self.assertTrue(work_acquire.persist_terminal_closeout(
             first["lane_id"], later_same_observation,
-            expected_receipt_sha256=first["receipt_sha256"],
+            expected_receipt_sha256=first["receipt_sha256"], audit_fn=audit,
         )["replayed"])
+        audit.assert_called_once()
         competing = closeout.assess(closeout.LaneCloseoutObservation(
             lane_id=first["lane_id"], repository=str(self.repo), workspace=str(self.target),
             branch="feat/authority-p0", base_revision=SHA, writer_state="completed",
@@ -829,6 +841,7 @@ class WorkAcquireTests(unittest.TestCase):
         capability.assert_not_called()
         self.assertEqual(persist.call_args.args[0], lane_id)
         self.assertEqual(persist.call_args.kwargs["expected_receipt_sha256"], "e" * 64)
+        self.assertIs(persist.call_args.kwargs["audit_fn"], work_acquire.operator.base._append_audit)
 
     def test_mcp_entry_binds_audit_to_runtime_base(self) -> None:
         params = self.parameters()

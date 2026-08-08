@@ -92,6 +92,25 @@ def _lane_assessment(
                 raise LaneRescueInputError("persisted lane receipt is bound to another lane")
             terminal = work_acquire._terminal_closeout_assessment(dict(record))
             if terminal is not None:
+                inputs = record.get("inputs")
+                if not isinstance(inputs, Mapping):
+                    raise LaneRescueInputError("persisted lane receipt inputs are missing")
+                expected_identity = {
+                    "repository": inputs.get("repo"),
+                    "workspace": inputs.get("target_path"),
+                    "branch": inputs.get("branch"),
+                    "base_revision": inputs.get("base_head"),
+                }
+                observed_identity = {
+                    "repository": observation.repository,
+                    "workspace": observation.workspace,
+                    "branch": observation.branch,
+                    "base_revision": observation.base_revision,
+                }
+                if observed_identity != expected_identity:
+                    raise LaneRescueInputError(
+                        "persisted lane receipt identity does not match observation"
+                    )
                 return terminal
     return closeout.classify(observation)
 
