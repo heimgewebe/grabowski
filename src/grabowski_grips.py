@@ -686,6 +686,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 # Conditional requirements cannot be expressed as static required_parameters,
 # so the published contract carries them explicitly per action.
 GRIP_CONDITIONAL_PRECONDITIONS = {
+    "work-acquire": (
+        "source_kind must be one of bureau_task, github_issue, operator_obligation, thread_focus; "
+        "other source kinds have no immutable terminal evidence observer and are rejected before checkout creation",
+    ),
     "transport-roundtrip": (
         "action=begin requires target_tool_name and target_arguments together; "
         "an unbound begin is refused fail-closed",

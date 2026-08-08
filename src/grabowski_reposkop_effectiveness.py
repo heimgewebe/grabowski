@@ -223,8 +223,8 @@ def select_prospective_policy(
 ) -> dict[str, Any]:
     """Select one deterministic v3 sample/control cohort after repository admission.
 
-    Only workspace-scoped local writers with a separately verified broad-repository
-    admission are eligible for the control arm. Everything else retains the
+    Only workspace-scoped local writers with a separately verified repository
+    admission for their exact checkout are eligible for the control arm. Everything else retains the
     fail-closed required posture selected by ``classify_task_effect``.
     """
     if not isinstance(classification, dict):

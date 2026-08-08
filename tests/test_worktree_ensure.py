@@ -187,6 +187,36 @@ class WorktreeEnsureTests(unittest.TestCase):
             self._ensure(parameters)
         self.assertFalse(Path(str(parameters["target_path"])).exists())
 
+
+    def test_work_lane_source_is_accepted_as_terminal_evidence_capable(self) -> None:
+        parameters = self._parameters(
+            key="work-lane-source",
+            branch="feat/work-lane-source",
+            target=self.worktree_root / "work-lane-source",
+        )
+        parameters["source_kind"] = "work_lane"
+        parameters["source_id"] = "a" * 32
+        created = self._ensure(parameters)
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertEqual(created["lifecycle"]["source"], {"kind": "work_lane", "id": "a" * 32})
+
+    def test_real_git_toplevel_output_with_trailing_newline_is_accepted(self) -> None:
+        parameters = self._parameters(
+            key="real-git-root-newline",
+            branch="feat/real-git-root-newline",
+            target=self.worktree_root / "real-git-root-newline",
+        )
+
+        def newline_runner(repo: Path, argv: list[str]) -> dict[str, object]:
+            result = dict(grips._default_command_runner(repo, argv))
+            if argv == ["rev-parse", "--show-toplevel"] and result.get("returncode") == 0:
+                result["stdout"] = str(result.get("stdout", "")).rstrip("\n") + "\n"
+            return result
+
+        created = self._ensure(parameters, runner=newline_runner)
+        self.assertEqual(created["result_state"], "CREATED")
+        self.assertTrue(Path(str(parameters["target_path"])).is_dir())
+
     def test_active_limit_blocks_new_growth_without_deleting_existing_checkout(self) -> None:
         first = self._parameters(
             key="limit-first",
@@ -772,6 +802,78 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertIs(calls[0]["reposkop_required"], True)
         self.assertIs(result["work_admission"]["evidence_mutation_only"], True)
         self.assertIs(result["work_admission"]["read_only"], False)
+
+    def test_system_convergence_context_reaches_work_admission_with_lane_plan_binding(self) -> None:
+        parameters = self._parameters(
+            key="system-convergence-bound",
+            branch="feat/system-convergence-bound",
+            target=self.worktree_root / "system-convergence-bound",
+        )
+        context = {
+            "change_risk": "R2",
+            "target_criticality": "essential",
+            "expected_protocol_head": "d" * 40,
+        }
+        plan_sha256 = "f" * 64
+        parameters["system_convergence"] = context
+        parameters["system_convergence_plan_sha256"] = plan_sha256
+        calls: list[dict[str, object]] = []
+
+        def assessor(**kwargs: object) -> dict[str, object]:
+            calls.append(dict(kwargs))
+            return {
+                "schema_version": 1,
+                "kind": "grabowski.repository_work_admission",
+                "repository": str(self.repo.resolve()),
+                "operation": "worktree_create",
+                "decision": "allow",
+                "blocker_codes": [],
+                "blockers": [],
+                "read_only": True,
+                "system_convergence_plan": {"plan_sha256": plan_sha256},
+                "assessment_sha256": "a" * 64,
+            }
+
+        result = self._ensure(parameters, assess_admission=assessor)
+
+        self.assertEqual(result["result_state"], "CREATED")
+        self.assertEqual(calls[0]["system_convergence"], context)
+        self.assertEqual(
+            result["work_admission"]["system_convergence_plan"]["plan_sha256"],
+            plan_sha256,
+        )
+        receipt = json.loads(Path(result["durable_receipt_path"]).read_text())
+        self.assertEqual(receipt["inputs"]["system_convergence"], context)
+        self.assertEqual(
+            receipt["inputs"]["system_convergence_plan_sha256"], plan_sha256
+        )
+
+    def test_system_convergence_plan_hash_mismatch_blocks_before_git_mutation(self) -> None:
+        parameters = self._parameters(
+            key="system-convergence-mismatch",
+            branch="feat/system-convergence-mismatch",
+            target=self.worktree_root / "system-convergence-mismatch",
+        )
+        parameters["system_convergence"] = {
+            "change_risk": "R2",
+            "target_criticality": "essential",
+            "expected_protocol_head": "d" * 40,
+        }
+        parameters["system_convergence_plan_sha256"] = "f" * 64
+
+        def assessor(**_kwargs: object) -> dict[str, object]:
+            return {
+                "decision": "allow",
+                "system_convergence_plan": {"plan_sha256": "e" * 64},
+            }
+
+        with self.assertRaisesRegex(
+            worktree_ensure.WorktreeEnsurePreflight,
+            "plan binding mismatch",
+        ):
+            self._ensure(parameters, assess_admission=assessor)
+        self.assertFalse(Path(str(parameters["target_path"])).exists())
+        self.assertEqual(list(self.receipt_root.glob("*.json")), [])
 
     def test_required_reposkop_rejects_incompatible_injected_assessor(self) -> None:
         parameters = self._parameters(

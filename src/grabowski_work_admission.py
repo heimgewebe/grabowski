@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Callable
 
+import grabowski_convergence as convergence
 import grabowski_nonconflict as nonconflict
 
 SCHEMA_VERSION = 1
@@ -17,6 +18,7 @@ MAX_RECONCILIATIONS = 100
 InventoryLoader = Callable[[str], dict[str, Any]]
 ReconciliationLoader = Callable[[str], dict[str, Any]]
 ReposkopContextLoader = Callable[[str, str], dict[str, Any]]
+ConvergencePlanner = Callable[[dict[str, Any] | None], dict[str, Any]]
 
 CONVERGENCE_STATES = frozenset(
     {
@@ -49,6 +51,11 @@ HARD_BLOCK_CODES = frozenset(
         "bounded-reconciliation-exceeded",
         "lifecycle-owner-ambiguous",
         "reposkop-context-unavailable",
+        "target-checkout-unobservable",
+        "target-checkout-main",
+        "target-checkout-detached",
+        "target-branch-mismatch",
+        "target-head-mismatch",
     }
 )
 SOURCE_CACHE_ROOT_NAMES = frozenset({".repobrief-sources", ".repoground-sources"})
@@ -57,7 +64,12 @@ SOURCE_CACHE_OWNER_PREFIXES = (
     "system:repoground-source-cache:",
 )
 SCOPED_CHECKOUT_OPERATIONS = frozenset(
-    {"worktree_create", "agent_workspace_create", "broad_repository_lease"}
+    {
+        "worktree_create",
+        "agent_workspace_create",
+        "broad_repository_lease",
+        "task_existing_checkout",
+    }
 )
 
 
@@ -74,6 +86,51 @@ def _canonical_json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def plan_system_convergence(
+    context: dict[str, Any] | None,
+    *,
+    planner: ConvergencePlanner | None = None,
+) -> dict[str, Any]:
+    try:
+        return (planner or convergence.build_system_convergence_plan)(context)
+    except convergence.ConvergenceExecutionError as exc:
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski.system_convergence_plan",
+            "status": "unavailable",
+            "change_risk": (context or {}).get("change_risk") if isinstance(context, dict) else None,
+            "target_criticality": (context or {}).get("target_criticality") if isinstance(context, dict) else None,
+            "protocol_head": (context or {}).get("expected_protocol_head") if isinstance(context, dict) else None,
+            "profile_id": None,
+            "profile_cell_id": None,
+            "profile_sha256": None,
+            "protocol_source": None,
+            "required_effects": [],
+            "required_verifications": [],
+            "required_closure_fields": [],
+            "requires_resilience_evidence": None,
+            "requires_independent_recovery": None,
+            "systemic_closure_gate": "unavailable",
+            "hard_gate_required": None,
+            "criticality_resolution_required": bool(
+                isinstance(context, dict)
+                and context.get("change_risk") in {"R2", "R3"}
+                and context.get("target_criticality") == "unknown"
+            ),
+            "admission_blocking": False,
+            "planning_error": f"{type(exc).__name__}: {exc}"[:2048],
+            "next_action": "restore the pinned convergence bundle before claiming systemic convergence",
+            "does_not_establish": [
+                "task state",
+                "execution authority",
+                "merge authorization",
+                "deployment truth",
+                "systemic convergence",
+            ],
+        }
+        return {**material, "plan_sha256": _digest(material)}
 
 
 def _default_inventory(repo: str) -> dict[str, Any]:
@@ -505,8 +562,26 @@ def _exact_checkout_scope(
         scope_target = scope_contract["worktree"]
         scope_branch = scope_contract["branch"]
     else:
-        scope_target = target_path
-        scope_branch = branch
+        if operation == "task_existing_checkout":
+            required_keys = {
+                "schema_version",
+                "repository",
+                "worktree",
+                "head",
+                "branch",
+                "resource_keys",
+            }
+            if (
+                set(scope_contract) != required_keys
+                or scope_contract.get("schema_version") != 1
+                or scope_contract.get("repository") != repository
+            ):
+                return None
+            scope_target = scope_contract.get("worktree")
+            scope_branch = scope_contract.get("branch")
+        else:
+            scope_target = target_path
+            scope_branch = branch
 
     if (
         not isinstance(scope_branch, str)
@@ -541,6 +616,29 @@ def _exact_checkout_scope(
             )
         ):
             return None
+    elif operation == "task_existing_checkout":
+        head = scope_contract.get("head")
+        resource_keys = scope_contract.get("resource_keys")
+        if (
+            not isinstance(head, str)
+            or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None
+            or set(head) == {"0"}
+            or not isinstance(resource_keys, list)
+            or not resource_keys
+            or any(not isinstance(value, str) or not value for value in resource_keys)
+        ):
+            return None
+        required_resource_keys = {
+            f"path:{canonical_target}",
+            f"repo:{repository}:branch:{scope_branch}",
+        }
+        if not required_resource_keys.issubset(set(resource_keys)):
+            return None
+        return {
+            "target_path": canonical_target,
+            "branch": scope_branch,
+            "head": head,
+        }
 
     return {"target_path": canonical_target, "branch": scope_branch}
 
@@ -698,12 +796,17 @@ def assess_repository_admission(
     source_id: str | None = None,
     inventory_loader: InventoryLoader | None = None,
     reconciliation_loader: ReconciliationLoader | None = None,
+    system_convergence: dict[str, Any] | None = None,
+    convergence_planner: ConvergencePlanner | None = None,
 ) -> dict[str, Any]:
     repository = str(Path(repo).expanduser().resolve(strict=True))
     if not isinstance(owner_id, str) or not owner_id:
         raise ValueError("owner_id must be a non-empty string")
     if not isinstance(operation, str) or not operation:
         raise ValueError("operation must be a non-empty string")
+    system_convergence_plan = plan_system_convergence(
+        system_convergence, planner=convergence_planner
+    )
     exact_checkout_scope = _exact_checkout_scope(
         repository=repository,
         operation=operation,
@@ -769,6 +872,8 @@ def assess_repository_admission(
         )
         worktrees = worktrees[:MAX_WORKTREES]
 
+    task_existing_target_count = 0
+
     if not isinstance(bindings, list):
         blockers.append(
             {"code": "reconciliation-unobservable", "detail": "binding reconciliation is unavailable"}
@@ -821,6 +926,37 @@ def assess_repository_admission(
         )
         status = item.get("status") if isinstance(item.get("status"), dict) else {}
         dirty = status.get("dirty")
+        task_existing_target = bool(
+            operation == "task_existing_checkout"
+            and exact_checkout_scope is not None
+            and effective_target_path is not None
+            and _same_checkout_path(path, effective_target_path)
+        )
+        if task_existing_target:
+            task_existing_target_count += 1
+            expected_head = exact_checkout_scope.get("head")
+            if item.get("is_main") is True:
+                blockers.append({"code": "target-checkout-main", "path": path})
+            if item.get("detached") is True or not isinstance(item.get("branch"), str):
+                blockers.append({"code": "target-checkout-detached", "path": path})
+            if item.get("branch") != effective_branch:
+                blockers.append(
+                    {
+                        "code": "target-branch-mismatch",
+                        "path": path,
+                        "expected_branch": effective_branch,
+                        "observed_branch": item.get("branch"),
+                    }
+                )
+            if item.get("head") != expected_head:
+                blockers.append(
+                    {
+                        "code": "target-head-mismatch",
+                        "path": path,
+                        "expected_head": expected_head,
+                        "observed_head": item.get("head"),
+                    }
+                )
         if scope_relevant:
             if dirty is True:
                 blockers.append({"code": "dirty-worktree", "path": path})
@@ -844,7 +980,7 @@ def assess_repository_admission(
         lifecycle_owner = (
             next(iter(lifecycle_owners)) if len(lifecycle_owners) == 1 else None
         )
-        requested_target_checkout = (
+        requested_target_checkout = task_existing_target or (
             source_kind == "expired_same_owner_lease"
             and isinstance(source_id, str)
             and len(source_id) == 64
@@ -936,6 +1072,15 @@ def assess_repository_admission(
                 }
             )
 
+    if operation == "task_existing_checkout" and task_existing_target_count != 1:
+        blockers.append(
+            {
+                "code": "target-checkout-unobservable",
+                "detail": "exact existing checkout must resolve to exactly one inventory row",
+                "path": effective_target_path,
+            }
+        )
+
     for row in bindings:
         if not isinstance(row, dict):
             blockers.append(
@@ -978,6 +1123,7 @@ def assess_repository_admission(
         "target_path": target_path,
         "branch": branch,
         "source": {"kind": source_kind, "id": source_id},
+        "system_convergence_plan": system_convergence_plan,
         "decision": decision,
         "blocker_codes": blocker_codes,
         "blockers": blockers,
@@ -1001,6 +1147,7 @@ def assess_repository_admission(
             "permission to override foreign ownership",
             "global one-lane serialization for exact disjoint resource keys",
             "absence of later semantic or merge conflicts between isolated branches",
+            "systemic convergence completion",
         ],
     }
     return {**material, "assessment_sha256": _digest(material)}

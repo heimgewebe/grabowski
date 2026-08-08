@@ -496,6 +496,28 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "effects": ["device-job-execute", "device-state-change", "receipt-create"],
         "reversibility": "job-dependent-with-local-stop-switch",
     },
+    "ipad_bluetooth_scan": {
+        "category": "device-worker",
+        "purpose": "Scan bounded nearby BLE advertisements through the paired Juno iPad.",
+        "risk_class": "medium",
+        "effects": ["device-job-execute", "device-bluetooth-scan", "receipt-create"],
+        "reversibility": "not-applicable-device-job-and-receipt-retained",
+    },
+    "ipad_bluetooth_inspect": {
+        "category": "device-worker",
+        "purpose": (
+            "Connect temporarily to one exact BLE identifier and enumerate GATT service "
+            "and characteristic metadata without value reads, writes, subscriptions or pairing."
+        ),
+        "risk_class": "medium",
+        "effects": [
+            "device-job-execute",
+            "device-bluetooth-connect",
+            "device-gatt-metadata-read",
+            "receipt-create",
+        ],
+        "reversibility": "temporary-connection-explicitly-disconnected",
+    },
     "ipad_native_permission_status": {
         "category": "device-worker",
         "purpose": "Read bounded native iPad permission states without reading private content.",

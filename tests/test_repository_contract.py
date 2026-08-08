@@ -98,10 +98,13 @@ class RepositoryContractTests(unittest.TestCase):
             '"routing_roles"',
             '"execution_priority"',
             '"chatgpt_operator"',
-            '"external_programming_modes": ["competitor", "contrast"]',
-            '"external_primary_writer_forbidden": True',
+            '"authority_principle": "model_identity_does_not_grant_authority"',
+            '"authority_roles"',
+            '"scoped_writer"',
+            '"external_programming_modes": ["scoped_writer", "competitor", "contrast"]',
+            '"external_primary_writer_forbidden": False',
             '"external_primary_reviewer_forbidden": True',
-            '"capacity_fallback_to_external_writer": False',
+            '"capacity_fallback_to_external_writer": True',
             '"automatic_winner_selection": False',
             '"cline"',
             '"operator_patch_relay"',
@@ -179,12 +182,14 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 189)
+        self.assertEqual(len(tools), 191)
         self.assertTrue(
             {
                 "grabowski_juno_status",
                 "grabowski_juno_pair",
                 "grabowski_juno_run",
+                "ipad_bluetooth_scan",
+                "ipad_bluetooth_inspect",
                 "ipad_native_permission_status",
                 "ipad_native_permission_request",
             }.issubset(tools)

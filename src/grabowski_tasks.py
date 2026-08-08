@@ -2672,12 +2672,12 @@ def _workspace_scope_identity(workspace: str) -> tuple[str, str]:
     return head, branch
 
 
-def _reposkop_prospective_admission_verified(
+def _reposkop_broad_admission_evidence(
     *,
     lease_result: dict[str, Any] | None,
     repository_scope_manifest: dict[str, Any] | None,
     workspace: str | None,
-) -> bool:
+) -> dict[str, Any] | None:
     if (
         not isinstance(lease_result, dict)
         or not isinstance(repository_scope_manifest, dict)
@@ -2685,7 +2685,7 @@ def _reposkop_prospective_admission_verified(
         or repository_scope_manifest.get("repository") != workspace
         or repository_scope_manifest.get("worktree") != workspace
     ):
-        return False
+        return None
     head = repository_scope_manifest.get("head")
     branch = repository_scope_manifest.get("branch")
     if (
@@ -2697,16 +2697,134 @@ def _reposkop_prospective_admission_verified(
         or branch in {"main", "master", "unversioned"}
         or branch.startswith("detached/")
     ):
-        return False
+        return None
     evidence = lease_result.get("work_admission")
     if not isinstance(evidence, list):
-        return False
-    return any(
-        isinstance(item, dict)
-        and item.get("repository") == workspace
-        and item.get("decision") == "allow"
-        and item.get("read_only") is True
-        for item in evidence
+        return None
+    for item in evidence:
+        if (
+            isinstance(item, dict)
+            and item.get("repository") == workspace
+            and item.get("decision") == "allow"
+            and item.get("read_only") is True
+        ):
+            return dict(item)
+    return None
+
+
+def _reposkop_exact_checkout_admission_evidence(
+    *,
+    lease_result: dict[str, Any] | None,
+    lease_owner_id: str,
+    task_resources: list[str],
+    workspace: str | None,
+    head: str,
+    branch: str,
+    now: int,
+) -> dict[str, Any] | None:
+    if (
+        not isinstance(lease_result, dict)
+        or not isinstance(workspace, str)
+        or not isinstance(head, str)
+        or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None
+        or set(head) == {"0"}
+        or not isinstance(branch, str)
+        or not branch
+        or branch in {"main", "master", "unversioned"}
+        or branch.startswith("detached/")
+    ):
+        return None
+    exact_path_key = resources.normalize_resource_key(f"path:{workspace}")
+    if exact_path_key not in task_resources:
+        return None
+    branch_bindings: list[tuple[str, str]] = []
+    for key in task_resources:
+        repository = resources.scoped_repository_resource_root(key)
+        if repository is None:
+            continue
+        expected_key = resources.normalize_resource_key(
+            f"repo:{repository}:branch:{branch}"
+        )
+        if key == expected_key:
+            branch_bindings.append((key, repository))
+    if len(branch_bindings) != 1:
+        return None
+    branch_key, repository = branch_bindings[0]
+    acquired = {
+        str(item.get("resource_key")): item
+        for item in lease_result.get("leases", [])
+        if isinstance(item, dict)
+    }
+    for key in (exact_path_key, branch_key):
+        lease = acquired.get(key)
+        if (
+            lease is None
+            or lease.get("owner_id") != lease_owner_id
+            or int(lease.get("expires_at_unix", 0)) <= now
+        ):
+            return None
+    requested_scope = {
+        "schema_version": 1,
+        "repository": repository,
+        "worktree": workspace,
+        "head": head,
+        "branch": branch,
+        "resource_keys": list(task_resources),
+    }
+    try:
+        assessment = resources.work_admission.require_repository_admission(
+            repo=repository,
+            owner_id=lease_owner_id,
+            operation="task_existing_checkout",
+            requested_scope=requested_scope,
+            target_path=workspace,
+            branch=branch,
+        )
+    except (
+        resources.work_admission.WorkAdmissionBlocked,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ):
+        return None
+    if (
+        not isinstance(assessment, dict)
+        or assessment.get("decision") != "allow"
+        or assessment.get("read_only") is not True
+        or assessment.get("scope_mode") != "exact_checkout"
+        or assessment.get("scope_identity")
+        != {"target_path": workspace, "branch": branch, "head": head}
+    ):
+        return None
+    return dict(assessment)
+
+
+def _reposkop_prospective_admission_evidence(
+    *,
+    lease_result: dict[str, Any] | None,
+    lease_owner_id: str,
+    task_resources: list[str],
+    repository_scope_manifest: dict[str, Any] | None,
+    workspace: str | None,
+    head: str,
+    branch: str,
+    now: int,
+) -> dict[str, Any] | None:
+    broad = _reposkop_broad_admission_evidence(
+        lease_result=lease_result,
+        repository_scope_manifest=repository_scope_manifest,
+        workspace=workspace,
+    )
+    if broad is not None:
+        return broad
+    return _reposkop_exact_checkout_admission_evidence(
+        lease_result=lease_result,
+        lease_owner_id=lease_owner_id,
+        task_resources=task_resources,
+        workspace=workspace,
+        head=head,
+        branch=branch,
+        now=now,
     )
 
 
@@ -6476,16 +6594,23 @@ def grabowski_task_start(
             ),
             metadata=lease_metadata,
         )
+    prospective_admission_evidence: dict[str, Any] | None = None
     if mutating_agent_workspace is not None:
+        prospective_admission_evidence = _reposkop_prospective_admission_evidence(
+            lease_result=lease_result,
+            lease_owner_id=lease_owner,
+            task_resources=task_resources,
+            repository_scope_manifest=repository_scope_manifest,
+            workspace=mutating_agent_workspace,
+            head=checkout_head,
+            branch=checkout_branch,
+            now=now,
+        )
         task_effect_classification = (
             reposkop_effectiveness.select_prospective_policy(
                 task_effect_classification,
                 sampling_key=task_id,
-                admission_verified=_reposkop_prospective_admission_verified(
-                    lease_result=lease_result,
-                    repository_scope_manifest=repository_scope_manifest,
-                    workspace=mutating_agent_workspace,
-                ),
+                admission_verified=prospective_admission_evidence is not None,
             )
         )
     reposkop_execution_attestation: dict[str, Any] | None = None
@@ -6807,12 +6932,8 @@ def grabowski_task_start(
             or lease_result is None
         ):
             raise RuntimeError("prospective Reposkop control lacks bound admission evidence")
-        admission_evidence = lease_result.get("work_admission")
-        if not _reposkop_prospective_admission_verified(
-            lease_result=lease_result,
-            repository_scope_manifest=repository_scope_manifest,
-            workspace=mutating_agent_workspace,
-        ):
+        admission_evidence = prospective_admission_evidence
+        if admission_evidence is None:
             raise RuntimeError("prospective Reposkop control lost repository admission")
         admission_sha256 = _sha256_json(admission_evidence)
         reposkop_decision_audit_ref = reposkop_effectiveness.append_event(

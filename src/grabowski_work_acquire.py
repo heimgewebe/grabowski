@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterator
 import grabowski_checkouts as checkouts
 import grabowski_operator_core as operator
 import grabowski_resources as resources
+import grabowski_work_admission as work_admission
 import grabowski_worktree_ensure as worktree_ensure
 
 mcp = operator.mcp
@@ -25,6 +26,7 @@ ACTOR_RE = re.compile(r"[A-Za-z0-9._:@/-]{1,256}\Z")
 SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
+DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
@@ -262,6 +264,13 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
         raise ValueError("ttl_seconds must be between 120 and 86400")
     idempotency_key = _text(parameters.get("idempotency_key"), "idempotency_key", pattern=IDEMPOTENCY_RE)
+    system_convergence = parameters.get("system_convergence")
+    if system_convergence is not None and not isinstance(system_convergence, dict):
+        raise ValueError("system_convergence must be an object or null")
+    system_convergence_plan = work_admission.plan_system_convergence(system_convergence)
+    normalized_system_convergence = (
+        dict(system_convergence) if system_convergence is not None else None
+    )
     requested = parameters.get("resource_keys") or []
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
         raise ValueError("resource_keys must be a list of strings")
@@ -293,6 +302,8 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         "retention_until_unix": retention,
         "resource_keys": resource_keys,
         "idempotency_key": idempotency_key,
+        "system_convergence": normalized_system_convergence,
+        "system_convergence_plan": system_convergence_plan,
     }
     if writer_argv is not None:
         identity["scoped_writer_command"] = {
@@ -308,6 +319,22 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         "ttl_seconds": ttl,
         "_scoped_writer_argv": writer_argv,
     }
+
+
+def _lifecycle_source(inputs: dict[str, Any]) -> dict[str, str]:
+    source = inputs.get("source")
+    if not isinstance(source, dict):
+        raise RuntimeError("work lane source binding is missing")
+    kind = source.get("kind")
+    source_id = source.get("id")
+    if not isinstance(kind, str) or not isinstance(source_id, str):
+        raise RuntimeError("work lane source binding is invalid")
+    if kind in DIRECT_SOURCE_KINDS:
+        lane_id = inputs.get("lane_id")
+        if not isinstance(lane_id, str) or not lane_id:
+            raise RuntimeError("direct work lane identity is missing")
+        return {"kind": "work_lane", "id": lane_id}
+    return {"kind": kind, "id": source_id}
 
 
 def _git_runner(cwd: Path, arguments: list[str]) -> dict[str, Any]:
@@ -349,6 +376,7 @@ def acquire_work(
     writer_argv = inputs.pop("_scoped_writer_argv")
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
+    lifecycle_source = _lifecycle_source(inputs)
     with _lane_lock(lane_id) as receipt_path:
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
@@ -396,6 +424,7 @@ def acquire_work(
             "lane_id": lane_id,
             "inputs_sha256": inputs_sha256,
             "inputs": inputs,
+            "lifecycle_source": lifecycle_source,
             "attempt_count": attempt,
             "created_at_unix": existing.get("created_at_unix", int(time.time())) if existing else int(time.time()),
             "updated_at_unix": int(time.time()),
@@ -419,6 +448,7 @@ def acquire_work(
             "controller_role": "controller",
             "scoped_writer_actor": (inputs["scoped_writer"] or {}).get("actor"),
             "source": inputs["source"],
+            "lifecycle_source": lifecycle_source,
             "repo": inputs["repo"],
             "branch": inputs["branch"],
             "target_path": inputs["target_path"],
@@ -454,11 +484,15 @@ def acquire_work(
             "base_head": inputs["base_head"],
             "lease_owner_id": inputs["lease_owner_id"],
             "purpose": inputs["purpose"],
-            "source_kind": inputs["source"]["kind"],
-            "source_id": inputs["source"]["id"],
+            "source_kind": lifecycle_source["kind"],
+            "source_id": lifecycle_source["id"],
             "artifact_class": inputs["artifact_class"],
             "retention_until_unix": inputs["retention_until_unix"],
             "idempotency_key": f"work-acquire:{lane_id}",
+            "system_convergence": inputs["system_convergence"],
+            "system_convergence_plan_sha256": inputs["system_convergence_plan"][
+                "plan_sha256"
+            ],
             "reposkop_required": True,
         }
         try:
@@ -559,6 +593,8 @@ def acquire_work(
             authority = {
                 "controller": inputs["controller"],
                 "scoped_writer": inputs["scoped_writer"],
+                "source": inputs["source"],
+                "lifecycle_source": lifecycle_source,
                 "writer_effects": [
                     "implement",
                     "test",
@@ -778,6 +814,7 @@ def grabowski_work_acquire(
     scoped_writer_actor: str | None = None,
     scoped_writer_argv: list[str] | None = None,
     scoped_writer_runtime_seconds: int = 7200,
+    system_convergence: dict[str, Any] | None = None,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
 ) -> dict[str, Any]:
@@ -809,6 +846,7 @@ def grabowski_work_acquire(
             "write_paths": write_paths,
             "scoped_writer_argv": scoped_writer_argv,
             "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
+            "system_convergence": system_convergence,
             "artifact_class": artifact_class,
             "ttl_seconds": ttl_seconds,
         },

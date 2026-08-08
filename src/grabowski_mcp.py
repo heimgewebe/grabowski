@@ -94,7 +94,7 @@ AGENT_INSTRUCTION_RULES: tuple[tuple[str, str], ...] = (
     ),
     (
         "convergence-before-high-risk-closure",
-        "Before marking deployment, runtime, security, data, or irreversible work completed, call grip_run with convergence-assess on a hash-bound request and require terminally_closed; bind the resulting receipt into the completion evidence. A nonterminal assessment blocks completion but grants no mutation authority.",
+        "Bind a risk-adaptive system_convergence_plan at work admission when classification evidence is available. Ordinary work or delivery closeout is not itself a systemic-convergence claim. Before claiming systemic convergence, resolve target criticality when the plan says classification_required; when systemic_closure_gate=hard, call grip_run with convergence-assess on a hash-bound request and require terminally_closed, binding its receipt into the systemic completion evidence. A nonterminal assessment blocks only the systemic-convergence claim and grants no mutation authority.",
     ),
     (
         "no-authority-escalation",
@@ -625,6 +625,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_juno_status": ("terminal_execute",),
     "grabowski_juno_pair": ("terminal_execute",),
     "grabowski_juno_run": ("terminal_execute",),
+    "ipad_bluetooth_scan": ("terminal_execute",),
+    "ipad_bluetooth_inspect": ("terminal_execute",),
     "ipad_native_permission_status": ("terminal_execute",),
     "ipad_native_permission_request": ("terminal_execute",),
     "ipad_capability_manifest": ("terminal_execute",),
@@ -774,6 +776,8 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_juno_status",
     "grabowski_juno_pair",
     "grabowski_juno_run",
+    "ipad_bluetooth_scan",
+    "ipad_bluetooth_inspect",
     "ipad_native_permission_status",
     "ipad_native_permission_request",
     "ipad_capability_manifest",

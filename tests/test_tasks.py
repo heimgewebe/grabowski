@@ -2993,6 +2993,111 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(result["audit"]["reposkop_cohort"], "prospective_control")
         self.assertIsNotNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
+    def test_exact_feature_path_and_branch_leases_can_enter_reposkop_control(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        branch = "feat/test-exact-control"
+        head = "1" * 40
+        canonical_repo = self.root.parent / f"{self.root.name}-canonical-repo"
+        canonical_repo.mkdir()
+        (canonical_repo / ".git").write_text("gitdir: /tmp/canonical.git\n")
+        path_key = f"path:{self.root}"
+        branch_key = f"repo:{canonical_repo}:branch:{branch}"
+        base = tasks.reposkop_effectiveness.classify_task_effect(
+            transport="local", argv=argv, mutating_workspace=str(self.root)
+        )
+        control_key = next(
+            f"{index:024x}"
+            for index in range(1, 256)
+            if tasks.reposkop_effectiveness.select_prospective_policy(
+                base, sampling_key=f"{index:024x}", admission_verified=True
+            )["reposkop_cohort"] == "prospective_control"
+        )
+        fake_uuid = types.SimpleNamespace(hex=control_key + "0" * 8)
+        exact_assessment = {
+            "schema_version": 1,
+            "kind": "grabowski.repository_work_admission",
+            "repository": str(canonical_repo),
+            "operation": "task_existing_checkout",
+            "scope_mode": "exact_checkout",
+            "scope_identity": {
+                "target_path": str(self.root),
+                "branch": branch,
+                "head": head,
+            },
+            "decision": "allow",
+            "assessment_sha256": "a" * 64,
+            "read_only": True,
+        }
+        tasks.resources.work_admission.require_repository_admission.return_value = exact_assessment
+        with patch.object(tasks.uuid, "uuid4", return_value=fake_uuid), patch.object(
+            tasks, "_workspace_scope_identity", return_value=(head, branch)
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[path_key, branch_key],
+            )
+
+        classification = result["task_effect_classification"]
+        self.assertEqual(classification["reposkop_cohort"], "prospective_control")
+        self.assertEqual(classification["reposkop_policy"], "not_required")
+        self.assertIs(classification["prospective_admission_verified"], True)
+        self.reposkop_attestation_mock.assert_not_called()
+        kwargs = tasks.resources.work_admission.require_repository_admission.call_args.kwargs
+        self.assertEqual(kwargs["operation"], "task_existing_checkout")
+        self.assertEqual(kwargs["repo"], str(canonical_repo))
+        self.assertEqual(kwargs["target_path"], str(self.root))
+        self.assertEqual(
+            result["reposkop_execution_attestation"]["admission_evidence_sha256"],
+            tasks._sha256_json(exact_assessment),
+        )
+
+    def test_exact_feature_pair_falls_back_to_required_when_exact_admission_blocks(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        branch = "feat/test-exact-blocked"
+        head = "2" * 40
+        canonical_repo = self.root.parent / f"{self.root.name}-canonical-repo-blocked"
+        canonical_repo.mkdir()
+        (canonical_repo / ".git").write_text("gitdir: /tmp/canonical-blocked.git\n")
+        path_key = f"path:{self.root}"
+        branch_key = f"repo:{canonical_repo}:branch:{branch}"
+        tasks.resources.work_admission.require_repository_admission.side_effect = (
+            tasks.resources.work_admission.WorkAdmissionBlocked(
+                {
+                    "decision": "blocked",
+                    "blocker_codes": ["dirty-worktree"],
+                }
+            )
+        )
+        with patch.object(
+            tasks, "_workspace_scope_identity", return_value=(head, branch)
+        ), patch.object(tasks.fleet, "fleet_host", return_value=LOCAL_HOST), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(tasks, "_dispatch", return_value=_launcher()), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 157}
+        ):
+            result = tasks.grabowski_task_start(
+                "local",
+                argv,
+                cwd=str(self.root),
+                runtime_seconds=60,
+                resource_keys=[path_key, branch_key],
+            )
+
+        classification = result["task_effect_classification"]
+        self.assertEqual(classification["reposkop_cohort"], "risk_required")
+        self.assertEqual(classification["reposkop_policy"], "required")
+        self.assertIs(classification["prospective_admission_verified"], False)
+        self.reposkop_attestation_mock.assert_called_once()
+
     def test_main_branch_and_exact_path_writers_remain_reposkop_required(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
         tasks.resources.work_admission.require_repository_admission.return_value = {

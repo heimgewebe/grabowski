@@ -1161,6 +1161,59 @@
         "tool": "grabowski_work_acquire"
       }
     },
+    "ipad_bluetooth_inspect": {
+      "evidence_refs": [
+        "docs:juno-ipad-bluetooth.md",
+        "tests:test_juno_bluetooth_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool can only rescan for one exact CoreBluetooth identifier, connect temporarily, enumerate GATT service/characteristic metadata and disconnect.",
+        "evidence": "Canonical target UUID validation, fixed source with discoverServices/discoverCharacteristics/cancel only, explicit absence of value-read/write/subscribe calls, host semantic validation and no-write/no-pairing markers."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it could read or write characteristic values, subscribe, pair or invoke unrelated native APIs; extending scan to implicit connections was rejected because connection is a distinct radio-side effect.",
+      "rationale": "GATT metadata discovery needs an explicit exact-target connection boundary with a mandatory disconnect and no device-control authority.",
+      "tool_contract": {
+        "tool": "ipad_bluetooth_inspect",
+        "category": "device-worker",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-bluetooth-connect",
+          "device-gatt-metadata-read",
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "temporary-connection-explicitly-disconnected"
+      }
+    },
+    "ipad_bluetooth_scan": {
+      "evidence_refs": [
+        "docs:juno-ipad-bluetooth.md",
+        "tests:test_juno_bluetooth_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one bounded BLE advertisement scan and cannot connect, pair, read characteristic values, write characteristics or subscribe to notifications.",
+        "evidence": "Fixed CoreBluetooth source, exact Juno agent/session binding, digest-bound device job, host semantic validation, bounded scan/result sizes and no-write/no-pairing tests."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it grants materially broader native API authority and cannot enforce a scan-only result schema.",
+      "rationale": "Nearby BLE observation is useful device metadata, but it should be available through one typed scan boundary rather than arbitrary code execution.",
+      "tool_contract": {
+        "tool": "ipad_bluetooth_scan",
+        "category": "device-worker",
+        "authority_class": "mutation",
+        "risk_class": "medium",
+        "read_only": false,
+        "effects": [
+          "device-bluetooth-scan",
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "reversibility": "not-applicable-device-job-and-receipt-retained"
+      }
+    },
     "ipad_capability_manifest": {
       "evidence_refs": [
         "docs:juno-ipad-storage.md",

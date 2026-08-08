@@ -47,6 +47,7 @@ if "mcp" not in sys.modules:
 import grabowski_checkouts as checkouts
 import grabowski_checkout_terminal_reconciliation as reconciliation
 import grabowski_checkout_terminal_sources as sources
+import grabowski_work_acquire as work_acquire
 
 
 class CheckoutTerminalReconciliationTests(unittest.TestCase):
@@ -393,6 +394,45 @@ class CheckoutTerminalReconciliationTests(unittest.TestCase):
                     ),
                 )
             observer.assert_called_once_with(source_id)
+
+
+    def test_work_lane_source_requires_explicit_terminal_closeout(self) -> None:
+        lane_id = "a" * 32
+        record = {
+            "lane_id": lane_id,
+            "state": "ready",
+            "receipt_sha256": "b" * 64,
+        }
+        with patch.object(work_acquire, "_read_state", return_value=record):
+            with self.assertRaisesRegex(
+                RuntimeError, "no terminal closeout evidence"
+            ):
+                sources.work_lane_terminal_evidence(lane_id)
+
+    def test_work_lane_source_accepts_bound_terminal_closeout(self) -> None:
+        lane_id = "c" * 32
+        record = {
+            "lane_id": lane_id,
+            "state": "ready",
+            "receipt_sha256": "d" * 64,
+            "terminal_closeout": {
+                "closeout_state": "pr_merged",
+                "assessment_sha256": "e" * 64,
+            },
+        }
+        with patch.object(work_acquire, "_read_state", return_value=record):
+            evidence = sources.work_lane_terminal_evidence(lane_id)
+        self.assertEqual(evidence["kind"], "work_lane")
+        self.assertEqual(evidence["source_id"], lane_id)
+        self.assertEqual(evidence["terminal_state"], "pr_merged")
+        self.assertEqual(evidence["lane_receipt_sha256"], "d" * 64)
+        self.assertEqual(evidence["assessment_sha256"], "e" * 64)
+        self.assertEqual(
+            evidence["evidence_sha256"],
+            checkouts._sha256_json(
+                {key: value for key, value in evidence.items() if key != "evidence_sha256"}
+            ),
+        )
 
     def test_operator_obligation_accepts_historical_resolution(self) -> None:
         status = {

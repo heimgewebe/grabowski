@@ -1050,6 +1050,37 @@
     },
     {
       "category": "device-worker",
+      "description": "Scan nearby BLE advertisements through the foreground-capable paired Juno iPad.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-scan",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_scan",
+      "purpose": "Scan bounded nearby BLE advertisements through the paired Juno iPad.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_bluetooth_scan"
+    },
+    {
+      "category": "device-worker",
+      "description": "Connect read-only to one discovered BLE identifier and enumerate GATT metadata.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-connect",
+        "device-gatt-metadata-read",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_inspect",
+      "purpose": "Connect temporarily to one exact BLE identifier and enumerate GATT service and characteristic metadata without value reads, writes, subscriptions or pairing.",
+      "read_only": false,
+      "reversibility": "temporary-connection-explicitly-disconnected",
+      "risk_class": "medium",
+      "tool": "ipad_bluetooth_inspect"
+    },
+    {
+      "category": "device-worker",
       "description": "Read bounded native iPad permission states without reading private content.",
       "effects": [
         "device-job-execute",
@@ -2409,6 +2440,50 @@
   },
   "kind": "repository-operator-context",
   "operating_protocol": {
+    "authority_principle": "model_identity_does_not_grant_authority",
+    "authority_roles": {
+      "controller": {
+        "authoritative": true,
+        "may_delegate": true,
+        "owns": [
+          "planning",
+          "integration",
+          "merge",
+          "deployment",
+          "closeout"
+        ]
+      },
+      "observer": {
+        "authoritative": false,
+        "mode": "evidence",
+        "read_only": true
+      },
+      "reviewer": {
+        "authoritative": false,
+        "mode": "advisory",
+        "read_only": true
+      },
+      "scoped_writer": {
+        "allowed_effects": [
+          "implement",
+          "test",
+          "commit",
+          "push",
+          "pull_request_create_or_update"
+        ],
+        "authoritative_within_lane": true,
+        "forbidden_without_controller": [
+          "merge",
+          "deployment",
+          "bureau_terminalization"
+        ],
+        "requires": [
+          "explicit_lane",
+          "resource_scope",
+          "controller_binding"
+        ]
+      }
+    },
     "coding_agent_priority": [
       "claude",
       "codex",
@@ -2417,7 +2492,7 @@
       "openhands",
       "cline"
     ],
-    "coding_agent_priority_semantics": "legacy_name_review_and_contrast_only",
+    "coding_agent_priority_semantics": "routing_preference_not_authority",
     "control_loop": [
       "typed_grabowski_tool",
       "grabowski_micro_task",
@@ -2429,8 +2504,9 @@
       "automatic_merge",
       "automatic_push",
       "automatic_deploy",
+      "model_identity_authority",
       "free_shell_as_default_path",
-      "durable_agent_autonomy",
+      "durable_agent_autonomy_without_lane_binding",
       "reposkop_report_action_approval"
     ],
     "execution_priority": [
@@ -2442,14 +2518,11 @@
       "openhands",
       "cline"
     ],
-    "execution_priority_semantics": "authoritative_operator_then_advisory_helpers",
+    "execution_priority_semantics": "routing_preference_not_model_authority",
     "name": "Operator Relay v0",
     "operator_first_for": [
       "task_decomposition",
-      "all_code_changes",
-      "tests",
       "integration",
-      "critical_self_review",
       "merge",
       "deployment",
       "closeout",
@@ -2465,48 +2538,51 @@
     ],
     "routing_roles": {
       "audit": "grabowski_git",
-      "complex_code_task": "chatgpt_operator_direct_external_review_or_explicit_contrast",
-      "local_micro_reasoning": "chatgpt_operator_direct",
+      "complex_code_task": "controller_or_lane_bound_scoped_writer",
+      "implementation": "controller_or_lane_bound_scoped_writer",
+      "local_micro_reasoning": "controller",
       "memory_prioritization": "bureau",
-      "patch_fallback": "chatgpt_operator_direct",
+      "patch_fallback": "controller",
       "patch_file_relay": "operator_patch_relay",
-      "quick_light_reasoning": "chatgpt_operator_direct",
+      "quick_light_reasoning": "controller",
       "repo_state_context": "reposkop_target_bound_report",
-      "security_or_architecture_review": "chatgpt_operator_plus_external_independent_review",
-      "session_resume": "chatgpt_operator_direct",
+      "security_or_architecture_review": "independent_reviewer_then_controller_verification",
+      "session_resume": "controller",
       "shell_or_git_grip": "grabowski_task"
     },
-    "rule": "ChatGPT/Grabowski performs authoritative work directly at every scale. External agents are advisory reviewers or explicitly requested isolated contrast programmers only.",
+    "rule": "Authority follows explicit controller and lane-role bindings, never model identity. The controller owns planning, integration, merge, deployment and closeout; a scoped writer may implement, test, commit, push and create or update a pull request only inside its bound lane; reviewers and observers remain read-only.",
     "workspace_execution_model": {
       "automatic_patch_apply": false,
       "automatic_winner_selection": false,
-      "capacity_fallback_to_external_writer": false,
-      "default": "direct_operator",
+      "capacity_fallback_to_external_writer": true,
+      "default": "controller_direct_or_delegated_scoped_writer",
       "delegation_triggers": [
+        "bounded_implementation_lane",
+        "disjoint_capacity_lane",
         "independent_review",
         "security_or_architecture_review",
         "explicit_contrast_request",
         "multiple_plausible_implementations_for_comparison"
       ],
       "direct_operator_for": [
-        "all_authoritative_implementation",
-        "all_reviews",
-        "all_task_sizes",
-        "runtime_or_security_change",
-        "long_or_multi_file_implementation",
-        "parallel_or_foreign_state",
-        "connector_or_execution_state_uncertainty"
+        "unscoped_or_ambiguous_work",
+        "integration",
+        "merge",
+        "deployment",
+        "closeout",
+        "recovery"
       ],
-      "external_agent_delegation": "review_or_explicit_contrast_only",
-      "external_candidate_authority": "advisory_only",
+      "external_agent_delegation": "role_bound_scoped_writer_reviewer_or_observer",
+      "external_candidate_authority": "role_dependent",
       "external_primary_reviewer_forbidden": true,
-      "external_primary_writer_forbidden": true,
+      "external_primary_writer_forbidden": false,
       "external_programming_modes": [
+        "scoped_writer",
         "competitor",
         "contrast"
       ],
       "full_workspace_for": [],
-      "lane_owner": "chatgpt_operator",
+      "lane_owner": "controller",
       "max_external_candidates": 2,
       "operator_self_serves_lanes": [
         "captain",
@@ -2644,6 +2720,8 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_bluetooth_scan",
+      "ipad_bluetooth_inspect",
       "ipad_native_permission_status",
       "ipad_native_permission_request",
       "ipad_capability_manifest",
@@ -3124,6 +3202,10 @@
         "source": "src/grabowski_juno_storage.py"
       },
       {
+        "module": "grabowski_juno_bluetooth",
+        "source": "src/grabowski_juno_bluetooth.py"
+      },
+      {
         "module": "grabowski_lifecycle_archive",
         "source": "src/grabowski_lifecycle_archive.py"
       },
@@ -3173,7 +3255,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "ffa9803354b796a8457cc0127ada83b924c814d26ca0b55476d272dcc5f72c93"
+      "sha256": "7014fa6bfcf39b9b324568bab50ff235a1f6e266cc4124fd3ba692fd11e24d15"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3181,7 +3263,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "cd665fbc8e11ba2729360eb4a13dcc3fb7446ae8c465dfb6a9d720eefa333a71"
+      "sha256": "f755c5db3dd4f13b46bbeaee39379f45ec3a90816ec434820b3402bf2d5bf89a"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3202,12 +3284,12 @@
       "src/grabowski_bureau_intake.py": "f1d862b3d7bfd7a7cb25f385c5335eef6cf3246efcff251a8a536e75788656e3",
       "src/grabowski_bureau_leases.py": "119a7dff971c9ef985554926830d6b984d1d3ec6921b4df5f083941dc2da78f0",
       "src/grabowski_bureau_pickup.py": "232e42a8f761e584a945e22b09913e65d5cb404b140f34293bf6aa6ddd0de136",
-      "src/grabowski_capabilities.py": "ffa9803354b796a8457cc0127ada83b924c814d26ca0b55476d272dcc5f72c93",
+      "src/grabowski_capabilities.py": "7014fa6bfcf39b9b324568bab50ff235a1f6e266cc4124fd3ba692fd11e24d15",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
-      "src/grabowski_checkout_terminal_sources.py": "a811533be912045be9e8698caf2c6dbe9ea2b4437e6b1df357260afb5c80335b",
-      "src/grabowski_checkouts.py": "dc44fb2e80ff2d7e93f72440ab05045ec64f5982b1c425d1f37e97325bc565b0",
+      "src/grabowski_checkout_terminal_sources.py": "b9ad9750311c5ba4366f8e9c0a43996e947b747d3b6631ee304af3a4dc5149e0",
+      "src/grabowski_checkouts.py": "71afe71beb61b2e7a4549c1b250b25e3bdfd2f156b7f4f8797a1cb547d6d7101",
       "src/grabowski_chronik.py": "96c46f2a75c239fd67c8cc4dc89b8297303e3bbd73b05dbfc60b9ee7412fbb4a",
       "src/grabowski_client_snapshot.py": "abc2ec5a8add99a8d12ea8ad04a2a884104a0ad33e8b6b0fb073fe7ded76f2ba",
       "src/grabowski_coding_agent_catalog_data.py": "5cc13b1000d61afbc730dafefa77e1fef0a0705352ff0ba37a4749413f0ac48e",
@@ -3217,7 +3299,7 @@
       "src/grabowski_connector_contract.py": "c0a128cbcbbc7ea906fd6edccccf986f95d531703ccb5c119576bc51bd215beb",
       "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
       "src/grabowski_context_fabric.py": "38f3d83511a8e0e6f8b8faaf43230df1466693f265f9bef70dadfe1ea3a97b95",
-      "src/grabowski_convergence.py": "238b0f5df09bb6a8a3b88802ade7aecb6c22258387e206f8dd9a492794e1e771",
+      "src/grabowski_convergence.py": "c18b249a31016a11cde4c3c4f04ba1eb5f9cb168e83a5ae9d824248711cd82b6",
       "src/grabowski_current_work.py": "96cbf7097927956443a2df9aa6ccb848570694cfeaf51d98c9a9b860f472dd10",
       "src/grabowski_current_work_surface.py": "7f8be512307ec55db4243bf427ae7a63ac8582f58896d41a31a010499c7be99d",
       "src/grabowski_deployment_observer.py": "01a9cbae636f29559c63cfe09a191d0e6ea78f5e838dc001914a6c4140be9e1c",
@@ -3226,10 +3308,11 @@
       "src/grabowski_fleet.py": "22b3afdde81ff3f0ec1b36d4f8d886bced6fdeb64c2f291f319df8a654dee20c",
       "src/grabowski_friction.py": "15137b57106c15bfac5d27b0fdb22fa7e958b06b32120217623d38abf3350d32",
       "src/grabowski_grip_orchestration.py": "04b6a9844dcaf353a5f4bb9a926cf80fc7ee4e56aab0551a936b7926703851c0",
-      "src/grabowski_grips.py": "326090f4d8eef6802fde319e405c3f2db88726fe77d954ceb0cb43a01788e0e7",
+      "src/grabowski_grips.py": "ddc90d2bc3d95256823168c8e6e0bf4380da93a7dc87be4d6fdcf1a25a8a8a79",
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "aeaae6e646638c7c1c6c516ec387bffce78170cf113cc175a627dec745ca9493",
+      "src/grabowski_juno_bluetooth.py": "4e27311e1e839070a21593f2289ab2a279696d09662664abba286853a0d97422",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
       "src/grabowski_lane_closeout.py": "77e78c3b2949206de9fade8608a59972c95ad472bf9426e416ac456f1de425f8",
       "src/grabowski_lifecycle_archive.py": "55ca2cfb58bb56a2c068b3a7c34c6bdc21f040492e1c437e5d8300783a23b3ce",
@@ -3239,7 +3322,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "573ca21eff333700b16d8e71d30e1c89b28e95ed72465d167df5d22617a80bdc",
+      "src/grabowski_mcp.py": "63cfbffc7670d449e555dc3ea872dc15b55e956da594556f083e01a66f457b8b",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "c5aff396a76758a2d121e728add7b440270b00cb49fcb16137941b80370387dd",
@@ -3249,7 +3332,7 @@
       "src/grabowski_operator.py": "8c12fc5edb3efff4368759dd727b10d0709c471d600382d9ddbc67ad2e2da68c",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
-      "src/grabowski_operator_relay.py": "3f314d82bb6c3c7b91eff774b487088e25ec44372512d50936eb18f199eaa02c",
+      "src/grabowski_operator_relay.py": "2b2516dd095eddbed08f46d6b9661248efad8a8846777bef5bad802c9491cc59",
       "src/grabowski_operator_routing_shadow_capture.py": "1fa2d18cd459873eab3a2535b6e48df5363ae151a24914fbd7693020c29da5b0",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "ea0cd51630be7362a985ed0a56288d521c9d3b7341218d656306643e6c27a498",
@@ -3260,9 +3343,9 @@
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "c1e46bd5b921834a89325fdffe4edba8f716369e6edca3401d230d736f3cfdae",
-      "src/grabowski_reposkop_effectiveness.py": "996f625e7db5080b0413f3d5656374260c28df5638a08be3e7da83492fb5300a",
+      "src/grabowski_reposkop_effectiveness.py": "d5bc043e63d126ad9730a350c3d1c1faaf44f5c291e5b4c4ec8bb63cd8f59b04",
       "src/grabowski_resources.py": "2e3185a182ec98711e9052487817ad59ad2da96aaacaf9e249824541f1d04c18",
-      "src/grabowski_runtime.py": "a01d8c574b1099e55d55f9645b88d74674c39571b658d9d344ff87d6470ea7dc",
+      "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "569d0f3f2a289e3ece52a98d205151cd78c3efb47d7bd5ca754d2d50c3095659",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
@@ -3271,15 +3354,15 @@
       "src/grabowski_systemkatalog.py": "39a1dae1a75615390864bdcd9fa60abb1f0863be0fc15d047465e53632ce5738",
       "src/grabowski_task_attention.py": "36b795533018553c82cfdb83980ef4082a894dfc49aa17337f11c7683e96716e",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "6fc06264d99c341fdba3374158937d121a568694bbde7493d9724d040361b3da",
+      "src/grabowski_tasks.py": "a65a873ce480526c63a1d8e1f89f6da2aa974e9dae72b90695382e71cbe2964c",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_transport_roundtrip.py": "903dc9db1747ed00e0181a49094e744cd99f6973edbf5c74458932aeaccf3e85",
-      "src/grabowski_work_acquire.py": "d1bf2614ea1dd6dcdc0d05625eedaf4a29e22260c2e0ae621b135f4352482761",
-      "src/grabowski_work_admission.py": "6d8c89b54cd35e792bebc7ccfc116ff2b067675cb4e16ac9d5db9ccce1b8e470",
+      "src/grabowski_work_acquire.py": "da091c8ed236ab5469658ca40a876f74e805704625b619180c6729affdab916c",
+      "src/grabowski_work_admission.py": "8e9b910e9f7a97fa8b2f4e537159b7e50de31f24e81df06b933e2f5fb24ea8c9",
       "src/grabowski_worker_process.py": "ec9a47c119104e1ac84307d8eb5685e93de1aed66c39828c324b7a3a626197f8",
       "src/grabowski_workers.py": "815914a20a0972210bdfd4ceb5774e2ca0d409c03858322a2fcdf8bf9219be3f",
-      "src/grabowski_worktree_ensure.py": "4ec7eecb853ab29e95e5716fe3ca3c77ae1172bc63b2a8901e041f5792336f4b"
+      "src/grabowski_worktree_ensure.py": "faa79d10d150b00c355718334df7de904567f46d42a5f881c66617a65e455ef8"
     }
   }
 }

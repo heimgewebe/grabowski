@@ -954,6 +954,10 @@ class GripFoundationTests(unittest.TestCase):
         ):
             self.assertIn(field, specs["repo-orient"])
         self.assertEqual("operator", specs["repo-orient"]["profile"])
+        work_acquire_preconditions = " ".join(specs["work-acquire"]["preconditions"])
+        for source_kind in ("bureau_task", "github_issue", "operator_obligation", "thread_focus"):
+            self.assertIn(source_kind, work_acquire_preconditions)
+        self.assertIn("immutable terminal evidence observer", work_acquire_preconditions)
 
     def test_work_acquire_grip_exposes_existing_lane_contract(self) -> None:
         parameters = {
