@@ -308,6 +308,40 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             tree_sha256,
         )
 
+    def _use_manifest_payload_launcher(
+        self, launcher_path: Path, manifest_path: Path
+    ) -> None:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload_raw = (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        manifest["manifest_payload_sha256"] = hashlib.sha256(payload_raw).hexdigest()
+        manifest_path.write_text(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launcher_path.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path({str(manifest_path)!r})\n"
+            "manifest_digest_field = 'manifest_payload_sha256'\n",
+            encoding="utf-8",
+        )
+        launcher_path.chmod(0o700)
+
     def test_managed_runtime_binding_binds_atomic_snapshots(self) -> None:
         runtime_root, launcher, manifest, inventory, source_commit, tree_sha256 = (
             self._managed_runtime_fixture()
@@ -330,6 +364,45 @@ class BureauIntakeAdapterTests(unittest.TestCase):
             binding.inventory.sha256,
             hashlib.sha256(binding.inventory.raw).hexdigest(),
         )
+
+    def test_managed_runtime_binding_accepts_manifest_payload_launcher(self) -> None:
+        runtime_root, launcher, manifest, _, source_commit, tree_sha256 = (
+            self._managed_runtime_fixture()
+        )
+        self._use_manifest_payload_launcher(launcher, manifest)
+        with mock.patch.object(
+            intake.bureau_runtime, "BUREAU_RUNTIME_ROOT", runtime_root
+        ):
+            binding = intake._managed_runtime_binding()
+            intake._assert_managed_runtime_unchanged(binding)
+        self.assertEqual(binding.source_commit, source_commit)
+        self.assertEqual(binding.registry_tree_sha256, tree_sha256)
+
+    def test_managed_runtime_binding_rejects_manifest_payload_digest_drift(
+        self,
+    ) -> None:
+        runtime_root, launcher, manifest, _, _, _ = self._managed_runtime_fixture()
+        self._use_manifest_payload_launcher(launcher, manifest)
+        manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+        manifest_value["installed_at"] = "drifted-after-binding"
+        manifest.write_text(
+            json.dumps(
+                manifest_value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            intake.bureau_runtime, "BUREAU_RUNTIME_ROOT", runtime_root
+        ):
+            with self.assertRaisesRegex(
+                intake.bureau_runtime.BureauLeaseContractError,
+                "manifest-payload-digest-mismatch",
+            ):
+                intake._managed_runtime_binding()
 
     def test_managed_runtime_binding_rejects_launcher_manifest_digest_drift(
         self,
