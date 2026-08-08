@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "ffa9803354b796a8457cc0127ada83b924c814d26ca0b55476d272dcc5f72c93",
+  "capability_source_sha256": "7014fa6bfcf39b9b324568bab50ff235a1f6e266cc4124fd3ba692fd11e24d15",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "cd665fbc8e11ba2729360eb4a13dcc3fb7446ae8c465dfb6a9d720eefa333a71",
+  "contract_sha256": "f755c5db3dd4f13b46bbeaee39379f45ec3a90816ec434820b3402bf2d5bf89a",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1059,6 +1059,37 @@
       "reversibility": "job-dependent-with-local-stop-switch",
       "risk_class": "high",
       "tool": "grabowski_juno_run"
+    },
+    {
+      "category": "device-worker",
+      "description": "Scan nearby BLE advertisements through the foreground-capable paired Juno iPad.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-scan",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_scan",
+      "purpose": "Scan bounded nearby BLE advertisements through the paired Juno iPad.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_bluetooth_scan"
+    },
+    {
+      "category": "device-worker",
+      "description": "Connect read-only to one discovered BLE identifier and enumerate GATT metadata.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-connect",
+        "device-gatt-metadata-read",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_inspect",
+      "purpose": "Connect temporarily to one exact BLE identifier and enumerate GATT service and characteristic metadata without value reads, writes, subscriptions or pairing.",
+      "read_only": false,
+      "reversibility": "temporary-connection-explicitly-disconnected",
+      "risk_class": "medium",
+      "tool": "ipad_bluetooth_inspect"
     },
     {
       "category": "device-worker",

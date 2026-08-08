@@ -20,6 +20,7 @@ import grabowski_self_deploy
 import grabowski_fleet
 import grabowski_juno
 import grabowski_juno_storage
+import grabowski_juno_bluetooth
 import grabowski_artifacts
 import grabowski_merge_delivery_surface
 import grabowski_agent_workspace
