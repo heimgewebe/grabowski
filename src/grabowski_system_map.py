@@ -42,9 +42,11 @@ def build_component_map(
     )
     obligation_attention = int(obligations.get("attention_count") or 0)
     active_leases = int(leases.get("active_count") or 0)
-    connector_observable = bool(
+    platform_connector_snapshot_observable = bool(
         client_snapshot.get("platform_connector_snapshot_observable")
     )
+    connector_fresh = bool(client_snapshot.get("fresh"))
+    connector_observable = platform_connector_snapshot_observable and connector_fresh
     components = [
         {
             "id": "grabowski",
@@ -70,7 +72,9 @@ def build_component_map(
             "evidence": {
                 "fresh": client_snapshot.get("fresh"),
                 "matched": client_snapshot.get("matched"),
-                "platform_connector_snapshot_observable": connector_observable,
+                "platform_connector_snapshot_observable": (
+                    platform_connector_snapshot_observable
+                ),
                 "server_loopback_observable": client_snapshot.get(
                     "server_loopback_observable"
                 ),

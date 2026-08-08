@@ -5336,6 +5336,21 @@ def _operator_system_overview(
     platform_connector_snapshot_observable = bool(
         client_snapshot.get("platform_connector_snapshot_observable")
     )
+    platform_connector_snapshot_fresh = bool(
+        client_snapshot.get(
+            "platform_connector_snapshot_fresh", client_snapshot.get("fresh")
+        )
+    )
+    platform_connector_snapshot_matched = bool(
+        client_snapshot.get(
+            "platform_connector_snapshot_matched", client_snapshot.get("matched")
+        )
+    )
+    platform_connector_snapshot_ready = (
+        platform_connector_snapshot_observable
+        and platform_connector_snapshot_fresh
+        and platform_connector_snapshot_matched
+    )
     coding_agent_catalog_ready = coding_agent_catalog.get("ready") is True
     unknown_state_count = tasks.get("unknown_state_count")
     truth_model_ready = tasks.get("available") is True and unknown_state_count == 0
@@ -5349,7 +5364,7 @@ def _operator_system_overview(
     operator_ready = (
         runtime_healthy
         and coding_agent_catalog_ready
-        and platform_connector_snapshot_observable
+        and platform_connector_snapshot_ready
         and truth_model_ready
         and components_observable
     )
@@ -5364,7 +5379,7 @@ def _operator_system_overview(
                 "bind the current connector client snapshot",
             )
         )
-    elif not platform_connector_snapshot_observable:
+    elif not platform_connector_snapshot_ready:
         next_action = str(
             client_snapshot.get(
                 "recommended_next_action",
@@ -5459,10 +5474,10 @@ def _operator_system_overview(
     }
     component_map_snapshot = dict(client_snapshot)
     component_map_snapshot["fresh"] = client_snapshot.get(
-        "platform_connector_snapshot_fresh"
+        "platform_connector_snapshot_fresh", client_snapshot.get("fresh")
     )
     component_map_snapshot["matched"] = client_snapshot.get(
-        "platform_connector_snapshot_matched"
+        "platform_connector_snapshot_matched", client_snapshot.get("matched")
     )
     component_map = grabowski_system_map.build_component_map(
         runtime_healthy=runtime_healthy, client_snapshot=component_map_snapshot, coding_agent_catalog=coding_agent_catalog, tasks=tasks, leases=leases, obligations=obligations, source_registry=source_registry,
@@ -5473,7 +5488,7 @@ def _operator_system_overview(
         "readiness": {
             "runtime_ready": runtime_healthy,
             "coding_agent_catalog_ready": coding_agent_catalog_ready,
-            "connector_snapshot_ready": platform_connector_snapshot_observable,
+            "connector_snapshot_ready": platform_connector_snapshot_ready,
             "truth_model_ready": truth_model_ready,
             "components_observable": components_observable,
         },
@@ -5601,22 +5616,9 @@ def grabowski_status(
                 ),
             }
         )
-    if not bool(client_snapshot.get("platform_connector_snapshot_observable")):
-        platform_snapshot = client_snapshot.get("platform_snapshot")
-        platform_snapshot = (
-            platform_snapshot if isinstance(platform_snapshot, dict) else {}
-        )
-        platform_state = str(platform_snapshot.get("state", "unavailable"))
-        warnings.append(
-            {
-                "code": f"platform_connector_snapshot_{platform_state}",
-                "detail": platform_snapshot.get(
-                    "recommended_next_action",
-                    "capture authoritative platform connector publication evidence",
-                ),
-                "authority": platform_snapshot.get("authority"),
-            }
-        )
+    # Platform publication evidence is surfaced explicitly in tool_contract and
+    # system_overview. Its absence must not inflate the compact operational warning
+    # channel, which is reserved for immediate runtime/action gates.
     if (
         transport_roundtrip.get("state") != "unavailable"
         and transport_roundtrip.get("mutation_gate_open") is not True
@@ -5661,14 +5663,6 @@ def grabowski_status(
                 "bind the current connector client snapshot",
             )
         )
-    elif not bool(client_snapshot.get("platform_connector_snapshot_observable")):
-        platform_snapshot = client_snapshot.get("platform_snapshot")
-        recommended_next_action = str(
-            (platform_snapshot if isinstance(platform_snapshot, dict) else {}).get(
-                "recommended_next_action",
-                "capture authoritative platform connector publication evidence",
-            )
-        )
     elif (
         transport_roundtrip.get("state") != "unavailable"
         and transport_roundtrip.get("mutation_gate_open") is not True
@@ -5677,6 +5671,14 @@ def grabowski_status(
             transport_roundtrip.get(
                 "recommended_next_action",
                 "complete a fresh transport roundtrip before mutation",
+            )
+        )
+    elif not bool(client_snapshot.get("platform_connector_snapshot_observable")):
+        platform_snapshot = client_snapshot.get("platform_snapshot")
+        recommended_next_action = str(
+            (platform_snapshot if isinstance(platform_snapshot, dict) else {}).get(
+                "recommended_next_action",
+                "capture authoritative platform connector publication evidence",
             )
         )
     elif system_overview is not None:
