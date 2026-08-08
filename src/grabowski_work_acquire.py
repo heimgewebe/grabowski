@@ -142,6 +142,22 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     return value
 
 
+def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    material = {
+        key: item
+        for key, item in validated.items()
+        if key
+        not in {
+            "observed_at_unix",
+            "assessment_sha256",
+            "audit_record_sha256",
+            "does_not_establish",
+        }
+    }
+    return _sha(material)
+
+
 def _terminal_closeout_assessment(record: dict[str, Any]) -> dict[str, Any] | None:
     terminal = record.get("terminal_closeout")
     if terminal is None:
@@ -189,7 +205,7 @@ def persist_terminal_closeout(
             raise RuntimeError("work-lane receipt is missing or bound to another lane")
         existing = _terminal_closeout_assessment(record)
         if existing is not None:
-            if existing["assessment_sha256"] != validated["assessment_sha256"]:
+            if _terminal_assessment_replay_sha256(existing) != _terminal_assessment_replay_sha256(validated):
                 raise RuntimeError("work-lane already records another terminal assessment")
             return {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
         if record.get("receipt_sha256") != expected_receipt_sha256:
@@ -274,7 +290,9 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
     return {**receipt, "receipt_sha256": _sha(receipt)}
 
 
-def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
+def _normalize(
+    parameters: dict[str, Any], *, require_fresh_retention: bool = True
+) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("parameters must be an object")
     controller_actor = _text(parameters.get("controller_actor"), "controller_actor", pattern=ACTOR_RE)
@@ -308,7 +326,13 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("base_head must be an exact lowercase 40-character commit")
     purpose = checkouts._purpose(_text(parameters.get("purpose"), "purpose"))
     artifact_class = checkouts._artifact_class(parameters.get("artifact_class", "implementation-worktree"))
-    retention = checkouts._retention_until(parameters.get("retention_until_unix"))
+    retention_value = parameters.get("retention_until_unix")
+    if require_fresh_retention:
+        retention = checkouts._retention_until(retention_value)
+    else:
+        if not isinstance(retention_value, int) or isinstance(retention_value, bool) or retention_value < 0:
+            raise ValueError("retention_until_unix must be a non-negative integer timestamp")
+        retention = retention_value
     ttl = parameters.get("ttl_seconds", 7200)
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
         raise ValueError("ttl_seconds must be between 120 and 86400")
@@ -904,14 +928,12 @@ def grabowski_work_acquire(
         observation = terminal_closeout["observation"]
         if not isinstance(observation, dict):
             raise ValueError("terminal_closeout.observation must be an object")
-        inputs = _normalize(parameters)
+        inputs = _normalize(parameters, require_fresh_retention=False)
         try:
             observed = lane_closeout.LaneCloseoutObservation(**observation)
         except TypeError as exc:
             raise ValueError(f"terminal_closeout observation shape is invalid: {exc}") from exc
-        assessment = lane_closeout.assess(
-            observed, append_audit=operator.base._append_audit
-        )
+        assessment = lane_closeout.assess(observed)
         if assessment.get("lane_id") != inputs["lane_id"]:
             raise RuntimeError("terminal closeout observation is bound to another lane")
         if assessment.get("phase") != "terminal":

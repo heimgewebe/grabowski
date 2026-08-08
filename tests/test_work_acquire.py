@@ -641,17 +641,35 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertTrue(work_acquire.persist_terminal_closeout(
             first["lane_id"], assessment, expected_receipt_sha256=first["receipt_sha256"]
         )["replayed"])
+        later_same_observation = self.terminal_assessment(first["lane_id"], 201)
+        self.assertNotEqual(
+            assessment["assessment_sha256"], later_same_observation["assessment_sha256"]
+        )
+        self.assertTrue(work_acquire.persist_terminal_closeout(
+            first["lane_id"], later_same_observation,
+            expected_receipt_sha256=first["receipt_sha256"],
+        )["replayed"])
+        competing = closeout.assess(closeout.LaneCloseoutObservation(
+            lane_id=first["lane_id"], repository=str(self.repo), workspace=str(self.target),
+            branch="feat/authority-p0", base_revision=SHA, writer_state="completed",
+            task_active=False, process_active=False, lease_active=True, git_dirty=False,
+            head_sha=SHA, remote_head_sha=SHA, ahead_commits=0, behind_commits=0,
+            durable_followup_id="followup-1",
+        ), observed_at_unix=202)
+        self.assertEqual(competing["closeout_state"], "blocked_with_durable_followup")
         with self.assertRaisesRegex(RuntimeError, "another terminal assessment"):
             work_acquire.persist_terminal_closeout(
-                first["lane_id"], self.terminal_assessment(first["lane_id"], 201),
-                expected_receipt_sha256=stored["receipt_sha256"],
+                first["lane_id"], competing, expected_receipt_sha256=stored["receipt_sha256"]
             )
-        acquire = Mock(); ensure = Mock()
+        acquire = Mock()
+        ensure = Mock()
         replay = work_acquire.acquire_work(
             params, acquire_resources_fn=acquire, release_resources_fn=Mock(),
             inspect_resource_fn=Mock(), ensure_worktree_fn=ensure, runner=Mock(),
         )
-        self.assertTrue(replay["replayed"]); acquire.assert_not_called(); ensure.assert_not_called()
+        self.assertTrue(replay["replayed"])
+        acquire.assert_not_called()
+        ensure.assert_not_called()
 
     def test_terminal_closeout_rejects_stale_receipt_preimage(self) -> None:
         lane_id = "d" * 32
@@ -664,6 +682,49 @@ class WorkAcquireTests(unittest.TestCase):
             work_acquire.persist_terminal_closeout(
                 lane_id, self.terminal_assessment(lane_id, 202), expected_receipt_sha256="e" * 64
             )
+
+    def test_mcp_entry_routes_terminal_closeout_after_original_retention_expires(self) -> None:
+        params = self.parameters()
+        params["retention_until_unix"] = 100
+        with patch.object(work_acquire.checkouts, "_now", return_value=50):
+            lane_id = work_acquire._normalize(params)["lane_id"]
+        expected = {"lane_id": lane_id, "replayed": False}
+        terminal = self.terminal_assessment(lane_id, 200)
+        with (
+            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(work_acquire.checkouts, "_now", return_value=200),
+            patch.object(work_acquire.lane_closeout, "assess", return_value=terminal),
+            patch.object(work_acquire, "persist_terminal_closeout", return_value=expected) as persist,
+            patch.object(work_acquire, "acquire_work") as acquire,
+        ):
+            result = work_acquire.grabowski_work_acquire(
+                source_kind=str(params["source_kind"]),
+                source_id=str(params["source_id"]),
+                controller_actor=str(params["controller_actor"]),
+                repo=str(params["repo"]),
+                base_head=str(params["base_head"]),
+                branch=str(params["branch"]),
+                target_path=str(params["target_path"]),
+                purpose=str(params["purpose"]),
+                retention_until_unix=int(params["retention_until_unix"]),
+                idempotency_key=str(params["idempotency_key"]),
+                scoped_writer_actor=str(params["scoped_writer_actor"]),
+                ttl_seconds=int(params["ttl_seconds"]),
+                terminal_closeout={
+                    "expected_receipt_sha256": "e" * 64,
+                    "observation": {
+                        "lane_id": lane_id, "repository": str(self.repo),
+                        "workspace": str(self.target), "branch": "feat/authority-p0",
+                        "base_revision": SHA, "writer_state": "completed",
+                        "task_active": False, "process_active": False, "lease_active": True,
+                        "git_dirty": False, "head_sha": SHA, "remote_head_sha": SHA,
+                        "ahead_commits": 0, "behind_commits": 0, "no_change_proven": True,
+                    },
+                },
+            )
+        self.assertEqual(expected, result)
+        self.assertEqual(persist.call_args.args[0], lane_id)
+        acquire.assert_not_called()
 
     def test_mcp_entry_routes_terminal_closeout_without_reacquiring(self) -> None:
         params = self.parameters()
