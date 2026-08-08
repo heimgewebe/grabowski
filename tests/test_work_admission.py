@@ -321,6 +321,168 @@ class WorkAdmissionTests(unittest.TestCase):
         self.assertEqual(result["decision"], "converge_first")
         self.assertIn("binding-reconciliation-blocking", result["blocker_codes"])
 
+    def test_existing_task_checkout_allows_exact_clean_feature_scope(self) -> None:
+        target = self._linked(
+            state="managed_active_attention",
+            owner="workspace-owner",
+        )
+        target["head"] = "a" * 40
+        target["detached"] = False
+        target_path = str(target["path"])
+        branch = str(target["branch"])
+        scope = {
+            "schema_version": 1,
+            "repository": str(self.repo),
+            "worktree": target_path,
+            "head": "a" * 40,
+            "branch": branch,
+            "resource_keys": [
+                f"path:{target_path}",
+                f"repo:{self.repo}:branch:{branch}",
+            ],
+        }
+        unrelated = self._linked(
+            state="completed_retained",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        unrelated["head"] = "b" * 40
+        unrelated["detached"] = False
+
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="task:abc",
+            operation="task_existing_checkout",
+            requested_scope=scope,
+            target_path=target_path,
+            branch=branch,
+            inventory_loader=lambda _repo: {
+                "worktrees": [self._main(dirty=True), target, unrelated],
+                "inventory_sha256": "a" * 64,
+            },
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["scope_mode"], "exact_checkout")
+        self.assertEqual(
+            result["scope_identity"],
+            {"target_path": target_path, "branch": branch, "head": "a" * 40},
+        )
+        self.assertEqual(result["blockers"], [])
+
+    def test_existing_task_checkout_fails_closed_on_target_drift_or_foreign_live_work(self) -> None:
+        for mutation, expected_code in (
+            ({"status": {"dirty": True}}, "dirty-worktree"),
+            ({"head": "b" * 40}, "target-head-mismatch"),
+            ({"branch": "feat/other"}, "target-branch-mismatch"),
+            ({"detached": True, "branch": None}, "target-checkout-detached"),
+        ):
+            target = self._linked(
+                state="managed_active_attention",
+                owner="workspace-owner",
+            )
+            target["head"] = "a" * 40
+            target["detached"] = False
+            target.update(mutation)
+            target_path = str(target["path"])
+            expected_branch = "feat/managed_active_attention"
+            scope = {
+                "schema_version": 1,
+                "repository": str(self.repo),
+                "worktree": target_path,
+                "head": "a" * 40,
+                "branch": expected_branch,
+                "resource_keys": [
+                    f"path:{target_path}",
+                    f"repo:{self.repo}:branch:{expected_branch}",
+                ],
+            }
+            result = admission.assess_repository_admission(
+                repo=str(self.repo),
+                owner_id="task:abc",
+                operation="task_existing_checkout",
+                requested_scope=scope,
+                target_path=target_path,
+                branch=expected_branch,
+                inventory_loader=lambda _repo, target=target: {
+                    "worktrees": [self._main(), target],
+                    "inventory_sha256": "a" * 64,
+                },
+                reconciliation_loader=lambda _repo: self._reconciliation(),
+            )
+            self.assertEqual(result["decision"], "blocked")
+            self.assertIn(expected_code, result["blocker_codes"])
+
+        foreign = self._linked(
+            state="managed_active_attention",
+            owner="workspace-owner",
+            foreign_lease=True,
+        )
+        foreign["head"] = "a" * 40
+        foreign["detached"] = False
+        target_path = str(foreign["path"])
+        branch = str(foreign["branch"])
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="task:abc",
+            operation="task_existing_checkout",
+            requested_scope={
+                "schema_version": 1,
+                "repository": str(self.repo),
+                "worktree": target_path,
+                "head": "a" * 40,
+                "branch": branch,
+                "resource_keys": [
+                    f"path:{target_path}",
+                    f"repo:{self.repo}:branch:{branch}",
+                ],
+            },
+            target_path=target_path,
+            branch=branch,
+            inventory_loader=lambda _repo: {
+                "worktrees": [self._main(), foreign],
+                "inventory_sha256": "a" * 64,
+            },
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("foreign-live-coordination", result["blocker_codes"])
+
+    def test_existing_task_checkout_requires_exact_path_and_branch_lease_binding(self) -> None:
+        target = self._linked(state="retained", owner="workspace-owner")
+        target["head"] = "a" * 40
+        target["detached"] = False
+        target_path = str(target["path"])
+        branch = str(target["branch"])
+        for resource_keys in (
+            [f"path:{target_path}"],
+            [f"repo:{self.repo}:branch:{branch}"],
+        ):
+            result = admission.assess_repository_admission(
+                repo=str(self.repo),
+                owner_id="task:abc",
+                operation="task_existing_checkout",
+                requested_scope={
+                    "schema_version": 1,
+                    "repository": str(self.repo),
+                    "worktree": target_path,
+                    "head": "a" * 40,
+                    "branch": branch,
+                    "resource_keys": resource_keys,
+                },
+                target_path=target_path,
+                branch=branch,
+                inventory_loader=lambda _repo: {
+                    "worktrees": [self._main(dirty=True), target],
+                    "inventory_sha256": "a" * 64,
+                },
+                reconciliation_loader=lambda _repo: self._reconciliation(),
+            )
+            self.assertEqual(result["scope_mode"], "repository")
+            self.assertEqual(result["decision"], "blocked")
+
     def test_exact_agent_workspace_ignores_unrelated_repository_hygiene(self) -> None:
         target_path = str(self.repo.parent / "worktrees" / "agent-target")
         branch = "fix/agent-target"

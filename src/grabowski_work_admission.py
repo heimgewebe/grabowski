@@ -49,6 +49,11 @@ HARD_BLOCK_CODES = frozenset(
         "bounded-reconciliation-exceeded",
         "lifecycle-owner-ambiguous",
         "reposkop-context-unavailable",
+        "target-checkout-unobservable",
+        "target-checkout-main",
+        "target-checkout-detached",
+        "target-branch-mismatch",
+        "target-head-mismatch",
     }
 )
 SOURCE_CACHE_ROOT_NAMES = frozenset({".repobrief-sources", ".repoground-sources"})
@@ -57,7 +62,12 @@ SOURCE_CACHE_OWNER_PREFIXES = (
     "system:repoground-source-cache:",
 )
 SCOPED_CHECKOUT_OPERATIONS = frozenset(
-    {"worktree_create", "agent_workspace_create", "broad_repository_lease"}
+    {
+        "worktree_create",
+        "agent_workspace_create",
+        "broad_repository_lease",
+        "task_existing_checkout",
+    }
 )
 
 
@@ -505,8 +515,26 @@ def _exact_checkout_scope(
         scope_target = scope_contract["worktree"]
         scope_branch = scope_contract["branch"]
     else:
-        scope_target = target_path
-        scope_branch = branch
+        if operation == "task_existing_checkout":
+            required_keys = {
+                "schema_version",
+                "repository",
+                "worktree",
+                "head",
+                "branch",
+                "resource_keys",
+            }
+            if (
+                set(scope_contract) != required_keys
+                or scope_contract.get("schema_version") != 1
+                or scope_contract.get("repository") != repository
+            ):
+                return None
+            scope_target = scope_contract.get("worktree")
+            scope_branch = scope_contract.get("branch")
+        else:
+            scope_target = target_path
+            scope_branch = branch
 
     if (
         not isinstance(scope_branch, str)
@@ -541,6 +569,29 @@ def _exact_checkout_scope(
             )
         ):
             return None
+    elif operation == "task_existing_checkout":
+        head = scope_contract.get("head")
+        resource_keys = scope_contract.get("resource_keys")
+        if (
+            not isinstance(head, str)
+            or re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", head) is None
+            or set(head) == {"0"}
+            or not isinstance(resource_keys, list)
+            or not resource_keys
+            or any(not isinstance(value, str) or not value for value in resource_keys)
+        ):
+            return None
+        required_resource_keys = {
+            f"path:{canonical_target}",
+            f"repo:{repository}:branch:{scope_branch}",
+        }
+        if not required_resource_keys.issubset(set(resource_keys)):
+            return None
+        return {
+            "target_path": canonical_target,
+            "branch": scope_branch,
+            "head": head,
+        }
 
     return {"target_path": canonical_target, "branch": scope_branch}
 
@@ -769,6 +820,8 @@ def assess_repository_admission(
         )
         worktrees = worktrees[:MAX_WORKTREES]
 
+    task_existing_target_count = 0
+
     if not isinstance(bindings, list):
         blockers.append(
             {"code": "reconciliation-unobservable", "detail": "binding reconciliation is unavailable"}
@@ -821,6 +874,37 @@ def assess_repository_admission(
         )
         status = item.get("status") if isinstance(item.get("status"), dict) else {}
         dirty = status.get("dirty")
+        task_existing_target = bool(
+            operation == "task_existing_checkout"
+            and exact_checkout_scope is not None
+            and effective_target_path is not None
+            and _same_checkout_path(path, effective_target_path)
+        )
+        if task_existing_target:
+            task_existing_target_count += 1
+            expected_head = exact_checkout_scope.get("head")
+            if item.get("is_main") is True:
+                blockers.append({"code": "target-checkout-main", "path": path})
+            if item.get("detached") is True or not isinstance(item.get("branch"), str):
+                blockers.append({"code": "target-checkout-detached", "path": path})
+            if item.get("branch") != effective_branch:
+                blockers.append(
+                    {
+                        "code": "target-branch-mismatch",
+                        "path": path,
+                        "expected_branch": effective_branch,
+                        "observed_branch": item.get("branch"),
+                    }
+                )
+            if item.get("head") != expected_head:
+                blockers.append(
+                    {
+                        "code": "target-head-mismatch",
+                        "path": path,
+                        "expected_head": expected_head,
+                        "observed_head": item.get("head"),
+                    }
+                )
         if scope_relevant:
             if dirty is True:
                 blockers.append({"code": "dirty-worktree", "path": path})
@@ -844,7 +928,7 @@ def assess_repository_admission(
         lifecycle_owner = (
             next(iter(lifecycle_owners)) if len(lifecycle_owners) == 1 else None
         )
-        requested_target_checkout = (
+        requested_target_checkout = task_existing_target or (
             source_kind == "expired_same_owner_lease"
             and isinstance(source_id, str)
             and len(source_id) == 64
@@ -935,6 +1019,15 @@ def assess_repository_admission(
                     "branch": effective_branch,
                 }
             )
+
+    if operation == "task_existing_checkout" and task_existing_target_count != 1:
+        blockers.append(
+            {
+                "code": "target-checkout-unobservable",
+                "detail": "exact existing checkout must resolve to exactly one inventory row",
+                "path": effective_target_path,
+            }
+        )
 
     for row in bindings:
         if not isinstance(row, dict):
