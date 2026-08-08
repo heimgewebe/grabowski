@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "49ac8a6f86db157e90e8d4e2d5f0d0e7ddb6c7162ed781a3f2f46c1a74f703d1",
+  "capability_source_sha256": "37fec8f21c46862376be26404d288c1e669af4b65327cf637e8698ecf49b1667",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "93192a0657da3c210f117deca7484cf04542bcbb8c64f106e4877a55f3f2f3e4",
   "integrity": {
@@ -518,17 +518,19 @@
     },
     {
       "category": "work-coordination",
-      "description": "Atomically acquire a lane, narrow leases and an exact isolated worktree.",
+      "description": "Acquire a work lane, or persist its evidence-bound terminal closeout.",
       "effects": [
         "resource-lease",
         "git-worktree-create",
         "checkout-lifecycle-bind",
-        "lane-receipt-create"
+        "lane-receipt-create",
+        "lane-receipt-update",
+        "audit-append"
       ],
       "id": "grabowski_work_acquire",
-      "purpose": "Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree.",
+      "purpose": "Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery.",
       "read_only": false,
-      "reversibility": "pre-effect lease compensation; created worktree retained for explicit closeout",
+      "reversibility": "pre-effect lease compensation; terminal receipt/audit are forward-only, retry-recoverable evidence",
       "risk_class": "high",
       "tool": "grabowski_work_acquire"
     },
