@@ -102,6 +102,11 @@ class WorkAcquireTests(unittest.TestCase):
         ensure.assert_called_once()
         ensure_parameters = ensure.call_args.args[0]
         self.assertIs(ensure_parameters["reposkop_required"], True)
+        self.assertIsNone(ensure_parameters["system_convergence"])
+        self.assertEqual(
+            ensure_parameters["system_convergence_plan_sha256"],
+            result["inputs"]["system_convergence_plan"]["plan_sha256"],
+        )
 
     def test_supplied_system_convergence_plan_is_bound_into_lane_identity(self) -> None:
         planned = {
@@ -120,6 +125,16 @@ class WorkAcquireTests(unittest.TestCase):
             "expected_protocol_head": "d" * 40,
         }
         params["system_convergence"] = context
+        ensure = Mock(
+            return_value={
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+        )
         with patch.object(
             work_acquire.work_admission,
             "plan_system_convergence",
@@ -130,20 +145,17 @@ class WorkAcquireTests(unittest.TestCase):
                 acquire_resources_fn=self.acquire,
                 release_resources_fn=Mock(),
                 inspect_resource_fn=Mock(),
-                ensure_worktree_fn=Mock(
-                    return_value={
-                        "result_state": "CREATED",
-                        "durable_receipt_sha256": "b" * 64,
-                        "post_state": {
-                            "target_registered": True,
-                            "target_path_exists": True,
-                        },
-                    }
-                ),
+                ensure_worktree_fn=ensure,
                 runner=Mock(),
             )
         planner.assert_called_once_with(context)
+        self.assertEqual(result["inputs"]["system_convergence"], context)
         self.assertEqual(result["inputs"]["system_convergence_plan"], planned)
+        ensure_parameters = ensure.call_args.args[0]
+        self.assertEqual(ensure_parameters["system_convergence"], context)
+        self.assertEqual(
+            ensure_parameters["system_convergence_plan_sha256"], "f" * 64
+        )
         self.assertEqual(result["decision"], "AUTO_PREPARE_AND_EXECUTE")
 
     def test_write_paths_become_exact_repo_path_resources(self) -> None:

@@ -263,8 +263,12 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
         raise ValueError("ttl_seconds must be between 120 and 86400")
     idempotency_key = _text(parameters.get("idempotency_key"), "idempotency_key", pattern=IDEMPOTENCY_RE)
-    system_convergence_plan = work_admission.plan_system_convergence(
-        parameters.get("system_convergence")
+    system_convergence = parameters.get("system_convergence")
+    if system_convergence is not None and not isinstance(system_convergence, dict):
+        raise ValueError("system_convergence must be an object or null")
+    system_convergence_plan = work_admission.plan_system_convergence(system_convergence)
+    normalized_system_convergence = (
+        dict(system_convergence) if system_convergence is not None else None
     )
     requested = parameters.get("resource_keys") or []
     if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
@@ -297,6 +301,7 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         "retention_until_unix": retention,
         "resource_keys": resource_keys,
         "idempotency_key": idempotency_key,
+        "system_convergence": normalized_system_convergence,
         "system_convergence_plan": system_convergence_plan,
     }
     if writer_argv is not None:
@@ -464,6 +469,10 @@ def acquire_work(
             "artifact_class": inputs["artifact_class"],
             "retention_until_unix": inputs["retention_until_unix"],
             "idempotency_key": f"work-acquire:{lane_id}",
+            "system_convergence": inputs["system_convergence"],
+            "system_convergence_plan_sha256": inputs["system_convergence_plan"][
+                "plan_sha256"
+            ],
             "reposkop_required": True,
         }
         try:

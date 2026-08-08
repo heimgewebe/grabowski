@@ -244,6 +244,20 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
     artifact_class = _required_string(parameters, "artifact_class")
     retention_until_unix = _required_integer(parameters, "retention_until_unix")
     idempotency_key = _required_string(parameters, "idempotency_key")
+    system_convergence = parameters.get("system_convergence")
+    if system_convergence is not None and not isinstance(system_convergence, dict):
+        raise WorktreeEnsurePreflight("system_convergence must be an object or null")
+    system_convergence_plan_sha256 = parameters.get(
+        "system_convergence_plan_sha256"
+    )
+    if system_convergence_plan_sha256 is not None:
+        if (
+            not isinstance(system_convergence_plan_sha256, str)
+            or SHA256_RE.fullmatch(system_convergence_plan_sha256) is None
+        ):
+            raise WorktreeEnsurePreflight(
+                "system_convergence_plan_sha256 must be a lowercase SHA-256"
+            )
     if IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key) is None:
         raise WorktreeEnsurePreflight("idempotency_key contains unsupported characters or is too long")
     if SHA40_RE.fullmatch(base_head) is None:
@@ -296,6 +310,10 @@ def _normalize_inputs(parameters: dict[str, Any]) -> dict[str, Any]:
             f"repo:{repo}:branch:{branch}",
         ],
     }
+    if system_convergence is not None:
+        normalized["system_convergence"] = dict(system_convergence)
+    if system_convergence_plan_sha256 is not None:
+        normalized["system_convergence_plan_sha256"] = system_convergence_plan_sha256
     if identity_supersession is not None:
         normalized["identity_supersession"] = identity_supersession
     return normalized
@@ -755,6 +773,14 @@ def ensure_worktree(
         raise WorktreeEnsurePreflight(
             "assess_admission must accept reposkop_required when Reposkop enforcement is enabled"
         )
+    if (
+        parameters.get("system_convergence") is not None
+        and assess_admission is not None
+        and not _accepts_keyword_argument(assess_admission, "system_convergence")
+    ):
+        raise WorktreeEnsurePreflight(
+            "assess_admission must accept system_convergence when convergence context is bound"
+        )
     inputs = _normalize_inputs(parameters)
     if reposkop_required:
         inputs = {**inputs, "reposkop_required": True}
@@ -965,9 +991,25 @@ def ensure_worktree(
                 "source_kind": inputs["source_kind"],
                 "source_id": inputs["source_id"],
             }
+            if inputs.get("system_convergence") is not None:
+                admission_parameters["system_convergence"] = inputs[
+                    "system_convergence"
+                ]
             if reposkop_required:
                 admission_parameters["reposkop_required"] = True
             admission = assessor(**admission_parameters)
+            expected_plan_sha256 = inputs.get("system_convergence_plan_sha256")
+            if expected_plan_sha256 is not None:
+                admission_plan = admission.get("system_convergence_plan")
+                actual_plan_sha256 = (
+                    admission_plan.get("plan_sha256")
+                    if isinstance(admission_plan, dict)
+                    else None
+                )
+                if actual_plan_sha256 != expected_plan_sha256:
+                    raise WorktreeEnsurePreflight(
+                        "system convergence plan binding mismatch between lane and worktree admission"
+                    )
         except work_admission.WorkAdmissionBlocked as exc:
             admission = exc.assessment
             friction = recovery_friction or _record_friction(
