@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "f755c5db3dd4f13b46bbeaee39379f45ec3a90816ec434820b3402bf2d5bf89a"
+    "sha256": "93192a0657da3c210f117deca7484cf04542bcbb8c64f106e4877a55f3f2f3e4"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "44b67822d4637d9e0332d2df7e1d66e047301ce02630c2dbab2437491a7fde2b"
+    "sha256": "f38032c9861064cf0a9e19a1dc92f9594768a3ffba4c240f1ebe2b60dd184998"
   },
   "counts": {
     "core": 22,
-    "full": 191,
-    "operator": 176
+    "full": 192,
+    "operator": 177
   },
   "profiles": {
     "core": [
@@ -126,6 +126,7 @@
       "grabowski_juno_run",
       "ipad_bluetooth_scan",
       "ipad_bluetooth_inspect",
+      "ipad_bluetooth_read",
       "ipad_native_permission_status",
       "ipad_native_permission_request",
       "ipad_capability_manifest",
@@ -306,6 +307,7 @@
       "grabowski_juno_run",
       "ipad_bluetooth_scan",
       "ipad_bluetooth_inspect",
+      "ipad_bluetooth_read",
       "ipad_native_permission_status",
       "ipad_native_permission_request",
       "ipad_capability_manifest",

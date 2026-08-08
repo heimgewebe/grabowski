@@ -518,6 +518,22 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         ],
         "reversibility": "temporary-connection-explicitly-disconnected",
     },
+    "ipad_bluetooth_read": {
+        "category": "device-worker",
+        "purpose": (
+            "Read bounded raw values from exact requested readable GATT characteristics on one "
+            "exact BLE identifier without writes, subscriptions, explicit pairing APIs or auth bypass; CoreBluetooth system-pairing risk requires affirmative acknowledgement."
+        ),
+        "risk_class": "high",
+        "effects": [
+            "device-job-execute",
+            "device-bluetooth-connect",
+            "device-gatt-value-read",
+            "device-private-content-return",
+            "receipt-create",
+        ],
+        "reversibility": "temporary-connection-explicitly-disconnected",
+    },
     "ipad_native_permission_status": {
         "category": "device-worker",
         "purpose": "Read bounded native iPad permission states without reading private content.",

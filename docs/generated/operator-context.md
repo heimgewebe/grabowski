@@ -117,6 +117,7 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_juno_run` | device-worker | no | high | Run one bounded digest-bound job on the paired Juno device worker. |
 | `ipad_bluetooth_scan` | device-worker | no | medium | Scan bounded nearby BLE advertisements through the paired Juno iPad. |
 | `ipad_bluetooth_inspect` | device-worker | no | medium | Connect temporarily to one exact BLE identifier and enumerate GATT service and characteristic metadata without value reads, writes, subscriptions or pairing. |
+| `ipad_bluetooth_read` | device-worker | no | high | Read bounded raw values from exact requested readable GATT characteristics on one exact BLE identifier without writes, subscriptions, explicit pairing APIs or auth bypass; CoreBluetooth system-pairing risk requires affirmative acknowledgement. |
 | `ipad_native_permission_status` | device-worker | no | medium | Read bounded native iPad permission states without reading private content. |
 | `ipad_native_permission_request` | device-worker | no | high | Request one allowlisted native iPad permission with foreground and post-readback gates. |
 | `ipad_capability_manifest` | device-storage | no | medium | Return the bounded iPad/Juno storage capability manifest without exposing bookmark bytes. |

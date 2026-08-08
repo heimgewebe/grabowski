@@ -1188,6 +1188,34 @@
         "reversibility": "temporary-connection-explicitly-disconnected"
       }
     },
+    "ipad_bluetooth_read": {
+      "evidence_refs": [
+        "docs:juno-ipad-bluetooth.md",
+        "tests:test_juno_bluetooth_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool can only read bounded raw values from an exact list of readable characteristics under one exact GATT service on one exact CoreBluetooth identifier, then disconnect; active reads require affirmative acknowledgement that CoreBluetooth may present system pairing UI.",
+        "evidence": "Exact device/service/characteristic validation, at most eight unique targets, 4 KiB per value and 16 KiB total, SHA-256-bound Base64 payloads, fixed one-shot read source, no write/subscribe/pairing API calls, and explicit system-pairing risk acknowledgement/result markers."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because it can write, subscribe, pair or invoke unrelated native APIs; extending metadata inspection with implicit value reads was rejected because private-content return is a distinct authority boundary.",
+      "rationale": "Characteristic values are private device content and active CoreBluetooth reads can also trigger system pairing UI when security is required; the surface therefore requires explicit exact targets, bounded receipt-bound reads, and affirmative pairing-risk acknowledgement while remaining separate from all control authority.",
+      "tool_contract": {
+        "tool": "ipad_bluetooth_read",
+        "category": "device-worker",
+        "authority_class": "mutation",
+        "risk_class": "high",
+        "read_only": false,
+        "effects": [
+          "device-bluetooth-connect",
+          "device-gatt-value-read",
+          "device-job-execute",
+          "device-private-content-return",
+          "receipt-create"
+        ],
+        "reversibility": "temporary-connection-explicitly-disconnected"
+      }
+    },
     "ipad_bluetooth_scan": {
       "evidence_refs": [
         "docs:juno-ipad-bluetooth.md",
