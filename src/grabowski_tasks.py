@@ -8484,7 +8484,10 @@ def reconcile_tasks_check(
         _validate_task_id(task_id)
         if limit != DEFAULT_TASK_RECONCILE_CHECK_LIMIT or cursor is not None:
             raise ValueError("task-specific reconcile check cannot use limit or cursor")
-        rows = _reconcile_candidate_rows(task_id)
+        rows = _reconcile_candidate_rows(
+            task_id,
+            include_converged_terminal=True,
+        )
         page = None
     else:
         page = _reconcile_check_candidate_page(limit=limit, cursor=cursor)
