@@ -4242,6 +4242,28 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(listed["tasks"][0]["state"], "running")
         self.assertIsNotNone(tasks.resources.inspect_resource("service:preview.service"))
 
+    def test_exact_reconcile_check_includes_named_converged_terminal_task(self) -> None:
+        started = self._start()
+        task_id = str(started["task"]["task_id"])
+        tasks._set_state(
+            task_id,
+            "failed",
+            observation={"state": "failed", "source": "test"},
+        )
+        observation = {
+            "state": "failed",
+            "properties": {"ActiveState": "failed", "SubState": "failed"},
+            "probe": None,
+            "observer": {"kind": "test"},
+            "observed_at_unix": 203,
+        }
+        with patch.object(
+            tasks, "_terminal_convergence_evidence", return_value=(True, True)
+        ), patch.object(tasks, "_reconcile_observation", return_value=observation):
+            result = tasks.reconcile_tasks_check(task_id=task_id)
+        self.assertEqual(result["scanned"], 1)
+        self.assertEqual(result["observations"][0]["task_id"], task_id)
+
     def test_reconcile_check_global_pages_without_duplicates(self) -> None:
         started = [
             self._start(resource_keys=[f"service:reconcile-page-{index}.service"])
