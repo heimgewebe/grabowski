@@ -86,6 +86,8 @@
     "grabowski_juno_status",
     "grabowski_juno_pair",
     "grabowski_juno_run",
+    "ipad_bluetooth_scan",
+    "ipad_bluetooth_inspect",
     "ipad_native_permission_status",
     "ipad_native_permission_request",
     "ipad_capability_manifest",
@@ -534,6 +536,10 @@
     {
       "module": "grabowski_juno_storage",
       "source": "src/grabowski_juno_storage.py"
+    },
+    {
+      "module": "grabowski_juno_bluetooth",
+      "source": "src/grabowski_juno_bluetooth.py"
     },
     {
       "module": "grabowski_lifecycle_archive",

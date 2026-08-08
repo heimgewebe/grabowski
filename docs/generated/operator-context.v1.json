@@ -1050,6 +1050,37 @@
     },
     {
       "category": "device-worker",
+      "description": "Scan nearby BLE advertisements through the foreground-capable paired Juno iPad.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-scan",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_scan",
+      "purpose": "Scan bounded nearby BLE advertisements through the paired Juno iPad.",
+      "read_only": false,
+      "reversibility": "not-applicable-device-job-and-receipt-retained",
+      "risk_class": "medium",
+      "tool": "ipad_bluetooth_scan"
+    },
+    {
+      "category": "device-worker",
+      "description": "Connect read-only to one discovered BLE identifier and enumerate GATT metadata.",
+      "effects": [
+        "device-job-execute",
+        "device-bluetooth-connect",
+        "device-gatt-metadata-read",
+        "receipt-create"
+      ],
+      "id": "ipad_bluetooth_inspect",
+      "purpose": "Connect temporarily to one exact BLE identifier and enumerate GATT service and characteristic metadata without value reads, writes, subscriptions or pairing.",
+      "read_only": false,
+      "reversibility": "temporary-connection-explicitly-disconnected",
+      "risk_class": "medium",
+      "tool": "ipad_bluetooth_inspect"
+    },
+    {
+      "category": "device-worker",
       "description": "Read bounded native iPad permission states without reading private content.",
       "effects": [
         "device-job-execute",
@@ -2644,6 +2675,8 @@
       "grabowski_juno_status",
       "grabowski_juno_pair",
       "grabowski_juno_run",
+      "ipad_bluetooth_scan",
+      "ipad_bluetooth_inspect",
       "ipad_native_permission_status",
       "ipad_native_permission_request",
       "ipad_capability_manifest",
@@ -3124,6 +3157,10 @@
         "source": "src/grabowski_juno_storage.py"
       },
       {
+        "module": "grabowski_juno_bluetooth",
+        "source": "src/grabowski_juno_bluetooth.py"
+      },
+      {
         "module": "grabowski_lifecycle_archive",
         "source": "src/grabowski_lifecycle_archive.py"
       },
@@ -3173,7 +3210,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "ffa9803354b796a8457cc0127ada83b924c814d26ca0b55476d272dcc5f72c93"
+      "sha256": "7014fa6bfcf39b9b324568bab50ff235a1f6e266cc4124fd3ba692fd11e24d15"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3181,7 +3218,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "cd665fbc8e11ba2729360eb4a13dcc3fb7446ae8c465dfb6a9d720eefa333a71"
+      "sha256": "f755c5db3dd4f13b46bbeaee39379f45ec3a90816ec434820b3402bf2d5bf89a"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3202,7 +3239,7 @@
       "src/grabowski_bureau_intake.py": "f1d862b3d7bfd7a7cb25f385c5335eef6cf3246efcff251a8a536e75788656e3",
       "src/grabowski_bureau_leases.py": "119a7dff971c9ef985554926830d6b984d1d3ec6921b4df5f083941dc2da78f0",
       "src/grabowski_bureau_pickup.py": "232e42a8f761e584a945e22b09913e65d5cb404b140f34293bf6aa6ddd0de136",
-      "src/grabowski_capabilities.py": "ffa9803354b796a8457cc0127ada83b924c814d26ca0b55476d272dcc5f72c93",
+      "src/grabowski_capabilities.py": "7014fa6bfcf39b9b324568bab50ff235a1f6e266cc4124fd3ba692fd11e24d15",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
@@ -3230,6 +3267,7 @@
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "aeaae6e646638c7c1c6c516ec387bffce78170cf113cc175a627dec745ca9493",
+      "src/grabowski_juno_bluetooth.py": "4e27311e1e839070a21593f2289ab2a279696d09662664abba286853a0d97422",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
       "src/grabowski_lane_closeout.py": "77e78c3b2949206de9fade8608a59972c95ad472bf9426e416ac456f1de425f8",
       "src/grabowski_lifecycle_archive.py": "55ca2cfb58bb56a2c068b3a7c34c6bdc21f040492e1c437e5d8300783a23b3ce",
@@ -3239,7 +3277,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "d62880d182d3c89bc98c68e05b58517aa4b533ffef9ee932e1969df79ec1270b",
+      "src/grabowski_mcp.py": "63cfbffc7670d449e555dc3ea872dc15b55e956da594556f083e01a66f457b8b",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "c5aff396a76758a2d121e728add7b440270b00cb49fcb16137941b80370387dd",
@@ -3262,7 +3300,7 @@
       "src/grabowski_reposkop_context.py": "c1e46bd5b921834a89325fdffe4edba8f716369e6edca3401d230d736f3cfdae",
       "src/grabowski_reposkop_effectiveness.py": "d5bc043e63d126ad9730a350c3d1c1faaf44f5c291e5b4c4ec8bb63cd8f59b04",
       "src/grabowski_resources.py": "2e3185a182ec98711e9052487817ad59ad2da96aaacaf9e249824541f1d04c18",
-      "src/grabowski_runtime.py": "a01d8c574b1099e55d55f9645b88d74674c39571b658d9d344ff87d6470ea7dc",
+      "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
       "src/grabowski_self_deploy.py": "569d0f3f2a289e3ece52a98d205151cd78c3efb47d7bd5ca754d2d50c3095659",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
