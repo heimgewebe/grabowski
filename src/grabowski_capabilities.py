@@ -522,7 +522,7 @@ TOOL_PROFILES: dict[str, dict[str, Any]] = {
         "category": "device-worker",
         "purpose": (
             "Read bounded raw values from exact requested readable GATT characteristics on one "
-            "exact BLE identifier without writes, subscriptions, pairing requests or auth bypass."
+            "exact BLE identifier without writes, subscriptions, explicit pairing APIs or auth bypass; CoreBluetooth system-pairing risk requires affirmative acknowledgement."
         ),
         "risk_class": "high",
         "effects": [

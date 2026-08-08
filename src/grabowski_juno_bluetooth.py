@@ -566,7 +566,7 @@ def _run(request):
     central_state = _manager_ready(manager)
     application_state = int(UIApplication.sharedApplication.applicationState)
     if central_state != 5:
-        return {
+        result = {
             "schema_version": SCHEMA_VERSION,
             "kind": "ipad_bluetooth_" + operation,
             "operation": operation,
@@ -574,8 +574,18 @@ def _run(request):
             "central_state": central_state,
             "bluetooth_powered_on": False,
             "writes_attempted": False,
-            "pairing_requested_by_tool": False,
         }
+        if operation == "read":
+            result.update({
+                "pairing_api_called_by_tool": False,
+                "system_pairing_prompt_possible": True,
+                "system_pairing_risk_acknowledged": bool(
+                    request.get("acknowledge_system_pairing_risk")
+                ),
+            })
+        else:
+            result["pairing_requested_by_tool"] = False
+        return result
 
     if operation == "scan":
         seconds = int(request["scan_seconds"])
@@ -616,10 +626,14 @@ def _run(request):
             "disconnected": False,
             "errors": [],
             "writes_attempted": False,
-            "pairing_requested_by_tool": False,
         }
         if operation == "read":
             result.update({
+                "pairing_api_called_by_tool": False,
+                "system_pairing_prompt_possible": True,
+                "system_pairing_risk_acknowledged": bool(
+                    request.get("acknowledge_system_pairing_risk")
+                ),
                 "service_uuid": request["service_uuid"],
                 "characteristic_uuids": list(request["characteristic_uuids"]),
                 "values": [
@@ -630,7 +644,7 @@ def _run(request):
                 "subscriptions_attempted": False,
             })
         else:
-            result["services"] = []
+            result.update({"services": [], "pairing_requested_by_tool": False})
         return result
 
     public = _public_device(row)
@@ -649,10 +663,14 @@ def _run(request):
             "disconnected": False,
             "errors": ["device_not_connectable"],
             "writes_attempted": False,
-            "pairing_requested_by_tool": False,
         }
         if operation == "read":
             result.update({
+                "pairing_api_called_by_tool": False,
+                "system_pairing_prompt_possible": True,
+                "system_pairing_risk_acknowledged": bool(
+                    request.get("acknowledge_system_pairing_risk")
+                ),
                 "service_uuid": request["service_uuid"],
                 "characteristic_uuids": list(request["characteristic_uuids"]),
                 "values": [
@@ -663,7 +681,7 @@ def _run(request):
                 "subscriptions_attempted": False,
             })
         else:
-            result["services"] = []
+            result.update({"services": [], "pairing_requested_by_tool": False})
         return result
 
     peripheral = row["_peripheral"]
@@ -732,7 +750,11 @@ def _run(request):
             "subscriptions_attempted": False,
             "errors": _inspect["errors"][:32],
             "writes_attempted": False,
-            "pairing_requested_by_tool": False,
+            "pairing_api_called_by_tool": False,
+            "system_pairing_prompt_possible": True,
+            "system_pairing_risk_acknowledged": bool(
+                request.get("acknowledge_system_pairing_risk")
+            ),
         }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -905,7 +927,14 @@ def _validate_device_result(request: dict[str, Any], result: Any) -> dict[str, A
         raise RuntimeError("Bluetooth device result kind mismatch")
     if result.get("writes_attempted") is not False:
         raise RuntimeError("Bluetooth device result does not prove no-write execution")
-    if result.get("pairing_requested_by_tool") is not False:
+    if operation == "read":
+        if result.get("pairing_api_called_by_tool") is not False:
+            raise RuntimeError("Bluetooth read result does not prove no explicit pairing API use")
+        if result.get("system_pairing_prompt_possible") is not True:
+            raise RuntimeError("Bluetooth read result hides the possible CoreBluetooth pairing flow")
+        if result.get("system_pairing_risk_acknowledged") is not True:
+            raise RuntimeError("Bluetooth read result is not bound to explicit system-pairing risk acknowledgement")
+    elif result.get("pairing_requested_by_tool") is not False:
         raise RuntimeError("Bluetooth device result does not prove no-pairing intent")
     if not isinstance(result.get("central_state"), int):
         raise RuntimeError("Bluetooth central state is invalid")
@@ -1195,6 +1224,7 @@ def ipad_bluetooth_read(
     characteristic_uuids: list[str],
     expected_started_at: str,
     session_escalation: dict[str, Any],
+    acknowledge_system_pairing_risk: bool,
     scan_seconds: int = 5,
     discovery_seconds: int = 7,
 ) -> dict[str, Any]:
@@ -1203,6 +1233,10 @@ def ipad_bluetooth_read(
     device_id = _validate_uuid(device_id)
     service_uuid = _validate_gatt_uuid(service_uuid, label="service_uuid")
     characteristic_uuids = _validate_characteristic_uuids(characteristic_uuids)
+    if acknowledge_system_pairing_risk is not True:
+        raise ValueError(
+            "acknowledge_system_pairing_risk must be true because CoreBluetooth may present system pairing UI when a characteristic requires encryption or authentication"
+        )
     scan_seconds = _bounded_int(
         scan_seconds,
         minimum=MIN_SCAN_SECONDS,
@@ -1221,6 +1255,7 @@ def ipad_bluetooth_read(
         "device_id": device_id,
         "service_uuid": service_uuid,
         "characteristic_uuids": characteristic_uuids,
+        "acknowledge_system_pairing_risk": True,
         "scan_seconds": scan_seconds,
         "discovery_seconds": discovery_seconds,
         "class_suffix": _new_suffix(),
@@ -1230,7 +1265,9 @@ def ipad_bluetooth_read(
         purpose=(
             "Read bounded raw values from exact readable BLE characteristics on one exact "
             "paired-Juno-visible peripheral, then disconnect without writing, subscribing, "
-            "requesting pairing, bypassing authentication, or interpreting values as commands."
+            "calling pairing APIs, bypassing authentication, or interpreting values as commands. "
+            "The caller explicitly acknowledges that CoreBluetooth may present system pairing UI "
+            "when the peripheral requires encryption or authentication."
         ),
         expected_started_at=expected_started_at,
         session_escalation=session_escalation,

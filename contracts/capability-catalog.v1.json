@@ -1,6 +1,6 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "64476052f1361131a171cf6380cad9f80974f0e5537ae9d9e3f30263e99e9812",
+  "capability_source_sha256": "49ac8a6f86db157e90e8d4e2d5f0d0e7ddb6c7162ed781a3f2f46c1a74f703d1",
   "contract": "config/runtime-entrypoint.json",
   "contract_sha256": "93192a0657da3c210f117deca7484cf04542bcbb8c64f106e4877a55f3f2f3e4",
   "integrity": {
@@ -1102,7 +1102,7 @@
         "receipt-create"
       ],
       "id": "ipad_bluetooth_read",
-      "purpose": "Read bounded raw values from exact requested readable GATT characteristics on one exact BLE identifier without writes, subscriptions, pairing requests or auth bypass.",
+      "purpose": "Read bounded raw values from exact requested readable GATT characteristics on one exact BLE identifier without writes, subscriptions, explicit pairing APIs or auth bypass; CoreBluetooth system-pairing risk requires affirmative acknowledgement.",
       "read_only": false,
       "reversibility": "temporary-connection-explicitly-disconnected",
       "risk_class": "high",

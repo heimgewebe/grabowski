@@ -1090,7 +1090,7 @@
         "receipt-create"
       ],
       "id": "ipad_bluetooth_read",
-      "purpose": "Read bounded raw values from exact requested readable GATT characteristics on one exact BLE identifier without writes, subscriptions, pairing requests or auth bypass.",
+      "purpose": "Read bounded raw values from exact requested readable GATT characteristics on one exact BLE identifier without writes, subscriptions, explicit pairing APIs or auth bypass; CoreBluetooth system-pairing risk requires affirmative acknowledgement.",
       "read_only": false,
       "reversibility": "temporary-connection-explicitly-disconnected",
       "risk_class": "high",
@@ -3273,7 +3273,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "64476052f1361131a171cf6380cad9f80974f0e5537ae9d9e3f30263e99e9812"
+      "sha256": "49ac8a6f86db157e90e8d4e2d5f0d0e7ddb6c7162ed781a3f2f46c1a74f703d1"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3302,7 +3302,7 @@
       "src/grabowski_bureau_intake.py": "f1d862b3d7bfd7a7cb25f385c5335eef6cf3246efcff251a8a536e75788656e3",
       "src/grabowski_bureau_leases.py": "119a7dff971c9ef985554926830d6b984d1d3ec6921b4df5f083941dc2da78f0",
       "src/grabowski_bureau_pickup.py": "232e42a8f761e584a945e22b09913e65d5cb404b140f34293bf6aa6ddd0de136",
-      "src/grabowski_capabilities.py": "64476052f1361131a171cf6380cad9f80974f0e5537ae9d9e3f30263e99e9812",
+      "src/grabowski_capabilities.py": "49ac8a6f86db157e90e8d4e2d5f0d0e7ddb6c7162ed781a3f2f46c1a74f703d1",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
@@ -3330,7 +3330,7 @@
       "src/grabowski_job_finalizer.py": "ecda3a3761c92a89a17367f75b2b2e359ae224c441d3502ca63c2aa69af1aa0f",
       "src/grabowski_job_origin.py": "7e9a47c5f39fcb990bc65543fadde3aaa0a39789e3a97ab579d0529fdcce7ea5",
       "src/grabowski_juno.py": "aeaae6e646638c7c1c6c516ec387bffce78170cf113cc175a627dec745ca9493",
-      "src/grabowski_juno_bluetooth.py": "b7454c7c5b90eaa147a08b8d53b5f5f810c8404166de09f7208e3b0e7ad4ffc3",
+      "src/grabowski_juno_bluetooth.py": "ab93bd696463e8e3de45fda8ff3e4f67c519d7cd860d5f3f3dd518d5ad1ac52e",
       "src/grabowski_juno_storage.py": "8c0297761211c9a0ce3e09bcb830646d9fef41e94dcfc5941dfe322ab0cbfd1d",
       "src/grabowski_lane_closeout.py": "77e78c3b2949206de9fade8608a59972c95ad472bf9426e416ac456f1de425f8",
       "src/grabowski_lifecycle_archive.py": "55ca2cfb58bb56a2c068b3a7c34c6bdc21f040492e1c437e5d8300783a23b3ce",

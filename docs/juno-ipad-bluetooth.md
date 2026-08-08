@@ -16,7 +16,7 @@ All three operations are device jobs and retain Juno's exact agent-instance bind
 
 The fixed Bluetooth job source can initialize `CBCentralManager`, scan, temporarily connect, discover services and characteristics, and disconnect. Only `ipad_bluetooth_read` may additionally call `readValueForCharacteristic` for the exact requested characteristics after CoreBluetooth reports them readable. It returns raw Base64 bytes, byte length and SHA-256; it does not interpret proprietary payloads as commands or state.
 
-The fixed source does **not** call characteristic writes or notification subscriptions. It does not call pairing APIs or authentication-bypass APIs. Host semantic validation requires `writes_attempted=false` and `pairing_requested_by_tool=false`; read results additionally require `subscriptions_attempted=false`, exact target identity, valid Base64, size bounds and payload SHA-256. Read discovery is restricted to the requested service so unrelated GATT services cannot delay the target read. Connection/discovery/read timeouts remain explicit indeterminate statuses and are never collapsed into a false `not_found` claim.
+The fixed source does **not** call characteristic writes, notification subscriptions, explicit pairing APIs, or authentication-bypass APIs. Scan/inspect results require `pairing_requested_by_tool=false`. Active value reads are different: CoreBluetooth itself can present system pairing UI when a characteristic requires encryption or authentication, and iPadOS does not expose a preflight bond/security requirement that lets this tool guarantee otherwise. Therefore `ipad_bluetooth_read` requires the caller to pass `acknowledge_system_pairing_risk=true`; its result proves `pairing_api_called_by_tool=false`, `system_pairing_prompt_possible=true`, and that the risk acknowledgement was bound to the request. Read discovery is restricted to the requested service so unrelated GATT services cannot delay the target read. Connection/discovery/read timeouts remain explicit indeterminate statuses and are never collapsed into a false `not_found` claim.
 
 `ipad_bluetooth_inspect` remains metadata-only. A characteristic being reported as writable does not grant control authority. `ipad_bluetooth_read` grants only the exact one-shot private-content read requested by its arguments and no broader device-control authority.
 
@@ -27,7 +27,7 @@ The fixed source does **not** call characteristic writes or notification subscri
 - GATT discovery/read window: 1–8 seconds.
 - Scan result: at most 128 devices.
 - GATT metadata result: at most 64 services and 128 characteristics per service.
-- Read request: one exact service and 1–8 unique 16-, 32- or 128-bit characteristic UUIDs.
+- Read request: one exact service and 1–8 unique 16-, 32- or 128-bit characteristic UUIDs, plus affirmative `acknowledge_system_pairing_risk=true`.
 - Read payload: at most 4 KiB per characteristic and 16 KiB total.
 - Advertisement descriptions are bounded to 4 KiB each.
 - Whole device result remains bounded to the Juno 256 KiB result ceiling.
@@ -41,7 +41,7 @@ The current Juno app declares Bluetooth usage consent but does not declare the `
 
 ## Privacy and interpretation
 
-Discovery does not establish ownership of a nearby device. RSSI is not a reliable distance measurement. CoreBluetooth peripheral UUIDs are local iPadOS identifiers. Characteristic values can be private device content; the read surface therefore requires explicit exact targets and returns raw bytes without claiming protocol meaning. A read failure caused by encryption, authentication or pairing requirements is reported as an error and is not bypassed.
+Discovery does not establish ownership of a nearby device. RSSI is not a reliable distance measurement. CoreBluetooth peripheral UUIDs are local iPadOS identifiers. Characteristic values can be private device content; the read surface therefore requires explicit exact targets and returns raw bytes without claiming protocol meaning. A protected read may cause iPadOS to present system pairing UI; that possibility must be explicitly acknowledged and is not represented as a Grabowski pairing API call. Authentication requirements are never bypassed.
 
 ## Evidence
 

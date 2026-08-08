@@ -114,7 +114,9 @@ def read_result() -> dict[str, object]:
         "subscriptions_attempted": False,
         "errors": [],
         "writes_attempted": False,
-        "pairing_requested_by_tool": False,
+        "pairing_api_called_by_tool": False,
+        "system_pairing_prompt_possible": True,
+        "system_pairing_risk_acknowledged": True,
     }
 
 
@@ -211,6 +213,7 @@ class JunoBluetoothHostTests(unittest.TestCase):
             "device_id": DEVICE_ID,
             "service_uuid": "FFF0",
             "characteristic_uuids": ["FFF3", "FFF4", "FFF5"],
+            "acknowledge_system_pairing_risk": True,
             "scan_seconds": 5,
             "discovery_seconds": 7,
             "class_suffix": "d" * 12,
@@ -221,6 +224,11 @@ class JunoBluetoothHostTests(unittest.TestCase):
         changed = copy.deepcopy(result)
         changed["subscriptions_attempted"] = True
         with self.assertRaisesRegex(RuntimeError, "no-subscription"):
+            bluetooth._validate_device_result(request, changed)
+
+        changed = copy.deepcopy(result)
+        changed["system_pairing_risk_acknowledged"] = False
+        with self.assertRaisesRegex(RuntimeError, "pairing risk acknowledgement"):
             bluetooth._validate_device_result(request, changed)
 
         changed = copy.deepcopy(result)
@@ -269,6 +277,7 @@ class JunoBluetoothHostTests(unittest.TestCase):
                 ["fff3", "fff4", "fff5"],
                 "2026-08-08T08:51:10.881206+00:00",
                 {"target": "ipad-10th-gen-wifi"},
+                True,
             )
         self.assertEqual(result, {"ok": True})
         request = run.call_args.kwargs["request"]
@@ -276,6 +285,20 @@ class JunoBluetoothHostTests(unittest.TestCase):
         self.assertEqual(request["device_id"], DEVICE_ID)
         self.assertEqual(request["service_uuid"], "FFF0")
         self.assertEqual(request["characteristic_uuids"], ["FFF3", "FFF4", "FFF5"])
+        self.assertIs(request["acknowledge_system_pairing_risk"], True)
+
+        with (
+            patch.object(bluetooth.operator, "_require_operator_capability"),
+            self.assertRaisesRegex(ValueError, "system pairing UI"),
+        ):
+            bluetooth.ipad_bluetooth_read(
+                DEVICE_ID,
+                "FFF0",
+                ["FFF3"],
+                "2026-08-08T08:51:10.881206+00:00",
+                {"target": "ipad-10th-gen-wifi"},
+                False,
+            )
 
     def test_code_is_digest_bound_and_delegate_name_is_unique_per_request(self) -> None:
         first_request = {
