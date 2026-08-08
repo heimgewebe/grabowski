@@ -1008,9 +1008,20 @@ def _literal_launcher_assignment(tree: ast.Module, name: str) -> ast.expr:
     return matches[0]
 
 
+def _launcher_assignment_values(tree: ast.Module, name: str) -> list[ast.expr]:
+    matches: list[ast.expr] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == name:
+            matches.append(node.value)
+    return matches
+
+
 def _parse_managed_launcher_binding(
     launcher_raw: bytes, launcher_path: Path
-) -> tuple[Path, str]:
+) -> tuple[Path, str, str]:
     if _MANAGED_LAUNCHER_MARKER not in launcher_raw[:512]:
         raise BureauLeaseContractError(
             "contract-managed-launcher-binding-invalid",
@@ -1025,7 +1036,6 @@ def _parse_managed_launcher_binding(
             details={"reason": "syntax-invalid", "error_type": type(exc).__name__},
         ) from None
     manifest_expr = _literal_launcher_assignment(tree, "manifest_path")
-    digest_expr = _literal_launcher_assignment(tree, "expected_manifest_sha256")
     if not (
         isinstance(manifest_expr, ast.Call)
         and isinstance(manifest_expr.func, ast.Name)
@@ -1039,16 +1049,103 @@ def _parse_managed_launcher_binding(
             "contract-managed-launcher-binding-invalid",
             details={"reason": "manifest-path-expression-invalid"},
         )
+    legacy = _launcher_assignment_values(tree, "expected_manifest_sha256")
+    payload = _launcher_assignment_values(tree, "manifest_digest_field")
+    if bool(legacy) == bool(payload):
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={
+                "reason": "manifest-digest-binding-ambiguous",
+                "legacy_count": len(legacy),
+                "payload_count": len(payload),
+            },
+        )
+    if legacy:
+        if len(legacy) != 1:
+            raise BureauLeaseContractError(
+                "contract-managed-launcher-binding-invalid",
+                details={"assignment": "expected_manifest_sha256", "count": len(legacy)},
+            )
+        digest_expr = legacy[0]
+        if not (
+            isinstance(digest_expr, ast.Constant)
+            and isinstance(digest_expr.value, str)
+            and _SHA256_RE.fullmatch(digest_expr.value)
+        ):
+            raise BureauLeaseContractError(
+                "contract-managed-launcher-binding-invalid",
+                details={"reason": "manifest-digest-expression-invalid"},
+            )
+        return (
+            Path(manifest_expr.args[0].value),
+            "manifest-sha256-v1",
+            digest_expr.value,
+        )
+    if len(payload) != 1:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"assignment": "manifest_digest_field", "count": len(payload)},
+        )
+    field_expr = payload[0]
     if not (
-        isinstance(digest_expr, ast.Constant)
-        and isinstance(digest_expr.value, str)
-        and _SHA256_RE.fullmatch(digest_expr.value)
+        isinstance(field_expr, ast.Constant)
+        and field_expr.value == "manifest_payload_sha256"
     ):
         raise BureauLeaseContractError(
             "contract-managed-launcher-binding-invalid",
-            details={"reason": "manifest-digest-expression-invalid"},
+            details={"reason": "manifest-payload-digest-field-invalid"},
         )
-    return Path(manifest_expr.args[0].value), digest_expr.value
+    return (
+        Path(manifest_expr.args[0].value),
+        "manifest-payload-sha256-v2",
+        field_expr.value,
+    )
+
+
+def _validate_manifest_payload_binding(
+    manifest_raw: bytes, manifest: dict[str, Any], *, field: str
+) -> None:
+    try:
+        canonical = (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-payload-canonicalization-failed", "error_type": type(exc).__name__},
+        ) from None
+    if manifest_raw != canonical:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-payload-manifest-not-canonical"},
+        )
+    payload = dict(manifest)
+    expected = payload.pop(field, None)
+    if not isinstance(expected, str) or _SHA256_RE.fullmatch(expected) is None:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-payload-digest-invalid"},
+        )
+    rendered_payload = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    if hashlib.sha256(rendered_payload).hexdigest() != expected:
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-payload-digest-mismatch"},
+        )
 
 
 def _managed_contract_runtime() -> dict[str, Any]:
@@ -1140,17 +1237,29 @@ def _managed_contract_runtime() -> dict[str, Any]:
     launcher_identity, launcher_raw = _regular_file_snapshot(
         executable, label="contract-contract-executable"
     )
-    configured_manifest, configured_manifest_sha256 = (
+    configured_manifest, manifest_binding_kind, manifest_binding_value = (
         _parse_managed_launcher_binding(launcher_raw, executable)
     )
     expected_manifest_sha256 = manifest_identity["sha256"]
-    if (
-        configured_manifest != manifest_path
-        or configured_manifest_sha256 != expected_manifest_sha256
-    ):
+    if configured_manifest != manifest_path:
         raise BureauLeaseContractError(
             "contract-managed-launcher-binding-invalid",
-            details={"reason": "manifest-binding-mismatch"},
+            details={"reason": "manifest-path-mismatch"},
+        )
+    if manifest_binding_kind == "manifest-sha256-v1":
+        if manifest_binding_value != expected_manifest_sha256:
+            raise BureauLeaseContractError(
+                "contract-managed-launcher-binding-invalid",
+                details={"reason": "manifest-binding-mismatch"},
+            )
+    elif manifest_binding_kind == "manifest-payload-sha256-v2":
+        _validate_manifest_payload_binding(
+            manifest_raw, manifest, field=manifest_binding_value
+        )
+    else:  # pragma: no cover - parser owns the closed binding vocabulary
+        raise BureauLeaseContractError(
+            "contract-managed-launcher-binding-invalid",
+            details={"reason": "manifest-binding-kind-unsupported"},
         )
     package_tree_sha256 = manifest.get("package_tree_sha256")
     if not isinstance(package_tree_sha256, str):
