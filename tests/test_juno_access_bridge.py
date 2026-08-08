@@ -238,6 +238,35 @@ class JunoAccessBridgeTests(unittest.TestCase):
                     )
 
 
+
+    def test_live_proven_native_paths_use_polling_and_audio_session(self) -> None:
+        import inspect
+
+        motion_source = inspect.getsource(self.bridge._motion_sample)
+        location_source = inspect.getsource(self.bridge._location_one_shot)
+        microphone_source = inspect.getsource(self.bridge._mic_record_short)
+        bluetooth_source = inspect.getsource(self.bridge._bluetooth_scan)
+        camera_source = inspect.getsource(self.bridge._camera_photo_workspace)
+
+        self.assertIn("startAccelerometerUpdates", motion_source)
+        self.assertIn("accelerometerData", motion_source)
+        self.assertIn("field_0", motion_source)
+        self.assertNotIn("startAccelerometerUpdatesToQueue_withHandler_", motion_source)
+
+        self.assertIn("startUpdatingLocation", location_source)
+        self.assertIn("manager.location", location_source)
+        self.assertIn("coordinate.field_0", location_source)
+        self.assertNotIn("requestLocation", location_source)
+
+        self.assertIn("AVAudioSession", microphone_source)
+        self.assertIn("AVAudioSessionCategoryRecord", microphone_source)
+        self.assertIn("setActive_error_(True", microphone_source)
+        self.assertIn('"recording", "isRecording"', microphone_source)
+        self.assertEqual(15.0, self.bridge.MAX_MIC_SECONDS)
+
+        self.assertIn("_bind_objc_delegate_method", bluetooth_source)
+        self.assertIn("_bind_objc_delegate_method", camera_source)
+
     def test_retention_mutations_are_lock_guarded(self) -> None:
         class TrackingLock:
             def __init__(self) -> None:

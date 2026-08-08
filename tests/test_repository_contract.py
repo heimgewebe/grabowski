@@ -182,7 +182,7 @@ class RepositoryContractTests(unittest.TestCase):
             ],
         )
         tools = set(contract["expected_tools"])
-        self.assertEqual(len(tools), 191)
+        self.assertEqual(len(tools), 192)
         self.assertTrue(
             {
                 "grabowski_juno_status",
@@ -190,6 +190,7 @@ class RepositoryContractTests(unittest.TestCase):
                 "grabowski_juno_run",
                 "ipad_bluetooth_scan",
                 "ipad_bluetooth_inspect",
+                "ipad_bluetooth_read",
                 "ipad_native_permission_status",
                 "ipad_native_permission_request",
             }.issubset(tools)
