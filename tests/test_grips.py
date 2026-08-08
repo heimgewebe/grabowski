@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import inspect
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -9780,6 +9781,85 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual("passed", passed["receipt"]["status"])
         self.assertTrue(late_component_blocked)
         self.assertIn(head_component, execution["merge_lease_guard"]["resource_keys"])
+
+    def _temporary_git_repository(
+        self, path: Path, *, remote: str = "git@github.com:heimgewebe/grabowski.git"
+    ) -> Path:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "remote", "add", "origin", remote],
+            check=True,
+        )
+        return path
+
+    def test_captain_merge_repository_falls_back_from_non_git_mcp_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            canonical = self._temporary_git_repository(home / "repos" / "grabowski")
+            outside = home / "runtime-cwd"
+            outside.mkdir()
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                resolved, source = merge_guard.resolve_captain_merge_repository(
+                    outside,
+                    repo_slug="heimgewebe/grabowski",
+                    allow_canonical_fallback=True,
+                )
+            self.assertEqual(canonical.resolve(), resolved)
+            self.assertEqual("canonical-target-fallback", source)
+
+    def test_captain_merge_repository_rejects_explicit_wrong_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self._temporary_git_repository(home / "repos" / "grabowski")
+            wrong = self._temporary_git_repository(
+                home / "other", remote="git@github.com:heimgewebe/weltgewebe.git"
+            )
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "does not match target"):
+                    merge_guard.resolve_captain_merge_repository(
+                        wrong,
+                        repo_slug="heimgewebe/grabowski",
+                        allow_canonical_fallback=False,
+                    )
+
+    def test_captain_merge_repository_rejects_noncanonical_same_remote_clone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self._temporary_git_repository(home / "repos" / "grabowski")
+            duplicate = self._temporary_git_repository(home / "duplicate")
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                with self.assertRaisesRegex(RuntimeError, "not the canonical repository common-dir"):
+                    merge_guard.resolve_captain_merge_repository(
+                        duplicate,
+                        repo_slug="heimgewebe/grabowski",
+                        allow_canonical_fallback=False,
+                    )
+
+    def test_captain_merge_runner_records_target_bound_repository_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            canonical = self._temporary_git_repository(home / "repos" / "grabowski")
+            outside = home / "runtime-cwd"
+            outside.mkdir()
+            parameters = authorized_captain_run_parameters()
+            with patch.object(merge_guard.Path, "home", return_value=home):
+                runner = merge_guard.CaptainMergeGuardRunner(
+                    repo_path=outside,
+                    action=captain_action(),
+                    parameters=parameters,
+                    github_runner=FakeGh(),
+                    execution_intent_sha256="f" * 64,
+                    lease_owner_id="captain-test-owner",
+                )
+            self.assertEqual(canonical.resolve(), runner.repo_path)
+            self.assertEqual(
+                "canonical-target-fallback",
+                runner.receipt["local_repository_binding"]["source"],
+            )
+            self.assertNotIn(
+                "merge_guard_local_repository_binding_invalid", runner.static_errors
+            )
 
     def test_merge_guard_resource_ids_are_collision_free_and_slash_safe(self) -> None:
         local_repo = merge_guard.merge_guard_repository_root(Path.cwd())

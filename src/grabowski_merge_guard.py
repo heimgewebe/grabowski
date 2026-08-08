@@ -11,7 +11,7 @@ import subprocess
 import threading
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 import weakref
 
 
@@ -19,6 +19,8 @@ import weakref
 _SHA40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _OWNER_RE = re.compile(r"[A-Za-z0-9._:@-]{1,128}\Z")
+_GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_GITHUB_SCP_REMOTE_RE = re.compile(r"(?:[^@\s]+@)?github\.com:(?P<path>[^?#\s]+)\Z", re.IGNORECASE)
 _MERGE_GUARD_TTL_SECONDS = 300
 _MERGE_GUARD_MAX_CHANGED_PATHS = 100
 _MERGE_GUARD_MAX_CHANGED_PATH_BYTES = 8 * 1024
@@ -698,6 +700,91 @@ def merge_guard_repository_root(repo_path: Path) -> Path:
     return repository
 
 
+def _merge_guard_github_repository_identity(remote: str) -> str:
+    if not isinstance(remote, str):
+        raise RuntimeError("merge guard origin remote is not text")
+    value = remote.strip()
+    if not value or "\x00" in value or value != remote.strip("\r\n"):
+        raise RuntimeError("merge guard origin remote is not canonical")
+    path: str | None = None
+    if "://" in value:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"git", "http", "https", "ssh"}
+            or (parsed.hostname or "").lower() != "github.com"
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError("merge guard origin remote is not a canonical GitHub URL")
+        path = parsed.path
+    else:
+        match = _GITHUB_SCP_REMOTE_RE.fullmatch(value)
+        if match is not None:
+            path = match.group("path")
+    if path is None:
+        raise RuntimeError("merge guard origin remote does not identify GitHub owner/repository")
+    identity = path.strip("/")
+    if identity.endswith(".git"):
+        identity = identity[:-4]
+    if _GITHUB_REPOSITORY_RE.fullmatch(identity) is None:
+        raise RuntimeError("merge guard origin remote owner/repository identity is invalid")
+    return identity
+
+
+def merge_guard_repository_identity(repo_path: Path) -> tuple[Path, str]:
+    repository = merge_guard_repository_root(repo_path)
+    completed = subprocess.run(
+        ["git", "-C", str(repository), "remote", "get-url", "origin"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        timeout=10,
+        env={
+            "HOME": str(Path.home()),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        },
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("merge guard cannot read canonical origin remote")
+    return repository, _merge_guard_github_repository_identity(completed.stdout)
+
+
+def resolve_captain_merge_repository(
+    repo_path: Path,
+    *,
+    repo_slug: str,
+    allow_canonical_fallback: bool,
+) -> tuple[Path, str]:
+    if not isinstance(repo_slug, str) or _GITHUB_REPOSITORY_RE.fullmatch(repo_slug) is None:
+        raise RuntimeError("merge guard target repository slug is invalid")
+    repository_name = repo_slug.split("/", 1)[1]
+    canonical_candidate = (Path.home() / "repos" / repository_name).resolve()
+    canonical_root: Path | None = None
+    if canonical_candidate.is_dir():
+        canonical_root, canonical_identity = merge_guard_repository_identity(
+            canonical_candidate
+        )
+        if canonical_identity.casefold() != repo_slug.casefold():
+            raise RuntimeError("merge guard canonical checkout origin does not match target repository")
+
+    try:
+        requested_root, requested_identity = merge_guard_repository_identity(repo_path)
+    except RuntimeError:
+        if allow_canonical_fallback and canonical_root is not None:
+            return canonical_root, "canonical-target-fallback"
+        raise
+    if requested_identity.casefold() != repo_slug.casefold():
+        raise RuntimeError("merge guard requested checkout origin does not match target repository")
+    if canonical_root is not None and requested_root != canonical_root:
+        raise RuntimeError("merge guard requested checkout is not the canonical repository common-dir")
+    return requested_root, "requested-target-bound"
+
+
 def merge_guard_resource_keys(
     repo_path: Path,
     *,
@@ -1162,9 +1249,25 @@ class CaptainMergeGuardRunner:
         server_task_lease_delegation: dict[str, Any] | None = None,
         server_operator_lease_delegation: dict[str, Any] | None = None,
     ) -> None:
-        self.repo_path = repo_path.resolve()
         self.action = action
         self.parameters = parameters
+        self.requested_repo_path = repo_path.resolve()
+        self.repository_binding_error: str | None = None
+        self.repository_binding_source = "unresolved"
+        try:
+            self.repo_path, self.repository_binding_source = (
+                resolve_captain_merge_repository(
+                    self.requested_repo_path,
+                    repo_slug=str(action.get("target", {}).get("repo", "")),
+                    allow_canonical_fallback=not (
+                        isinstance(parameters.get("local_repo"), str)
+                        and bool(str(parameters.get("local_repo")).strip())
+                    ),
+                )
+            )
+        except RuntimeError as exc:
+            self.repo_path = self.requested_repo_path
+            self.repository_binding_error = f"{type(exc).__name__}:{exc}"
         self.github_runner = github_runner
         self.execution_intent_sha256 = execution_intent_sha256
         self.requested_lease_owner_id = lease_owner_id
@@ -1266,6 +1369,19 @@ class CaptainMergeGuardRunner:
             "contract_satisfied": False,
             "dispatch_called": False,
             "resource_keys": [],
+            "local_repository_binding": {
+                "source": self.repository_binding_source,
+                "requested_path_sha256": hashlib.sha256(
+                    str(self.requested_repo_path).encode("utf-8")
+                ).hexdigest(),
+                "resolved_path_sha256": (
+                    hashlib.sha256(str(self.repo_path).encode("utf-8")).hexdigest()
+                    if self.repository_binding_error is None
+                    else None
+                ),
+                "target_repository": str(action.get("target", {}).get("repo", "")),
+                "error": self.repository_binding_error,
+            },
             "lease_owner_binding": {
                 "source": self.lease_owner_source,
                 "server_authenticated": self.server_actor_identity is not None,
@@ -2377,6 +2493,8 @@ class CaptainMergeGuardRunner:
         expected_base_sha = str(self.parameters.get("expected_base_sha", ""))
         expected_diff = str(self.parameters.get("diff_sha256", ""))
         errors: list[str] = []
+        if self.repository_binding_error is not None:
+            errors.append("merge_guard_local_repository_binding_invalid")
         if self.server_actor_identity_error:
             errors.append("merge_guard_server_actor_identity_invalid")
         if self.server_task_lease_delegation_error:
