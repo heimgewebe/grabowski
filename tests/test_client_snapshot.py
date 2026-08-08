@@ -178,7 +178,7 @@ class ClientSnapshotTests(unittest.TestCase):
             "observed_tools": observed_tools,
         }
         document["snapshot_sha256"] = snapshot._sha256_json(document)
-        snapshot.PLATFORM_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.PLATFORM_SNAPSHOT_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         snapshot._write_private_json(snapshot.PLATFORM_SNAPSHOT_PATH, document)
         return document
 
