@@ -5155,12 +5155,17 @@ def _runtime_tool_contract_summary(
         and isinstance(repo_head, str)
         and re.fullmatch(r"[0-9a-f]{40}", repo_head) is not None
     ):
+        try:
+            runtime_observed_tools = _runtime_connector_observed_tools()
+        except RuntimeError:
+            runtime_observed_tools = None
         client_snapshot = grabowski_client_snapshot.snapshot_status(
             expected_tool_count=len(registered),
             expected_names_sha256=registered_names_sha256,
             expected_release_id=release_id,
             expected_repo_head=repo_head,
             expected_agent_instructions_sha256=AGENT_INSTRUCTIONS_SHA256,
+            expected_runtime_tools=runtime_observed_tools,
         )
     else:
         client_snapshot = {
@@ -5192,6 +5197,13 @@ def _runtime_tool_contract_summary(
         "client_schema_snapshot_observable": bool(
             client_snapshot.get("schema_observable")
         ),
+        "platform_connector_snapshot_observable": bool(
+            client_snapshot.get("platform_connector_snapshot_observable")
+        ),
+        "platform_connector_schema_observable": bool(
+            client_snapshot.get("platform_connector_schema_observable")
+        ),
+        "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
         "client_snapshot_verification_model": client_snapshot.get("verification_model"),
         "refresh_required_when_client_count_or_hash_differs": True,
     }
@@ -5396,6 +5408,17 @@ def _operator_system_overview(
             ),
             "freshness": "current bounded scan",
         },
+        "platform_connector_catalog": {
+            "authority": "trusted platform connector catalog snapshot",
+            "observation_state": client_snapshot.get("platform_evidence_state"),
+            "freshness": (client_snapshot.get("platform_snapshot") or {}).get(
+                "fresh"
+            ),
+            "source": (client_snapshot.get("platform_snapshot") or {}).get("source"),
+            "trust_contract": (client_snapshot.get("platform_snapshot") or {}).get(
+                "authority"
+            ),
+        },
         "bureau": {
             "authority": "Bureau",
             "observation_state": "target_required",
@@ -5446,7 +5469,15 @@ def _operator_system_overview(
         "connector": {
             "state": client_snapshot.get("state"),
             "observable": snapshot_observable,
+            "external_client_snapshot_observable": client_snapshot.get(
+                "external_client_snapshot_observable"
+            ),
             "platform_snapshot_observable": platform_connector_snapshot_observable,
+            "platform_schema_observable": client_snapshot.get(
+                "platform_connector_schema_observable"
+            ),
+            "platform_evidence_state": client_snapshot.get("platform_evidence_state"),
+            "platform_snapshot": client_snapshot.get("platform_snapshot"),
             "server_loopback_observable": client_snapshot.get("server_loopback_observable"),
             "fresh": client_snapshot.get("fresh"),
             "matched": client_snapshot.get("matched"),
@@ -5551,6 +5582,22 @@ def grabowski_status(
                 ),
             }
         )
+    if not bool(client_snapshot.get("platform_connector_snapshot_observable")):
+        platform_snapshot = client_snapshot.get("platform_snapshot")
+        platform_snapshot = (
+            platform_snapshot if isinstance(platform_snapshot, dict) else {}
+        )
+        platform_state = str(platform_snapshot.get("state", "unavailable"))
+        warnings.append(
+            {
+                "code": f"platform_connector_snapshot_{platform_state}",
+                "detail": platform_snapshot.get(
+                    "recommended_next_action",
+                    "capture authoritative platform connector publication evidence",
+                ),
+                "authority": platform_snapshot.get("authority"),
+            }
+        )
     if (
         transport_roundtrip.get("state") != "unavailable"
         and transport_roundtrip.get("mutation_gate_open") is not True
@@ -5593,6 +5640,14 @@ def grabowski_status(
             client_snapshot.get(
                 "recommended_next_action",
                 "bind the current connector client snapshot",
+            )
+        )
+    elif not bool(client_snapshot.get("platform_connector_snapshot_observable")):
+        platform_snapshot = client_snapshot.get("platform_snapshot")
+        recommended_next_action = str(
+            (platform_snapshot if isinstance(platform_snapshot, dict) else {}).get(
+                "recommended_next_action",
+                "capture authoritative platform connector publication evidence",
             )
         )
     elif (
@@ -5640,6 +5695,13 @@ def grabowski_status(
             "client_schema_snapshot_observable": tool_contract.get(
                 "client_schema_snapshot_observable"
             ),
+            "platform_connector_snapshot_observable": tool_contract.get(
+                "platform_connector_snapshot_observable"
+            ),
+            "platform_connector_schema_observable": tool_contract.get(
+                "platform_connector_schema_observable"
+            ),
+            "platform_evidence_state": tool_contract.get("platform_evidence_state"),
             "client_snapshot": client_snapshot,
             "refresh_required_when_client_count_or_hash_differs": tool_contract.get(
                 "refresh_required_when_client_count_or_hash_differs"
