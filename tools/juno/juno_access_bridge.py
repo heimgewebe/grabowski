@@ -36,6 +36,7 @@ RETENTION_LIMIT = 128
 ALLOWED_URL_SCHEMES = frozenset({"https", "http", "mailto", "maps", "shortcuts", "rm-juno"})
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _RETAINED: list[Any] = []
+_RETAINED_LOCK = threading.Lock()
 
 OPERATIONS = {
     "capabilities": {"private": False, "foreground": False},
@@ -150,17 +151,19 @@ def _identifier(request: dict[str, Any], name: str = "identifier") -> str:
 
 
 def _retain(value: Any) -> Any:
-    if len(_RETAINED) >= RETENTION_LIMIT:
-        raise RuntimeError("native retention bound exhausted")
-    _RETAINED.append(value)
+    with _RETAINED_LOCK:
+        if len(_RETAINED) >= RETENTION_LIMIT:
+            raise RuntimeError("native retention bound exhausted")
+        _RETAINED.append(value)
     return value
 
 
 def _release(value: Any) -> None:
-    for index, item in enumerate(_RETAINED):
-        if item is value:
-            del _RETAINED[index]
-            return
+    with _RETAINED_LOCK:
+        for index, item in enumerate(_RETAINED):
+            if item is value:
+                del _RETAINED[index]
+                return
 
 
 def _objc() -> Any:
@@ -338,11 +341,11 @@ def _clipboard_set(request: dict[str, Any], _workspace: Path | None) -> dict[str
 
 
 def _open_url(request: dict[str, Any], _workspace: Path | None) -> dict[str, Any]:
-    _require_foreground()
     url_text = _string(request, "url", max_bytes=MAX_URL_BYTES)
     scheme = urlparse(url_text).scheme.lower()
     if scheme not in ALLOWED_URL_SCHEMES:
         raise ValueError("URL scheme is not allowlisted")
+    _require_foreground()
     objc = _objc()
     NSURL = objc.ObjCClass("NSURL")
     native_url = NSURL.URLWithString_(url_text)
@@ -412,10 +415,10 @@ def _notification_remove(request: dict[str, Any], _workspace: Path | None) -> di
 
 def _motion_sample(request: dict[str, Any], _workspace: Path | None) -> dict[str, Any]:
     _private_ack(request)
-    _require_foreground()
     timeout = _number(
         request, "timeout_seconds", minimum=0.2, maximum=MAX_MOTION_TIMEOUT_SECONDS, default=2.0
     )
+    _require_foreground()
     objc = _objc()
     auth = int(_zero(objc.ObjCClass("CMMotionActivityManager").authorizationStatus))
     if auth != 3:
@@ -475,6 +478,7 @@ def _bluetooth_scan(request: dict[str, Any], _workspace: Path | None) -> dict[st
         raise RuntimeError(f"bluetooth authorization is not granted; status={auth}")
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
+    done = threading.Event()
 
     def centralManagerDidUpdateState_(self: Any, central: Any) -> None:
         return None
@@ -505,6 +509,8 @@ def _bluetooth_scan(request: dict[str, Any], _workspace: Path | None) -> dict[st
             except Exception:
                 rssi_value = None
         results.append({"identifier": identifier[:128], "name": name, "rssi": rssi_value})
+        if len(results) >= limit:
+            done.set()
 
     Delegate = objc.create_objc_class(
         "GrabowskiBluetoothDelegate_" + uuid.uuid4().hex,
@@ -537,7 +543,7 @@ def _bluetooth_scan(request: dict[str, Any], _workspace: Path | None) -> dict[st
         manager.stopScan()
     try:
         _on_main(start)
-        time.sleep(duration)
+        done.wait(duration)
     finally:
         try:
             _on_main(stop)
@@ -671,10 +677,10 @@ def _reminder_create(request: dict[str, Any], _workspace: Path | None) -> dict[s
 
 def _location_one_shot(request: dict[str, Any], _workspace: Path | None) -> dict[str, Any]:
     _private_ack(request)
-    _require_foreground()
     timeout = _number(
         request, "timeout_seconds", minimum=1.0, maximum=MAX_LOCATION_TIMEOUT_SECONDS, default=5.0
     )
+    _require_foreground()
     objc = _objc()
     Manager = objc.ObjCClass("CLLocationManager")
     auth = int(_zero(Manager.authorizationStatus))
@@ -723,6 +729,10 @@ def _location_one_shot(request: dict[str, Any], _workspace: Path | None) -> dict
         return _result("location_one_shot", location=holder["location"])
     finally:
         try:
+            _on_main(manager.stopUpdatingLocation)
+        except Exception:
+            pass
+        try:
             manager.setDelegate_(None)
         except Exception:
             pass
@@ -738,10 +748,16 @@ def _photos_latest_metadata(request: dict[str, Any], _workspace: Path | None) ->
     auth = int(Library.authorizationStatusForAccessLevel_(2))
     if auth not in {3, 4}:
         raise RuntimeError(f"photo authorization is not granted; status={auth}")
-    assets = objc.ObjCClass("PHAsset").fetchAssetsWithOptions_(None)
-    count = int(_zero(assets.count))
+    options = objc.ObjCClass("PHFetchOptions").alloc().init()
+    newest_first = objc.ObjCClass("NSSortDescriptor").sortDescriptorWithKey_ascending_(
+        "creationDate", False
+    )
+    options.setSortDescriptors_(objc.ns([newest_first]))
+    options.setFetchLimit_(limit)
+    assets = objc.ObjCClass("PHAsset").fetchAssetsWithOptions_(options)
+    count = min(int(_zero(assets.count)), limit)
     output: list[dict[str, Any]] = []
-    for index in range(count - 1, max(-1, count - limit - 1), -1):
+    for index in range(count):
         asset = assets.objectAtIndex_(index)
         output.append(
             {
@@ -775,12 +791,12 @@ def _safe_workspace_path(workspace: Path | None, relative_text: str) -> Path:
 
 def _mic_record_short(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
     _private_ack(request)
-    _require_foreground()
     duration = _number(request, "duration_seconds", minimum=0.2, maximum=MAX_MIC_SECONDS, default=5.0)
     relative_path = _string(request, "relative_path", max_bytes=512)
     target = _safe_workspace_path(workspace, relative_path)
     if target.suffix.lower() != ".caf":
         raise ValueError("relative_path must end in .caf")
+    _require_foreground()
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
         raise FileExistsError("recording target already exists")
@@ -850,14 +866,14 @@ def _write_bytes_create_only(target: Path, payload: bytes) -> None:
 
 def _camera_photo_workspace(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
     _private_ack(request)
-    _require_foreground()
     relative_path = _string(request, "relative_path", max_bytes=512)
     target = _safe_workspace_path(workspace, relative_path)
     if target.suffix.lower() not in {".jpg", ".jpeg"}:
         raise ValueError("relative_path must end in .jpg or .jpeg")
+    timeout = _number(request, "timeout_seconds", minimum=2.0, maximum=12.0, default=8.0)
+    _require_foreground()
     if target.exists():
         raise FileExistsError("camera target already exists")
-    timeout = _number(request, "timeout_seconds", minimum=2.0, maximum=12.0, default=8.0)
     objc = _objc()
     Device = objc.ObjCClass("AVCaptureDevice")
     auth = int(Device.authorizationStatusForMediaType_("vide"))
@@ -1041,9 +1057,9 @@ def _vision_barcodes_workspace_image(request: dict[str, Any], workspace: Path | 
 
 
 def _shortcut_run(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
-    _require_foreground()
     name = _string(request, "name", max_bytes=256)
     text = _string(request, "text", required=False, allow_empty=True, max_bytes=4096)
+    _require_foreground()
     url = "shortcuts://run-shortcut?name=" + quote(name, safe="")
     if text:
         url += "&input=text&text=" + quote(text, safe="")
@@ -1149,9 +1165,9 @@ def _present_share_sheet(items: list[Any]) -> dict[str, Any]:
 
 def _share_workspace_file(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
     _private_ack(request)
-    _require_foreground()
     relative_path = _string(request, "relative_path", max_bytes=512)
     target = _safe_workspace_path(workspace, relative_path)
+    _require_foreground()
     if not target.is_file():
         raise FileNotFoundError("workspace file does not exist")
     size = target.stat().st_size
@@ -1169,8 +1185,8 @@ def _share_workspace_file(request: dict[str, Any], workspace: Path | None) -> di
 
 
 def _share_text(request: dict[str, Any], workspace: Path | None) -> dict[str, Any]:
-    _require_foreground()
     text = _string(request, "text", max_bytes=MAX_TEXT_BYTES, allow_empty=False)
+    _require_foreground()
     evidence = _present_share_sheet([text])
     return _result(
         "share_text",
