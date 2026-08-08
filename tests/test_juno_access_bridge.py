@@ -238,5 +238,163 @@ class JunoAccessBridgeTests(unittest.TestCase):
                     )
 
 
+    def test_retention_mutations_are_lock_guarded(self) -> None:
+        class TrackingLock:
+            def __init__(self) -> None:
+                self.entries = 0
+
+            def __enter__(self):
+                self.entries += 1
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+        lock = TrackingLock()
+        value = object()
+        self.bridge._RETAINED.clear()
+        try:
+            with patch.object(self.bridge, "_RETAINED_LOCK", lock):
+                self.bridge._retain(value)
+                self.bridge._release(value)
+        finally:
+            self.bridge._RETAINED.clear()
+        self.assertEqual(2, lock.entries)
+
+    def test_bluetooth_and_location_cleanup_have_bounded_completion_paths(self) -> None:
+        import inspect
+
+        bluetooth_source = inspect.getsource(self.bridge._bluetooth_scan)
+        location_source = inspect.getsource(self.bridge._location_one_shot)
+        self.assertIn("done.set()", bluetooth_source)
+        self.assertIn("done.wait(duration)", bluetooth_source)
+        self.assertNotIn("time.sleep(duration)", bluetooth_source)
+        self.assertIn("manager.stopUpdatingLocation", location_source)
+
+    def test_syntactic_validation_precedes_foreground_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                (self.request("open_url", url="file:///etc/passwd"), None, "scheme"),
+                (
+                    self.request("motion_sample", timeout_seconds=99, private_content_ack=True),
+                    None,
+                    "out of range",
+                ),
+                (
+                    self.request("location_one_shot", timeout_seconds=99, private_content_ack=True),
+                    None,
+                    "out of range",
+                ),
+                (
+                    self.request("mic_record_short", relative_path="capture.txt", private_content_ack=True),
+                    root,
+                    r"\.caf",
+                ),
+                (
+                    self.request("camera_photo_workspace", relative_path="capture.png", private_content_ack=True),
+                    root,
+                    "jpg",
+                ),
+                (self.request("shortcut_run", name="x" * 300), None, "byte bound"),
+                (
+                    self.request("share_workspace_file", relative_path="../escape.txt", private_content_ack=True),
+                    root,
+                    "workspace|escapes",
+                ),
+                (self.request("share_text", text="x" * 20000), None, "byte bound"),
+            )
+            for request, workspace, message in cases:
+                with self.subTest(operation=request["operation"]):
+                    with patch.object(
+                        self.bridge,
+                        "_require_foreground",
+                        side_effect=AssertionError("foreground checked too early"),
+                    ):
+                        with self.assertRaisesRegex(ValueError, message):
+                            self.bridge.dispatch(request, workspace=workspace)
+
+    def test_photos_fetch_is_sorted_and_limited_at_framework_level(self) -> None:
+        class FakeAsset:
+            def __init__(self, identifier: str) -> None:
+                self.localIdentifier = identifier
+                self.mediaType = 1
+                self.pixelWidth = 10
+                self.pixelHeight = 20
+                self.duration = 0.0
+                self.favorite = False
+                self.hidden = False
+                self.creationDate = identifier
+
+        class FakeAssets:
+            def __init__(self) -> None:
+                self.items = [FakeAsset("newest"), FakeAsset("older"), FakeAsset("old")]
+                self.count = len(self.items)
+
+            def objectAtIndex_(self, index: int):
+                return self.items[index]
+
+        class FakeOptions:
+            latest = None
+
+            @classmethod
+            def alloc(cls):
+                cls.latest = cls()
+                return cls.latest
+
+            def init(self):
+                return self
+
+            def setSortDescriptors_(self, value) -> None:
+                self.sort_descriptors = value
+
+            def setFetchLimit_(self, value) -> None:
+                self.fetch_limit = value
+
+        class FakePhotoLibrary:
+            @staticmethod
+            def authorizationStatusForAccessLevel_(level: int) -> int:
+                return 3
+
+        class FakePHAsset:
+            last_options = None
+
+            @classmethod
+            def fetchAssetsWithOptions_(cls, options):
+                cls.last_options = options
+                return FakeAssets()
+
+        class FakeSortDescriptor:
+            @staticmethod
+            def sortDescriptorWithKey_ascending_(key: str, ascending: bool):
+                return (key, ascending)
+
+        class FakeObjC:
+            classes = {
+                "PHPhotoLibrary": FakePhotoLibrary,
+                "PHFetchOptions": FakeOptions,
+                "PHAsset": FakePHAsset,
+                "NSSortDescriptor": FakeSortDescriptor,
+            }
+
+            def ObjCClass(self, name: str):
+                return self.classes[name]
+
+            @staticmethod
+            def ns(value):
+                return value
+
+        with patch.object(self.bridge, "_objc", return_value=FakeObjC()):
+            result = self.bridge.dispatch(
+                self.request("photos_latest_metadata", max_results=2, private_content_ack=True)
+            )
+        self.assertEqual(2, FakeOptions.latest.fetch_limit)
+        self.assertEqual([("creationDate", False)], FakeOptions.latest.sort_descriptors)
+        self.assertIs(FakePHAsset.last_options, FakeOptions.latest)
+        self.assertEqual(
+            ["newest", "older"],
+            [item["local_identifier"] for item in result["assets"]],
+        )
+
 if __name__ == "__main__":
     unittest.main()
