@@ -28,6 +28,13 @@ STATE_ROOT = Path.home() / ".local/state/grabowski/client-snapshot"
 SNAPSHOT_PATH = STATE_ROOT / "current.json"
 OBSERVER_STATE_PATH = STATE_ROOT / "observer.json"
 LOCK_PATH = STATE_ROOT / ".lock"
+PLATFORM_SNAPSHOT_SCHEMA_VERSION = 1
+PLATFORM_SNAPSHOT_KIND = "grabowski_platform_connector_snapshot"
+PLATFORM_SNAPSHOT_PATH = Path("/run/grabowski/platform-connector-snapshot.json")
+PLATFORM_SNAPSHOT_TRUSTED_UID = 0
+PLATFORM_SNAPSHOT_TTL_SECONDS = 3_600
+MAX_PLATFORM_SNAPSHOT_BYTES = 64 * 1024
+PLATFORM_SOURCE_KIND = "chatgpt_connector_catalog"
 AUTO_REFRESH_CLIENT_ID = "grabowski-tunnel-watchdog-observer-v1"
 OBSERVATION_SCOPE_EXTERNAL_CLIENT = "external_client_declared"
 OBSERVATION_SCOPE_SERVER_LOOPBACK = "server_loopback_watchdog"
@@ -169,6 +176,70 @@ def _read_private_json(path: Path) -> dict[str, Any]:
         raise ClientSnapshotError("client snapshot receipt is not valid UTF-8 JSON") from exc
     if not isinstance(value, dict):
         raise ClientSnapshotError("client snapshot receipt must be an object")
+    return value
+
+
+def _validate_platform_snapshot_file(
+    metadata: os.stat_result, *, label: str
+) -> None:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != PLATFORM_SNAPSHOT_TRUSTED_UID
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or metadata.st_nlink != 1
+    ):
+        raise ClientSnapshotError(
+            f"{label} is not a trusted root-owned regular file"
+        )
+
+
+def _read_platform_snapshot(path: Path | None = None) -> dict[str, Any]:
+    target = PLATFORM_SNAPSHOT_PATH if path is None else path
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(target, flags)
+    try:
+        before = os.fstat(descriptor)
+        _validate_platform_snapshot_file(before, label="platform connector snapshot")
+        if before.st_size > MAX_PLATFORM_SNAPSHOT_BYTES:
+            raise ClientSnapshotError("platform connector snapshot exceeds size limit")
+        chunks: list[bytes] = []
+        remaining = MAX_PLATFORM_SNAPSHOT_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise ClientSnapshotError(
+                "platform connector snapshot changed while reading"
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ClientSnapshotError(
+            "platform connector snapshot is not valid UTF-8 JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ClientSnapshotError("platform connector snapshot must be an object")
     return value
 
 
@@ -544,6 +615,305 @@ def _validate_receipt(receipt: dict[str, Any]) -> None:
         raise ClientSnapshotError("client snapshot declaration hash mismatch")
 
 
+def platform_snapshot_status(
+    *,
+    expected_tool_count: int,
+    expected_names_sha256: str,
+    expected_release_id: str,
+    expected_repo_head: str,
+    expected_agent_instructions_sha256: str,
+    expected_runtime_tools: dict[str, Any] | None = None,
+    now_unix: int | None = None,
+) -> dict[str, Any]:
+    timestamp = int(time.time()) if now_unix is None else now_unix
+    authority = {
+        "source_kind": PLATFORM_SOURCE_KIND,
+        "trusted_path": str(PLATFORM_SNAPSHOT_PATH),
+        "trusted_owner_uid": PLATFORM_SNAPSHOT_TRUSTED_UID,
+        "requires_regular_file": True,
+        "requires_single_link": True,
+        "forbids_group_or_world_write": True,
+        "ttl_seconds": PLATFORM_SNAPSHOT_TTL_SECONDS,
+    }
+    base: dict[str, Any] = {
+        "observable": False,
+        "schema_observable": False,
+        "fresh": False,
+        "matched": False,
+        "authority": authority,
+        "source": None,
+        "runtime_binding_matches": False,
+        "schema_contract_matches": False,
+        "required_schema_property_mismatches": [],
+        "recommended_next_action": (
+            "capture a trusted platform connector catalog snapshot from ChatGPT "
+            "connector discovery at the configured root-owned path"
+        ),
+        "does_not_establish": [
+            "platform behavior outside the captured catalog revision",
+            "future platform connector publication",
+            "a platform signature when the platform does not provide one",
+        ],
+    }
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or timestamp < 0
+    ):
+        return {
+            **base,
+            "state": "invalid",
+            "error": "timestamp_contract",
+            "recommended_next_action": "repair platform snapshot clock inputs",
+        }
+    try:
+        document = _read_platform_snapshot()
+    except FileNotFoundError:
+        return {**base, "state": "missing"}
+    except (OSError, ValueError, ClientSnapshotError) as exc:
+        return {
+            **base,
+            "state": "invalid",
+            "error": type(exc).__name__,
+            "recommended_next_action": (
+                "replace the untrusted or invalid platform connector snapshot "
+                "through the platform evidence integration"
+            ),
+        }
+    try:
+        required_keys = {
+            "schema_version",
+            "kind",
+            "source",
+            "runtime_binding",
+            "observed_tools",
+            "snapshot_sha256",
+        }
+        if set(document) != required_keys:
+            raise ClientSnapshotError(
+                "platform connector snapshot has unexpected fields"
+            )
+        if (
+            document.get("schema_version") != PLATFORM_SNAPSHOT_SCHEMA_VERSION
+            or document.get("kind") != PLATFORM_SNAPSHOT_KIND
+        ):
+            raise ClientSnapshotError(
+                "platform connector snapshot contract mismatch"
+            )
+        declared_snapshot_sha256 = _validate_sha256(
+            document.get("snapshot_sha256"),
+            label="platform snapshot_sha256",
+        )
+        unsigned = dict(document)
+        unsigned.pop("snapshot_sha256", None)
+        if _sha256_json(unsigned) != declared_snapshot_sha256:
+            raise ClientSnapshotError(
+                "platform connector snapshot hash mismatch"
+            )
+        source = document.get("source")
+        binding = document.get("runtime_binding")
+        if not isinstance(source, dict) or set(source) != {
+            "kind",
+            "connector",
+            "reference",
+            "observed_at_unix",
+            "catalog_sha256",
+        }:
+            raise ClientSnapshotError(
+                "platform connector snapshot source contract mismatch"
+            )
+        if source.get("kind") != PLATFORM_SOURCE_KIND:
+            raise ClientSnapshotError(
+                "platform connector snapshot source is not authoritative"
+            )
+        if source.get("connector") != "grabowski":
+            raise ClientSnapshotError(
+                "platform connector snapshot targets another connector"
+            )
+        reference = source.get("reference")
+        if (
+            not isinstance(reference, str)
+            or not reference
+            or reference.strip() != reference
+            or len(reference.encode("utf-8")) > 1024
+        ):
+            raise ClientSnapshotError(
+                "platform connector snapshot source reference is invalid"
+            )
+        observed_at = source.get("observed_at_unix")
+        if (
+            isinstance(observed_at, bool)
+            or not isinstance(observed_at, int)
+            or observed_at < 0
+        ):
+            raise ClientSnapshotError(
+                "platform connector snapshot observation time is invalid"
+            )
+        catalog_sha256 = _validate_sha256(
+            source.get("catalog_sha256"),
+            label="platform catalog_sha256",
+        )
+        if not isinstance(binding, dict) or set(binding) != {
+            "registered_tool_count",
+            "registered_names_sha256",
+            "release_id",
+            "repo_head",
+            "agent_instructions_sha256",
+        }:
+            raise ClientSnapshotError(
+                "platform connector snapshot runtime binding mismatch"
+            )
+        registered_count = binding.get("registered_tool_count")
+        if (
+            isinstance(registered_count, bool)
+            or not isinstance(registered_count, int)
+            or not 1 <= registered_count <= connector_contract.MAX_OBSERVED_TOOLS
+        ):
+            raise ClientSnapshotError(
+                "platform connector snapshot tool count is invalid"
+            )
+        _validate_sha256(
+            binding.get("registered_names_sha256"),
+            label="platform registered_names_sha256",
+        )
+        _validate_release_id(
+            binding.get("release_id"), label="platform release id"
+        )
+        repo_head = binding.get("repo_head")
+        if (
+            not isinstance(repo_head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None
+        ):
+            raise ClientSnapshotError(
+                "platform connector snapshot repository head is invalid"
+            )
+        _validate_sha256(
+            binding.get("agent_instructions_sha256"),
+            label="platform agent instructions sha256",
+        )
+        observed_names, observed_schemas, observed_metadata = (
+            connector_contract.parse_observed_artifact(
+                document.get("observed_tools"),
+                label="platform connector catalog artifact",
+            )
+        )
+        if observed_metadata["artifact_sha256"] != catalog_sha256:
+            raise ClientSnapshotError(
+                "platform connector catalog content hash mismatch"
+            )
+        if expected_runtime_tools is None:
+            return {
+                **base,
+                "state": "runtime_schema_unavailable",
+                "source": dict(source),
+                "recommended_next_action": (
+                    "restore runtime schema observability before evaluating "
+                    "the platform connector snapshot"
+                ),
+            }
+        runtime_names, runtime_schemas, runtime_metadata = (
+            connector_contract.parse_observed_artifact(
+                expected_runtime_tools,
+                label="runtime connector artifact",
+            )
+        )
+        if (
+            runtime_metadata["name_count"] != expected_tool_count
+            or runtime_metadata["names_sha256"] != expected_names_sha256
+        ):
+            return {
+                **base,
+                "state": "runtime_schema_invalid",
+                "source": dict(source),
+                "recommended_next_action": (
+                    "repair runtime schema observability before evaluating "
+                    "platform publication"
+                ),
+            }
+        probe = connector_contract.probe_contract(
+            observed_names,
+            observed_schemas,
+            runtime_names,
+            runtime_schemas,
+            runtime_names,
+            observed_source="platform",
+        )
+    except (TypeError, ValueError, ClientSnapshotError, connector_contract.ConnectorContractError) as exc:
+        return {
+            **base,
+            "state": "invalid",
+            "error": type(exc).__name__,
+            "recommended_next_action": (
+                "replace the invalid platform connector snapshot with a fresh "
+                "platform-primary observation"
+            ),
+        }
+
+    expected_binding = {
+        "registered_tool_count": expected_tool_count,
+        "registered_names_sha256": expected_names_sha256,
+        "release_id": expected_release_id,
+        "repo_head": expected_repo_head,
+        "agent_instructions_sha256": expected_agent_instructions_sha256,
+    }
+    binding_mismatches = sorted(
+        key
+        for key, expected_value in expected_binding.items()
+        if binding.get(key) != expected_value
+    )
+    if observed_metadata["name_count"] != expected_tool_count:
+        binding_mismatches.append("observed_tool_count")
+    if observed_metadata["names_sha256"] != expected_names_sha256:
+        binding_mismatches.append("observed_names_sha256")
+    binding_matches = not binding_mismatches
+    future_clock_drift = observed_at > timestamp + SNAPSHOT_CLOCK_SKEW_SECONDS
+    fresh = (
+        not future_clock_drift
+        and timestamp <= observed_at + PLATFORM_SNAPSHOT_TTL_SECONDS
+    )
+    matched = binding_matches and probe.get("matches") is True
+    observable = fresh and matched
+    if future_clock_drift:
+        state = "clock_drift"
+        next_action = (
+            "replace the future-dated platform connector snapshot with a "
+            "current platform observation"
+        )
+    elif not fresh:
+        state = "stale"
+        next_action = "capture a fresh platform connector catalog snapshot"
+    elif not matched:
+        state = "mismatch"
+        next_action = (
+            "capture the exact current platform connector catalog after "
+            "repairing reported schema or revision drift"
+        )
+    else:
+        state = "matched"
+        next_action = "none"
+    return {
+        **base,
+        "state": state,
+        "observable": observable,
+        "schema_observable": observable and probe.get("schema_contract_matches") is True,
+        "fresh": fresh,
+        "matched": matched,
+        "source": dict(source),
+        "snapshot_sha256": declared_snapshot_sha256,
+        "runtime_binding": dict(binding),
+        "runtime_binding_matches": binding_matches,
+        "binding_mismatches": sorted(set(binding_mismatches)),
+        "catalog": observed_metadata,
+        "schema_contract_matches": probe.get("schema_contract_matches") is True,
+        "required_schema_property_mismatches": probe.get(
+            "required_schema_property_mismatches", []
+        ),
+        "probe": probe,
+        "age_seconds": max(0, timestamp - observed_at),
+        "recommended_next_action": next_action,
+    }
+
+
 def snapshot_status(
     *,
     expected_tool_count: int,
@@ -551,17 +921,37 @@ def snapshot_status(
     expected_release_id: str,
     expected_repo_head: str,
     expected_agent_instructions_sha256: str,
+    expected_runtime_tools: dict[str, Any] | None = None,
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     timestamp = int(time.time()) if now_unix is None else now_unix
+    platform_snapshot = platform_snapshot_status(
+        expected_tool_count=expected_tool_count,
+        expected_names_sha256=expected_names_sha256,
+        expected_release_id=expected_release_id,
+        expected_repo_head=expected_repo_head,
+        expected_agent_instructions_sha256=expected_agent_instructions_sha256,
+        expected_runtime_tools=expected_runtime_tools,
+        now_unix=timestamp,
+    )
+    platform_snapshot_observable = bool(platform_snapshot.get("observable"))
+    platform_schema_observable = bool(
+        platform_snapshot.get("schema_observable")
+    )
     base = {
         "observable": False,
         "observation_scope": None,
         "schema_observable": False,
         "schema_evidence_observed": False,
         "schema_contract_matches": False,
-        "platform_connector_snapshot_observable": False,
-        "platform_connector_schema_observable": False,
+        "external_client_snapshot_observable": False,
+        "external_client_schema_observable": False,
+        "platform_connector_snapshot_observable": platform_snapshot_observable,
+        "platform_connector_schema_observable": platform_schema_observable,
+        "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
+        "platform_connector_snapshot_matched": bool(platform_snapshot.get("matched")),
+        "platform_evidence_state": platform_snapshot.get("state"),
+        "platform_snapshot": platform_snapshot,
         "server_loopback_observable": False,
         "server_loopback_schema_observable": False,
         "server_loopback_schema_contract_matches": False,
@@ -573,6 +963,7 @@ def snapshot_status(
             "that the client invoked every declared tool",
             "client instruction compliance",
             "resistance to compromised same-uid code",
+            "platform publication from a client declaration alone",
         ],
     }
     try:
@@ -580,13 +971,19 @@ def snapshot_status(
             receipt = _read_private_json(SNAPSHOT_PATH)
         _validate_receipt(receipt)
     except FileNotFoundError:
-        return {**base, "state": "missing", "recommended_next_action": "bind the current connector snapshot"}
+        return {
+            **base,
+            "state": "missing",
+            "recommended_next_action": "bind the current connector snapshot",
+        }
     except (OSError, ValueError, ClientSnapshotError) as exc:
         return {
             **base,
             "state": "invalid",
             "error": type(exc).__name__,
-            "recommended_next_action": "inspect or replace the invalid connector snapshot receipt",
+            "recommended_next_action": (
+                "inspect or replace the invalid connector snapshot receipt"
+            ),
         }
     created_at = receipt.get("created_at_unix")
     expires_at = receipt.get("expires_at_unix")
@@ -597,7 +994,14 @@ def snapshot_status(
         or not isinstance(expires_at, int)
         or expires_at < created_at
     ):
-        return {**base, "state": "invalid", "error": "timestamp_contract", "recommended_next_action": "replace the invalid connector snapshot receipt"}
+        return {
+            **base,
+            "state": "invalid",
+            "error": "timestamp_contract",
+            "recommended_next_action": (
+                "replace the invalid connector snapshot receipt"
+            ),
+        }
     binding = receipt["server_binding"]
     declaration = receipt["client_declaration"]
     expected = {
@@ -607,7 +1011,9 @@ def snapshot_status(
         "repo_head": expected_repo_head,
         "agent_instructions_sha256": expected_agent_instructions_sha256,
     }
-    binding_matches = all(binding.get(key) == value for key, value in expected.items())
+    binding_matches = all(
+        binding.get(key) == value for key, value in expected.items()
+    )
     declaration_matches = (
         declaration.get("observed_tool_count") == expected_tool_count
         and declaration.get("observed_names_sha256") == expected_names_sha256
@@ -620,9 +1026,16 @@ def snapshot_status(
         OBSERVATION_SCOPE_EXTERNAL_CLIENT,
         OBSERVATION_SCOPE_SERVER_LOOPBACK,
     }:
-        observation_scope = _client_observation_scope(str(declaration.get("client_id", "")))
+        observation_scope = _client_observation_scope(
+            str(declaration.get("client_id", ""))
+        )
     fresh = created_at - SNAPSHOT_CLOCK_SKEW_SECONDS <= timestamp <= expires_at
-    matched = receipt.get("verified") is True and not receipt.get("mismatches") and binding_matches and declaration_matches
+    matched = (
+        receipt.get("verified") is True
+        and not receipt.get("mismatches")
+        and binding_matches
+        and declaration_matches
+    )
     observable = fresh and matched
     schema_evidence = receipt.get("schema_evidence")
     schema_probe = (
@@ -637,13 +1050,13 @@ def snapshot_status(
         and schema_probe.get("matches") is True
         and schema_probe.get("schema_contract_matches") is True
     )
-    platform_connector_snapshot_observable = (
+    external_client_snapshot_observable = (
         observable and observation_scope == OBSERVATION_SCOPE_EXTERNAL_CLIENT
     )
     server_loopback_observable = (
         observable and observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK
     )
-    schema_contract_matches = (
+    external_client_schema_contract_matches = (
         observed_schema_contract_matches
         and observation_scope == OBSERVATION_SCOPE_EXTERNAL_CLIENT
     )
@@ -651,11 +1064,13 @@ def snapshot_status(
         observed_schema_contract_matches
         and observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK
     )
-    schema_observable = (
-        platform_connector_snapshot_observable and schema_contract_matches
+    external_client_schema_observable = (
+        external_client_snapshot_observable
+        and external_client_schema_contract_matches
     )
     server_loopback_schema_observable = (
-        server_loopback_observable and server_loopback_schema_contract_matches
+        server_loopback_observable
+        and server_loopback_schema_contract_matches
     )
     if not fresh:
         state = "stale"
@@ -666,33 +1081,47 @@ def snapshot_status(
     else:
         state = "matched"
         next_action = (
-            "bind a platform connector snapshot to establish published tool visibility"
-            if observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK
-            else "none"
+            "none"
+            if platform_snapshot_observable
+            else str(
+                platform_snapshot.get(
+                    "recommended_next_action",
+                    "capture authoritative platform connector publication evidence",
+                )
+            )
         )
     does_not_establish = list(
         receipt.get("does_not_establish") or base["does_not_establish"]
     )
-    if observation_scope == OBSERVATION_SCOPE_SERVER_LOOPBACK:
-        for limitation in (
-            "platform connector catalog publication",
-            "tool schema visibility in ChatGPT",
-        ):
-            if limitation not in does_not_establish:
-                does_not_establish.append(limitation)
+    for limitation in (
+        "platform connector catalog publication from the client receipt alone",
+        "tool schema visibility in ChatGPT from the client receipt alone",
+    ):
+        if limitation not in does_not_establish:
+            does_not_establish.append(limitation)
     return {
         **base,
         "state": state,
         "observable": observable,
         "observation_scope": observation_scope,
-        "schema_observable": schema_observable,
+        "schema_observable": external_client_schema_observable,
         "schema_evidence_observed": schema_evidence_observed,
-        "schema_contract_matches": schema_contract_matches,
-        "platform_connector_snapshot_observable": platform_connector_snapshot_observable,
-        "platform_connector_schema_observable": schema_observable,
+        "schema_contract_matches": external_client_schema_contract_matches,
+        "external_client_snapshot_observable": (
+            external_client_snapshot_observable
+        ),
+        "external_client_schema_observable": external_client_schema_observable,
+        "platform_connector_snapshot_observable": platform_snapshot_observable,
+        "platform_connector_schema_observable": platform_schema_observable,
+        "platform_connector_snapshot_fresh": bool(platform_snapshot.get("fresh")),
+        "platform_connector_snapshot_matched": bool(platform_snapshot.get("matched")),
+        "platform_evidence_state": platform_snapshot.get("state"),
+        "platform_snapshot": platform_snapshot,
         "server_loopback_observable": server_loopback_observable,
         "server_loopback_schema_observable": server_loopback_schema_observable,
-        "server_loopback_schema_contract_matches": server_loopback_schema_contract_matches,
+        "server_loopback_schema_contract_matches": (
+            server_loopback_schema_contract_matches
+        ),
         "schema_probe": schema_probe,
         "fresh": fresh,
         "matched": matched,
@@ -713,6 +1142,7 @@ def snapshot_status(
         "recommended_next_action": next_action,
         "does_not_establish": does_not_establish,
     }
+
 
 def connector_session_id(pid: int, start_ticks: int) -> str:
     """Return a bounded identity for one concrete tunnel-client process lifetime."""

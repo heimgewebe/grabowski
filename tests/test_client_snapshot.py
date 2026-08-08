@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -26,6 +27,10 @@ class ClientSnapshotTests(unittest.TestCase):
             mock.patch.object(snapshot, "SNAPSHOT_PATH", root / "current.json"),
             mock.patch.object(snapshot, "OBSERVER_STATE_PATH", root / "observer.json"),
             mock.patch.object(snapshot, "LOCK_PATH", root / ".lock"),
+            mock.patch.object(
+                snapshot, "PLATFORM_SNAPSHOT_PATH", root / "platform-current.json"
+            ),
+            mock.patch.object(snapshot, "PLATFORM_SNAPSHOT_TRUSTED_UID", os.getuid()),
         )
         for patch in self.patches:
             patch.start()
@@ -141,6 +146,68 @@ class ClientSnapshotTests(unittest.TestCase):
         value.update(overrides)
         return value
 
+    def write_platform_snapshot(
+        self,
+        artifact: dict[str, object] | None = None,
+        *,
+        observed_at_unix: int = 1_000,
+        release_id: str = RELEASE_ID,
+        repo_head: str = REPO_HEAD,
+    ) -> dict[str, object]:
+        observed_tools = self.schema_artifact() if artifact is None else artifact
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            observed_tools
+        )
+        document: dict[str, object] = {
+            "schema_version": snapshot.PLATFORM_SNAPSHOT_SCHEMA_VERSION,
+            "kind": snapshot.PLATFORM_SNAPSHOT_KIND,
+            "source": {
+                "kind": snapshot.PLATFORM_SOURCE_KIND,
+                "connector": "grabowski",
+                "reference": "chatgpt:connector-catalog:test-observation",
+                "observed_at_unix": observed_at_unix,
+                "catalog_sha256": metadata["artifact_sha256"],
+            },
+            "runtime_binding": {
+                "registered_tool_count": len(names),
+                "registered_names_sha256": metadata["names_sha256"],
+                "release_id": release_id,
+                "repo_head": repo_head,
+                "agent_instructions_sha256": INSTRUCTIONS_HASH,
+            },
+            "observed_tools": observed_tools,
+        }
+        document["snapshot_sha256"] = snapshot._sha256_json(document)
+        snapshot.PLATFORM_SNAPSHOT_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        snapshot._write_private_json(snapshot.PLATFORM_SNAPSHOT_PATH, document)
+        return document
+
+    def platform_status(
+        self,
+        *,
+        platform_artifact: dict[str, object] | None = None,
+        runtime_artifact: dict[str, object] | None = None,
+        now_unix: int = 1_100,
+    ) -> dict[str, object]:
+        platform_artifact = (
+            self.schema_artifact() if platform_artifact is None else platform_artifact
+        )
+        runtime_artifact = (
+            self.schema_artifact() if runtime_artifact is None else runtime_artifact
+        )
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(
+            runtime_artifact
+        )
+        return snapshot.platform_snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=runtime_artifact,
+            now_unix=now_unix,
+        )
+
     def test_matching_snapshot_is_fresh_and_observable(self) -> None:
         result = snapshot.bind_snapshot(self.parameters(), now_unix=1_000)
 
@@ -181,15 +248,23 @@ class ClientSnapshotTests(unittest.TestCase):
             expected_release_id=RELEASE_ID,
             expected_repo_head=REPO_HEAD,
             expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=parameters["observed_tools"],
             now_unix=1_100,
         )
         self.assertTrue(observed["observable"])
         self.assertTrue(observed["schema_observable"])
         self.assertTrue(observed["schema_evidence_observed"])
         self.assertTrue(observed["schema_contract_matches"])
-        self.assertTrue(observed["platform_connector_snapshot_observable"])
-        self.assertTrue(observed["platform_connector_schema_observable"])
+        self.assertTrue(observed["external_client_snapshot_observable"])
+        self.assertTrue(observed["external_client_schema_observable"])
+        self.assertFalse(observed["platform_connector_snapshot_observable"])
+        self.assertFalse(observed["platform_connector_schema_observable"])
+        self.assertEqual(observed["platform_evidence_state"], "missing")
         self.assertFalse(observed["server_loopback_observable"])
+        self.assertIn(
+            "platform connector catalog snapshot",
+            observed["recommended_next_action"],
+        )
 
     def test_watchdog_snapshot_is_loopback_evidence_not_platform_publication(self) -> None:
         parameters = self.schema_parameters(
@@ -230,13 +305,118 @@ class ClientSnapshotTests(unittest.TestCase):
         self.assertFalse(observed["schema_observable"])
         self.assertFalse(observed["schema_contract_matches"])
         self.assertIn(
-            "platform connector snapshot",
+            "platform connector catalog snapshot",
             observed["recommended_next_action"],
         )
-        self.assertIn(
-            "tool schema visibility in ChatGPT",
-            observed["does_not_establish"],
+        self.assertTrue(
+            any(
+                "tool schema visibility in ChatGPT" in item
+                for item in observed["does_not_establish"]
+            )
         )
+
+    def test_full_platform_snapshot_convergence_is_separate_and_observable(self) -> None:
+        parameters = self.schema_parameters()
+        artifact = parameters["observed_tools"]
+        snapshot.bind_snapshot(parameters, now_unix=1_000)
+        self.write_platform_snapshot(artifact)
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(artifact)
+
+        observed = snapshot.snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=artifact,
+            now_unix=1_100,
+        )
+
+        self.assertTrue(observed["external_client_snapshot_observable"])
+        self.assertTrue(observed["platform_connector_snapshot_observable"])
+        self.assertTrue(observed["platform_connector_schema_observable"])
+        self.assertEqual(observed["platform_evidence_state"], "matched")
+        self.assertEqual(
+            observed["platform_snapshot"]["source"]["kind"],
+            snapshot.PLATFORM_SOURCE_KIND,
+        )
+        self.assertEqual(observed["recommended_next_action"], "none")
+
+    def test_platform_match_fields_remain_paired_without_client_receipt(self) -> None:
+        artifact = self.schema_artifact()
+        self.write_platform_snapshot(artifact)
+        names, _schemas, metadata = connector_contract.parse_observed_artifact(artifact)
+
+        observed = snapshot.snapshot_status(
+            expected_tool_count=len(names),
+            expected_names_sha256=metadata["names_sha256"],
+            expected_release_id=RELEASE_ID,
+            expected_repo_head=REPO_HEAD,
+            expected_agent_instructions_sha256=INSTRUCTIONS_HASH,
+            expected_runtime_tools=artifact,
+            now_unix=1_100,
+        )
+
+        self.assertEqual(observed["state"], "missing")
+        self.assertFalse(observed["observable"])
+        self.assertFalse(observed["matched"])
+        self.assertTrue(observed["platform_connector_snapshot_observable"])
+        self.assertTrue(observed["platform_connector_snapshot_fresh"])
+        self.assertTrue(observed["platform_connector_snapshot_matched"])
+        self.assertEqual(observed["platform_evidence_state"], "matched")
+
+    def test_platform_snapshot_missing_grip_run_allow_mutation_fails_closed(self) -> None:
+        runtime_artifact = self.schema_artifact()
+        platform_artifact = json.loads(json.dumps(runtime_artifact))
+        grip_run = next(
+            item
+            for item in platform_artifact["tools"]
+            if isinstance(item, dict) and item["name"] == "grip_run"
+        )
+        del grip_run["inputSchema"]["properties"]["allow_mutation"]
+        self.write_platform_snapshot(platform_artifact)
+
+        observed = self.platform_status(runtime_artifact=runtime_artifact)
+
+        self.assertEqual(observed["state"], "mismatch")
+        self.assertFalse(observed["observable"])
+        self.assertFalse(observed["schema_observable"])
+        self.assertIn(
+            {
+                "tool": "grip_run",
+                "source": "platform",
+                "missing_properties": ["allow_mutation"],
+            },
+            observed["required_schema_property_mismatches"],
+        )
+
+    def test_platform_snapshot_stale_and_revision_drift_fail_closed(self) -> None:
+        self.write_platform_snapshot(observed_at_unix=1_000)
+        stale = self.platform_status(now_unix=5_000)
+        self.assertEqual(stale["state"], "stale")
+        self.assertFalse(stale["observable"])
+
+        self.write_platform_snapshot(repo_head="d" * 40)
+        drifted = self.platform_status()
+        self.assertEqual(drifted["state"], "mismatch")
+        self.assertFalse(drifted["observable"])
+        self.assertIn("repo_head", drifted["binding_mismatches"])
+
+    def test_platform_snapshot_integrity_and_trust_boundary_fail_closed(self) -> None:
+        document = self.write_platform_snapshot()
+        document["source"]["reference"] = "tampered"
+        snapshot._write_private_json(snapshot.PLATFORM_SNAPSHOT_PATH, document)
+        tampered = self.platform_status()
+        self.assertEqual(tampered["state"], "invalid")
+        self.assertFalse(tampered["observable"])
+
+        self.write_platform_snapshot()
+        with mock.patch.object(
+            snapshot, "PLATFORM_SNAPSHOT_TRUSTED_UID", os.getuid() + 1
+        ):
+            untrusted = self.platform_status()
+        self.assertEqual(untrusted["state"], "invalid")
+        self.assertFalse(untrusted["observable"])
 
     def test_schema_snapshot_fails_closed_on_field_and_binding_drift(self) -> None:
         for field in sorted(
