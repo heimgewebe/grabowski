@@ -186,6 +186,22 @@ def _sort_devices(devices):
     )
 
 
+def _mark_unresolved_reads(status, error=None):
+    if _REQUEST.get("operation") != "read":
+        return
+    for characteristic_uuid in _REQUEST.get("characteristic_uuids", []):
+        if characteristic_uuid in _inspect["read_values"]:
+            continue
+        row = {
+            "uuid": characteristic_uuid,
+            "status": status,
+            "properties": None,
+        }
+        if error:
+            row["error"] = _bounded_text(error) or "unknown"
+        _inspect["read_values"][characteristic_uuid] = row
+
+
 ctypes.cdll.LoadLibrary(
     "/System/Library/Frameworks/CoreBluetooth.framework/CoreBluetooth"
 )
@@ -289,14 +305,18 @@ class __DELEGATE_CLASS__(NSObject):
         try:
             peripheral.discoverServices_(None)
         except Exception as exc:
-            _inspect["errors"].append("discover_services:" + _bounded_text(exc))
+            detail = _bounded_text(exc) or "unknown"
+            _inspect["errors"].append("discover_services:" + detail)
+            _mark_unresolved_reads("discovery_error", detail)
             _inspect["finished"] = True
 
     @objc_method
     def centralManager_didFailToConnectPeripheral_error_(self, central, peripheral, error):
         if _uuid(peripheral) != _REQUEST.get("device_id"):
             return
-        _inspect["errors"].append("connect:" + (_bounded_text(error) or "unknown"))
+        detail = _bounded_text(error) or "unknown"
+        _inspect["errors"].append("connect:" + detail)
+        _mark_unresolved_reads("connect_error", detail)
         _inspect["finished"] = True
 
     @objc_method
@@ -312,16 +332,51 @@ class __DELEGATE_CLASS__(NSObject):
         if _uuid(peripheral) != _REQUEST.get("device_id"):
             return
         if error is not None:
-            _inspect["errors"].append("services:" + (_bounded_text(error) or "unknown"))
+            detail = _bounded_text(error) or "unknown"
+            _inspect["errors"].append("services:" + detail)
+            _mark_unresolved_reads("discovery_error", detail)
             _inspect["finished"] = True
             return
         try:
             services = list(peripheral.services) if peripheral.services is not None else []
         except Exception as exc:
-            _inspect["errors"].append("services_list:" + _bounded_text(exc))
+            detail = _bounded_text(exc) or "unknown"
+            _inspect["errors"].append("services_list:" + detail)
+            _mark_unresolved_reads("discovery_error", detail)
             _inspect["finished"] = True
             return
         services = services[:MAX_SERVICES]
+        if _REQUEST.get("operation") == "read":
+            target_uuid = _REQUEST["service_uuid"]
+            target_service = next(
+                (
+                    service
+                    for service in services
+                    if _bounded_text(service.UUID) == target_uuid
+                ),
+                None,
+            )
+            if target_service is None:
+                _inspect["services"] = []
+                _inspect["discovery_complete"] = True
+                _mark_unresolved_reads("not_found")
+                _inspect["finished"] = True
+                return
+            _inspect["services"] = [
+                {"uuid": target_uuid, "characteristics": None}
+            ]
+            try:
+                peripheral.discoverCharacteristics_forService_(None, target_service)
+            except Exception as exc:
+                detail = _bounded_text(exc) or "unknown"
+                _inspect["errors"].append(
+                    "discover_characteristics:" + target_uuid + ":" + detail
+                )
+                _inspect["discovery_complete"] = True
+                _mark_unresolved_reads("discovery_error", detail)
+                _inspect["finished"] = True
+            return
+
         _inspect["services"] = [
             {"uuid": _bounded_text(service.UUID), "characteristics": None}
             for service in services
@@ -349,12 +404,25 @@ class __DELEGATE_CLASS__(NSObject):
         service_uuid = _bounded_text(service.UUID)
         characteristics = []
         if error is not None:
+            detail = _bounded_text(error) or "unknown"
             _inspect["errors"].append(
                 "characteristics:"
                 + (service_uuid or "unknown")
                 + ":"
-                + (_bounded_text(error) or "unknown")
+                + detail
             )
+            if (
+                _REQUEST.get("operation") == "read"
+                and service_uuid == _REQUEST.get("service_uuid")
+            ):
+                for row in _inspect["services"]:
+                    if row["uuid"] == service_uuid:
+                        row["characteristics"] = []
+                        break
+                _inspect["discovery_complete"] = True
+                _mark_unresolved_reads("discovery_error", detail)
+                _inspect["finished"] = True
+                return
         else:
             try:
                 values = (
@@ -363,12 +431,25 @@ class __DELEGATE_CLASS__(NSObject):
                     else []
                 )
             except Exception as exc:
+                detail = _bounded_text(exc) or "unknown"
                 _inspect["errors"].append(
                     "characteristics_list:"
                     + (service_uuid or "unknown")
                     + ":"
-                    + (_bounded_text(exc) or "unknown")
+                    + detail
                 )
+                if (
+                    _REQUEST.get("operation") == "read"
+                    and service_uuid == _REQUEST.get("service_uuid")
+                ):
+                    for row in _inspect["services"]:
+                        if row["uuid"] == service_uuid:
+                            row["characteristics"] = []
+                            break
+                    _inspect["discovery_complete"] = True
+                    _mark_unresolved_reads("discovery_error", detail)
+                    _inspect["finished"] = True
+                    return
                 values = []
             for characteristic in values[:MAX_CHARACTERISTICS_PER_SERVICE]:
                 characteristic_uuid = _bounded_text(characteristic.UUID)
@@ -592,18 +673,23 @@ def _run(request):
         deadline = time.time() + int(request["discovery_seconds"])
         while time.time() < deadline and not _inspect["finished"]:
             time.sleep(0.05)
-        if operation == "read" and _inspect["read_pending"]:
-            for characteristic_uuid in list(_inspect["read_pending"]):
-                current = _inspect["read_values"].get(characteristic_uuid, {})
-                _inspect["read_values"][characteristic_uuid] = {
-                    "uuid": characteristic_uuid,
-                    "status": "read_timeout",
-                    "properties": current.get("properties"),
-                }
-            _inspect["read_pending"].clear()
+        if operation == "read" and not _inspect["finished"]:
+            if _inspect["read_pending"]:
+                for characteristic_uuid in list(_inspect["read_pending"]):
+                    current = _inspect["read_values"].get(characteristic_uuid, {})
+                    _inspect["read_values"][characteristic_uuid] = {
+                        "uuid": characteristic_uuid,
+                        "status": "read_timeout",
+                        "properties": current.get("properties"),
+                    }
+                _inspect["read_pending"].clear()
+            if not _inspect["read_started"]:
+                _mark_unresolved_reads("discovery_timeout")
             _inspect["finished"] = True
     except Exception as exc:
-        _inspect["errors"].append("connect_start:" + (_bounded_text(exc) or "unknown"))
+        detail = _bounded_text(exc) or "unknown"
+        _inspect["errors"].append("connect_start:" + detail)
+        _mark_unresolved_reads("connect_error", detail)
     finally:
         try:
             manager.cancelPeripheralConnection_(peripheral)
@@ -623,7 +709,7 @@ def _run(request):
         values = [
             _inspect["read_values"].get(
                 characteristic_uuid,
-                {"uuid": characteristic_uuid, "status": "not_found", "properties": None},
+                {"uuid": characteristic_uuid, "status": "unknown", "properties": None},
             )
             for characteristic_uuid in request["characteristic_uuids"]
         ]
@@ -888,11 +974,15 @@ def _validate_device_result(request: dict[str, Any], result: Any) -> dict[str, A
             "not_found",
             "not_readable",
             "not_connectable",
+            "connect_error",
+            "discovery_error",
+            "discovery_timeout",
             "read_error",
             "read_timeout",
             "read_start_error",
             "encode_error",
             "value_too_large",
+            "unknown",
         }
         for item in values:
             if not isinstance(item, dict) or item.get("status") not in statuses:

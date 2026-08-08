@@ -198,6 +198,8 @@ class JunoBluetoothHostTests(unittest.TestCase):
         self.assertIn("discoverServices_", source)
         self.assertIn("discoverCharacteristics_forService_", source)
         self.assertIn("readValueForCharacteristic_", source)
+        self.assertIn('target_service = next(', source)
+        self.assertIn('_mark_unresolved_reads("discovery_timeout")', source)
         self.assertIn("cancelPeripheralConnection_", source)
         self.assertNotIn("writeValue", source)
         self.assertNotIn("setNotifyValue", source)
@@ -226,6 +228,17 @@ class JunoBluetoothHostTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
             bluetooth._validate_device_result(request, changed)
 
+        timeout_result = copy.deepcopy(result)
+        timeout_result["read_attempted_count"] = 0
+        timeout_result["values"] = [
+            {"uuid": uuid, "status": "discovery_timeout", "properties": None}
+            for uuid in request["characteristic_uuids"]
+        ]
+        self.assertIs(
+            bluetooth._validate_device_result(request, timeout_result),
+            timeout_result,
+        )
+
     def test_input_bounds_and_uuid_normalization(self) -> None:
         self.assertEqual(bluetooth._validate_uuid(DEVICE_ID.lower()), DEVICE_ID)
         with self.assertRaises(ValueError):
@@ -246,7 +259,10 @@ class JunoBluetoothHostTests(unittest.TestCase):
                 bluetooth._bounded_int(value, minimum=1, maximum=12, label="scan_seconds")
 
     def test_typed_read_normalizes_exact_targets_and_uses_read_operation(self) -> None:
-        with patch.object(bluetooth, "_run_typed_bluetooth_job", return_value={"ok": True}) as run:
+        with (
+            patch.object(bluetooth.operator, "_require_operator_capability"),
+            patch.object(bluetooth, "_run_typed_bluetooth_job", return_value={"ok": True}) as run,
+        ):
             result = bluetooth.ipad_bluetooth_read(
                 DEVICE_ID.lower(),
                 "fff0",
