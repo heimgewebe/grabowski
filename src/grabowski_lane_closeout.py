@@ -88,6 +88,22 @@ def sha256_json(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def validate_terminal_assessment(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an exact terminal assess() result before durable reuse."""
+    if not isinstance(value, Mapping):
+        raise LaneCloseoutError("terminal closeout assessment must be a mapping")
+    if value.get("phase") != "terminal" or value.get("closeout_state") not in TERMINAL_CLOSEOUT_STATES:
+        raise LaneCloseoutError("lane closeout assessment is not terminal")
+    supplied = value.get("assessment_sha256")
+    material = {
+        key: item for key, item in value.items()
+        if key not in {"assessment_sha256", "audit_record_sha256", "does_not_establish"}
+    }
+    if not isinstance(supplied, str) or SHA256.fullmatch(supplied) is None or supplied != sha256_json(material):
+        raise LaneCloseoutError("terminal closeout assessment digest mismatch")
+    return dict(value)
+
+
 def _identity(value: Any, field: str, *, optional: bool = False) -> str | None:
     if value is None and optional:
         return None

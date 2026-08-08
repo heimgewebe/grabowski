@@ -1118,15 +1118,17 @@ TOOL_PROFILES.update(
         },
         "grabowski_work_acquire": {
             "category": "work-coordination",
-            "purpose": "Atomically bind one controller lane, acquire narrow leases and prepare an exact isolated worktree.",
+            "purpose": "Atomically bind and prepare one controller lane, or persist and audit its evidence-bound terminal closeout with retry-safe audit recovery.",
             "risk_class": "high",
             "effects": [
                 "resource-lease",
                 "git-worktree-create",
                 "checkout-lifecycle-bind",
                 "lane-receipt-create",
+                "lane-receipt-update",
+                "audit-append",
             ],
-            "reversibility": "pre-effect lease compensation; created worktree retained for explicit closeout",
+            "reversibility": "pre-effect lease compensation; terminal receipt/audit are forward-only, retry-recoverable evidence",
         },
         "grabowski_operator_optimization_report": {
             "category": "operations-observability",

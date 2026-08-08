@@ -1140,23 +1140,25 @@
         "tests:test_current_work.py"
       ],
       "exception_detail": {
-        "claim": "The tool owns only the atomic transition from one controller mandate to narrow leases, one exact isolated worktree and an integrity-bound work-lane receipt.",
-        "evidence": "Exact source, actor, repository, base, branch, path and resource binding; existing lease and worktree authorities remain canonical; pre-effect compensation and outcome-unknown retention are tested."
+        "claim": "The tool owns the atomic transition from one controller mandate to narrow leases and an exact isolated worktree, plus the evidence-bound terminal mutation of that lane receipt with recoverable audit append.",
+        "evidence": "Exact source, actor, repository, base, branch, path and resource binding; existing lease and worktree authorities remain canonical; terminal closeout is CAS-bound to the lane receipt, persisted before audit, and retry-reconciled against the verified audit chain."
       },
       "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Separate resource-acquire and worktree-ensure calls were rejected because their inter-call gap repeatedly left callers without an owner-bound lease or with ambiguous partial preparation. Generic terminal execution cannot preserve atomic compensation, idempotent lane identity and typed authority roles.",
-      "rationale": "Work acquisition crosses the existing resource and checkout authorities and must either prepare both coherently or retain exact reconciliation evidence. The tool does not replace either lifecycle store and does not start, merge or deploy work.",
+      "operation_alternative_considered": "Separate resource-acquire and worktree-ensure calls were rejected because their inter-call gap repeatedly left callers without an owner-bound lease or with ambiguous partial preparation. A separate terminal mutation call was rejected because closeout must reuse the exact lane identity, CAS preimage and receipt lock while recovering any audit append that succeeded or failed after durable receipt persistence. Generic terminal execution cannot preserve these bindings.",
+      "rationale": "Work acquisition crosses the existing resource and checkout authorities and must either prepare both coherently or retain exact reconciliation evidence. Terminal mode mutates only the existing lane receipt and append-only audit under the same identity; it does not replace either lifecycle store and does not start, merge or deploy work.",
       "tool_contract": {
         "authority_class": "mutation",
         "category": "work-coordination",
         "effects": [
+          "audit-append",
           "checkout-lifecycle-bind",
           "git-worktree-create",
           "lane-receipt-create",
+          "lane-receipt-update",
           "resource-lease"
         ],
         "read_only": false,
-        "reversibility": "pre-effect lease compensation; created worktree retained for explicit closeout",
+        "reversibility": "pre-effect lease compensation; terminal receipt/audit are forward-only, retry-recoverable evidence",
         "risk_class": "high",
         "tool": "grabowski_work_acquire"
       }
