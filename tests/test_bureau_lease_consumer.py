@@ -734,6 +734,155 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         ]
         return launcher, source_commit, patches
 
+    def _use_manifest_payload_launcher(self, launcher: Path) -> Path:
+        manifest_path = self.runtime / "deployment-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload_raw = (
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+        manifest["manifest_payload_sha256"] = hashlib.sha256(payload_raw).hexdigest()
+        manifest_path.write_text(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        launcher.write_text(
+            "#!/usr/bin/env python3\n"
+            "# managed-by: heimgewebe-bureau-runtime-v1\n"
+            "from pathlib import Path\n"
+            f"manifest_path = Path('{manifest_path}')\n"
+            "manifest_digest_field = 'manifest_payload_sha256'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        return manifest_path
+
+    def test_managed_runtime_accepts_manifest_payload_launcher(self) -> None:
+        launcher, source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-fragments-v3"
+        )
+        self._use_manifest_payload_launcher(launcher)
+        with (
+            patches[0],
+            patches[1],
+            patch.object(
+                bureau.subprocess,
+                "run",
+                side_effect=lambda argv, **kwargs: self._response(argv),
+            ),
+        ):
+            runtime = bureau._managed_contract_runtime()
+            result = resources.acquire_resources(
+                "owner-a",
+                ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                purpose="task",
+                ttl_seconds=60,
+            )
+        self.assertEqual(runtime["release_commit"], source_commit)
+        self.assertEqual(
+            runtime["managed_package_contract"],
+            "bureau-scheduler-fragments-v3",
+        )
+        self.assertEqual(
+            result["bureau_contract"]["contract_release_commit"], source_commit
+        )
+
+    def test_manifest_payload_launcher_rejects_payload_digest_drift(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-fragments-v3"
+        )
+        manifest_path = self._use_manifest_payload_launcher(launcher)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["installed_at"] = "drifted-after-binding"
+        manifest_path.write_text(
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.details.get("reason"),
+            "manifest-payload-digest-mismatch",
+        )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_manifest_payload_launcher_rejects_duplicate_field_binding(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-fragments-v3"
+        )
+        manifest_path = self._use_manifest_payload_launcher(launcher)
+        launcher.write_text(
+            launcher.read_text(encoding="utf-8")
+            + "manifest_digest_field = 'manifest_payload_sha256'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.details,
+            {"assignment": "manifest_digest_field", "count": 2},
+        )
+        self.assertEqual(manifest_path.name, "deployment-manifest.json")
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
+    def test_managed_launcher_rejects_mixed_manifest_digest_contracts(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-fragments-v3"
+        )
+        manifest_path = self._use_manifest_payload_launcher(launcher)
+        launcher.write_text(
+            launcher.read_text(encoding="utf-8")
+            + f"expected_manifest_sha256 = '{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}'\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                resources.acquire_resources(
+                    "owner-a",
+                    ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                    purpose="task",
+                    ttl_seconds=60,
+                )
+        self.assertEqual(
+            raised.exception.details.get("reason"),
+            "manifest-digest-binding-ambiguous",
+        )
+        run.assert_not_called()
+        self.assertFalse(self.database.exists())
+
     def test_managed_runtime_is_preferred_and_invoked_via_bound_fd(self) -> None:
         launcher, source_commit, patches = self._install_managed_runtime()
         observed: list[tuple[list[str], dict[str, object]]] = []
