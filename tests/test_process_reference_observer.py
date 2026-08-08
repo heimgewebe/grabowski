@@ -19,11 +19,43 @@ SPEC.loader.exec_module(observer)
 
 
 class ProcessReferenceObserverTests(unittest.TestCase):
-    def test_production_allowed_roots_include_weltgewebe_standalone(self) -> None:
-        self.assertIn(
+    def test_production_allowed_roots_cover_managed_worktree_contract(self) -> None:
+        expected = {
+            Path("/home/alex/repos/.weltgewebe-audit-implementation"),
+            Path("/home/alex/repos/.weltgewebe-audit-main-20260717"),
+            Path("/home/alex/repos/.weltgewebe-release-worktrees"),
             Path("/home/alex/repos/.weltgewebe-standalone"),
-            observer.ALLOWED_ROOTS,
-        )
+            Path("/home/alex/repos/.weltgewebe-worktrees"),
+            Path("/home/alex/worktrees"),
+            Path("/home/alex/repos/.semantah-standalone"),
+            Path("/home/alex/repos/.semantah-worktrees"),
+            Path("/home/alex/repos/.heimlern-worktrees"),
+            Path("/home/alex/repos/.operator-redundancy-worktrees"),
+            Path("/home/alex/repos/.audio-standalone"),
+            Path("/home/alex/repos/.audio-worktrees"),
+            Path("/home/alex/repos/.hauski-worktrees"),
+            Path("/home/alex/repos/.hauski-audio-worktrees"),
+            Path("/home/alex/repos/.grabowski-deploy-worktrees"),
+            Path("/home/alex/repos/.grabowski-standalone"),
+            Path("/home/alex/repos/.grabowski-worktrees"),
+            Path("/home/alex/repos/.heim-pc-standalone"),
+            Path("/home/alex/repos/.heim-pc-worktrees"),
+            Path("/home/alex/repos/.bureau-audit-clones"),
+            Path("/home/alex/repos/.bureau-audits"),
+            Path("/home/alex/repos/.bureau-standalone"),
+            Path("/home/alex/repos/.bureau-task-worktrees"),
+            Path("/home/alex/repos/.bureau-worktrees"),
+            Path("/home/alex/repos/.repoground-audits"),
+            Path("/home/alex/repos/.repoground-standalone"),
+            Path("/home/alex/repos/.repoground-task-worktrees"),
+            Path("/home/alex/repos/.repoground-worktrees"),
+            Path("/home/alex/repos/.commonworld-audits"),
+            Path("/home/alex/repos/.commonworld-standalone"),
+            Path("/home/alex/repos/.commonworld-worktrees"),
+            Path("/home/alex/repos/.plexer-worktrees"),
+            Path("/home/alex/repos/.worktree-target-quarantine"),
+        }
+        self.assertEqual(set(observer.ALLOWED_ROOTS), expected)
 
     def make_root(self) -> tempfile.TemporaryDirectory[str]:
         return tempfile.TemporaryDirectory(prefix="observer-root-")
