@@ -808,6 +808,83 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(persist.call_args.args[0], lane_id)
         acquire.assert_not_called()
 
+    def test_mcp_entry_reuses_stored_system_convergence_plan_on_closeout(self) -> None:
+        params = self.parameters()
+        params["system_convergence"] = {"system_id": "example"}
+        stored_plan = {"status": "unavailable", "plan_sha256": "1" * 64}
+        with patch.object(
+            work_acquire.work_admission,
+            "plan_system_convergence",
+            return_value=stored_plan,
+        ):
+            stored_inputs = work_acquire._normalize(params)
+        stored_inputs.pop("_scoped_writer_argv")
+        lane_id = str(stored_inputs["lane_id"])
+        work_acquire._private_directory(self.state)
+        receipt = work_acquire._write_state(
+            self.state / f"{lane_id}.json",
+            {
+                "kind": work_acquire.LANE_KIND,
+                "schema_version": work_acquire.SCHEMA_VERSION,
+                "lane_id": lane_id,
+                "inputs_sha256": work_acquire._sha(stored_inputs),
+                "inputs": stored_inputs,
+                "state": "ready",
+            },
+        )
+        expected = {"lane_id": lane_id, "replayed": False}
+        terminal = {"lane_id": lane_id, "phase": "terminal"}
+        with (
+            patch.object(work_acquire.operator, "_require_operator_mutation"),
+            patch.object(
+                work_acquire.work_admission,
+                "plan_system_convergence",
+                side_effect=AssertionError("terminal closeout must not re-plan convergence"),
+            ) as planner,
+            patch.object(work_acquire.lane_closeout, "assess", return_value=terminal),
+            patch.object(
+                work_acquire, "persist_terminal_closeout", return_value=expected
+            ) as persist,
+        ):
+            result = work_acquire.grabowski_work_acquire(
+                source_kind=str(params["source_kind"]),
+                source_id=str(params["source_id"]),
+                controller_actor=str(params["controller_actor"]),
+                repo=str(params["repo"]),
+                base_head=str(params["base_head"]),
+                branch=str(params["branch"]),
+                target_path=str(params["target_path"]),
+                purpose=str(params["purpose"]),
+                retention_until_unix=int(params["retention_until_unix"]),
+                idempotency_key=str(params["idempotency_key"]),
+                scoped_writer_actor=str(params["scoped_writer_actor"]),
+                system_convergence=dict(params["system_convergence"]),
+                ttl_seconds=int(params["ttl_seconds"]),
+                terminal_closeout={
+                    "expected_receipt_sha256": receipt["receipt_sha256"],
+                    "observation": {
+                        "lane_id": lane_id,
+                        "repository": str(self.repo),
+                        "workspace": str(self.target),
+                        "branch": "feat/authority-p0",
+                        "base_revision": SHA,
+                        "writer_state": "completed",
+                        "task_active": False,
+                        "process_active": False,
+                        "lease_active": True,
+                        "git_dirty": False,
+                        "head_sha": SHA,
+                        "remote_head_sha": SHA,
+                        "ahead_commits": 0,
+                        "behind_commits": 0,
+                        "no_change_proven": True,
+                    },
+                },
+            )
+        self.assertEqual(expected, result)
+        planner.assert_not_called()
+        self.assertEqual(persist.call_args.args[0], lane_id)
+
     def test_mcp_entry_rejects_terminal_closeout_identity_mismatch(self) -> None:
         params = self.parameters()
         lane_id = work_acquire._normalize(params)["lane_id"]

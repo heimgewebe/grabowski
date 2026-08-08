@@ -31,6 +31,7 @@ DIRECT_SOURCE_KINDS = frozenset({"direct", "direct-user"})
 MAX_WRITE_PATHS = 256
 MAX_WRITER_ARGV = 256
 MAX_WRITER_ARGUMENT_BYTES = 8192
+_SYSTEM_CONVERGENCE_PLAN_UNSET = object()
 
 
 class ScopedWriterStartPreflight(ValueError):
@@ -140,6 +141,24 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     if not isinstance(supplied, str) or supplied != _sha(material):
         raise RuntimeError("work-lane receipt integrity mismatch")
     return value
+
+
+def _stored_system_convergence_plan(lane_id: str) -> dict[str, Any]:
+    _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
+    with _lane_lock(lane_id) as receipt_path:
+        record = _read_state(receipt_path)
+    if record is None or record.get("lane_id") != lane_id:
+        raise RuntimeError("work-lane receipt is missing or bound to another lane")
+    inputs = record.get("inputs")
+    if (
+        not isinstance(inputs, dict)
+        or record.get("inputs_sha256") != _sha(inputs)
+    ):
+        raise RuntimeError("work-lane stored inputs are invalid")
+    plan = inputs.get("system_convergence_plan")
+    if not isinstance(plan, dict):
+        raise RuntimeError("work-lane stored system convergence plan is invalid")
+    return dict(plan)
 
 
 def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
@@ -383,7 +402,10 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize(
-    parameters: dict[str, Any], *, require_fresh_retention: bool = True
+    parameters: dict[str, Any],
+    *,
+    require_fresh_retention: bool = True,
+    system_convergence_plan: Any = _SYSTEM_CONVERGENCE_PLAN_UNSET,
 ) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("parameters must be an object")
@@ -432,7 +454,14 @@ def _normalize(
     system_convergence = parameters.get("system_convergence")
     if system_convergence is not None and not isinstance(system_convergence, dict):
         raise ValueError("system_convergence must be an object or null")
-    system_convergence_plan = work_admission.plan_system_convergence(system_convergence)
+    if system_convergence_plan is _SYSTEM_CONVERGENCE_PLAN_UNSET:
+        normalized_system_convergence_plan = work_admission.plan_system_convergence(
+            system_convergence
+        )
+    else:
+        if not isinstance(system_convergence_plan, dict):
+            raise RuntimeError("stored system convergence plan must be an object")
+        normalized_system_convergence_plan = dict(system_convergence_plan)
     normalized_system_convergence = (
         dict(system_convergence) if system_convergence is not None else None
     )
@@ -468,7 +497,7 @@ def _normalize(
         "resource_keys": resource_keys,
         "idempotency_key": idempotency_key,
         "system_convergence": normalized_system_convergence,
-        "system_convergence_plan": system_convergence_plan,
+        "system_convergence_plan": normalized_system_convergence_plan,
     }
     if writer_argv is not None:
         identity["scoped_writer_command"] = {
@@ -1020,11 +1049,18 @@ def grabowski_work_acquire(
         observation = terminal_closeout["observation"]
         if not isinstance(observation, dict):
             raise ValueError("terminal_closeout.observation must be an object")
-        inputs = _normalize(parameters, require_fresh_retention=False)
         try:
             observed = lane_closeout.LaneCloseoutObservation(**observation)
         except TypeError as exc:
             raise ValueError(f"terminal_closeout observation shape is invalid: {exc}") from exc
+        stored_plan: Any = _SYSTEM_CONVERGENCE_PLAN_UNSET
+        if system_convergence is not None:
+            stored_plan = _stored_system_convergence_plan(observed.lane_id)
+        inputs = _normalize(
+            parameters,
+            require_fresh_retention=False,
+            system_convergence_plan=stored_plan,
+        )
         expected_observation_identity = {
             "repository": inputs["repo"],
             "workspace": inputs["target_path"],
