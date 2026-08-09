@@ -1359,11 +1359,7 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(payload["receipt_sha256"], stored["lifecycle_receipt_sha256"])
         self.assertEqual(payload["receipt_sha256"], transition["lifecycle_receipt_sha256"])
-        self.reposkop_shadow_terminal_mock.assert_called_once_with(
-            task_id=task_id,
-            terminalization_sha256=transition["transition_sha256"],
-            lifecycle_receipt_sha256=payload["receipt_sha256"],
-        )
+        self.reposkop_shadow_terminal_mock.assert_not_called()
         with self.assertRaisesRegex(ValueError, "terminalized task owner"):
             resources.acquire_resources(
                 owner,
@@ -1372,6 +1368,39 @@ class TaskTests(unittest.TestCase):
                 ttl_seconds=120,
                 metadata={"task_id": task_id, "attempt": 1},
             )
+
+    def test_terminal_shadow_runs_only_after_recorded_before_attempt(self) -> None:
+        result = self._start(resource_keys=["component:test-terminal-shadow-before"])
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "unavailable",
+            "measurement_class": "inconclusive/unavailable",
+            "failure_category": "capability_unavailable",
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "f" * 64,
+        }
+
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "shadow-gate-test"},
+        )
+
+        transition = resources.task_terminalization_record(task_id)
+        self.assertIsNotNone(transition)
+        receipt_path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual("completed", stored["state"])
+        self.reposkop_shadow_terminal_mock.assert_called_once_with(
+            task_id=task_id,
+            terminalization_sha256=transition["transition_sha256"],
+            lifecycle_receipt_sha256=payload["receipt_sha256"],
+        )
 
     def test_terminal_shadow_adapter_failure_cannot_block_terminal_state(self) -> None:
         import grabowski_reposkop_shadow

@@ -2659,6 +2659,28 @@ def _record_reposkop_execution_attestation(
     return dict(value) if isinstance(value, dict) else None
 
 
+def _record_reposkop_checkout_shadow_before(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        launcher = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    value = launcher.get("reposkop_checkout_shadow_before")
+    if (
+        not isinstance(value, dict)
+        or value.get("phase") != "before"
+        or value.get("status") not in {"completed", "unavailable"}
+        or value.get("decision_effect") is not False
+        or value.get("effect_authorized") is not False
+    ):
+        return None
+    return dict(value)
+
+
 def _record_task_effect_classification(
     record: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -4944,11 +4966,12 @@ def _apply_terminalization_projection(
     )
     updated = _row_raw(task_id)
     chronik.record_task_state_safely(updated, state)
-    _capture_reposkop_shadow_terminal_best_effort(
-        task_id=task_id,
-        terminalization_sha256=transition_sha256,
-        lifecycle_receipt_sha256=receipt_sha256,
-    )
+    if _record_reposkop_checkout_shadow_before(updated) is not None:
+        _capture_reposkop_shadow_terminal_best_effort(
+            task_id=task_id,
+            terminalization_sha256=transition_sha256,
+            lifecycle_receipt_sha256=receipt_sha256,
+        )
     return updated
 
 
