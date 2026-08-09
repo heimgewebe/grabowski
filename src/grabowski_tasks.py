@@ -71,6 +71,9 @@ TASK_TERMINALIZATION_RECOVERY_CURSOR_METADATA_KEY = (
     "task_terminalization_recovery_cursor_v1"
 )
 TASK_TERMINALIZATION_RECOVERY_CURSOR_VERSION = 1
+REPOSKOP_SHADOW_TERMINAL_FINALIZED_METADATA_PREFIX = (
+    "reposkop_shadow_terminal_finalized_v1:"
+)
 GRABOWSKI_RUNTIME_PYTHON = operator.HOME / ".local/share/grabowski-mcp/.venv/bin/python"
 GRABOWSKI_REPOSITORY_SLUG = "heimgewebe/grabowski"
 MANAGED_BUILD_RESOLVER = (
@@ -2824,6 +2827,63 @@ def _reposkop_shadow_terminal_marker(task_id: str) -> dict[str, Any] | None:
     return value
 
 
+def _reposkop_shadow_terminal_finalization_metadata_key(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+) -> str:
+    identifier = _validate_task_id(task_id)
+    if SHA256.fullmatch(terminalization_sha256) is None:
+        raise ValueError("Reposkop terminalization digest is invalid")
+    if SHA256.fullmatch(lifecycle_receipt_sha256) is None:
+        raise ValueError("Reposkop lifecycle receipt digest is invalid")
+    return (
+        REPOSKOP_SHADOW_TERMINAL_FINALIZED_METADATA_PREFIX
+        + identifier
+        + ":"
+        + terminalization_sha256
+        + ":"
+        + lifecycle_receipt_sha256
+    )
+
+
+def _record_reposkop_shadow_terminal_finalization(
+    marker: dict[str, Any],
+) -> str:
+    marker_sha256 = marker.get("marker_sha256")
+    lifecycle_receipt_sha256 = marker.get("lifecycle_receipt_sha256")
+    if not isinstance(marker_sha256, str) or SHA256.fullmatch(marker_sha256) is None:
+        raise RuntimeError("Reposkop terminal shadow marker digest is invalid")
+    if (
+        not isinstance(lifecycle_receipt_sha256, str)
+        or SHA256.fullmatch(lifecycle_receipt_sha256) is None
+    ):
+        raise RuntimeError("Reposkop terminal shadow lifecycle receipt is invalid")
+    key = _reposkop_shadow_terminal_finalization_metadata_key(
+        task_id=str(marker.get("task_id") or ""),
+        terminalization_sha256=str(marker.get("terminalization_sha256") or ""),
+        lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+    )
+    with _database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        existing = connection.execute(
+            "SELECT value FROM metadata WHERE key=?",
+            (key,),
+        ).fetchone()
+        if existing is not None and str(existing[0]) != lifecycle_receipt_sha256:
+            connection.rollback()
+            raise RuntimeError(
+                "Reposkop terminal shadow finalization index conflicts with marker truth"
+            )
+        if existing is None:
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES(?, ?)",
+                (key, lifecycle_receipt_sha256),
+            )
+        connection.commit()
+    return key
+
 def _persist_reposkop_shadow_terminal_marker(
     *,
     task_id: str,
@@ -2860,7 +2920,8 @@ def _persist_reposkop_shadow_terminal_marker(
         existing = _reposkop_shadow_terminal_marker(task_id)
         if existing != marker:
             raise RuntimeError("Reposkop terminal shadow marker conflicts with terminal truth")
-        return existing
+        marker = existing
+    _record_reposkop_shadow_terminal_finalization(marker)
     return marker
 
 
@@ -2889,6 +2950,10 @@ def _reposkop_shadow_terminal_recovery_needed(record: dict[str, Any]) -> bool:
         or marker["lifecycle_receipt_sha256"] != receipt_sha256
     ):
         return True
+    try:
+        _record_reposkop_shadow_terminal_finalization(marker)
+    except Exception:
+        return True
     return False
 
 
@@ -2914,6 +2979,7 @@ def _recover_reposkop_shadow_terminal(
             or existing["lifecycle_receipt_sha256"] != receipt_sha256
         ):
             raise RuntimeError("Reposkop terminal shadow marker is bound to another lifecycle")
+        _record_reposkop_shadow_terminal_finalization(existing)
         return existing
     result = _finalize_reposkop_shadow_terminal_best_effort(
         task_id=str(record["task_id"]),
@@ -8247,9 +8313,11 @@ def _select_reconcile_task_rows(
         "(state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
         "'failed', 'timed_out', 'signalled') OR "
         "(state IN ('completed', 'cancelled') AND "
-        "launcher_json LIKE '%\"reposkop_checkout_shadow_terminal_prepare\"%'))"
+        "launcher_json LIKE '%\"reposkop_checkout_shadow_terminal_prepare\"%' AND "
+        "shadow_terminal_finalized.key IS NULL))"
     )
     parameters: list[Any] = [
+        REPOSKOP_SHADOW_TERMINAL_FINALIZED_METADATA_PREFIX,
         TASK_RECONCILE_SEQUENCE_KEY_PREFIX,
         cycle["high_water_sequence"],
     ]
@@ -8263,7 +8331,13 @@ def _select_reconcile_task_rows(
         parameters.extend((cursor[0], cursor[0], cursor[1]))
     parameters.append(limit)
     return connection.execute(
-        "SELECT tasks.* FROM tasks LEFT JOIN metadata AS reconcile_order "
+        "SELECT tasks.* FROM tasks "
+        "LEFT JOIN metadata AS shadow_terminal_finalized ON "
+        "shadow_terminal_finalized.key = ? || tasks.task_id || ':' || "
+        "COALESCE(tasks.terminalization_sha256, '') || ':' || "
+        "COALESCE(tasks.lifecycle_receipt_sha256, '') "
+        "AND shadow_terminal_finalized.value = tasks.lifecycle_receipt_sha256 "
+        "LEFT JOIN metadata AS reconcile_order "
         "ON reconcile_order.key = ? || tasks.task_id "
         f"WHERE {candidate_clause} "
         "AND (reconcile_order.value IS NULL "

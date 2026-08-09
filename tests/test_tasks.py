@@ -1679,6 +1679,166 @@ class TaskTests(unittest.TestCase):
         )
         self.reposkop_shadow_terminal_mock.assert_called_once()
 
+    def test_finalized_shadow_history_does_not_consume_reconcile_page_budget(self) -> None:
+        def launcher_for(task_id: str, token: str) -> dict[str, object]:
+            record = tasks._row_raw(task_id)
+            launcher = json.loads(record["launcher_json"])
+            launcher["reposkop_checkout_shadow_before"] = {
+                "phase": "before",
+                "status": "completed",
+                "evaluation_id": token * 64,
+                "reposkop_cohort": "prospective_control",
+                "before_observation_sha256": "d" * 64,
+                "evidence_sha256": "1" * 64,
+                "decision_effect": False,
+                "effect_authorized": False,
+                "audit_ref": "audit-record-sha256:" + "e" * 64,
+            }
+            return launcher
+
+        finalized: list[str] = []
+        for index in range(6):
+            result = self._start(
+                resource_keys=[f"component:test-shadow-finalized-{index}"]
+            )
+            task_id = str(result["task"]["task_id"])
+            stored = tasks._set_state(
+                task_id,
+                "completed",
+                launcher=launcher_for(task_id, format(index + 1, "x")),
+                observation={"state": "completed", "source": "finalized-history"},
+            )
+            marker = tasks._reposkop_shadow_terminal_marker(task_id)
+            self.assertIsNotNone(marker)
+            assert marker is not None
+            key = tasks._reposkop_shadow_terminal_finalization_metadata_key(
+                task_id=task_id,
+                terminalization_sha256=stored["terminalization_sha256"],
+                lifecycle_receipt_sha256=stored["lifecycle_receipt_sha256"],
+            )
+            with tasks._database_connection() as connection:
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE key=?", (key,)
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(stored["lifecycle_receipt_sha256"], row[0])
+            finalized.append(task_id)
+
+        missing_result = self._start(
+            resource_keys=["component:test-shadow-finalization-missing"]
+        )
+        missing_id = str(missing_result["task"]["task_id"])
+        self.reposkop_shadow_terminal_mock.side_effect = lambda **_kwargs: None
+        tasks._set_state(
+            missing_id,
+            "completed",
+            launcher=launcher_for(missing_id, "a"),
+            observation={"state": "completed", "source": "missing-finalization"},
+        )
+        self.reposkop_shadow_terminal_mock.side_effect = (
+            self.default_reposkop_shadow_finalize
+        )
+
+        active_result = self._start(
+            resource_keys=["component:test-shadow-current-running"]
+        )
+        active_id = str(active_result["task"]["task_id"])
+
+        with tasks._database_connection() as connection:
+            cycle = tasks._ensure_reconcile_cycle(connection)
+            selected = tasks._select_reconcile_task_rows(
+                connection, cycle, limit=2
+            )
+
+        selected_ids = {str(row["task_id"]) for row in selected}
+        self.assertEqual({missing_id, active_id}, selected_ids)
+        self.assertTrue(set(finalized).isdisjoint(selected_ids))
+
+    def test_existing_shadow_marker_backfills_missing_finalization_index(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-shadow-finalization-backfill"]
+        )
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "evaluation_id": "c" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "backfill-index"},
+        )
+        key = tasks._reposkop_shadow_terminal_finalization_metadata_key(
+            task_id=task_id,
+            terminalization_sha256=stored["terminalization_sha256"],
+            lifecycle_receipt_sha256=stored["lifecycle_receipt_sha256"],
+        )
+        with tasks._database_connection() as connection:
+            connection.execute("DELETE FROM metadata WHERE key=?", (key,))
+
+        self.assertFalse(
+            tasks._reposkop_shadow_terminal_recovery_needed(
+                tasks._row_raw(task_id)
+            )
+        )
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(stored["lifecycle_receipt_sha256"], row[0])
+
+    def test_corrupt_shadow_finalization_index_is_not_treated_as_final(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-shadow-finalization-corrupt-index"]
+        )
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "evaluation_id": "b" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "corrupt-index"},
+        )
+        key = tasks._reposkop_shadow_terminal_finalization_metadata_key(
+            task_id=task_id,
+            terminalization_sha256=stored["terminalization_sha256"],
+            lifecycle_receipt_sha256=stored["lifecycle_receipt_sha256"],
+        )
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE metadata SET value=? WHERE key=?",
+                ("f" * 64, key),
+            )
+            cycle = tasks._ensure_reconcile_cycle(connection)
+            selected = tasks._select_reconcile_task_rows(
+                connection, cycle, limit=10
+            )
+
+        self.assertIn(task_id, {str(row["task_id"]) for row in selected})
+
     def test_legacy_row_first_terminal_state_is_recovered_before_delegation(self) -> None:
         result = self._start(
             resource_keys=["component:test-terminalization-legacy-row-first"]
