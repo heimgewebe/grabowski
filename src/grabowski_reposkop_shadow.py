@@ -641,7 +641,8 @@ def _existing_terminal_audit_summary(
             "task_id": task_id,
             "terminalization_sha256": terminalization_sha256,
             "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
-        }
+        },
+        synchronize=False,
     )
     if found is None:
         return None
@@ -996,6 +997,9 @@ def _finalize_terminal_under_identity_lock(
     lifecycle_receipt_sha256: str,
     prepared: dict[str, Any],
 ) -> dict[str, Any] | None:
+    # A peer can append and crash after our outer pre-sync but before we acquire
+    # this identity stripe. Catch up that short tail while serialization is held.
+    reposkop_effectiveness.sync_event_identity_index()
     existing_audit = _existing_terminal_audit_summary(
         task_id=task_id,
         terminalization_sha256=terminalization_sha256,
@@ -1127,6 +1131,8 @@ def _finalize_terminal_under_identity_lock(
             paths["terminal_audit"] if paths is not None else None,
             event,
         )
+        if audit_ref is not None:
+            reposkop_effectiveness.sync_event_identity_index()
     except Exception:
         audit_ref = None
     return _public_summary(audit_binding, audit_ref)
@@ -1148,6 +1154,9 @@ def finalize_terminal_best_effort(
         ):
             return None
         prepared = _validated_terminal_prepare(dict(prepared), task_id=task_id)
+        # Synchronize outside the striped identity lock: bootstrap or a large crash tail
+        # must never consume the stripe's short lock budget.
+        reposkop_effectiveness.sync_event_identity_index()
         identity = {
             "operation": TERMINAL_OPERATION,
             "task_id": task_id,

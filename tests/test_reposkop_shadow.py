@@ -143,12 +143,19 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
             "event_identity_lock",
             return_value=self.audit_identity_lock,
         )
+        self.audit_sync_patch = patch.object(
+            shadow.reposkop_effectiveness,
+            "sync_event_identity_index",
+            return_value={"through_global_ordinal": 0, "scanned_records": 0},
+        )
         self.root_patch.start()
         self.audit_patch.start()
         self.audit_lookup_patch.start()
         self.audit_identity_lock_patch.start()
+        self.audit_sync_patch.start()
 
     def tearDown(self) -> None:
+        self.audit_sync_patch.stop()
         self.audit_identity_lock_patch.stop()
         self.audit_lookup_patch.stop()
         self.audit_patch.stop()
@@ -494,6 +501,28 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
         self.assertIs(terminal_event["effect_authorized"], False)
         terminal_path = shadow._paths(self.evidence_root, task_id)["terminal_binding"]
         self.assertFalse(terminal_path.exists())
+
+    def test_terminal_identity_resyncs_inside_stripe_before_lookup(self) -> None:
+        expected = {"status": "unavailable", "audit_ref": "audit-record-sha256:" + "1" * 64}
+        with patch.object(
+            shadow.reposkop_effectiveness, "sync_event_identity_index"
+        ) as synchronize, patch.object(
+            shadow, "_existing_terminal_audit_summary", return_value=expected
+        ) as lookup:
+            result = shadow._finalize_terminal_under_identity_lock(
+                task_id="resync-race",
+                terminalization_sha256="a" * 64,
+                lifecycle_receipt_sha256="b" * 64,
+                prepared={},
+            )
+
+        self.assertEqual(result, expected)
+        synchronize.assert_called_once_with()
+        lookup.assert_called_once_with(
+            task_id="resync-race",
+            terminalization_sha256="a" * 64,
+            lifecycle_receipt_sha256="b" * 64,
+        )
 
     def test_terminal_fallback_audit_is_reused_after_private_storage_recovers(self) -> None:
         task_id = "terminal-fallback-replay"

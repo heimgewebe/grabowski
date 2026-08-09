@@ -7,6 +7,8 @@ import math
 import os
 from pathlib import Path
 import re
+import sqlite3
+import stat as statmod
 import tempfile
 import time
 from typing import Any, Literal, cast, get_args
@@ -55,6 +57,15 @@ FINDING_TAXONOMY_VERSION = 2
 REVIEW_SCHEMA_VERSION = 1
 MAX_REVIEW_SCAN_RECORDS = 500_000
 MAX_REVIEW_EVIDENCE_REFS = 20
+EVENT_IDENTITY_INDEX_SCHEMA_VERSION = 1
+EVENT_IDENTITY_INDEX_FILENAME = "reposkop-event-identity-index-v1.sqlite3"
+TERMINAL_IDENTITY_OPERATION = "reposkop-checkout-shadow-terminal-observed"
+TERMINAL_IDENTITY_FIELDS = (
+    "operation",
+    "task_id",
+    "terminalization_sha256",
+    "lifecycle_receipt_sha256",
+)
 MAX_REVIEW_REASON_CODES = 16
 MIN_FALSE_POSITIVE_CLUSTER = 3
 MIN_FALSE_NEGATIVE_CLUSTER = 2
@@ -717,59 +728,303 @@ def _validated_event_identity(identity: dict[str, Any]) -> dict[str, Any]:
     return dict(identity)
 
 
+def _canonical_identity_json(identity: dict[str, Any]) -> str:
+    return json.dumps(
+        _validated_event_identity(identity),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 def event_identity_lock(identity: dict[str, Any]):
-    """Serialize same-identity audit decisions across processes with bounded lock files."""
-    validated = _validated_event_identity(identity)
-    identity_sha256 = _sha256_json(validated)
+    """Serialize same-identity terminal decisions with a bounded lock namespace."""
+    identity_sha256 = hashlib.sha256(
+        _canonical_identity_json(identity).encode("utf-8")
+    ).hexdigest()
     lock_target = base.AUDIT_LOG.parent / f"reposkop-event-identity-{identity_sha256[:2]}"
     return base._audit_coordination_lock(lock_target, exclusive=True)
 
 
-def find_event_by_identity(
-    identity: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Return the oldest exact event from one complete verified audit snapshot."""
-    identity = _validated_event_identity(identity)
-    snapshot = audit_query.capture_verified_audit_snapshot()
+def _event_identity_index_path() -> Path:
+    return base.AUDIT_LOG.parent / EVENT_IDENTITY_INDEX_FILENAME
 
-    global_ordinal = 0
+
+def event_identity_index_lock():
+    return base._audit_coordination_lock(_event_identity_index_path(), exclusive=True)
+
+
+def _ensure_event_identity_index_file(path: Path) -> None:
+    parent = path.parent
+    if parent.is_symlink():
+        raise PermissionError("Reposkop identity-index parent may not be a symlink")
+    parent_meta = os.stat(parent, follow_symlinks=False)
+    if (
+        not statmod.S_ISDIR(parent_meta.st_mode)
+        or parent_meta.st_uid != os.getuid()
+        or parent_meta.st_gid != os.getgid()
+        or statmod.S_IMODE(parent_meta.st_mode) & 0o077
+    ):
+        raise PermissionError("Reposkop identity-index parent violates its private contract")
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        try:
+            descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            descriptor = os.open(path, flags)
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            base._fsync_directory(parent)
+        opened = os.fstat(descriptor)
+        linked = os.stat(path, follow_symlinks=False)
+        if (
+            not statmod.S_ISREG(opened.st_mode)
+            or not statmod.S_ISREG(linked.st_mode)
+            or opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_uid != os.getuid()
+            or opened.st_gid != os.getgid()
+            or opened.st_nlink != 1
+            or statmod.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise PermissionError("Reposkop identity index violates its file contract")
+    finally:
+        os.close(descriptor)
+
+
+def _open_event_identity_index() -> sqlite3.Connection:
+    path = _event_identity_index_path()
+    _ensure_event_identity_index_file(path)
+    connection = sqlite3.connect(str(path), timeout=5.0)
+    try:
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if user_version not in {0, EVENT_IDENTITY_INDEX_SCHEMA_VERSION}:
+            raise RuntimeError("Reposkop identity-index schema version is unsupported")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS checkpoint ("
+            "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+            "through_global_ordinal INTEGER NOT NULL, "
+            "through_record_sha256 TEXT)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS event_identity ("
+            "identity_sha256 TEXT PRIMARY KEY, "
+            "identity_json TEXT NOT NULL, "
+            "global_ordinal INTEGER NOT NULL, "
+            "audit_ref TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO checkpoint(singleton, through_global_ordinal, through_record_sha256) "
+            "VALUES(1, 0, NULL)"
+        )
+        if user_version == 0:
+            connection.execute(f"PRAGMA user_version={EVENT_IDENTITY_INDEX_SCHEMA_VERSION}")
+        connection.commit()
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _audit_item_from_raw(raw_line: bytes, *, global_ordinal: int) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("verified audit record decode invariant violated") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("verified audit chain yielded a non-object record")
+    digest = parsed.get("record_sha256")
+    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+        digest = hashlib.sha256(raw_line).hexdigest()
+    return {
+        "audit_ref": f"audit-record-sha256:{digest}",
+        "record": parsed,
+        "global_ordinal": global_ordinal,
+    }
+
+
+def _verified_item_at_global_ordinal(
+    snapshot: audit_query.VerifiedAuditSnapshot,
+    global_ordinal: int,
+) -> dict[str, Any]:
+    if not isinstance(global_ordinal, int) or isinstance(global_ordinal, bool) or global_ordinal < 1:
+        raise ValueError("global_ordinal must be a positive integer")
     for segment in snapshot.segments:
+        if segment.global_start_ordinal <= global_ordinal <= segment.global_end_ordinal:
+            data = audit_query._load_snapshot_segment(segment)
+            lines = data.splitlines()
+            if len(lines) != segment.records:
+                raise RuntimeError("verified audit segment record count changed")
+            index = global_ordinal - segment.global_start_ordinal
+            return _audit_item_from_raw(lines[index], global_ordinal=global_ordinal)
+    raise RuntimeError("Reposkop identity-index ordinal is outside the verified audit snapshot")
+
+
+def _iter_verified_items_after(
+    snapshot: audit_query.VerifiedAuditSnapshot,
+    after_global_ordinal: int,
+):
+    if after_global_ordinal < 0 or after_global_ordinal > snapshot.total_records:
+        raise RuntimeError("Reposkop identity-index checkpoint is outside the verified audit snapshot")
+    for segment in snapshot.segments:
+        if segment.global_end_ordinal <= after_global_ordinal:
+            continue
         data = audit_query._load_snapshot_segment(segment)
         lines = data.splitlines()
         if len(lines) != segment.records:
-            raise RuntimeError(
-                "verified audit segment changed during exact event identity scan"
-            )
-        for raw_line in lines:
-            global_ordinal += 1
-            try:
-                parsed = json.loads(raw_line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    "verified audit record decode invariant violated during exact event identity scan"
-                ) from exc
-            if not isinstance(parsed, dict):
-                raise RuntimeError(
-                    "verified audit exact event identity scan yielded a non-object record"
-                )
-            if any(parsed.get(key) != expected for key, expected in identity.items()):
-                continue
-            digest = parsed.get("record_sha256")
-            if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
-                digest = hashlib.sha256(raw_line).hexdigest()
-            return {
-                "audit_ref": f"audit-record-sha256:{digest}",
-                "record": parsed,
-                "global_ordinal": global_ordinal,
-                "source": {
-                    "chain_content_sha256": snapshot.chain_content_sha256,
-                    "chain_materialization_sha256": snapshot.chain_materialization_sha256,
-                    "total_records": snapshot.total_records,
-                    "scan_complete": True,
-                },
-            }
-    return None
+            raise RuntimeError("verified audit segment record count changed")
+        first = max(0, after_global_ordinal + 1 - segment.global_start_ordinal)
+        for index in range(first, len(lines)):
+            ordinal = segment.global_start_ordinal + index
+            yield _audit_item_from_raw(lines[index], global_ordinal=ordinal)
 
+
+def _terminal_identity_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("operation") != TERMINAL_IDENTITY_OPERATION:
+        return None
+    identity = {field: record.get(field) for field in TERMINAL_IDENTITY_FIELDS}
+    if not isinstance(identity["task_id"], str) or not identity["task_id"]:
+        raise RuntimeError("Reposkop terminal audit identity has an invalid task_id")
+    for field in ("terminalization_sha256", "lifecycle_receipt_sha256"):
+        if not isinstance(identity[field], str) or SHA256_RE.fullmatch(identity[field]) is None:
+            raise RuntimeError(f"Reposkop terminal audit identity has an invalid {field}")
+    return identity
+
+
+def _index_identity_item(connection: sqlite3.Connection, item: dict[str, Any]) -> None:
+    identity = _terminal_identity_from_record(item["record"])
+    if identity is None:
+        return
+    identity_json = _canonical_identity_json(identity)
+    identity_sha256 = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    existing = connection.execute(
+        "SELECT identity_json, global_ordinal, audit_ref FROM event_identity WHERE identity_sha256=?",
+        (identity_sha256,),
+    ).fetchone()
+    if existing is None:
+        connection.execute(
+            "INSERT INTO event_identity(identity_sha256, identity_json, global_ordinal, audit_ref) "
+            "VALUES(?, ?, ?, ?)",
+            (identity_sha256, identity_json, item["global_ordinal"], item["audit_ref"]),
+        )
+        return
+    if existing[0] != identity_json:
+        raise RuntimeError("Reposkop identity-index digest collision detected")
+    if int(existing[1]) > int(item["global_ordinal"]):
+        connection.execute(
+            "UPDATE event_identity SET global_ordinal=?, audit_ref=? WHERE identity_sha256=?",
+            (item["global_ordinal"], item["audit_ref"], identity_sha256),
+        )
+
+
+def _sync_event_identity_index_unlocked(
+    snapshot: audit_query.VerifiedAuditSnapshot,
+    connection: sqlite3.Connection,
+) -> dict[str, Any]:
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute(
+            "SELECT through_global_ordinal, through_record_sha256 FROM checkpoint WHERE singleton=1"
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("Reposkop identity-index checkpoint is missing")
+        through = int(row[0])
+        through_sha = row[1]
+        if through < 0 or through > snapshot.total_records:
+            raise RuntimeError("Reposkop identity-index checkpoint is outside current audit truth")
+        if through:
+            anchor = _verified_item_at_global_ordinal(snapshot, through)
+            if anchor["audit_ref"] != f"audit-record-sha256:{through_sha}":
+                raise RuntimeError("Reposkop identity-index checkpoint lost its audit binding")
+        last_ref = f"audit-record-sha256:{through_sha}" if through else None
+        scanned = 0
+        for item in _iter_verified_items_after(snapshot, through):
+            scanned += 1
+            _index_identity_item(connection, item)
+            last_ref = item["audit_ref"]
+        if snapshot.total_records and last_ref is None:
+            raise RuntimeError("Reposkop identity-index could not bind the audit tail")
+        last_sha = last_ref.removeprefix("audit-record-sha256:") if last_ref else None
+        connection.execute(
+            "UPDATE checkpoint SET through_global_ordinal=?, through_record_sha256=? WHERE singleton=1",
+            (snapshot.total_records, last_sha),
+        )
+        connection.commit()
+        return {
+            "through_global_ordinal": snapshot.total_records,
+            "through_record_sha256": last_sha,
+            "scanned_records": scanned,
+            "chain_content_sha256": snapshot.chain_content_sha256,
+            "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+        }
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def sync_event_identity_index() -> dict[str, Any]:
+    """Advance the derived terminal-identity index only across the verified audit tail."""
+    with event_identity_index_lock():
+        snapshot = audit_query.capture_verified_audit_snapshot()
+        connection = _open_event_identity_index()
+        try:
+            return _sync_event_identity_index_unlocked(snapshot, connection)
+        finally:
+            connection.close()
+
+
+def find_event_by_identity(
+    identity: dict[str, Any],
+    *,
+    synchronize: bool = True,
+) -> dict[str, Any] | None:
+    """Resolve one terminal identity via the derived index and re-verify audit truth."""
+    identity = _validated_event_identity(identity)
+    if _terminal_identity_from_record(identity) is None:
+        raise ValueError("only terminal Reposkop audit identities are indexed")
+    if synchronize:
+        sync_event_identity_index()
+    identity_json = _canonical_identity_json(identity)
+    identity_sha256 = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()
+    with event_identity_index_lock():
+        connection = _open_event_identity_index()
+        try:
+            row = connection.execute(
+                "SELECT identity_json, global_ordinal, audit_ref FROM event_identity WHERE identity_sha256=?",
+                (identity_sha256,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        if row[0] != identity_json:
+            raise RuntimeError("Reposkop identity-index digest collision detected")
+        snapshot = audit_query.capture_verified_audit_snapshot()
+        item = _verified_item_at_global_ordinal(snapshot, int(row[1]))
+        if item["audit_ref"] != row[2]:
+            raise RuntimeError("Reposkop identity-index audit reference drifted")
+        if any(item["record"].get(key) != value for key, value in identity.items()):
+            raise RuntimeError("Reposkop identity-index points at the wrong audit identity")
+        return {
+            **item,
+            "source": {
+                "chain_content_sha256": snapshot.chain_content_sha256,
+                "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+                "total_records": snapshot.total_records,
+                "scan_complete": True,
+                "scan_mode": "verified_incremental_identity_index",
+            },
+        }
 
 def enrich_attestation(
     attestation: dict[str, Any],

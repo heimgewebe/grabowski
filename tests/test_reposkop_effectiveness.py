@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 import sys
@@ -1296,71 +1297,172 @@ class ReposkopEffectivenessTests(unittest.TestCase):
 
     def test_find_event_by_identity_returns_oldest_exact_verified_event(self) -> None:
         identity = {
-            "operation": "reposkop-checkout-shadow-terminal-observed",
+            "operation": effectiveness.TERMINAL_IDENTITY_OPERATION,
             "task_id": "task-1",
             "terminalization_sha256": "a" * 64,
             "lifecycle_receipt_sha256": "b" * 64,
         }
         first = {**identity, "shadow_status": "unavailable", "record_sha256": "1" * 64}
         other = {**identity, "shadow_status": "completed", "record_sha256": "2" * 64}
-        segment = types.SimpleNamespace(records=2)
-        snapshot = types.SimpleNamespace(
-            total_records=2,
-            segments=(segment,),
-            chain_content_sha256="c" * 64,
-            chain_materialization_sha256="d" * 64,
-        )
         payload = (
             json.dumps(first, sort_keys=True).encode("utf-8")
             + b"\n"
             + json.dumps(other, sort_keys=True).encode("utf-8")
             + b"\n"
         )
-        with patch.object(
-            effectiveness.audit_query,
-            "capture_verified_audit_snapshot",
-            return_value=snapshot,
-        ), patch.object(
-            effectiveness.audit_query,
-            "_load_snapshot_segment",
-            return_value=payload,
-        ):
-            result = effectiveness.find_event_by_identity(identity)
+        segment = types.SimpleNamespace(
+            path=Path("segment-1"),
+            records=2,
+            global_start_ordinal=1,
+            global_end_ordinal=2,
+        )
+        snapshot = types.SimpleNamespace(
+            total_records=2,
+            segments=(segment,),
+            chain_content_sha256="c" * 64,
+            chain_materialization_sha256="d" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "index.sqlite3"
+            with patch.object(
+                effectiveness, "_event_identity_index_path", return_value=index_path
+            ), patch.object(
+                effectiveness, "event_identity_index_lock", side_effect=contextlib.nullcontext
+            ), patch.object(
+                effectiveness.audit_query,
+                "capture_verified_audit_snapshot",
+                return_value=snapshot,
+            ), patch.object(
+                effectiveness.audit_query,
+                "_load_snapshot_segment",
+                return_value=payload,
+            ):
+                result = effectiveness.find_event_by_identity(identity)
 
         self.assertIsNotNone(result)
         self.assertEqual(result["audit_ref"], _ref("1"))
         self.assertEqual(result["record"]["shadow_status"], "unavailable")
         self.assertEqual(result["global_ordinal"], 1)
-        self.assertTrue(result["source"]["scan_complete"])
+        self.assertEqual(result["source"]["scan_mode"], "verified_incremental_identity_index")
 
-    def test_find_event_by_identity_keeps_working_beyond_review_scan_threshold(self) -> None:
-        identity = {"operation": "reposkop-checkout-shadow-terminal-observed"}
-        record = {**identity, "record_sha256": "3" * 64}
-        segment = types.SimpleNamespace(records=1)
-        snapshot = types.SimpleNamespace(
-            total_records=effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
-            segments=(segment,),
+    def test_identity_index_scans_only_checkpoint_anchor_and_new_tail(self) -> None:
+        def record(operation: str, digest: str) -> bytes:
+            return json.dumps(
+                {"operation": operation, "record_sha256": digest * 64}, sort_keys=True
+            ).encode("utf-8") + b"\n"
+
+        old_segments = tuple(
+            types.SimpleNamespace(
+                path=Path(f"old-{index}"),
+                records=1,
+                global_start_ordinal=index + 1,
+                global_end_ordinal=index + 1,
+            )
+            for index in range(3)
+        )
+        tail = types.SimpleNamespace(
+            path=Path("tail"), records=1, global_start_ordinal=4, global_end_ordinal=4
+        )
+        first_snapshot = types.SimpleNamespace(
+            total_records=3,
+            segments=old_segments,
             chain_content_sha256="c" * 64,
             chain_materialization_sha256="d" * 64,
         )
-        payload = json.dumps(record, sort_keys=True).encode("utf-8") + b"\n"
-        with patch.object(
-            effectiveness.audit_query,
-            "capture_verified_audit_snapshot",
-            return_value=snapshot,
-        ), patch.object(
-            effectiveness.audit_query,
-            "_load_snapshot_segment",
-            return_value=payload,
-        ):
-            result = effectiveness.find_event_by_identity(identity)
+        second_snapshot = types.SimpleNamespace(
+            total_records=4,
+            segments=(*old_segments, tail),
+            chain_content_sha256="e" * 64,
+            chain_materialization_sha256="f" * 64,
+        )
+        payloads = {
+            Path("old-0"): record("unrelated-0", "1"),
+            Path("old-1"): record("unrelated-1", "2"),
+            Path("old-2"): record("unrelated-2", "3"),
+            Path("tail"): record("unrelated-tail", "4"),
+        }
+        loads: list[Path] = []
+
+        def load(segment: object) -> bytes:
+            path = segment.path
+            loads.append(path)
+            return payloads[path]
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "index.sqlite3"
+            with patch.object(
+                effectiveness, "_event_identity_index_path", return_value=index_path
+            ), patch.object(
+                effectiveness, "event_identity_index_lock", side_effect=contextlib.nullcontext
+            ), patch.object(
+                effectiveness.audit_query,
+                "capture_verified_audit_snapshot",
+                side_effect=[first_snapshot, second_snapshot],
+            ), patch.object(
+                effectiveness.audit_query, "_load_snapshot_segment", side_effect=load
+            ):
+                effectiveness.sync_event_identity_index()
+                loads.clear()
+                result = effectiveness.sync_event_identity_index()
+
+        self.assertEqual(result["scanned_records"], 1)
+        self.assertEqual(loads, [Path("old-2"), Path("tail")])
+
+    def test_identity_index_recovers_an_appended_terminal_event_from_tail(self) -> None:
+        identity = {
+            "operation": effectiveness.TERMINAL_IDENTITY_OPERATION,
+            "task_id": "task-recovery",
+            "terminalization_sha256": "a" * 64,
+            "lifecycle_receipt_sha256": "b" * 64,
+        }
+        unrelated = {"operation": "unrelated", "record_sha256": "1" * 64}
+        terminal = {**identity, "shadow_status": "unavailable", "record_sha256": "2" * 64}
+        first_segment = types.SimpleNamespace(
+            path=Path("base"), records=1, global_start_ordinal=1, global_end_ordinal=1
+        )
+        tail_segment = types.SimpleNamespace(
+            path=Path("tail"), records=1, global_start_ordinal=2, global_end_ordinal=2
+        )
+        first_snapshot = types.SimpleNamespace(
+            total_records=1,
+            segments=(first_segment,),
+            chain_content_sha256="c" * 64,
+            chain_materialization_sha256="d" * 64,
+        )
+        second_snapshot = types.SimpleNamespace(
+            total_records=2,
+            segments=(first_segment, tail_segment),
+            chain_content_sha256="e" * 64,
+            chain_materialization_sha256="f" * 64,
+        )
+        payloads = {
+            Path("base"): json.dumps(unrelated, sort_keys=True).encode("utf-8") + b"\n",
+            Path("tail"): json.dumps(terminal, sort_keys=True).encode("utf-8") + b"\n",
+        }
+
+        def load(segment: object) -> bytes:
+            return payloads[segment.path]
+
+        with tempfile.TemporaryDirectory() as directory:
+            index_path = Path(directory) / "index.sqlite3"
+            with patch.object(
+                effectiveness, "_event_identity_index_path", return_value=index_path
+            ), patch.object(
+                effectiveness, "event_identity_index_lock", side_effect=contextlib.nullcontext
+            ), patch.object(
+                effectiveness.audit_query,
+                "capture_verified_audit_snapshot",
+                side_effect=[first_snapshot, second_snapshot, second_snapshot],
+            ), patch.object(
+                effectiveness.audit_query, "_load_snapshot_segment", side_effect=load
+            ):
+                effectiveness.sync_event_identity_index()
+                effectiveness.sync_event_identity_index()
+                result = effectiveness.find_event_by_identity(identity, synchronize=False)
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["audit_ref"], _ref("3"))
-        self.assertEqual(
-            result["source"]["total_records"],
-            effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
-        )
+        self.assertEqual(result["audit_ref"], _ref("2"))
+        self.assertEqual(result["global_ordinal"], 2)
 
     def test_event_identity_lock_uses_bounded_audit_lock_stripe(self) -> None:
         token = object()
