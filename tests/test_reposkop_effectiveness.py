@@ -1093,6 +1093,64 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(result["classification"], "confirmed_unique_value")
         self.assertIs(result["replayed"], False)
 
+    def test_confirmed_unique_value_rejects_unrelated_identity_break_shadow(self) -> None:
+        evaluation = "9" * 64
+        unrelated_evaluation = "a" * 64
+        decision_ref = _ref("5")
+        outcome_ref = _ref("6")
+        unrelated_shadow_ref = _ref("7")
+        records = [
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "5",
+                task_id="task-reviewed",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                final_decision="allow",
+                decision_changed=False,
+                reposkop_execution_skipped=True,
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "6",
+                task_id="task-reviewed",
+                terminal_state="completed",
+            ),
+            _event(
+                "reposkop-checkout-shadow-terminal-observed",
+                unrelated_evaluation,
+                "7",
+                task_id="task-unrelated",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                shadow_status="completed",
+                continuity_state="identity_break",
+                measurement_class="identity_break",
+                decision_effect=False,
+            ),
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "confirmed_unique_value",
+            "reviewer": "operator:reviewer",
+            "scope": "repository",
+            "detectable_category": "checkout_identity",
+            "reason_codes": ["semantic_checkout_identity_break"],
+            "evidence_refs": [decision_ref, outcome_ref, unrelated_shadow_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+
+        with patch.object(
+            effectiveness, "_review_records", return_value=(records, {})
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "confirmed_unique_value requires a reviewed, completed identity-break shadow artifact",
+        ):
+            effectiveness.record_review_classification(parameters)
+
     def test_false_positive_cluster_requires_same_detectable_category(self) -> None:
         records: list[dict[str, object]] = []
         for index, category in enumerate(("checkout_identity", "remote_freshness", "working_tree_state"), 1):

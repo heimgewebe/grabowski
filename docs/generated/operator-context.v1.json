@@ -3367,7 +3367,7 @@
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
       "src/grabowski_reposkop_context.py": "d3f41bf2302f99b137b2a6e637fc92fd203845236a3d9e11270c477fe90b2c20",
-      "src/grabowski_reposkop_effectiveness.py": "bd95ca0127c5e17d59804becdbceca61408cdb69b7b5a048c5dfe889862677b2",
+      "src/grabowski_reposkop_effectiveness.py": "3cd490ee15863cb65b17fd62da94abd8394fd1cd836a747fd64ed6fdea9ab049",
       "src/grabowski_reposkop_shadow.py": "769011ff4cbd5b8bc64e0440c9e60fc0e1651e022394254c4648bf1d00b6f11f",
       "src/grabowski_resources.py": "7084aefab51791cce26af7340e99d1283f10650fadb2ccbf270bccbcc6e16963",
       "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",

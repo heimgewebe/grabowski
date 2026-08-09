@@ -1095,6 +1095,12 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
             and audit_records_by_ref[reference].get("shadow_status") == "completed"
             and audit_records_by_ref[reference].get("continuity_state")
             == "identity_break"
+            and (
+                audit_records_by_ref[reference].get("evaluation_id") == evaluation
+                or audit_records_by_ref[reference].get("transaction_id")
+                == evaluation
+                or audit_records_by_ref[reference].get("task_id") == task_id
+            )
         ]
         if not qualifying_shadow_refs:
             raise ReposkopReviewIntegrityError(
