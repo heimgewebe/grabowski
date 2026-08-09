@@ -3579,7 +3579,7 @@ def _write_orphan_pre_effect(
         },
     )
 
-def _assert_owner_leases_unchanged_or_absent(
+def _assert_owner_leases_same_lineage_or_absent(
     acquisition: dict[str, Any],
 ) -> None:
     owner_id = acquisition["owner_id"]
@@ -3608,7 +3608,7 @@ def _assert_owner_leases_unchanged_or_absent(
                 "orphan-reconcile-lease-snapshot-missing",
                 details={"resource_key": key},
             )
-        if not _owner_lease_matches_snapshot(expected, observed):
+        if not _owner_lease_matches_terminal_lineage(expected, observed):
             raise BureauPickupError(
                 "orphan-reconcile-lease-metadata-drift",
                 details={"resource_key": key},
@@ -3772,7 +3772,7 @@ def grabowski_bureau_pickup_orphan_reconcile(
                     "effect_started": False,
                 },
             )
-        _assert_owner_leases_unchanged_or_absent(acquisition)
+        _assert_owner_leases_same_lineage_or_absent(acquisition)
         # Persist pre-effect digest before any fail mutation for later terminal CAS.
         _write_orphan_pre_effect(
             run_dir,
@@ -3880,7 +3880,7 @@ def grabowski_bureau_pickup_orphan_reconcile(
                     "does_not_establish": _execution_binding_does_not_establish(),
                 },
             )
-        _assert_owner_leases_unchanged_or_absent(acquisition)
+        _assert_owner_leases_same_lineage_or_absent(acquisition)
 
     if not isinstance(status, dict) or status.get("status") != "coordinated":
         return {
