@@ -60,6 +60,22 @@ TASK_ID_RE = re.compile(r"[0-9a-f]{24}\Z")
 MIN_TTL_SECONDS = 30
 MAX_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_OPERATION_RESOURCE_VALUE_BYTES = 4096
+OPERATION_SCOPE_SCHEMA_VERSION = 1
+OPERATION_SCOPE_METADATA_KEY = "operation_scope"
+OPERATION_SCOPE_EFFECT_CLASSES = frozenset(
+    {"publication", "merge", "deploy", "worktree_admin", "unknown"}
+)
+OPERATION_SCOPE_CLASS_BY_EFFECT = {
+    "publication": frozenset({"push", "pr-publication"}),
+    "merge": frozenset({"merge"}),
+    "deploy": frozenset({"deploy"}),
+    "worktree_admin": frozenset({"worktree-admin"}),
+    "unknown": frozenset({"unknown"}),
+}
+PUBLICATION_OPERATION_PREFIX_BY_CLASS = {
+    "push": "branch-publish",
+    "pr-publication": "pr-create-or-update",
+}
 MAX_TERMINAL_RECEIPT_BYTES = 64 * 1024
 MAX_RUNTIME_REFRESH_RECEIPT_BYTES = 256 * 1024
 BUREAU_RUNTIME_REFRESH_STATE_ROOT = Path(
@@ -2728,6 +2744,253 @@ def _repository_resource_scope(
     return None
 
 
+def _normalize_operation_scope_strings(values: Any, *, label: str) -> list[str]:
+    if not isinstance(values, list):
+        raise ValueError(f"operation_scope.{label} must be a list")
+    normalized: list[str] = []
+    for value in values:
+        if (
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 1024
+        ):
+            raise ValueError(f"operation_scope.{label} contains an invalid value")
+        normalized.append(value)
+    result = sorted(set(normalized))
+    if len(result) > 32:
+        raise ValueError(f"operation_scope.{label} exceeds entry limit")
+    return result
+
+
+def _normalize_operation_scope_pull_requests(values: Any) -> list[int]:
+    if not isinstance(values, list):
+        raise ValueError("operation_scope.pull_requests must be a list")
+    normalized: list[int] = []
+    for value in values:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 1
+            or value > 2_147_483_647
+        ):
+            raise ValueError("operation_scope.pull_requests contains an invalid value")
+        normalized.append(value)
+    result = sorted(set(normalized))
+    if len(result) > 32:
+        raise ValueError("operation_scope.pull_requests exceeds entry limit")
+    return result
+
+
+def normalize_operation_scope(value: Any) -> dict[str, Any]:
+    """Normalize one exact self-scoped repository operation contract.
+
+    Only the two named publication operation classes can establish merge
+    non-conflict. Other classes remain machine-readable but fail closed.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("operation_scope must be an object")
+    expected = {
+        "schema_version",
+        "effect_class",
+        "operation_class",
+        "repository",
+        "resource_key",
+        "branches",
+        "pull_requests",
+        "scope_complete",
+    }
+    if set(value) != expected:
+        raise ValueError("operation_scope fields are invalid")
+    if value.get("schema_version") != OPERATION_SCOPE_SCHEMA_VERSION:
+        raise ValueError("operation_scope schema_version is unsupported")
+    effect_class = value.get("effect_class")
+    operation_class = value.get("operation_class")
+    if effect_class not in OPERATION_SCOPE_EFFECT_CLASSES:
+        raise ValueError("operation_scope effect_class is invalid")
+    if operation_class not in OPERATION_SCOPE_CLASS_BY_EFFECT[effect_class]:
+        raise ValueError("operation_scope operation_class does not match effect_class")
+    repository_value = value.get("repository")
+    if not isinstance(repository_value, str):
+        raise ValueError("operation_scope repository must be text")
+    repository_path = Path(repository_value).expanduser()
+    if not repository_path.is_absolute():
+        raise ValueError("operation_scope repository must be absolute")
+    repository = os.path.normpath(str(repository_path))
+    resource_key = normalize_resource_key(value.get("resource_key"))
+    resource_scope = _repository_resource_scope(resource_key, repository=repository)
+    if (
+        resource_scope is None
+        or resource_scope["scope_kind"] != "operation"
+        or resource_scope["repository"] != repository
+    ):
+        raise ValueError(
+            "operation_scope resource_key must be an operation-scoped repository key"
+        )
+    branches = _normalize_operation_scope_strings(
+        value.get("branches"), label="branches"
+    )
+    pull_requests = _normalize_operation_scope_pull_requests(
+        value.get("pull_requests")
+    )
+    scope_complete = value.get("scope_complete")
+    if not isinstance(scope_complete, bool):
+        raise ValueError("operation_scope.scope_complete must be boolean")
+    scope_value = str(resource_scope["scope_value"] or "")
+    if effect_class == "publication":
+        if scope_complete is not True:
+            raise ValueError("publication operation_scope must be complete")
+        expected_prefix = PUBLICATION_OPERATION_PREFIX_BY_CLASS[operation_class]
+        if not (
+            scope_value == expected_prefix
+            or scope_value.startswith(expected_prefix + ":")
+        ):
+            raise ValueError(
+                "publication operation_scope does not match the operation resource class"
+            )
+        if operation_class == "push":
+            if not branches or pull_requests:
+                raise ValueError(
+                    "push operation_scope requires branches and forbids pull_requests"
+                )
+        elif not branches and not pull_requests:
+            raise ValueError(
+                "pr-publication operation_scope requires a branch or pull request"
+            )
+    elif branches or pull_requests:
+        raise ValueError(
+            "non-publication operation_scope may not declare publication scope"
+        )
+    return {
+        "schema_version": OPERATION_SCOPE_SCHEMA_VERSION,
+        "effect_class": effect_class,
+        "operation_class": operation_class,
+        "repository": repository,
+        "resource_key": resource_key,
+        "branches": branches,
+        "pull_requests": pull_requests,
+        "scope_complete": scope_complete,
+    }
+
+
+def operation_scope_contract(
+    resource_key: str,
+    *,
+    repository: str,
+    effect_class: str,
+    operation_class: str,
+    branches: Iterable[str] = (),
+    pull_requests: Iterable[int] = (),
+    scope_complete: bool = True,
+) -> dict[str, Any]:
+    """Build one canonical operation-scope contract for lease metadata."""
+    return normalize_operation_scope(
+        {
+            "schema_version": OPERATION_SCOPE_SCHEMA_VERSION,
+            "effect_class": effect_class,
+            "operation_class": operation_class,
+            "repository": repository,
+            "resource_key": resource_key,
+            "branches": list(branches),
+            "pull_requests": list(pull_requests),
+            "scope_complete": scope_complete,
+        }
+    )
+
+
+def _operation_scope_from_metadata(
+    metadata: dict[str, Any],
+    *,
+    resource_key: str,
+    repository: str,
+) -> dict[str, Any] | None:
+    value = metadata.get(OPERATION_SCOPE_METADATA_KEY)
+    if value is None:
+        return None
+    try:
+        normalized = normalize_operation_scope(value)
+    except ValueError:
+        return None
+    if (
+        normalized["resource_key"] != resource_key
+        or normalized["repository"] != repository
+    ):
+        return None
+    return normalized
+
+
+def _merge_guard_pull_request(metadata: dict[str, Any]) -> int | None:
+    guard = metadata.get("merge_guard")
+    if not isinstance(guard, dict):
+        return None
+    value = guard.get("pull_request")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _operation_merge_nonconflict_evidence(
+    metadata: dict[str, Any],
+    *,
+    resource_key: str,
+    repository: str,
+    guarded_branches: set[str],
+    merge_pull_request: int | None,
+) -> dict[str, Any] | None:
+    operation_scope = _operation_scope_from_metadata(
+        metadata,
+        resource_key=resource_key,
+        repository=repository,
+    )
+    if (
+        operation_scope is None
+        or operation_scope["effect_class"] != "publication"
+        or operation_scope["scope_complete"] is not True
+    ):
+        return None
+    operation_branches = list(operation_scope["branches"])
+    operation_pull_requests = list(operation_scope["pull_requests"])
+    branch_overlap = sorted(set(operation_branches).intersection(guarded_branches))
+    pull_request_overlap = (
+        []
+        if merge_pull_request is None
+        else [
+            item
+            for item in operation_pull_requests
+            if item == merge_pull_request
+        ]
+    )
+    if branch_overlap or pull_request_overlap:
+        return None
+    if operation_pull_requests and merge_pull_request is None:
+        return None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski_operation_merge_nonconflict",
+        "decision": "allow",
+        "reason": "complete-publication-scope-disjoint",
+        "resource_key": resource_key,
+        "effect_class": operation_scope["effect_class"],
+        "operation_class": operation_scope["operation_class"],
+        "operation_branches": operation_branches,
+        "operation_pull_requests": operation_pull_requests,
+        "guarded_branches": sorted(guarded_branches),
+        "guarded_pull_request": merge_pull_request,
+        "branch_overlap": branch_overlap,
+        "pull_request_overlap": pull_request_overlap,
+        "operation_scope_sha256": hashlib.sha256(
+            _canonical_json(operation_scope).encode("utf-8")
+        ).hexdigest(),
+    }
+    return {
+        **material,
+        "evidence_sha256": hashlib.sha256(
+            _canonical_json(material).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _merge_guard_branch_names(metadata: dict[str, Any]) -> set[str] | None:
     guard = metadata.get("merge_guard")
     if not isinstance(guard, dict):
@@ -2806,7 +3069,7 @@ def _check_active_merge_guard_conflicts(
     keys: list[str],
     metadata: dict[str, Any],
     now: int,
-) -> None:
+) -> list[dict[str, Any]]:
     requested_scope = _scope_manifest_from_metadata(metadata, required=False)
     requested_paths = [
         path for key in keys if (path := _resource_path_value(key)) is not None
@@ -2817,6 +3080,7 @@ def _check_active_merge_guard_conflicts(
         "AND expires_at_unix>? ORDER BY resource_key",
         (now,),
     ).fetchall()
+    nonconflicts: list[dict[str, Any]] = []
     for row in rows:
         repository = _merge_guard_repository_from_row(row)
         row_metadata = _row_metadata(row)
@@ -2856,15 +3120,39 @@ def _check_active_merge_guard_conflicts(
             is not None
         ]
         repo_scope_same_repository = bool(requested_repo_scopes)
-        repo_scope_overlap = any(
-            _repository_resource_overlaps_merge_guard(
+        repo_scope_overlap = False
+        merge_pull_request = _merge_guard_pull_request(row_metadata)
+        for key in keys:
+            if not key.startswith("repo:"):
+                continue
+            key_scope = _repository_resource_scope(key, repository=repository)
+            if key_scope is not None and key_scope["scope_kind"] == "operation":
+                proof = _operation_merge_nonconflict_evidence(
+                    metadata,
+                    resource_key=key,
+                    repository=repository,
+                    guarded_branches=guarded_branches,
+                    merge_pull_request=merge_pull_request,
+                )
+                if proof is not None:
+                    nonconflicts.append(
+                        {
+                            **proof,
+                            "direction": "late-operation-to-active-merge",
+                            "merge_guard_resource_key": row["resource_key"],
+                            "merge_guard_owner_id": row["owner_id"],
+                            "merge_guard_metadata_sha256": row["metadata_sha256"],
+                        }
+                    )
+                    continue
+                repo_scope_overlap = True
+                continue
+            if _repository_resource_overlaps_merge_guard(
                 key,
                 repository=repository,
                 guarded_branches=guarded_branches,
-            )
-            for key in keys
-            if key.startswith("repo:")
-        )
+            ):
+                repo_scope_overlap = True
         same_repository = (
             repo_scope_same_repository
             or (
@@ -2904,6 +3192,8 @@ def _check_active_merge_guard_conflicts(
             raise ResourceConflict(
                 row["resource_key"], row["owner_id"], row["expires_at_unix"]
             )
+    return nonconflicts
+
 
 
 
@@ -3943,6 +4233,7 @@ def acquire_merge_guard_resources(
         else min(expires, delegated_expires_at_unix)
     )
     observed: list[dict[str, Any]] = []
+    operation_nonconflicts: list[dict[str, Any]] = []
     acquired_rows: list[sqlite3.Row] = []
     held_keys: list[str] = []
     task_adoption: dict[str, Any] | None = None
@@ -4100,9 +4391,32 @@ def acquire_merge_guard_resources(
                 row_repo_scope = _repository_resource_scope(
                     row_key, repository=canonical_repository
                 )
+                operation_nonconflict = None
+                if (
+                    row_repo_scope is not None
+                    and row_repo_scope["repository"] == canonical_repository
+                    and row_repo_scope["scope_kind"] == "operation"
+                ):
+                    operation_nonconflict = _operation_merge_nonconflict_evidence(
+                        row_metadata,
+                        resource_key=row_key,
+                        repository=canonical_repository,
+                        guarded_branches=guarded_branches,
+                        merge_pull_request=_merge_guard_pull_request(normalized_metadata),
+                    )
+                    if operation_nonconflict is not None:
+                        operation_nonconflicts.append(
+                            {
+                                **operation_nonconflict,
+                                "direction": "existing-operation-to-merge",
+                                "lease_owner_id": row["owner_id"],
+                                "lease_metadata_sha256": row["metadata_sha256"],
+                            }
+                        )
                 repo_resource_relevant = (
                     row_repo_scope is not None
                     and row_repo_scope["repository"] == canonical_repository
+                    and operation_nonconflict is None
                     and (
                         row_repo_scope["scope_kind"] != "branch"
                         or guarded_branches is None
@@ -4239,6 +4553,10 @@ def acquire_merge_guard_resources(
         "observed_at_unix_ns": observed_at_unix_ns,
         "expires_at_unix": expires,
         "observed_leases": observed,
+        "operation_nonconflicts": operation_nonconflicts,
+        "operation_nonconflicts_sha256": hashlib.sha256(
+            _canonical_json(operation_nonconflicts).encode("utf-8")
+        ).hexdigest(),
         "acquired_leases": [_public(row) for row in acquired_rows],
         "held_resource_keys": held_keys,
         "resource_keys": keys,
@@ -4304,6 +4622,31 @@ def acquire_resources(
         normalized_metadata["scope_manifest"] = nonconflict.normalize_scope_manifest(
             normalized_metadata["scope_manifest"]
         )
+    if OPERATION_SCOPE_METADATA_KEY in normalized_metadata:
+        normalized_operation_scope = normalize_operation_scope(
+            normalized_metadata[OPERATION_SCOPE_METADATA_KEY]
+        )
+        if normalized_operation_scope["resource_key"] not in keys:
+            raise ValueError(
+                "operation_scope resource_key must be part of the acquisition"
+            )
+        same_repository_operations = [
+            key
+            for key in keys
+            if (
+                scope := _repository_resource_scope(
+                    key,
+                    repository=normalized_operation_scope["repository"],
+                )
+            )
+            is not None
+            and scope["scope_kind"] == "operation"
+        ]
+        if same_repository_operations != [normalized_operation_scope["resource_key"]]:
+            raise ValueError(
+                "operation_scope must bind the acquisition's exact operation resource"
+            )
+        normalized_metadata[OPERATION_SCOPE_METADATA_KEY] = normalized_operation_scope
     bureau_contract = bureau_leases.enforce_bureau_lease_contract(
         keys, ttl_seconds=ttl, metadata=normalized_metadata
     )
@@ -4442,7 +4785,7 @@ def acquire_resources(
                 ).fetchone()
                 if terminalization is not None:
                     raise ValueError("terminalized task owner cannot acquire resources")
-            _check_active_merge_guard_conflicts(
+            merge_guard_nonconflicts = _check_active_merge_guard_conflicts(
                 connection, keys=keys, metadata=sanitized_metadata, now=now
             )
             _check_bureau_semantic_conflicts(
@@ -4605,6 +4948,7 @@ def acquire_resources(
         "preserved": preserved,
         "bureau_contract": bureau_contract,
         "nonconflict_exception": nonconflict_exception,
+        "merge_guard_nonconflicts": merge_guard_nonconflicts,
         "work_admission": admission_evidence,
     }
 
@@ -5149,6 +5493,10 @@ def grabowski_resource_acquire(
             "reclaimed_count": len(result["reclaimed"]),
             "bureau_contract": result.get("bureau_contract"),
             "nonconflict_exception": result.get("nonconflict_exception"),
+            "merge_guard_nonconflicts": result["merge_guard_nonconflicts"],
+            "merge_guard_nonconflicts_sha256": hashlib.sha256(
+                _canonical_json(result["merge_guard_nonconflicts"]).encode("utf-8")
+            ).hexdigest(),
         }
     )
     return result

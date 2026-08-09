@@ -1059,6 +1059,20 @@ class JunoStorageGrantScriptTests(unittest.TestCase):
 
         self.assertTrue(token)
         self.assertNotIn("protocols", observed["delegate_kwargs"])
+        methods = observed["delegate_kwargs"]["methods"]
+        self.assertEqual(
+            [method.__name__ for method in methods],
+            [
+                "documentPicker_didPickDocumentsAtURLs_",
+                "documentPickerWasCancelled_",
+            ],
+        )
+        for method in methods:
+            argument_names = method.__code__.co_varnames[: method.__code__.co_argcount]
+            self.assertTrue(argument_names)
+            for argument_name in argument_names:
+                self.assertIs(method.__annotations__[argument_name], module.ObjCInstance)
+            self.assertIs(method.__annotations__["return"], type(None))
         self.assertEqual(observed["mode"], module.PICKER_MODE_OPEN)
 
     def test_missing_active_window_allocates_and_retains_nothing(self) -> None:

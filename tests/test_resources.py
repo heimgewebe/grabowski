@@ -81,6 +81,27 @@ class ResourceTests(unittest.TestCase):
             "shared_gates": [],
         }
 
+    def operation_scope(
+        self,
+        repository: Path,
+        resource_key: str,
+        *,
+        effect_class: str = "publication",
+        operation_class: str = "push",
+        branches: list[str] | None = None,
+        pull_requests: list[int] | None = None,
+        scope_complete: bool = True,
+    ) -> dict[str, object]:
+        return resources.operation_scope_contract(
+            resource_key,
+            repository=str(repository),
+            effect_class=effect_class,
+            operation_class=operation_class,
+            branches=branches or [],
+            pull_requests=pull_requests or [],
+            scope_complete=scope_complete,
+        )
+
     def _pending_terminalization(
         self,
         task_id: str,
@@ -1532,6 +1553,429 @@ class ResourceTests(unittest.TestCase):
         )
         self.assertEqual(
             "foreign-owner", resources.inspect_resource(unrelated_key)["owner_id"]
+        )
+
+    def test_operation_scope_contract_is_fail_closed_and_publication_identity_bound(self) -> None:
+        repository = self.root / "operation-contract-repo"
+        repository.mkdir()
+        push_key = f"repo:{repository}:operation:branch-publish:lane-a"
+        contract = self.operation_scope(
+            repository,
+            push_key,
+            branches=["feat/publish", "feat/publish"],
+        )
+        self.assertEqual("publication", contract["effect_class"])
+        self.assertEqual("push", contract["operation_class"])
+        self.assertEqual(["feat/publish"], contract["branches"])
+        self.assertTrue(contract["scope_complete"])
+
+        spoofed_key = f"repo:{repository}:operation:worktree-add:lane-a"
+        with self.assertRaisesRegex(
+            ValueError, "does not match the operation resource class"
+        ):
+            self.operation_scope(
+                repository,
+                spoofed_key,
+                branches=["feat/publish"],
+            )
+        with self.assertRaisesRegex(ValueError, "must be complete"):
+            self.operation_scope(
+                repository,
+                push_key,
+                branches=["feat/publish"],
+                scope_complete=False,
+            )
+
+        for effect_class, operation_class, suffix in (
+            ("merge", "merge", "pr-merge:lane-a"),
+            ("deploy", "deploy", "runtime-deploy:lane-a"),
+            ("worktree_admin", "worktree-admin", "worktree-add:lane-a"),
+            ("unknown", "unknown", "legacy:lane-a"),
+        ):
+            with self.subTest(effect_class=effect_class):
+                key = f"repo:{repository}:operation:{suffix}"
+                classified = self.operation_scope(
+                    repository,
+                    key,
+                    effect_class=effect_class,
+                    operation_class=operation_class,
+                )
+                self.assertEqual(effect_class, classified["effect_class"])
+                self.assertEqual(operation_class, classified["operation_class"])
+                self.assertEqual([], classified["branches"])
+                self.assertEqual([], classified["pull_requests"])
+
+    def test_merge_guard_allows_existing_disjoint_pr_publication_operation(self) -> None:
+        repository = self.root / "existing-publication-repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        operation_key = (
+            f"repo:{repository}:operation:pr-create-or-update:lane-a"
+        )
+        resources.acquire_resources(
+            "foreign-publication-owner",
+            [operation_key],
+            purpose="disjoint PR publication",
+            ttl_seconds=120,
+            metadata={
+                "operation_scope": self.operation_scope(
+                    repository,
+                    operation_key,
+                    operation_class="pr-publication",
+                    branches=["feat/unrelated"],
+                    pull_requests=[99],
+                )
+            },
+        )
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        guard = resources.acquire_merge_guard_resources(
+            "captain-merge:existing-publication",
+            "task-owner",
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="merge with disjoint publication",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                    "pull_request": 57,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
+                }
+            },
+        )
+        self.assertEqual([], guard["observed_leases"])
+        self.assertEqual(1, len(guard["operation_nonconflicts"]))
+        proof = guard["operation_nonconflicts"][0]
+        self.assertEqual("existing-operation-to-merge", proof["direction"])
+        self.assertEqual("pr-publication", proof["operation_class"])
+        self.assertEqual([], proof["branch_overlap"])
+        self.assertEqual([], proof["pull_request_overlap"])
+        self.assertRegex(guard["operation_nonconflicts_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertEqual(
+            "foreign-publication-owner",
+            resources.inspect_resource(operation_key)["owner_id"],
+        )
+        resources.release_resources(
+            "captain-merge:existing-publication", guard["held_resource_keys"]
+        )
+
+    def test_active_merge_guard_allows_late_disjoint_push_operation(self) -> None:
+        repository = self.root / "late-publication-repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        guard = resources.acquire_merge_guard_resources(
+            "captain-merge:late-publication",
+            "task-owner",
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="active merge",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                    "pull_request": 57,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
+                }
+            },
+        )
+        operation_key = f"repo:{repository}:operation:branch-publish:lane-a"
+        acquired = resources.acquire_resources(
+            "late-publication-owner",
+            [operation_key],
+            purpose="late disjoint push",
+            ttl_seconds=60,
+            metadata={
+                "operation_scope": self.operation_scope(
+                    repository,
+                    operation_key,
+                    branches=["feat/unrelated"],
+                )
+            },
+        )
+        self.assertEqual(1, len(acquired["merge_guard_nonconflicts"]))
+        proof = acquired["merge_guard_nonconflicts"][0]
+        self.assertEqual("late-operation-to-active-merge", proof["direction"])
+        self.assertEqual("push", proof["operation_class"])
+        self.assertEqual([], proof["branch_overlap"])
+        self.assertEqual([], proof["pull_request_overlap"])
+        resources.release_resources("late-publication-owner", [operation_key])
+        resources.release_resources(
+            "captain-merge:late-publication", guard["held_resource_keys"]
+        )
+
+    def test_late_disjoint_publication_persists_nonconflict_audit(self) -> None:
+        repository = self.root / "late-publication-audit-repo"
+        repository.mkdir()
+        (repository / ".git").write_text(
+            "gitdir: /tmp/late-publication-audit-repo\n", encoding="utf-8"
+        )
+        changed_path = repository / "src" / "target.py"
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        guard = resources.acquire_merge_guard_resources(
+            "captain-merge:late-publication-audit",
+            "task-owner",
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="active merge",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                    "pull_request": 57,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
+                }
+            },
+        )
+        operation_key = f"repo:{repository}:operation:branch-publish:lane-a"
+        audit_log = self.root / "audit" / "write-audit.jsonl"
+        audit_log.parent.mkdir(mode=0o700)
+        with patch.object(
+            resources.operator, "_require_operator_mutation"
+        ), patch.object(resources.base, "AUDIT_LOG", audit_log):
+            acquired = resources.grabowski_resource_acquire(
+                "late-publication-audit-owner",
+                [operation_key],
+                "late disjoint push",
+                60,
+                {
+                    "operation_scope": self.operation_scope(
+                        repository,
+                        operation_key,
+                        branches=["feat/unrelated"],
+                    )
+                },
+            )
+        resources.release_resources(
+            "late-publication-audit-owner", [operation_key]
+        )
+
+        self.assertIsNone(resources.inspect_resource(operation_key))
+        audit_records = [
+            json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()
+        ]
+        acquire_audit = next(
+            record
+            for record in audit_records
+            if record["operation"] == "resource-acquire"
+        )
+        proofs = acquired["merge_guard_nonconflicts"]
+        self.assertEqual(1, len(proofs))
+        self.assertEqual(proofs, acquire_audit["merge_guard_nonconflicts"])
+        self.assertEqual(
+            hashlib.sha256(resources._canonical_json(proofs).encode("utf-8")).hexdigest(),
+            acquire_audit["merge_guard_nonconflicts_sha256"],
+        )
+        resources.release_resources(
+            "captain-merge:late-publication-audit", guard["held_resource_keys"]
+        )
+
+    def test_merge_guard_keeps_overlapping_and_nonpublication_operations_serialized(self) -> None:
+        repository = self.root / "serialized-operation-repo"
+        repository.mkdir()
+        changed_path = repository / "src" / "target.py"
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        guard_metadata = {
+            "merge_guard": {
+                "head_sha": "a" * 40,
+                "diff_sha256": "b" * 64,
+                "pull_request": 57,
+                "base_branch": "main",
+                "head_branch": "feat/work",
+            }
+        }
+
+        overlapping_key = f"repo:{repository}:operation:branch-publish:overlap"
+        resources.acquire_resources(
+            "overlap-owner",
+            [overlapping_key],
+            purpose="overlapping publication",
+            ttl_seconds=60,
+            metadata={
+                "operation_scope": self.operation_scope(
+                    repository,
+                    overlapping_key,
+                    branches=["feat/work"],
+                )
+            },
+        )
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_merge_guard_resources(
+                "captain-merge:overlap-existing",
+                "task-owner",
+                guard_keys,
+                repository=str(repository),
+                changed_paths=[str(changed_path)],
+                purpose="must serialize overlapping publication",
+                ttl_seconds=60,
+                metadata=guard_metadata,
+            )
+
+        cases = (
+            ("merge", "merge", "pr-merge:lane"),
+            ("deploy", "deploy", "runtime-deploy:lane"),
+            ("worktree_admin", "worktree-admin", "worktree-add:lane"),
+            ("unknown", "unknown", "legacy:lane"),
+        )
+        for effect_class, operation_class, suffix in cases:
+            with self.subTest(direction="existing", effect_class=effect_class):
+                self.database.unlink(missing_ok=True)
+                operation_key = f"repo:{repository}:operation:{suffix}"
+                resources.acquire_resources(
+                    "unsafe-owner",
+                    [operation_key],
+                    purpose="explicit unsafe operation",
+                    ttl_seconds=60,
+                    metadata={
+                        "operation_scope": self.operation_scope(
+                            repository,
+                            operation_key,
+                            effect_class=effect_class,
+                            operation_class=operation_class,
+                        )
+                    },
+                )
+                with self.assertRaises(resources.ResourceConflict):
+                    resources.acquire_merge_guard_resources(
+                        f"captain-merge:unsafe-{effect_class}",
+                        "task-owner",
+                        guard_keys,
+                        repository=str(repository),
+                        changed_paths=[str(changed_path)],
+                        purpose="unsafe operation remains serialized",
+                        ttl_seconds=60,
+                        metadata=guard_metadata,
+                    )
+
+        self.database.unlink(missing_ok=True)
+        active = resources.acquire_merge_guard_resources(
+            "captain-merge:late-overlap",
+            "task-owner",
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="active merge for overlap",
+            ttl_seconds=60,
+            metadata=guard_metadata,
+        )
+        late_overlap = f"repo:{repository}:operation:pr-create-or-update:late-overlap"
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "late-overlap-owner",
+                [late_overlap],
+                purpose="late overlapping PR publication",
+                ttl_seconds=60,
+                metadata={
+                    "operation_scope": self.operation_scope(
+                        repository,
+                        late_overlap,
+                        operation_class="pr-publication",
+                        pull_requests=[57],
+                    )
+                },
+            )
+        for effect_class, operation_class, suffix in cases:
+            with self.subTest(direction="late", effect_class=effect_class):
+                late_key = f"repo:{repository}:operation:{suffix}:late"
+                with self.assertRaises(resources.ResourceConflict):
+                    resources.acquire_resources(
+                        f"late-{effect_class}-owner",
+                        [late_key],
+                        purpose="late unsafe operation remains serialized",
+                        ttl_seconds=60,
+                        metadata={
+                            "operation_scope": self.operation_scope(
+                                repository,
+                                late_key,
+                                effect_class=effect_class,
+                                operation_class=operation_class,
+                            )
+                        },
+                    )
+
+        legacy_publication = f"repo:{repository}:operation:branch-publish:legacy"
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "legacy-owner",
+                [legacy_publication],
+                purpose="legacy publication without scope metadata",
+                ttl_seconds=60,
+            )
+        resources.release_resources(
+            "captain-merge:late-overlap", active["held_resource_keys"]
+        )
+
+        self.database.unlink(missing_ok=True)
+        legacy_guard_metadata = {
+            "merge_guard": {
+                "head_sha": "a" * 40,
+                "diff_sha256": "b" * 64,
+                "base_branch": "main",
+                "head_branch": "feat/work",
+            }
+        }
+        legacy_guard = resources.acquire_merge_guard_resources(
+            "captain-merge:legacy-no-pr",
+            "task-owner",
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="legacy merge without PR binding",
+            ttl_seconds=60,
+            metadata=legacy_guard_metadata,
+        )
+        late_pr = f"repo:{repository}:operation:pr-create-or-update:legacy-guard"
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "late-pr-owner",
+                [late_pr],
+                purpose="PR publication requires exact merge PR identity",
+                ttl_seconds=60,
+                metadata={
+                    "operation_scope": self.operation_scope(
+                        repository,
+                        late_pr,
+                        operation_class="pr-publication",
+                        branches=["feat/unrelated"],
+                        pull_requests=[99],
+                    )
+                },
+            )
+        resources.release_resources(
+            "captain-merge:legacy-no-pr", legacy_guard["held_resource_keys"]
         )
 
     def test_active_merge_guard_blocks_relevant_branch_and_repo_operation_leases(self) -> None:

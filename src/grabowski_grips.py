@@ -39,6 +39,8 @@ class GripSpec:
     acceptance_ids: tuple[str, ...]
     runner: str
     uses_github: bool = False
+    operation_effect_class: str = "unknown"
+    operation_class: str = "unknown"
 
 
 GRIP_RECEIPT_KIND = "grabowski.operator_grip_receipt"
@@ -124,6 +126,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "durable-lane-receipt",
         ),
         runner="work_acquire",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "worktree-ensure": GripSpec(
         name="worktree-ensure",
@@ -151,6 +155,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
             "durable-receipt",
         ),
         runner="worktree_ensure",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "worktree-hygiene-reconcile": GripSpec(
         name="worktree-hygiene-reconcile",
@@ -168,6 +174,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
         ),
         runner="worktree_hygiene_reconcile",
         uses_github=True,
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
     ),
     "post-merge-sync": GripSpec(
         name="post-merge-sync",
@@ -558,6 +566,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
         required_parameters=("repo", "branch", "expected_head"),
         acceptance_ids=("acceptance-1", "acceptance-2"),
         runner="branch_publish",
+        operation_effect_class="publication",
+        operation_class="push",
     ),
     "pr-create-or-update": GripSpec(
         name="pr-create-or-update",
@@ -568,6 +578,8 @@ GRIP_SPECS: dict[str, GripSpec] = {
         acceptance_ids=("acceptance-1", "acceptance-2"),
         runner="pr_create_or_update",
         uses_github=True,
+        operation_effect_class="publication",
+        operation_class="pr-publication",
     ),
 }
 
@@ -2180,6 +2192,8 @@ def _grip_catalog_snapshot() -> dict[str, Any]:
                 "acceptance_ids": list(spec.acceptance_ids),
                 "runner": spec.runner,
                 "uses_github": spec.uses_github,
+                "operation_effect_class": spec.operation_effect_class,
+                "operation_class": spec.operation_class,
             }
             for name, spec in sorted(GRIP_SPECS.items())
         },
@@ -8910,6 +8924,13 @@ def _surface_grip_contract(spec: GripSpec, profile: str) -> dict[str, Any]:
         "required_parameters": list(spec.required_parameters),
         "acceptance_ids": list(spec.acceptance_ids),
         "uses_github": spec.uses_github,
+        "operation_effect_class": spec.operation_effect_class,
+        "operation_class": spec.operation_class,
+        "operation_lease_parallelism": (
+            "merge-disjointness-eligible"
+            if spec.operation_effect_class == "publication"
+            else "fail-closed-with-merge"
+        ),
         "profile": profile,
         "availability": availability,
         "expected_receipt_shape": {

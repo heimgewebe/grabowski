@@ -1235,6 +1235,11 @@ def _github_actor(value: Any) -> str:
     return ""
 
 
+def _github_actor_identity(value: Any) -> str:
+    """Canonicalize GitHub bot aliases without weakening actor allowlisting."""
+    return _github_actor(value).removesuffix("[bot]")
+
+
 class CaptainMergeGuardRunner:
     def __init__(
         self,
@@ -2270,7 +2275,9 @@ class CaptainMergeGuardRunner:
                     )
                     if actor not in _CODEX_REVIEW_ACTORS:
                         errors.append("merge_guard_codex_review_actor_untrusted")
-                    if actor != str(completion.get("actor", "")).lower():
+                    if _github_actor_identity(actor) != _github_actor_identity(
+                        completion.get("actor")
+                    ):
                         errors.append("merge_guard_codex_review_actor_drift")
                     if state not in {"APPROVED", "COMMENTED"}:
                         errors.append("merge_guard_codex_review_state_blocking")
@@ -2307,7 +2314,9 @@ class CaptainMergeGuardRunner:
                     completion_time = _github_datetime(live_comment.get("created_at"))
                     if actor not in _CODEX_REVIEW_ACTORS:
                         errors.append("merge_guard_codex_clean_comment_actor_untrusted")
-                    if actor != str(completion.get("actor", "")).lower():
+                    if _github_actor_identity(actor) != _github_actor_identity(
+                        completion.get("actor")
+                    ):
                         errors.append("merge_guard_codex_clean_comment_actor_drift")
                     if not isinstance(body, str):
                         errors.append("merge_guard_codex_clean_comment_body_missing")
@@ -2873,8 +2882,18 @@ class CaptainMergeGuardRunner:
 
         self.resource_keys = list(self.acquisition["resource_keys"])
         self.held_resource_keys = list(self.acquisition["held_resource_keys"])
+        operation_nonconflicts = list(
+            self.acquisition.get("operation_nonconflicts", [])
+        )
+        operation_nonconflicts_sha256 = self.acquisition.get(
+            "operation_nonconflicts_sha256"
+        )
+        if operation_nonconflicts_sha256 != _sha256_json(operation_nonconflicts):
+            raise RuntimeError("merge lease guard operation non-conflict evidence drift")
         lease_snapshot = {
             "observed_leases": self.acquisition["observed_leases"],
+            "operation_nonconflicts": operation_nonconflicts,
+            "operation_nonconflicts_sha256": operation_nonconflicts_sha256,
             "acquired_leases": self.acquisition["acquired_leases"],
             "held_resource_keys": self.held_resource_keys,
         }
@@ -2892,6 +2911,8 @@ class CaptainMergeGuardRunner:
                 "changed_paths": bindings["changed_paths"],
                 "changed_paths_sha256": bindings["changed_paths_sha256"],
                 "held_resource_keys": self.held_resource_keys,
+                "operation_nonconflicts": operation_nonconflicts,
+                "operation_nonconflicts_sha256": operation_nonconflicts_sha256,
                 "guard_acquired_at_unix": self.acquisition["observed_at_unix"],
                 "lease_snapshot_observed_at_unix_ns": self.acquisition[
                     "observed_at_unix_ns"

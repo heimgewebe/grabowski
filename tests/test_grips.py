@@ -942,6 +942,33 @@ class GripFoundationTests(unittest.TestCase):
             self.assertIn("acceptance_ids", item)
         self.assertEqual("mutating", specs["branch-publish"]["effect"])
         self.assertEqual("read_only", specs["repo-orient"]["effect"])
+        self.assertEqual(
+            ("publication", "push", "merge-disjointness-eligible"),
+            (
+                specs["branch-publish"]["operation_effect_class"],
+                specs["branch-publish"]["operation_class"],
+                specs["branch-publish"]["operation_lease_parallelism"],
+            ),
+        )
+        self.assertEqual(
+            ("publication", "pr-publication", "merge-disjointness-eligible"),
+            (
+                specs["pr-create-or-update"]["operation_effect_class"],
+                specs["pr-create-or-update"]["operation_class"],
+                specs["pr-create-or-update"]["operation_lease_parallelism"],
+            ),
+        )
+        for name in (
+            "work-acquire",
+            "worktree-ensure",
+            "worktree-hygiene-reconcile",
+        ):
+            self.assertEqual("worktree_admin", specs[name]["operation_effect_class"])
+            self.assertEqual("worktree-admin", specs[name]["operation_class"])
+            self.assertEqual(
+                "fail-closed-with-merge",
+                specs[name]["operation_lease_parallelism"],
+            )
         for field in (
             "purpose",
             "target",
@@ -7572,6 +7599,18 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         )
         self.assertLessEqual(guard["dispatch_at_unix_ns"], guard["completed_at_unix_ns"])
         self.assertRegex(guard["lease_snapshot_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertEqual([], guard["operation_nonconflicts"])
+        self.assertRegex(
+            guard["operation_nonconflicts_sha256"], r"[0-9a-f]{64}\Z"
+        )
+        self.assertEqual(
+            guard["operation_nonconflicts"],
+            guard["lease_snapshot"]["operation_nonconflicts"],
+        )
+        self.assertEqual(
+            guard["operation_nonconflicts_sha256"],
+            guard["lease_snapshot"]["operation_nonconflicts_sha256"],
+        )
         self.assertRegex(guard["receipt_sha256"], r"[0-9a-f]{64}\Z")
         self.assertEqual(
             "settled", guard["initial_codex_review_revalidation"]["status"]
@@ -7579,6 +7618,80 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         self.assertEqual(
             "settled", guard["dispatch_codex_review_revalidation"]["status"]
         )
+        self.assertEqual([], resources.list_resources())
+
+    def test_atomic_merge_guard_receipt_binds_disjoint_publication_operation(self) -> None:
+        worktree = Path.cwd().resolve()
+        repository = merge_guard.merge_guard_repository_root(worktree)
+        operation_key = (
+            f"repo:{repository}:operation:pr-create-or-update:captain-test"
+        )
+        with patch.object(
+            resources.bureau_leases,
+            "enforce_bureau_lease_contract",
+            return_value=None,
+        ):
+            resources.acquire_resources(
+                "foreign-publication-owner",
+                [operation_key],
+                purpose="parallel disjoint PR publication",
+                ttl_seconds=120,
+                metadata={
+                    "operation_scope": resources.operation_scope_contract(
+                        operation_key,
+                        repository=str(repository),
+                        effect_class="publication",
+                        operation_class="pr-publication",
+                        branches=["feat/unrelated-publication"],
+                        pull_requests=[97],
+                    )
+                },
+            )
+        parameters = authorized_captain_run_parameters(local_repo=str(worktree))
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        gh = FakeGh(
+            view={
+                "number": 96,
+                "state": "OPEN",
+                "baseRefName": "main",
+                "baseRefOid": "e" * 40,
+                "headRefName": "feat/captain",
+                "headRefOid": CAPTAIN_HEAD,
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+            },
+            diff_text=CAPTAIN_DIFF_TEXT,
+        )
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+        self.assertEqual("passed", result["receipt"]["status"])
+        guard = result["output"]["executions"][0]["merge_lease_guard"]
+        self.assertEqual("completed", guard["status"])
+        self.assertEqual(1, len(guard["operation_nonconflicts"]))
+        proof = guard["operation_nonconflicts"][0]
+        self.assertEqual("existing-operation-to-merge", proof["direction"])
+        self.assertEqual("pr-publication", proof["operation_class"])
+        self.assertEqual(["feat/unrelated-publication"], proof["operation_branches"])
+        self.assertEqual([97], proof["operation_pull_requests"])
+        self.assertEqual([], proof["branch_overlap"])
+        self.assertEqual([], proof["pull_request_overlap"])
+        self.assertRegex(proof["evidence_sha256"], r"[0-9a-f]{64}\Z")
+        self.assertEqual(
+            guard["operation_nonconflicts"],
+            guard["lease_snapshot"]["operation_nonconflicts"],
+        )
+        self.assertEqual(
+            "foreign-publication-owner",
+            resources.inspect_resource(operation_key)["owner_id"],
+        )
+        resources.release_resources("foreign-publication-owner", [operation_key])
         self.assertEqual([], resources.list_resources())
 
     def test_atomic_merge_guard_allows_optional_codex_without_findings(self) -> None:
@@ -8182,6 +8295,85 @@ class CaptainAuthorityPathTests(unittest.TestCase):
             review_pages=[[blocker, approval]],
         )
         state["review"] = approval
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+
+    def test_atomic_merge_guard_accepts_canonical_codex_review_actor_alias(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        evidence = captain_codex_review_evidence()
+        evidence["completion"]["actor"] = "chatgpt-codex-connector"
+        core = {
+            key: value for key, value in evidence.items() if key != "evidence_sha256"
+        }
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        state = captain_codex_live_state(view)
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+
+    def test_atomic_merge_guard_accepts_canonical_clean_comment_actor_alias(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        evidence = captain_codex_clean_comment_evidence()
+        evidence["completion"]["actor"] = "chatgpt-codex-connector"
+        core = {
+            key: value for key, value in evidence.items() if key != "evidence_sha256"
+        }
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        base_state = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(base_state["request_comment"])
+        clean_comment = captain_codex_clean_comment()
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, clean_comment]],
+            review_pages=[[]],
+        )
         gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
 
         result = grips.grip_run(
