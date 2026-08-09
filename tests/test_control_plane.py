@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import json
@@ -1435,6 +1436,59 @@ class PrivilegedAndConnectorTests(unittest.TestCase):
         self.assertNotIn("ProtectHome=yes", service_unit)
         self.assertIn("ExecStart=/usr/local/libexec/grabowski-privileged-broker", service_unit)
         self.assertNotIn("SuccessExitStatus=", service_unit)
+
+    def test_process_reference_root_contract_stays_synchronized(self) -> None:
+        expected = tuple(str(path) for path in privileged.PROCESS_REFERENCE_ALLOWED_ROOTS)
+
+        def string_tuple(path: Path, name: str, *, wrapped_in_path: bool = False) -> tuple[str, ...]:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if not isinstance(node, ast.Assign):
+                    continue
+                if not any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+                    continue
+                if not isinstance(node.value, ast.Tuple):
+                    raise AssertionError(f"{name} must remain a tuple")
+                values: list[str] = []
+                for element in node.value.elts:
+                    if wrapped_in_path:
+                        if not (
+                            isinstance(element, ast.Call)
+                            and isinstance(element.func, ast.Name)
+                            and element.func.id == "Path"
+                            and len(element.args) == 1
+                        ):
+                            raise AssertionError(f"{name} contains a non-Path literal")
+                        element = element.args[0]
+                    value = ast.literal_eval(element)
+                    if not isinstance(value, str):
+                        raise AssertionError(f"{name} contains a non-string root")
+                    values.append(value)
+                return tuple(values)
+            raise AssertionError(f"{name} not found")
+
+        observer_roots = string_tuple(
+            ROOT / "tools" / "grabowski_process_reference_observer.py",
+            "ALLOWED_ROOTS",
+            wrapped_in_path=True,
+        )
+        cutover_roots = string_tuple(
+            ROOT / "tools" / "grabowski_rootbroker_cutover.py",
+            "PROCESS_OBSERVER_BIND_PATHS",
+        )
+        service_roots = tuple(
+            line.removeprefix("BindReadOnlyPaths=-")
+            for line in (ROOT / "systemd" / "grabowski-privileged-broker@.service")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.startswith("BindReadOnlyPaths=-/home/alex/repos/")
+            or line == "BindReadOnlyPaths=-/home/alex/worktrees"
+        )
+
+        self.assertEqual(observer_roots, expected)
+        self.assertEqual(cutover_roots, expected)
+        self.assertEqual(service_roots, expected)
+        self.assertNotIn("/home/alex/repos", expected)
 
     def test_broker_script_uses_utf8_audit_hash_and_process_group_timeout(self) -> None:
         broker = (ROOT / "tools" / "grabowski_privileged_broker.py").read_text(encoding="utf-8")
