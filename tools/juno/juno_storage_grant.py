@@ -4,7 +4,7 @@
 Run this script interactively in Juno. It presents the system document picker for
 one folder, creates a security-scoped bookmark, verifies it immediately, and
 stores the bookmark as a private create-only grant record inside the persistent
-Grabowski Juno agent state.
+Grabowski Juno grant registry.
 
 The script does not bypass iPadOS sandboxing and does not enumerate or read the
 selected folder's contents.
@@ -76,6 +76,17 @@ def _sha256_bytes(value: bytes) -> str:
 
 def _zero_arg(value: Any) -> Any:
     return value() if callable(value) else value
+
+
+def _bind_objc_delegate_method(function: Any) -> Any:
+    # ``from __future__ import annotations`` leaves these callback annotations
+    # as strings. Rubicon/Juno needs concrete native-compatible runtime types
+    # when no protocol metadata is available, otherwise UIKit can present the
+    # picker while never dispatching its delegate selectors back into Python.
+    argument_names = function.__code__.co_varnames[: function.__code__.co_argcount]
+    function.__annotations__ = {name: ObjCInstance for name in argument_names}
+    function.__annotations__["return"] = type(None)
+    return function
 
 
 def _python_home() -> Path:
@@ -383,8 +394,8 @@ def _present_picker() -> str:
         delegate_class_name,
         superclass=ObjCClass("NSObject"),
         methods=[
-            documentPicker_didPickDocumentsAtURLs_,
-            documentPickerWasCancelled_,
+            _bind_objc_delegate_method(documentPicker_didPickDocumentsAtURLs_),
+            _bind_objc_delegate_method(documentPickerWasCancelled_),
         ],
         **delegate_options,
     )
