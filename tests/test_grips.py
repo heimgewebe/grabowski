@@ -8914,6 +8914,12 @@ class CaptainAuthorityPathTests(unittest.TestCase):
 
         self.assertEqual(first["owner_id"], repeated["owner_id"])
         self.assertNotEqual(first["owner_id"], second["owner_id"])
+        weak_entry = merge_guard._SERVER_ACTOR_SESSIONS.get(first_session)
+        self.assertIsNotNone(weak_entry)
+        self.assertIs(first_session, weak_entry[0]())
+        self.assertNotIn(
+            id(first_session), merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS
+        )
         verified = merge_guard.verify_server_runtime_actor_identity(first, now_unix=100)
         self.assertEqual(first["owner_id"], verified["owner_id"])
 
@@ -8921,6 +8927,132 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         tampered["owner_id"] = "runtime-actor:" + "0" * 64
         with self.assertRaisesRegex(ValueError, "proof"):
             merge_guard.verify_server_runtime_actor_identity(tampered, now_unix=100)
+
+    def test_server_runtime_actor_identity_supports_non_weakref_session(self) -> None:
+        class Session:
+            __slots__ = ()
+
+        session = Session()
+        with patch.dict(merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS, {}, clear=True):
+            first = merge_guard.issue_server_runtime_actor_identity(
+                session, profile="trusted-owner", now_unix=100
+            )
+            repeated = merge_guard.issue_server_runtime_actor_identity(
+                session, profile="trusted-owner", now_unix=101
+            )
+
+            self.assertEqual(first["owner_id"], repeated["owner_id"])
+            entry = merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS[id(session)]
+            self.assertIs(session, entry.session)
+
+    def test_server_runtime_actor_identity_supports_unhashable_session(self) -> None:
+        class Session:
+            __hash__ = None
+
+            def __eq__(self, other: object) -> bool:
+                del other
+                raise AssertionError("session equality must not be consulted")
+
+        session = Session()
+        with patch.dict(merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS, {}, clear=True):
+            first = merge_guard.issue_server_runtime_actor_identity(
+                session, profile="trusted-owner", now_unix=100
+            )
+            repeated = merge_guard.issue_server_runtime_actor_identity(
+                session, profile="trusted-owner", now_unix=101
+            )
+
+            self.assertEqual(first["owner_id"], repeated["owner_id"])
+            self.assertIs(
+                session,
+                merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS[id(session)].session,
+            )
+
+    def test_distinct_incompatible_server_actor_sessions_never_share_owner(self) -> None:
+        class Session:
+            __slots__ = ()
+
+        first_session = Session()
+        second_session = Session()
+        with patch.dict(merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS, {}, clear=True):
+            first = merge_guard.issue_server_runtime_actor_identity(
+                first_session, profile="trusted-owner", now_unix=100
+            )
+            second = merge_guard.issue_server_runtime_actor_identity(
+                second_session, profile="trusted-owner", now_unix=100
+            )
+
+            self.assertNotEqual(first["owner_id"], second["owner_id"])
+            self.assertIs(
+                first_session,
+                merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS[
+                    id(first_session)
+                ].session,
+            )
+            self.assertIs(
+                second_session,
+                merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS[
+                    id(second_session)
+                ].session,
+            )
+
+    def test_server_actor_fallback_is_bounded_pruned_and_rotates_safely(self) -> None:
+        class Session:
+            __slots__ = ()
+
+        first_session = Session()
+        second_session = Session()
+        third_session = Session()
+        fourth_session = Session()
+        with (
+            patch.dict(
+                merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS, {}, clear=True
+            ),
+            patch.object(merge_guard, "_SERVER_ACTOR_FALLBACK_MAX_SESSIONS", 2),
+            patch.object(merge_guard, "_SERVER_ACTOR_FALLBACK_TTL_SECONDS", 10),
+            patch.object(
+                merge_guard.time,
+                "monotonic",
+                side_effect=[100.0, 101.0, 102.0, 103.0, 114.0],
+            ),
+        ):
+            first = merge_guard.issue_server_runtime_actor_identity(
+                first_session, profile="trusted-owner", now_unix=100
+            )
+            second = merge_guard.issue_server_runtime_actor_identity(
+                second_session, profile="trusted-owner", now_unix=100
+            )
+            third = merge_guard.issue_server_runtime_actor_identity(
+                third_session, profile="trusted-owner", now_unix=100
+            )
+            self.assertEqual(2, len(merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS))
+            self.assertNotIn(
+                id(first_session), merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS
+            )
+
+            first_after_eviction = merge_guard.issue_server_runtime_actor_identity(
+                first_session, profile="trusted-owner", now_unix=101
+            )
+            self.assertNotEqual(first["owner_id"], first_after_eviction["owner_id"])
+            self.assertNotEqual(third["owner_id"], first_after_eviction["owner_id"])
+            self.assertNotEqual(second["owner_id"], first_after_eviction["owner_id"])
+            self.assertEqual(2, len(merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS))
+
+            fourth = merge_guard.issue_server_runtime_actor_identity(
+                fourth_session, profile="trusted-owner", now_unix=102
+            )
+            self.assertEqual(1, len(merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS))
+            retained = merge_guard._SERVER_ACTOR_FALLBACK_SESSIONS[id(fourth_session)]
+            self.assertIs(fourth_session, retained.session)
+            self.assertNotIn(
+                fourth["owner_id"],
+                {
+                    first["owner_id"],
+                    second["owner_id"],
+                    third["owner_id"],
+                    first_after_eviction["owner_id"],
+                },
+            )
 
     def test_server_task_lease_delegation_is_request_bound_and_short_lived(self) -> None:
         class Session:
