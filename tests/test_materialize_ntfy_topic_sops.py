@@ -46,6 +46,23 @@ class NtfyTopicSopsMaterializationTests(TestCase):
         self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
         sync_directory.assert_called_once_with(destination.parent)
 
+    def test_new_parent_entries_are_fsynced_leaf_to_root(self) -> None:
+        destination = self.root / "new-parent" / "new-leaf" / "topic"
+        with mock.patch.object(materializer, "_fsync_directory") as sync_directory:
+            materializer._atomic_private_write(
+                destination, b"ciphertext", create_only=True
+            )
+
+        self.assertEqual(destination.read_bytes(), b"ciphertext")
+        self.assertEqual(
+            sync_directory.call_args_list,
+            [
+                mock.call(destination.parent),
+                mock.call(destination.parent.parent),
+                mock.call(self.root),
+            ],
+        )
+
     def test_atomic_replacement_fsyncs_destination_directory(self) -> None:
         destination = self.root / "replace-topic"
         destination.write_bytes(b"old")

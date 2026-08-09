@@ -116,8 +116,26 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _ensure_parent_directory(path: Path) -> list[Path]:
+    missing: list[Path] = []
+    current = path
+    while True:
+        try:
+            current.stat()
+        except FileNotFoundError:
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                raise TopicMaterializationError("destination directory unavailable")
+            current = parent
+            continue
+        break
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return [directory.parent for directory in missing]
+
+
 def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_entry_sync_paths = _ensure_parent_directory(path.parent)
     if create_only and path.exists():
         raise TopicMaterializationError("destination already exists")
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -137,6 +155,8 @@ def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> N
         else:
             os.replace(temporary, path)
         _fsync_directory(path.parent)
+        for sync_path in parent_entry_sync_paths:
+            _fsync_directory(sync_path)
     finally:
         if temporary.exists():
             temporary.unlink()
