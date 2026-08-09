@@ -4989,6 +4989,14 @@ def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
             != transition.get("lifecycle_receipt_sha256")
         ):
             return _apply_terminalization_projection(transition, recovered=True)
+        if _record_reposkop_checkout_shadow_before(record) is not None:
+            receipt_sha256 = transition.get("lifecycle_receipt_sha256")
+            if isinstance(receipt_sha256, str) and SHA256.fullmatch(receipt_sha256):
+                _capture_reposkop_shadow_terminal_best_effort(
+                    task_id=identifier,
+                    terminalization_sha256=transition["transition_sha256"],
+                    lifecycle_receipt_sha256=receipt_sha256,
+                )
         return record
     record = _row_raw(identifier)
     if not _is_terminal_state(str(record["state"])):

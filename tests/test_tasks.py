@@ -1507,6 +1507,59 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("recovered_after_revocation", final["recovery_status"])
         self.assertEqual(final["transition_sha256"], recovered["terminalization_sha256"])
 
+    def test_projected_terminalization_recovery_replays_missing_shadow_terminal(self) -> None:
+        result = self._start(resource_keys=["component:test-terminal-shadow-recovery"])
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "before_observation_sha256": "d" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE tasks SET launcher_json=? WHERE task_id=?",
+                (tasks._canonical_json(launcher), task_id),
+            )
+            connection.commit()
+        record = tasks._row_raw(task_id)
+        observation = {"state": "completed", "source": "shadow-recovery-fixture"}
+        projection = tasks._terminal_projection(
+            record,
+            "completed",
+            observation=observation,
+        )
+        transition = resources.begin_task_terminalization(
+            task_id,
+            int(record["attempt"]),
+            record["lease_owner_id"],
+            "completed",
+            tasks._record_resource_keys(record),
+            task_projection=projection,
+            observation_sha256=tasks._sha256_json(observation),
+        )
+        self.reposkop_shadow_terminal_mock.side_effect = SystemExit("crash after projection")
+        with self.assertRaisesRegex(SystemExit, "crash after projection"):
+            tasks._apply_terminalization_projection(transition)
+
+        projected = resources.task_terminalization_record(task_id)
+        self.assertEqual("projected", projected["phase"])
+        self.reposkop_shadow_terminal_mock.side_effect = None
+        self.reposkop_shadow_terminal_mock.reset_mock()
+
+        recovered = tasks._recover_task_terminalization(task_id)
+
+        self.assertEqual("completed", recovered["state"])
+        self.reposkop_shadow_terminal_mock.assert_called_once_with(
+            task_id=task_id,
+            terminalization_sha256=projected["transition_sha256"],
+            lifecycle_receipt_sha256=projected["lifecycle_receipt_sha256"],
+        )
+
     def test_legacy_row_first_terminal_state_is_recovered_before_delegation(self) -> None:
         result = self._start(
             resource_keys=["component:test-terminalization-legacy-row-first"]
