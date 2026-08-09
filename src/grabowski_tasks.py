@@ -50,6 +50,7 @@ TASK_DB = Path(
     )
 ).expanduser()
 TASK_OUTCOMES_DIR = TASK_DB.with_suffix(".outcomes")
+REPOSKOP_SHADOW_TERMINAL_MARKER_MAX_BYTES = 64 * 1024
 TASK_LIST_SCAN_BATCH = 100
 TASK_RECONCILE_BATCH_LIMIT = 500
 DEFAULT_TASK_RECONCILE_BATCH_SIZE = 100
@@ -2519,22 +2520,61 @@ def _capture_reposkop_shadow_before_best_effort(
         }
 
 
-def _capture_reposkop_shadow_terminal_best_effort(
+def _prepare_reposkop_shadow_terminal_best_effort(
+    *,
+    task_id: str,
+    before_summary: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import grabowski_reposkop_shadow
+
+        return grabowski_reposkop_shadow.prepare_terminal_best_effort(
+            task_id=task_id,
+            before_summary=before_summary,
+        )
+    except Exception:
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski.reposkop_checkout_shadow_evidence",
+            "phase": "terminal_prepare",
+            "status": "unavailable",
+            "task_id": task_id,
+            "evaluation_id": before_summary.get("evaluation_id"),
+            "reposkop_cohort": before_summary.get("reposkop_cohort"),
+            "captured_at_unix": _now(),
+            "before_evidence_sha256": before_summary.get("evidence_sha256"),
+            "before_observation_sha256": before_summary.get(
+                "before_observation_sha256"
+            ),
+            "failure_category": "shadow_adapter_error",
+            "continuity_state": "inconclusive",
+            "measurement_class": "inconclusive/unavailable",
+            "reason_codes": ["shadow.shadow_adapter_error"],
+            "anomaly_codes": [],
+            "decision_effect": False,
+            "effect_authorized": False,
+        }
+        return {**material, "evidence_sha256": _sha256_json(material)}
+
+
+def _finalize_reposkop_shadow_terminal_best_effort(
     *,
     task_id: str,
     terminalization_sha256: str,
     lifecycle_receipt_sha256: str,
-) -> None:
+    prepared: dict[str, Any],
+) -> dict[str, Any] | None:
     try:
         import grabowski_reposkop_shadow
 
-        grabowski_reposkop_shadow.capture_terminal_best_effort(
+        return grabowski_reposkop_shadow.finalize_terminal_best_effort(
             task_id=task_id,
             terminalization_sha256=terminalization_sha256,
             lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+            prepared=prepared,
         )
     except Exception:
-        return
+        return None
 
 
 def _workspace_lease_resource_keys(
@@ -2679,6 +2719,216 @@ def _record_reposkop_checkout_shadow_before(
     ):
         return None
     return dict(value)
+
+
+def _record_reposkop_checkout_shadow_terminal_prepare(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    raw = record.get("launcher_json")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        launcher = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    value = launcher.get("reposkop_checkout_shadow_terminal_prepare")
+    if not isinstance(value, dict):
+        return None
+    digest = value.get("evidence_sha256")
+    material = {key: item for key, item in value.items() if key != "evidence_sha256"}
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "grabowski.reposkop_checkout_shadow_evidence"
+        or value.get("phase") != "terminal_prepare"
+        or value.get("task_id") != record.get("task_id")
+        or value.get("status") not in {"completed", "unavailable"}
+        or value.get("decision_effect") is not False
+        or value.get("effect_authorized") is not False
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+        or digest != _sha256_json(material)
+    ):
+        return None
+    return dict(value)
+
+
+def _reposkop_shadow_terminal_marker_root() -> Path:
+    parent = TASK_OUTCOMES_DIR
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_stat = parent.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or stat.S_IMODE(parent_stat.st_mode) != 0o700
+    ):
+        raise PermissionError(
+            "Reposkop terminal shadow marker parent violates its private-directory contract"
+        )
+    root = parent / ".reposkop-shadow-terminals"
+    try:
+        root.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    root_stat = root.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or root_stat.st_uid != os.getuid()
+        or stat.S_IMODE(root_stat.st_mode) != 0o700
+    ):
+        raise PermissionError(
+            "Reposkop terminal shadow marker root violates its private-directory contract"
+        )
+    return root
+
+
+def _reposkop_shadow_terminal_marker_path(task_id: str) -> Path:
+    identifier = _validate_task_id(task_id)
+    return _reposkop_shadow_terminal_marker_root() / f"{identifier}.json"
+
+
+def _reposkop_shadow_terminal_marker(task_id: str) -> dict[str, Any] | None:
+    path = _reposkop_shadow_terminal_marker_path(task_id)
+    if not path.exists():
+        return None
+    payload = base._read_private_evidence(
+        path,
+        max_bytes=REPOSKOP_SHADOW_TERMINAL_MARKER_MAX_BYTES,
+    )
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Reposkop terminal shadow marker is invalid") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("Reposkop terminal shadow marker is invalid")
+    digest = value.get("marker_sha256")
+    material = {key: item for key, item in value.items() if key != "marker_sha256"}
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "grabowski.reposkop_terminal_shadow_marker"
+        or value.get("task_id") != task_id
+        or not isinstance(value.get("terminalization_sha256"), str)
+        or SHA256.fullmatch(value["terminalization_sha256"]) is None
+        or not isinstance(value.get("lifecycle_receipt_sha256"), str)
+        or SHA256.fullmatch(value["lifecycle_receipt_sha256"]) is None
+        or not isinstance(value.get("shadow_evidence_sha256"), str)
+        or SHA256.fullmatch(value["shadow_evidence_sha256"]) is None
+        or not isinstance(value.get("audit_ref"), str)
+        or re.fullmatch(r"audit-record-sha256:[0-9a-f]{64}", value["audit_ref"])
+        is None
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+        or digest != _sha256_json(material)
+        or payload.decode("utf-8") != _canonical_json(value) + "\n"
+    ):
+        raise RuntimeError("Reposkop terminal shadow marker is invalid")
+    return value
+
+
+def _persist_reposkop_shadow_terminal_marker(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    evidence_sha256 = result.get("evidence_sha256")
+    audit_ref = result.get("audit_ref")
+    if (
+        not isinstance(evidence_sha256, str)
+        or SHA256.fullmatch(evidence_sha256) is None
+        or not isinstance(audit_ref, str)
+        or re.fullmatch(r"audit-record-sha256:[0-9a-f]{64}", audit_ref) is None
+    ):
+        return None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski.reposkop_terminal_shadow_marker",
+        "task_id": task_id,
+        "terminalization_sha256": terminalization_sha256,
+        "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        "shadow_evidence_sha256": evidence_sha256,
+        "shadow_status": result.get("status"),
+        "audit_ref": audit_ref,
+        "decision_effect": False,
+    }
+    marker = {**material, "marker_sha256": _sha256_json(material)}
+    path = _reposkop_shadow_terminal_marker_path(task_id)
+    payload = (_canonical_json(marker) + "\n").encode("utf-8")
+    try:
+        base._write_private_create_only(path, payload)
+    except FileExistsError:
+        existing = _reposkop_shadow_terminal_marker(task_id)
+        if existing != marker:
+            raise RuntimeError("Reposkop terminal shadow marker conflicts with terminal truth")
+        return existing
+    return marker
+
+
+def _reposkop_shadow_terminal_recovery_needed(record: dict[str, Any]) -> bool:
+    if not _is_terminal_state(str(record.get("state"))):
+        return False
+    if _record_reposkop_checkout_shadow_terminal_prepare(record) is None:
+        return False
+    transition_sha256 = record.get("terminalization_sha256")
+    receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    if (
+        not isinstance(transition_sha256, str)
+        or SHA256.fullmatch(transition_sha256) is None
+        or not isinstance(receipt_sha256, str)
+        or SHA256.fullmatch(receipt_sha256) is None
+    ):
+        return False
+    try:
+        marker = _reposkop_shadow_terminal_marker(str(record["task_id"]))
+    except Exception:
+        return True
+    if marker is None:
+        return True
+    if (
+        marker["terminalization_sha256"] != transition_sha256
+        or marker["lifecycle_receipt_sha256"] != receipt_sha256
+    ):
+        return True
+    return False
+
+
+def _recover_reposkop_shadow_terminal(
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    prepared = _record_reposkop_checkout_shadow_terminal_prepare(record)
+    if prepared is None:
+        return None
+    transition_sha256 = record.get("terminalization_sha256")
+    receipt_sha256 = record.get("lifecycle_receipt_sha256")
+    if (
+        not isinstance(transition_sha256, str)
+        or SHA256.fullmatch(transition_sha256) is None
+        or not isinstance(receipt_sha256, str)
+        or SHA256.fullmatch(receipt_sha256) is None
+    ):
+        return None
+    existing = _reposkop_shadow_terminal_marker(str(record["task_id"]))
+    if existing is not None:
+        if (
+            existing["terminalization_sha256"] != transition_sha256
+            or existing["lifecycle_receipt_sha256"] != receipt_sha256
+        ):
+            raise RuntimeError("Reposkop terminal shadow marker is bound to another lifecycle")
+        return existing
+    result = _finalize_reposkop_shadow_terminal_best_effort(
+        task_id=str(record["task_id"]),
+        terminalization_sha256=transition_sha256,
+        lifecycle_receipt_sha256=receipt_sha256,
+        prepared=prepared,
+    )
+    if result is None:
+        return None
+    return _persist_reposkop_shadow_terminal_marker(
+        task_id=str(record["task_id"]),
+        terminalization_sha256=transition_sha256,
+        lifecycle_receipt_sha256=receipt_sha256,
+        result=result,
+    )
 
 
 def _record_task_effect_classification(
@@ -4966,12 +5216,11 @@ def _apply_terminalization_projection(
     )
     updated = _row_raw(task_id)
     chronik.record_task_state_safely(updated, state)
-    if _record_reposkop_checkout_shadow_before(updated) is not None:
-        _capture_reposkop_shadow_terminal_best_effort(
-            task_id=task_id,
-            terminalization_sha256=transition_sha256,
-            lifecycle_receipt_sha256=receipt_sha256,
-        )
+    if _record_reposkop_checkout_shadow_terminal_prepare(updated) is not None:
+        try:
+            _recover_reposkop_shadow_terminal(updated)
+        except Exception:
+            pass
     return updated
 
 
@@ -4989,14 +5238,11 @@ def _recover_task_terminalization(task_id: str) -> dict[str, Any] | None:
             != transition.get("lifecycle_receipt_sha256")
         ):
             return _apply_terminalization_projection(transition, recovered=True)
-        if _record_reposkop_checkout_shadow_before(record) is not None:
-            receipt_sha256 = transition.get("lifecycle_receipt_sha256")
-            if isinstance(receipt_sha256, str) and SHA256.fullmatch(receipt_sha256):
-                _capture_reposkop_shadow_terminal_best_effort(
-                    task_id=identifier,
-                    terminalization_sha256=transition["transition_sha256"],
-                    lifecycle_receipt_sha256=receipt_sha256,
-                )
+        if _record_reposkop_checkout_shadow_terminal_prepare(record) is not None:
+            try:
+                _recover_reposkop_shadow_terminal(record)
+            except Exception:
+                pass
         return record
     record = _row_raw(identifier)
     if not _is_terminal_state(str(record["state"])):
@@ -5803,10 +6049,30 @@ def _set_state(
         recovered = _recover_task_terminalization(identifier)
         return recovered if recovered is not None else _row_raw(identifier)
     if _is_terminal_state(state):
+        projection_launcher = launcher
+        selected_launcher = (
+            dict(launcher)
+            if launcher is not None
+            else json.loads(str(current["launcher_json"]))
+        )
+        shadow_record = {
+            **current,
+            "launcher_json": _canonical_json(selected_launcher),
+        }
+        before_shadow = _record_reposkop_checkout_shadow_before(shadow_record)
+        if before_shadow is not None:
+            prepared_shadow = _prepare_reposkop_shadow_terminal_best_effort(
+                task_id=identifier,
+                before_summary=before_shadow,
+            )
+            selected_launcher[
+                "reposkop_checkout_shadow_terminal_prepare"
+            ] = prepared_shadow
+            projection_launcher = selected_launcher
         projection = _terminal_projection(
             current,
             state,
-            launcher=launcher,
+            launcher=projection_launcher,
             observation=observation,
             unit=unit,
             authoritative_unit=authoritative_unit,
@@ -7978,8 +8244,10 @@ def _select_reconcile_task_rows(
     limit: int,
 ) -> list[sqlite3.Row]:
     candidate_clause = (
-        "state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
-        "'failed', 'timed_out', 'signalled')"
+        "(state IN ('launching', 'running', 'outcome_unknown', 'interrupted', "
+        "'failed', 'timed_out', 'signalled') OR "
+        "(state IN ('completed', 'cancelled') AND "
+        "launcher_json LIKE '%\"reposkop_checkout_shadow_terminal_prepare\"%'))"
     )
     parameters: list[Any] = [
         TASK_RECONCILE_SEQUENCE_KEY_PREFIX,
@@ -8063,6 +8331,8 @@ def _reconcile_task_candidate_page(limit: int) -> dict[str, Any]:
         if _is_terminal_state(str(record["state"])):
             terminal_valid, lease_valid = _terminal_convergence_evidence(record)
             if terminal_valid and lease_valid:
+                if _reposkop_shadow_terminal_recovery_needed(record):
+                    candidates.append(record)
                 continue
         candidates.append(record)
     return {
@@ -8751,6 +9021,21 @@ def _reconcile_tasks_refresh_locked(
     released: list[str] = []
     denied: list[dict[str, Any]] = []
     for record in rows:
+        if _is_terminal_state(str(record["state"])):
+            terminal_valid, lease_valid = _terminal_convergence_evidence(record)
+            if (
+                terminal_valid
+                and lease_valid
+                and _reposkop_shadow_terminal_recovery_needed(record)
+            ):
+                try:
+                    _recover_reposkop_shadow_terminal(record)
+                except Exception:
+                    pass
+                public = _public(_row_raw(str(record["task_id"])))
+                public["lease_maintenance"] = None
+                refreshed.append(public)
+                continue
         try:
             observation = _reconcile_observation(record)
         except PermissionError as exc:

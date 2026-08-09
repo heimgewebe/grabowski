@@ -3,9 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
 
 import grabowski_reposkop_shadow as shadow
 
@@ -166,15 +172,21 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
                 evaluation_id="b" * 64,
                 reposkop_cohort="prospective_control",
             )
-            terminal_result = shadow.capture_terminal_best_effort(
+            prepared = shadow.prepare_terminal_best_effort(
                 task_id=task_id,
-                terminalization_sha256="c" * 64,
-                lifecycle_receipt_sha256="d" * 64,
+                before_summary=before_result,
             )
-            replay = shadow.capture_terminal_best_effort(
+            terminal_result = shadow.finalize_terminal_best_effort(
                 task_id=task_id,
                 terminalization_sha256="c" * 64,
                 lifecycle_receipt_sha256="d" * 64,
+                prepared=prepared,
+            )
+            replay = shadow.finalize_terminal_best_effort(
+                task_id=task_id,
+                terminalization_sha256="c" * 64,
+                lifecycle_receipt_sha256="d" * 64,
+                prepared=prepared,
             )
 
         self.assertEqual(before_result["status"], "completed")
@@ -248,16 +260,21 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
             )
 
         with patch.object(shadow, "_run_reposkop", side_effect=run):
-            shadow.capture_before_best_effort(
+            before_result = shadow.capture_before_best_effort(
                 task_id=task_id,
                 workspace=str(self.workspace),
                 evaluation_id="2" * 64,
                 reposkop_cohort="prospective_sample",
             )
-            result = shadow.capture_terminal_best_effort(
+            prepared = shadow.prepare_terminal_best_effort(
+                task_id=task_id,
+                before_summary=before_result,
+            )
+            result = shadow.finalize_terminal_best_effort(
                 task_id=task_id,
                 terminalization_sha256="3" * 64,
                 lifecycle_receipt_sha256="4" * 64,
+                prepared=prepared,
             )
 
         self.assertEqual(result["status"], "unavailable")
@@ -265,6 +282,51 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
         self.assertEqual(result["measurement_class"], "inconclusive/unavailable")
         self.assertIs(result["decision_effect"], False)
         self.assertEqual(self.events[-1]["failure_category"], "capability_unavailable")
+
+    def test_terminal_prepare_storage_failure_is_audited_unavailable(self) -> None:
+        task_id = "storage-failure"
+        purpose = f"grabowski-task-shadow:{shadow._task_key(task_id)[:32]}"
+        before = _observation(self.workspace, purpose, identity="1")
+
+        with patch.object(
+            shadow, "_run_reposkop", return_value=(before, "a" * 64)
+        ):
+            before_result = shadow.capture_before_best_effort(
+                task_id=task_id,
+                workspace=str(self.workspace),
+                evaluation_id="9" * 64,
+                reposkop_cohort="prospective_control",
+            )
+
+        with patch.object(
+            shadow,
+            "_ensure_root",
+            side_effect=PermissionError("shadow root inaccessible"),
+        ):
+            prepared = shadow.prepare_terminal_best_effort(
+                task_id=task_id,
+                before_summary=before_result,
+            )
+            result = shadow.finalize_terminal_best_effort(
+                task_id=task_id,
+                terminalization_sha256="3" * 64,
+                lifecycle_receipt_sha256="4" * 64,
+                prepared=prepared,
+            )
+
+        self.assertEqual(prepared["status"], "unavailable")
+        self.assertEqual(prepared["failure_category"], "permission_unavailable")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "unavailable")
+        terminal_event = self.events[-1]
+        self.assertEqual(terminal_event["operation"], shadow.TERMINAL_OPERATION)
+        self.assertEqual(terminal_event["shadow_status"], "unavailable")
+        self.assertIs(terminal_event["attempted"], True)
+        self.assertEqual(
+            terminal_event["failure_category"], "permission_unavailable"
+        )
+        self.assertIs(terminal_event["decision_effect"], False)
+        self.assertIs(terminal_event["effect_authorized"], False)
 
     def test_non_repository_is_not_sent_to_reposkop(self) -> None:
         non_repository = self.root / "plain"

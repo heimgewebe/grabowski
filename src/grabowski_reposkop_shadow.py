@@ -736,133 +736,128 @@ def capture_before_best_effort(
     return _public_summary(binding, audit_ref)
 
 
-def capture_terminal_best_effort(
+def _before_summary_value(before_summary: dict[str, Any] | None, key: str) -> Any:
+    if not isinstance(before_summary, dict):
+        return None
+    return before_summary.get(key)
+
+
+def prepare_terminal_best_effort(
     *,
     task_id: str,
-    terminalization_sha256: str,
-    lifecycle_receipt_sha256: str,
-) -> dict[str, Any] | None:
+    before_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    _validate_task_id(task_id)
+    before_binding: dict[str, Any] | None = None
     try:
-        _validate_task_id(task_id)
-        if (
-            SHA256_RE.fullmatch(terminalization_sha256) is None
-            or SHA256_RE.fullmatch(lifecycle_receipt_sha256) is None
-        ):
-            return None
         root = _ensure_root()
         paths = _paths(root, task_id)
-        if paths["terminal_binding"].exists():
-            terminal_value, _payload = _read_private_json(paths["terminal_binding"])
-            binding = _validate_binding(
-                terminal_value, task_id=task_id, phase="terminal"
+        before_value, _payload = _read_private_json(paths["before_binding"])
+        before_binding = _validate_binding(
+            before_value, task_id=task_id, phase="before"
+        )
+        if before_binding.get("status") != "completed":
+            raise ReposkopShadowError(
+                "Reposkop BEFORE shadow is unavailable",
+                category="before_unavailable",
             )
-            if (
-                binding.get("terminalization_sha256") != terminalization_sha256
-                or binding.get("lifecycle_receipt_sha256")
-                != lifecycle_receipt_sha256
+        if isinstance(before_summary, dict):
+            for key in (
+                "evaluation_id",
+                "reposkop_cohort",
+                "before_observation_sha256",
+                "evidence_sha256",
             ):
-                raise ReposkopShadowError(
-                    "Reposkop terminal shadow binding conflicts with terminal truth",
-                    category="evidence_integrity_error",
+                supplied = before_summary.get(key)
+                expected = (
+                    before_binding.get("evidence_sha256")
+                    if key == "evidence_sha256"
+                    else before_binding.get(key)
                 )
-        else:
-            before_value, _payload = _read_private_json(paths["before_binding"])
-            before_binding = _validate_binding(
-                before_value, task_id=task_id, phase="before"
+                if supplied is not None and supplied != expected:
+                    raise ReposkopShadowError(
+                        "Reposkop BEFORE summary lost its private binding",
+                        category="evidence_integrity_error",
+                    )
+        workspace = _workspace_observable(str(before_binding.get("workspace") or ""))
+        if workspace is None:
+            raise ReposkopShadowError(
+                "Reposkop shadow workspace is no longer observable",
+                category="workspace_unavailable",
             )
-            if before_binding.get("status") != "completed":
-                raise ReposkopShadowError(
-                    "Reposkop BEFORE shadow is unavailable",
-                    category="before_unavailable",
-                )
-            workspace = _workspace_observable(str(before_binding.get("workspace") or ""))
-            if workspace is None:
-                raise ReposkopShadowError(
-                    "Reposkop shadow workspace is no longer observable",
-                    category="workspace_unavailable",
-                )
-            purpose = str(before_binding.get("purpose") or "")
-            before, before_payload = _read_private_json(paths["before_artifact"])
-            before = _validate_observation(
-                before,
-                workspace=workspace,
-                purpose=purpose,
-                require_complete=True,
+        purpose = str(before_binding.get("purpose") or "")
+        before, before_payload = _read_private_json(paths["before_artifact"])
+        before = _validate_observation(
+            before,
+            workspace=workspace,
+            purpose=purpose,
+            require_complete=True,
+        )
+        if (
+            _sha256_bytes(before_payload)
+            != before_binding.get("artifact_file_sha256")
+            or before["observation_sha256"]
+            != before_binding.get("before_observation_sha256")
+        ):
+            raise ReposkopShadowError(
+                "Reposkop BEFORE artifact lost its binding",
+                category="evidence_integrity_error",
             )
-            if (
-                _sha256_bytes(before_payload)
-                != before_binding.get("artifact_file_sha256")
-                or before["observation_sha256"]
-                != before_binding.get("before_observation_sha256")
-            ):
-                raise ReposkopShadowError(
-                    "Reposkop BEFORE artifact lost its binding",
-                    category="evidence_integrity_error",
-                )
-            continuity, executable_sha256 = _run_reposkop(
-                "continuity",
-                workspace,
-                purpose=purpose,
-                expected_artifact=paths["before_artifact"],
-            )
-            result = _validate_continuity(
-                continuity,
-                before=before,
-                workspace=workspace,
-                purpose=purpose,
-            )
-            artifact_payload = _canonical_bytes(continuity)
-            _write_or_match(paths["terminal_artifact"], artifact_payload)
-            material = {
-                "schema_version": 1,
-                "kind": "grabowski.reposkop_checkout_shadow_evidence",
-                "phase": "terminal",
-                "status": "completed",
-                "task_id": task_id,
-                "evaluation_id": before_binding.get("evaluation_id"),
-                "reposkop_cohort": before_binding.get("reposkop_cohort"),
-                "captured_at_unix": int(time.time()),
-                "terminalization_sha256": terminalization_sha256,
-                "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
-                "before_evidence_sha256": before_binding["evidence_sha256"],
-                **result,
-                "artifact_file_sha256": _sha256_bytes(artifact_payload),
-                "reposkop_executable_sha256": executable_sha256,
-                "decision_effect": False,
-                "effect_authorized": False,
-            }
-            binding = _binding_payload(material)
-            _write_or_match(paths["terminal_binding"], _canonical_bytes(binding))
-    except Exception as exc:
-        failure_category = _failure_category(exc)
-        try:
-            root = _ensure_root()
-            paths = _paths(root, task_id)
-        except Exception:
-            return None
-        before_binding = None
-        try:
-            before_value, _payload = _read_private_json(paths["before_binding"])
-            before_binding = _validate_binding(
-                before_value, task_id=task_id, phase="before"
-            )
-        except Exception:
-            pass
+        continuity, executable_sha256 = _run_reposkop(
+            "continuity",
+            workspace,
+            purpose=purpose,
+            expected_artifact=paths["before_artifact"],
+        )
+        result = _validate_continuity(
+            continuity,
+            before=before,
+            workspace=workspace,
+            purpose=purpose,
+        )
         material = {
             "schema_version": 1,
             "kind": "grabowski.reposkop_checkout_shadow_evidence",
-            "phase": "terminal",
+            "phase": "terminal_prepare",
+            "status": "completed",
+            "task_id": task_id,
+            "evaluation_id": before_binding.get("evaluation_id"),
+            "reposkop_cohort": before_binding.get("reposkop_cohort"),
+            "captured_at_unix": int(time.time()),
+            "before_evidence_sha256": before_binding["evidence_sha256"],
+            **result,
+            "reposkop_executable_sha256": executable_sha256,
+            "decision_effect": False,
+            "effect_authorized": False,
+        }
+    except Exception as exc:
+        failure_category = _failure_category(exc)
+        fallback = before_binding or {}
+        evaluation_id = fallback.get("evaluation_id")
+        reposkop_cohort = fallback.get("reposkop_cohort")
+        before_evidence_sha256 = fallback.get("evidence_sha256")
+        before_observation_sha256 = fallback.get("before_observation_sha256")
+        if evaluation_id is None:
+            evaluation_id = _before_summary_value(before_summary, "evaluation_id")
+        if reposkop_cohort is None:
+            reposkop_cohort = _before_summary_value(before_summary, "reposkop_cohort")
+        if before_evidence_sha256 is None:
+            before_evidence_sha256 = _before_summary_value(before_summary, "evidence_sha256")
+        if before_observation_sha256 is None:
+            before_observation_sha256 = _before_summary_value(
+                before_summary, "before_observation_sha256"
+            )
+        material = {
+            "schema_version": 1,
+            "kind": "grabowski.reposkop_checkout_shadow_evidence",
+            "phase": "terminal_prepare",
             "status": "unavailable",
             "task_id": task_id,
-            "evaluation_id": (before_binding or {}).get("evaluation_id"),
-            "reposkop_cohort": (before_binding or {}).get("reposkop_cohort"),
+            "evaluation_id": evaluation_id,
+            "reposkop_cohort": reposkop_cohort,
             "captured_at_unix": int(time.time()),
-            "terminalization_sha256": terminalization_sha256,
-            "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
-            "before_evidence_sha256": (before_binding or {}).get("evidence_sha256"),
-            "before_observation_sha256": (before_binding or {}).get(
-                "before_observation_sha256"
-            ),
+            "before_evidence_sha256": before_evidence_sha256,
+            "before_observation_sha256": before_observation_sha256,
             "failure_category": failure_category,
             "continuity_state": "inconclusive",
             "measurement_class": "inconclusive/unavailable",
@@ -871,38 +866,204 @@ def capture_terminal_best_effort(
             "decision_effect": False,
             "effect_authorized": False,
         }
-        binding = _binding_payload(material)
-        try:
-            _write_or_match(paths["terminal_binding"], _canonical_bytes(binding))
-        except Exception:
+    return _binding_payload(material)
+
+
+def _validated_terminal_prepare(
+    value: dict[str, Any], *, task_id: str
+) -> dict[str, Any]:
+    prepared = _validate_binding(value, task_id=task_id, phase="terminal_prepare")
+    if prepared.get("status") not in {"completed", "unavailable"}:
+        raise ReposkopShadowError(
+            "Reposkop terminal prepare status is invalid",
+            category="evidence_integrity_error",
+        )
+    if prepared.get("status") == "completed":
+        state = prepared.get("continuity_state")
+        if state not in CONTINUITY_STATES:
+            raise ReposkopShadowError(
+                "Reposkop terminal prepare continuity state is invalid",
+                category="evidence_integrity_error",
+            )
+        for field in (
+            "before_observation_sha256",
+            "after_observation_sha256",
+            "transition_sha256",
+            "continuity_sha256",
+            "reposkop_executable_sha256",
+        ):
+            item = prepared.get(field)
+            if not isinstance(item, str) or SHA256_RE.fullmatch(item) is None:
+                raise ReposkopShadowError(
+                    "Reposkop terminal prepare digest is invalid",
+                    category="evidence_integrity_error",
+                )
+        _stable_codes(prepared.get("reason_codes"))
+        _stable_codes(prepared.get("anomaly_codes"))
+    else:
+        if prepared.get("continuity_state") != "inconclusive":
+            raise ReposkopShadowError(
+                "Reposkop unavailable terminal prepare must be inconclusive",
+                category="evidence_integrity_error",
+            )
+        if prepared.get("measurement_class") != "inconclusive/unavailable":
+            raise ReposkopShadowError(
+                "Reposkop unavailable terminal prepare class is invalid",
+                category="evidence_integrity_error",
+            )
+        failure_category = prepared.get("failure_category")
+        if not isinstance(failure_category, str) or not failure_category:
+            raise ReposkopShadowError(
+                "Reposkop unavailable terminal prepare lacks a failure category",
+                category="evidence_integrity_error",
+            )
+    return prepared
+
+
+def finalize_terminal_best_effort(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+    prepared: dict[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        _validate_task_id(task_id)
+        if (
+            SHA256_RE.fullmatch(terminalization_sha256) is None
+            or SHA256_RE.fullmatch(lifecycle_receipt_sha256) is None
+        ):
             return None
+        prepared = _validated_terminal_prepare(dict(prepared), task_id=task_id)
+    except Exception:
+        return None
+    material = {
+        "schema_version": 1,
+        "kind": "grabowski.reposkop_checkout_shadow_evidence",
+        "phase": "terminal",
+        "status": prepared["status"],
+        "task_id": task_id,
+        "evaluation_id": prepared.get("evaluation_id"),
+        "reposkop_cohort": prepared.get("reposkop_cohort"),
+        "captured_at_unix": int(prepared["captured_at_unix"]),
+        "terminal_observed_at_unix": int(prepared["captured_at_unix"]),
+        "terminalization_sha256": terminalization_sha256,
+        "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        "before_evidence_sha256": prepared.get("before_evidence_sha256"),
+        "before_observation_sha256": prepared.get("before_observation_sha256"),
+        "after_observation_sha256": prepared.get("after_observation_sha256"),
+        "transition_sha256": prepared.get("transition_sha256"),
+        "continuity_sha256": prepared.get("continuity_sha256"),
+        "continuity_state": prepared.get("continuity_state"),
+        "measurement_class": prepared.get("measurement_class"),
+        "reason_codes": list(prepared.get("reason_codes") or []),
+        "anomaly_codes": list(prepared.get("anomaly_codes") or []),
+        "failure_category": prepared.get("failure_category"),
+        "reposkop_executable_sha256": prepared.get("reposkop_executable_sha256"),
+        "prepare_evidence_sha256": prepared["evidence_sha256"],
+        "decision_effect": False,
+        "effect_authorized": False,
+    }
+    binding = _binding_payload(material)
+    audit_binding = binding
+    paths: dict[str, Path] | None = None
+    try:
+        root = _ensure_root()
+        paths = _paths(root, task_id)
+        if paths["terminal_binding"].exists():
+            existing_value, _payload = _read_private_json(paths["terminal_binding"])
+            existing = _validate_binding(
+                existing_value, task_id=task_id, phase="terminal"
+            )
+            if existing != binding:
+                raise ReposkopShadowError(
+                    "Reposkop terminal shadow binding conflicts with terminal truth",
+                    category="evidence_integrity_error",
+                )
+            binding = existing
+            audit_binding = existing
+        else:
+            _write_or_match(paths["terminal_binding"], _canonical_bytes(binding))
+    except Exception as exc:
+        # The continuity observation may have succeeded while its private terminal
+        # binding became unavailable. Do not report that case as completed: keep
+        # the private evidence absent and emit an independent public unavailable
+        # event so effectiveness metrics cannot silently lose the failure.
+        failure_category = _failure_category(exc)
+        unavailable_material = {
+            "schema_version": 1,
+            "kind": "grabowski.reposkop_checkout_shadow_evidence",
+            "phase": "terminal",
+            "status": "unavailable",
+            "task_id": task_id,
+            "evaluation_id": prepared.get("evaluation_id"),
+            "reposkop_cohort": prepared.get("reposkop_cohort"),
+            "captured_at_unix": int(prepared["captured_at_unix"]),
+            "terminal_observed_at_unix": int(prepared["captured_at_unix"]),
+            "terminalization_sha256": terminalization_sha256,
+            "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+            "before_evidence_sha256": prepared.get("before_evidence_sha256"),
+            "before_observation_sha256": prepared.get("before_observation_sha256"),
+            "after_observation_sha256": None,
+            "transition_sha256": None,
+            "continuity_sha256": None,
+            "continuity_state": "inconclusive",
+            "measurement_class": "inconclusive/unavailable",
+            "reason_codes": [f"shadow.{failure_category}"],
+            "anomaly_codes": [],
+            "failure_category": failure_category,
+            "reposkop_executable_sha256": prepared.get("reposkop_executable_sha256"),
+            "prepare_evidence_sha256": prepared["evidence_sha256"],
+            "decision_effect": False,
+            "effect_authorized": False,
+        }
+        audit_binding = _binding_payload(unavailable_material)
+        paths = None
     event = {
-        "timestamp_unix": binding["captured_at_unix"],
+        "timestamp_unix": audit_binding["terminal_observed_at_unix"],
         "operation": TERMINAL_OPERATION,
         "task_id": task_id,
-        "evaluation_id": binding.get("evaluation_id"),
-        "reposkop_cohort": binding.get("reposkop_cohort"),
+        "evaluation_id": audit_binding.get("evaluation_id"),
+        "reposkop_cohort": audit_binding.get("reposkop_cohort"),
         "shadow_phase": "terminal",
-        "shadow_status": binding["status"],
+        "shadow_status": audit_binding["status"],
         "attempted": True,
         "terminalization_sha256": terminalization_sha256,
         "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
-        "before_observation_sha256": binding.get("before_observation_sha256"),
-        "after_observation_sha256": binding.get("after_observation_sha256"),
-        "transition_sha256": binding.get("transition_sha256"),
-        "continuity_sha256": binding.get("continuity_sha256"),
-        "continuity_state": binding.get("continuity_state"),
-        "measurement_class": binding.get("measurement_class"),
-        "reason_codes": list(binding.get("reason_codes") or []),
-        "anomaly_codes": list(binding.get("anomaly_codes") or []),
-        "failure_category": binding.get("failure_category"),
-        "shadow_evidence_sha256": binding["evidence_sha256"],
+        "before_observation_sha256": audit_binding.get("before_observation_sha256"),
+        "after_observation_sha256": audit_binding.get("after_observation_sha256"),
+        "transition_sha256": audit_binding.get("transition_sha256"),
+        "continuity_sha256": audit_binding.get("continuity_sha256"),
+        "continuity_state": audit_binding.get("continuity_state"),
+        "measurement_class": audit_binding.get("measurement_class"),
+        "reason_codes": list(audit_binding.get("reason_codes") or []),
+        "anomaly_codes": list(audit_binding.get("anomaly_codes") or []),
+        "failure_category": audit_binding.get("failure_category"),
+        "shadow_evidence_sha256": audit_binding["evidence_sha256"],
         "measurement_only": True,
         "decision_effect": False,
         "effect_authorized": False,
     }
     try:
-        audit_ref = _append_event_once(paths["terminal_audit"], event)
+        audit_ref = _append_event_once(
+            paths["terminal_audit"] if paths is not None else None,
+            event,
+        )
     except Exception:
         audit_ref = None
-    return _public_summary(binding, audit_ref)
+    return _public_summary(audit_binding, audit_ref)
+
+
+def capture_terminal_best_effort(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+) -> dict[str, Any] | None:
+    prepared = prepare_terminal_best_effort(task_id=task_id)
+    return finalize_terminal_best_effort(
+        task_id=task_id,
+        terminalization_sha256=terminalization_sha256,
+        lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+        prepared=prepared,
+    )
