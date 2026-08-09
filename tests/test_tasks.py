@@ -203,6 +203,26 @@ class TaskTests(unittest.TestCase):
             "_attest_mutating_agent_workspace",
             return_value=self.reposkop_attestation,
         )
+        self.reposkop_shadow_before_patch = patch.object(
+            tasks,
+            "_capture_reposkop_shadow_before_best_effort",
+            return_value={
+                "phase": "before",
+                "status": "completed",
+                "before_observation_sha256": "d" * 64,
+                "decision_effect": False,
+                "effect_authorized": False,
+                "audit_ref": "audit-record-sha256:" + "e" * 64,
+            },
+        )
+        self.reposkop_shadow_terminal_patch = patch.object(
+            tasks,
+            "_capture_reposkop_shadow_terminal_best_effort",
+            return_value=None,
+        )
+        self.real_reposkop_shadow_terminal_capture = (
+            tasks._capture_reposkop_shadow_terminal_best_effort
+        )
         self.task_archive_root = self.root / "state" / "task-archives"
         self.task_projection_root = self.root / "state" / "task-projection"
         (self.root / "state").mkdir(parents=True, exist_ok=True)
@@ -216,9 +236,13 @@ class TaskTests(unittest.TestCase):
         self.resource_patch.start()
         self.admission_patch.start()
         self.reposkop_attestation_mock = self.reposkop_patch.start()
+        self.reposkop_shadow_before_mock = self.reposkop_shadow_before_patch.start()
+        self.reposkop_shadow_terminal_mock = self.reposkop_shadow_terminal_patch.start()
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.reposkop_shadow_terminal_patch.stop()
+        self.reposkop_shadow_before_patch.stop()
         self.reposkop_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
@@ -1282,6 +1306,7 @@ class TaskTests(unittest.TestCase):
             tasks.server_task_lease_delegation_evidence(owner)
 
     def test_terminalization_atomically_revokes_owner_leases_and_binds_lifecycle_receipt(self) -> None:
+        self.reposkop_shadow_terminal_mock.return_value = {"state": "failed"}
         result = self._start(
             resource_keys=[
                 "component:test-terminalization-a",
@@ -1334,6 +1359,11 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(payload["receipt_sha256"], stored["lifecycle_receipt_sha256"])
         self.assertEqual(payload["receipt_sha256"], transition["lifecycle_receipt_sha256"])
+        self.reposkop_shadow_terminal_mock.assert_called_once_with(
+            task_id=task_id,
+            terminalization_sha256=transition["transition_sha256"],
+            lifecycle_receipt_sha256=payload["receipt_sha256"],
+        )
         with self.assertRaisesRegex(ValueError, "terminalized task owner"):
             resources.acquire_resources(
                 owner,
@@ -1342,6 +1372,22 @@ class TaskTests(unittest.TestCase):
                 ttl_seconds=120,
                 metadata={"task_id": task_id, "attempt": 1},
             )
+
+    def test_terminal_shadow_adapter_failure_cannot_block_terminal_state(self) -> None:
+        import grabowski_reposkop_shadow
+
+        with patch.object(
+            grabowski_reposkop_shadow,
+            "capture_terminal_best_effort",
+            side_effect=RuntimeError("shadow unavailable"),
+        ):
+            result = self.real_reposkop_shadow_terminal_capture(
+                task_id="0123456789abcdef01234567",
+                terminalization_sha256="1" * 64,
+                lifecycle_receipt_sha256="2" * 64,
+            )
+
+        self.assertIsNone(result)
 
     def test_lifecycle_receipt_link_race_with_legacy_primary_uses_lifecycle_path(self) -> None:
         result = self._start(
@@ -2991,6 +3037,16 @@ class TaskTests(unittest.TestCase):
         self.assertRegex(attestation["decision_audit_ref"], r"^audit-record-sha256:[0-9a-f]{64}$")
         self.assertIs(result["audit"]["reposkop_execution_attestation_required"], False)
         self.assertEqual(result["audit"]["reposkop_cohort"], "prospective_control")
+        self.assertEqual(
+            result["reposkop_checkout_shadow_before"]["status"],
+            "completed",
+        )
+        self.reposkop_shadow_before_mock.assert_called_once_with(
+            task_id=control_key,
+            workspace=str(self.root),
+            evaluation_id=result["audit"]["evaluation_id"],
+            reposkop_cohort="prospective_control",
+        )
         self.assertIsNotNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
     def test_exact_feature_path_and_branch_leases_can_enter_reposkop_control(self) -> None:
@@ -3097,6 +3153,45 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(classification["reposkop_policy"], "required")
         self.assertIs(classification["prospective_admission_verified"], False)
         self.reposkop_attestation_mock.assert_called_once()
+        self.reposkop_shadow_before_mock.assert_called_once()
+
+    def test_reposkop_shadow_start_failure_is_nonblocking_and_recorded(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        self.reposkop_shadow_before_mock.return_value = {
+            "phase": "before",
+            "status": "unavailable",
+            "task_id": "test-task",
+            "measurement_class": "inconclusive/unavailable",
+            "failure_category": "capability_unavailable",
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "f" * 64,
+        }
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 159}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        dispatch.assert_called_once()
+        self.assertEqual(result["task"]["state"], "running")
+        self.assertEqual(
+            result["audit"]["reposkop_checkout_shadow_before"]["status"],
+            "unavailable",
+        )
+        self.assertIs(
+            result["audit"]["reposkop_checkout_shadow_before"]["decision_effect"],
+            False,
+        )
 
     def test_main_branch_and_exact_path_writers_remain_reposkop_required(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -3180,6 +3275,32 @@ class TaskTests(unittest.TestCase):
             False,
         )
         self.reposkop_attestation_mock.assert_not_called()
+        self.reposkop_shadow_before_mock.assert_not_called()
+
+    def test_remote_writer_is_not_forced_through_checkout_shadow(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 160}
+        ):
+            result = tasks.grabowski_task_start(
+                "remote", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        self.assertEqual(
+            result["task_effect_classification"]["effect_profile"],
+            "remote_write",
+        )
+        self.assertIsNone(result["reposkop_checkout_shadow_before"])
+        self.reposkop_attestation_mock.assert_not_called()
+        self.reposkop_shadow_before_mock.assert_not_called()
 
     def test_reposkop_execution_attestation_contract_is_hash_bound(self) -> None:
         workspace = str(self.root)

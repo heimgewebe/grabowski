@@ -431,6 +431,17 @@ def _verify_reposkop_digest(
     return expected
 
 
+def _bounded_string_list(value: Any, *, label: str, limit: int = 64) -> list[str]:
+    if not isinstance(value, list) or len(value) > limit:
+        raise ReposkopContextError(f"Reposkop projection has invalid {label}")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item or len(item) > 512 or "\x00" in item:
+            raise ReposkopContextError(f"Reposkop projection has invalid {label}")
+        result.append(item)
+    return result
+
+
 def _validate_report(
     report: Any,
     *,
@@ -440,10 +451,14 @@ def _validate_report(
 ) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise ReposkopContextError("Reposkop report must be a JSON object")
-    if (
-        report.get("kind") != "reposkop_coherence_report"
-        or not _is_schema_version(report.get("schema_version"), 2)
-    ):
+    if report.get("kind") != "reposkop_coherence_report":
+        raise ReposkopContextError("Reposkop report kind or schema is unsupported")
+    report_schema = report.get("schema_version")
+    if _is_schema_version(report_schema, 2):
+        expected_projection_schema = 1
+    elif _is_schema_version(report_schema, 3):
+        expected_projection_schema = 2
+    else:
         raise ReposkopContextError("Reposkop report kind or schema is unsupported")
     if report.get("effect_authorized") is not False:
         raise ReposkopContextError("Reposkop report must keep effect_authorized=false")
@@ -479,15 +494,41 @@ def _validate_report(
         raise ReposkopContextError("Reposkop observation must be complete")
     if (
         projection.get("kind") != "reposkop_coherence_projection"
-        or not _is_schema_version(projection.get("schema_version"), 1)
+        or not _is_schema_version(
+            projection.get("schema_version"), expected_projection_schema
+        )
     ):
         raise ReposkopContextError(
-            "Reposkop projection kind or schema is unsupported"
+            "Reposkop projection kind or schema is unsupported for report/projection schema pair"
         )
     if projection.get("effect_authorized") is not False:
         raise ReposkopContextError(
             "Reposkop projection must keep effect_authorized=false"
         )
+    if expected_projection_schema == 2:
+        if projection.get("state") not in {"local_coherent", "inconclusive"}:
+            raise ReposkopContextError("Reposkop projection local state is unsupported")
+        _bounded_string_list(projection.get("reasons"), label="reasons")
+        _bounded_string_list(
+            projection.get("active_bindings"), label="active_bindings"
+        )
+        _bounded_string_list(
+            projection.get("foreign_authority_gaps"),
+            label="foreign_authority_gaps",
+        )
+        _bounded_string_list(
+            projection.get("does_not_establish"), label="does_not_establish"
+        )
+        if not isinstance(projection.get("observation_validation"), dict):
+            raise ReposkopContextError(
+                "Reposkop projection observation_validation is invalid"
+            )
+        if projection.get("evidence_validation") is not None and not isinstance(
+            projection.get("evidence_validation"), dict
+        ):
+            raise ReposkopContextError(
+                "Reposkop projection evidence_validation is invalid"
+            )
     identities = observation.get("identities")
     if not isinstance(identities, dict):
         raise ReposkopContextError("Reposkop observation is missing identities")
@@ -529,7 +570,6 @@ def _validate_report(
         label="report_sha256",
     )
     return report
-
 
 def _kill_process_group(process: subprocess.Popen[bytes], *, pgid: int | None = None) -> None:
     # With start_new_session=True the child pid is the session/process-group id.

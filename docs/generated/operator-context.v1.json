@@ -3018,6 +3018,10 @@
         "source": "src/grabowski_reposkop_effectiveness.py"
       },
       {
+        "module": "grabowski_reposkop_shadow",
+        "source": "src/grabowski_reposkop_shadow.py"
+      },
+      {
         "module": "grabowski_checkouts",
         "source": "src/grabowski_checkouts.py"
       },
@@ -3283,7 +3287,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "93192a0657da3c210f117deca7484cf04542bcbb8c64f106e4877a55f3f2f3e4"
+      "sha256": "f07d94c21761567803dac99cc60a82ce5ce7b1245d31ad034a5f0548dc8d497f"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3362,8 +3366,9 @@
       "src/grabowski_recovery.py": "b3fdbb3d47cea1723dad00646cf93a6bbfd41cac856b115610fbf1872cb88777",
       "src/grabowski_repobrief.py": "8fcf518290bb302d55512d0c2011292c9f3ed8621223104397fd94fbafa409b2",
       "src/grabowski_repoground_catalog.py": "5873a9ebef50d554410e5d0e86b9af7190da2e99787799f9adbf677e9fbfe841",
-      "src/grabowski_reposkop_context.py": "c1e46bd5b921834a89325fdffe4edba8f716369e6edca3401d230d736f3cfdae",
-      "src/grabowski_reposkop_effectiveness.py": "d5bc043e63d126ad9730a350c3d1c1faaf44f5c291e5b4c4ec8bb63cd8f59b04",
+      "src/grabowski_reposkop_context.py": "d3f41bf2302f99b137b2a6e637fc92fd203845236a3d9e11270c477fe90b2c20",
+      "src/grabowski_reposkop_effectiveness.py": "bd95ca0127c5e17d59804becdbceca61408cdb69b7b5a048c5dfe889862677b2",
+      "src/grabowski_reposkop_shadow.py": "769011ff4cbd5b8bc64e0440c9e60fc0e1651e022394254c4648bf1d00b6f11f",
       "src/grabowski_resources.py": "7084aefab51791cce26af7340e99d1283f10650fadb2ccbf270bccbcc6e16963",
       "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",
       "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
@@ -3374,7 +3379,7 @@
       "src/grabowski_systemkatalog.py": "39a1dae1a75615390864bdcd9fa60abb1f0863be0fc15d047465e53632ce5738",
       "src/grabowski_task_attention.py": "36b795533018553c82cfdb83980ef4082a894dfc49aa17337f11c7683e96716e",
       "src/grabowski_task_reconcile.py": "5f3f1035cfe44e7b1cb01de1f0f7eff702d1cc97bcaec5fc85cb1d39edcb6b6b",
-      "src/grabowski_tasks.py": "a65a873ce480526c63a1d8e1f89f6da2aa974e9dae72b90695382e71cbe2964c",
+      "src/grabowski_tasks.py": "12a6a3a31333508bd4b585940c7f4b3cc42b988f086ec5fd594f3a667333aa9e",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
       "src/grabowski_transport_roundtrip.py": "903dc9db1747ed00e0181a49094e744cd99f6973edbf5c74458932aeaccf3e85",

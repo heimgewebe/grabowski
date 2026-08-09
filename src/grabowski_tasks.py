@@ -2488,6 +2488,55 @@ def _default_reposkop_execution_context(
     )
 
 
+def _capture_reposkop_shadow_before_best_effort(
+    *,
+    task_id: str,
+    workspace: str,
+    evaluation_id: str | None,
+    reposkop_cohort: str | None,
+) -> dict[str, Any] | None:
+    try:
+        import grabowski_reposkop_shadow
+
+        return grabowski_reposkop_shadow.capture_before_best_effort(
+            task_id=task_id,
+            workspace=workspace,
+            evaluation_id=evaluation_id,
+            reposkop_cohort=reposkop_cohort,
+        )
+    except Exception:
+        return {
+            "phase": "before",
+            "status": "unavailable",
+            "task_id": task_id,
+            "evaluation_id": evaluation_id,
+            "reposkop_cohort": reposkop_cohort,
+            "measurement_class": "inconclusive/unavailable",
+            "failure_category": "shadow_adapter_error",
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": None,
+        }
+
+
+def _capture_reposkop_shadow_terminal_best_effort(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+) -> None:
+    try:
+        import grabowski_reposkop_shadow
+
+        grabowski_reposkop_shadow.capture_terminal_best_effort(
+            task_id=task_id,
+            terminalization_sha256=terminalization_sha256,
+            lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+        )
+    except Exception:
+        return
+
+
 def _workspace_lease_resource_keys(
     workspace: str,
     resource_keys: list[str],
@@ -4895,6 +4944,11 @@ def _apply_terminalization_projection(
     )
     updated = _row_raw(task_id)
     chronik.record_task_state_safely(updated, state)
+    _capture_reposkop_shadow_terminal_best_effort(
+        task_id=task_id,
+        terminalization_sha256=transition_sha256,
+        lifecycle_receipt_sha256=receipt_sha256,
+    )
     return updated
 
 
@@ -6986,6 +7040,16 @@ def grabowski_task_start(
             **control_material,
             "execution_binding_sha256": _sha256_json(control_material),
         }
+    reposkop_checkout_shadow_before = (
+        _capture_reposkop_shadow_before_best_effort(
+            task_id=task_id,
+            workspace=mutating_agent_workspace,
+            evaluation_id=reposkop_evaluation_id,
+            reposkop_cohort=task_effect_classification.get("reposkop_cohort"),
+        )
+        if mutating_agent_workspace is not None
+        else None
+    )
     record = {
         "task_id": task_id,
         "host": host,
@@ -7033,6 +7097,15 @@ def grabowski_task_start(
                         )
                     }
                     if reposkop_execution_attestation is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "reposkop_checkout_shadow_before": dict(
+                            reposkop_checkout_shadow_before
+                        )
+                    }
+                    if reposkop_checkout_shadow_before is not None
                     else {}
                 ),
             }
@@ -7109,6 +7182,13 @@ def grabowski_task_start(
             **launcher,
             "reposkop_execution_attestation": dict(
                 reposkop_execution_attestation
+            ),
+        }
+    if reposkop_checkout_shadow_before is not None:
+        launcher = {
+            **launcher,
+            "reposkop_checkout_shadow_before": dict(
+                reposkop_checkout_shadow_before
             ),
         }
     state = _launch_state(launcher)
@@ -7200,6 +7280,7 @@ def grabowski_task_start(
             if reposkop_execution_attestation is not None
             else []
         ),
+        "reposkop_checkout_shadow_before": reposkop_checkout_shadow_before,
     }
     base._append_audit(audit)
     return {
@@ -7211,6 +7292,7 @@ def grabowski_task_start(
         "operation_identity": normalized_operation_identity,
         "operation_retry_binding": operation_retry_binding,
         "reposkop_execution_attestation": reposkop_execution_attestation,
+        "reposkop_checkout_shadow_before": reposkop_checkout_shadow_before,
         "task_effect_classification": task_effect_classification,
         "deduplicated_reuse": None,
     }

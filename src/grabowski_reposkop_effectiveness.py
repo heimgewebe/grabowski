@@ -61,6 +61,7 @@ MIN_FALSE_NEGATIVE_CLUSTER = 2
 REVIEW_CLASSIFICATIONS = frozenset(
     {
         "confirmed_prevention",
+        "confirmed_unique_value",
         "beneficial_context",
         "neutral",
         "false_positive",
@@ -336,6 +337,13 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
     reasons: set[str] = set()
     observation = report.get("observation")
     projection = report.get("projection")
+    local_authority_v2 = bool(
+        type(report.get("schema_version")) is int
+        and report.get("schema_version") == 3
+        and isinstance(projection, dict)
+        and type(projection.get("schema_version")) is int
+        and projection.get("schema_version") == 2
+    )
     if not isinstance(observation, dict) or not isinstance(projection, dict):
         _finding_add(
             counts,
@@ -436,40 +444,41 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
                 category="repository_structure",
                 reason="gitmodules_present",
             )
-        ahead = git.get("ahead")
-        behind = git.get("behind")
-        if type(ahead) is int and ahead > 0:
-            _finding_add(
-                counts,
-                categories,
-                reasons,
-                severity="information",
-                category="remote_freshness",
-                reason="upstream_ahead",
-            )
-        if type(behind) is int and behind > 0:
-            _finding_add(
-                counts,
-                categories,
-                reasons,
-                severity="warning",
-                category="remote_freshness",
-                reason="upstream_behind",
-            )
-        upstream_freshness = git.get("upstream_freshness")
-        if upstream_freshness not in {"current", "fresh", "verified"}:
-            _finding_add(
-                counts,
-                categories,
-                reasons,
-                severity="information",
-                category="remote_freshness",
-                reason=(
-                    "upstream_unbound"
-                    if git.get("upstream") in {None, ""}
-                    else "upstream_freshness_unverified"
-                ),
-            )
+        if not local_authority_v2:
+            ahead = git.get("ahead")
+            behind = git.get("behind")
+            if type(ahead) is int and ahead > 0:
+                _finding_add(
+                    counts,
+                    categories,
+                    reasons,
+                    severity="information",
+                    category="remote_freshness",
+                    reason="upstream_ahead",
+                )
+            if type(behind) is int and behind > 0:
+                _finding_add(
+                    counts,
+                    categories,
+                    reasons,
+                    severity="warning",
+                    category="remote_freshness",
+                    reason="upstream_behind",
+                )
+            upstream_freshness = git.get("upstream_freshness")
+            if upstream_freshness not in {"current", "fresh", "verified"}:
+                _finding_add(
+                    counts,
+                    categories,
+                    reasons,
+                    severity="information",
+                    category="remote_freshness",
+                    reason=(
+                        "upstream_unbound"
+                        if git.get("upstream") in {None, ""}
+                        else "upstream_freshness_unverified"
+                    ),
+                )
         role = observation.get("role")
         if isinstance(role, dict) and role.get("value") not in {
             "canonical_checkout",
@@ -495,7 +504,11 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
                 reason="observation_validation_failed",
             )
         active_bindings = projection.get("active_bindings")
-        if isinstance(active_bindings, list) and active_bindings:
+        if (
+            not local_authority_v2
+            and isinstance(active_bindings, list)
+            and active_bindings
+        ):
             _finding_add(
                 counts,
                 categories,
@@ -532,13 +545,35 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
             for value in projection_reasons[:32]:
                 if not isinstance(value, str):
                     continue
-                mapped = known_projection_reasons.get(value)
-                if mapped is None:
-                    mapped = (
-                        "information",
-                        "projection",
-                        "projection_reason_other",
-                    )
+                if local_authority_v2:
+                    if (
+                        value == "local_checkout_observation_complete"
+                        or value == "git_dirty"
+                        or value.startswith("managed_role:")
+                    ):
+                        continue
+                    if value == "observation_invalid":
+                        mapped = ("error", "report_integrity", "observation_invalid")
+                    elif value == "git_observation_incomplete":
+                        mapped = (
+                            "information",
+                            "coherence_state",
+                            "git_observation_incomplete",
+                        )
+                    else:
+                        mapped = (
+                            "information",
+                            "projection",
+                            "projection_reason_other",
+                        )
+                else:
+                    mapped = known_projection_reasons.get(value)
+                    if mapped is None:
+                        mapped = (
+                            "information",
+                            "projection",
+                            "projection_reason_other",
+                        )
                 _finding_add(
                     counts,
                     categories,
@@ -573,7 +608,13 @@ def finding_summary(report: dict[str, Any] | None = None) -> dict[str, Any]:
                 category="coherence_state",
                 reason=f"projection_state_{normalized_state}",
             )
-        elif normalized_state not in {"coherent", "clean", "ready", "verified"}:
+        elif normalized_state not in {
+            "coherent",
+            "local_coherent",
+            "clean",
+            "ready",
+            "verified",
+        }:
             _finding_add(
                 counts,
                 categories,
@@ -1024,21 +1065,41 @@ def record_review_classification(parameters: dict[str, Any]) -> dict[str, Any]:
         raise ReposkopReviewIntegrityError("Reposkop decision outcome is unsupported")
     decision_cohort = decision.get("reposkop_cohort")
     if decision_cohort == "prospective_control" and classification not in {
+        "confirmed_unique_value",
         "neutral",
         "false_negative",
         "unresolved",
     }:
         raise ReposkopReviewInputError(
-            "prospective control decisions may only be neutral, false_negative or unresolved"
+            "prospective control decisions may only be confirmed_unique_value, neutral, false_negative or unresolved"
         )
     if classification in {"confirmed_prevention", "false_positive", "operational_failure"} and final_decision != "block":
         raise ReposkopReviewInputError(
             f"classification={classification} requires a blocked evaluation"
         )
-    if classification in {"beneficial_context", "neutral", "false_negative"} and final_decision != "allow":
+    if classification in {
+        "confirmed_unique_value",
+        "beneficial_context",
+        "neutral",
+        "false_negative",
+    } and final_decision != "allow":
         raise ReposkopReviewInputError(
             f"classification={classification} requires an allowed evaluation"
         )
+    if classification == "confirmed_unique_value":
+        qualifying_shadow_refs = [
+            reference
+            for reference in verified_corroborating
+            if audit_records_by_ref[reference].get("operation")
+            == "reposkop-checkout-shadow-terminal-observed"
+            and audit_records_by_ref[reference].get("shadow_status") == "completed"
+            and audit_records_by_ref[reference].get("continuity_state")
+            == "identity_break"
+        ]
+        if not qualifying_shadow_refs:
+            raise ReposkopReviewIntegrityError(
+                "confirmed_unique_value requires a reviewed, completed identity-break shadow artifact"
+            )
     if classification == "false_negative" and detectable_category == "not_applicable":
         raise ReposkopReviewInputError(
             "false_negative requires one declared detectable_category"
@@ -1126,6 +1187,8 @@ def project_records(
         "reposkop-execution-attestation-blocked",
         "reposkop-task-outcome-observed",
         "reposkop-review-classification-recorded",
+        "reposkop-checkout-shadow-before-observed",
+        "reposkop-checkout-shadow-terminal-observed",
         "task-start",
     }
     requested: dict[str, dict[str, Any]] = {}
@@ -1134,6 +1197,8 @@ def project_records(
     blocked: dict[str, dict[str, Any]] = {}
     outcomes: dict[str, dict[str, Any]] = {}
     reviews: dict[str, dict[str, Any]] = {}
+    shadow_before: dict[str, dict[str, Any]] = {}
+    shadow_terminal: dict[str, dict[str, Any]] = {}
     classified_starts: list[dict[str, Any]] = []
     legacy_unclassified = 0
 
@@ -1144,6 +1209,20 @@ def project_records(
                 classified_starts.append(record)
             else:
                 legacy_unclassified += 1
+            continue
+        if operation in {
+            "reposkop-checkout-shadow-before-observed",
+            "reposkop-checkout-shadow-terminal-observed",
+        }:
+            task_id = record.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            target = (
+                shadow_before
+                if operation == "reposkop-checkout-shadow-before-observed"
+                else shadow_terminal
+            )
+            target.setdefault(task_id, record)
             continue
         if operation not in relevant:
             continue
@@ -1302,6 +1381,7 @@ def project_records(
                         category_cluster.get(detectable_category, 0) + 1
                     )
     confirmed_preventions = review_counts["confirmed_prevention"]
+    confirmed_unique_value = review_counts["confirmed_unique_value"]
     false_positives = review_counts["false_positive"]
     false_negatives = review_counts["false_negative"]
     false_positive_cluster_size = max(
@@ -1337,7 +1417,15 @@ def project_records(
 
     refs = [
         str(value.get("_audit_ref"))
-        for mapping in (requested, completed, blocked, outcomes, reviews)
+        for mapping in (
+            requested,
+            completed,
+            blocked,
+            outcomes,
+            reviews,
+            shadow_before,
+            shadow_terminal,
+        )
         for value in mapping.values()
         if isinstance(value.get("_audit_ref"), str)
     ][:MAX_SAMPLE_REFS]
@@ -1470,6 +1558,35 @@ def project_records(
     required_count = len(required_ids)
     covered_count = len(verified_ids | blocked_ids)
     technical_denominator = len(verified_ids) + len(blocked_ids)
+    shadow_attempted_ids = set(shadow_before) | set(shadow_terminal)
+    shadow_completed_ids = {
+        task_id
+        for task_id, value in shadow_terminal.items()
+        if value.get("shadow_status") == "completed"
+    }
+    shadow_unavailable_ids = {
+        task_id
+        for mapping in (shadow_before, shadow_terminal)
+        for task_id, value in mapping.items()
+        if value.get("shadow_status") == "unavailable"
+    }
+    shadow_continuity_states: dict[str, int] = {}
+    shadow_measurement_classes: dict[str, int] = {}
+    for value in shadow_terminal.values():
+        state = value.get("continuity_state")
+        if state in {"intact", "explainable_drift", "identity_break", "inconclusive"}:
+            shadow_continuity_states[str(state)] = (
+                shadow_continuity_states.get(str(state), 0) + 1
+            )
+        measurement_class = value.get("measurement_class")
+        if measurement_class in {
+            "identity_break",
+            "intact/explainable_drift",
+            "inconclusive/unavailable",
+        }:
+            shadow_measurement_classes[str(measurement_class)] = (
+                shadow_measurement_classes.get(str(measurement_class), 0) + 1
+            )
     return {
         "schema_version": 2,
         "kind": "grabowski_reposkop_effectiveness_projection",
@@ -1508,6 +1625,7 @@ def project_records(
             ),
             "classification_counts": review_counts,
             "confirmed_preventions": confirmed_preventions,
+            "confirmed_unique_value": confirmed_unique_value,
             "false_positives": false_positives,
             "false_negatives": false_negatives,
             "precision": (
@@ -1541,6 +1659,12 @@ def project_records(
                 for evaluation in prospective_control_ids
                 if reviews.get(evaluation, {}).get("classification") == "false_negative"
             ),
+            "control_confirmed_unique_value": sum(
+                1
+                for evaluation in prospective_control_ids
+                if reviews.get(evaluation, {}).get("classification")
+                == "confirmed_unique_value"
+            ),
             "sample_confirmed_preventions": sum(
                 1
                 for evaluation in prospective_sample_ids
@@ -1554,6 +1678,41 @@ def project_records(
                 if outcomes[evaluation].get("terminal_state") == "completed"
             ),
         },
+        "checkout_continuity_shadow": {
+            "attempted": len(shadow_attempted_ids),
+            "completed": len(shadow_completed_ids),
+            "unavailable": len(shadow_unavailable_ids),
+            "before": {
+                "attempted": len(shadow_before),
+                "completed": sum(
+                    1
+                    for value in shadow_before.values()
+                    if value.get("shadow_status") == "completed"
+                ),
+                "unavailable": sum(
+                    1
+                    for value in shadow_before.values()
+                    if value.get("shadow_status") == "unavailable"
+                ),
+            },
+            "terminal": {
+                "attempted": len(shadow_terminal),
+                "completed": len(shadow_completed_ids),
+                "unavailable": sum(
+                    1
+                    for value in shadow_terminal.values()
+                    if value.get("shadow_status") == "unavailable"
+                ),
+            },
+            "continuity_state_counts": dict(
+                sorted(shadow_continuity_states.items())
+            ),
+            "measurement_class_counts": dict(
+                sorted(shadow_measurement_classes.items())
+            ),
+            "confirmed_unique_value": confirmed_unique_value,
+            "confirmed_unique_value_source": "semantic_review_only",
+        },
         "duration_ms": {
             "sample_size": len(durations),
             "p50": p50,
@@ -1565,6 +1724,7 @@ def project_records(
             "causality_between_reposkop_and_task_outcome",
             "semantic_correctness_of_agent_output",
             "review_truth_beyond_the_supplied_evidence_refs",
+            "unique_value_from_identity_break_without_semantic_review",
             "future_failure_probability",
         ],
     }
