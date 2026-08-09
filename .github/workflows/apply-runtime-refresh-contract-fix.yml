@@ -27,330 +27,314 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD^)" = "9ce242a4fb1ab34ed87c95cb629a9bb96de931a9"
+          base=9ce242a4fb1ab34ed87c95cb629a9bb96de931a9
           test "$(git rev-parse --abbrev-ref HEAD)" = "fix/runtime-refresh-three-lease-contract-20260809"
+          test "$(git merge-base HEAD "$base")" = "$base"
+          test "$(git diff --name-only "$base"..HEAD)" = ".github/workflows/apply-runtime-refresh-contract-fix.yml"
       - name: Apply bounded contract patch
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           from pathlib import Path
+          import re
+          import textwrap
 
-          def replace_once(path: str, old: str, new: str) -> None:
-              target = Path(path)
-              text = target.read_text(encoding="utf-8")
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected one replacement, found {count}")
-              target.write_text(text.replace(old, new, 1), encoding="utf-8")
-
-          def replace_count(path: str, old: str, new: str, expected: int) -> None:
+          def replace_literal(path: str, old: str, new: str, expected: int = 1) -> None:
               target = Path(path)
               text = target.read_text(encoding="utf-8")
               count = text.count(old)
               if count != expected:
-                  raise SystemExit(f"{path}: expected {expected} replacements for {old!r}, found {count}")
+                  raise SystemExit(f"{path}: expected {expected} literal replacements for {old!r}, found {count}")
               target.write_text(text.replace(old, new), encoding="utf-8")
 
-          resources_old = '''    canonical_resource_keys = [
-              f"path:{Path(str(intent['bin_dir'])).expanduser() / 'bureau'}",
-              f"path:{Path(str(intent['bin_dir'])).expanduser() / 'bureau-runtime-refresh'}",
-              f"path:{Path(str(intent['prefix'])).expanduser()}",
-              f"path:{root}",
-              f"path:{Path(str(intent['workspace'])).expanduser()}",
-          ]
-          canonical_resource_keys = sorted(set(canonical_resource_keys))
-          if (
-              resource_keys != canonical_resource_keys
-              or intent.get("required_resource_keys") != canonical_resource_keys
-              or Path(str(intent.get("workspace", ""))).expanduser()
-              != root / "workspaces" / main_commit
-          ):
-              raise nonconflict.NonConflictDenied(
-                  "terminal-evidence-invalid",
-                  "runtime-refresh resources are not the five canonical paths",
-              )
-          '''
-          resources_new = '''    intent_resource_keys = intent.get("required_resource_keys")
-          if (
-              not isinstance(intent_resource_keys, list)
-              or not intent_resource_keys
-              or any(not isinstance(item, str) for item in intent_resource_keys)
-              or intent_resource_keys != sorted(set(intent_resource_keys))
-          ):
-              raise nonconflict.NonConflictDenied(
-                  "terminal-evidence-invalid",
-                  "runtime-refresh intent resource binding is invalid",
-              )
-          canonical_resource_keys: list[str] = []
-          for resource_key in intent_resource_keys:
-              if not resource_key.startswith("path:"):
-                  raise nonconflict.NonConflictDenied(
-                      "terminal-evidence-invalid",
-                      "runtime-refresh intent resources must be path resources",
-                  )
-              resource_path = Path(resource_key[len("path:"):]).expanduser()
-              normalized_path = Path(os.path.normpath(str(resource_path)))
-              if not resource_path.is_absolute() or resource_path != normalized_path:
-                  raise nonconflict.NonConflictDenied(
-                      "terminal-evidence-invalid",
-                      "runtime-refresh intent resources are not canonical absolute paths",
-                  )
-              canonical_resource_keys.append(f"path:{resource_path}")
-          if (
-              resource_keys != canonical_resource_keys
-              or Path(str(intent.get("workspace", ""))).expanduser()
-              != root / "workspaces" / main_commit
-          ):
-              raise nonconflict.NonConflictDenied(
-                  "terminal-evidence-invalid",
-                  "runtime-refresh resources differ from the verified intent",
-              )
-          '''
-          replace_once("src/grabowski_resources.py", resources_old, resources_new)
+          def replace_regex(path: str, pattern: str, replacement: str, expected: int = 1) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              compiled = re.compile(pattern, re.MULTILINE | re.DOTALL)
+              updated, count = compiled.subn(lambda _match: replacement, text)
+              if count != expected:
+                  raise SystemExit(f"{path}: expected {expected} regex replacements, found {count}: {pattern}")
+              target.write_text(updated, encoding="utf-8")
 
-          grip_path = "src/grabowski_grips.py"
-          replace_once(
-              grip_path,
-              '''    "runtime-refresh-lease-release": GripSpec(
-                  name="runtime-refresh-lease-release",
-                  version="1.0",
-          ''',
-              '''    "runtime-refresh-lease-release": GripSpec(
-                  name="runtime-refresh-lease-release",
-                  version="1.1",
-          ''',
+          def block(body: str, spaces: int) -> str:
+              return textwrap.indent(textwrap.dedent(body).lstrip("\n"), " " * spaces)
+
+          replace_regex(
+              "src/grabowski_resources.py",
+              r'''^    canonical_resource_keys = \[\n.*?^            "runtime-refresh resources are not the five canonical paths",\n        \)\n''',
+              block(
+                  '''
+                  intent_resource_keys = intent.get("required_resource_keys")
+                  if (
+                      not isinstance(intent_resource_keys, list)
+                      or not intent_resource_keys
+                      or any(not isinstance(item, str) for item in intent_resource_keys)
+                      or intent_resource_keys != sorted(set(intent_resource_keys))
+                  ):
+                      raise nonconflict.NonConflictDenied(
+                          "terminal-evidence-invalid",
+                          "runtime-refresh intent resource binding is invalid",
+                      )
+                  canonical_resource_keys: list[str] = []
+                  for resource_key in intent_resource_keys:
+                      if not resource_key.startswith("path:"):
+                          raise nonconflict.NonConflictDenied(
+                              "terminal-evidence-invalid",
+                              "runtime-refresh intent resources must be path resources",
+                          )
+                      resource_path = Path(resource_key[len("path:"):]).expanduser()
+                      normalized_path = Path(os.path.normpath(str(resource_path)))
+                      if not resource_path.is_absolute() or resource_path != normalized_path:
+                          raise nonconflict.NonConflictDenied(
+                              "terminal-evidence-invalid",
+                              "runtime-refresh intent resources are not canonical absolute paths",
+                          )
+                      canonical_resource_keys.append(f"path:{resource_path}")
+                  if (
+                      resource_keys != canonical_resource_keys
+                      or Path(str(intent.get("workspace", ""))).expanduser()
+                      != root / "workspaces" / main_commit
+                  ):
+                      raise nonconflict.NonConflictDenied(
+                          "terminal-evidence-invalid",
+                          "runtime-refresh resources differ from the verified intent",
+                      )
+                  ''',
+                  4,
+              ),
           )
-          replace_count(
-              grip_path,
+
+          grips = "src/grabowski_grips.py"
+          replace_literal(
+              grips,
+              'name="runtime-refresh-lease-release",\n        version="1.0",',
+              'name="runtime-refresh-lease-release",\n        version="1.1",',
+          )
+          replace_literal(
+              grips,
               "exact-five-path-binding",
               "exact-intent-resource-binding",
-              2,
+              expected=2,
           )
-          grip_old = '''    exact_five = (
-              isinstance(resources_bound, list)
-              and len(resources_bound) == 5
-              and resources_bound == sorted(set(resources_bound))
-              and all(
-                  isinstance(item, str) and item.startswith("path:")
-                  for item in resources_bound
-              )
+          replace_regex(
+              grips,
+              r'''^    exact_five = \(\n        isinstance\(resources_bound, list\)\n        and len\(resources_bound\) == 5\n        and resources_bound == sorted\(set\(resources_bound\)\)\n        and all\(\n            isinstance\(item, str\) and item\.startswith\("path:"\)\n            for item in resources_bound\n        \)\n    \)\n''',
+              block(
+                  '''
+                  exact_binding = (
+                      isinstance(resources_bound, list)
+                      and bool(resources_bound)
+                      and resources_bound == sorted(set(resources_bound))
+                      and all(
+                          isinstance(item, str) and item.startswith("path:")
+                          for item in resources_bound
+                      )
+                  )
+                  resource_count = len(resources_bound) if isinstance(resources_bound, list) else 0
+                  ''',
+                  4,
+              ),
           )
-          '''
-          grip_new = '''    exact_binding = (
-              isinstance(resources_bound, list)
-              and bool(resources_bound)
-              and resources_bound == sorted(set(resources_bound))
-              and all(
-                  isinstance(item, str) and item.startswith("path:")
-                  for item in resources_bound
-              )
+          replace_literal(grips, "and absent_count == 5", "and absent_count == resource_count")
+          replace_literal(
+              grips,
+              '    replay_ready = complete and len(output.get("released", [])) + absent_count == 5\n',
+              block(
+                  '''
+                  replay_ready = (
+                      complete
+                      and resource_count > 0
+                      and len(output.get("released", [])) + absent_count == resource_count
+                  )
+                  ''',
+                  4,
+              ),
           )
-          resource_count = len(resources_bound) if isinstance(resources_bound, list) else 0
-          '''
-          replace_once(grip_path, grip_old, grip_new)
-          replace_once(
-              grip_path,
-              '''        and absent_count == 5
-          ''',
-              '''        and absent_count == resource_count
-          ''',
+          replace_literal(
+              grips,
+              "and exact_five and complete and replay_ready",
+              "and exact_binding and complete and replay_ready",
           )
-          replace_once(
-              grip_path,
-              '''    replay_ready = complete and len(output.get("released", [])) + absent_count == 5
-          ''',
-              '''    replay_ready = (
-              complete
-              and resource_count > 0
-              and len(output.get("released", [])) + absent_count == resource_count
-          )
-          ''',
-          )
-          replace_once(grip_path, "and exact_five and complete and replay_ready", "and exact_binding and complete and replay_ready")
 
           test_resources = "tests/test_resources.py"
-          replace_once(
+          replace_regex(
               test_resources,
-              '''    def _runtime_refresh_fixture(
-              self,
-              *,
-              status: str = "deployed",
-              effect_started: bool | None = None,
-          ) -> dict[str, object]:
-          ''',
-              '''    def _runtime_refresh_fixture(
-              self,
-              *,
-              status: str = "deployed",
-              effect_started: bool | None = None,
-              resource_contract: str = "current-three",
-          ) -> dict[str, object]:
-          ''',
+              r'''^    def _runtime_refresh_fixture\(\n        self,\n        \*,\n        status: str = "deployed",\n        effect_started: bool \| None = None,\n    \) -> dict\[str, object\]:\n''',
+              block(
+                  '''
+                  def _runtime_refresh_fixture(
+                      self,
+                      *,
+                      status: str = "deployed",
+                      effect_started: bool | None = None,
+                      resource_contract: str = "historical-five",
+                  ) -> dict[str, object]:
+                  ''',
+                  4,
+              ),
           )
-          fixture_old = '''        resource_keys = sorted(
-              [
-                  f"path:{bin_dir / 'bureau'}",
-                  f"path:{bin_dir / 'bureau-runtime-refresh'}",
-                  f"path:{prefix}",
-                  f"path:{state_root}",
-                  f"path:{workspace}",
-              ]
-          )
-          '''
-          fixture_new = '''        resource_sets = {
-              "current-three": [
-                  f"path:{prefix}",
-                  f"path:{state_root}",
-                  f"path:{workspace}",
-              ],
-              "historical-five": [
-                  f"path:{bin_dir / 'bureau'}",
-                  f"path:{bin_dir / 'bureau-runtime-refresh'}",
-                  f"path:{prefix}",
-                  f"path:{state_root}",
-                  f"path:{workspace}",
-              ],
-          }
-          if resource_contract not in resource_sets:
-              raise ValueError(f"unknown runtime-refresh resource contract: {resource_contract}")
-          resource_keys = sorted(resource_sets[resource_contract])
-          '''
-          replace_once(test_resources, fixture_old, fixture_new)
-          replace_once(
+          replace_regex(
               test_resources,
-              '''    def test_runtime_refresh_terminal_release_deployed_and_reacquires(self) -> None:
-              fixture = self._runtime_refresh_fixture()
-              with patch.object(
-          ''',
-              '''    def test_runtime_refresh_terminal_release_deployed_and_reacquires(self) -> None:
-              fixture = self._runtime_refresh_fixture()
-              self.assertEqual(3, len(fixture["resource_keys"]))
-              with patch.object(
-          ''',
+              r'''^        resource_keys = sorted\(\n            \[\n                f"path:\{bin_dir / 'bureau'\}",\n.*?^        \)\n(?=        owner = "operator:test-runtime-refresh")''',
+              block(
+                  '''
+                  resource_sets = {
+                      "current-three": [
+                          f"path:{prefix}",
+                          f"path:{state_root}",
+                          f"path:{workspace}",
+                      ],
+                      "historical-five": [
+                          f"path:{bin_dir / 'bureau'}",
+                          f"path:{bin_dir / 'bureau-runtime-refresh'}",
+                          f"path:{prefix}",
+                          f"path:{state_root}",
+                          f"path:{workspace}",
+                      ],
+                  }
+                  if resource_contract not in resource_sets:
+                      raise ValueError(
+                          f"unknown runtime-refresh resource contract: {resource_contract}"
+                      )
+                  resource_keys = sorted(resource_sets[resource_contract])
+                  ''',
+                  8,
+              ),
           )
-          insertion_anchor = '''    def test_runtime_refresh_mcp_tool_requires_operator_and_audits(self) -> None:
-          '''
-          insertion = '''    def test_runtime_refresh_terminal_release_preserves_historical_five_resource_contract(self) -> None:
-              fixture = self._runtime_refresh_fixture(resource_contract="historical-five")
-              self.assertEqual(5, len(fixture["resource_keys"]))
-              with patch.object(
-                  resources,
-                  "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
-                  fixture["state_root"],
-              ):
-                  result = resources.release_runtime_refresh_terminal_leases(
-                      target_sha256=fixture["target_sha256"],
-                      result_sha256=fixture["result_sha256"],
+          anchor = '    def test_runtime_refresh_mcp_tool_requires_operator_and_audits(self) -> None:\n'
+          tests = block(
+              '''
+              def test_runtime_refresh_terminal_release_accepts_current_three_resource_contract(self) -> None:
+                  fixture = self._runtime_refresh_fixture(resource_contract="current-three")
+                  self.assertEqual(3, len(fixture["resource_keys"]))
+                  with patch.object(
+                      resources,
+                      "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+                      fixture["state_root"],
+                  ):
+                      result = resources.release_runtime_refresh_terminal_leases(
+                          target_sha256=fixture["target_sha256"],
+                          result_sha256=fixture["result_sha256"],
+                      )
+                  self.assertEqual("complete", result["state"])
+                  self.assertEqual(
+                      fixture["resource_keys"],
+                      [item["resource_key"] for item in result["released"]],
                   )
-              self.assertEqual("complete", result["state"])
-              self.assertEqual(
-                  fixture["resource_keys"],
-                  [item["resource_key"] for item in result["released"]],
-              )
+                  reacquired = resources.acquire_resources(
+                      fixture["owner"],
+                      fixture["resource_keys"],
+                      purpose="next current-contract runtime refresh",
+                      ttl_seconds=120,
+                  )
+                  self.assertEqual(
+                      fixture["resource_keys"],
+                      [item["resource_key"] for item in reacquired["leases"]],
+                  )
 
-              
-          def test_runtime_refresh_terminal_release_rejects_caller_subset_and_superset(self) -> None:
-              fixture = self._runtime_refresh_fixture()
-              source = {
-                  "kind": resources.BUREAU_RUNTIME_REFRESH_RESULT_KIND,
-                  "target_sha256": fixture["target_sha256"],
-                  "result_sha256": fixture["result_sha256"],
-              }
-              extra_key = f"path:{self.root / 'extra-runtime-refresh-resource'}"
-              resources.acquire_resources(
-                  fixture["owner"],
-                  [extra_key],
-                  purpose="unbound runtime refresh resource",
-                  ttl_seconds=360,
-              )
-              extra_snapshot = {
-                  field: resources.inspect_resource(extra_key)[field]
-                  for field in resources.LEASE_SNAPSHOT_KEYS
-              }
-              cases = [
-                  (
-                      "subset",
-                      list(fixture["resource_keys"][:-1]),
-                      list(fixture["snapshots"][:-1]),
-                  ),
-                  (
-                      "superset",
-                      sorted([*fixture["resource_keys"], extra_key]),
-                      sorted(
-                          [*fixture["snapshots"], extra_snapshot],
-                          key=lambda item: item["resource_key"],
+              def test_runtime_refresh_terminal_source_rejects_caller_subset_and_superset(self) -> None:
+                  fixture = self._runtime_refresh_fixture(resource_contract="current-three")
+                  source = {
+                      "kind": resources.BUREAU_RUNTIME_REFRESH_RESULT_KIND,
+                      "target_sha256": fixture["target_sha256"],
+                      "result_sha256": fixture["result_sha256"],
+                  }
+                  extra_key = f"path:{self.root / 'extra-runtime-refresh-resource'}"
+                  resources.acquire_resources(
+                      fixture["owner"],
+                      [extra_key],
+                      purpose="unbound runtime refresh resource",
+                      ttl_seconds=360,
+                  )
+                  extra_snapshot = {
+                      field: resources.inspect_resource(extra_key)[field]
+                      for field in resources.LEASE_SNAPSHOT_KEYS
+                  }
+                  cases = [
+                      (
+                          "subset",
+                          list(fixture["resource_keys"][:-1]),
+                          list(fixture["snapshots"][:-1]),
                       ),
-                  ),
-              ]
-              with patch.object(
-                  resources,
-                  "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
-                  fixture["state_root"],
-              ):
-                  for label, resource_keys, snapshots in cases:
-                      with self.subTest(label=label):
-                          with self.assertRaisesRegex(PermissionError, "names other resources"):
-                              resources.reconcile_obsolete_path_leases(
-                                  owner_id=fixture["owner"],
-                                  resource_keys=resource_keys,
-                                  expected_leases=snapshots,
-                                  terminal_source=source,
-                              )
-              self.assertTrue(
-                  all(
-                      resources.inspect_resource(key) is not None
-                      for key in [*fixture["resource_keys"], extra_key]
+                      (
+                          "superset",
+                          sorted([*fixture["resource_keys"], extra_key]),
+                          sorted(
+                              [*fixture["snapshots"], extra_snapshot],
+                              key=lambda item: item["resource_key"],
+                          ),
+                      ),
+                  ]
+                  with patch.object(
+                      resources,
+                      "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+                      fixture["state_root"],
+                  ):
+                      for label, resource_keys, snapshots in cases:
+                          with self.subTest(label=label):
+                              with self.assertRaisesRegex(PermissionError, "names other resources"):
+                                  resources.reconcile_obsolete_path_leases(
+                                      owner_id=fixture["owner"],
+                                      resource_keys=resource_keys,
+                                      expected_leases=snapshots,
+                                      terminal_source=source,
+                                  )
+                  self.assertTrue(
+                      all(
+                          resources.inspect_resource(key) is not None
+                          for key in [*fixture["resource_keys"], extra_key]
+                      )
                   )
-              )
 
-          '''
-          replace_once(test_resources, insertion_anchor, insertion + insertion_anchor)
+              ''',
+              4,
+          )
+          replace_literal(test_resources, anchor, tests + anchor)
 
           test_grips = "tests/test_grips.py"
-          replace_once(
+          replace_literal(
               test_grips,
-              '''    KEYS = [
-              "path:/home/alex/.local/bin/bureau",
-              "path:/home/alex/.local/bin/bureau-runtime-refresh",
-              "path:/home/alex/.local/share/bureau",
-              "path:/home/alex/.local/state/bureau/runtime-refresh",
-              "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,
-          ]
-          ''',
-              '''    KEYS = [
-              "path:/home/alex/.local/share/bureau",
-              "path:/home/alex/.local/state/bureau/runtime-refresh",
-              "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,
-          ]
-          ''',
+              '\n'.join([
+                  '    KEYS = [',
+                  '        "path:/home/alex/.local/bin/bureau",',
+                  '        "path:/home/alex/.local/bin/bureau-runtime-refresh",',
+                  '        "path:/home/alex/.local/share/bureau",',
+                  '        "path:/home/alex/.local/state/bureau/runtime-refresh",',
+                  '        "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,',
+                  '    ]',
+              ]),
+              '\n'.join([
+                  '    KEYS = [',
+                  '        "path:/home/alex/.local/share/bureau",',
+                  '        "path:/home/alex/.local/state/bureau/runtime-refresh",',
+                  '        "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,',
+                  '    ]',
+              ]),
           )
-          replace_count(
+          replace_literal(
               test_grips,
               "exact-five-path-binding",
               "exact-intent-resource-binding",
-              1,
           )
 
           docs = "docs/bureau-lease-contract-v2.md"
-          replace_once(
+          replace_regex(
               docs,
-              '''A Bureau runtime refresh owns exactly five canonical path leases: the installed `bureau` and
-          `bureau-runtime-refresh` entrypoints, the immutable Bureau prefix, the canonical runtime-refresh
-          state root, and the commit-bound workspace. Those leases may be released only through
-          `runtime-refresh-lease-release` or the equivalent typed MCP tool
-          `grabowski_runtime_refresh_lease_release`.
-          ''',
-              '''A Bureau runtime refresh owns the exact sorted, unique path-resource set recorded by its
-          digest-bound intent and copied unchanged into the attempt-start and terminal result lease binding.
-          The current contract uses three resources (the immutable Bureau prefix, canonical runtime-refresh
-          state root, and commit-bound workspace); historical valid receipts may still name the two installed
-          entrypoints as well. No fixed resource count is authoritative. Those leases may be released only
-          through `runtime-refresh-lease-release` or the equivalent typed MCP tool
-          `grabowski_runtime_refresh_lease_release`.
-          ''',
+              r'''^A Bureau runtime refresh owns exactly five canonical path leases:.*?^`grabowski_runtime_refresh_lease_release`\.\n''',
+              textwrap.dedent(
+                  '''
+                  A Bureau runtime refresh owns the exact sorted, unique path-resource set recorded by its
+                  digest-bound intent and copied unchanged into the attempt-start and terminal result lease binding.
+                  The current contract uses three resources (the immutable Bureau prefix, canonical runtime-refresh
+                  state root, and commit-bound workspace); historical valid receipts may still name the two installed
+                  entrypoints as well. No fixed resource count is authoritative. Those leases may be released only
+                  through `runtime-refresh-lease-release` or the equivalent typed MCP tool
+                  `grabowski_runtime_refresh_lease_release`.
+                  '''
+              ).lstrip("\n"),
           )
-          replace_once(
+          replace_literal(
               docs,
               "resource database identity and all five snapshots before",
               "resource database identity and every snapshot named by that bound resource list before",
