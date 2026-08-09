@@ -1722,6 +1722,81 @@ class ResourceTests(unittest.TestCase):
             "captain-merge:late-publication", guard["held_resource_keys"]
         )
 
+    def test_late_disjoint_publication_persists_nonconflict_audit(self) -> None:
+        repository = self.root / "late-publication-audit-repo"
+        repository.mkdir()
+        (repository / ".git").write_text(
+            "gitdir: /tmp/late-publication-audit-repo\n", encoding="utf-8"
+        )
+        changed_path = repository / "src" / "target.py"
+        guard_keys = merge_guard.merge_guard_resource_keys(
+            repository,
+            repo_slug="heimgewebe/grabowski",
+            pr_number=57,
+            base="main",
+            head="feat/work",
+        )
+        guard = resources.acquire_merge_guard_resources(
+            "captain-merge:late-publication-audit",
+            "task-owner",
+            guard_keys,
+            repository=str(repository),
+            changed_paths=[str(changed_path)],
+            purpose="active merge",
+            ttl_seconds=60,
+            metadata={
+                "merge_guard": {
+                    "head_sha": "a" * 40,
+                    "diff_sha256": "b" * 64,
+                    "pull_request": 57,
+                    "base_branch": "main",
+                    "head_branch": "feat/work",
+                }
+            },
+        )
+        operation_key = f"repo:{repository}:operation:branch-publish:lane-a"
+        audit_log = self.root / "audit" / "write-audit.jsonl"
+        audit_log.parent.mkdir(mode=0o700)
+        with patch.object(
+            resources.operator, "_require_operator_mutation"
+        ), patch.object(resources.base, "AUDIT_LOG", audit_log):
+            acquired = resources.grabowski_resource_acquire(
+                "late-publication-audit-owner",
+                [operation_key],
+                "late disjoint push",
+                60,
+                {
+                    "operation_scope": self.operation_scope(
+                        repository,
+                        operation_key,
+                        branches=["feat/unrelated"],
+                    )
+                },
+            )
+        resources.release_resources(
+            "late-publication-audit-owner", [operation_key]
+        )
+
+        self.assertIsNone(resources.inspect_resource(operation_key))
+        audit_records = [
+            json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()
+        ]
+        acquire_audit = next(
+            record
+            for record in audit_records
+            if record["operation"] == "resource-acquire"
+        )
+        proofs = acquired["merge_guard_nonconflicts"]
+        self.assertEqual(1, len(proofs))
+        self.assertEqual(proofs, acquire_audit["merge_guard_nonconflicts"])
+        self.assertEqual(
+            hashlib.sha256(resources._canonical_json(proofs).encode("utf-8")).hexdigest(),
+            acquire_audit["merge_guard_nonconflicts_sha256"],
+        )
+        resources.release_resources(
+            "captain-merge:late-publication-audit", guard["held_resource_keys"]
+        )
+
     def test_merge_guard_keeps_overlapping_and_nonpublication_operations_serialized(self) -> None:
         repository = self.root / "serialized-operation-repo"
         repository.mkdir()

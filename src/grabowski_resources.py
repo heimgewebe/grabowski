@@ -5493,6 +5493,10 @@ def grabowski_resource_acquire(
             "reclaimed_count": len(result["reclaimed"]),
             "bureau_contract": result.get("bureau_contract"),
             "nonconflict_exception": result.get("nonconflict_exception"),
+            "merge_guard_nonconflicts": result["merge_guard_nonconflicts"],
+            "merge_guard_nonconflicts_sha256": hashlib.sha256(
+                _canonical_json(result["merge_guard_nonconflicts"]).encode("utf-8")
+            ).hexdigest(),
         }
     )
     return result
