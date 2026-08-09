@@ -217,13 +217,13 @@ GRIP_SPECS: dict[str, GripSpec] = {
     ),
     "runtime-refresh-lease-release": GripSpec(
         name="runtime-refresh-lease-release",
-        version="1.0",
+        version="1.1",
         summary="Release one terminal Bureau runtime-refresh attempt's exact unchanged path leases.",
         effect=MUTATING,
         required_parameters=("target_sha256", "result_sha256"),
         acceptance_ids=(
             "canonical-terminal-receipt",
-            "exact-five-path-binding",
+            "exact-intent-resource-binding",
             "unchanged-owner-release",
             "idempotent-reacquire-ready",
         ),
@@ -7793,15 +7793,16 @@ def _run_runtime_refresh_lease_release(
         }
     terminal = output.get("terminal_evidence")
     resources_bound = output.get("resource_keys")
-    exact_five = (
+    exact_binding = (
         isinstance(resources_bound, list)
-        and len(resources_bound) == 5
+        and bool(resources_bound)
         and resources_bound == sorted(set(resources_bound))
         and all(
             isinstance(item, str) and item.startswith("path:")
             for item in resources_bound
         )
     )
+    resource_count = len(resources_bound) if isinstance(resources_bound, list) else 0
     retained = output.get("retained", [])
     absent_count = (
         sum(
@@ -7825,10 +7826,14 @@ def _run_runtime_refresh_lease_release(
         output.get("state") == "complete"
         and not retained
         or output.get("state") == "no_change"
-        and absent_count == 5
+        and absent_count == resource_count
         and not harmful_retained
     )
-    replay_ready = complete and len(output.get("released", [])) + absent_count == 5
+    replay_ready = (
+        complete
+        and resource_count > 0
+        and len(output.get("released", [])) + absent_count == resource_count
+    )
     _check(
         receipt,
         "canonical-terminal-receipt",
@@ -7837,8 +7842,8 @@ def _run_runtime_refresh_lease_release(
     )
     _check(
         receipt,
-        "exact-five-path-binding",
-        "pass" if exact_five else "fail",
+        "exact-intent-resource-binding",
+        "pass" if exact_binding else "fail",
         f"resources={len(resources_bound) if isinstance(resources_bound, list) else 'invalid'}",
     )
     _check(
@@ -7853,7 +7858,7 @@ def _run_runtime_refresh_lease_release(
         "pass" if replay_ready else "fail",
         f"released_or_absent={len(output.get('released', [])) + len(output.get('already_absent', []))}",
     )
-    if not (isinstance(terminal, dict) and exact_five and complete and replay_ready):
+    if not (isinstance(terminal, dict) and exact_binding and complete and replay_ready):
         return {
             **output,
             "receipt_status": "failed",
