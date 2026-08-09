@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import math
@@ -750,8 +751,28 @@ def _event_identity_index_path() -> Path:
     return base.AUDIT_LOG.parent / EVENT_IDENTITY_INDEX_FILENAME
 
 
+@contextlib.contextmanager
 def event_identity_index_lock():
-    return base._audit_coordination_lock(_event_identity_index_path(), exclusive=True)
+    """Wait through index-writer contention instead of dropping terminal evidence."""
+    while True:
+        manager = base._audit_coordination_lock(
+            _event_identity_index_path(),
+            exclusive=True,
+        )
+        try:
+            manager.__enter__()
+        except RuntimeError as exc:
+            if str(exc) != "Audit lock acquisition timed out":
+                raise
+            # The underlying flock is process-bound, so a crashed holder cannot
+            # leave a stale lock behind. Retry rather than letting best-effort
+            # terminalization convert ordinary contention into missing evidence.
+            continue
+        break
+    try:
+        yield
+    finally:
+        manager.__exit__(None, None, None)
 
 
 def _ensure_event_identity_index_file(path: Path) -> None:

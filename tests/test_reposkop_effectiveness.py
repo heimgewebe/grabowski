@@ -1464,6 +1464,45 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(result["audit_ref"], _ref("2"))
         self.assertEqual(result["global_ordinal"], 2)
 
+    def test_event_identity_index_lock_retries_transient_timeout(self) -> None:
+        attempts = 0
+
+        @contextlib.contextmanager
+        def coordination_lock(_path: Path, *, exclusive: bool):
+            nonlocal attempts
+            attempts += 1
+            self.assertIs(exclusive, True)
+            if attempts == 1:
+                raise RuntimeError("Audit lock acquisition timed out")
+            yield
+
+        entered = False
+        with patch.object(
+            effectiveness.base,
+            "_audit_coordination_lock",
+            side_effect=coordination_lock,
+        ):
+            with effectiveness.event_identity_index_lock():
+                entered = True
+
+        self.assertTrue(entered)
+        self.assertEqual(attempts, 2)
+
+    def test_event_identity_index_lock_does_not_retry_other_failures(self) -> None:
+        @contextlib.contextmanager
+        def coordination_lock(_path: Path, *, exclusive: bool):
+            self.assertIs(exclusive, True)
+            raise RuntimeError("identity-index lock contract failed")
+            yield  # pragma: no cover
+
+        with patch.object(
+            effectiveness.base,
+            "_audit_coordination_lock",
+            side_effect=coordination_lock,
+        ), self.assertRaisesRegex(RuntimeError, "identity-index lock contract failed"):
+            with effectiveness.event_identity_index_lock():
+                self.fail("unexpected lock acquisition")
+
     def test_event_identity_lock_uses_bounded_audit_lock_stripe(self) -> None:
         token = object()
         identity = {
