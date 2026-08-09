@@ -105,7 +105,28 @@ _SERVER_ACTOR_KIND = "grabowski_server_runtime_actor_identity"
 _SERVER_ACTOR_TTL_SECONDS = 300
 _SERVER_ACTOR_SECRET = secrets.token_bytes(32)
 _SERVER_ACTOR_LOCK = threading.Lock()
-_SERVER_ACTOR_SESSIONS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+_SERVER_ACTOR_SESSIONS: weakref.WeakKeyDictionary[
+    Any, tuple[weakref.ReferenceType[Any], str]
+] = weakref.WeakKeyDictionary()
+_SERVER_ACTOR_FALLBACK_TTL_SECONDS = 300
+_SERVER_ACTOR_FALLBACK_MAX_SESSIONS = 1024
+
+
+class _ServerActorFallbackSession:
+    __slots__ = ("session", "session_nonce", "expires_at_monotonic")
+
+    def __init__(
+        self,
+        session: Any,
+        session_nonce: str,
+        expires_at_monotonic: float,
+    ) -> None:
+        self.session = session
+        self.session_nonce = session_nonce
+        self.expires_at_monotonic = expires_at_monotonic
+
+
+_SERVER_ACTOR_FALLBACK_SESSIONS: dict[int, _ServerActorFallbackSession] = {}
 _SERVER_ACTOR_KEYS = frozenset(
     {
         "schema_version",
@@ -192,6 +213,73 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _server_actor_weak_session_nonce(session: Any) -> str | None:
+    """Return a nonce only when WeakKeyDictionary has object-identity semantics."""
+    session_type = type(session)
+    if (
+        session_type.__eq__ is not object.__eq__
+        or session_type.__hash__ is not object.__hash__
+    ):
+        return None
+    try:
+        entry = _SERVER_ACTOR_SESSIONS.get(session)
+    except TypeError:
+        return None
+    if entry is not None:
+        session_ref, session_nonce = entry
+        return session_nonce if session_ref() is session else None
+    session_nonce = secrets.token_hex(32)
+    try:
+        session_ref = weakref.ref(session)
+        _SERVER_ACTOR_SESSIONS[session] = (session_ref, session_nonce)
+    except TypeError:
+        return None
+    return session_nonce
+
+
+def _prune_server_actor_fallback_sessions(*, now_monotonic: float) -> None:
+    expired_session_ids = [
+        session_id
+        for session_id, entry in _SERVER_ACTOR_FALLBACK_SESSIONS.items()
+        if entry.expires_at_monotonic <= now_monotonic
+    ]
+    for session_id in expired_session_ids:
+        _SERVER_ACTOR_FALLBACK_SESSIONS.pop(session_id, None)
+
+
+def _server_actor_fallback_session_nonce(
+    session: Any,
+    *,
+    now_monotonic: float,
+) -> str:
+    """Return a bounded strong-reference nonce without consulting object equality."""
+    session_id = id(session)
+    entry = _SERVER_ACTOR_FALLBACK_SESSIONS.get(session_id)
+    if entry is not None:
+        if entry.session is session:
+            entry.expires_at_monotonic = (
+                now_monotonic + _SERVER_ACTOR_FALLBACK_TTL_SECONDS
+            )
+            _SERVER_ACTOR_FALLBACK_SESSIONS.pop(session_id)
+            _SERVER_ACTOR_FALLBACK_SESSIONS[session_id] = entry
+            return entry.session_nonce
+        # The strong reference makes this unreachable under normal Python id rules.
+        # If those assumptions ever change, rotate instead of aliasing the objects.
+        _SERVER_ACTOR_FALLBACK_SESSIONS.pop(session_id)
+
+    while len(_SERVER_ACTOR_FALLBACK_SESSIONS) >= _SERVER_ACTOR_FALLBACK_MAX_SESSIONS:
+        oldest_session_id = next(iter(_SERVER_ACTOR_FALLBACK_SESSIONS))
+        _SERVER_ACTOR_FALLBACK_SESSIONS.pop(oldest_session_id)
+
+    session_nonce = secrets.token_hex(32)
+    _SERVER_ACTOR_FALLBACK_SESSIONS[session_id] = _ServerActorFallbackSession(
+        session,
+        session_nonce,
+        now_monotonic + _SERVER_ACTOR_FALLBACK_TTL_SECONDS,
+    )
+    return session_nonce
+
+
 def issue_server_runtime_actor_identity(
     session: Any,
     *,
@@ -204,16 +292,14 @@ def issue_server_runtime_actor_identity(
     if _OWNER_RE.fullmatch(profile) is None:
         raise ValueError("server runtime actor profile is invalid")
     with _SERVER_ACTOR_LOCK:
-        try:
-            session_nonce = _SERVER_ACTOR_SESSIONS.get(session)
-        except TypeError as exc:
-            raise ValueError("server runtime actor session must support weak references") from exc
+        now_monotonic = time.monotonic()
+        _prune_server_actor_fallback_sessions(now_monotonic=now_monotonic)
+        session_nonce = _server_actor_weak_session_nonce(session)
         if session_nonce is None:
-            session_nonce = secrets.token_hex(32)
-            try:
-                _SERVER_ACTOR_SESSIONS[session] = session_nonce
-            except TypeError as exc:
-                raise ValueError("server runtime actor session must support weak references") from exc
+            session_nonce = _server_actor_fallback_session_nonce(
+                session,
+                now_monotonic=now_monotonic,
+            )
     owner_digest = hmac.new(
         _SERVER_ACTOR_SECRET,
         b"owner\x00" + session_nonce.encode("ascii") + b"\x00" + profile.encode("utf-8"),

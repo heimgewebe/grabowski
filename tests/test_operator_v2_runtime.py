@@ -908,6 +908,58 @@ class OperatorV2RuntimeTests(unittest.TestCase):
                     unavailable["output"]["error"],
                 )
 
+    def test_captain_surface_accepts_incompatible_runtime_session(self) -> None:
+        class Session:
+            __slots__ = ()
+
+        class RequestContext:
+            session = Session()
+
+        parameters = {
+            "actions": [],
+            "session_escalation": {
+                "target": {"repo": "heimgewebe/grabowski"},
+                "reason": "bounded regression",
+            },
+        }
+        with (
+            patch.object(grabowski_mcp, "_require_capability"),
+            patch.object(grabowski_mcp, "_require_mutations_enabled"),
+            patch.object(
+                grabowski_mcp,
+                "_session_grip_policy_decision",
+                return_value={
+                    "allowed": True,
+                    "session_profile": {"profile": "test"},
+                },
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_captain_audit_intent",
+                return_value={"audit_record_sha256": "a" * 64},
+            ),
+            patch.object(
+                grabowski_mcp,
+                "_captain_audit_completion",
+                return_value={"audit_record_sha256": "b" * 64},
+            ),
+            patch.object(
+                grabowski_mcp.grabowski_grips, "_default_github_runner"
+            ) as github,
+        ):
+            result = grabowski_mcp._grip_run_core(
+                "captain-run",
+                parameters,
+                profile="captain",
+                allow_mutation=True,
+                ctx=RequestContext(),
+            )
+
+        self.assertEqual("blocked", result["receipt"]["status"])
+        self.assertEqual("actions must be a non-empty list", result["output"]["error"])
+        self.assertNotIn("server runtime lease identity failed", json.dumps(result))
+        github.assert_not_called()
+
     def test_session_forbidden_hosts_block_operator_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
