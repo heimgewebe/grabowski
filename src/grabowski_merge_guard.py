@@ -2882,8 +2882,18 @@ class CaptainMergeGuardRunner:
 
         self.resource_keys = list(self.acquisition["resource_keys"])
         self.held_resource_keys = list(self.acquisition["held_resource_keys"])
+        operation_nonconflicts = list(
+            self.acquisition.get("operation_nonconflicts", [])
+        )
+        operation_nonconflicts_sha256 = self.acquisition.get(
+            "operation_nonconflicts_sha256"
+        )
+        if operation_nonconflicts_sha256 != _sha256_json(operation_nonconflicts):
+            raise RuntimeError("merge lease guard operation non-conflict evidence drift")
         lease_snapshot = {
             "observed_leases": self.acquisition["observed_leases"],
+            "operation_nonconflicts": operation_nonconflicts,
+            "operation_nonconflicts_sha256": operation_nonconflicts_sha256,
             "acquired_leases": self.acquisition["acquired_leases"],
             "held_resource_keys": self.held_resource_keys,
         }
@@ -2901,6 +2911,8 @@ class CaptainMergeGuardRunner:
                 "changed_paths": bindings["changed_paths"],
                 "changed_paths_sha256": bindings["changed_paths_sha256"],
                 "held_resource_keys": self.held_resource_keys,
+                "operation_nonconflicts": operation_nonconflicts,
+                "operation_nonconflicts_sha256": operation_nonconflicts_sha256,
                 "guard_acquired_at_unix": self.acquisition["observed_at_unix"],
                 "lease_snapshot_observed_at_unix_ns": self.acquisition[
                     "observed_at_unix_ns"
