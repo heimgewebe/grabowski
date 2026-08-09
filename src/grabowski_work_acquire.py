@@ -13,6 +13,7 @@ import uuid
 from typing import Any, Callable, Iterator
 
 import grabowski_checkouts as checkouts
+import grabowski_lane_closeout as lane_closeout
 import grabowski_operator_core as operator
 import grabowski_resources as resources
 import grabowski_work_admission as work_admission
@@ -141,12 +142,284 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     return value
 
 
+def _stored_lane_inputs(lane_id: str) -> dict[str, Any]:
+    _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
+    with _lane_lock(lane_id) as receipt_path:
+        record = _read_state(receipt_path)
+    if record is None or record.get("lane_id") != lane_id:
+        raise RuntimeError("work-lane receipt is missing or bound to another lane")
+    inputs = record.get("inputs")
+    if not isinstance(inputs, dict) or record.get("inputs_sha256") != _sha(inputs):
+        raise RuntimeError("work-lane stored inputs are invalid")
+    if inputs.get("lane_id") != lane_id or inputs.get("lease_owner_id") != f"lane:{lane_id}":
+        raise RuntimeError("work-lane stored input identity is invalid")
+    identity = {
+        key: value
+        for key, value in inputs.items()
+        if key not in {"lane_id", "lease_owner_id", "ttl_seconds"}
+    }
+    if _sha(identity)[:32] != lane_id:
+        raise RuntimeError("work-lane stored identity digest is invalid")
+    return dict(inputs)
+
+
+def _closeout_inputs(parameters: dict[str, Any], lane_id: str) -> dict[str, Any]:
+    """Bind closeout to durable lane identity without re-resolving mutable paths."""
+    if not isinstance(parameters, dict):
+        raise ValueError("parameters must be an object")
+    inputs = _stored_lane_inputs(lane_id)
+
+    controller_actor = _text(
+        parameters.get("controller_actor"), "controller_actor", pattern=ACTOR_RE
+    )
+    if parameters.get("controller_role", "controller") != "controller":
+        raise ValueError("controller_role must be controller")
+    writer = parameters.get("scoped_writer_actor")
+    if writer is not None:
+        writer = _text(writer, "scoped_writer_actor", pattern=ACTOR_RE)
+        if writer == controller_actor:
+            raise ValueError("scoped_writer_actor must differ from controller_actor")
+    source_kind, source_id = checkouts._source_binding(
+        _text(parameters.get("source_kind"), "source_kind"),
+        _text(parameters.get("source_id"), "source_id"),
+    )
+    _text(parameters.get("repo"), "repo")
+    target = Path(_text(parameters.get("target_path"), "target_path")).expanduser()
+    if not target.is_absolute():
+        raise ValueError("target_path must be absolute")
+    branch = _text(parameters.get("branch"), "branch")
+    base_head = _text(parameters.get("base_head"), "base_head").lower()
+    if SHA40_RE.fullmatch(base_head) is None:
+        raise ValueError("base_head must be an exact lowercase 40-character commit")
+    purpose = checkouts._purpose(_text(parameters.get("purpose"), "purpose"))
+    artifact_class = checkouts._artifact_class(
+        parameters.get("artifact_class", "implementation-worktree")
+    )
+    retention = parameters.get("retention_until_unix")
+    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 0:
+        raise ValueError("retention_until_unix must be a non-negative integer timestamp")
+    ttl = parameters.get("ttl_seconds", 7200)
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
+        raise ValueError("ttl_seconds must be between 120 and 86400")
+    idempotency_key = _text(
+        parameters.get("idempotency_key"), "idempotency_key", pattern=IDEMPOTENCY_RE
+    )
+    system_convergence = parameters.get("system_convergence")
+    if system_convergence is not None and not isinstance(system_convergence, dict):
+        raise ValueError("system_convergence must be an object or null")
+    requested = parameters.get("resource_keys") or []
+    if not isinstance(requested, list) or not all(isinstance(item, str) for item in requested):
+        raise ValueError("resource_keys must be a list of strings")
+    write_paths = parameters.get("write_paths")
+    if write_paths is not None:
+        if not isinstance(write_paths, list) or len(write_paths) > MAX_WRITE_PATHS:
+            raise ValueError(
+                f"write_paths must be a list with at most {MAX_WRITE_PATHS} entries"
+            )
+        for index, item in enumerate(write_paths):
+            _text(item, f"write_paths[{index}]")
+    writer_argv = _scoped_writer_argv(parameters.get("scoped_writer_argv"), writer)
+    writer_runtime = parameters.get("scoped_writer_runtime_seconds", 7200)
+    if (
+        isinstance(writer_runtime, bool)
+        or not isinstance(writer_runtime, int)
+        or not 120 <= writer_runtime <= 86400
+    ):
+        raise ValueError(
+            "scoped_writer_runtime_seconds must be between 120 and 86400"
+        )
+    writer_command = None
+    if writer_argv is not None:
+        writer_command = {
+            "argv_sha256": _sha(writer_argv),
+            "argc": len(writer_argv),
+            "runtime_seconds": writer_runtime,
+        }
+
+    expected = {
+        "source": {"kind": source_kind, "id": source_id},
+        "controller": {"actor": controller_actor, "role": "controller"},
+        "scoped_writer": ({"actor": writer, "role": "scoped_writer"} if writer else None),
+        "base_head": base_head,
+        "branch": branch,
+        "purpose": purpose,
+        "artifact_class": artifact_class,
+        "retention_until_unix": retention,
+        "idempotency_key": idempotency_key,
+        "system_convergence": (
+            dict(system_convergence) if system_convergence is not None else None
+        ),
+        "ttl_seconds": ttl,
+        "scoped_writer_command": writer_command,
+    }
+    stored = {key: inputs.get(key) for key in expected}
+    if stored != expected:
+        raise RuntimeError("terminal closeout parameters do not match stored work lane inputs")
+    return inputs
+
+
+def _terminal_assessment_replay_sha256(assessment: dict[str, Any]) -> str:
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    material = {
+        key: item
+        for key, item in validated.items()
+        if key
+        not in {
+            "observed_at_unix",
+            "assessment_sha256",
+            "audit_record_sha256",
+            "does_not_establish",
+        }
+    }
+    return _sha(material)
+
+
+def _terminal_closeout_assessment(record: dict[str, Any]) -> dict[str, Any] | None:
+    terminal = record.get("terminal_closeout")
+    if terminal is None:
+        return None
+    if not isinstance(terminal, dict) or terminal.get("schema_version") != 1 or terminal.get("kind") != "grabowski.work_lane_terminal_closeout":
+        raise RuntimeError("work-lane terminal closeout wrapper is invalid")
+    assessment = terminal.get("assessment")
+    if not isinstance(assessment, dict):
+        raise RuntimeError("work-lane terminal closeout assessment is missing")
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if (validated.get("lane_id") != record.get("lane_id")
+        or terminal.get("closeout_state") != validated.get("closeout_state")
+        or terminal.get("assessment_sha256") != validated.get("assessment_sha256")):
+        raise RuntimeError("work-lane terminal closeout binding is invalid")
+    return validated
+
+
 def _text(value: Any, label: str, *, pattern: re.Pattern[str] | None = None) -> str:
     if not isinstance(value, str) or not value.strip() or value != value.strip() or "\x00" in value:
         raise ValueError(f"{label} must be trimmed non-empty text")
     if pattern is not None and pattern.fullmatch(value) is None:
         raise ValueError(f"{label} has an invalid format")
     return value
+
+
+def _terminal_closeout_audit_event(
+    record: dict[str, Any], assessment: dict[str, Any]
+) -> dict[str, Any]:
+    terminal = record.get("terminal_closeout")
+    if not isinstance(terminal, dict):
+        raise RuntimeError("work-lane terminal closeout wrapper is missing")
+    expected_preimage = terminal.get("expected_receipt_sha256")
+    receipt_sha256 = record.get("receipt_sha256")
+    if (
+        not isinstance(expected_preimage, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_preimage) is None
+        or not isinstance(receipt_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_sha256) is None
+    ):
+        raise RuntimeError("work-lane terminal closeout audit binding is invalid")
+    material = {
+        "operation": "work-lane-terminal-closeout",
+        "lane_id": record["lane_id"],
+        "state": "persisted",
+        "closeout_state": assessment["closeout_state"],
+        "assessment_sha256": assessment["assessment_sha256"],
+        "receipt_sha256": receipt_sha256,
+        "expected_receipt_sha256": expected_preimage,
+    }
+    return {**material, "terminal_transition_sha256": _sha(material)}
+
+
+def _find_terminal_closeout_audit(event: dict[str, Any]) -> str | None:
+    records, status = operator.base._audit_records_snapshot()
+    if not status.get("valid"):
+        raise RuntimeError("audit snapshot is invalid during terminal closeout recovery")
+    matches = [
+        record
+        for record in records
+        if all(record.get(key) == value for key, value in event.items())
+    ]
+    if len(matches) > 1:
+        raise RuntimeError("terminal closeout audit contains duplicate transition records")
+    if not matches:
+        return None
+    digest = matches[0].get("record_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise RuntimeError("terminal closeout audit record digest is invalid")
+    return digest
+
+
+def _ensure_terminal_closeout_audit(
+    record: dict[str, Any],
+    assessment: dict[str, Any],
+    *,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None,
+) -> str | None:
+    if audit_fn is None:
+        if audit_lookup_fn is not None:
+            raise ValueError("audit_lookup_fn requires audit_fn")
+        return None
+    if audit_lookup_fn is None:
+        raise ValueError("audit_fn requires audit_lookup_fn for retry-safe closeout")
+    event = _terminal_closeout_audit_event(record, assessment)
+    existing = audit_lookup_fn(event)
+    if existing is not None:
+        if not isinstance(existing, str) or re.fullmatch(r"[0-9a-f]{64}", existing) is None:
+            raise RuntimeError("terminal closeout audit lookup returned an invalid digest")
+        return existing
+    appended = audit_fn(event)
+    if not isinstance(appended, str) or re.fullmatch(r"[0-9a-f]{64}", appended) is None:
+        raise RuntimeError("terminal closeout audit append returned an invalid digest")
+    readback = audit_lookup_fn(event)
+    if readback != appended:
+        raise RuntimeError("terminal closeout audit append readback mismatch")
+    return appended
+
+
+def persist_terminal_closeout(
+    lane_id: str,
+    assessment: dict[str, Any],
+    *,
+    expected_receipt_sha256: str,
+    audit_fn: Callable[[dict[str, Any]], str | None] | None = None,
+    audit_lookup_fn: Callable[[dict[str, Any]], str | None] | None = None,
+) -> dict[str, Any]:
+    """CAS-persist one terminal assessment into the existing lane receipt."""
+    _text(lane_id, "lane_id", pattern=re.compile(r"[0-9a-f]{32}\Z"))
+    _text(expected_receipt_sha256, "expected_receipt_sha256", pattern=re.compile(r"[0-9a-f]{64}\Z"))
+    validated = lane_closeout.validate_terminal_assessment(assessment)
+    if validated.get("lane_id") != lane_id:
+        raise RuntimeError("terminal closeout assessment is bound to another lane")
+    wrapper = {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane_terminal_closeout",
+        "closeout_state": validated["closeout_state"],
+        "assessment_sha256": validated["assessment_sha256"],
+        "expected_receipt_sha256": expected_receipt_sha256,
+        "assessment": validated,
+    }
+    with _lane_lock(lane_id) as receipt_path:
+        record = _read_state(receipt_path)
+        if record is None or record.get("lane_id") != lane_id:
+            raise RuntimeError("work-lane receipt is missing or bound to another lane")
+        existing = _terminal_closeout_assessment(record)
+        if existing is not None:
+            if _terminal_assessment_replay_sha256(existing) != _terminal_assessment_replay_sha256(validated):
+                raise RuntimeError("work-lane already records another terminal assessment")
+            audit_record_sha256 = _ensure_terminal_closeout_audit(
+                record, existing, audit_fn=audit_fn, audit_lookup_fn=audit_lookup_fn
+            )
+            result = {**record, "durable_receipt_path": str(receipt_path), "replayed": True}
+            if audit_record_sha256 is not None:
+                result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
+            return result
+        if record.get("receipt_sha256") != expected_receipt_sha256:
+            raise RuntimeError("work-lane terminal closeout CAS preimage changed")
+        stored = _write_state(receipt_path, {**record, "terminal_closeout": wrapper, "updated_at_unix": int(time.time())})
+        result = {**stored, "durable_receipt_path": str(receipt_path), "replayed": False}
+        audit_record_sha256 = _ensure_terminal_closeout_audit(
+            stored, validated, audit_fn=audit_fn, audit_lookup_fn=audit_lookup_fn
+        )
+        if audit_record_sha256 is not None:
+            result["terminal_closeout_audit_record_sha256"] = audit_record_sha256
+        return result
 
 
 def _write_path_resource_keys(repo: Path, value: Any) -> list[str]:
@@ -225,7 +498,9 @@ def _writer_job_receipt(result: dict[str, Any]) -> dict[str, Any]:
     return {**receipt, "receipt_sha256": _sha(receipt)}
 
 
-def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
+def _normalize(
+    parameters: dict[str, Any], *, require_fresh_retention: bool = True
+) -> dict[str, Any]:
     if not isinstance(parameters, dict):
         raise ValueError("parameters must be an object")
     controller_actor = _text(parameters.get("controller_actor"), "controller_actor", pattern=ACTOR_RE)
@@ -259,7 +534,13 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("base_head must be an exact lowercase 40-character commit")
     purpose = checkouts._purpose(_text(parameters.get("purpose"), "purpose"))
     artifact_class = checkouts._artifact_class(parameters.get("artifact_class", "implementation-worktree"))
-    retention = checkouts._retention_until(parameters.get("retention_until_unix"))
+    retention_value = parameters.get("retention_until_unix")
+    if require_fresh_retention:
+        retention = checkouts._retention_until(retention_value)
+    else:
+        if not isinstance(retention_value, int) or isinstance(retention_value, bool) or retention_value < 0:
+            raise ValueError("retention_until_unix must be a non-negative integer timestamp")
+        retention = retention_value
     ttl = parameters.get("ttl_seconds", 7200)
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 120 <= ttl <= 86400:
         raise ValueError("ttl_seconds must be between 120 and 86400")
@@ -267,7 +548,9 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
     system_convergence = parameters.get("system_convergence")
     if system_convergence is not None and not isinstance(system_convergence, dict):
         raise ValueError("system_convergence must be an object or null")
-    system_convergence_plan = work_admission.plan_system_convergence(system_convergence)
+    normalized_system_convergence_plan = work_admission.plan_system_convergence(
+        system_convergence
+    )
     normalized_system_convergence = (
         dict(system_convergence) if system_convergence is not None else None
     )
@@ -303,7 +586,7 @@ def _normalize(parameters: dict[str, Any]) -> dict[str, Any]:
         "resource_keys": resource_keys,
         "idempotency_key": idempotency_key,
         "system_convergence": normalized_system_convergence,
-        "system_convergence_plan": system_convergence_plan,
+        "system_convergence_plan": normalized_system_convergence_plan,
     }
     if writer_argv is not None:
         identity["scoped_writer_command"] = {
@@ -381,6 +664,8 @@ def acquire_work(
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
             raise RuntimeError("work-lane identity collision")
+        if existing is not None and _terminal_closeout_assessment(existing) is not None:
+            return {**existing, "durable_receipt_path": str(receipt_path), "replayed": True}
         existing_writer_job = (
             existing.get("writer_job")
             if isinstance(existing, dict) and isinstance(existing.get("writer_job"), dict)
@@ -817,8 +1102,79 @@ def grabowski_work_acquire(
     system_convergence: dict[str, Any] | None = None,
     artifact_class: str = "implementation-worktree",
     ttl_seconds: int = 7200,
+    terminal_closeout: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Atomically acquire a lane, narrow leases and an exact isolated worktree."""
+    """Acquire a work lane, or persist its evidence-bound terminal closeout."""
+    parameters = {
+        "source_kind": source_kind,
+        "source_id": source_id,
+        "controller_actor": controller_actor,
+        "controller_role": "controller",
+        "scoped_writer_actor": scoped_writer_actor,
+        "repo": repo,
+        "base_head": base_head,
+        "branch": branch,
+        "target_path": target_path,
+        "purpose": purpose,
+        "retention_until_unix": retention_until_unix,
+        "idempotency_key": idempotency_key,
+        "resource_keys": resource_keys or [],
+        "write_paths": write_paths,
+        "scoped_writer_argv": scoped_writer_argv,
+        "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
+        "system_convergence": system_convergence,
+        "artifact_class": artifact_class,
+        "ttl_seconds": ttl_seconds,
+    }
+    if terminal_closeout is not None:
+        if not isinstance(terminal_closeout, dict) or set(terminal_closeout) != {
+            "expected_receipt_sha256",
+            "observation",
+        }:
+            raise ValueError(
+                "terminal_closeout must contain exactly expected_receipt_sha256 and observation"
+            )
+        observation = terminal_closeout["observation"]
+        if not isinstance(observation, dict):
+            raise ValueError("terminal_closeout.observation must be an object")
+        try:
+            observed = lane_closeout.LaneCloseoutObservation(**observation)
+        except TypeError as exc:
+            raise ValueError(f"terminal_closeout observation shape is invalid: {exc}") from exc
+        inputs = _closeout_inputs(parameters, observed.lane_id)
+        operator._require_operator_mutation(
+            "resource_lease", path=inputs["target_path"], repo=inputs["repo"]
+        )
+        expected_observation_identity = {
+            "repository": inputs["repo"],
+            "workspace": inputs["target_path"],
+            "branch": inputs["branch"],
+            "base_revision": inputs["base_head"],
+        }
+        observed_identity = {
+            field: getattr(observed, field) for field in expected_observation_identity
+        }
+        if observed_identity != expected_observation_identity:
+            raise RuntimeError(
+                "terminal closeout observation identity does not match work lane inputs"
+            )
+        assessment = lane_closeout.assess(observed)
+        if assessment.get("lane_id") != inputs["lane_id"]:
+            raise RuntimeError("terminal closeout observation is bound to another lane")
+        if assessment.get("phase") != "terminal":
+            return {
+                "status": "nonterminal",
+                "persisted": False,
+                "lane_id": inputs["lane_id"],
+                "assessment": assessment,
+            }
+        return persist_terminal_closeout(
+            inputs["lane_id"],
+            assessment,
+            expected_receipt_sha256=terminal_closeout["expected_receipt_sha256"],
+            audit_fn=operator.base._append_audit_with_digest,
+            audit_lookup_fn=_find_terminal_closeout_audit,
+        )
     operator._require_operator_mutation("resource_lease", path=target_path, repo=repo)
     operator._require_operator_capability("git_cli")
     if scoped_writer_argv is not None:
@@ -828,27 +1184,4 @@ def grabowski_work_acquire(
             repo=repo,
             opaque_command=True,
         )
-    return acquire_work(
-        {
-            "source_kind": source_kind,
-            "source_id": source_id,
-            "controller_actor": controller_actor,
-            "controller_role": "controller",
-            "scoped_writer_actor": scoped_writer_actor,
-            "repo": repo,
-            "base_head": base_head,
-            "branch": branch,
-            "target_path": target_path,
-            "purpose": purpose,
-            "retention_until_unix": retention_until_unix,
-            "idempotency_key": idempotency_key,
-            "resource_keys": resource_keys or [],
-            "write_paths": write_paths,
-            "scoped_writer_argv": scoped_writer_argv,
-            "scoped_writer_runtime_seconds": scoped_writer_runtime_seconds,
-            "system_convergence": system_convergence,
-            "artifact_class": artifact_class,
-            "ttl_seconds": ttl_seconds,
-        },
-        audit_fn=operator.base._append_audit,
-    )
+    return acquire_work(parameters, audit_fn=operator.base._append_audit)

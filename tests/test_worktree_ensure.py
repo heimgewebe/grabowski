@@ -228,9 +228,12 @@ class WorktreeEnsureTests(unittest.TestCase):
             branch="feat/limit-second",
             target=self.worktree_root / "limit-second",
         )
+        def allow_admission(**_kwargs: object) -> dict[str, object]:
+            return {"decision": "allow", "blocker_codes": []}
+
         with patch.object(checkouts, "MAX_ACTIVE_CHECKOUTS_PER_REPO", 1):
-            created = self._ensure(first)
-            blocked = self._ensure(second)
+            created = self._ensure(first, assess_admission=allow_admission)
+            blocked = self._ensure(second, assess_admission=allow_admission)
 
         self.assertEqual(created["result_state"], "CREATED")
         self.assertEqual(blocked["result_state"], "NOT_ACCEPTED")

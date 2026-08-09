@@ -335,6 +335,16 @@ class LaneCloseoutTests(unittest.TestCase):
         self.assertIn("workspace_cleanup_authority", result["does_not_establish"])
         self.assertEqual(records[0]["operation"], "lane-closeout-assessment")
 
+    def test_terminal_assessment_validator_rejects_tampering(self) -> None:
+        assessment = closeout.assess(
+            self.observation(pr_number=631, pr_state="open", pr_head_sha=HEAD),
+            observed_at_unix=200,
+        )
+        self.assertEqual(closeout.validate_terminal_assessment(assessment), assessment)
+        assessment["reason_codes"] = ["tampered"]
+        with self.assertRaisesRegex(closeout.LaneCloseoutError, "digest mismatch"):
+            closeout.validate_terminal_assessment(assessment)
+
     def test_unknown_live_observation_fails_to_rescue(self) -> None:
         result = closeout.classify(self.observation(process_active=None))
         self.assertEqual(result["phase"], "rescue_required")
