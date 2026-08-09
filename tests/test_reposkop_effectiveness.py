@@ -1294,6 +1294,59 @@ class ReposkopEffectivenessTests(unittest.TestCase):
             self.assertEqual(marker["audit_ref"], _ref("e"))
             self.assertRegex(calls[0]["outcome_event_sha256"], r"^[0-9a-f]{64}$")
 
+    def test_find_event_by_identity_returns_oldest_exact_verified_event(self) -> None:
+        identity = {
+            "operation": "reposkop-checkout-shadow-terminal-observed",
+            "task_id": "task-1",
+            "terminalization_sha256": "a" * 64,
+            "lifecycle_receipt_sha256": "b" * 64,
+        }
+        first = {**identity, "shadow_status": "unavailable", "record_sha256": "1" * 64}
+        other = {**identity, "shadow_status": "completed", "record_sha256": "2" * 64}
+        segment = types.SimpleNamespace(records=2)
+        snapshot = types.SimpleNamespace(
+            total_records=2,
+            segments=(segment,),
+            chain_content_sha256="c" * 64,
+            chain_materialization_sha256="d" * 64,
+        )
+        payload = (
+            json.dumps(first, sort_keys=True).encode("utf-8")
+            + b"\n"
+            + json.dumps(other, sort_keys=True).encode("utf-8")
+            + b"\n"
+        )
+        with patch.object(
+            effectiveness.audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ), patch.object(
+            effectiveness.audit_query,
+            "_load_snapshot_segment",
+            return_value=payload,
+        ):
+            result = effectiveness.find_event_by_identity(identity)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["audit_ref"], _ref("1"))
+        self.assertEqual(result["record"]["shadow_status"], "unavailable")
+        self.assertEqual(result["global_ordinal"], 1)
+        self.assertTrue(result["source"]["scan_complete"])
+
+    def test_find_event_by_identity_fails_closed_when_scan_is_truncated(self) -> None:
+        snapshot = types.SimpleNamespace(
+            total_records=2,
+            segments=(),
+            chain_content_sha256="c" * 64,
+            chain_materialization_sha256="d" * 64,
+        )
+        with patch.object(
+            effectiveness.audit_query,
+            "capture_verified_audit_snapshot",
+            return_value=snapshot,
+        ), self.assertRaisesRegex(RuntimeError, "bounded exact event identity scan"):
+            effectiveness.find_event_by_identity({"operation": "x"}, scan_limit=1)
+
     def test_append_event_rejects_unbounded_or_sensitive_fields(self) -> None:
         for field in ("argv", "prompt", "raw_report", "stderr", "error"):
             with self.subTest(field=field), self.assertRaisesRegex(

@@ -709,6 +709,68 @@ def append_event(record: dict[str, Any]) -> str:
     return f"audit-record-sha256:{digest}"
 
 
+def find_event_by_identity(
+    identity: dict[str, Any],
+    *,
+    scan_limit: int = MAX_REVIEW_SCAN_RECORDS,
+) -> dict[str, Any] | None:
+    """Return the oldest exact event from one complete verified audit snapshot."""
+    if not isinstance(identity, dict) or not identity:
+        raise ValueError("identity must be a non-empty object")
+    if any(not isinstance(key, str) or not key for key in identity):
+        raise ValueError("identity keys must be non-empty strings")
+    if (
+        not isinstance(scan_limit, int)
+        or isinstance(scan_limit, bool)
+        or scan_limit < 1
+    ):
+        raise ValueError("scan_limit must be a positive integer")
+
+    snapshot = audit_query.capture_verified_audit_snapshot()
+    if snapshot.total_records > scan_limit:
+        raise RuntimeError(
+            "verified audit chain exceeds the bounded exact event identity scan"
+        )
+
+    global_ordinal = 0
+    for segment in snapshot.segments:
+        data = audit_query._load_snapshot_segment(segment)
+        lines = data.splitlines()
+        if len(lines) != segment.records:
+            raise RuntimeError(
+                "verified audit segment changed during exact event identity scan"
+            )
+        for raw_line in lines:
+            global_ordinal += 1
+            try:
+                parsed = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "verified audit record decode invariant violated during exact event identity scan"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError(
+                    "verified audit exact event identity scan yielded a non-object record"
+                )
+            if any(parsed.get(key) != expected for key, expected in identity.items()):
+                continue
+            digest = parsed.get("record_sha256")
+            if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+                digest = hashlib.sha256(raw_line).hexdigest()
+            return {
+                "audit_ref": f"audit-record-sha256:{digest}",
+                "record": parsed,
+                "global_ordinal": global_ordinal,
+                "source": {
+                    "chain_content_sha256": snapshot.chain_content_sha256,
+                    "chain_materialization_sha256": snapshot.chain_materialization_sha256,
+                    "total_records": snapshot.total_records,
+                    "scan_complete": True,
+                },
+            }
+    return None
+
+
 def enrich_attestation(
     attestation: dict[str, Any],
     *,

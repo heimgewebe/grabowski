@@ -131,10 +131,17 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
             "append_event",
             side_effect=self._append_event,
         )
+        self.audit_lookup_patch = patch.object(
+            shadow.reposkop_effectiveness,
+            "find_event_by_identity",
+            side_effect=self._find_event_by_identity,
+        )
         self.root_patch.start()
         self.audit_patch.start()
+        self.audit_lookup_patch.start()
 
     def tearDown(self) -> None:
+        self.audit_lookup_patch.stop()
         self.audit_patch.stop()
         self.root_patch.stop()
         self.temporary.cleanup()
@@ -142,6 +149,18 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
     def _append_event(self, event: dict[str, object]) -> str:
         self.events.append(dict(event))
         return "audit-record-sha256:" + f"{len(self.events):064x}"
+
+    def _find_event_by_identity(
+        self, identity: dict[str, object], **_kwargs: object
+    ) -> dict[str, object] | None:
+        for index, event in enumerate(self.events, start=1):
+            if all(event.get(key) == expected for key, expected in identity.items()):
+                return {
+                    "audit_ref": "audit-record-sha256:" + f"{index:064x}",
+                    "record": dict(event),
+                    "global_ordinal": index,
+                }
+        return None
 
     def test_success_persists_bound_artifacts_and_exact_terminal_audit_once(self) -> None:
         task_id = "0123456789abcdef01234567"
@@ -465,6 +484,68 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
         self.assertIs(terminal_event["decision_effect"], False)
         self.assertIs(terminal_event["effect_authorized"], False)
         terminal_path = shadow._paths(self.evidence_root, task_id)["terminal_binding"]
+        self.assertFalse(terminal_path.exists())
+
+    def test_terminal_fallback_audit_is_reused_after_private_storage_recovers(self) -> None:
+        task_id = "terminal-fallback-replay"
+        purpose = f"grabowski-task-shadow:{shadow._task_key(task_id)[:32]}"
+        before = _observation(self.workspace, purpose, identity="1")
+        after = _observation(self.workspace, purpose, identity="1")
+        continuity = _continuity(before, after, state="intact")
+
+        def run(
+            command: str,
+            target: Path,
+            *,
+            purpose: str,
+            expected_artifact: Path | None = None,
+        ) -> tuple[dict[str, object], str]:
+            if command == "inspect":
+                return before, "a" * 64
+            return continuity, "a" * 64
+
+        with patch.object(shadow, "_run_reposkop", side_effect=run):
+            before_result = shadow.capture_before_best_effort(
+                task_id=task_id,
+                workspace=str(self.workspace),
+                evaluation_id="a" * 64,
+                reposkop_cohort="prospective_control",
+            )
+            prepared = shadow.prepare_terminal_best_effort(
+                task_id=task_id,
+                before_summary=before_result,
+            )
+
+        with patch.object(
+            shadow,
+            "_ensure_root",
+            side_effect=PermissionError("terminal shadow root inaccessible"),
+        ):
+            first = shadow.finalize_terminal_best_effort(
+                task_id=task_id,
+                terminalization_sha256="3" * 64,
+                lifecycle_receipt_sha256="4" * 64,
+                prepared=prepared,
+            )
+
+        terminal_path = shadow._paths(self.evidence_root, task_id)["terminal_binding"]
+        self.assertFalse(terminal_path.exists())
+        self.assertEqual(first["status"], "unavailable")
+        self.assertEqual(first["failure_category"], "permission_unavailable")
+        self.assertEqual(len(self.events), 2)
+
+        replay = shadow.finalize_terminal_best_effort(
+            task_id=task_id,
+            terminalization_sha256="3" * 64,
+            lifecycle_receipt_sha256="4" * 64,
+            prepared=prepared,
+        )
+
+        self.assertEqual(replay["status"], "unavailable")
+        self.assertEqual(replay["failure_category"], "permission_unavailable")
+        self.assertEqual(replay["audit_ref"], first["audit_ref"])
+        self.assertEqual(replay["evidence_sha256"], first["evidence_sha256"])
+        self.assertEqual(len(self.events), 2)
         self.assertFalse(terminal_path.exists())
 
     def test_non_repository_is_not_sent_to_reposkop(self) -> None:

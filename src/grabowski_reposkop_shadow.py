@@ -629,6 +629,71 @@ def _public_summary(binding: dict[str, Any], audit_ref: str | None) -> dict[str,
     } | {"audit_ref": audit_ref}
 
 
+def _existing_terminal_audit_summary(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+) -> dict[str, Any] | None:
+    found = reposkop_effectiveness.find_event_by_identity(
+        {
+            "operation": TERMINAL_OPERATION,
+            "task_id": task_id,
+            "terminalization_sha256": terminalization_sha256,
+            "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        }
+    )
+    if found is None:
+        return None
+    record = found.get("record")
+    audit_ref = found.get("audit_ref")
+    if (
+        not isinstance(record, dict)
+        or not isinstance(audit_ref, str)
+        or record.get("operation") != TERMINAL_OPERATION
+        or record.get("task_id") != task_id
+        or record.get("terminalization_sha256") != terminalization_sha256
+        or record.get("lifecycle_receipt_sha256") != lifecycle_receipt_sha256
+        or record.get("shadow_phase") != "terminal"
+        or record.get("shadow_status") not in {"completed", "unavailable"}
+        or record.get("attempted") is not True
+        or record.get("measurement_only") is not True
+        or record.get("decision_effect") is not False
+        or record.get("effect_authorized") is not False
+    ):
+        raise ReposkopShadowError(
+            "existing Reposkop terminal audit event failed validation",
+            category="evidence_integrity_error",
+        )
+    evidence_sha256 = record.get("shadow_evidence_sha256")
+    if (
+        not isinstance(evidence_sha256, str)
+        or SHA256_RE.fullmatch(evidence_sha256) is None
+    ):
+        raise ReposkopShadowError(
+            "existing Reposkop terminal audit evidence digest is invalid",
+            category="evidence_integrity_error",
+        )
+    binding = {
+        "phase": "terminal",
+        "status": record["shadow_status"],
+        "task_id": task_id,
+        "evaluation_id": record.get("evaluation_id"),
+        "reposkop_cohort": record.get("reposkop_cohort"),
+        "before_observation_sha256": record.get("before_observation_sha256"),
+        "after_observation_sha256": record.get("after_observation_sha256"),
+        "transition_sha256": record.get("transition_sha256"),
+        "continuity_sha256": record.get("continuity_sha256"),
+        "continuity_state": record.get("continuity_state"),
+        "measurement_class": record.get("measurement_class"),
+        "failure_category": record.get("failure_category"),
+        "evidence_sha256": evidence_sha256,
+        "decision_effect": False,
+        "effect_authorized": False,
+    }
+    return _public_summary(binding, audit_ref)
+
+
 def capture_before_best_effort(
     *,
     task_id: str,
@@ -939,8 +1004,15 @@ def finalize_terminal_best_effort(
         ):
             return None
         prepared = _validated_terminal_prepare(dict(prepared), task_id=task_id)
+        existing_audit = _existing_terminal_audit_summary(
+            task_id=task_id,
+            terminalization_sha256=terminalization_sha256,
+            lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+        )
     except Exception:
         return None
+    if existing_audit is not None:
+        return existing_audit
     material = {
         "schema_version": 1,
         "kind": "grabowski.reposkop_checkout_shadow_evidence",
