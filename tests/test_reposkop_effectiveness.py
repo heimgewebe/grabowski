@@ -257,6 +257,88 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertNotIn("secret internal reason", summary["finding_reason_codes"])
         self.assertNotIn("private raw detail", json.dumps(summary))
 
+    def test_local_authority_v3_ignores_foreign_authority_noise(self) -> None:
+        report = {
+            "schema_version": 3,
+            "observation": {
+                "errors": [],
+                "git": {
+                    "dirty": False,
+                    "staged": False,
+                    "unstaged": False,
+                    "untracked": False,
+                    "operation_state": [],
+                    "detached": False,
+                    "alternates_configured": False,
+                    "gitmodules_present": False,
+                    "ahead": 0,
+                    "behind": 7,
+                    "upstream": None,
+                    "upstream_freshness": "locally_available_only",
+                },
+                "role": {"value": "linked_worktree"},
+            },
+            "projection": {
+                "schema_version": 2,
+                "state": "local_coherent",
+                "reasons": [
+                    "local_checkout_observation_complete",
+                    "managed_role:linked_worktree",
+                ],
+                "active_bindings": ["task:foreign"],
+                "foreign_authority_gaps": [
+                    "lifecycle_evidence_missing",
+                    "remote_freshness_unverified",
+                ],
+                "observation_validation": {"valid": True},
+            },
+        }
+        summary = effectiveness.finding_summary(report)
+        self.assertEqual(summary["projection_state"], "local_coherent")
+        self.assertEqual(summary["advisory_posture"], "clean")
+        self.assertEqual(summary["finding_count"], 0)
+        self.assertNotIn("remote_freshness", summary["finding_categories"])
+        self.assertNotIn("lifecycle_evidence", summary["finding_categories"])
+        self.assertNotIn("projection_state_other", summary["finding_reason_codes"])
+
+    def test_local_authority_v3_keeps_local_inconclusive_signal(self) -> None:
+        report = {
+            "schema_version": 3,
+            "observation": {
+                "errors": [],
+                "git": {
+                    "dirty": False,
+                    "staged": False,
+                    "unstaged": False,
+                    "untracked": False,
+                    "operation_state": [],
+                    "detached": False,
+                    "alternates_configured": False,
+                    "gitmodules_present": False,
+                    "ahead": 0,
+                    "behind": 9,
+                    "upstream": None,
+                    "upstream_freshness": "locally_available_only",
+                },
+                "role": {"value": "linked_worktree"},
+            },
+            "projection": {
+                "schema_version": 2,
+                "state": "inconclusive",
+                "reasons": ["git_observation_incomplete"],
+                "active_bindings": [],
+                "foreign_authority_gaps": ["lifecycle_evidence_missing"],
+                "observation_validation": {"valid": True},
+            },
+        }
+        summary = effectiveness.finding_summary(report)
+        self.assertEqual(summary["projection_state"], "inconclusive")
+        self.assertEqual(summary["advisory_posture"], "informational")
+        self.assertIn("git_observation_incomplete", summary["finding_reason_codes"])
+        self.assertIn("projection_state_inconclusive", summary["finding_reason_codes"])
+        self.assertNotIn("upstream_unbound", summary["finding_reason_codes"])
+        self.assertNotIn("upstream_behind", summary["finding_reason_codes"])
+
     def test_failure_summary_uses_stable_categories_without_raw_error(self) -> None:
         result = effectiveness.failure_summary(
             ValueError("Reposkop observation must be complete: /private/path")
@@ -892,6 +974,182 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(result["review"]["false_negatives"], 1)
         self.assertEqual(result["review"]["reviewed_evaluations"], 1)
         self.assertEqual(result["review"]["unreviewed_evaluations"], 1)
+
+    def test_projection_counts_checkout_shadow_without_inferred_unique_value(self) -> None:
+        first = "6" * 64
+        second = "7" * 64
+        records = [
+            _event(
+                "reposkop-checkout-shadow-before-observed",
+                first,
+                "1",
+                task_id="shadow-completed",
+                shadow_phase="before",
+                shadow_status="completed",
+                decision_effect=False,
+            ),
+            _event(
+                "reposkop-checkout-shadow-terminal-observed",
+                first,
+                "2",
+                task_id="shadow-completed",
+                shadow_phase="terminal",
+                shadow_status="completed",
+                continuity_state="identity_break",
+                measurement_class="identity_break",
+                decision_effect=False,
+            ),
+            _event(
+                "reposkop-checkout-shadow-before-observed",
+                second,
+                "3",
+                task_id="shadow-unavailable",
+                shadow_phase="before",
+                shadow_status="unavailable",
+                measurement_class="inconclusive/unavailable",
+                decision_effect=False,
+            ),
+            _event(
+                "reposkop-checkout-shadow-terminal-observed",
+                second,
+                "4",
+                task_id="shadow-unavailable",
+                shadow_phase="terminal",
+                shadow_status="unavailable",
+                continuity_state="inconclusive",
+                measurement_class="inconclusive/unavailable",
+                decision_effect=False,
+            ),
+        ]
+
+        result = effectiveness.project_records(records)
+
+        shadow_projection = result["checkout_continuity_shadow"]
+        self.assertEqual(shadow_projection["attempted"], 2)
+        self.assertEqual(shadow_projection["completed"], 1)
+        self.assertEqual(shadow_projection["unavailable"], 1)
+        self.assertEqual(
+            shadow_projection["continuity_state_counts"],
+            {"identity_break": 1, "inconclusive": 1},
+        )
+        self.assertEqual(
+            shadow_projection["measurement_class_counts"],
+            {"identity_break": 1, "inconclusive/unavailable": 1},
+        )
+        self.assertEqual(shadow_projection["confirmed_unique_value"], 0)
+        self.assertEqual(
+            shadow_projection["confirmed_unique_value_source"],
+            "semantic_review_only",
+        )
+
+    def test_confirmed_unique_value_requires_explicit_bound_semantic_review(self) -> None:
+        evaluation = "8" * 64
+        decision_ref = _ref("5")
+        shadow_ref = _ref("6")
+        records = [
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "5",
+                task_id="task-unique-value",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                final_decision="allow",
+                decision_changed=False,
+                reposkop_execution_skipped=True,
+            ),
+            _event(
+                "reposkop-checkout-shadow-terminal-observed",
+                evaluation,
+                "6",
+                task_id="task-unique-value",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                shadow_status="completed",
+                continuity_state="identity_break",
+                measurement_class="identity_break",
+                decision_effect=False,
+            ),
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "confirmed_unique_value",
+            "reviewer": "operator:reviewer",
+            "scope": "repository",
+            "detectable_category": "checkout_identity",
+            "reason_codes": ["semantic_checkout_identity_break"],
+            "evidence_refs": [decision_ref, shadow_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+
+        with patch.object(
+            effectiveness, "_review_records", return_value=(records, {})
+        ), patch.object(
+            effectiveness, "append_event", return_value=_ref("7")
+        ):
+            result = effectiveness.record_review_classification(parameters)
+
+        self.assertEqual(result["classification"], "confirmed_unique_value")
+        self.assertIs(result["replayed"], False)
+
+    def test_confirmed_unique_value_rejects_unrelated_identity_break_shadow(self) -> None:
+        evaluation = "9" * 64
+        unrelated_evaluation = "a" * 64
+        decision_ref = _ref("5")
+        outcome_ref = _ref("6")
+        unrelated_shadow_ref = _ref("7")
+        records = [
+            _event(
+                "reposkop-decision-applied",
+                evaluation,
+                "5",
+                task_id="task-reviewed",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                final_decision="allow",
+                decision_changed=False,
+                reposkop_execution_skipped=True,
+            ),
+            _event(
+                "reposkop-task-outcome-observed",
+                evaluation,
+                "6",
+                task_id="task-reviewed",
+                terminal_state="completed",
+            ),
+            _event(
+                "reposkop-checkout-shadow-terminal-observed",
+                unrelated_evaluation,
+                "7",
+                task_id="task-unrelated",
+                reposkop_policy="not_required",
+                reposkop_cohort="prospective_control",
+                shadow_status="completed",
+                continuity_state="identity_break",
+                measurement_class="identity_break",
+                decision_effect=False,
+            ),
+        ]
+        parameters = {
+            "evaluation_id": evaluation,
+            "classification": "confirmed_unique_value",
+            "reviewer": "operator:reviewer",
+            "scope": "repository",
+            "detectable_category": "checkout_identity",
+            "reason_codes": ["semantic_checkout_identity_break"],
+            "evidence_refs": [decision_ref, outcome_ref, unrelated_shadow_ref],
+            "expected_decision_audit_ref": decision_ref,
+            "supersedes_review_audit_ref": "",
+        }
+
+        with patch.object(
+            effectiveness, "_review_records", return_value=(records, {})
+        ), self.assertRaisesRegex(
+            effectiveness.ReposkopReviewIntegrityError,
+            "confirmed_unique_value requires a reviewed, completed identity-break shadow artifact",
+        ):
+            effectiveness.record_review_classification(parameters)
 
     def test_false_positive_cluster_requires_same_detectable_category(self) -> None:
         records: list[dict[str, object]] = []

@@ -79,6 +79,21 @@ class ReposkopContextTests(unittest.TestCase):
             "observation_sha256": observation["observation_sha256"],
             "effect_authorized": False,
         }
+        if projection_schema_version == 2:
+            projection.update(
+                {
+                    "state": "local_coherent",
+                    "reasons": ["local_checkout_observation_complete"],
+                    "active_bindings": [],
+                    "foreign_authority_gaps": ["lifecycle_evidence_missing"],
+                    "observation_validation": {"valid": True},
+                    "evidence_validation": None,
+                    "does_not_establish": [
+                        "task_or_queue_truth",
+                        "remote_or_pull_request_freshness_beyond_supplied_evidence",
+                    ],
+                }
+            )
         projection["projection_sha256"] = context._reposkop_artifact_sha256(
             projection
         )
@@ -1685,6 +1700,92 @@ class ReposkopContextTests(unittest.TestCase):
         finally:
             context.os.close(descriptor)
 
+
+
+    def test_validate_report_accepts_legacy_v2_projection_v1_pair(self) -> None:
+        report = self.report(schema_version=2, projection_schema_version=1)
+        validated = context._validate_report(
+            report,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+        )
+        self.assertEqual(validated["schema_version"], 2)
+        self.assertEqual(validated["projection"]["schema_version"], 1)
+
+    def test_validate_report_accepts_local_authority_v3_projection_v2_pair(self) -> None:
+        report = self.report(schema_version=3, projection_schema_version=2)
+        validated = context._validate_report(
+            report,
+            target=self.repo.resolve(),
+            purpose="grabowski-repo-state-context",
+        )
+        self.assertEqual(validated["schema_version"], 3)
+        self.assertEqual(validated["projection"]["state"], "local_coherent")
+
+    def test_validate_report_rejects_crossed_schema_pair(self) -> None:
+        report = self.report(schema_version=3, projection_schema_version=1)
+        with self.assertRaisesRegex(
+            context.ReposkopContextError, "report/projection schema pair"
+        ):
+            context._validate_report(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+            )
+
+    def test_validate_report_rejects_bad_v2_local_state(self) -> None:
+        report = self.report(schema_version=3, projection_schema_version=2)
+        projection = report["projection"]
+        assert isinstance(projection, dict)
+        projection["state"] = "managed_retain"
+        projection.pop("projection_sha256")
+        projection["projection_sha256"] = context._reposkop_artifact_sha256(projection)
+        report.pop("report_sha256")
+        report["report_sha256"] = context._reposkop_artifact_sha256(report)
+        with self.assertRaisesRegex(
+            context.ReposkopContextError, "local state is unsupported"
+        ):
+            context._validate_report(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+            )
+
+    def test_validate_report_rejects_bad_v2_foreign_gap_shape(self) -> None:
+        report = self.report(schema_version=3, projection_schema_version=2)
+        projection = report["projection"]
+        assert isinstance(projection, dict)
+        projection["foreign_authority_gaps"] = [{"bad": True}]
+        projection.pop("projection_sha256")
+        projection["projection_sha256"] = context._reposkop_artifact_sha256(projection)
+        report.pop("report_sha256")
+        report["report_sha256"] = context._reposkop_artifact_sha256(report)
+        with self.assertRaisesRegex(
+            context.ReposkopContextError, "foreign_authority_gaps"
+        ):
+            context._validate_report(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+            )
+
+    def test_validate_report_rejects_v2_projection_observation_mismatch(self) -> None:
+        report = self.report(schema_version=3, projection_schema_version=2)
+        projection = report["projection"]
+        assert isinstance(projection, dict)
+        projection["observation_sha256"] = "a" * 64
+        projection.pop("projection_sha256")
+        projection["projection_sha256"] = context._reposkop_artifact_sha256(projection)
+        report.pop("report_sha256")
+        report["report_sha256"] = context._reposkop_artifact_sha256(report)
+        with self.assertRaisesRegex(
+            context.ReposkopContextError, "not bound to the observation"
+        ):
+            context._validate_report(
+                report,
+                target=self.repo.resolve(),
+                purpose="grabowski-repo-state-context",
+            )
 
 
 if __name__ == "__main__":

@@ -203,6 +203,79 @@ class TaskTests(unittest.TestCase):
             "_attest_mutating_agent_workspace",
             return_value=self.reposkop_attestation,
         )
+        self.reposkop_shadow_before_patch = patch.object(
+            tasks,
+            "_capture_reposkop_shadow_before_best_effort",
+            return_value={
+                "phase": "before",
+                "status": "completed",
+                "before_observation_sha256": "d" * 64,
+                "decision_effect": False,
+                "effect_authorized": False,
+                "audit_ref": "audit-record-sha256:" + "e" * 64,
+            },
+        )
+        def shadow_prepare(*, task_id, before_summary):
+            material = {
+                "schema_version": 1,
+                "kind": "grabowski.reposkop_checkout_shadow_evidence",
+                "phase": "terminal_prepare",
+                "status": "completed",
+                "task_id": task_id,
+                "evaluation_id": before_summary.get("evaluation_id"),
+                "reposkop_cohort": before_summary.get("reposkop_cohort"),
+                "captured_at_unix": 123,
+                "before_evidence_sha256": before_summary.get(
+                    "evidence_sha256", "1" * 64
+                ),
+                "before_observation_sha256": before_summary.get(
+                    "before_observation_sha256", "d" * 64
+                ),
+                "after_observation_sha256": "2" * 64,
+                "transition_sha256": "3" * 64,
+                "continuity_sha256": "4" * 64,
+                "continuity_state": "intact",
+                "measurement_class": "intact/explainable_drift",
+                "reason_codes": [],
+                "anomaly_codes": [],
+                "reposkop_executable_sha256": "5" * 64,
+                "decision_effect": False,
+                "effect_authorized": False,
+            }
+            return {**material, "evidence_sha256": tasks._sha256_json(material)}
+
+        def shadow_finalize(
+            *,
+            task_id,
+            terminalization_sha256,
+            lifecycle_receipt_sha256,
+            prepared,
+        ):
+            return {
+                "phase": "terminal",
+                "status": prepared["status"],
+                "task_id": task_id,
+                "evidence_sha256": "6" * 64,
+                "decision_effect": False,
+                "effect_authorized": False,
+                "audit_ref": "audit-record-sha256:" + "7" * 64,
+            }
+
+        self.default_reposkop_shadow_prepare = shadow_prepare
+        self.default_reposkop_shadow_finalize = shadow_finalize
+        self.reposkop_shadow_prepare_patch = patch.object(
+            tasks,
+            "_prepare_reposkop_shadow_terminal_best_effort",
+            side_effect=shadow_prepare,
+        )
+        self.reposkop_shadow_terminal_patch = patch.object(
+            tasks,
+            "_finalize_reposkop_shadow_terminal_best_effort",
+            side_effect=shadow_finalize,
+        )
+        self.real_reposkop_shadow_terminal_finalize = (
+            tasks._finalize_reposkop_shadow_terminal_best_effort
+        )
         self.task_archive_root = self.root / "state" / "task-archives"
         self.task_projection_root = self.root / "state" / "task-projection"
         (self.root / "state").mkdir(parents=True, exist_ok=True)
@@ -216,9 +289,15 @@ class TaskTests(unittest.TestCase):
         self.resource_patch.start()
         self.admission_patch.start()
         self.reposkop_attestation_mock = self.reposkop_patch.start()
+        self.reposkop_shadow_before_mock = self.reposkop_shadow_before_patch.start()
+        self.reposkop_shadow_prepare_mock = self.reposkop_shadow_prepare_patch.start()
+        self.reposkop_shadow_terminal_mock = self.reposkop_shadow_terminal_patch.start()
         self.start_counter = 0
 
     def tearDown(self) -> None:
+        self.reposkop_shadow_terminal_patch.stop()
+        self.reposkop_shadow_prepare_patch.stop()
+        self.reposkop_shadow_before_patch.stop()
         self.reposkop_patch.stop()
         self.admission_patch.stop()
         self.resource_patch.stop()
@@ -1334,6 +1413,7 @@ class TaskTests(unittest.TestCase):
         )
         self.assertEqual(payload["receipt_sha256"], stored["lifecycle_receipt_sha256"])
         self.assertEqual(payload["receipt_sha256"], transition["lifecycle_receipt_sha256"])
+        self.reposkop_shadow_terminal_mock.assert_not_called()
         with self.assertRaisesRegex(ValueError, "terminalized task owner"):
             resources.acquire_resources(
                 owner,
@@ -1342,6 +1422,110 @@ class TaskTests(unittest.TestCase):
                 ttl_seconds=120,
                 metadata={"task_id": task_id, "attempt": 1},
             )
+
+    def test_terminal_shadow_runs_only_after_recorded_before_attempt(self) -> None:
+        result = self._start(resource_keys=["component:test-terminal-shadow-before"])
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "unavailable",
+            "measurement_class": "inconclusive/unavailable",
+            "failure_category": "capability_unavailable",
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "f" * 64,
+        }
+
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "shadow-gate-test"},
+        )
+
+        transition = resources.task_terminalization_record(task_id)
+        self.assertIsNotNone(transition)
+        receipt_path = tasks.TASK_OUTCOMES_DIR / f"{task_id}.json"
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual("completed", stored["state"])
+        self.reposkop_shadow_prepare_mock.assert_called_once()
+        stored_launcher = json.loads(stored["launcher_json"])
+        prepared = stored_launcher["reposkop_checkout_shadow_terminal_prepare"]
+        self.reposkop_shadow_terminal_mock.assert_called_once_with(
+            task_id=task_id,
+            terminalization_sha256=transition["transition_sha256"],
+            lifecycle_receipt_sha256=payload["receipt_sha256"],
+            prepared=prepared,
+        )
+        self.assertIsNotNone(tasks._reposkop_shadow_terminal_marker(task_id))
+
+    def test_terminal_shadow_prepare_runs_while_writer_lease_is_held(self) -> None:
+        path_key = f"path:{self.root}"
+        result = self._start(resource_keys=[path_key])
+        task_id = str(result["task"]["task_id"])
+        owner = str(result["task"]["lease_owner_id"])
+        original_prepare = self.default_reposkop_shadow_prepare
+
+        def assert_owned(*, task_id, before_summary):
+            lease = resources.inspect_resource(path_key)
+            self.assertIsNotNone(lease)
+            self.assertEqual(owner, lease["owner_id"])
+            return original_prepare(task_id=task_id, before_summary=before_summary)
+
+        self.reposkop_shadow_prepare_mock.side_effect = assert_owned
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "evaluation_id": "8" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "ownership-test"},
+        )
+
+        self.assertEqual("completed", stored["state"])
+        self.reposkop_shadow_prepare_mock.assert_called_once()
+        self.assertIsNone(resources.inspect_resource(path_key))
+
+    def test_terminal_shadow_adapter_failure_cannot_block_terminal_state(self) -> None:
+        import grabowski_reposkop_shadow
+
+        before_summary = {
+            "evaluation_id": "8" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+        }
+        prepared = self.default_reposkop_shadow_prepare(
+            task_id="0123456789abcdef01234567",
+            before_summary=before_summary,
+        )
+        with patch.object(
+            grabowski_reposkop_shadow,
+            "finalize_terminal_best_effort",
+            side_effect=RuntimeError("shadow unavailable"),
+        ):
+            result = self.real_reposkop_shadow_terminal_finalize(
+                task_id="0123456789abcdef01234567",
+                terminalization_sha256="1" * 64,
+                lifecycle_receipt_sha256="2" * 64,
+                prepared=prepared,
+            )
+
+        self.assertIsNone(result)
 
     def test_lifecycle_receipt_link_race_with_legacy_primary_uses_lifecycle_path(self) -> None:
         result = self._start(
@@ -1431,6 +1615,229 @@ class TaskTests(unittest.TestCase):
         self.assertEqual("projected", final["phase"])
         self.assertEqual("recovered_after_revocation", final["recovery_status"])
         self.assertEqual(final["transition_sha256"], recovered["terminalization_sha256"])
+
+    def test_projected_terminalization_recovery_replays_missing_shadow_terminal(self) -> None:
+        result = self._start(resource_keys=["component:test-terminal-shadow-recovery"])
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "evaluation_id": "9" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+        self.reposkop_shadow_terminal_mock.side_effect = SystemExit(
+            "crash after projection"
+        )
+        with self.assertRaisesRegex(SystemExit, "crash after projection"):
+            tasks._set_state(
+                task_id,
+                "completed",
+                launcher=launcher,
+                observation={
+                    "state": "completed",
+                    "source": "shadow-recovery-fixture",
+                },
+            )
+
+        projected = resources.task_terminalization_record(task_id)
+        self.assertEqual("projected", projected["phase"])
+        record = tasks._row_raw(task_id)
+        self.assertEqual("completed", record["state"])
+        self.assertTrue(tasks._reposkop_shadow_terminal_recovery_needed(record))
+        self.assertIsNone(tasks._reposkop_shadow_terminal_marker(task_id))
+
+        self.reposkop_shadow_terminal_mock.side_effect = lambda **_kwargs: None
+        self.reposkop_shadow_terminal_mock.reset_mock()
+
+        failed_refresh = tasks._reconcile_tasks_refresh_locked(batch_size=100)
+
+        self.assertGreaterEqual(failed_refresh["scanned"], 1)
+        self.assertIsNone(tasks._reposkop_shadow_terminal_marker(task_id))
+        self.assertTrue(
+            any(item["task_id"] == task_id for item in failed_refresh["blocked"])
+        )
+        self.assertFalse(
+            any(item["task_id"] == task_id for item in failed_refresh["refreshed"])
+        )
+
+        self.reposkop_shadow_terminal_mock.side_effect = self.default_reposkop_shadow_finalize
+        self.reposkop_shadow_terminal_mock.reset_mock()
+
+        refreshed = tasks._reconcile_tasks_refresh_locked(batch_size=100)
+
+        self.assertGreaterEqual(refreshed["scanned"], 1)
+        self.assertIsNotNone(tasks._reposkop_shadow_terminal_marker(task_id))
+        self.assertFalse(
+            tasks._reposkop_shadow_terminal_recovery_needed(tasks._row_raw(task_id))
+        )
+        self.reposkop_shadow_terminal_mock.assert_called_once()
+
+    def test_finalized_shadow_history_does_not_consume_reconcile_page_budget(self) -> None:
+        def launcher_for(task_id: str, token: str) -> dict[str, object]:
+            record = tasks._row_raw(task_id)
+            launcher = json.loads(record["launcher_json"])
+            launcher["reposkop_checkout_shadow_before"] = {
+                "phase": "before",
+                "status": "completed",
+                "evaluation_id": token * 64,
+                "reposkop_cohort": "prospective_control",
+                "before_observation_sha256": "d" * 64,
+                "evidence_sha256": "1" * 64,
+                "decision_effect": False,
+                "effect_authorized": False,
+                "audit_ref": "audit-record-sha256:" + "e" * 64,
+            }
+            return launcher
+
+        finalized: list[str] = []
+        for index in range(6):
+            result = self._start(
+                resource_keys=[f"component:test-shadow-finalized-{index}"]
+            )
+            task_id = str(result["task"]["task_id"])
+            stored = tasks._set_state(
+                task_id,
+                "completed",
+                launcher=launcher_for(task_id, format(index + 1, "x")),
+                observation={"state": "completed", "source": "finalized-history"},
+            )
+            marker = tasks._reposkop_shadow_terminal_marker(task_id)
+            self.assertIsNotNone(marker)
+            assert marker is not None
+            key = tasks._reposkop_shadow_terminal_finalization_metadata_key(
+                task_id=task_id,
+                terminalization_sha256=stored["terminalization_sha256"],
+                lifecycle_receipt_sha256=stored["lifecycle_receipt_sha256"],
+            )
+            with tasks._database_connection() as connection:
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE key=?", (key,)
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(stored["lifecycle_receipt_sha256"], row[0])
+            finalized.append(task_id)
+
+        missing_result = self._start(
+            resource_keys=["component:test-shadow-finalization-missing"]
+        )
+        missing_id = str(missing_result["task"]["task_id"])
+        self.reposkop_shadow_terminal_mock.side_effect = lambda **_kwargs: None
+        tasks._set_state(
+            missing_id,
+            "completed",
+            launcher=launcher_for(missing_id, "a"),
+            observation={"state": "completed", "source": "missing-finalization"},
+        )
+        self.reposkop_shadow_terminal_mock.side_effect = (
+            self.default_reposkop_shadow_finalize
+        )
+
+        active_result = self._start(
+            resource_keys=["component:test-shadow-current-running"]
+        )
+        active_id = str(active_result["task"]["task_id"])
+
+        with tasks._database_connection() as connection:
+            cycle = tasks._ensure_reconcile_cycle(connection)
+            selected = tasks._select_reconcile_task_rows(
+                connection, cycle, limit=2
+            )
+
+        selected_ids = {str(row["task_id"]) for row in selected}
+        self.assertEqual({missing_id, active_id}, selected_ids)
+        self.assertTrue(set(finalized).isdisjoint(selected_ids))
+
+    def test_existing_shadow_marker_backfills_missing_finalization_index(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-shadow-finalization-backfill"]
+        )
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "evaluation_id": "c" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "backfill-index"},
+        )
+        key = tasks._reposkop_shadow_terminal_finalization_metadata_key(
+            task_id=task_id,
+            terminalization_sha256=stored["terminalization_sha256"],
+            lifecycle_receipt_sha256=stored["lifecycle_receipt_sha256"],
+        )
+        with tasks._database_connection() as connection:
+            connection.execute("DELETE FROM metadata WHERE key=?", (key,))
+
+        self.assertFalse(
+            tasks._reposkop_shadow_terminal_recovery_needed(
+                tasks._row_raw(task_id)
+            )
+        )
+        with tasks._database_connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM metadata WHERE key=?", (key,)
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(stored["lifecycle_receipt_sha256"], row[0])
+
+    def test_corrupt_shadow_finalization_index_is_not_treated_as_final(self) -> None:
+        result = self._start(
+            resource_keys=["component:test-shadow-finalization-corrupt-index"]
+        )
+        task_id = str(result["task"]["task_id"])
+        record = tasks._row_raw(task_id)
+        launcher = json.loads(record["launcher_json"])
+        launcher["reposkop_checkout_shadow_before"] = {
+            "phase": "before",
+            "status": "completed",
+            "evaluation_id": "b" * 64,
+            "reposkop_cohort": "prospective_control",
+            "before_observation_sha256": "d" * 64,
+            "evidence_sha256": "1" * 64,
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "e" * 64,
+        }
+        stored = tasks._set_state(
+            task_id,
+            "completed",
+            launcher=launcher,
+            observation={"state": "completed", "source": "corrupt-index"},
+        )
+        key = tasks._reposkop_shadow_terminal_finalization_metadata_key(
+            task_id=task_id,
+            terminalization_sha256=stored["terminalization_sha256"],
+            lifecycle_receipt_sha256=stored["lifecycle_receipt_sha256"],
+        )
+        with tasks._database_connection() as connection:
+            connection.execute(
+                "UPDATE metadata SET value=? WHERE key=?",
+                ("f" * 64, key),
+            )
+            cycle = tasks._ensure_reconcile_cycle(connection)
+            selected = tasks._select_reconcile_task_rows(
+                connection, cycle, limit=10
+            )
+
+        self.assertIn(task_id, {str(row["task_id"]) for row in selected})
 
     def test_legacy_row_first_terminal_state_is_recovered_before_delegation(self) -> None:
         result = self._start(
@@ -2991,6 +3398,16 @@ class TaskTests(unittest.TestCase):
         self.assertRegex(attestation["decision_audit_ref"], r"^audit-record-sha256:[0-9a-f]{64}$")
         self.assertIs(result["audit"]["reposkop_execution_attestation_required"], False)
         self.assertEqual(result["audit"]["reposkop_cohort"], "prospective_control")
+        self.assertEqual(
+            result["reposkop_checkout_shadow_before"]["status"],
+            "completed",
+        )
+        self.reposkop_shadow_before_mock.assert_called_once_with(
+            task_id=control_key,
+            workspace=str(self.root),
+            evaluation_id=result["audit"]["evaluation_id"],
+            reposkop_cohort="prospective_control",
+        )
         self.assertIsNotNone(tasks.resources.inspect_resource(f"repo:{self.root}"))
 
     def test_exact_feature_path_and_branch_leases_can_enter_reposkop_control(self) -> None:
@@ -3097,6 +3514,45 @@ class TaskTests(unittest.TestCase):
         self.assertEqual(classification["reposkop_policy"], "required")
         self.assertIs(classification["prospective_admission_verified"], False)
         self.reposkop_attestation_mock.assert_called_once()
+        self.reposkop_shadow_before_mock.assert_called_once()
+
+    def test_reposkop_shadow_start_failure_is_nonblocking_and_recorded(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        self.reposkop_shadow_before_mock.return_value = {
+            "phase": "before",
+            "status": "unavailable",
+            "task_id": "test-task",
+            "measurement_class": "inconclusive/unavailable",
+            "failure_category": "capability_unavailable",
+            "decision_effect": False,
+            "effect_authorized": False,
+            "audit_ref": "audit-record-sha256:" + "f" * 64,
+        }
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=LOCAL_HOST
+        ), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ) as dispatch, patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 159}
+        ):
+            result = tasks.grabowski_task_start(
+                "local", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        dispatch.assert_called_once()
+        self.assertEqual(result["task"]["state"], "running")
+        self.assertEqual(
+            result["audit"]["reposkop_checkout_shadow_before"]["status"],
+            "unavailable",
+        )
+        self.assertIs(
+            result["audit"]["reposkop_checkout_shadow_before"]["decision_effect"],
+            False,
+        )
 
     def test_main_branch_and_exact_path_writers_remain_reposkop_required(self) -> None:
         argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
@@ -3180,6 +3636,32 @@ class TaskTests(unittest.TestCase):
             False,
         )
         self.reposkop_attestation_mock.assert_not_called()
+        self.reposkop_shadow_before_mock.assert_not_called()
+
+    def test_remote_writer_is_not_forced_through_checkout_shadow(self) -> None:
+        argv = ["/opt/codex", "exec", "--sandbox", "workspace-write"]
+        with patch.object(
+            tasks.fleet, "fleet_host", return_value=REMOTE_HOST
+        ), patch.object(
+            tasks, "_validate_command", return_value=argv
+        ), patch.object(
+            tasks, "_dispatch", return_value=_launcher()
+        ), patch.object(
+            tasks.base, "_append_audit"
+        ), patch.object(
+            tasks, "_require_recovery_gate", return_value={"checked_at_unix": 160}
+        ):
+            result = tasks.grabowski_task_start(
+                "remote", argv, cwd=str(self.root), runtime_seconds=60
+            )
+
+        self.assertEqual(
+            result["task_effect_classification"]["effect_profile"],
+            "remote_write",
+        )
+        self.assertIsNone(result["reposkop_checkout_shadow_before"])
+        self.reposkop_attestation_mock.assert_not_called()
+        self.reposkop_shadow_before_mock.assert_not_called()
 
     def test_reposkop_execution_attestation_contract_is_hash_bound(self) -> None:
         workspace = str(self.root)
