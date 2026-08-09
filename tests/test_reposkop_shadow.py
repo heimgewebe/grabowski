@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -136,11 +137,19 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
             "find_event_by_identity",
             side_effect=self._find_event_by_identity,
         )
+        self.audit_identity_lock = threading.Lock()
+        self.audit_identity_lock_patch = patch.object(
+            shadow.reposkop_effectiveness,
+            "event_identity_lock",
+            return_value=self.audit_identity_lock,
+        )
         self.root_patch.start()
         self.audit_patch.start()
         self.audit_lookup_patch.start()
+        self.audit_identity_lock_patch.start()
 
     def tearDown(self) -> None:
+        self.audit_identity_lock_patch.stop()
         self.audit_lookup_patch.stop()
         self.audit_patch.stop()
         self.root_patch.stop()
@@ -547,6 +556,93 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
         self.assertEqual(replay["evidence_sha256"], first["evidence_sha256"])
         self.assertEqual(len(self.events), 2)
         self.assertFalse(terminal_path.exists())
+
+    def test_concurrent_terminal_fallbacks_append_one_public_event(self) -> None:
+        task_id = "terminal-fallback-race"
+        purpose = f"grabowski-task-shadow:{shadow._task_key(task_id)[:32]}"
+        before = _observation(self.workspace, purpose, identity="1")
+        after = _observation(self.workspace, purpose, identity="1")
+        continuity = _continuity(before, after, state="intact")
+
+        def run(
+            command: str,
+            target: Path,
+            *,
+            purpose: str,
+            expected_artifact: Path | None = None,
+        ) -> tuple[dict[str, object], str]:
+            if command == "inspect":
+                return before, "a" * 64
+            return continuity, "a" * 64
+
+        with patch.object(shadow, "_run_reposkop", side_effect=run):
+            before_result = shadow.capture_before_best_effort(
+                task_id=task_id,
+                workspace=str(self.workspace),
+                evaluation_id="a" * 64,
+                reposkop_cohort="prospective_control",
+            )
+            prepared = shadow.prepare_terminal_best_effort(
+                task_id=task_id,
+                before_summary=before_result,
+            )
+
+        start = threading.Barrier(2)
+        lookup_race = threading.Barrier(2)
+        results: list[dict[str, object] | None] = []
+        errors: list[BaseException] = []
+
+        def racing_lookup(
+            identity: dict[str, object], **_kwargs: object
+        ) -> dict[str, object] | None:
+            existing = self._find_event_by_identity(identity)
+            if existing is not None:
+                return existing
+            try:
+                lookup_race.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+            return None
+
+        def worker() -> None:
+            try:
+                start.wait(timeout=1)
+                results.append(
+                    shadow.finalize_terminal_best_effort(
+                        task_id=task_id,
+                        terminalization_sha256="5" * 64,
+                        lifecycle_receipt_sha256="6" * 64,
+                        prepared=prepared,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(
+            shadow,
+            "_ensure_root",
+            side_effect=PermissionError("terminal shadow root inaccessible"),
+        ), patch.object(
+            shadow.reposkop_effectiveness,
+            "find_event_by_identity",
+            side_effect=racing_lookup,
+        ):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        terminal_events = [
+            event for event in self.events if event.get("operation") == shadow.TERMINAL_OPERATION
+        ]
+        self.assertEqual(len(terminal_events), 1)
+        self.assertEqual(results[0]["audit_ref"], results[1]["audit_ref"])
+        self.assertEqual(results[0]["status"], "unavailable")
+        self.assertEqual(results[1]["status"], "unavailable")
 
     def test_non_repository_is_not_sent_to_reposkop(self) -> None:
         non_repository = self.root / "plain"

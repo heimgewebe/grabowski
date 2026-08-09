@@ -709,28 +709,28 @@ def append_event(record: dict[str, Any]) -> str:
     return f"audit-record-sha256:{digest}"
 
 
-def find_event_by_identity(
-    identity: dict[str, Any],
-    *,
-    scan_limit: int = MAX_REVIEW_SCAN_RECORDS,
-) -> dict[str, Any] | None:
-    """Return the oldest exact event from one complete verified audit snapshot."""
+def _validated_event_identity(identity: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(identity, dict) or not identity:
         raise ValueError("identity must be a non-empty object")
     if any(not isinstance(key, str) or not key for key in identity):
         raise ValueError("identity keys must be non-empty strings")
-    if (
-        not isinstance(scan_limit, int)
-        or isinstance(scan_limit, bool)
-        or scan_limit < 1
-    ):
-        raise ValueError("scan_limit must be a positive integer")
+    return dict(identity)
 
+
+def event_identity_lock(identity: dict[str, Any]):
+    """Serialize same-identity audit decisions across processes with bounded lock files."""
+    validated = _validated_event_identity(identity)
+    identity_sha256 = _sha256_json(validated)
+    lock_target = base.AUDIT_LOG.parent / f"reposkop-event-identity-{identity_sha256[:2]}"
+    return base._audit_coordination_lock(lock_target, exclusive=True)
+
+
+def find_event_by_identity(
+    identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Return the oldest exact event from one complete verified audit snapshot."""
+    identity = _validated_event_identity(identity)
     snapshot = audit_query.capture_verified_audit_snapshot()
-    if snapshot.total_records > scan_limit:
-        raise RuntimeError(
-            "verified audit chain exceeds the bounded exact event identity scan"
-        )
 
     global_ordinal = 0
     for segment in snapshot.segments:

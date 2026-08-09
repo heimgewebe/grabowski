@@ -1333,19 +1333,53 @@ class ReposkopEffectivenessTests(unittest.TestCase):
         self.assertEqual(result["global_ordinal"], 1)
         self.assertTrue(result["source"]["scan_complete"])
 
-    def test_find_event_by_identity_fails_closed_when_scan_is_truncated(self) -> None:
+    def test_find_event_by_identity_keeps_working_beyond_review_scan_threshold(self) -> None:
+        identity = {"operation": "reposkop-checkout-shadow-terminal-observed"}
+        record = {**identity, "record_sha256": "3" * 64}
+        segment = types.SimpleNamespace(records=1)
         snapshot = types.SimpleNamespace(
-            total_records=2,
-            segments=(),
+            total_records=effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
+            segments=(segment,),
             chain_content_sha256="c" * 64,
             chain_materialization_sha256="d" * 64,
         )
+        payload = json.dumps(record, sort_keys=True).encode("utf-8") + b"\n"
         with patch.object(
             effectiveness.audit_query,
             "capture_verified_audit_snapshot",
             return_value=snapshot,
-        ), self.assertRaisesRegex(RuntimeError, "bounded exact event identity scan"):
-            effectiveness.find_event_by_identity({"operation": "x"}, scan_limit=1)
+        ), patch.object(
+            effectiveness.audit_query,
+            "_load_snapshot_segment",
+            return_value=payload,
+        ):
+            result = effectiveness.find_event_by_identity(identity)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["audit_ref"], _ref("3"))
+        self.assertEqual(
+            result["source"]["total_records"],
+            effectiveness.MAX_REVIEW_SCAN_RECORDS + 1,
+        )
+
+    def test_event_identity_lock_uses_bounded_audit_lock_stripe(self) -> None:
+        token = object()
+        identity = {
+            "operation": "reposkop-checkout-shadow-terminal-observed",
+            "task_id": "task-1",
+        }
+        with patch.object(
+            effectiveness.base,
+            "_audit_coordination_lock",
+            return_value=token,
+        ) as coordination_lock:
+            result = effectiveness.event_identity_lock(identity)
+
+        self.assertIs(result, token)
+        lock_target = coordination_lock.call_args.args[0]
+        self.assertEqual(lock_target.parent, effectiveness.base.AUDIT_LOG.parent)
+        self.assertRegex(lock_target.name, r"^reposkop-event-identity-[0-9a-f]{2}$")
+        self.assertIs(coordination_lock.call_args.kwargs["exclusive"], True)
 
     def test_append_event_rejects_unbounded_or_sensitive_fields(self) -> None:
         for field in ("argv", "prompt", "raw_report", "stderr", "error"):

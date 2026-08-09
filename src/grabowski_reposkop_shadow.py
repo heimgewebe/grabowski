@@ -989,28 +989,18 @@ def _validated_terminal_prepare(
     return prepared
 
 
-def finalize_terminal_best_effort(
+def _finalize_terminal_under_identity_lock(
     *,
     task_id: str,
     terminalization_sha256: str,
     lifecycle_receipt_sha256: str,
     prepared: dict[str, Any],
 ) -> dict[str, Any] | None:
-    try:
-        _validate_task_id(task_id)
-        if (
-            SHA256_RE.fullmatch(terminalization_sha256) is None
-            or SHA256_RE.fullmatch(lifecycle_receipt_sha256) is None
-        ):
-            return None
-        prepared = _validated_terminal_prepare(dict(prepared), task_id=task_id)
-        existing_audit = _existing_terminal_audit_summary(
-            task_id=task_id,
-            terminalization_sha256=terminalization_sha256,
-            lifecycle_receipt_sha256=lifecycle_receipt_sha256,
-        )
-    except Exception:
-        return None
+    existing_audit = _existing_terminal_audit_summary(
+        task_id=task_id,
+        terminalization_sha256=terminalization_sha256,
+        lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+    )
     if existing_audit is not None:
         return existing_audit
     material = {
@@ -1141,6 +1131,38 @@ def finalize_terminal_best_effort(
         audit_ref = None
     return _public_summary(audit_binding, audit_ref)
 
+
+
+def finalize_terminal_best_effort(
+    *,
+    task_id: str,
+    terminalization_sha256: str,
+    lifecycle_receipt_sha256: str,
+    prepared: dict[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        _validate_task_id(task_id)
+        if (
+            SHA256_RE.fullmatch(terminalization_sha256) is None
+            or SHA256_RE.fullmatch(lifecycle_receipt_sha256) is None
+        ):
+            return None
+        prepared = _validated_terminal_prepare(dict(prepared), task_id=task_id)
+        identity = {
+            "operation": TERMINAL_OPERATION,
+            "task_id": task_id,
+            "terminalization_sha256": terminalization_sha256,
+            "lifecycle_receipt_sha256": lifecycle_receipt_sha256,
+        }
+        with reposkop_effectiveness.event_identity_lock(identity):
+            return _finalize_terminal_under_identity_lock(
+                task_id=task_id,
+                terminalization_sha256=terminalization_sha256,
+                lifecycle_receipt_sha256=lifecycle_receipt_sha256,
+                prepared=prepared,
+            )
+    except Exception:
+        return None
 
 def capture_terminal_best_effort(
     *,
