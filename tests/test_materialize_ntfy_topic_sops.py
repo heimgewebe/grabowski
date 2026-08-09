@@ -63,6 +63,26 @@ class NtfyTopicSopsMaterializationTests(TestCase):
             ],
         )
 
+    def test_parent_removed_before_child_creation_fails_closed(self) -> None:
+        stable_parent = self.root / "stable-parent"
+        stable_parent.mkdir()
+        new_leaf = stable_parent / "new-leaf"
+        original_mkdir = Path.mkdir
+
+        def racing_mkdir(directory: Path, *args: object, **kwargs: object) -> None:
+            if directory == new_leaf and stable_parent.exists():
+                stable_parent.rmdir()
+            original_mkdir(directory, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", autospec=True, side_effect=racing_mkdir):
+            with self.assertRaisesRegex(
+                materializer.TopicMaterializationError,
+                "destination directory unavailable",
+            ):
+                materializer._ensure_parent_directory(new_leaf)
+
+        self.assertFalse(new_leaf.exists())
+
     def test_atomic_replacement_fsyncs_destination_directory(self) -> None:
         destination = self.root / "replace-topic"
         destination.write_bytes(b"old")

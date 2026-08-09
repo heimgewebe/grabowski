@@ -117,21 +117,27 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _ensure_parent_directory(path: Path) -> list[Path]:
-    missing: list[Path] = []
+    ancestry: list[Path] = []
     current = path
     while True:
+        ancestry.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    created: list[Path] = []
+    for directory in reversed(ancestry):
         try:
-            current.stat()
-        except FileNotFoundError:
-            missing.append(current)
-            parent = current.parent
-            if parent == current:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            if not directory.is_dir():
                 raise TopicMaterializationError("destination directory unavailable")
-            current = parent
-            continue
-        break
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return [directory.parent for directory in missing]
+        except OSError as exc:
+            raise TopicMaterializationError("destination directory unavailable") from exc
+        else:
+            created.append(directory)
+    return [directory.parent for directory in reversed(created)]
 
 
 def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> None:
