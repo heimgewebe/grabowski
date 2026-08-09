@@ -4374,20 +4374,55 @@ class BureauPickupTests(unittest.TestCase):
             second["receipt"]["receipt_sha256"],
         )
 
-    def test_orphan_reconcile_rejects_renewed_lease_same_metadata(self) -> None:
-        intent, _run_dir, _acq, coordination, request, lease, _key = (
+    def test_orphan_reconcile_accepts_renewed_lease_same_lineage(self) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, key = (
             self._orphan_setup()
         )
         renewed = dict(lease)
         renewed["updated_at_unix"] = lease["updated_at_unix"] + 120
         renewed["expires_at_unix"] = lease["expires_at_unix"] + 600
         self.assertEqual(lease["metadata_sha256"], renewed["metadata_sha256"])
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {
+            "run_id": intent["run_id"],
+            "state": "failed",
+            "error": pickup.ORPHAN_RECONCILE_ERROR,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, fail_result, terminal, terminal],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[renewed, renewed, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [renewed]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", result["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+
+    def test_orphan_reconcile_rejects_changed_lease_metadata_lineage(self) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, _key = (
+            self._orphan_setup()
+        )
+        drifted = dict(lease)
+        drifted["updated_at_unix"] = lease["updated_at_unix"] + 120
+        drifted["expires_at_unix"] = lease["expires_at_unix"] + 600
+        drifted["metadata_sha256"] = "f" * 64
         with (
             mock.patch.object(
                 pickup.bureau, "_invoke_bureau", return_value=coordination
             ) as invoke,
             mock.patch.object(
-                pickup.resources, "inspect_resource", return_value=renewed
+                pickup.resources, "inspect_resource", return_value=drifted
             ),
             mock.patch.object(pickup.resources, "release_resources") as release,
         ):
