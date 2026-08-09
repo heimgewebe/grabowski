@@ -909,6 +909,8 @@ def platform_snapshot_status(
             "required_schema_property_mismatches", []
         ),
         "probe": probe,
+        "missing_from_platform": probe.get("missing_from_connector", []),
+        "unexpected_in_platform": probe.get("unexpected_in_connector", []),
         "age_seconds": max(0, timestamp - observed_at),
         "recommended_next_action": next_action,
     }
@@ -1632,6 +1634,263 @@ def refresh_connector_snapshot_if_needed(
     }
 
 
+def _runtime_platform_binding(runtime_root: Path) -> tuple[dict[str, Any], list[str]]:
+    try:
+        root = runtime_root.expanduser().resolve(strict=True)
+        manifest_path = root / "deployment-manifest.json"
+        metadata = manifest_path.stat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > MAX_DEPLOYMENT_MANIFEST_BYTES
+        ):
+            raise ClientSnapshotError("runtime deployment manifest is unavailable")
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ClientSnapshotError("runtime deployment manifest is unavailable") from exc
+    if not isinstance(payload, dict) or payload.get("completion_status") != "complete":
+        raise ClientSnapshotError("runtime deployment manifest is incomplete")
+    entrypoint = payload.get("entrypoint_contract")
+    instructions = payload.get("agent_instructions")
+    if not isinstance(entrypoint, dict) or not isinstance(instructions, dict):
+        raise ClientSnapshotError("runtime deployment manifest contract is incomplete")
+    expected_tools = entrypoint.get("expected_tools")
+    if (
+        not isinstance(expected_tools, list)
+        or not expected_tools
+        or len(expected_tools) > connector_contract.MAX_OBSERVED_TOOLS
+        or any(
+            not isinstance(name, str)
+            or not name
+            or len(name.encode("utf-8")) > 512
+            for name in expected_tools
+        )
+        or len(set(expected_tools)) != len(expected_tools)
+    ):
+        raise ClientSnapshotError("runtime deployment manifest tool contract is invalid")
+    release_id = _validate_release_id(
+        payload.get("release_id"), label="runtime release id"
+    )
+    repo_head = payload.get("repo_head")
+    if (
+        not isinstance(repo_head, str)
+        or re.fullmatch(r"[0-9a-f]{40}", repo_head) is None
+    ):
+        raise ClientSnapshotError("runtime repository head is invalid")
+    instructions_sha256 = _validate_sha256(
+        instructions.get("sha256"), label="runtime agent instructions sha256"
+    )
+    return (
+        {
+            "registered_tool_count": len(expected_tools),
+            "registered_names_sha256": connector_contract.fingerprint(expected_tools),
+            "release_id": release_id,
+            "repo_head": repo_head,
+            "agent_instructions_sha256": instructions_sha256,
+        },
+        list(expected_tools),
+    )
+
+
+def _validate_platform_source_reference(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.strip() != value
+        or len(value.encode("utf-8")) > 1024
+    ):
+        raise ClientSnapshotError("platform connector source reference is invalid")
+    return value
+
+
+def _build_platform_connector_snapshot_with_runtime_names(
+    *,
+    observed_tools: dict[str, Any],
+    runtime_root: Path,
+    source_reference: str,
+    observed_at_unix: int | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    timestamp = int(time.time()) if observed_at_unix is None else observed_at_unix
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise ClientSnapshotError("platform connector observation time is invalid")
+    reference = _validate_platform_source_reference(source_reference)
+    try:
+        _observed_names, _observed_schemas, observed_metadata = (
+            connector_contract.parse_observed_artifact(
+                observed_tools,
+                label="platform connector catalog artifact",
+            )
+        )
+    except connector_contract.ConnectorContractError as exc:
+        raise ClientSnapshotError(str(exc)) from exc
+    runtime_binding, runtime_names = _runtime_platform_binding(runtime_root)
+    document: dict[str, Any] = {
+        "schema_version": PLATFORM_SNAPSHOT_SCHEMA_VERSION,
+        "kind": PLATFORM_SNAPSHOT_KIND,
+        "source": {
+            "kind": PLATFORM_SOURCE_KIND,
+            "connector": "grabowski",
+            "reference": reference,
+            "observed_at_unix": timestamp,
+            "catalog_sha256": observed_metadata["artifact_sha256"],
+        },
+        "runtime_binding": runtime_binding,
+        "observed_tools": observed_tools,
+    }
+    document["snapshot_sha256"] = _sha256_json(document)
+    encoded = _canonical_bytes(document)
+    if len(encoded) > MAX_PLATFORM_SNAPSHOT_BYTES:
+        raise ClientSnapshotError("platform connector snapshot exceeds size limit")
+    return document, runtime_names
+
+
+def build_platform_connector_snapshot(
+    *,
+    observed_tools: dict[str, Any],
+    runtime_root: Path,
+    source_reference: str,
+    observed_at_unix: int | None = None,
+) -> dict[str, Any]:
+    document, _runtime_names = _build_platform_connector_snapshot_with_runtime_names(
+        observed_tools=observed_tools,
+        runtime_root=runtime_root,
+        source_reference=source_reference,
+        observed_at_unix=observed_at_unix,
+    )
+    return document
+
+
+def _validate_platform_snapshot_parent(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise ClientSnapshotError(
+            "platform connector snapshot parent is unavailable"
+        ) from exc
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != PLATFORM_SNAPSHOT_TRUSTED_UID
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise ClientSnapshotError(
+            "platform connector snapshot parent is not a trusted root-owned directory"
+        )
+
+
+def _persist_platform_snapshot(document: dict[str, Any]) -> None:
+    if os.geteuid() != PLATFORM_SNAPSHOT_TRUSTED_UID:
+        raise ClientSnapshotError(
+            "platform connector snapshot capture requires the trusted root authority"
+        )
+    target = PLATFORM_SNAPSHOT_PATH
+    parent = target.parent
+    _validate_platform_snapshot_parent(parent)
+    try:
+        current = target.lstat()
+    except FileNotFoundError:
+        current = None
+    except OSError as exc:
+        raise ClientSnapshotError(
+            "platform connector snapshot destination cannot be inspected safely"
+        ) from exc
+    if current is not None:
+        _validate_platform_snapshot_file(
+            current, label="existing platform connector snapshot"
+        )
+
+    encoded = _canonical_bytes(document)
+    if len(encoded) > MAX_PLATFORM_SNAPSHOT_BYTES:
+        raise ClientSnapshotError("platform connector snapshot exceeds size limit")
+    temporary = parent / (
+        f".{target.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("platform connector snapshot write made no progress")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, target)
+        directory_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise ClientSnapshotError(
+            "platform connector snapshot persistence failed"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    persisted = _read_platform_snapshot(target)
+    if persisted != document:
+        raise ClientSnapshotError(
+            "platform connector snapshot readback does not match the captured document"
+        )
+
+
+def capture_platform_connector_snapshot(
+    *,
+    observed_tools: dict[str, Any],
+    runtime_root: Path,
+    source_reference: str,
+    observed_at_unix: int | None = None,
+) -> dict[str, Any]:
+    document, runtime_names = _build_platform_connector_snapshot_with_runtime_names(
+        observed_tools=observed_tools,
+        runtime_root=runtime_root,
+        source_reference=source_reference,
+        observed_at_unix=observed_at_unix,
+    )
+    _persist_platform_snapshot(document)
+    try:
+        observed_names, _observed_schemas, observed_metadata = (
+            connector_contract.parse_observed_artifact(
+                observed_tools,
+                label="platform connector catalog artifact",
+            )
+        )
+    except connector_contract.ConnectorContractError as exc:
+        raise ClientSnapshotError(str(exc)) from exc
+    missing_from_platform = sorted(set(runtime_names) - set(observed_names))
+    unexpected_in_platform = sorted(set(observed_names) - set(runtime_names))
+    return {
+        "state": "captured",
+        "snapshot_sha256": document["snapshot_sha256"],
+        "catalog_sha256": observed_metadata["artifact_sha256"],
+        "observed_tool_count": len(observed_names),
+        "runtime_tool_count": len(runtime_names),
+        "name_contract_matches": (
+            not missing_from_platform and not unexpected_in_platform
+        ),
+        "missing_from_platform": missing_from_platform,
+        "unexpected_in_platform": unexpected_in_platform,
+        "schema_coverage_count": observed_metadata["schema_coverage_count"],
+        "source_reference": document["source"]["reference"],
+    }
+
+
 def _auto_refresh_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Grabowski connector snapshot maintenance")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1644,22 +1903,46 @@ def _auto_refresh_parser() -> argparse.ArgumentParser:
         "--renewal-margin-seconds", type=int, default=AUTO_REFRESH_RENEW_MARGIN_SECONDS
     )
     refresh.add_argument("--timeout-seconds", type=float, default=AUTO_REFRESH_TIMEOUT_SECONDS)
+    capture = subparsers.add_parser(
+        "capture-platform",
+        help="Persist one controller-observed ChatGPT connector catalog as root-owned evidence.",
+    )
+    capture.add_argument("--runtime-root", type=Path, required=True)
+    capture.add_argument("--source-reference", required=True)
+    capture.add_argument("--observed-tools-json", required=True)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _auto_refresh_parser().parse_args(argv)
     try:
-        if args.command != "refresh-if-needed":
+        if args.command == "refresh-if-needed":
+            result = refresh_connector_snapshot_if_needed(
+                runtime_root=args.runtime_root,
+                mcp_url=args.mcp_url,
+                connector_pid=args.connector_pid,
+                connector_start_ticks=args.connector_start_ticks,
+                renewal_margin_seconds=args.renewal_margin_seconds,
+                timeout_seconds=args.timeout_seconds,
+            )
+        elif args.command == "capture-platform":
+            try:
+                observed_tools = json.loads(args.observed_tools_json)
+            except json.JSONDecodeError as exc:
+                raise ClientSnapshotError(
+                    "platform connector catalog artifact is not valid JSON"
+                ) from exc
+            if not isinstance(observed_tools, dict):
+                raise ClientSnapshotError(
+                    "platform connector catalog artifact must be a JSON object"
+                )
+            result = capture_platform_connector_snapshot(
+                observed_tools=observed_tools,
+                runtime_root=args.runtime_root,
+                source_reference=args.source_reference,
+            )
+        else:
             raise ClientSnapshotError("unsupported snapshot maintenance command")
-        result = refresh_connector_snapshot_if_needed(
-            runtime_root=args.runtime_root,
-            mcp_url=args.mcp_url,
-            connector_pid=args.connector_pid,
-            connector_start_ticks=args.connector_start_ticks,
-            renewal_margin_seconds=args.renewal_margin_seconds,
-            timeout_seconds=args.timeout_seconds,
-        )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")), flush=True)
         return 0
     except ClientSnapshotError as exc:
