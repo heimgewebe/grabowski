@@ -101,6 +101,21 @@ def _run_sops(
     return completed.stdout
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise TopicMaterializationError("destination directory sync failed") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise TopicMaterializationError("destination directory sync failed") from exc
+    finally:
+        os.close(fd)
+
+
 def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if create_only and path.exists():
@@ -121,6 +136,7 @@ def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> N
             temporary.unlink()
         else:
             os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()

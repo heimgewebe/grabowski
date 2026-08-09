@@ -35,6 +35,49 @@ class NtfyTopicSopsMaterializationTests(TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_create_only_publication_fsyncs_destination_directory(self) -> None:
+        destination = self.root / "created-topic"
+        with mock.patch.object(materializer, "_fsync_directory") as sync_directory:
+            materializer._atomic_private_write(
+                destination, b"ciphertext", create_only=True
+            )
+
+        self.assertEqual(destination.read_bytes(), b"ciphertext")
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        sync_directory.assert_called_once_with(destination.parent)
+
+    def test_atomic_replacement_fsyncs_destination_directory(self) -> None:
+        destination = self.root / "replace-topic"
+        destination.write_bytes(b"old")
+        destination.chmod(0o600)
+        with mock.patch.object(materializer, "_fsync_directory") as sync_directory:
+            materializer._atomic_private_write(
+                destination, b"new", create_only=False
+            )
+
+        self.assertEqual(destination.read_bytes(), b"new")
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        sync_directory.assert_called_once_with(destination.parent)
+
+    def test_directory_fsync_failure_is_secret_free_and_not_success(self) -> None:
+        destination = self.root / "durability-failure-topic"
+        with mock.patch.object(
+            materializer.os,
+            "fsync",
+            side_effect=[None, OSError("sensitive diagnostic secret")],
+        ):
+            with self.assertRaisesRegex(
+                materializer.TopicMaterializationError,
+                "destination directory sync failed",
+            ) as caught:
+                materializer._atomic_private_write(
+                    destination, b"secret-topic-material", create_only=True
+                )
+
+        self.assertEqual(destination.read_bytes(), b"secret-topic-material")
+        self.assertNotIn("sensitive diagnostic secret", str(caught.exception))
+        self.assertNotIn("secret-topic-material", str(caught.exception))
+
     def test_encrypt_requires_two_distinct_recipients(self) -> None:
         with self.assertRaisesRegex(
             materializer.TopicMaterializationError,
