@@ -1653,6 +1653,20 @@ class TaskTests(unittest.TestCase):
         self.assertTrue(tasks._reposkop_shadow_terminal_recovery_needed(record))
         self.assertIsNone(tasks._reposkop_shadow_terminal_marker(task_id))
 
+        self.reposkop_shadow_terminal_mock.side_effect = lambda **_kwargs: None
+        self.reposkop_shadow_terminal_mock.reset_mock()
+
+        failed_refresh = tasks._reconcile_tasks_refresh_locked(batch_size=100)
+
+        self.assertGreaterEqual(failed_refresh["scanned"], 1)
+        self.assertIsNone(tasks._reposkop_shadow_terminal_marker(task_id))
+        self.assertTrue(
+            any(item["task_id"] == task_id for item in failed_refresh["blocked"])
+        )
+        self.assertFalse(
+            any(item["task_id"] == task_id for item in failed_refresh["refreshed"])
+        )
+
         self.reposkop_shadow_terminal_mock.side_effect = self.default_reposkop_shadow_finalize
         self.reposkop_shadow_terminal_mock.reset_mock()
 

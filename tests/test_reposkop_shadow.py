@@ -176,6 +176,15 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
                 task_id=task_id,
                 before_summary=before_result,
             )
+            terminal_artifact_path = shadow._paths(self.evidence_root, task_id)[
+                "terminal_artifact"
+            ]
+            terminal_artifact_payload = terminal_artifact_path.read_bytes()
+            self.assertEqual(json.loads(terminal_artifact_payload), continuity)
+            self.assertEqual(
+                prepared["artifact_file_sha256"],
+                hashlib.sha256(terminal_artifact_payload).hexdigest(),
+            )
             terminal_result = shadow.finalize_terminal_best_effort(
                 task_id=task_id,
                 terminalization_sha256="c" * 64,
@@ -191,6 +200,14 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
 
         self.assertEqual(before_result["status"], "completed")
         self.assertEqual(terminal_result["status"], "completed")
+        terminal_binding_path = shadow._paths(self.evidence_root, task_id)[
+            "terminal_binding"
+        ]
+        terminal_binding = json.loads(terminal_binding_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            terminal_binding["artifact_file_sha256"],
+            prepared["artifact_file_sha256"],
+        )
         self.assertEqual(replay["evidence_sha256"], terminal_result["evidence_sha256"])
         self.assertEqual(len(self.events), 2)
         terminal_event = self.events[-1]
@@ -211,6 +228,10 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
         self.assertEqual(
             terminal_event["continuity_sha256"],
             continuity["continuity_sha256"],
+        )
+        self.assertEqual(
+            terminal_event["artifact_file_sha256"],
+            prepared["artifact_file_sha256"],
         )
         self.assertEqual(terminal_event["continuity_state"], "identity_break")
         self.assertEqual(terminal_event["measurement_class"], "identity_break")
@@ -327,6 +348,124 @@ class ReposkopCheckoutShadowTests(unittest.TestCase):
         )
         self.assertIs(terminal_event["decision_effect"], False)
         self.assertIs(terminal_event["effect_authorized"], False)
+
+    def test_terminal_artifact_tamper_after_prepare_is_audited_unavailable(self) -> None:
+        task_id = "terminal-artifact-tamper"
+        purpose = f"grabowski-task-shadow:{shadow._task_key(task_id)[:32]}"
+        before = _observation(self.workspace, purpose, identity="1")
+        after = _observation(self.workspace, purpose, identity="1")
+        continuity = _continuity(before, after, state="intact")
+
+        def run(
+            command: str,
+            target: Path,
+            *,
+            purpose: str,
+            expected_artifact: Path | None = None,
+        ) -> tuple[dict[str, object], str]:
+            if command == "inspect":
+                return before, "a" * 64
+            return continuity, "a" * 64
+
+        with patch.object(shadow, "_run_reposkop", side_effect=run):
+            before_result = shadow.capture_before_best_effort(
+                task_id=task_id,
+                workspace=str(self.workspace),
+                evaluation_id="b" * 64,
+                reposkop_cohort="prospective_control",
+            )
+            prepared = shadow.prepare_terminal_best_effort(
+                task_id=task_id,
+                before_summary=before_result,
+            )
+
+        self.assertEqual(prepared["status"], "completed")
+        paths = shadow._paths(self.evidence_root, task_id)
+        paths["terminal_artifact"].write_text(
+            '{"tampered":true}\n', encoding="utf-8"
+        )
+
+        result = shadow.finalize_terminal_best_effort(
+            task_id=task_id,
+            terminalization_sha256="3" * 64,
+            lifecycle_receipt_sha256="4" * 64,
+            prepared=prepared,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["failure_category"], "evidence_integrity_error")
+        self.assertIsNotNone(result["audit_ref"])
+        self.assertFalse(paths["terminal_binding"].exists())
+        terminal_event = self.events[-1]
+        self.assertEqual(terminal_event["shadow_status"], "unavailable")
+        self.assertEqual(
+            terminal_event["failure_category"], "evidence_integrity_error"
+        )
+        self.assertEqual(
+            terminal_event["artifact_file_sha256"],
+            prepared["artifact_file_sha256"],
+        )
+        self.assertIs(terminal_event["decision_effect"], False)
+        self.assertIs(terminal_event["effect_authorized"], False)
+
+    def test_terminal_storage_failure_after_prepare_is_audited_unavailable(self) -> None:
+        task_id = "terminal-storage-failure"
+        purpose = f"grabowski-task-shadow:{shadow._task_key(task_id)[:32]}"
+        before = _observation(self.workspace, purpose, identity="1")
+        after = _observation(self.workspace, purpose, identity="1")
+        continuity = _continuity(before, after, state="intact")
+
+        def run(
+            command: str,
+            target: Path,
+            *,
+            purpose: str,
+            expected_artifact: Path | None = None,
+        ) -> tuple[dict[str, object], str]:
+            if command == "inspect":
+                return before, "a" * 64
+            return continuity, "a" * 64
+
+        with patch.object(shadow, "_run_reposkop", side_effect=run):
+            before_result = shadow.capture_before_best_effort(
+                task_id=task_id,
+                workspace=str(self.workspace),
+                evaluation_id="a" * 64,
+                reposkop_cohort="prospective_control",
+            )
+            prepared = shadow.prepare_terminal_best_effort(
+                task_id=task_id,
+                before_summary=before_result,
+            )
+
+        self.assertEqual(prepared["status"], "completed")
+        with patch.object(
+            shadow,
+            "_ensure_root",
+            side_effect=PermissionError("terminal shadow root inaccessible"),
+        ):
+            result = shadow.finalize_terminal_best_effort(
+                task_id=task_id,
+                terminalization_sha256="3" * 64,
+                lifecycle_receipt_sha256="4" * 64,
+                prepared=prepared,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["failure_category"], "permission_unavailable")
+        self.assertEqual(result["continuity_state"], "inconclusive")
+        self.assertEqual(result["measurement_class"], "inconclusive/unavailable")
+        self.assertIsNotNone(result["audit_ref"])
+        terminal_event = self.events[-1]
+        self.assertEqual(terminal_event["operation"], shadow.TERMINAL_OPERATION)
+        self.assertEqual(terminal_event["shadow_status"], "unavailable")
+        self.assertEqual(terminal_event["failure_category"], "permission_unavailable")
+        self.assertIs(terminal_event["decision_effect"], False)
+        self.assertIs(terminal_event["effect_authorized"], False)
+        terminal_path = shadow._paths(self.evidence_root, task_id)["terminal_binding"]
+        self.assertFalse(terminal_path.exists())
 
     def test_non_repository_is_not_sent_to_reposkop(self) -> None:
         non_repository = self.root / "plain"

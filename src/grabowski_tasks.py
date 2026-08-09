@@ -9029,9 +9029,27 @@ def _reconcile_tasks_refresh_locked(
                 and _reposkop_shadow_terminal_recovery_needed(record)
             ):
                 try:
-                    _recover_reposkop_shadow_terminal(record)
-                except Exception:
-                    pass
+                    marker = _recover_reposkop_shadow_terminal(record)
+                except Exception as exc:
+                    denied.append(
+                        {
+                            "task_id": str(record["task_id"]),
+                            "reason": _redact_reason(str(exc)),
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                    continue
+                if marker is None:
+                    denied.append(
+                        {
+                            "task_id": str(record["task_id"]),
+                            "reason": (
+                                "Reposkop terminal shadow recovery did not persist a marker"
+                            ),
+                            "error_type": "Unavailable",
+                        }
+                    )
+                    continue
                 public = _public(_row_raw(str(record["task_id"])))
                 public["lease_maintenance"] = None
                 refreshed.append(public)

@@ -815,6 +815,8 @@ def prepare_terminal_best_effort(
             workspace=workspace,
             purpose=purpose,
         )
+        artifact_payload = _canonical_bytes(continuity)
+        _write_or_match(paths["terminal_artifact"], artifact_payload)
         material = {
             "schema_version": 1,
             "kind": "grabowski.reposkop_checkout_shadow_evidence",
@@ -826,6 +828,7 @@ def prepare_terminal_best_effort(
             "captured_at_unix": int(time.time()),
             "before_evidence_sha256": before_binding["evidence_sha256"],
             **result,
+            "artifact_file_sha256": _sha256_bytes(artifact_payload),
             "reposkop_executable_sha256": executable_sha256,
             "decision_effect": False,
             "effect_authorized": False,
@@ -890,6 +893,7 @@ def _validated_terminal_prepare(
             "after_observation_sha256",
             "transition_sha256",
             "continuity_sha256",
+            "artifact_file_sha256",
             "reposkop_executable_sha256",
         ):
             item = prepared.get(field)
@@ -954,6 +958,7 @@ def finalize_terminal_best_effort(
         "after_observation_sha256": prepared.get("after_observation_sha256"),
         "transition_sha256": prepared.get("transition_sha256"),
         "continuity_sha256": prepared.get("continuity_sha256"),
+        "artifact_file_sha256": prepared.get("artifact_file_sha256"),
         "continuity_state": prepared.get("continuity_state"),
         "measurement_class": prepared.get("measurement_class"),
         "reason_codes": list(prepared.get("reason_codes") or []),
@@ -970,6 +975,15 @@ def finalize_terminal_best_effort(
     try:
         root = _ensure_root()
         paths = _paths(root, task_id)
+        if prepared["status"] == "completed":
+            _artifact_value, artifact_payload = _read_private_json(
+                paths["terminal_artifact"]
+            )
+            if _sha256_bytes(artifact_payload) != prepared.get("artifact_file_sha256"):
+                raise ReposkopShadowError(
+                    "Reposkop terminal continuity artifact lost its prepare binding",
+                    category="evidence_integrity_error",
+                )
         if paths["terminal_binding"].exists():
             existing_value, _payload = _read_private_json(paths["terminal_binding"])
             existing = _validate_binding(
@@ -1007,6 +1021,7 @@ def finalize_terminal_best_effort(
             "after_observation_sha256": None,
             "transition_sha256": None,
             "continuity_sha256": None,
+            "artifact_file_sha256": prepared.get("artifact_file_sha256"),
             "continuity_state": "inconclusive",
             "measurement_class": "inconclusive/unavailable",
             "reason_codes": [f"shadow.{failure_category}"],
@@ -1034,6 +1049,7 @@ def finalize_terminal_best_effort(
         "after_observation_sha256": audit_binding.get("after_observation_sha256"),
         "transition_sha256": audit_binding.get("transition_sha256"),
         "continuity_sha256": audit_binding.get("continuity_sha256"),
+        "artifact_file_sha256": audit_binding.get("artifact_file_sha256"),
         "continuity_state": audit_binding.get("continuity_state"),
         "measurement_class": audit_binding.get("measurement_class"),
         "reason_codes": list(audit_binding.get("reason_codes") or []),
