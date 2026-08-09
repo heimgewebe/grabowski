@@ -12081,8 +12081,6 @@ class RuntimeRefreshLeaseReleaseGripTests(unittest.TestCase):
     TARGET = "a" * 64
     RESULT = "b" * 64
     KEYS = [
-        "path:/home/alex/.local/bin/bureau",
-        "path:/home/alex/.local/bin/bureau-runtime-refresh",
         "path:/home/alex/.local/share/bureau",
         "path:/home/alex/.local/state/bureau/runtime-refresh",
         "path:/home/alex/.local/state/bureau/runtime-refresh/workspaces/" + "c" * 40,
@@ -12129,7 +12127,7 @@ class RuntimeRefreshLeaseReleaseGripTests(unittest.TestCase):
         )
         checks = {item["id"]: item["status"] for item in result["receipt"]["checks"]}
         self.assertEqual("pass", checks["canonical-terminal-receipt"])
-        self.assertEqual("pass", checks["exact-five-path-binding"])
+        self.assertEqual("pass", checks["exact-intent-resource-binding"])
         self.assertEqual("pass", checks["unchanged-owner-release"])
         self.assertEqual("pass", checks["idempotent-reacquire-ready"])
 

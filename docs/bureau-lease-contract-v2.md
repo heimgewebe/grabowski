@@ -52,17 +52,19 @@ rejected. Merge and worktree-admin gates cannot be acquired together.
 
 ## Runtime-refresh terminal lease release
 
-A Bureau runtime refresh owns exactly five canonical path leases: the installed `bureau` and
-`bureau-runtime-refresh` entrypoints, the immutable Bureau prefix, the canonical runtime-refresh
-state root, and the commit-bound workspace. Those leases may be released only through
-`runtime-refresh-lease-release` or the equivalent typed MCP tool
+A Bureau runtime refresh owns the exact sorted, unique path-resource set recorded by its
+digest-bound intent and copied unchanged into the attempt-start and terminal result lease binding.
+The current contract uses three resources (the immutable Bureau prefix, canonical runtime-refresh
+state root, and commit-bound workspace); historical valid receipts may still name the two installed
+entrypoints as well. No fixed resource count is authoritative. Those leases may be released only
+through `runtime-refresh-lease-release` or the equivalent typed MCP tool
 `grabowski_runtime_refresh_lease_release`.
 
 The caller supplies only the observation target SHA-256 and the terminal result SHA-256. Grabowski
 reads the private, owner-only receipts below the compiled canonical state root
 `~/.local/state/bureau/runtime-refresh` and derives the owner, task, resources and lease snapshots
 from them. It verifies the observation, target, intent, attempt-start, terminal result, merge commit,
-source identity, installed-runtime readback, resource database identity and all five snapshots before
+source identity, installed-runtime readback, resource database identity and every snapshot named by that bound resource list before
 opening the release transaction.
 
 Release is permitted for:

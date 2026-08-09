@@ -4091,6 +4091,7 @@ class ResourceTests(unittest.TestCase):
         *,
         status: str = "deployed",
         effect_started: bool | None = None,
+        resource_contract: str = "historical-five",
     ) -> dict[str, object]:
         state_root = self.root / "runtime-refresh"
         attempts_root = state_root / "attempts"
@@ -4112,15 +4113,25 @@ class ResourceTests(unittest.TestCase):
         workspace = workspaces_root / main_commit
         bin_dir.mkdir(mode=0o700)
         prefix.mkdir(mode=0o700)
-        resource_keys = sorted(
-            [
+        resource_sets = {
+            "current-three": [
+                f"path:{prefix}",
+                f"path:{state_root}",
+                f"path:{workspace}",
+            ],
+            "historical-five": [
                 f"path:{bin_dir / 'bureau'}",
                 f"path:{bin_dir / 'bureau-runtime-refresh'}",
                 f"path:{prefix}",
                 f"path:{state_root}",
                 f"path:{workspace}",
-            ]
-        )
+            ],
+        }
+        if resource_contract not in resource_sets:
+            raise ValueError(
+                f"unknown runtime-refresh resource contract: {resource_contract}"
+            )
+        resource_keys = sorted(resource_sets[resource_contract])
         owner = "operator:test-runtime-refresh"
         task_id = "BUREAU-RUNTIME-REFRESH-TEST"
         acquired_at = int(time.time()) - 60
@@ -4408,6 +4419,88 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(
             fixture["resource_keys"],
             [item["resource_key"] for item in reacquired["leases"]],
+        )
+
+    def test_runtime_refresh_terminal_release_accepts_current_three_resource_contract(self) -> None:
+        fixture = self._runtime_refresh_fixture(resource_contract="current-three")
+        self.assertEqual(3, len(fixture["resource_keys"]))
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            result = resources.release_runtime_refresh_terminal_leases(
+                target_sha256=fixture["target_sha256"],
+                result_sha256=fixture["result_sha256"],
+            )
+        self.assertEqual("complete", result["state"])
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in result["released"]],
+        )
+        reacquired = resources.acquire_resources(
+            fixture["owner"],
+            fixture["resource_keys"],
+            purpose="next current-contract runtime refresh",
+            ttl_seconds=120,
+        )
+        self.assertEqual(
+            fixture["resource_keys"],
+            [item["resource_key"] for item in reacquired["leases"]],
+        )
+
+    def test_runtime_refresh_terminal_source_rejects_caller_subset_and_superset(self) -> None:
+        fixture = self._runtime_refresh_fixture(resource_contract="current-three")
+        source = {
+            "kind": resources.BUREAU_RUNTIME_REFRESH_RESULT_KIND,
+            "target_sha256": fixture["target_sha256"],
+            "result_sha256": fixture["result_sha256"],
+        }
+        extra_key = f"path:{self.root / 'extra-runtime-refresh-resource'}"
+        resources.acquire_resources(
+            fixture["owner"],
+            [extra_key],
+            purpose="unbound runtime refresh resource",
+            ttl_seconds=360,
+        )
+        extra_snapshot = {
+            field: resources.inspect_resource(extra_key)[field]
+            for field in resources.LEASE_SNAPSHOT_KEYS
+        }
+        cases = [
+            (
+                "subset",
+                list(fixture["resource_keys"][:-1]),
+                list(fixture["snapshots"][:-1]),
+            ),
+            (
+                "superset",
+                sorted([*fixture["resource_keys"], extra_key]),
+                sorted(
+                    [*fixture["snapshots"], extra_snapshot],
+                    key=lambda item: item["resource_key"],
+                ),
+            ),
+        ]
+        with patch.object(
+            resources,
+            "BUREAU_RUNTIME_REFRESH_STATE_ROOT",
+            fixture["state_root"],
+        ):
+            for label, resource_keys, snapshots in cases:
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(PermissionError, "names other resources"):
+                        resources.reconcile_obsolete_path_leases(
+                            owner_id=fixture["owner"],
+                            resource_keys=resource_keys,
+                            expected_leases=snapshots,
+                            terminal_source=source,
+                        )
+        self.assertTrue(
+            all(
+                resources.inspect_resource(key) is not None
+                for key in [*fixture["resource_keys"], extra_key]
+            )
         )
 
     def test_runtime_refresh_mcp_tool_requires_operator_and_audits(self) -> None:

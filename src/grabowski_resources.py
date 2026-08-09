@@ -2125,23 +2125,40 @@ def _runtime_refresh_terminal_material(
             "terminal-evidence-invalid",
             "runtime-refresh intent paths are not canonical absolute paths",
         )
-    canonical_resource_keys = [
-        f"path:{Path(str(intent['bin_dir'])).expanduser() / 'bureau'}",
-        f"path:{Path(str(intent['bin_dir'])).expanduser() / 'bureau-runtime-refresh'}",
-        f"path:{Path(str(intent['prefix'])).expanduser()}",
-        f"path:{root}",
-        f"path:{Path(str(intent['workspace'])).expanduser()}",
-    ]
-    canonical_resource_keys = sorted(set(canonical_resource_keys))
+    intent_resource_keys = intent.get("required_resource_keys")
+    if (
+        not isinstance(intent_resource_keys, list)
+        or not intent_resource_keys
+        or any(not isinstance(item, str) for item in intent_resource_keys)
+        or intent_resource_keys != sorted(set(intent_resource_keys))
+    ):
+        raise nonconflict.NonConflictDenied(
+            "terminal-evidence-invalid",
+            "runtime-refresh intent resource binding is invalid",
+        )
+    canonical_resource_keys: list[str] = []
+    for resource_key in intent_resource_keys:
+        if not resource_key.startswith("path:"):
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid",
+                "runtime-refresh intent resources must be path resources",
+            )
+        resource_path = Path(resource_key[len("path:"):]).expanduser()
+        normalized_path = Path(os.path.normpath(str(resource_path)))
+        if not resource_path.is_absolute() or resource_path != normalized_path:
+            raise nonconflict.NonConflictDenied(
+                "terminal-evidence-invalid",
+                "runtime-refresh intent resources are not canonical absolute paths",
+            )
+        canonical_resource_keys.append(f"path:{resource_path}")
     if (
         resource_keys != canonical_resource_keys
-        or intent.get("required_resource_keys") != canonical_resource_keys
         or Path(str(intent.get("workspace", ""))).expanduser()
         != root / "workspaces" / main_commit
     ):
         raise nonconflict.NonConflictDenied(
             "terminal-evidence-invalid",
-            "runtime-refresh resources are not the five canonical paths",
+            "runtime-refresh resources differ from the verified intent",
         )
     snapshots = _normalize_expected_lease_snapshots(
         lease_snapshots, owner_id=owner_id, resource_keys=resource_keys
