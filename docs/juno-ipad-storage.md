@@ -41,6 +41,12 @@ Grant-Dateien liegen privat unter:
 <Juno-Python-Home>/Library/Application Support/GrabowskiJunoAgent/storage-grants/
 ```
 
+Diese Grant-Registry ist absichtlich vom operativen Agent-State getrennt. Der
+Agent-State kann beispielsweise im iCloud-synchronisierten
+`grabowski_workspace` liegen; Security-Scoped Bookmarks bleiben dagegen in der
+lokalen privaten Application-Support-Registry, die Grant-Helfer und typisierte
+Storage-Jobs gemeinsam verwenden.
+
 Vertrag:
 
 - Verzeichnis: Eigentümer ist der Juno-Prozessnutzer, Modus exakt `0700`.
