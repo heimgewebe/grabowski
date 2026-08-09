@@ -8196,6 +8196,85 @@ class CaptainAuthorityPathTests(unittest.TestCase):
         execution = result["output"]["executions"][0]
         self.assertTrue(execution["verification_passed"])
 
+    def test_atomic_merge_guard_accepts_canonical_codex_review_actor_alias(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        evidence = captain_codex_review_evidence()
+        evidence["completion"]["actor"] = "chatgpt-codex-connector"
+        core = {
+            key: value for key, value in evidence.items() if key != "evidence_sha256"
+        }
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        state = captain_codex_live_state(view)
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+
+    def test_atomic_merge_guard_accepts_canonical_clean_comment_actor_alias(self) -> None:
+        parameters = authorized_captain_run_parameters()
+        evidence = captain_codex_clean_comment_evidence()
+        evidence["completion"]["actor"] = "chatgpt-codex-connector"
+        core = {
+            key: value for key, value in evidence.items() if key != "evidence_sha256"
+        }
+        evidence["evidence_sha256"] = grips.sha256_json(core)
+        parameters["codex_review_evidence"] = evidence
+        parameters["execution_intent"] = captain_execution_intent(parameters)
+        view = {
+            "number": 96,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "baseRefOid": CAPTAIN_BASE_SHA,
+            "headRefName": "feat/captain",
+            "headRefOid": CAPTAIN_HEAD,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+        }
+        base_state = captain_codex_live_state(view, review_pages=[[]])
+        request_comment = deepcopy(base_state["request_comment"])
+        clean_comment = captain_codex_clean_comment()
+        state = captain_codex_live_state(
+            view,
+            request_pages=[[request_comment, clean_comment]],
+            review_pages=[[]],
+        )
+        gh = FakeGh(view=view, diff_text=CAPTAIN_DIFF_TEXT, codex_state=state)
+
+        result = grips.grip_run(
+            "captain-run",
+            parameters,
+            profile="captain",
+            allow_mutation=True,
+            command_runner=FakeGit(),
+            github_runner=gh,
+        )
+
+        execution = result["output"]["executions"][0]
+        self.assertTrue(execution["verification_passed"])
+
     def test_atomic_merge_guard_accepts_bound_clean_comment(self) -> None:
         parameters = authorized_captain_run_parameters()
         parameters["codex_review_evidence"] = captain_codex_clean_comment_evidence()

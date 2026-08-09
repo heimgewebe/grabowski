@@ -3345,7 +3345,7 @@
       "src/grabowski_mcp.py": "f820472e05d4030d29dcd4ea53ba3ee4fdbe1715274c1141f7cb9031e155d84c",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
-      "src/grabowski_merge_guard.py": "e7a23e36a7623cc07bf09c294d7e2934b47bec5e867b9cf77b866244b3052d14",
+      "src/grabowski_merge_guard.py": "a6b598ccd4c9684db923f7de649d7ec318227fd4feb7db5c3ce6507aacd69b37",
       "src/grabowski_nonconflict.py": "bb4bdc65f8da78e58d2f3921cceb94caa9639c441364db9b4b1cb777f32e36ab",
       "src/grabowski_ntfy_dispatch.py": "982bc06d4e4be7823fcc7613df01d39294ebb2b76d2ed378f412e762191dfbc5",
       "src/grabowski_operations.py": "a26527b270d3e5ca0ab85b429921f7c90c74f677f9e7ddc21407a4c661a8cb2e",
