@@ -15,7 +15,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_VERSION = 1
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 STATE_KIND = "grabowski_transport_roundtrip_state"
 CHALLENGE_KIND = "grabowski_transport_roundtrip_challenge"
 VERIFICATION_KIND = "grabowski_transport_roundtrip_verification"
@@ -41,7 +41,9 @@ _RUNTIME_BINDING_KEYS = frozenset(
     }
 )
 _CLIENT_SCOPE_KEYS = frozenset({"kind", "label"})
-_CLIENT_SCOPE_KINDS = frozenset({"client_declared_meta", "shared_unlabeled"})
+_CLIENT_SCOPE_KINDS = frozenset(
+    {"client_declared_meta", "connector_capability", "shared_unlabeled"}
+)
 _MUTATION_INTENT_KEYS = frozenset({"tool_name", "arguments_sha256"})
 _EXECUTION_CAPABILITY_KEY = "execution_capability_sha256"
 _EXECUTION_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -736,6 +738,12 @@ def _validate_state(state: Any, *, scope: dict[str, str]) -> dict[str, Any]:
         return _legacy_state_to_current(state, scope=scope)
     if state.get("schema_version") == 2 and set(state) == _STATE_KEYS:
         return _state_v2_to_current(state, scope=scope)
+    if state.get("schema_version") == 3 and set(state) == _STATE_KEYS:
+        # T142: schema-v3 scopes were not protocol-authenticated.  Validate only
+        # their storage identity, then discard every challenge/verification so
+        # no pre-capability receipt can authorize a schema-v4 mutation.
+        _validate_state_identity(state, scope=scope, schema_version=3)
+        return _empty_state(scope)
     if set(state) != _STATE_KEYS:
         raise TransportRoundtripError(
             "transport roundtrip state contract mismatch"

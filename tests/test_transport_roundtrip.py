@@ -930,9 +930,40 @@ class UnboundVerificationAuthorizesNothingTests(_TransportHarness):
         refreshed = self.begin(
             scope=SHARED_SCOPE, mutation_intent=intent, now=103
         )
-        self.assertEqual(refreshed["state_schema_version"], 3)
+        self.assertEqual(refreshed["state_schema_version"], 4)
         migrated = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["schema_version"], 3)
+        self.assertEqual(migrated["schema_version"], 4)
+
+    def test_v3_verification_is_discarded_before_schema_v4_use(self) -> None:
+        intent = self.intent("write", "schema-v3")
+        begun = self.begin(scope=META_SCOPE, mutation_intent=intent)
+        self.acknowledge(begun["challenge_receipt_sha256"], scope=META_SCOPE)
+        path = roundtrip._state_path(roundtrip._sha256_json(META_SCOPE))
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(state["schema_version"], 4)
+        self.assertEqual(len(state["verified_receipts"]), 1)
+        state["schema_version"] = 3
+        path.write_text(json.dumps(state), encoding="utf-8")
+        os.chmod(path, 0o600)
+
+        projected = roundtrip.status(
+            client_scope=META_SCOPE, runtime_binding=BINDING, now_unix=102
+        )
+        self.assertEqual(projected["verified_receipt_count"], 0)
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=META_SCOPE,
+                runtime_binding=BINDING,
+                now_unix=102,
+                **intent,
+            )
+        refreshed = self.begin(
+            scope=META_SCOPE, mutation_intent=intent, now=103
+        )
+        self.assertEqual(refreshed["state_schema_version"], 4)
+        migrated = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(migrated["schema_version"], 4)
+        self.assertEqual(migrated["verified_receipts"], [])
 
     def test_error_names_the_caller_scope_and_the_exact_requested_target(self) -> None:
         self.verify(mutation_intent=self.intent("intended-write", "1"))
