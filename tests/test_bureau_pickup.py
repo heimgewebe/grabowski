@@ -4213,6 +4213,56 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual("preserve-me", dirty.read_text(encoding="utf-8"))
         self.assertTrue(workspace.is_dir())
 
+    def test_orphan_reconcile_separates_read_binding_from_fail_mutation_root(
+        self,
+    ) -> None:
+        intent, _run_dir, _acq, coordination, request, lease, key = (
+            self._orphan_setup()
+        )
+        mutation_registry_root = self.root / "bureau-control"
+        mutation_registry_root.mkdir()
+        terminal = self.coordinated_status(intent, state="failed")
+        fail_result = {
+            "run_id": intent["run_id"],
+            "state": "failed",
+            "error": pickup.ORPHAN_RECONCILE_ERROR,
+        }
+        with (
+            mock.patch.object(
+                pickup.bureau, "BUREAU_ROOT", mutation_registry_root
+            ),
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[coordination, fail_result, terminal, terminal],
+            ) as invoke,
+            mock.patch.object(
+                pickup.resources,
+                "inspect_resource",
+                side_effect=[lease, lease, None],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "release_resources",
+                return_value={"released": [lease]},
+            ) as release,
+        ):
+            result = pickup.grabowski_bureau_pickup_orphan_reconcile(request)
+        self.assertEqual("reconciled", result["status"])
+        release.assert_called_once_with(intent["lease_owner_id"], [key])
+        self.assertEqual(4, invoke.call_count)
+        roots = []
+        for call in invoke.call_args_list:
+            argv = call.args[0]
+            roots.append(argv[argv.index("--root") + 1])
+        self.assertEqual(str(self.registry_root), roots[0])
+        self.assertEqual(str(mutation_registry_root), roots[1])
+        self.assertEqual(str(self.registry_root), roots[2])
+        self.assertEqual(str(self.registry_root), roots[3])
+        pickup.operator._require_operator_mutation.assert_any_call(
+            "terminal_execute", path=str(mutation_registry_root)
+        )
+
     def test_orphan_reconcile_digest_drift_is_no_op(self) -> None:
         intent, _run_dir, _acq, coordination, request, lease, _key = (
             self._orphan_setup()
