@@ -136,12 +136,12 @@ def _bureau_pickup_error_message(
 class _RequiredBureauPickupRequest(TypedDict):
     worker_id: str
     capabilities: list[str]
-    task_id: str
 
 
 class BureauPickupRequest(_RequiredBureauPickupRequest, total=False):
     __pydantic_config__ = {"extra": "forbid", "strict": True}
 
+    task_id: str | None
     resource: str | None
     kind: str
     base_dir: str | None
@@ -1089,7 +1089,7 @@ def _bound_bureau_call(binding: RegistryBinding, callback):
 
 def _task_document_path(request: dict[str, Any]) -> Path | None:
     task_id = request["task_id"]
-    if TASK_ID_RE.fullmatch(task_id) is None:
+    if task_id is None or TASK_ID_RE.fullmatch(task_id) is None:
         return None
     root = Path(request["registry_root"])
     path = root / "registry" / "tasks" / f"{task_id}.json"
@@ -1288,7 +1288,12 @@ def _normalize_request(
     if extra:
         raise ValueError(f"unsupported request fields: {extra}")
     worker_id = _text(request.get("worker_id"), label="worker_id", maximum=200)
-    task_id = _text(request.get("task_id"), label="task_id", maximum=200)
+    raw_task_id = request.get("task_id")
+    task_id = (
+        None
+        if raw_task_id is None
+        else _text(raw_task_id, label="task_id", maximum=200)
+    )
     kind = _text(
         request.get("kind", "interactive-agent"), label="kind", maximum=128
     )
@@ -1354,7 +1359,8 @@ def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
     )
     arguments.extend(["--worker", request["worker_id"]])
     arguments.extend(["--kind", request["kind"]])
-    arguments.extend(["--task-id", request["task_id"]])
+    if request["task_id"] is not None:
+        arguments.extend(["--task-id", request["task_id"]])
     for capability in request["capabilities"]:
         arguments.extend(["--capability", capability])
     if request["resource"]:
@@ -1548,7 +1554,13 @@ def _validate_intent_result(
         raise BureauPickupError("claim-intent-missing")
     if RUN_ID_RE.fullmatch(str(intent.get("run_id", ""))) is None:
         raise BureauPickupError("claim-intent-run-id-invalid")
-    if intent.get("task_id") != request["task_id"]:
+    selected_task_id = intent.get("task_id")
+    if (
+        not isinstance(selected_task_id, str)
+        or TASK_ID_RE.fullmatch(selected_task_id) is None
+    ):
+        raise BureauPickupError("claim-intent-task-id-invalid")
+    if request["task_id"] is not None and selected_task_id != request["task_id"]:
         raise BureauPickupError("claim-intent-task-mismatch")
     if intent.get("worker_id") != request["worker_id"]:
         raise BureauPickupError("claim-intent-worker-mismatch")
@@ -2740,6 +2752,35 @@ def _repair_existing_assignment_lease_binding(
     return True
 
 
+def _closeout_latched_response(
+    request: dict[str, Any],
+    registry_binding: RegistryBinding,
+    request_sha256: str,
+    closeout_latch: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = request["task_id"]
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_closeout_latched",
+        "status": "closeout-only",
+        "effect_started": False,
+        "retryable": False,
+        "ambiguity": False,
+        "request_sha256": request_sha256,
+        "registry_binding_sha256": registry_binding["identity"]["binding_sha256"],
+        "registry_binding_kind": registry_binding["identity"]["kind"],
+        "task_id": task_id,
+        "latch": closeout_latch,
+        "required_readback": [f"bureau_task:{task_id}"],
+    }
+    bureau._audit(
+        "bureau-pickup-closeout-latched",
+        result,
+        task_id=task_id,
+    )
+    return result
+
+
 @mcp.tool(name="grabowski_bureau_pickup_execute", annotations=MUTATING)
 def grabowski_bureau_pickup_execute(
     request: BureauPickupRequest,
@@ -2759,28 +2800,9 @@ def grabowski_bureau_pickup_execute(
         lambda: _claim_intent_or_closeout(normalized),
     )
     if closeout_latch is not None:
-        result = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "grabowski_bureau_pickup_closeout_latched",
-            "status": "closeout-only",
-            "effect_started": False,
-            "retryable": False,
-            "ambiguity": False,
-            "request_sha256": request_sha256,
-            "registry_binding_sha256": registry_binding["identity"][
-                "binding_sha256"
-            ],
-            "registry_binding_kind": registry_binding["identity"]["kind"],
-            "task_id": normalized["task_id"],
-            "latch": closeout_latch,
-            "required_readback": [f"bureau_task:{normalized['task_id']}"],
-        }
-        bureau._audit(
-            "bureau-pickup-closeout-latched",
-            result,
-            task_id=normalized["task_id"],
+        return _closeout_latched_response(
+            normalized, registry_binding, request_sha256, closeout_latch
         )
-        return result
     cached_coordination: dict[str, Any] | None = None
     try:
         intent, existing = _validate_intent_result(intent_payload, normalized)
@@ -2795,6 +2817,19 @@ def grabowski_bureau_pickup_execute(
         intent_payload, registry_binding, normalized, cached_coordination = replay
         request_sha256 = _sha256(normalized)
         intent, existing = _validate_intent_result(intent_payload, normalized)
+    if normalized["task_id"] is None and not existing:
+        selected_request = {**normalized, "task_id": intent["task_id"]}
+        selected_closeout_latch = _bound_bureau_call(
+            registry_binding,
+            lambda: _machine_completion_closeout_latch(selected_request),
+        )
+        if selected_closeout_latch is not None:
+            return _closeout_latched_response(
+                selected_request,
+                registry_binding,
+                request_sha256,
+                selected_closeout_latch,
+            )
     run_dir = _run_directory(intent["run_id"])
     if existing:
         stored_request_payload = _read_bound_json(
