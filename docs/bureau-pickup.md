@@ -24,16 +24,17 @@ The MCP input remains one top-level `request` object, preserving existing Python
 2. creates or reopens the configured coordination directory through descriptor-bound `O_DIRECTORY|O_NOFOLLOW` traversal, requiring current ownership and mode `0700`;
 3. requests a read-only, approved Bureau `claim-intent` against the Registry root and the same explicit coordination root, selecting the requested task strictly or the next eligible task when `task_id` is omitted;
 4. validates task, worker, run, owner, expiry and exact resource keys;
-5. writes immutable private request and intent artifacts;
-6. acquires Bureau resources, broad repository resources and remaining resources in explicit groups under `bureau-run:<run_id>`;
-7. binds every lease metadata set to `task_id`, `run_id` and `claim_intent_sha256`;
-8. requires a complete Grabowski scope manifest for every broad repository lease, while self-scoped `repo:<checkout>:branch:<name>`, `repo:<checkout>:operation:<name>` and `repo:<checkout>:tag:<name>` keys remain authoritative and carry no scope manifest;
-9. commits the exact intent and live lease binding through the same Bureau root, optionally creating the planned workspace;
-10. reads the canonical Bureau run through the same root after any unclear commit result;
-11. compensates all acquired leases when the commit is authoritatively known not to have started or Bureau authoritatively reports that the run does not exist;
-12. compensates the current acquisition group as well when snapshot validation or immutable journaling fails after the lease database commit.
+5. precomputes and validates the effect-free acquisition-group plan, including broad-repository scope manifests and every supplied non-conflict proof's shape, owner, resource set, purpose, requested scope binding and requested lease lifetime;
+6. writes immutable private request and intent artifacts only after that preflight succeeds;
+7. acquires Bureau resources, broad repository resources and remaining resources from that exact validated plan under `bureau-run:<run_id>`;
+8. binds every lease metadata set to `task_id`, `run_id` and `claim_intent_sha256`;
+9. requires a complete Grabowski scope manifest for every broad repository lease, while self-scoped `repo:<checkout>:branch:<name>`, `repo:<checkout>:operation:<name>` and `repo:<checkout>:tag:<name>` keys remain authoritative and carry no scope manifest;
+10. commits the exact intent and live lease binding through the same Bureau root, optionally creating the planned workspace;
+11. reads the canonical Bureau run through the same root after any unclear commit result;
+12. compensates all acquired leases when the commit is authoritatively known not to have started or Bureau authoritatively reports that the run does not exist;
+13. compensates the current acquisition group as well when snapshot validation or immutable journaling fails after the lease database commit.
 
-A transport timeout never proves that the claim was absent. Ambiguous states retain their leases and raise `claim-commit-recovery-required` with the structured recovery result. A definitely unapplied commit compensates its own acquisitions and raises `claim-commit-not-applied`. An exact retry may recover an existing assignment only when the stored request, Registry root, coordination root, intent digest and acquisition journal all match; an unjournaled assignment remains foreign and fails closed. Legacy assignments lacking the explicit coordination-root field may be recovered by execute only while the configured root still equals Bureau's implicit legacy state. After a configured root cutover they are read through status/recovery and are not adopted by execute.
+A deterministic preflight refusal, such as a missing broad-repository scope, proof scope drift, or a lease lifetime exceeding its proof, reports `effect_started: false` and leaves no immutable request or intent artifact that could collide with a corrected retry. Live blocker identity, lease snapshot, existing scope and conflict-axis revalidation remain atomic inside resource acquisition. A transport timeout never proves that the claim was absent. Ambiguous states retain their leases and raise `claim-commit-recovery-required` with the structured recovery result. A definitely unapplied commit compensates its own acquisitions and raises `claim-commit-not-applied`. An exact retry may recover an existing assignment only when the stored request, Registry root, coordination root, intent digest and acquisition journal all match; an unjournaled assignment remains foreign and fails closed. Legacy assignments lacking the explicit coordination-root field may be recovered by execute only while the configured root still equals Bureau's implicit legacy state. After a configured root cutover they are read through status/recovery and are not adopted by execute.
 
 ## Status and release
 

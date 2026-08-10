@@ -17,6 +17,7 @@ except ModuleNotFoundError:
 
 import grabowski_bureau_intake as bureau
 import grabowski_bureau_leases as bureau_leases
+import grabowski_nonconflict as nonconflict
 import grabowski_resources as resources
 import grabowski_work_admission as work_admission
 
@@ -1755,6 +1756,105 @@ def _acquisition_groups(
     return groups
 
 
+def _preflight_acquisition_groups(
+    intent: dict[str, Any], request: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Build and validate the effect-free lease plan before journaling intent."""
+    try:
+        groups = _acquisition_groups(intent, request)
+        for group in groups:
+            metadata = group["metadata"]
+            scope = metadata.get("scope_manifest")
+            normalized_scope: dict[str, Any] | None = None
+            if scope is not None:
+                normalized_scope = nonconflict.normalize_scope_manifest(scope)
+                broad_repository_keys = [
+                    key
+                    for key in group["resource_keys"]
+                    if key.startswith("repo:")
+                    and resources.scoped_repository_resource_root(key) is None
+                ]
+                expected_key = f"repo:{normalized_scope['repository']}"
+                if broad_repository_keys and broad_repository_keys != [expected_key]:
+                    raise ValueError(
+                        "scope_manifest repository must match acquisition resource key"
+                    )
+                metadata["scope_manifest"] = normalized_scope
+            proof = group["nonconflict_proof"]
+            if proof is None:
+                continue
+            validated_proof = nonconflict.validate_public_proof(proof)
+            expected_keys = sorted(group["resource_keys"])
+            if validated_proof["requesting_owner"] != intent["lease_owner_id"]:
+                raise nonconflict.NonConflictDenied(
+                    "owner-drift",
+                    "non-conflict proof owner does not match the claim intent",
+                )
+            if validated_proof["resource_keys"] != expected_keys:
+                raise nonconflict.NonConflictDenied(
+                    "resource-drift",
+                    "non-conflict proof resources do not match the acquisition group",
+                )
+            expected_purpose = (
+                f"Bureau coordinated pickup {intent['run_id']} group {group['name']}"
+            )
+            if validated_proof["purpose_sha256"] != hashlib.sha256(
+                expected_purpose.encode("utf-8")
+            ).hexdigest():
+                raise nonconflict.NonConflictDenied(
+                    "purpose-drift",
+                    "non-conflict proof purpose does not match the acquisition group",
+                )
+            if normalized_scope is None:
+                raise nonconflict.NonConflictDenied(
+                    "requested-scope-missing",
+                    "non-conflict exception requires metadata.scope_manifest",
+                )
+            if metadata.get("scope_manifest_complete") is not True:
+                raise nonconflict.NonConflictDenied(
+                    "requested-scope-unattested",
+                    "requesting owner did not attest that the scope manifest is complete",
+                )
+            requested_scope = nonconflict.validate_resource_scope_binding(
+                expected_keys, normalized_scope
+            )
+            if requested_scope != validated_proof["requested_scope"]:
+                raise nonconflict.NonConflictDenied(
+                    "scope-drift",
+                    "requested scope changed after proof creation",
+                )
+            requested_ttl_seconds = group["ttl_seconds"]
+            if (
+                type(requested_ttl_seconds) is not int
+                or requested_ttl_seconds <= 0
+            ):
+                raise ValueError("requested_ttl_seconds must be a positive integer")
+            if (
+                requested_ttl_seconds > nonconflict.MAX_PROOF_TTL_SECONDS
+                or int(time.time()) + requested_ttl_seconds
+                > validated_proof["expires_at_unix"]
+            ):
+                raise nonconflict.NonConflictDenied(
+                    "lease-outlives-proof",
+                    "requested lease would outlive the non-conflict proof",
+                )
+            group["nonconflict_proof"] = validated_proof
+        return groups
+    except BureauPickupError as exc:
+        exc.details.setdefault("effect_started", False)
+        exc.details.setdefault("required_readback", ["claim-intent"])
+        raise
+    except Exception as exc:
+        raise BureauPickupError(
+            "lease-acquisition-preflight-failed",
+            details={
+                "effect_started": False,
+                "required_readback": ["claim-intent"],
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
+
+
 def _validate_acquired_group(
     owner_id: str, group: dict[str, Any], result: dict[str, Any]
 ) -> None:
@@ -1792,11 +1892,16 @@ def _validate_acquired_group(
 
 
 def _acquire_groups(
-    intent: dict[str, Any], request: dict[str, Any], run_dir: Path
+    intent: dict[str, Any],
+    request: dict[str, Any],
+    run_dir: Path,
+    *,
+    groups: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     acquired: list[dict[str, Any]] = []
     owner_id = intent["lease_owner_id"]
-    groups = _acquisition_groups(intent, request)
+    if groups is None:
+        groups = _acquisition_groups(intent, request)
     try:
         for index, group in enumerate(groups, start=1):
             result = resources.acquire_resources(
@@ -2830,6 +2935,9 @@ def grabowski_bureau_pickup_execute(
                 request_sha256,
                 selected_closeout_latch,
             )
+    acquisition_groups = (
+        None if existing else _preflight_acquisition_groups(intent, normalized)
+    )
     run_dir = _run_directory(intent["run_id"])
     if existing:
         stored_request_payload = _read_bound_json(
@@ -2962,7 +3070,12 @@ def grabowski_bureau_pickup_execute(
     )
     _write_bound_json(run_dir / "intent-result.json", intent_payload)
     _write_bound_json(run_dir / "intent.json", intent)
-    acquisition = _acquire_groups(intent, normalized, run_dir)
+    acquisition = _acquire_groups(
+        intent,
+        normalized,
+        run_dir,
+        groups=acquisition_groups,
+    )
     try:
         commit = _bound_bureau_call(
             registry_binding, lambda: _commit_claim(intent, normalized, run_dir)

@@ -569,6 +569,73 @@ class BureauPickupTests(unittest.TestCase):
             "reclaimed_from_owner": None,
         }
 
+    def valid_nonconflict_group(
+        self,
+        intent,
+        *,
+        proof_ttl_seconds=300,
+        lease_ttl_seconds=120,
+    ):
+        resource_key = intent["required_resource_keys"][0]
+        self.assertTrue(resource_key.startswith("path:"))
+        path = Path(resource_key.removeprefix("path:"))
+        repository = path.parent
+        requested_scope = {
+            "schema_version": 1,
+            "repository": str(repository),
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-branch",
+            "worktree": str(repository),
+            "effects": ["write"],
+            "paths": [str(path)],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        existing_scope = {
+            **requested_scope,
+            "task_id": "TEST-T002",
+            "head": "b" * 40,
+            "branch": "existing-branch",
+            "worktree": str(repository.parent / "existing-worktree"),
+            "paths": [str(repository / "existing.py")],
+        }
+        now = int(time.time())
+        proof = pickup.nonconflict.create_nonconflict_proof(
+            blocked_lease={
+                "resource_key": f"repo:{repository}",
+                "owner_id": "other-owner",
+                "acquired_at_unix": now - 1,
+                "updated_at_unix": now - 1,
+                "expires_at_unix": now + 3600,
+                "metadata_sha256": "a" * 64,
+            },
+            existing_scope=existing_scope,
+            requesting_owner=intent["lease_owner_id"],
+            resource_keys=[resource_key],
+            purpose=f"Bureau coordinated pickup {intent['run_id']} group other",
+            requested_scope=requested_scope,
+            requested_scope_complete=True,
+            proof_ttl_seconds=proof_ttl_seconds,
+            now=now,
+        )
+        return {
+            "name": "other",
+            "resource_keys": [resource_key],
+            "metadata": {
+                "scope_manifest": requested_scope,
+                "scope_manifest_complete": True,
+            },
+            "nonconflict_proof": proof,
+            "ttl_seconds": lease_ttl_seconds,
+        }
+
     @staticmethod
     def utc_heartbeat(age_seconds: int = 30) -> str:
         moment = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
@@ -1571,9 +1638,105 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(["/tmp/repository"], scope["paths"])
         self.assertEqual(["write"], scope["effects"])
 
-    def test_repository_scope_is_required_without_workspace_creation(self) -> None:
-        key = "repo:/tmp/repository"
+    def test_repository_scope_preflight_leaves_no_artifact_for_corrected_replay(
+        self,
+    ) -> None:
+        repository = self.root / "repository"
+        key = f"repo:{repository}"
         intent = self.intent([key])
+        scope = {
+            "schema_version": 1,
+            "repository": str(repository),
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-branch",
+            "worktree": str(repository),
+            "effects": ["write"],
+            "paths": [str(repository)],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        lease = self.lease(key, intent["lease_owner_id"])
+        existing = {
+            "status": "existing-assignment",
+            "envelope": {"claim_intent": intent},
+        }
+        run_dir = pickup.STATE_ROOT / "runs" / intent["run_id"]
+        corrected_request = self.request(
+            create_workspace=False,
+            repository_scope_manifests={key: scope},
+        )
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                side_effect=[
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claim-intent", "intent": intent},
+                    {"status": "claimed", "run": {"run_id": intent["run_id"]}},
+                    self.coordinated_status(intent),
+                    existing,
+                    self.coordinated_status(intent),
+                ],
+            ),
+            mock.patch.object(
+                pickup.resources,
+                "acquire_resources",
+                return_value={
+                    "owner_id": intent["lease_owner_id"],
+                    "leases": [lease],
+                },
+            ) as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "repository-scope-required"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(create_workspace=False)
+                )
+            self.assertFalse(raised.exception.details["effect_started"])
+            self.assertFalse((run_dir / "request.json").exists())
+
+            claimed = pickup.grabowski_bureau_pickup_execute(corrected_request)
+            replayed = pickup.grabowski_bureau_pickup_execute(corrected_request)
+
+        self.assertEqual("claimed", claimed["status"])
+        self.assertEqual("existing-assignment", replayed["status"])
+        acquire.assert_called_once()
+        self.assertTrue((run_dir / "request.json").is_file())
+
+    def test_multigroup_preflight_failure_precedes_all_acquisition_and_artifacts(
+        self,
+    ) -> None:
+        repository = self.root / "repository"
+        repo_key = f"repo:{repository}"
+        other_key = f"path:{repository / 'target.py'}"
+        intent = self.intent([repo_key, other_key])
+        scope = {
+            "schema_version": 1,
+            "repository": str(repository),
+            "task_id": intent["task_id"],
+            "base_head": "a" * 40,
+            "head": "a" * 40,
+            "branch": "test-branch",
+            "worktree": str(repository),
+            "effects": ["write"],
+            "paths": [str(repository)],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        run_dir = pickup.STATE_ROOT / "runs" / intent["run_id"]
         with (
             mock.patch.object(
                 pickup.bureau,
@@ -1582,10 +1745,118 @@ class BureauPickupTests(unittest.TestCase):
             ),
             mock.patch.object(pickup.resources, "acquire_resources") as acquire,
         ):
-            with self.assertRaisesRegex(pickup.BureauPickupError, "repository-scope-required"):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "lease-acquisition-preflight-failed"
+            ) as raised:
                 pickup.grabowski_bureau_pickup_execute(
-                    self.request(create_workspace=False)
+                    self.request(
+                        create_workspace=False,
+                        repository_scope_manifests={repo_key: scope},
+                        nonconflict_proofs={"other": {}},
+                    )
                 )
+
+        self.assertFalse(raised.exception.details["effect_started"])
+        self.assertFalse((run_dir / "request.json").exists())
+        acquire.assert_not_called()
+
+    def test_invalid_nonconflict_proof_fails_before_journal_artifacts(self) -> None:
+        intent = self.intent()
+        run_dir = pickup.STATE_ROOT / "runs" / intent["run_id"]
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError, "lease-acquisition-preflight-failed"
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(nonconflict_proofs={"other": {}})
+                )
+
+        self.assertFalse(raised.exception.details["effect_started"])
+        self.assertFalse((run_dir / "request.json").exists())
+        acquire.assert_not_called()
+
+    def test_nonconflict_scope_preflight_fails_before_journal_artifacts(
+        self,
+    ) -> None:
+        repository = self.root / "repository"
+        intent = self.intent([f"path:{repository / 'target.py'}"])
+        run_dir = pickup.STATE_ROOT / "runs" / intent["run_id"]
+        for case in ("missing", "unattested", "drift"):
+            with self.subTest(case=case):
+                group = self.valid_nonconflict_group(intent)
+                if case == "missing":
+                    group["metadata"].pop("scope_manifest")
+                    group["metadata"].pop("scope_manifest_complete")
+                elif case == "unattested":
+                    group["metadata"].pop("scope_manifest_complete")
+                else:
+                    group["metadata"]["scope_manifest"] = {
+                        **group["metadata"]["scope_manifest"],
+                        "branch": "drifted-branch",
+                    }
+                pickup.nonconflict.validate_public_proof(group["nonconflict_proof"])
+                with (
+                    mock.patch.object(
+                        pickup.bureau,
+                        "_invoke_bureau",
+                        return_value={"status": "claim-intent", "intent": intent},
+                    ),
+                    mock.patch.object(
+                        pickup, "_acquisition_groups", return_value=[group]
+                    ),
+                    mock.patch.object(
+                        pickup.resources, "acquire_resources"
+                    ) as acquire,
+                ):
+                    with self.assertRaisesRegex(
+                        pickup.BureauPickupError,
+                        "lease-acquisition-preflight-failed",
+                    ) as raised:
+                        pickup.grabowski_bureau_pickup_execute(
+                            self.request(lease_ttl_seconds=120)
+                        )
+                self.assertFalse(raised.exception.details["effect_started"])
+                self.assertFalse((run_dir / "request.json").exists())
+                acquire.assert_not_called()
+
+    def test_nonconflict_lease_ttl_preflight_fails_before_journal_artifacts(
+        self,
+    ) -> None:
+        repository = self.root / "repository"
+        intent = self.intent([f"path:{repository / 'target.py'}"])
+        group = self.valid_nonconflict_group(
+            intent,
+            proof_ttl_seconds=120,
+            lease_ttl_seconds=300,
+        )
+        pickup.nonconflict.validate_public_proof(group["nonconflict_proof"])
+        run_dir = pickup.STATE_ROOT / "runs" / intent["run_id"]
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ),
+            mock.patch.object(pickup, "_acquisition_groups", return_value=[group]),
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                pickup.BureauPickupError,
+                "lease-acquisition-preflight-failed",
+            ) as raised:
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(lease_ttl_seconds=300)
+                )
+
+        self.assertFalse(raised.exception.details["effect_started"])
+        self.assertFalse((run_dir / "request.json").exists())
         acquire.assert_not_called()
 
     def test_work_admission_block_is_classified_with_bounded_evidence(self) -> None:
