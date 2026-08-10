@@ -1093,6 +1093,31 @@ class BureauPickupTests(unittest.TestCase):
             "repeat_connector_probe", result["latch"]["suppressed_effects"]
         )
 
+    def test_implicit_selection_rechecks_closeout_latch_before_effects(self) -> None:
+        self.write_machine_complete_task()
+        intent = self.intent()
+        with (
+            mock.patch.object(
+                pickup.bureau,
+                "_invoke_bureau",
+                return_value={"status": "claim-intent", "intent": intent},
+            ) as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+            mock.patch.object(pickup, "_run_directory") as run_directory,
+        ):
+            result = pickup.grabowski_bureau_pickup_execute(
+                self.request(task_id=None)
+            )
+        invoke.assert_called_once()
+        acquire.assert_not_called()
+        run_directory.assert_not_called()
+        self.assertEqual("closeout-only", result["status"])
+        self.assertFalse(result["effect_started"])
+        self.assertEqual(intent["task_id"], result["task_id"])
+        self.assertEqual(
+            [f"bureau_task:{intent['task_id']}"], result["required_readback"]
+        )
+
     def test_closeout_latch_requires_every_acceptance_result(self) -> None:
         self.write_machine_complete_task(
             acceptance_results={"contract": True, "runtime": False}

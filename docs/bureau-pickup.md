@@ -14,7 +14,7 @@ The module declares three canonical MCP tools: `grabowski_bureau_pickup_execute`
 
 ## Machine-readable execute request
 
-The MCP input remains one top-level `request` object, preserving existing Python and Grip callers. Its generated schema requires `worker_id`, `task_id` and the non-empty `capabilities` list enforced by runtime normalization. It exposes `resource`, `kind`, `base_dir`, `approval_source`, `lease_ttl_seconds`, `create_workspace`, `repository_scope_manifests`, `nonconflict_proofs` and `registry_root` as optional properties. `coordination_root` is deliberately absent from the public schema and is accepted only when re-reading an adapter-owned private journal. Unknown request properties are forbidden by the MCP schema and remain rejected by the authoritative `_normalize_request` path for direct callers. Value bounds, path checks, defaults and normalization remain runtime checks and are not weakened by the published structural schema.
+The MCP input remains one top-level `request` object, preserving existing Python and Grip callers. Its generated schema requires `worker_id` and the non-empty `capabilities` list enforced by runtime normalization; `task_id` is optional. When `task_id` is omitted, Bureau selects the next eligible task for the same worker/capability request, while an explicit `task_id` remains a strict selection constraint. It exposes `resource`, `kind`, `base_dir`, `approval_source`, `lease_ttl_seconds`, `create_workspace`, `repository_scope_manifests`, `nonconflict_proofs` and `registry_root` as optional properties. `coordination_root` is deliberately absent from the public schema and is accepted only when re-reading an adapter-owned private journal. Unknown request properties are forbidden by the MCP schema and remain rejected by the authoritative `_normalize_request` path for direct callers. Value bounds, path checks, defaults and normalization remain runtime checks and are not weakened by the published structural schema.
 
 ## Execute path
 
@@ -22,7 +22,7 @@ The MCP input remains one top-level `request` object, preserving existing Python
 
 1. normalizes the exact Bureau registry root, derives the adapter-owned coordination root and checks operator mutation authority for both paths;
 2. creates or reopens the configured coordination directory through descriptor-bound `O_DIRECTORY|O_NOFOLLOW` traversal, requiring current ownership and mode `0700`;
-3. requests a read-only, approved Bureau `claim-intent` against the Registry root and the same explicit coordination root;
+3. requests a read-only, approved Bureau `claim-intent` against the Registry root and the same explicit coordination root, selecting the requested task strictly or the next eligible task when `task_id` is omitted;
 4. validates task, worker, run, owner, expiry and exact resource keys;
 5. writes immutable private request and intent artifacts;
 6. acquires Bureau resources, broad repository resources and remaining resources in explicit groups under `bureau-run:<run_id>`;

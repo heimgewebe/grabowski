@@ -2752,6 +2752,35 @@ def _repair_existing_assignment_lease_binding(
     return True
 
 
+def _closeout_latched_response(
+    request: dict[str, Any],
+    registry_binding: RegistryBinding,
+    request_sha256: str,
+    closeout_latch: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = request["task_id"]
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "grabowski_bureau_pickup_closeout_latched",
+        "status": "closeout-only",
+        "effect_started": False,
+        "retryable": False,
+        "ambiguity": False,
+        "request_sha256": request_sha256,
+        "registry_binding_sha256": registry_binding["identity"]["binding_sha256"],
+        "registry_binding_kind": registry_binding["identity"]["kind"],
+        "task_id": task_id,
+        "latch": closeout_latch,
+        "required_readback": [f"bureau_task:{task_id}"],
+    }
+    bureau._audit(
+        "bureau-pickup-closeout-latched",
+        result,
+        task_id=task_id,
+    )
+    return result
+
+
 @mcp.tool(name="grabowski_bureau_pickup_execute", annotations=MUTATING)
 def grabowski_bureau_pickup_execute(
     request: BureauPickupRequest,
@@ -2771,28 +2800,9 @@ def grabowski_bureau_pickup_execute(
         lambda: _claim_intent_or_closeout(normalized),
     )
     if closeout_latch is not None:
-        result = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": "grabowski_bureau_pickup_closeout_latched",
-            "status": "closeout-only",
-            "effect_started": False,
-            "retryable": False,
-            "ambiguity": False,
-            "request_sha256": request_sha256,
-            "registry_binding_sha256": registry_binding["identity"][
-                "binding_sha256"
-            ],
-            "registry_binding_kind": registry_binding["identity"]["kind"],
-            "task_id": normalized["task_id"],
-            "latch": closeout_latch,
-            "required_readback": [f"bureau_task:{normalized['task_id']}"],
-        }
-        bureau._audit(
-            "bureau-pickup-closeout-latched",
-            result,
-            task_id=normalized["task_id"],
+        return _closeout_latched_response(
+            normalized, registry_binding, request_sha256, closeout_latch
         )
-        return result
     cached_coordination: dict[str, Any] | None = None
     try:
         intent, existing = _validate_intent_result(intent_payload, normalized)
@@ -2807,6 +2817,19 @@ def grabowski_bureau_pickup_execute(
         intent_payload, registry_binding, normalized, cached_coordination = replay
         request_sha256 = _sha256(normalized)
         intent, existing = _validate_intent_result(intent_payload, normalized)
+    if normalized["task_id"] is None and not existing:
+        selected_request = {**normalized, "task_id": intent["task_id"]}
+        selected_closeout_latch = _bound_bureau_call(
+            registry_binding,
+            lambda: _machine_completion_closeout_latch(selected_request),
+        )
+        if selected_closeout_latch is not None:
+            return _closeout_latched_response(
+                selected_request,
+                registry_binding,
+                request_sha256,
+                selected_closeout_latch,
+            )
     run_dir = _run_directory(intent["run_id"])
     if existing:
         stored_request_payload = _read_bound_json(
