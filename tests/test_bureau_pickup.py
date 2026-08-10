@@ -4233,6 +4233,11 @@ class BureauPickupTests(unittest.TestCase):
             ),
             mock.patch.object(
                 pickup.bureau,
+                "_prepare_registry_root",
+                return_value=str(mutation_registry_root),
+            ) as prepare_root,
+            mock.patch.object(
+                pickup.bureau,
                 "_invoke_bureau",
                 side_effect=[coordination, fail_result, terminal, terminal],
             ) as invoke,
@@ -4259,8 +4264,8 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(str(mutation_registry_root), roots[1])
         self.assertEqual(str(self.registry_root), roots[2])
         self.assertEqual(str(self.registry_root), roots[3])
-        pickup.operator._require_operator_mutation.assert_any_call(
-            "terminal_execute", path=str(mutation_registry_root)
+        prepare_root.assert_called_once_with(
+            str(mutation_registry_root), refresh=True, mutation=True
         )
 
     def test_orphan_reconcile_digest_drift_is_no_op(self) -> None:

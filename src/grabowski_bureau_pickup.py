@@ -3622,9 +3622,8 @@ def grabowski_bureau_pickup_orphan_reconcile(
     run_id = normalized["run_id"]
     binding = _root_binding_for_run(run_id)
     registry_root = binding["registry_root"]
-    mutation_registry_root = _normalize_registry_root(str(bureau.BUREAU_ROOT))
-    operator._require_operator_mutation(
-        "terminal_execute", path=mutation_registry_root
+    mutation_registry_root = bureau._prepare_registry_root(
+        str(bureau.BUREAU_ROOT), refresh=True, mutation=True
     )
     coordination_effect_root = (
         Path(binding["coordination_root"])
