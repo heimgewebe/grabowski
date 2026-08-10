@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import tempfile
 import types
@@ -557,6 +558,240 @@ class TransportGripIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(extra["status"], "blocked")
         self.assertIn("unknown transport roundtrip field", extra["output"]["error"])
+
+
+class ConnectorCapabilityScopeTests(unittest.TestCase):
+    TOKEN_A = "A" * 43
+    TOKEN_B = "B" * 43
+    TOKEN_UNKNOWN = "C" * 43
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "transport-connectors"
+        self.base = _load_grabowski_mcp()
+        self.base._TRANSPORT_CONNECTOR_IDENTITY_ROOT = self.root
+        self.base._TRANSPORT_CONNECTOR_ENFORCEMENT_MARKER = (
+            self.root / "require-identity"
+        )
+        self.base._TRANSPORT_SERVER_INSTANCE_ID = "server-instance-a"
+        state_root = Path(temporary.name) / "roundtrip-state"
+        self.state_root_patch = mock.patch.object(roundtrip, "STATE_ROOT", state_root)
+        self.lock_path_patch = mock.patch.object(
+            roundtrip, "LOCK_PATH", state_root / ".lock"
+        )
+        self.state_root_patch.start()
+        self.lock_path_patch.start()
+        self.addCleanup(self.state_root_patch.stop)
+        self.addCleanup(self.lock_path_patch.stop)
+
+    def enroll(self, **tokens: str) -> None:
+        self.root.mkdir(mode=0o700)
+        os.chmod(self.root, 0o700)
+        for connector_id, token in tokens.items():
+            path = self.root / f"{connector_id}.token"
+            path.write_text(token, encoding="ascii")
+            os.chmod(path, 0o600)
+
+    def require_identity(self) -> None:
+        marker = self.root / "require-identity"
+        marker.write_text("required-v1", encoding="ascii")
+        os.chmod(marker, 0o600)
+
+    def context(
+        self,
+        token: str | None = None,
+        *,
+        client_id: str = "client-meta",
+        session_id: str = "session-meta",
+    ) -> object:
+        headers: dict[str, str] = {}
+        if token is not None:
+            headers[self.base._TRANSPORT_CONNECTOR_CAPABILITY_HEADER] = token
+        request = types.SimpleNamespace(headers=headers)
+        request_context = types.SimpleNamespace(request=request)
+        return types.SimpleNamespace(
+            client_id=client_id,
+            session_id=session_id,
+            request_context=request_context,
+        )
+
+    def test_client_declared_meta_is_not_transport_authority(self) -> None:
+        scope = self.base._transport_roundtrip_client_scope(
+            self.context(client_id="spoofed-client", session_id="spoofed-session")
+        )
+        self.assertEqual(scope, SHARED_SCOPE)
+
+    def test_same_connector_capability_survives_meta_and_session_churn(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        first = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A, client_id="one", session_id="session-one")
+        )
+        second = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A, client_id="two", session_id="session-two")
+        )
+        self.assertEqual(first["kind"], "connector_capability")
+        self.assertEqual(first, second)
+        self.assertNotIn(self.TOKEN_A, first["label"])
+
+    def test_distinct_tunnel_capabilities_are_isolated(self) -> None:
+        self.enroll(primary=self.TOKEN_A, johannes=self.TOKEN_B)
+        primary = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A)
+        )
+        johannes = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_B)
+        )
+        self.assertEqual(primary["kind"], "connector_capability")
+        self.assertEqual(johannes["kind"], "connector_capability")
+        self.assertNotEqual(primary["label"], johannes["label"])
+
+    def test_server_restart_changes_connector_scope(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        first = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A)
+        )
+        self.base._TRANSPORT_SERVER_INSTANCE_ID = "server-instance-b"
+        second = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A)
+        )
+        self.assertNotEqual(first["label"], second["label"])
+
+    def test_unknown_connector_capability_fails_closed(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        with self.assertRaisesRegex(RuntimeError, "not enrolled"):
+            self.base._transport_roundtrip_client_scope(
+                self.context(self.TOKEN_UNKNOWN)
+            )
+
+    def test_enforcement_rejects_headerless_mutation_scope(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.require_identity()
+        with self.assertRaisesRegex(RuntimeError, "identity is required"):
+            self.base._transport_roundtrip_client_scope(self.context())
+
+    def test_status_projection_remains_readable_without_identity(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        self.require_identity()
+        projected = self.base._transport_roundtrip_status(self.context())
+        self.assertEqual(projected["state"], "connector_identity_required")
+        self.assertFalse(projected["mutation_gate_open"])
+
+
+    def test_same_connector_completes_three_call_handshake_across_context_churn(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        arguments = {"path": "/tmp/t142", "content": "ok"}
+        intent = {
+            "tool_name": "write",
+            "arguments_sha256": roundtrip.canonical_arguments_sha256(arguments),
+        }
+        begin_scope = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A, client_id="begin", session_id="session-a")
+        )
+        begun = roundtrip.begin(
+            client_scope=begin_scope,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+            now_unix=100,
+        )
+        ack_scope = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A, client_id="ack", session_id="session-b")
+        )
+        acked = roundtrip.acknowledge(
+            client_scope=ack_scope,
+            challenge_receipt_sha256=begun["challenge_receipt_sha256"],
+            runtime_binding=BINDING,
+            now_unix=101,
+        )
+        self.assertEqual(acked["state"], "verified")
+        consume_scope = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A, client_id="consume", session_id="session-c")
+        )
+        consumed = roundtrip.consume_verified(
+            client_scope=consume_scope,
+            runtime_binding=BINDING,
+            now_unix=102,
+            **intent,
+        )
+        self.assertTrue(consumed["consumption_receipt_sha256"])
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=consume_scope,
+                runtime_binding=BINDING,
+                now_unix=103,
+                **intent,
+            )
+
+    def test_foreign_connector_cannot_ack_or_consume_owner_handshake(self) -> None:
+        self.enroll(primary=self.TOKEN_A, johannes=self.TOKEN_B)
+        primary = self.base._transport_roundtrip_client_scope(self.context(self.TOKEN_A))
+        foreign = self.base._transport_roundtrip_client_scope(self.context(self.TOKEN_B))
+        intent = {"tool_name": "write", "arguments_sha256": "d" * 64}
+        begun = roundtrip.begin(
+            client_scope=primary,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+            now_unix=100,
+        )
+        challenge = begun["challenge_receipt_sha256"]
+        with self.assertRaises(roundtrip.TransportRoundtripError):
+            roundtrip.acknowledge(
+                client_scope=foreign,
+                challenge_receipt_sha256=challenge,
+                runtime_binding=BINDING,
+                now_unix=101,
+            )
+        roundtrip.acknowledge(
+            client_scope=primary,
+            challenge_receipt_sha256=challenge,
+            runtime_binding=BINDING,
+            now_unix=101,
+        )
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=foreign,
+                runtime_binding=BINDING,
+                now_unix=102,
+                **intent,
+            )
+        consumed = roundtrip.consume_verified(
+            client_scope=primary,
+            runtime_binding=BINDING,
+            now_unix=102,
+            **intent,
+        )
+        self.assertTrue(consumed["consumption_receipt_sha256"])
+
+    def test_server_restart_invalidates_verified_connector_scope(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        before_restart = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A)
+        )
+        intent = {"tool_name": "write", "arguments_sha256": "f" * 64}
+        begun = roundtrip.begin(
+            client_scope=before_restart,
+            runtime_binding=BINDING,
+            mutation_intent=intent,
+            now_unix=100,
+        )
+        roundtrip.acknowledge(
+            client_scope=before_restart,
+            challenge_receipt_sha256=begun["challenge_receipt_sha256"],
+            runtime_binding=BINDING,
+            now_unix=101,
+        )
+        self.base._TRANSPORT_SERVER_INSTANCE_ID = "server-instance-b"
+        after_restart = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A)
+        )
+        self.assertNotEqual(before_restart, after_restart)
+        with self.assertRaises(roundtrip.TransportRoundtripRequired):
+            roundtrip.consume_verified(
+                client_scope=after_restart,
+                runtime_binding=BINDING,
+                now_unix=102,
+                **intent,
+            )
 
 
 class CentralTransportGateTests(unittest.TestCase):

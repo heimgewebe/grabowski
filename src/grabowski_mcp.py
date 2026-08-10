@@ -10,6 +10,7 @@ import asyncio
 import base64
 import fcntl
 import hashlib
+import hmac
 import importlib.metadata
 import importlib.util
 import json
@@ -145,6 +146,19 @@ _RETAINED_TRANSPORT_TARGET_MAX_BYTES = 4 * 1024 * 1024
 _RETAINED_TRANSPORT_TARGET_TOTAL_MAX_BYTES = 16 * 1024 * 1024
 _RETAINED_TRANSPORT_TARGET_LOCK = threading.Lock()
 _RETAINED_TRANSPORT_TARGETS: dict[str, dict[str, Any]] = {}
+
+_TRANSPORT_CONNECTOR_CAPABILITY_HEADER = "x-grabowski-connector-capability"
+_TRANSPORT_CONNECTOR_IDENTITY_ROOT = (
+    Path.home() / ".local/state/grabowski/transport-connectors"
+)
+_TRANSPORT_CONNECTOR_ENFORCEMENT_MARKER = (
+    _TRANSPORT_CONNECTOR_IDENTITY_ROOT / "require-identity"
+)
+_TRANSPORT_CONNECTOR_TOKEN_SUFFIX = ".token"
+_TRANSPORT_CONNECTOR_MAX_IDENTITIES = 32
+_TRANSPORT_CONNECTOR_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
+_TRANSPORT_CONNECTOR_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
+_TRANSPORT_SERVER_INSTANCE_ID = uuid.uuid4().hex
 
 
 class _RetainedTransportTargetMissing(RuntimeError):
@@ -5057,31 +5071,202 @@ def _transport_roundtrip_runtime_binding() -> dict[str, str]:
     )
 
 
+def _transport_secure_owned_file(path: Path, *, maximum_bytes: int) -> bytes:
+    try:
+        linked = os.lstat(path)
+    except FileNotFoundError:
+        raise
+    if (
+        statmod.S_ISLNK(linked.st_mode)
+        or not statmod.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or (statmod.S_IMODE(linked.st_mode) & 0o077) != 0
+        or linked.st_nlink != 1
+    ):
+        raise RuntimeError(f"transport connector identity file is unsafe: {path.name}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if (
+            opened.st_dev != linked.st_dev
+            or opened.st_ino != linked.st_ino
+            or opened.st_mode != linked.st_mode
+            or opened.st_uid != linked.st_uid
+            or opened.st_gid != linked.st_gid
+            or opened.st_nlink != linked.st_nlink
+        ):
+            raise RuntimeError(
+                f"transport connector identity changed during open: {path.name}"
+            )
+        payload = os.read(fd, maximum_bytes + 1)
+        if len(payload) > maximum_bytes or os.read(fd, 1):
+            raise RuntimeError(
+                f"transport connector identity file exceeds size bound: {path.name}"
+            )
+        return payload
+    finally:
+        os.close(fd)
+
+
+def _transport_connector_identity_root_ready() -> bool:
+    try:
+        linked = os.lstat(_TRANSPORT_CONNECTOR_IDENTITY_ROOT)
+    except FileNotFoundError:
+        return False
+    if (
+        statmod.S_ISLNK(linked.st_mode)
+        or not statmod.S_ISDIR(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or (statmod.S_IMODE(linked.st_mode) & 0o077) != 0
+    ):
+        raise RuntimeError("transport connector identity root is unsafe")
+    return True
+
+
+def _transport_connector_identity_required() -> bool:
+    if not _transport_connector_identity_root_ready():
+        return False
+    try:
+        payload = _transport_secure_owned_file(
+            _TRANSPORT_CONNECTOR_ENFORCEMENT_MARKER, maximum_bytes=64
+        )
+    except FileNotFoundError:
+        return False
+    if payload not in {b"required-v1", b"required-v1\n"}:
+        raise RuntimeError("transport connector enforcement marker is invalid")
+    return True
+
+
+def _transport_enrolled_connector_capabilities() -> list[tuple[str, str]]:
+    if not _transport_connector_identity_root_ready():
+        return []
+    paths = sorted(
+        path
+        for path in _TRANSPORT_CONNECTOR_IDENTITY_ROOT.iterdir()
+        if path.name.endswith(_TRANSPORT_CONNECTOR_TOKEN_SUFFIX)
+    )
+    if len(paths) > _TRANSPORT_CONNECTOR_MAX_IDENTITIES:
+        raise RuntimeError("too many transport connector identities are enrolled")
+    identities: list[tuple[str, str]] = []
+    token_digests: set[str] = set()
+    for path in paths:
+        connector_id = path.name[: -len(_TRANSPORT_CONNECTOR_TOKEN_SUFFIX)]
+        if _TRANSPORT_CONNECTOR_ID_RE.fullmatch(connector_id) is None:
+            raise RuntimeError("transport connector identity name is invalid")
+        payload = _transport_secure_owned_file(path, maximum_bytes=256)
+        try:
+            token = payload.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"transport connector capability is not ASCII: {connector_id}"
+            ) from exc
+        if token.endswith("\n"):
+            token = token[:-1]
+        if _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(token) is None:
+            raise RuntimeError(
+                f"transport connector capability has invalid format: {connector_id}"
+            )
+        digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+        if digest in token_digests:
+            raise RuntimeError("duplicate transport connector capability is enrolled")
+        token_digests.add(digest)
+        identities.append((connector_id, token))
+    return identities
+
+
+def _transport_context_connector_capability(ctx: Context | None) -> str | None:
+    if ctx is None:
+        return None
+    try:
+        request_context = ctx.request_context
+    except (AttributeError, RuntimeError, ValueError):
+        return None
+    request = getattr(request_context, "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get(_TRANSPORT_CONNECTOR_CAPABILITY_HEADER)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or _TRANSPORT_CONNECTOR_TOKEN_RE.fullmatch(raw) is None:
+        raise RuntimeError("transport connector capability header is invalid")
+    return raw
+
+
+def _transport_connector_capability_scope(
+    ctx: Context | None,
+) -> dict[str, str] | None:
+    supplied = _transport_context_connector_capability(ctx)
+    required = _transport_connector_identity_required()
+    if supplied is None:
+        if required:
+            raise RuntimeError("stable transport connector identity is required")
+        return None
+    matches = [
+        connector_id
+        for connector_id, enrolled in _transport_enrolled_connector_capabilities()
+        if hmac.compare_digest(supplied, enrolled)
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("transport connector capability is not enrolled")
+    connector_id = matches[0]
+    label = hashlib.sha256(
+        (
+            "grabowski-connector-capability-v1\\0"
+            + connector_id
+            + "\\0"
+            + _TRANSPORT_SERVER_INSTANCE_ID
+            + "\\0"
+            + supplied
+        ).encode("utf-8")
+    ).hexdigest()
+    return grabowski_transport_roundtrip.validate_client_scope(
+        {"kind": "connector_capability", "label": label}
+    )
+
+
 def _transport_roundtrip_client_scope(
     ctx: Context | None,
 ) -> dict[str, str]:
-    client_label: str | None = None
-    if ctx is not None:
-        try:
-            raw_label = ctx.client_id
-        except (AttributeError, RuntimeError, ValueError):
-            raw_label = None
-        if isinstance(raw_label, str) and raw_label.strip() == raw_label and raw_label:
-            client_label = raw_label
-    if client_label is None:
-        return grabowski_transport_roundtrip.validate_client_scope(
-            {
-                "kind": "shared_unlabeled",
-                "label": grabowski_transport_roundtrip.SHARED_UNLABELED_SCOPE,
-            }
-        )
+    connector_scope = _transport_connector_capability_scope(ctx)
+    if connector_scope is not None:
+        return connector_scope
+    # Rollout-only compatibility: until the secure enforcement marker is
+    # installed, callers without the server-validated tunnel capability remain
+    # in the existing shared atomic-execution partition.  Client-declared meta
+    # is deliberately ignored and never becomes authority.
     return grabowski_transport_roundtrip.validate_client_scope(
-        {"kind": "client_declared_meta", "label": client_label}
+        {
+            "kind": "shared_unlabeled",
+            "label": grabowski_transport_roundtrip.SHARED_UNLABELED_SCOPE,
+        }
     )
 
 
 def _transport_roundtrip_status(ctx: Context | None) -> dict[str, Any]:
-    client_scope = _transport_roundtrip_client_scope(ctx)
+    try:
+        client_scope = _transport_roundtrip_client_scope(ctx)
+    except RuntimeError as exc:
+        return {
+            "schema_version": 1,
+            "state": "connector_identity_required",
+            "mutation_gate_open": False,
+            "error": type(exc).__name__,
+            "recommended_next_action": (
+                "use an enrolled tunnel connector capability before mutation"
+            ),
+            "does_not_establish": [
+                "authenticated human identity",
+                "mutation authority without a connector capability",
+                "application-level success of any mutating tool",
+            ],
+        }
     try:
         runtime_binding = _transport_roundtrip_runtime_binding()
     except (RuntimeError, ValueError) as exc:

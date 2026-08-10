@@ -8,13 +8,14 @@ Der Transport-Roundtrip schützt mutierende MCP-Aufrufe vor Fremdverbrauch, Wied
 
 ## Öffentlicher Ablauf
 
-### Stabil identifizierter Client
+### Servervalidierter Connector
 
-1. `grip_run(name="transport-roundtrip", action="begin", target_tool_name=..., target_arguments=...)`
-2. `action="ack"` mit dem exakten Challenge-Hash
-3. exakt ein unveränderter Zielaufruf
+1. Der lokale Tunnel hängt seinen geheimen `X-Grabowski-Connector-Capability`-Header an jede MCP-Anfrage.
+2. `grip_run(name="transport-roundtrip", action="begin", target_tool_name=..., target_arguments=...)`
+3. `action="ack"` mit dem exakten Challenge-Hash
+4. exakt ein unveränderter Zielaufruf
 
-Dieser Kompatibilitätspfad bleibt nur für `client_declared_meta` erhalten. Zielwerkzeug, kanonischer Argumentdigest, Runtimebindung, Ablaufzeit und Einmalverbrauch bleiben geprüft.
+Der Ack-Pfad ist nur für einen stabilen, servervalidierten `connector_capability`-Scope vorgesehen. Client-deklarierte Metadaten wie `_meta.client_id` sind keine Autorität. Zielwerkzeug, kanonischer Argumentdigest, Runtimebindung, Ablaufzeit und Einmalverbrauch bleiben geprüft.
 
 ### Gemeinsamer unbeschrifteter Client
 
@@ -25,8 +26,8 @@ Dieser Kompatibilitätspfad bleibt nur für `client_declared_meta` erhalten. Zie
 
 ## Zustands- und Sicherheitsvertrag
 
-- Zustandsformat: `STATE_SCHEMA_VERSION = 3`.
-- Bestehende v2-Verifikationen im gemeinsamen Pool sind übertragbar und werden bei der Migration verworfen. Sie können keine neue Mutation autorisieren.
+- Zustandsformat: `STATE_SCHEMA_VERSION = 4`.
+- Bestehende v2- und v3-Verifikationen werden bei der Migration verworfen. Insbesondere kann kein vor T142 erzeugter objekt-, Meta- oder Shared-Scope eine Schema-v4-Mutation autorisieren.
 - Frische, exakt gebundene Pending-Challenges bleiben diagnostizierbar; jede neue gemeinsame `begin`-Anfrage erhält eine eigene Challenge.
 - Die Ausführungsfähigkeit wird nur als SHA-256-Bindung der Challenge persistiert. Der Zielaufruf erhält die Challenge nicht als Produktargument.
 - Direkter Verbrauch einer reservierten gemeinsamen Verifikation außerhalb ihres Ausführungskontexts scheitert mit `TransportAtomicExecutionRequired`, `TransportExecutionCapabilityRequired` oder `TransportExecutionCapabilityMismatch`.
@@ -54,3 +55,19 @@ Die verbindlichen Tests liegen in:
 - `tests/test_operator_v2_runtime.py`
 
 Der revisionsgebundene Laufnachweis wird unter `docs/proofs/transport-roundtrip-v3-t139-20260804.md` veröffentlicht.
+
+## T142: stabile Connector-Capability
+
+Für HTTP-Tunnel kann `tunnel-client` mit `mcp.extra-headers` einen statischen, lokal konfigurierten Header aus einer `file:/...`-Quelle an **jede** downstream MCP-Anfrage anhängen. Grabowski nutzt `X-Grabowski-Connector-Capability` als Protokollanker:
+
+- jede Connector-Instanz besitzt ein eigenes zufälliges Token in `~/.local/state/grabowski/transport-connectors/<id>.token`;
+- Token-Dateien und Identitätswurzel müssen dem Grabowski-Benutzer gehören, dürfen keine Symlinks sein und sind für Gruppe/Andere unzugänglich;
+- der rohe Tokenwert erscheint nie im Transportzustand oder Receipt; die Scope-ID ist ein SHA-256-Digest aus Connector-ID, Token und einer zufälligen Server-Instanz-ID;
+- zwei Tunnel mit verschiedenen Token erhalten verschiedene `connector_capability`-Scopes;
+- ein Server-Neustart ändert die Instanz-ID und macht alte Connector-Scopes unverwendbar;
+- `_meta.client_id`, Python-Objektidentität und `mcp-session-id` sind keine Autorität; OpenAI kann pro Tool-Aufruf weiterhin eine neue MCP-Session erzeugen;
+- ein unbekannter Capability-Header scheitert immer fail-closed.
+
+Der Rollout ist absichtlich zweiphasig. Solange der sichere Marker `require-identity` fehlt, bleiben headerlose Aufrufe nur im bisherigen `shared_unlabeled`-Atomic-Pfad, damit die Capability ohne Connector-Ausfall ausgerollt werden kann. Nach Provisionierung und Live-Nachweis beider Tunnel wird der Marker mit Inhalt `required-v1` gesetzt. Ab dann scheitert jede Mutation **vor dem Handshake**, wenn kein gültiger Connector-Capability-Header vorhanden ist. Read-only-Werkzeuge bleiben davon unabhängig.
+
+Dieser Vertrag authentifiziert die lokal konfigurierte Tunnelinstanz, nicht die menschliche Person hinter dem entfernten Client. Er schützt nicht gegen kompromittierten Code desselben Betriebssystembenutzers, der die 0600-Token-Dateien lesen kann.
