@@ -42,6 +42,7 @@ from mcp.types import ToolAnnotations
 import grabowski_consumer_surface as consumer_surface
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
+import grabowski_transport_assertion
 import grabowski_serving_process
 import grabowski_connector_contract
 import grabowski_lifecycle_read_surface as lifecycle_read_surface
@@ -148,6 +149,13 @@ _RETAINED_TRANSPORT_TARGET_LOCK = threading.Lock()
 _RETAINED_TRANSPORT_TARGETS: dict[str, dict[str, Any]] = {}
 
 _TRANSPORT_CONNECTOR_CAPABILITY_HEADER = "x-grabowski-connector-capability"
+_TRANSPORT_INGRESS_VERSION_HEADER = "x-grabowski-ingress-version"
+_TRANSPORT_REQUEST_ID_HEADER = "x-grabowski-request-id"
+_TRANSPORT_REQUEST_TIMESTAMP_HEADER = "x-grabowski-request-timestamp"
+_TRANSPORT_REQUEST_AUDIENCE_HEADER = "x-grabowski-request-audience"
+_TRANSPORT_REQUEST_BODY_SHA256_HEADER = "x-grabowski-request-body-sha256"
+_TRANSPORT_RUNTIME_BINDING_SHA256_HEADER = "x-grabowski-runtime-binding-sha256"
+_TRANSPORT_REQUEST_MAC_HEADER = "x-grabowski-request-mac"
 _TRANSPORT_CONNECTOR_IDENTITY_ROOT = (
     Path.home() / ".local/state/grabowski/transport-connectors"
 )
@@ -5199,6 +5207,28 @@ def _transport_context_connector_capability(ctx: Context | None) -> str | None:
     return raw
 
 
+def _transport_context_header(ctx: Context | None, name: str) -> str | None:
+    if ctx is None:
+        return None
+    try:
+        request_context = ctx.request_context
+    except (AttributeError, RuntimeError, ValueError):
+        return None
+    request = getattr(request_context, "request", None)
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get(name)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or "\x00" in raw or "\r" in raw or "\n" in raw:
+        raise RuntimeError(f"transport header is invalid: {name}")
+    return raw
+
+
 def _transport_connector_capability_scope(
     ctx: Context | None,
 ) -> dict[str, str] | None:
@@ -5229,6 +5259,65 @@ def _transport_connector_capability_scope(
     return grabowski_transport_roundtrip.validate_client_scope(
         {"kind": "connector_capability", "label": label}
     )
+
+
+def _transport_signed_one_call_evidence(
+    ctx: Context | None,
+    *,
+    tool_name: str,
+    arguments_sha256: str,
+    runtime_binding: dict[str, str],
+) -> dict[str, Any] | None:
+    version = _transport_context_header(ctx, _TRANSPORT_INGRESS_VERSION_HEADER)
+    if version is None:
+        return None
+    if version != grabowski_transport_assertion.ASSERTION_VERSION:
+        raise RuntimeError("transport ingress assertion version is unsupported")
+    supplied = _transport_context_connector_capability(ctx)
+    scope = _transport_connector_capability_scope(ctx)
+    if supplied is None or scope is None:
+        raise RuntimeError("signed one-call transport requires an enrolled connector capability")
+    request_id = _transport_context_header(ctx, _TRANSPORT_REQUEST_ID_HEADER)
+    issued_raw = _transport_context_header(ctx, _TRANSPORT_REQUEST_TIMESTAMP_HEADER)
+    audience = _transport_context_header(ctx, _TRANSPORT_REQUEST_AUDIENCE_HEADER)
+    body_sha256 = _transport_context_header(ctx, _TRANSPORT_REQUEST_BODY_SHA256_HEADER)
+    asserted_runtime_binding_sha256 = _transport_context_header(
+        ctx, _TRANSPORT_RUNTIME_BINDING_SHA256_HEADER
+    )
+    mac_sha256 = _transport_context_header(ctx, _TRANSPORT_REQUEST_MAC_HEADER)
+    if None in {
+        request_id,
+        issued_raw,
+        audience,
+        body_sha256,
+        asserted_runtime_binding_sha256,
+        mac_sha256,
+    }:
+        raise RuntimeError("signed one-call transport assertion is incomplete")
+    try:
+        issued_at_unix = int(str(issued_raw), 10)
+    except ValueError as exc:
+        raise RuntimeError("signed one-call transport timestamp is invalid") from exc
+    runtime_binding_sha256 = grabowski_transport_assertion.runtime_binding_sha256(
+        runtime_binding
+    )
+    try:
+        evidence = grabowski_transport_assertion.consume_assertion(
+            secret=supplied,
+            client_scope_sha256=grabowski_transport_roundtrip.client_scope_sha256(scope),
+            runtime_binding_sha256=runtime_binding_sha256,
+            asserted_runtime_binding_sha256=str(asserted_runtime_binding_sha256),
+            request_id=str(request_id),
+            issued_at_unix=issued_at_unix,
+            audience=str(audience),
+            tool_name=tool_name,
+            arguments_sha256=arguments_sha256,
+            body_sha256=str(body_sha256),
+            mac_sha256=str(mac_sha256),
+        )
+    except grabowski_transport_assertion.TransportAssertionError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return {**evidence, "client_scope_kind": scope["kind"]}
 
 
 def _transport_roundtrip_client_scope(

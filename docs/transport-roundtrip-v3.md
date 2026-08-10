@@ -8,14 +8,19 @@ Der Transport-Roundtrip schützt mutierende MCP-Aufrufe vor Fremdverbrauch, Wied
 
 ## Öffentlicher Ablauf
 
-### Servervalidierter Connector
+### Signierter Owner-Pfad (Normalfall)
 
-1. Der lokale Tunnel hängt seinen geheimen `X-Grabowski-Connector-Capability`-Header an jede MCP-Anfrage.
-2. `grip_run(name="transport-roundtrip", action="begin", target_tool_name=..., target_arguments=...)`
-3. `action="ack"` mit dem exakten Challenge-Hash
-4. exakt ein unveränderter Zielaufruf
+1. `tunnel-client` leitet MCP an den lokalen `grabowski-transport-ingress` weiter.
+2. Der Ingress entfernt alle vom entfernten Client gelieferten `X-Grabowski-*`-Header.
+3. Für einen `tools/call` erzeugt er eine stabile Request-ID aus MCP-Session, JSON-RPC-ID und exaktem HTTP-Body-Digest.
+4. Er bindet Request-ID, Timestamp, Audience, Werkzeug, kanonischen Argumentdigest, Body-Digest und den Digest der aktuell deployten Runtime mit HMAC an die lokal eingeschriebene Connector-Capability.
+5. Der Operator prüft Capability, MAC, signierte Runtimebindung, Frische und Einmalverbrauch und führt die Mutation im selben MCP-Aufruf aus.
 
-Der Ack-Pfad ist nur für einen stabilen, servervalidierten `connector_capability`-Scope vorgesehen. Client-deklarierte Metadaten wie `_meta.client_id` sind keine Autorität. Zielwerkzeug, kanonischer Argumentdigest, Runtimebindung, Ablaufzeit und Einmalverbrauch bleiben geprüft.
+Damit benötigt der normale Owner-Pfad genau **einen** Agentenaufruf. Die Request-ID ist Idempotenz- und Replayanker, keine ChatGPT-Threadidentität. Eine bereits konsumierte Request-ID wird nicht erneut ausgeführt; nach Antwortverlust ist der Zielzustand zu reconciliieren.
+
+### Roundtrip-Fallback
+
+Wenn eine Anfrage nicht über den signierten Ingress kommt, bleibt der bisherige `begin`/`ack`- beziehungsweise `begin`/`execute`-Pfad während der Migration fail-closed erhalten. Er ist Recovery-/Kompatibilitätspfad und nicht mehr das Zielmodell. Client-deklarierte Metadaten wie `_meta.client_id` bleiben ohne Autorität.
 
 ### Gemeinsamer unbeschrifteter Client
 
@@ -49,6 +54,7 @@ Der Vertrag authentifiziert keinen Menschen und schützt nicht gegen kompromitti
 
 Die verbindlichen Tests liegen in:
 
+- `tests/test_transport_one_call.py`
 - `tests/test_transport_roundtrip.py`
 - `tests/test_transport_gate_integration.py`
 - `tests/test_transport_roundtrip_intent_replacement.py`

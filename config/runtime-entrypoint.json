@@ -235,6 +235,10 @@
       "source": "src/grabowski_transport_roundtrip.py"
     },
     {
+      "module": "grabowski_transport_assertion",
+      "source": "src/grabowski_transport_assertion.py"
+    },
+    {
       "module": "grabowski_serving_process",
       "source": "src/grabowski_serving_process.py"
     },

@@ -1400,11 +1400,13 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         return SimpleNamespace(repo_head="a" * 40)
 
     def test_default_projection_declares_complete_watchdog_asset_set(self) -> None:
-        self.assertEqual(9, len(dual.WATCHDOG_HOST_ASSETS))
+        self.assertEqual(11, len(dual.WATCHDOG_HOST_ASSETS))
         self.assertEqual(
             {
                 "tools/component_watchdog.py",
                 "tools/watchdog_admission_recovery.py",
+                "tools/grabowski_transport_ingress.py",
+                "systemd/grabowski-transport-ingress.service.example",
                 "systemd/tunnel-client-grabowski.service.d/70-operator-dependency.conf.example",
                 "systemd/grabowski-operator-watchdog.service.example",
                 "systemd/grabowski-operator-watchdog.timer.example",
@@ -1417,6 +1419,7 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         )
         self.assertEqual(
             {
+                "grabowski-transport-ingress.service",
                 "grabowski-operator-watchdog.service",
                 "grabowski-operator-watchdog.timer",
                 "grabowski-tunnel-watchdog.service",
@@ -1462,9 +1465,9 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
         target = target or dual.TUNNEL_OPERATOR_DEPENDENCY_PATH
         return {
             "LoadState": ("loaded",),
-            "Wants": (dual.OPERATOR_SERVICE, "network-online.target"),
-            "After": (dual.OPERATOR_SERVICE, "network-online.target"),
-            "PartOf": (dual.OPERATOR_SERVICE,),
+            "Wants": (dual.TRANSPORT_INGRESS_SERVICE, "network-online.target"),
+            "After": (dual.TRANSPORT_INGRESS_SERVICE, "network-online.target"),
+            "PartOf": (dual.TRANSPORT_INGRESS_SERVICE,),
             "BindsTo": (),
             "DropInPaths": (str(target.resolve()),),
         }
@@ -1475,12 +1478,12 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             expected, dual._validate_tunnel_operator_dependency_bytes(expected)
         )
         invalid = {
-            "binds-to": expected + b"BindsTo=grabowski-operator.service\n",
+            "binds-to": expected + b"BindsTo=grabowski-transport-ingress.service\n",
             "extra-partof": expected.replace(
-                b"PartOf=grabowski-operator.service",
-                b"PartOf=grabowski-operator.service other.service",
+                b"PartOf=grabowski-transport-ingress.service",
+                b"PartOf=grabowski-transport-ingress.service other.service",
             ),
-            "duplicate": expected + b"PartOf=grabowski-operator.service\n",
+            "duplicate": expected + b"PartOf=grabowski-transport-ingress.service\n",
             "extra-section": expected + b"[Service]\nType=oneshot\n",
             "missing-newline": expected.rstrip(b"\n"),
         }
@@ -1494,18 +1497,18 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             ["systemctl"],
             0,
             "LoadState=loaded\n"
-            "Wants=grabowski-operator.service network-online.target\n"
-            "After=grabowski-operator.service network-online.target\n"
-            "PartOf=grabowski-operator.service\n"
+            "Wants=grabowski-transport-ingress.service network-online.target\n"
+            "After=grabowski-transport-ingress.service network-online.target\n"
+            "PartOf=grabowski-transport-ingress.service\n"
             "BindsTo=\n"
             f"DropInPaths={path}\n",
             "",
         )
         with mock.patch.object(core, "run", return_value=completed) as run:
             observed = dual.verify_tunnel_operator_dependency()
-        self.assertEqual((dual.OPERATOR_SERVICE,), observed["PartOf"])
-        self.assertIn(dual.OPERATOR_SERVICE, observed["After"])
-        self.assertIn(dual.OPERATOR_SERVICE, observed["Wants"])
+        self.assertEqual((dual.TRANSPORT_INGRESS_SERVICE,), observed["PartOf"])
+        self.assertIn(dual.TRANSPORT_INGRESS_SERVICE, observed["After"])
+        self.assertIn(dual.TRANSPORT_INGRESS_SERVICE, observed["Wants"])
         self.assertEqual((), observed["BindsTo"])
         self.assertEqual(
             [
@@ -1532,9 +1535,9 @@ class WatchdogHostAssetProjectionTests(unittest.TestCase):
             "missing-partof": {**base, "PartOf": ()},
             "extra-partof": {
                 **base,
-                "PartOf": tuple(sorted((dual.OPERATOR_SERVICE, "other.service"))),
+                "PartOf": tuple(sorted((dual.TRANSPORT_INGRESS_SERVICE, "other.service"))),
             },
-            "binds-to": {**base, "BindsTo": (dual.OPERATOR_SERVICE,)},
+            "binds-to": {**base, "BindsTo": (dual.TRANSPORT_INGRESS_SERVICE,)},
             "wrong-dropin": {**base, "DropInPaths": ("/tmp/other.conf",)},
         }
         for name, observed in cases.items():
@@ -3517,6 +3520,57 @@ class DeploymentSequenceTests(unittest.TestCase):
                 f"start:{dual.TUNNEL_SERVICE}",
             ],
         )
+
+
+class SignedIngressProfileCutoverTests(unittest.TestCase):
+    def profile(self, root: Path) -> Path:
+        path = root / "grabowski.yaml"
+        path.write_text(
+            "config_version: 1\nmcp:\n  server_urls:\n    - channel: main\n      url: \"http://127.0.0.1:18181/mcp\"\n",
+            encoding="utf-8",
+        )
+        os.chmod(path, 0o600)
+        return path
+
+    def test_profile_cutover_and_restore_are_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile(Path(directory))
+            before = profile.read_bytes()
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                cutover = dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+            self.assertEqual(18181, cutover.before_port)
+            self.assertEqual(18180, cutover.after_port)
+            applied = dual.apply_tunnel_profile_cutover(profile, cutover)
+            self.assertTrue(applied["changed"])
+            self.assertIn(b"127.0.0.1:18180/mcp", profile.read_bytes())
+            restored = dual.restore_tunnel_profile_cutover(profile, cutover)
+            self.assertTrue(restored["restored"])
+            self.assertEqual(before, profile.read_bytes())
+
+    def test_profile_rollback_refuses_foreign_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile(Path(directory))
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                cutover = dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+            dual.apply_tunnel_profile_cutover(profile, cutover)
+            drifted = profile.read_bytes() + b"# foreign-drift\n"
+            profile.write_bytes(drifted)
+            os.chmod(profile, 0o600)
+            with self.assertRaises(core.DeployError):
+                dual.restore_tunnel_profile_cutover(profile, cutover)
+            self.assertEqual(drifted, profile.read_bytes())
 
 
 if __name__ == "__main__":
