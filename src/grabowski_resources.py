@@ -5299,20 +5299,54 @@ def grabowski_resource_nonconflict_assess(
         requested_scope_complete=requested_scope_complete,
         proof_ttl_seconds=proof_ttl_seconds,
     )
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": "resource-nonconflict-assess",
-            "blocked_resource_key": result["blocked_resource_key"],
-            "requesting_owner": result["requesting_owner"],
-            "decision": result["decision"],
-            "requested_scope_complete": True,
-            "proof_sha256": result["proof"]["proof_sha256"],
-            "requested_scope_sha256": result["proof"]["requested_scope_sha256"],
-            "existing_scope_sha256": result["proof"]["existing_scope_sha256"],
-            "expires_at_unix": result["proof"]["expires_at_unix"],
-        }
-    )
+    decision = result.get("decision")
+    if decision not in {"allow", "deny"}:
+        raise RuntimeError("nonconflict assessment returned an invalid decision")
+    audit_record: dict[str, Any] = {
+        "timestamp_unix": _now(),
+        "operation": "resource-nonconflict-assess",
+        "blocked_resource_key": result["blocked_resource_key"],
+        "requesting_owner": result["requesting_owner"],
+        "decision": decision,
+        "requested_scope_complete": requested_scope_complete,
+    }
+    if decision == "allow":
+        proof = result.get("proof")
+        if not isinstance(proof, Mapping):
+            raise RuntimeError("allowed nonconflict assessment is missing its proof")
+        required_proof_fields = (
+            "proof_sha256",
+            "requested_scope_sha256",
+            "existing_scope_sha256",
+            "expires_at_unix",
+        )
+        if any(field not in proof for field in required_proof_fields):
+            raise RuntimeError("allowed nonconflict assessment proof is incomplete")
+        audit_record.update(
+            {
+                "proof_sha256": proof["proof_sha256"],
+                "requested_scope_sha256": proof["requested_scope_sha256"],
+                "existing_scope_sha256": proof["existing_scope_sha256"],
+                "expires_at_unix": proof["expires_at_unix"],
+            }
+        )
+    else:
+        if "proof" in result:
+            raise RuntimeError("denied nonconflict assessment must not include a proof")
+        code = result.get("code")
+        blocker_type = result.get("blocker_type")
+        if not isinstance(code, str) or not code or not isinstance(blocker_type, str) or not blocker_type:
+            raise RuntimeError("denied nonconflict assessment is missing its stable classification")
+        audit_record.update(
+            {
+                "code": code,
+                "blocker_type": blocker_type,
+                "requires_atomic_revalidation": bool(
+                    result.get("requires_atomic_revalidation", False)
+                ),
+            }
+        )
+    base._append_audit(audit_record)
     return result
 
 
