@@ -35,6 +35,86 @@ class NtfyTopicSopsMaterializationTests(TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_create_only_publication_fsyncs_destination_directory(self) -> None:
+        destination = self.root / "created-topic"
+        with mock.patch.object(materializer, "_fsync_directory") as sync_directory:
+            materializer._atomic_private_write(
+                destination, b"ciphertext", create_only=True
+            )
+
+        self.assertEqual(destination.read_bytes(), b"ciphertext")
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        sync_directory.assert_called_once_with(destination.parent)
+
+    def test_new_parent_entries_are_fsynced_leaf_to_root(self) -> None:
+        destination = self.root / "new-parent" / "new-leaf" / "topic"
+        with mock.patch.object(materializer, "_fsync_directory") as sync_directory:
+            materializer._atomic_private_write(
+                destination, b"ciphertext", create_only=True
+            )
+
+        self.assertEqual(destination.read_bytes(), b"ciphertext")
+        self.assertEqual(
+            sync_directory.call_args_list,
+            [
+                mock.call(destination.parent),
+                mock.call(destination.parent.parent),
+                mock.call(self.root),
+            ],
+        )
+
+    def test_parent_removed_before_child_creation_fails_closed(self) -> None:
+        stable_parent = self.root / "stable-parent"
+        stable_parent.mkdir()
+        new_leaf = stable_parent / "new-leaf"
+        original_mkdir = Path.mkdir
+
+        def racing_mkdir(directory: Path, *args: object, **kwargs: object) -> None:
+            if directory == new_leaf and stable_parent.exists():
+                stable_parent.rmdir()
+            original_mkdir(directory, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", autospec=True, side_effect=racing_mkdir):
+            with self.assertRaisesRegex(
+                materializer.TopicMaterializationError,
+                "destination directory unavailable",
+            ):
+                materializer._ensure_parent_directory(new_leaf)
+
+        self.assertFalse(new_leaf.exists())
+
+    def test_atomic_replacement_fsyncs_destination_directory(self) -> None:
+        destination = self.root / "replace-topic"
+        destination.write_bytes(b"old")
+        destination.chmod(0o600)
+        with mock.patch.object(materializer, "_fsync_directory") as sync_directory:
+            materializer._atomic_private_write(
+                destination, b"new", create_only=False
+            )
+
+        self.assertEqual(destination.read_bytes(), b"new")
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        sync_directory.assert_called_once_with(destination.parent)
+
+    def test_directory_fsync_failure_is_secret_free_and_not_success(self) -> None:
+        destination = self.root / "durability-failure-topic"
+        with mock.patch.object(
+            materializer.os,
+            "fsync",
+            side_effect=[None, OSError("sensitive diagnostic secret")],
+        ):
+            with self.assertRaisesRegex(
+                materializer.TopicMaterializationError,
+                "destination directory sync failed",
+            ) as caught:
+                materializer._atomic_private_write(
+                    destination, b"secret-topic-material", create_only=True
+                )
+
+        self.assertEqual(destination.read_bytes(), b"secret-topic-material")
+        self.assertNotIn("sensitive diagnostic secret", str(caught.exception))
+        self.assertNotIn("secret-topic-material", str(caught.exception))
+
     def test_encrypt_requires_two_distinct_recipients(self) -> None:
         with self.assertRaisesRegex(
             materializer.TopicMaterializationError,

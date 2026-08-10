@@ -101,8 +101,47 @@ def _run_sops(
     return completed.stdout
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise TopicMaterializationError("destination directory sync failed") from exc
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        raise TopicMaterializationError("destination directory sync failed") from exc
+    finally:
+        os.close(fd)
+
+
+def _ensure_parent_directory(path: Path) -> list[Path]:
+    ancestry: list[Path] = []
+    current = path
+    while True:
+        ancestry.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    created: list[Path] = []
+    for directory in reversed(ancestry):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            if not directory.is_dir():
+                raise TopicMaterializationError("destination directory unavailable")
+        except OSError as exc:
+            raise TopicMaterializationError("destination directory unavailable") from exc
+        else:
+            created.append(directory)
+    return [directory.parent for directory in reversed(created)]
+
+
 def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    parent_entry_sync_paths = _ensure_parent_directory(path.parent)
     if create_only and path.exists():
         raise TopicMaterializationError("destination already exists")
     fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -121,6 +160,9 @@ def _atomic_private_write(path: Path, payload: bytes, *, create_only: bool) -> N
             temporary.unlink()
         else:
             os.replace(temporary, path)
+        _fsync_directory(path.parent)
+        for sync_path in parent_entry_sync_paths:
+            _fsync_directory(sync_path)
     finally:
         if temporary.exists():
             temporary.unlink()
