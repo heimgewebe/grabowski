@@ -83,8 +83,9 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(expected, observed)
 
     def test_execute_request_type_contract_is_complete_and_strict(self) -> None:
-        required = {"worker_id", "capabilities", "task_id"}
+        required = {"worker_id", "capabilities"}
         optional = {
+            "task_id",
             "resource",
             "kind",
             "base_dir",
@@ -120,8 +121,9 @@ class BureauPickupTests(unittest.TestCase):
         ):
             request_schema = request_schema[component]
 
-        required = {"worker_id", "capabilities", "task_id"}
+        required = {"worker_id", "capabilities"}
         optional = {
+            "task_id",
             "resource",
             "kind",
             "base_dir",
@@ -222,6 +224,43 @@ class BureauPickupTests(unittest.TestCase):
             str(pickup.COORDINATION_ROOT),
             normalized["coordination_root"],
         )
+
+    def test_minimal_request_without_task_id_selects_next_task_implicitly(self) -> None:
+        normalized = pickup._normalize_request(
+            {
+                "worker_id": "operator-test",
+                "capabilities": ["repository", "shell"],
+            }
+        )
+        self.assertIsNone(normalized["task_id"])
+
+        intent = self.intent()
+        with mock.patch.object(
+            pickup.bureau, "_invoke_bureau", return_value={"status": "claim-intent", "intent": intent}
+        ) as invoke:
+            payload = pickup._claim_intent(normalized)
+
+        arguments = invoke.call_args.args[0]
+        self.assertNotIn("--task-id", arguments)
+        validated, existing = pickup._validate_intent_result(payload, normalized)
+        self.assertFalse(existing)
+        self.assertEqual(intent["task_id"], validated["task_id"])
+        self.assertIsNone(normalized["task_id"])
+
+    def test_explicit_task_id_stays_strict_on_bureau_selection(self) -> None:
+        normalized = pickup._normalize_request(
+            {
+                "worker_id": "operator-test",
+                "capabilities": ["repository", "shell"],
+                "task_id": "TEST-T999",
+            }
+        )
+        with self.assertRaisesRegex(
+            pickup.BureauPickupError, "claim-intent-task-mismatch"
+        ):
+            pickup._validate_intent_result(
+                {"status": "claim-intent", "intent": self.intent()}, normalized
+            )
 
     def test_normalizer_still_rejects_unknown_request_fields(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported request fields"):
