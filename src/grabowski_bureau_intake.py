@@ -46,6 +46,7 @@ BUREAU_ROOT = bureau_runtime.BUREAU_CONTROL_ROOT
 MAX_INPUT_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 30
+AUDIT_FAILURE_REASON_MAX_CHARS = 512
 PROPOSAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 MANAGED_LAUNCHER_MARKER = b"# managed-by: heimgewebe-bureau-runtime-v1\n"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -822,18 +823,44 @@ def _invoke_bureau(
     return payload
 
 
+def _audit_failure_reason(payload: dict[str, Any]) -> str | None:
+    """Bounded Bureau failure reason for the audit chain.
+
+    The typed Bureau failure payload carries the only statement of *why* a
+    contract call was rejected. Without it the chain records that a code
+    repeated N times but never what distinguishes those N calls, so a large
+    homogeneous cluster cannot be grouped by root cause from evidence alone.
+    """
+    if payload.get("status") != "failed":
+        return None
+    message = payload.get("message")
+    if not isinstance(message, str):
+        return None
+    collapsed = " ".join(message.split())
+    if not collapsed:
+        return None
+    if len(collapsed) > AUDIT_FAILURE_REASON_MAX_CHARS:
+        return collapsed[: AUDIT_FAILURE_REASON_MAX_CHARS - 1] + "…"
+    return collapsed
+
+
 def _audit(operation: str, payload: dict[str, Any], **extra: Any) -> None:
-    base._append_audit(
-        {
-            "operation": operation,
-            "bureau_result_kind": payload.get("kind"),
-            "bureau_status": payload.get("status"),
-            "bureau_code": payload.get("code"),
-            "effect_started": bool(payload.get("effect_started")),
-            "ambiguity": bool(payload.get("ambiguity")),
-            **extra,
-        }
-    )
+    record: dict[str, Any] = {
+        "operation": operation,
+        "bureau_result_kind": payload.get("kind"),
+        "bureau_status": payload.get("status"),
+        "bureau_code": payload.get("code"),
+        "effect_started": bool(payload.get("effect_started")),
+        "ambiguity": bool(payload.get("ambiguity")),
+    }
+    reason = _audit_failure_reason(payload)
+    if reason is not None:
+        record["bureau_failure_reason"] = reason
+        retryable = payload.get("retryable")
+        if isinstance(retryable, bool):
+            record["bureau_retryable"] = retryable
+    record.update(extra)
+    base._append_audit(record)
 
 
 def _proposal_directory(proposal_id: str) -> Path:
