@@ -112,6 +112,39 @@ def _ctx(headers: dict[str, str]) -> SimpleNamespace:
     )
 
 
+class _FakeJSONResponse:
+    def __init__(self, content: object, *, status_code: int = 200) -> None:
+        self.status_code = status_code
+        self.body = json.dumps(content, separators=(",", ":")).encode("utf-8")
+
+
+def _run_locally_rejected_proxy(
+    proxy: ingress.TransportIngress, request: object
+) -> _FakeJSONResponse:
+    fake_httpx = types.ModuleType("httpx")
+    fake_httpx.AsyncClient = mock.Mock(
+        side_effect=AssertionError("local rejection constructed outbound client")
+    )
+    fake_starlette = types.ModuleType("starlette")
+    fake_background = types.ModuleType("starlette.background")
+    fake_background.BackgroundTask = object
+    fake_responses = types.ModuleType("starlette.responses")
+    fake_responses.JSONResponse = _FakeJSONResponse
+    fake_responses.StreamingResponse = object
+    fake_starlette.background = fake_background
+    fake_starlette.responses = fake_responses
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "httpx": fake_httpx,
+            "starlette": fake_starlette,
+            "starlette.background": fake_background,
+            "starlette.responses": fake_responses,
+        },
+    ):
+        return asyncio.run(proxy.proxy(request))
+
+
 class TransportAssertionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -342,11 +375,12 @@ class TransportIngressTests(unittest.TestCase):
     def test_private_token_reader_matches_operator_capability_syntax(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "primary.token"
-            path.write_text(SECRET + "\n", encoding="ascii")
+            valid_fixture = "test-fixture-" + "A" * 30
+            path.write_text(valid_fixture + "\n", encoding="ascii")
             path.chmod(0o600)
-            self.assertEqual(ingress._read_private_token(path), SECRET)
+            self.assertEqual(ingress._read_private_token(path), valid_fixture)
             invalid = (
-                SECRET + "\n\n",
+                valid_fixture + "\n\n",
                 "short-token",
                 "A" * 42,
                 "A" * 129,
@@ -367,7 +401,7 @@ class TransportIngressTests(unittest.TestCase):
         )
         request = self.FakeRequest([b"12345678", b"9"])
         with mock.patch.object(ingress, "MAX_REQUEST_BYTES", 8):
-            response = asyncio.run(proxy.proxy(request))
+            response = _run_locally_rejected_proxy(proxy, request)
         self.assertEqual(response.status_code, 413)
         self.assertEqual(json.loads(response.body), {"error": "request_too_large"})
 
@@ -377,7 +411,9 @@ class TransportIngressTests(unittest.TestCase):
             upstream=ingress.DEFAULT_UPSTREAM,
             runtime_binding_sha256=_runtime_sha256(),
         )
-        response = asyncio.run(proxy.proxy(self.FakeRequest([b"x"], content_length=2)))
+        response = _run_locally_rejected_proxy(
+            proxy, self.FakeRequest([b"x"], content_length=2)
+        )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(
             json.loads(response.body), {"error": "content_length_mismatch"}
@@ -393,13 +429,27 @@ class TransportIngressTests(unittest.TestCase):
             b'{"jsonrpc":"2.0","id":7,"method":"tools/call","params":'
             b'{"name":"grabowski_terminal_run","arguments":{"value":NaN}}}'
         )
-        response = asyncio.run(
-            proxy.proxy(self.FakeRequest([body], content_length=len(body)))
+        response = _run_locally_rejected_proxy(
+            proxy, self.FakeRequest([body], content_length=len(body))
         )
         self.assertEqual(response.status_code, 400)
         projected = json.loads(response.body)
         self.assertEqual(projected["error"], "invalid_mcp_request")
         self.assertNotIn(SECRET, json.dumps(projected))
+
+    def test_unauthorized_request_is_rejected_before_outbound_client(self) -> None:
+        proxy = ingress.TransportIngress(
+            token=SECRET,
+            upstream=ingress.DEFAULT_UPSTREAM,
+            runtime_binding_sha256=_runtime_sha256(),
+        )
+        request = self.FakeRequest([b""])
+        request.headers[ingress.INGRESS_AUTH_HEADER] = "not-the-owner-secret"
+        response = _run_locally_rejected_proxy(proxy, request)
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            json.loads(response.body), {"error": "unauthorized_ingress_client"}
+        )
 
     def test_ingress_client_authentication_is_secret_bound(self) -> None:
         self.assertFalse(ingress._ingress_client_authenticated({}, SECRET))
