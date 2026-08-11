@@ -548,25 +548,19 @@ def _lease_remediation(owner_id: str, checked: list[dict[str, Any]]) -> dict[str
         )
         return remediation
 
-    steps: list[str] = []
-    if buckets[LEASE_STATUS_MISSING]:
-        steps.append(
-            "acquire the missing leases for "
-            f"{', '.join(buckets[LEASE_STATUS_MISSING])} — run the "
-            f"{LEASE_ACQUIRING_GRIP} grip with the same repo, branch and target_path to bind lane, "
-            "leases and worktree atomically in one call, or acquire the exact resource keys with "
-            "grabowski_resource_acquire"
-        )
-    if buckets[LEASE_STATUS_EXPIRED]:
-        steps.append(
-            "renew the expired leases for "
-            f"{', '.join(buckets[LEASE_STATUS_EXPIRED])} with grabowski_resource_renew, or "
-            "re-acquire them"
-        )
+    # Missing and expired keys are both *acquired*, never renewed: a lease that has
+    # already expired is rejected by grabowski_resource_renew, and acquisition only
+    # conflicts with a live lease held by another owner.
+    acquirable = buckets[LEASE_STATUS_MISSING] + buckets[LEASE_STATUS_EXPIRED]
     remediation["acquiring_grip"] = LEASE_ACQUIRING_GRIP
     remediation["retry_safe_after_remediation"] = True
     remediation["recommended_next_action"] = (
-        "; then ".join(steps) + "; then retry with the same idempotency_key"
+        f"acquire the leases for {', '.join(acquirable)} — run the {LEASE_ACQUIRING_GRIP} grip "
+        "with the same repo, branch and target_path to bind lane, leases and worktree atomically "
+        "in one call, or acquire the exact resource keys with grabowski_resource_acquire (an "
+        "expired lease is re-acquired, not renewed: grabowski_resource_renew rejects a lease that "
+        "has already expired); then retry with a new idempotency_key, because this rejection is "
+        "durable evidence and the current key replays it unchanged without re-reading the leases"
     )
     return remediation
 

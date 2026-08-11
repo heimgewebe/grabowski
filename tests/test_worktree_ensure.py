@@ -465,13 +465,13 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(remediation["acquiring_grip"], "work-acquire")
         self.assertTrue(remediation["retry_safe_after_remediation"])
         self.assertIn("work-acquire", remediation["recommended_next_action"])
-        self.assertIn("same idempotency_key", remediation["recommended_next_action"])
+        self.assertIn("new idempotency_key", remediation["recommended_next_action"])
         self.assertEqual(
             [entry["status"] for entry in result["lease"]["checked"]],
             ["missing", "missing"],
         )
 
-    def test_expired_lease_rejection_recommends_renewal(self) -> None:
+    def test_expired_lease_rejection_recommends_reacquisition_not_renewal(self) -> None:
         def expired_lease(resource_key: str) -> dict[str, object]:
             return {
                 "resource_key": resource_key,
@@ -488,7 +488,47 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(remediation["blocking_statuses"], ["expired"])
         self.assertEqual(remediation["missing_resource_keys"], [])
         self.assertTrue(remediation["retry_safe_after_remediation"])
-        self.assertIn("grabowski_resource_renew", remediation["recommended_next_action"])
+        action = remediation["recommended_next_action"]
+        # renew_resources raises ResourceLeaseExpired once expires_at_unix <= now, so
+        # renewal is never a valid route out of the expired state.
+        self.assertIn("re-acquired, not renewed", action)
+        self.assertIn("grabowski_resource_acquire", action)
+
+    def test_rejection_replays_unchanged_so_remediation_demands_a_new_key(self) -> None:
+        live = False
+
+        def toggling_lease(resource_key: str) -> dict[str, object] | None:
+            if not live:
+                return None
+            return {
+                "resource_key": resource_key,
+                "owner_id": self.owner,
+                "expires_at_unix": int(time.time()) + 3600,
+            }
+
+        rejected = self._ensure(
+            self._parameters(key="replay-hazard"), inspect_lease=toggling_lease
+        )
+        self.assertEqual(rejected["result_state"], "REJECTED_BY_LEASE")
+
+        live = True
+        replayed = self._ensure(
+            self._parameters(key="replay-hazard"), inspect_lease=toggling_lease
+        )
+
+        # The durable rejection is immutable evidence: the same key replays it even
+        # though the leases are now satisfied. This is exactly why the remediation
+        # prescribes a fresh key rather than an unchanged retry.
+        self.assertEqual(replayed["result_state"], "REJECTED_BY_LEASE")
+        self.assertTrue(replayed["replayed"])
+        self.assertIn(
+            "new idempotency_key", replayed["lease_remediation"]["recommended_next_action"]
+        )
+
+        fresh = self._ensure(
+            self._parameters(key="replay-hazard-2"), inspect_lease=toggling_lease
+        )
+        self.assertEqual(fresh["result_state"], "CREATED")
 
     def test_live_foreign_lease_rejection_forbids_unchanged_retry(self) -> None:
         def foreign_lease(resource_key: str) -> dict[str, object]:
