@@ -29,7 +29,7 @@ Aktuelle Adapterrollen:
 
 Chrome Stable ist damit die kanonische allgemeine Operatorwahl. Brave bleibt ausdrücklich zulässig, wird aber nicht zur kanonischen Agentenbasis erklärt. Chrome for Testing ist eine reproduzierbare Testoption und kein Zwang für allgemeines Browsing.
 
-Ein Executable ohne implementierten CDP-Adapter wird vor Profilerzeugung und Workerstart abgewiesen. Eine bloße Aufnahme in `GRABOWSKI_BROWSER_EXECUTABLES` erzeugt also keine neue Protokollunterstützung.
+Ein Executable ohne implementierten CDP-Adapter wird vor Profilerzeugung und Workerstart abgewiesen. Eine bloße Aufnahme in `GRABOWSKI_BROWSER_EXECUTABLES` erzeugt also keine neue Protokollunterstützung. Der Adapter-Launchvertrag besitzt außerdem die protokollspezifische Port-/Argument-Validierung, Endpoint-Projektion und Argv-Konstruktion; `browser_start()` selbst verwaltet nur den gemeinsamen Worker-, Profil- und Lease-Lifecycle.
 
 ## Endpoint- und Transportvertrag
 
@@ -118,12 +118,12 @@ Die Repository-Implementierung ändert ausschließlich:
 - `tests/test_workers.py`
 - dieses Dokument.
 
-Deployment und Live-Abnahme gehören in einen separaten Bureau-Nachfolgetask mit `runtime_mutation`-Freigabe. Dieser Nachfolgetask muss mindestens belegen:
+Der Repository-PR selbst erzeugt keine Runtime-Wirkung. Der Bureau-Task ist jedoch erst nach dem revisionsgebundenen Merge **und** der anschließenden Live-Abnahme auf dem exakt gemergten Grabowski-Head abgeschlossen. Die Live-Abnahme muss mindestens belegen:
 
 1. Deployment auf den exakten gemergten Grabowski-Head;
-2. frischen Chrome-Stable-Worker über den neuen Adaptervertrag;
-3. loopback-only CDP-Readback;
+2. einen frischen Chrome-Stable-Worker über den neuen Adaptervertrag;
+3. loopback-only CDP- und Control-Plane-Readback;
 4. terminalen Stop und exakte Freigabe von Port-/Profil-Leases;
-5. unveränderten menschlichen Desktop-Default Brave.
+5. per separatem Readback, dass der menschliche Desktop-Default weiterhin Brave ist.
 
-Der Repository-Task selbst autorisiert keine Runtime-Wirkung und keine Änderung des Desktop-Default-Browsers.
+Deployment und Live-Abnahme laufen ausschließlich über die dafür vorgesehenen typisierten Grabowski-Operatorpfade. Der Task autorisiert keine Änderung des Desktop-Default-Browsers, keine Nutzung des menschlichen Standardprofils und keine Exposition des Debugging-Endpunkts über Loopback hinaus.

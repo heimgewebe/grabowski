@@ -373,6 +373,53 @@ globalThis.fetch = async () => ({
         self.assertEqual(future[0]["id"], "webdriver-bidi")
         self.assertFalse(future[0]["implemented"])
 
+    def test_distinct_ephemeral_profiles_can_run_concurrently(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            first = workers.browser_start(
+                str(self.binary), port=9240, runtime_seconds=60
+            )["worker"]
+            second = workers.browser_start(
+                str(self.binary), port=9241, runtime_seconds=60
+            )["worker"]
+        self.assertNotEqual(first["worker_id"], second["worker_id"])
+        self.assertNotEqual(first["profile_path"], second["profile_path"])
+        self.assertEqual(first["control_plane"]["profile"]["mode"], "ephemeral")
+        self.assertEqual(second["control_plane"]["profile"]["mode"], "ephemeral")
+        self.assertEqual(
+            workers.resources.inspect_resource(f"browser-profile:{first['profile_path']}")["owner_id"],
+            f"worker:{first['worker_id']}",
+        )
+        self.assertEqual(
+            workers.resources.inspect_resource(f"browser-profile:{second['profile_path']}")["owner_id"],
+            f"worker:{second['worker_id']}",
+        )
+
+    def test_browser_start_routes_launch_through_adapter_contract(self) -> None:
+        with patch.object(
+            workers,
+            "_browser_adapter_launch_argv",
+            wraps=workers._browser_adapter_launch_argv,
+        ) as launch_adapter, patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(workers.operator, "_run", return_value=result()):
+            started = workers.browser_start(
+                str(self.binary), port=9242, args=["--headless=new"], runtime_seconds=60
+            )
+        launch_adapter.assert_called_once()
+        call = launch_adapter.call_args
+        self.assertEqual(call.args[0]["adapter_id"], "chrome-cdp")
+        self.assertEqual(call.kwargs["port"], 9242)
+        self.assertEqual(
+            started["worker"]["control_plane"]["endpoint"],
+            {"address": "127.0.0.1", "port": 9242, "loopback_only": True},
+        )
+        self.assertIn(
+            "loopback-debugging",
+            started["worker"]["control_plane"]["adapter"]["capabilities"],
+        )
+
     def test_brave_uses_chromium_cdp_fallback_policy(self) -> None:
         brave = self.root / "brave-browser"
         brave.write_text("#!/bin/sh\nexit 0\n")

@@ -304,6 +304,75 @@ def _browser_adapter_policy(
     }
 
 
+_BROWSER_CDP_ADAPTER_IDS = frozenset({"chrome-cdp", "chromium-cdp"})
+_BROWSER_CDP_CAPABILITIES = (
+    "loopback-debugging",
+    "profile-isolation",
+    "exclusive-profile-lease",
+    "terminal-outcome-readback",
+)
+
+
+def _browser_adapter_runtime_contract(
+    adapter: dict[str, Any], *, port: int | None
+) -> dict[str, Any]:
+    if adapter.get("implemented") is not True:
+        return {
+            "capabilities": [],
+            "endpoint": {"address": None, "port": port, "loopback_only": False},
+        }
+    if adapter.get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS:
+        raise ValueError("browser adapter runtime contract is not implemented")
+    return {
+        "capabilities": list(_BROWSER_CDP_CAPABILITIES),
+        "endpoint": {
+            "address": "127.0.0.1",
+            "port": port,
+            "loopback_only": True,
+        },
+    }
+
+
+def _browser_adapter_launch_preflight(
+    adapter: dict[str, Any], *, port: int, args: list[str]
+) -> dict[str, Any]:
+    if adapter.get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS:
+        raise ValueError("browser adapter launch is not implemented")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1024 <= port <= 65535:
+        raise ValueError("browser CDP port must be between 1024 and 65535")
+    forbidden = (
+        "--remote-debugging-address",
+        "--remote-debugging-port",
+        "--user-data-dir",
+    )
+    if any(
+        any(item == prefix or item.startswith(prefix + "=") for prefix in forbidden)
+        for item in args
+    ):
+        raise ValueError("browser args may not override profile or CDP binding")
+    return _browser_adapter_runtime_contract(adapter, port=port)
+
+
+def _browser_adapter_launch_argv(
+    adapter: dict[str, Any],
+    *,
+    executable: Path,
+    port: int,
+    profile: Path,
+    args: list[str],
+) -> list[str]:
+    if adapter.get("adapter_id") not in _BROWSER_CDP_ADAPTER_IDS:
+        raise ValueError("browser adapter launch is not implemented")
+    return [
+        str(executable),
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        *args,
+    ]
+
+
 def _browser_profile_mode(record: dict[str, Any]) -> str:
     profile_path = record.get("profile_path")
     if not isinstance(profile_path, str) or not profile_path:
@@ -325,6 +394,9 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
     if record.get("kind") != "browser":
         raise ValueError("browser control-plane projection requires a browser worker")
     adapter = _browser_adapter_policy(record["executable"], require_supported=False)
+    runtime_contract = _browser_adapter_runtime_contract(
+        adapter, port=record.get("port")
+    )
     profile_path = record.get("profile_path")
     profile_mode = _browser_profile_mode(record)
     profile_identity = _browser_profile_identity(profile_path)
@@ -351,16 +423,7 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
             "id": adapter["adapter_id"],
             "protocol": adapter["protocol"],
             "implemented": adapter["implemented"],
-            "capabilities": (
-                [
-                    "loopback-debugging",
-                    "profile-isolation",
-                    "exclusive-profile-lease",
-                    "terminal-outcome-readback",
-                ]
-                if adapter["implemented"]
-                else []
-            ),
+            "capabilities": runtime_contract["capabilities"],
             "future_adapters": [dict(item) for item in BROWSER_CONTROL_PLANE_FUTURE_ADAPTERS],
         },
         "browser": {
@@ -368,11 +431,7 @@ def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
             "vendor": adapter["vendor"],
             "selection_role": adapter["selection_role"],
         },
-        "endpoint": {
-            "address": "127.0.0.1",
-            "port": record.get("port"),
-            "loopback_only": True,
-        },
+        "endpoint": runtime_contract["endpoint"],
         "profile": {
             "mode": profile_mode,
             "scope_kind": (
@@ -1847,33 +1906,24 @@ def browser_start(
     persistent_profile: str | None = None,
     runtime_seconds: int = 3600,
 ) -> dict[str, Any]:
-    if not isinstance(port, int) or not 1024 <= port <= 65535:
-        raise ValueError("browser CDP port must be between 1024 and 65535")
     runtime = operator._job_runtime(runtime_seconds)
     binary = _executable(
         executable,
         environment_name="GRABOWSKI_BROWSER_EXECUTABLES",
         defaults=DEFAULT_BROWSER_EXECUTABLES,
     )
-    _browser_adapter_policy(binary)
+    adapter = _browser_adapter_policy(binary)
     extra = _validate_args(args)
-    forbidden = (
-        "--remote-debugging-address",
-        "--remote-debugging-port",
-        "--user-data-dir",
-    )
-    if any(any(item == prefix or item.startswith(prefix + "=") for prefix in forbidden) for item in extra):
-        raise ValueError("browser args may not override profile or CDP binding")
+    _browser_adapter_launch_preflight(adapter, port=port, args=extra)
     worker_id = uuid.uuid4().hex[:20]
     profile, ephemeral = _browser_profile(worker_id, persistent_profile)
-    argv = [
-        str(binary),
-        "--remote-debugging-address=127.0.0.1",
-        f"--remote-debugging-port={port}",
-        f"--user-data-dir={profile}",
-        "--no-first-run",
-        *extra,
-    ]
+    argv = _browser_adapter_launch_argv(
+        adapter,
+        executable=binary,
+        port=port,
+        profile=profile,
+        args=extra,
+    )
     lease_keys = [f"port:{port}", f"browser-profile:{profile}"]
     ephemeral_paths = [profile] if ephemeral else []
     config = {
