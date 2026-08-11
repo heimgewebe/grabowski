@@ -50,6 +50,16 @@ DEFAULT_BROWSER_EXECUTABLES = (
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
 )
+BROWSER_CONTROL_PLANE_SCHEMA_VERSION = 1
+BROWSER_CONTROL_PLANE_AUTHORITY = "grabowski"
+BROWSER_CONTROL_PLANE_FUTURE_ADAPTERS = (
+    {
+        "id": "webdriver-bidi",
+        "protocol": "webdriver-bidi",
+        "implemented": False,
+        "intended_browser_family": "firefox",
+    },
+)
 DEFAULT_GUI_EXECUTABLES = (
     "/usr/bin/gedit",
     "/usr/bin/evince",
@@ -232,6 +242,164 @@ def _browser_profile(worker_id: str, persistent_profile: str | None) -> tuple[Pa
     return resolved, False
 
 
+def _browser_adapter_policy(
+    executable: str | Path, *, require_supported: bool = True
+) -> dict[str, Any]:
+    path = Path(str(executable))
+    normalized = str(path).lower().replace("_", "-")
+    name = path.name.lower()
+    parts = tuple(part.lower() for part in path.parts)
+
+    if "brave" in normalized:
+        family = "brave"
+        vendor = "brave"
+        adapter_id = "chromium-cdp"
+        role = "fallback-test"
+    elif "chromium" in normalized:
+        family = "chromium"
+        vendor = "chromium"
+        adapter_id = "chromium-cdp"
+        role = "fallback-test"
+    elif (
+        "chrome-for-testing" in normalized
+        or "chrome-headless-shell" in normalized
+        or any(part.startswith("chrome-linux") for part in parts)
+    ):
+        family = "chrome-for-testing"
+        vendor = "google"
+        adapter_id = "chrome-cdp"
+        role = "reproducible-test"
+    elif (
+        "google-chrome" in normalized
+        or "/google/chrome/" in normalized
+        or name == "chrome"
+    ):
+        nonstable = any(channel in normalized for channel in ("beta", "unstable", "dev"))
+        family = "chrome-nonstable" if nonstable else "chrome-stable"
+        vendor = "google"
+        adapter_id = "chrome-cdp"
+        role = "fallback-test" if nonstable else "canonical-operator"
+    else:
+        if require_supported:
+            raise ValueError(
+                "browser executable has no supported CDP adapter; "
+                "WebDriver BiDi is not implemented"
+            )
+        return {
+            "family": "unsupported",
+            "vendor": "unknown",
+            "adapter_id": None,
+            "protocol": None,
+            "selection_role": "unsupported",
+            "implemented": False,
+        }
+
+    return {
+        "family": family,
+        "vendor": vendor,
+        "adapter_id": adapter_id,
+        "protocol": "cdp",
+        "selection_role": role,
+        "implemented": True,
+    }
+
+
+def _browser_profile_mode(record: dict[str, Any]) -> str:
+    profile_path = record.get("profile_path")
+    if not isinstance(profile_path, str) or not profile_path:
+        return "unknown"
+    ephemeral_paths = {
+        str(item) for item in json.loads(record.get("ephemeral_paths_json") or "[]")
+    }
+    return "ephemeral" if profile_path in ephemeral_paths else "persistent"
+
+
+def _browser_profile_identity(profile_path: str | None) -> str | None:
+    if not profile_path:
+        return None
+    normalized = os.path.normpath(profile_path)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _browser_control_plane(record: dict[str, Any]) -> dict[str, Any]:
+    if record.get("kind") != "browser":
+        raise ValueError("browser control-plane projection requires a browser worker")
+    adapter = _browser_adapter_policy(record["executable"], require_supported=False)
+    profile_path = record.get("profile_path")
+    profile_mode = _browser_profile_mode(record)
+    profile_identity = _browser_profile_identity(profile_path)
+    profile_lease_identity = (
+        hashlib.sha256(f"browser-profile:{profile_path}".encode("utf-8")).hexdigest()
+        if profile_path
+        else None
+    )
+    return {
+        "schema_version": BROWSER_CONTROL_PLANE_SCHEMA_VERSION,
+        "kind": "browser-control-plane",
+        "authority": {
+            "control_plane": BROWSER_CONTROL_PLANE_AUTHORITY,
+            "lease": "grabowski-resource-store",
+            "worker_state": "grabowski-worker-registry",
+            "outcome_readback": "grabowski-browser-worker-status",
+            "audit": "grabowski-audit-chain",
+        },
+        "intent": {
+            "kind": "browser-session",
+            "effect_class": "managed-runtime-process",
+        },
+        "adapter": {
+            "id": adapter["adapter_id"],
+            "protocol": adapter["protocol"],
+            "implemented": adapter["implemented"],
+            "capabilities": (
+                [
+                    "loopback-debugging",
+                    "profile-isolation",
+                    "exclusive-profile-lease",
+                    "terminal-outcome-readback",
+                ]
+                if adapter["implemented"]
+                else []
+            ),
+            "future_adapters": [dict(item) for item in BROWSER_CONTROL_PLANE_FUTURE_ADAPTERS],
+        },
+        "browser": {
+            "family": adapter["family"],
+            "vendor": adapter["vendor"],
+            "selection_role": adapter["selection_role"],
+        },
+        "endpoint": {
+            "address": "127.0.0.1",
+            "port": record.get("port"),
+            "loopback_only": True,
+        },
+        "profile": {
+            "mode": profile_mode,
+            "scope_kind": (
+                "worker-ephemeral"
+                if profile_mode == "ephemeral"
+                else "explicit-auth-trust-scope"
+                if profile_mode == "persistent"
+                else "unknown"
+            ),
+            "canonicalized": profile_mode in {"ephemeral", "persistent"},
+            "exclusive_lease": True,
+            "identity_sha256": profile_identity,
+            "lease_identity_sha256": profile_lease_identity,
+        },
+        "outcome": {
+            "state": record.get("state"),
+            "readback": "grabowski-browser-worker-status",
+        },
+        "does_not_establish": [
+            "browser authentication success",
+            "profile credential contents",
+            "Firefox or WebDriver BiDi availability",
+            "remote debugging beyond loopback",
+        ],
+    }
+
+
 def _worker_directory(worker_id: str) -> Path:
     directory = WORKER_STATE / "instances" / worker_id
     directory.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -356,7 +524,7 @@ def _update(
 
 
 def _public(record: dict[str, Any]) -> dict[str, Any]:
-    return {
+    public = {
         "worker_id": record["worker_id"],
         "kind": record["kind"],
         "unit": record["unit"],
@@ -377,6 +545,9 @@ def _public(record: dict[str, Any]) -> dict[str, Any]:
         ),
         "lease_keys": json.loads(record["lease_keys_json"]),
     }
+    if record["kind"] == "browser":
+        public["control_plane"] = _browser_control_plane(record)
+    return public
 
 
 def _release(record: dict[str, Any]) -> dict[str, Any]:
@@ -1684,6 +1855,7 @@ def browser_start(
         environment_name="GRABOWSKI_BROWSER_EXECUTABLES",
         defaults=DEFAULT_BROWSER_EXECUTABLES,
     )
+    _browser_adapter_policy(binary)
     extra = _validate_args(args)
     forbidden = (
         "--remote-debugging-address",
@@ -2119,18 +2291,33 @@ def worker_list(
 
 def _audit(operation: str, result: dict[str, Any]) -> None:
     worker = result.get("worker", result)
-    base._append_audit(
-        {
-            "timestamp_unix": _now(),
-            "operation": operation,
-            "worker_id": worker["worker_id"],
-            "kind": worker["kind"],
-            "unit": worker["unit"],
-            "state": worker["state"],
-            "port": worker.get("port"),
-            "display_number": worker.get("display_number"),
+    audit = {
+        "timestamp_unix": _now(),
+        "operation": operation,
+        "worker_id": worker["worker_id"],
+        "kind": worker["kind"],
+        "unit": worker["unit"],
+        "state": worker["state"],
+        "port": worker.get("port"),
+        "display_number": worker.get("display_number"),
+    }
+    control_plane = worker.get("control_plane")
+    if worker["kind"] == "browser" and isinstance(control_plane, dict):
+        adapter = control_plane["adapter"]
+        browser = control_plane["browser"]
+        profile = control_plane["profile"]
+        audit["browser_control_plane"] = {
+            "schema_version": control_plane["schema_version"],
+            "authority": control_plane["authority"]["control_plane"],
+            "adapter_id": adapter["id"],
+            "protocol": adapter["protocol"],
+            "browser_family": browser["family"],
+            "selection_role": browser["selection_role"],
+            "profile_mode": profile["mode"],
+            "profile_identity_sha256": profile["identity_sha256"],
+            "loopback_only": control_plane["endpoint"]["loopback_only"],
         }
-    )
+    base._append_audit(audit)
 
 
 @mcp.tool(name="grabowski_browser_worker_start", annotations=MUTATING)

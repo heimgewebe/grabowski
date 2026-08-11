@@ -68,7 +68,7 @@ class WorkerTests(unittest.TestCase):
         ]
         for item in self.patches:
             item.start()
-        self.binary = self.root / "browser"
+        self.binary = self.root / "google-chrome"
         self.binary.write_text("#!/bin/sh\nexit 0\n")
         self.binary.chmod(0o755)
 
@@ -343,6 +343,166 @@ globalThis.fetch = async () => ({
             workers.resources.inspect_resource("port:9222")["owner_id"],
             f"worker:{worker['worker_id']}",
         )
+
+    def test_browser_control_plane_projects_canonical_chrome_without_new_state(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(
+                str(self.binary), port=9224, args=["--headless=new"], runtime_seconds=60
+            )
+        worker = started["worker"]
+        control = worker["control_plane"]
+        self.assertEqual(control["schema_version"], 1)
+        self.assertEqual(control["authority"]["control_plane"], "grabowski")
+        self.assertEqual(control["intent"]["effect_class"], "managed-runtime-process")
+        self.assertEqual(control["adapter"]["id"], "chrome-cdp")
+        self.assertEqual(control["adapter"]["protocol"], "cdp")
+        self.assertTrue(control["adapter"]["implemented"])
+        self.assertEqual(control["browser"]["family"], "chrome-stable")
+        self.assertEqual(control["browser"]["selection_role"], "canonical-operator")
+        self.assertEqual(control["endpoint"]["address"], "127.0.0.1")
+        self.assertTrue(control["endpoint"]["loopback_only"])
+        self.assertEqual(control["profile"]["mode"], "ephemeral")
+        self.assertEqual(control["profile"]["scope_kind"], "worker-ephemeral")
+        self.assertEqual(
+            control["profile"]["identity_sha256"],
+            workers._browser_profile_identity(worker["profile_path"]),
+        )
+        future = control["adapter"]["future_adapters"]
+        self.assertEqual(future[0]["id"], "webdriver-bidi")
+        self.assertFalse(future[0]["implemented"])
+
+    def test_brave_uses_chromium_cdp_fallback_policy(self) -> None:
+        brave = self.root / "brave-browser"
+        brave.write_text("#!/bin/sh\nexit 0\n")
+        brave.chmod(0o755)
+        with patch.object(workers, "_executable", return_value=brave.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(brave), port=9227, runtime_seconds=60)
+        control = started["worker"]["control_plane"]
+        self.assertEqual(control["adapter"]["id"], "chromium-cdp")
+        self.assertEqual(control["adapter"]["protocol"], "cdp")
+        self.assertEqual(control["browser"]["family"], "brave")
+        self.assertEqual(control["browser"]["selection_role"], "fallback-test")
+
+    def test_chrome_for_testing_is_reproducible_test_only(self) -> None:
+        policy = workers._browser_adapter_policy(
+            "/opt/chrome-for-testing/chrome-linux64/chrome"
+        )
+        self.assertEqual(policy["family"], "chrome-for-testing")
+        self.assertEqual(policy["adapter_id"], "chrome-cdp")
+        self.assertEqual(policy["selection_role"], "reproducible-test")
+
+    def test_non_chromium_browser_fails_closed_before_profile_creation(self) -> None:
+        firefox = self.root / "firefox"
+        firefox.write_text("#!/bin/sh\nexit 0\n")
+        firefox.chmod(0o755)
+        with patch.object(workers, "_executable", return_value=firefox.resolve()):
+            with self.assertRaisesRegex(ValueError, "WebDriver BiDi is not implemented"):
+                workers.browser_start(str(firefox), port=9228, runtime_seconds=60)
+        self.assertFalse(workers.WORKER_STATE.exists())
+        projected = workers._browser_adapter_policy(firefox, require_supported=False)
+        self.assertFalse(projected["implemented"])
+        self.assertEqual(projected["selection_role"], "unsupported")
+
+    def test_same_persistent_profile_is_exclusive(self) -> None:
+        profile_root = self.root / "browser-profiles"
+        profile_root.mkdir()
+        profile = profile_root / "github-auth"
+        configured_roots = [str(profile_root)]
+        with patch.object(workers.base, "_load_policy", return_value={}), patch.object(
+            workers.base, "_profile_values", return_value=configured_roots
+        ), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            first = workers.browser_start(
+                str(self.binary),
+                port=9230,
+                persistent_profile=str(profile),
+                runtime_seconds=60,
+            )["worker"]
+            with self.assertRaises(workers.resources.ResourceConflict):
+                workers.browser_start(
+                    str(self.binary),
+                    port=9231,
+                    persistent_profile=str(profile),
+                    runtime_seconds=60,
+                )
+        profile_key = f"browser-profile:{profile}"
+        self.assertEqual(
+            workers.resources.inspect_resource(profile_key)["owner_id"],
+            f"worker:{first['worker_id']}",
+        )
+        self.assertIsNone(workers.resources.inspect_resource("port:9231"))
+        self.assertEqual(first["control_plane"]["profile"]["mode"], "persistent")
+        self.assertEqual(
+            first["control_plane"]["profile"]["scope_kind"],
+            "explicit-auth-trust-scope",
+        )
+
+    def test_distinct_persistent_profiles_can_run_concurrently(self) -> None:
+        profile_root = self.root / "browser-profiles"
+        profile_root.mkdir()
+        first_profile = profile_root / "github-auth"
+        second_profile = profile_root / "n8n-auth"
+        configured_roots = [str(profile_root)]
+        with patch.object(workers.base, "_load_policy", return_value={}), patch.object(
+            workers.base, "_profile_values", return_value=configured_roots
+        ), patch.object(
+            workers, "_executable", return_value=self.binary.resolve()
+        ), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            first = workers.browser_start(
+                str(self.binary),
+                port=9232,
+                persistent_profile=str(first_profile),
+                runtime_seconds=60,
+            )["worker"]
+            second = workers.browser_start(
+                str(self.binary),
+                port=9233,
+                persistent_profile=str(second_profile),
+                runtime_seconds=60,
+            )["worker"]
+        self.assertNotEqual(first["worker_id"], second["worker_id"])
+        self.assertNotEqual(
+            first["control_plane"]["profile"]["identity_sha256"],
+            second["control_plane"]["profile"]["identity_sha256"],
+        )
+        self.assertEqual(
+            workers.resources.inspect_resource(f"browser-profile:{first_profile}")["owner_id"],
+            f"worker:{first['worker_id']}",
+        )
+        self.assertEqual(
+            workers.resources.inspect_resource(f"browser-profile:{second_profile}")["owner_id"],
+            f"worker:{second['worker_id']}",
+        )
+
+    def test_browser_audit_uses_hashed_profile_identity_only(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers.operator, "_run", return_value=result()
+        ):
+            started = workers.browser_start(str(self.binary), port=9234, runtime_seconds=60)
+        worker = started["worker"]
+        with patch.object(workers.base, "_append_audit") as append:
+            workers._audit("browser-worker-start", started)
+        audit = append.call_args.args[0]
+        serialized = json.dumps(audit, sort_keys=True)
+        self.assertNotIn(worker["profile_path"], serialized)
+        control = audit["browser_control_plane"]
+        self.assertEqual(control["adapter_id"], "chrome-cdp")
+        self.assertEqual(control["protocol"], "cdp")
+        self.assertEqual(control["profile_mode"], "ephemeral")
+        self.assertEqual(
+            control["profile_identity_sha256"],
+            worker["control_plane"]["profile"]["identity_sha256"],
+        )
+        self.assertTrue(control["loopback_only"])
 
     def test_persistent_profile_ignores_missing_alternative_roots(self) -> None:
         existing_root = self.root / "brave"
