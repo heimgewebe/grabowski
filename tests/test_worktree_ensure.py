@@ -444,6 +444,99 @@ class WorktreeEnsureTests(unittest.TestCase):
         self.assertEqual(result["error_class"], "LEASE_REJECTED")
         self.assertFalse(Path(parameters["target_path"]).exists())
 
+    def test_missing_lease_rejection_names_the_acquiring_route(self) -> None:
+        parameters = self._parameters(key="missing-lease")
+
+        result = self._ensure(parameters, inspect_lease=lambda _key: None)
+
+        self.assertEqual(result["result_state"], "REJECTED_BY_LEASE")
+        remediation = result["lease_remediation"]
+        self.assertFalse(remediation["satisfied"])
+        self.assertEqual(remediation["blocking_statuses"], ["missing"])
+        self.assertEqual(
+            sorted(remediation["missing_resource_keys"]),
+            sorted(
+                [
+                    f"path:{parameters['target_path']}",
+                    f"repo:{parameters['repo']}:branch:{parameters['branch']}",
+                ]
+            ),
+        )
+        self.assertEqual(remediation["acquiring_grip"], "work-acquire")
+        self.assertTrue(remediation["retry_safe_after_remediation"])
+        self.assertIn("work-acquire", remediation["recommended_next_action"])
+        self.assertIn("same idempotency_key", remediation["recommended_next_action"])
+        self.assertEqual(
+            [entry["status"] for entry in result["lease"]["checked"]],
+            ["missing", "missing"],
+        )
+
+    def test_expired_lease_rejection_recommends_renewal(self) -> None:
+        def expired_lease(resource_key: str) -> dict[str, object]:
+            return {
+                "resource_key": resource_key,
+                "owner_id": self.owner,
+                "expires_at_unix": int(time.time()) - 60,
+            }
+
+        result = self._ensure(
+            self._parameters(key="expired-lease"), inspect_lease=expired_lease
+        )
+
+        self.assertEqual(result["result_state"], "REJECTED_BY_LEASE")
+        remediation = result["lease_remediation"]
+        self.assertEqual(remediation["blocking_statuses"], ["expired"])
+        self.assertEqual(remediation["missing_resource_keys"], [])
+        self.assertTrue(remediation["retry_safe_after_remediation"])
+        self.assertIn("grabowski_resource_renew", remediation["recommended_next_action"])
+
+    def test_live_foreign_lease_rejection_forbids_unchanged_retry(self) -> None:
+        def foreign_lease(resource_key: str) -> dict[str, object]:
+            return {
+                "resource_key": resource_key,
+                "owner_id": "foreign-owner",
+                "expires_at_unix": int(time.time()) + 3600,
+            }
+
+        result = self._ensure(
+            self._parameters(key="foreign-remediation"), inspect_lease=foreign_lease
+        )
+
+        remediation = result["lease_remediation"]
+        self.assertEqual(remediation["blocking_statuses"], ["foreign_owner"])
+        self.assertIsNone(remediation["acquiring_grip"])
+        self.assertFalse(remediation["retry_safe_after_remediation"])
+        self.assertIn("do not retry unchanged", remediation["recommended_next_action"])
+
+    def test_unreadable_lease_store_blocks_retry(self) -> None:
+        def unreadable(_resource_key: str) -> dict[str, object]:
+            raise RuntimeError("lease store unavailable")
+
+        result = self._ensure(
+            self._parameters(key="unreadable-lease"), inspect_lease=unreadable
+        )
+
+        remediation = result["lease_remediation"]
+        self.assertEqual(remediation["blocking_statuses"], ["unreadable"])
+        self.assertFalse(remediation["retry_safe_after_remediation"])
+        self.assertIn("do not retry", remediation["recommended_next_action"])
+
+    def test_lease_rejection_friction_note_leads_with_the_remediation(self) -> None:
+        self._ensure(self._parameters(key="note-order"), inspect_lease=lambda _key: None)
+
+        self.assertEqual(len(self.friction_events), 1)
+        notes = self.friction_events[0]["notes"]
+        self.assertTrue(notes[0].startswith("remediation: "))
+        self.assertIn("work-acquire", notes[0])
+        self.assertTrue(any(note.startswith("missing lease: ") for note in notes[1:]))
+
+    def test_satisfied_lease_precondition_reports_no_remediation(self) -> None:
+        result = self._ensure(self._parameters(key="satisfied-lease"))
+
+        self.assertEqual(result["result_state"], "CREATED")
+        self.assertTrue(result["lease_remediation"]["satisfied"])
+        self.assertEqual(result["lease_remediation"]["blocking_statuses"], [])
+
     def test_same_idempotency_key_cannot_be_rebound_without_new_git_reads(self) -> None:
         original = self._parameters(key="stable-key")
         self.assertEqual(self._ensure(original)["result_state"], "CREATED")
