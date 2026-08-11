@@ -18,6 +18,8 @@ MAX_RECALL_LIMIT = 500
 MAX_EVIDENCE_REFS = 20
 MAX_REJECTED_SOURCES = 20
 MAX_REJECTION_DETAIL_CHARS = 160
+MAX_HISTORICAL_SUPPORT_REFS = 6
+MAX_HISTORICAL_PATTERN_SUMMARY = 50
 SOURCE_TRUST = "caller_supplied_unverified"
 EVIDENCE_BINDING = "requires_concrete_ref_but_does_not_verify_source"
 LEARNED_RULE_TRUST = "caller_supplied_unverified"
@@ -412,6 +414,58 @@ def _historical_display_text(value: Any, *, label: str, max_chars: int = 160) ->
     return sanitized[:max_chars]
 
 
+def _historical_support_refs(event: dict[str, Any]) -> tuple[list[str], bool]:
+    raw_refs = event.get("evidence_refs")
+    if not isinstance(raw_refs, list) or not all(
+        isinstance(ref, str) and ref for ref in raw_refs
+    ):
+        raise ValueError("Chronik history event evidence_refs are invalid")
+    refs = [
+        _historical_display_text(
+            ref,
+            label=f"Chronik history evidence ref {index}",
+            max_chars=240,
+        )
+        for index, ref in enumerate(raw_refs[:MAX_HISTORICAL_SUPPORT_REFS], start=1)
+    ]
+    return refs, len(raw_refs) > MAX_HISTORICAL_SUPPORT_REFS
+
+
+def _historical_pattern_summary(
+    items: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        fingerprint = item.get("pattern_fingerprint")
+        if isinstance(fingerprint, str):
+            counts[fingerprint] = counts.get(fingerprint, 0) + 1
+
+    summaries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        fingerprint = item.get("pattern_fingerprint")
+        if not isinstance(fingerprint, str):
+            continue
+        item["pattern_occurrence_count"] = counts[fingerprint]
+        item["pattern_scope"] = "bounded_query_result"
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        pattern = item.get("historical_pattern")
+        if isinstance(pattern, dict):
+            summaries.append(
+                {
+                    "pattern_fingerprint": fingerprint,
+                    "occurrences": counts[fingerprint],
+                    "pattern": dict(pattern),
+                    "scope": "bounded_query_result",
+                }
+            )
+    summaries.sort(key=lambda entry: (-entry["occurrences"], entry["pattern_fingerprint"]))
+    total_patterns = len(summaries)
+    return summaries[:MAX_HISTORICAL_PATTERN_SUMMARY], total_patterns
+
+
 def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(event, dict):
         raise ValueError("Chronik history event must be an object")
@@ -447,39 +501,134 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Chronik history event payload is invalid")
     if data.get("result") != expected_results[kind]:
         raise ValueError("Chronik history event outcome is invalid")
-    operation = _bounded_text(data.get("operation"), label="Chronik history operation", max_chars=160)
-    task_class = _bounded_text(data.get("task_class"), label="Chronik history task_class", max_chars=160)
+
+    operation = _bounded_text(
+        data.get("operation"), label="Chronik history operation", max_chars=160
+    )
+    task_class = _bounded_text(
+        data.get("task_class"), label="Chronik history task_class", max_chars=160
+    )
     if subject.get("scope") == "repository":
         target = _historical_display_text(subject.get("repo"), label="Chronik history repo")
     elif subject.get("scope") == "host":
         target = _historical_display_text(subject.get("host"), label="Chronik history host")
     else:
         raise ValueError("Chronik history event subject scope is invalid")
+
+    observed_at = _historical_display_text(
+        event.get("ts"), label="Chronik history timestamp", max_chars=80
+    )
+    run_id = _historical_display_text(
+        source.get("run_id"), label="Chronik history run_id", max_chars=160
+    )
+    subject_component = _optional_bounded_text(subject.get("component"), max_chars=160)
+    subject_context: dict[str, Any] = {
+        "scope": subject["scope"],
+        "target": target,
+    }
+    if subject_component:
+        subject_context["component"] = subject_component
+    pr_number = subject.get("pr_number")
+    if type(pr_number) is int and pr_number > 0:
+        subject_context["pr_number"] = pr_number
+
     outcome = data["result"]
     blocker = _optional_bounded_text(data.get("blocker_code"), max_chars=120)
+    support_refs, support_refs_truncated = _historical_support_refs(event)
+
+    historical_pattern: dict[str, Any] = {
+        "scope": subject_context["scope"],
+        "target": target,
+        "component": subject_component,
+        "operation": operation,
+        "task_class": task_class,
+        "outcome": outcome,
+        "blocker_code": blocker,
+    }
+    pattern_fingerprint = "sha256:" + _sha256_json(historical_pattern)
+    reuse_match = {
+        "scope": subject_context["scope"],
+        "target": target,
+        "operation": operation,
+        "task_class": task_class,
+    }
+    if subject_component:
+        reuse_match["component"] = subject_component
+    terminal_signature: dict[str, Any] | None = None
+    if outcome != "started":
+        terminal_signature = {"outcome": outcome}
+        if blocker:
+            terminal_signature["blocker_code"] = blocker
+
+    reuse_condition: dict[str, Any] = {
+        "match": reuse_match,
+        "requires_live_recheck": True,
+    }
+    if terminal_signature is not None:
+        reuse_condition["terminal_signature"] = terminal_signature
+
     result_text = f"Historical outcome: {outcome}."
     if blocker:
         result_text += f" Blocker: {blocker}."
     topic = f"historical run: {target} / {operation}"[:120]
-    item = {
+    target_detail = f" for component {subject_component}" if subject_component else ""
+    pr_detail = f" (PR {pr_number})" if type(pr_number) is int and pr_number > 0 else ""
+    if outcome == "started":
+        learned_rule = (
+            "Start event alone is not outcome evidence; correlate it with a terminal event "
+            "and re-check current live state before acting."
+        )
+    elif outcome == "blocked" and blocker:
+        learned_rule = (
+            f"Historical warning only: this matching pattern ended blocked with {blocker}; "
+            "re-check current live state and authorization before acting."
+        )
+    elif outcome == "blocked":
+        learned_rule = (
+            "Historical warning only: this matching pattern ended blocked; re-check current "
+            "live state and authorization before acting."
+        )
+    else:
+        learned_rule = (
+            "Historical precedent only: this matching pattern completed; re-check current "
+            "live state and authorization before reusing the approach."
+        )
+
+    return {
         "schema_version": 1,
         "kind": RECALL_KIND,
         "source": "chronik_event",
         "topic": topic,
         "situation": _bounded_text(
-            f"Chronik recorded a historical Grabowski {task_class} run for {target}.",
+            f"Chronik recorded a historical Grabowski {task_class} run for {target}"
+            f"{target_detail}{pr_detail} at {observed_at}.",
             label="situation",
         ),
-        "attempt": _bounded_text(f"Historical operation: {operation}.", label="attempt"),
+        "attempt": _bounded_text(
+            f"Run {run_id} attempted {operation} ({task_class}).", label="attempt"
+        ),
         "result": _bounded_text(result_text, label="result"),
-        "learned_rule": "Historical outcome only; re-check current live state and authorization before acting.",
+        "learned_rule": _bounded_text(learned_rule, label="learned_rule"),
         "learned_rule_trust": HISTORICAL_RULE_TRUST,
+        "historical_context": {
+            "observed_at": observed_at,
+            "run_id": run_id,
+            "operation": operation,
+            "task_class": task_class,
+            "outcome": outcome,
+            "blocker_code": blocker,
+            "subject": subject_context,
+            "support_refs": support_refs,
+            "support_refs_truncated": support_refs_truncated,
+        },
+        "historical_pattern": historical_pattern,
+        "pattern_fingerprint": pattern_fingerprint,
+        "reuse_condition": reuse_condition,
         "evidence_refs": [
             _evidence_ref("chronik_event", event_id, sha256=event_id.removeprefix("sha256:"))
         ],
         "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
     }
-    return item
 
 
 def export_chronik_history_recall(
@@ -565,6 +714,7 @@ def export_chronik_history_recall(
         "event_ids_sha256": _sha256_json(event_ids),
     }
     items = [_validated_chronik_event_recall(event) for event in raw_events[:limit]]
+    pattern_summary, pattern_count = _historical_pattern_summary(items)
     return {
         "schema_version": 1,
         "kind": "grabowski_operator_historical_recall",
@@ -578,6 +728,10 @@ def export_chronik_history_recall(
         "result_reference": result_reference,
         "returned": len(items),
         "items": items,
+        "pattern_count": pattern_count,
+        "pattern_summary": pattern_summary,
+        "pattern_summary_truncated": pattern_count > len(pattern_summary),
+        "pattern_scope": "bounded_query_result",
         "does_not_establish": list(HISTORICAL_RECALL_DOES_NOT_ESTABLISH),
     }
 
