@@ -1240,5 +1240,81 @@ class BureauIntakeAdapterTests(unittest.TestCase):
         self.assertTrue(result["ambiguity"])
 
 
+class BureauAuditFailureReasonTests(unittest.TestCase):
+    """The audit chain must carry *why* a Bureau contract call was rejected."""
+
+    def _record(self, payload: dict[str, object]) -> dict[str, object]:
+        with mock.patch.object(intake.base, "_append_audit") as appended:
+            intake._audit("bureau-candidate-record", payload, request_sha256="a" * 24)
+        self.assertEqual(appended.call_count, 1)
+        return appended.call_args.args[0]
+
+    def test_failure_reason_and_retryability_are_recorded(self) -> None:
+        record = self._record(
+            {
+                "kind": "bureau_operator_intake_failure",
+                "status": "failed",
+                "code": "candidate-record-invalid",
+                "message": "candidate repo cannot change across supersession",
+                "retryable": False,
+                "effect_started": False,
+                "ambiguity": False,
+            }
+        )
+
+        self.assertEqual(record["bureau_code"], "candidate-record-invalid")
+        self.assertEqual(
+            record["bureau_failure_reason"],
+            "candidate repo cannot change across supersession",
+        )
+        self.assertIs(record["bureau_retryable"], False)
+        self.assertEqual(record["request_sha256"], "a" * 24)
+
+    def test_successful_result_records_no_failure_reason(self) -> None:
+        record = self._record(
+            {
+                "kind": "bureau_candidate_record_result",
+                "status": "recorded",
+                "message": "not a failure",
+                "effect_started": True,
+                "ambiguity": False,
+            }
+        )
+
+        self.assertNotIn("bureau_failure_reason", record)
+        self.assertNotIn("bureau_retryable", record)
+
+    def test_reason_is_bounded_and_single_line(self) -> None:
+        record = self._record(
+            {
+                "status": "failed",
+                "code": "candidate-record-invalid",
+                "message": "line one\n   line two\t" + "x" * 4000,
+            }
+        )
+
+        reason = record["bureau_failure_reason"]
+        self.assertEqual(len(reason), intake.AUDIT_FAILURE_REASON_MAX_CHARS)
+        self.assertTrue(reason.startswith("line one line two x"))
+        self.assertNotIn("\n", reason)
+        self.assertTrue(reason.endswith("…"))
+
+    def test_missing_or_empty_message_is_omitted(self) -> None:
+        for message in (None, "", "   ", 17):
+            with self.subTest(message=message):
+                record = self._record(
+                    {"status": "failed", "code": "x", "message": message}
+                )
+                self.assertNotIn("bureau_failure_reason", record)
+
+    def test_explicit_extra_fields_still_win(self) -> None:
+        record = self._record(
+            {"status": "failed", "code": "x", "message": "boom", "retryable": True}
+        )
+
+        self.assertIs(record["bureau_retryable"], True)
+        self.assertEqual(record["operation"], "bureau-candidate-record")
+
+
 if __name__ == "__main__":
     unittest.main()

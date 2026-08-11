@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
@@ -14,6 +15,33 @@ import grabowski_nonconflict as nonconflict
 SCHEMA_VERSION = 1
 MAX_WORKTREES = 256
 MAX_RECONCILIATIONS = 100
+GIT_IDENTITY_TIMEOUT_SECONDS = 5
+INVENTORY_COMPLETENESS_KEYS = frozenset(
+    {
+        "schema_version",
+        "repository",
+        "requested_repo",
+        "git_common_dir",
+        "truncated",
+        "total_worktree_count",
+        "observed_worktree_count",
+        "omitted_worktree_count",
+        "probe_errors",
+        "probe_errors_truncated",
+        "observation_contract",
+        "generated_at_unix",
+        "inventory_sha256",
+    }
+)
+INVENTORY_COMPLETENESS_REPORT_KEYS = frozenset(
+    {
+        "truncated",
+        "total_worktree_count",
+        "observed_worktree_count",
+        "omitted_worktree_count",
+        "observation_contract",
+    }
+)
 
 InventoryLoader = Callable[[str], dict[str, Any]]
 ReconciliationLoader = Callable[[str], dict[str, Any]]
@@ -505,6 +533,117 @@ def _checkout_paths_overlap(left: Any, right: Any) -> bool:
     )
 
 
+def _git_repository_identity(repository: str) -> tuple[str, str | None]:
+    requested_repository = _canonical_checkout_path(repository)
+    if requested_repository is None:
+        return repository, None
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                requested_repository,
+                "rev-parse",
+                "--show-toplevel",
+                "--git-common-dir",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=GIT_IDENTITY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return requested_repository, None
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or len(lines) != 2:
+        return requested_repository, None
+    try:
+        top_level = Path(lines[0]).expanduser()
+        common_dir = Path(lines[1]).expanduser()
+        if not top_level.is_absolute():
+            return requested_repository, None
+        if not common_dir.is_absolute():
+            common_dir = Path(requested_repository) / common_dir
+        top_level = top_level.resolve(strict=True)
+        common_dir = common_dir.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return requested_repository, None
+    if not top_level.is_dir() or not common_dir.is_dir():
+        return requested_repository, None
+    return str(top_level), str(common_dir)
+
+
+def _complete_repository_inventory(
+    inventory: dict[str, Any],
+    *,
+    repository: str,
+    worktrees: list[Any],
+    requested_repository: str | None = None,
+    git_common_dir: str | None = None,
+) -> bool:
+    if not INVENTORY_COMPLETENESS_KEYS.issubset(inventory):
+        return False
+    expected_requested_repository = requested_repository or repository
+    observed_git_common_dir = _canonical_checkout_path(
+        inventory.get("git_common_dir")
+    )
+    if (
+        inventory.get("schema_version") != 1
+        or inventory.get("truncated") is not False
+        or not _same_checkout_path(inventory.get("repository"), repository)
+        or not _same_checkout_path(
+            inventory.get("requested_repo"), expected_requested_repository
+        )
+        or observed_git_common_dir is None
+        or (
+            git_common_dir is not None
+            and not _same_checkout_path(observed_git_common_dir, git_common_dir)
+        )
+    ):
+        return False
+
+    total = inventory.get("total_worktree_count")
+    observed = inventory.get("observed_worktree_count")
+    omitted = inventory.get("omitted_worktree_count")
+    generated_at = inventory.get("generated_at_unix")
+    if any(
+        not isinstance(value, int) or isinstance(value, bool) or value < 0
+        for value in (total, observed, omitted, generated_at)
+    ):
+        return False
+    if total != len(worktrees) or observed != len(worktrees) or omitted != 0:
+        return False
+    if (
+        not isinstance(inventory.get("probe_errors"), list)
+        or not isinstance(inventory.get("probe_errors_truncated"), bool)
+    ):
+        return False
+
+    observation_contract = inventory.get("observation_contract")
+    if (
+        not isinstance(observation_contract, dict)
+        or not isinstance(observation_contract.get("bounded"), bool)
+        or observation_contract.get("attempted_worktree_count") != len(worktrees)
+        or observation_contract.get("unobserved_worktrees_are_not_reported_clean")
+        is not True
+    ):
+        return False
+
+    inventory_sha256 = inventory.get("inventory_sha256")
+    if not _is_sha256(inventory_sha256):
+        return False
+    body = {
+        key: value
+        for key, value in inventory.items()
+        if key not in {"generated_at_unix", "inventory_sha256"}
+    }
+    try:
+        return inventory_sha256 == _digest(body)
+    except (TypeError, ValueError):
+        return False
+
+
 def _safe_relative_paths(value: Any, *, require_nonempty: bool) -> bool:
     if not isinstance(value, list) or (require_nonempty and not value):
         return False
@@ -799,7 +938,8 @@ def assess_repository_admission(
     system_convergence: dict[str, Any] | None = None,
     convergence_planner: ConvergencePlanner | None = None,
 ) -> dict[str, Any]:
-    repository = str(Path(repo).expanduser().resolve(strict=True))
+    requested_repository = str(Path(repo).expanduser().resolve(strict=True))
+    repository, git_common_dir = _git_repository_identity(requested_repository)
     if not isinstance(owner_id, str) or not owner_id:
         raise ValueError("owner_id must be a non-empty string")
     if not isinstance(operation, str) or not operation:
@@ -828,7 +968,7 @@ def assess_repository_admission(
     inventory_error: str | None = None
     reconciliation_error: str | None = None
     try:
-        inventory = (inventory_loader or _default_inventory)(repository)
+        inventory = (inventory_loader or _default_inventory)(requested_repository)
     except (
         ImportError, OSError, RuntimeError, ValueError, sqlite3.Error
     ) as exc:
@@ -844,6 +984,11 @@ def assess_repository_admission(
     worktrees = inventory.get("worktrees") if isinstance(inventory, dict) else None
     bindings = reconciliation.get("bindings") if isinstance(reconciliation, dict) else None
     blockers: list[dict[str, Any]] = []
+    inventory_complete = False
+    inventory_completeness_reported = bool(
+        isinstance(inventory, dict)
+        and INVENTORY_COMPLETENESS_REPORT_KEYS.intersection(inventory)
+    )
 
     if inventory_error is not None:
         blockers.append(
@@ -863,14 +1008,45 @@ def assess_repository_admission(
     if not isinstance(worktrees, list):
         blockers.append({"code": "inventory-unobservable", "detail": "worktree inventory is unavailable"})
         worktrees = []
-    elif len(worktrees) > MAX_WORKTREES and exact_checkout_scope is None:
-        blockers.append(
-            {
-                "code": "bounded-inventory-exceeded",
-                "detail": f"worktree inventory exceeds {MAX_WORKTREES}",
-            }
+    else:
+        inventory_complete = bool(
+            git_common_dir is not None
+            and _complete_repository_inventory(
+                inventory,
+                repository=repository,
+                worktrees=worktrees,
+                requested_repository=requested_repository,
+                git_common_dir=git_common_dir,
+            )
         )
-        worktrees = worktrees[:MAX_WORKTREES]
+        if inventory_completeness_reported and not inventory_complete:
+            blockers.append(
+                {
+                    "code": "inventory-unobservable",
+                    "detail": "worktree inventory completeness or repository binding is invalid",
+                }
+            )
+        if len(worktrees) > MAX_WORKTREES:
+            if exact_checkout_scope is None:
+                blockers.append(
+                    {
+                        "code": "bounded-inventory-exceeded",
+                        "detail": f"worktree inventory exceeds {MAX_WORKTREES}",
+                    }
+                )
+                worktrees = worktrees[:MAX_WORKTREES]
+            elif not inventory_complete:
+                if not inventory_completeness_reported:
+                    blockers.append(
+                        {
+                            "code": "inventory-unobservable",
+                            "detail": (
+                                "exact checkout admission above the inventory bound "
+                                "requires complete repository-bound inventory"
+                            ),
+                        }
+                    )
+                worktrees = worktrees[:MAX_WORKTREES]
 
     task_existing_target_count = 0
 

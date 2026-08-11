@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import ast
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,10 @@ class WorkAdmissionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.repo = Path(self.temporary.name) / "repo"
         self.repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)],
+            check=True,
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -98,6 +103,66 @@ class WorkAdmissionTests(unittest.TestCase):
             "snapshot_sha256": "b" * 64,
         }
 
+    def _complete_inventory(
+        self,
+        worktrees: list[dict[str, object]],
+        *,
+        truncated: bool = False,
+        requested_repo: str | None = None,
+    ) -> dict[str, object]:
+        omitted_worktree_count = 1 if truncated else 0
+        body: dict[str, object] = {
+            "schema_version": 1,
+            "repository": str(self.repo),
+            "requested_repo": requested_repo or str(self.repo),
+            "git_common_dir": str(self.repo / ".git"),
+            "worktrees": worktrees,
+            "truncated": truncated,
+            "total_worktree_count": len(worktrees) + omitted_worktree_count,
+            "observed_worktree_count": len(worktrees),
+            "omitted_worktree_count": omitted_worktree_count,
+            "probe_errors": [],
+            "probe_errors_truncated": False,
+            "observation_contract": {
+                "bounded": truncated,
+                "git_timeout_seconds": 5.0,
+                "observation_budget_seconds": 5.0 if truncated else None,
+                "max_worktrees": len(worktrees) if truncated else None,
+                "attempted_worktree_count": len(worktrees),
+                "unobserved_worktrees_are_not_reported_clean": True,
+            },
+        }
+        return {
+            **body,
+            "generated_at_unix": 1,
+            "inventory_sha256": admission._digest(body),
+        }
+
+    def _scoped_repository_write(
+        self,
+        *,
+        target_path: str,
+        branch: str,
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "repository": str(self.repo),
+            "task_id": "WELTGEWEBE-OS-V1-T067",
+            "base_head": "0" * 40,
+            "head": "a" * 40,
+            "branch": branch,
+            "worktree": target_path,
+            "effects": ["write"],
+            "paths": [str(self.repo / "src" / "example.py")],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+
     def _assess(
         self,
         worktrees: list[dict[str, object]],
@@ -109,10 +174,7 @@ class WorkAdmissionTests(unittest.TestCase):
             repo=str(self.repo),
             owner_id="owner-a",
             operation="worktree_create",
-            inventory_loader=lambda _repo: {
-                "worktrees": worktrees,
-                "inventory_sha256": "a" * 64,
-            },
+            inventory_loader=lambda _repo: self._complete_inventory(worktrees),
             reconciliation_loader=lambda _repo: (
                 reconciliation or self._reconciliation()
             ),
@@ -696,24 +758,10 @@ class WorkAdmissionTests(unittest.TestCase):
     def test_exact_scope_assesses_complete_inventory_above_legacy_bound(self) -> None:
         target_path = str(self.repo.parent / "worktrees" / "bureau-target")
         branch = "feat/bureau-target"
-        scope = {
-            "schema_version": 1,
-            "repository": str(self.repo),
-            "task_id": "WELTGEWEBE-OS-V1-T067",
-            "base_head": "0" * 40,
-            "head": "a" * 40,
-            "branch": branch,
-            "worktree": target_path,
-            "effects": ["write"],
-            "paths": [str(self.repo / "src" / "example.py")],
-            "components": [],
-            "runtime_resources": [],
-            "processes": [],
-            "deployments": [],
-            "migrations": [],
-            "generated_artifacts": [],
-            "shared_gates": [],
-        }
+        scope = self._scoped_repository_write(
+            target_path=target_path,
+            branch=branch,
+        )
         unrelated = [
             self._linked(state="unclassified_clean")
             for _ in range(admission.MAX_WORKTREES)
@@ -729,10 +777,9 @@ class WorkAdmissionTests(unittest.TestCase):
             owner_id="owner-a",
             operation="broad_repository_lease",
             requested_scope=scope,
-            inventory_loader=lambda _repo: {
-                "worktrees": [self._main(dirty=True), *unrelated],
-                "inventory_sha256": "a" * 64,
-            },
+            inventory_loader=lambda _repo: self._complete_inventory(
+                [self._main(dirty=True), *unrelated]
+            ),
             reconciliation_loader=lambda _repo: self._reconciliation(),
         )
 
@@ -742,6 +789,141 @@ class WorkAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "allow")
         self.assertNotIn("bounded-inventory-exceeded", result["blocker_codes"])
+
+    def test_exact_scope_above_bound_rejects_unobservable_partial_or_unbound_inventory(
+        self,
+    ) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "bureau-target")
+        branch = "feat/bureau-target"
+        scope = self._scoped_repository_write(
+            target_path=target_path,
+            branch=branch,
+        )
+        unrelated = [
+            self._linked(state="unclassified_clean")
+            for _ in range(admission.MAX_WORKTREES)
+        ]
+        for index, row in enumerate(unrelated):
+            row["path"] = str(
+                self.repo.parent / "worktrees" / f"unrelated-{index}"
+            )
+            row["branch"] = f"feat/unrelated-{index}"
+        worktrees = [self._main(), *unrelated]
+        inventories = {
+            "unobservable": {
+                "worktrees": worktrees,
+                "inventory_sha256": "a" * 64,
+            },
+            "partial": self._complete_inventory(worktrees, truncated=True),
+            "unbound": self._complete_inventory(
+                worktrees,
+                requested_repo=str(self.repo.parent / "other-repo"),
+            ),
+            "hash-mismatch": {
+                **self._complete_inventory(worktrees),
+                "inventory_sha256": "f" * 64,
+            },
+        }
+
+        for label, inventory in inventories.items():
+            with self.subTest(label=label):
+                result = admission.assess_repository_admission(
+                    repo=str(self.repo),
+                    owner_id="owner-a",
+                    operation="broad_repository_lease",
+                    requested_scope=scope,
+                    inventory_loader=lambda _repo, value=inventory: value,
+                    reconciliation_loader=lambda _repo: self._reconciliation(),
+                )
+
+                self.assertEqual(result["decision"], "blocked")
+                self.assertIn("inventory-unobservable", result["blocker_codes"])
+
+    def test_exact_scope_above_bound_still_inspects_late_target_overlap(self) -> None:
+        target = self._linked(
+            state="retained",
+            dirty=True,
+            owner="foreign-owner",
+            foreign_lease=True,
+        )
+        target_path = str(target["path"])
+        branch = str(target["branch"])
+        scope = self._scoped_repository_write(
+            target_path=target_path,
+            branch=branch,
+        )
+        unrelated = [
+            self._linked(state="unclassified_clean")
+            for _ in range(admission.MAX_WORKTREES - 1)
+        ]
+        for index, row in enumerate(unrelated):
+            row["path"] = str(
+                self.repo.parent / "worktrees" / f"unrelated-{index}"
+            )
+            row["branch"] = f"feat/unrelated-{index}"
+        worktrees = [self._main(), *unrelated, target]
+
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: self._complete_inventory(worktrees),
+            reconciliation_loader=lambda _repo: self._reconciliation(),
+        )
+
+        self.assertGreater(len(worktrees), admission.MAX_WORKTREES)
+        self.assertEqual(result["decision"], "blocked")
+        self.assertIn("dirty-worktree", result["blocker_codes"])
+        self.assertIn("foreign-live-coordination", result["blocker_codes"])
+        self.assertIn("foreign-retained-worktree", result["blocker_codes"])
+
+    def test_exact_scope_above_bound_still_blocks_target_binding_drift(self) -> None:
+        target_path = str(self.repo.parent / "worktrees" / "bureau-target")
+        branch = "feat/bureau-target"
+        scope = self._scoped_repository_write(
+            target_path=target_path,
+            branch=branch,
+        )
+        unrelated = [
+            self._linked(state="unclassified_clean")
+            for _ in range(admission.MAX_WORKTREES)
+        ]
+        for index, row in enumerate(unrelated):
+            row["path"] = str(
+                self.repo.parent / "worktrees" / f"unrelated-{index}"
+            )
+            row["branch"] = f"feat/unrelated-{index}"
+        worktrees = [self._main(), *unrelated]
+        reconciliation = {
+            "bindings": [
+                {
+                    "blocking": True,
+                    "checkout_key": "target",
+                    "state": "binding_identity_drift",
+                    "reasons": ["expected-branch-mismatch"],
+                    "binding_identity": {
+                        "checkout_path": target_path,
+                        "expected_branch": branch,
+                    },
+                }
+            ],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "b" * 64,
+        }
+
+        result = admission.assess_repository_admission(
+            repo=str(self.repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: self._complete_inventory(worktrees),
+            reconciliation_loader=lambda _repo: reconciliation,
+        )
+
+        self.assertEqual(result["decision"], "converge_first")
+        self.assertIn("binding-reconciliation-blocking", result["blocker_codes"])
 
     def test_repository_scope_above_inventory_bound_remains_fail_closed(self) -> None:
         unrelated = [
