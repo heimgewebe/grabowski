@@ -177,6 +177,45 @@ GRIP_SPECS: dict[str, GripSpec] = {
         operation_effect_class="worktree_admin",
         operation_class="worktree-admin",
     ),
+    "checkout-binding-terminal-preview": GripSpec(
+        name="checkout-binding-terminal-preview",
+        version="1.0",
+        summary="Preview one evidence-bound terminal transition for a missing managed checkout.",
+        effect=READ_ONLY,
+        required_parameters=("checkout_key",),
+        acceptance_ids=(
+            "checkout-key-bound",
+            "preview-read-only",
+            "terminal-evidence-visible",
+            "coordination-visible",
+            "preview-digest-bound",
+        ),
+        runner="checkout_binding_terminal_preview",
+    ),
+    "checkout-binding-terminal-apply": GripSpec(
+        name="checkout-binding-terminal-apply",
+        version="1.0",
+        summary="CAS-apply one evidence-bound terminal transition for a missing managed checkout.",
+        effect=MUTATING,
+        required_parameters=(
+            "checkout_key",
+            "owner_id",
+            "expected_preview_sha256",
+            "preview_created_at_unix",
+            "confirmation",
+        ),
+        acceptance_ids=(
+            "checkout-key-bound",
+            "preview-cas-bound",
+            "terminal-source-revalidated",
+            "lifecycle-only-effect",
+            "active-capacity-transition",
+            "durable-receipt",
+        ),
+        runner="checkout_binding_terminal_apply",
+        operation_effect_class="worktree_admin",
+        operation_class="worktree-admin",
+    ),
     "post-merge-sync": GripSpec(
         name="post-merge-sync",
         version="1.0",
@@ -591,6 +630,8 @@ GRIP_SURFACE_ALLOWLIST = frozenset(
         "work-acquire",
         "worktree-ensure",
         "worktree-hygiene-reconcile",
+        "checkout-binding-terminal-preview",
+        "checkout-binding-terminal-apply",
         "situation",
         "scout",
         "runtime-deploy-check",
@@ -630,6 +671,8 @@ GRIP_SURFACE_TARGETS = {
     "work-acquire": "one controller-owned work lane and exact isolated worktree",
     "worktree-ensure": "one exact repository worktree",
     "worktree-hygiene-reconcile": "terminal repository worktree lifecycle",
+    "checkout-binding-terminal-preview": "one missing managed checkout lifecycle binding",
+    "checkout-binding-terminal-apply": "one preview-bound missing checkout lifecycle transition",
     "situation": "repository and PR situation snapshot",
     "scout": "change-only repository, PR and runtime drift signal",
     "runtime-deploy-check": "registered runtime deployment adapter readiness",
@@ -665,6 +708,11 @@ GRIP_SURFACE_RECOVERY_PATHS = {
     MUTATING: "inspect the emitted receipt, verify target/scope, then use git/GitHub rollback or retry from the recorded head",
 }
 GRIP_RECOVERY_PATHS_BY_NAME = {
+    "checkout-binding-terminal-apply": (
+        "rerun checkout-binding-terminal-preview for the exact checkout key and apply only "
+        "a fresh matching digest; never force-release leases, delete refs, or infer terminality "
+        "from checkout absence"
+    ),
     "runtime-refresh-lease-release": (
         "re-read the exact runtime-refresh result and inspect retained rows; "
         "never substitute generic or forced lease release"
@@ -698,6 +746,10 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 # Conditional requirements cannot be expressed as static required_parameters,
 # so the published contract carries them explicitly per action.
 GRIP_CONDITIONAL_PRECONDITIONS = {
+    "checkout-binding-terminal-apply": (
+        "requires the exact preview SHA-256, preview creation time and terminal-reconciliation confirmation; "
+        "the existing reconciliation implementation revalidates terminal source evidence, coordination and CAS state",
+    ),
     "work-acquire": (
         "source_kind must be one of bureau_task, github_issue, operator_obligation, thread_focus; "
         "other source kinds have no immutable terminal evidence observer and are rejected before checkout creation",
@@ -4294,6 +4346,169 @@ def _run_worktree_hygiene_reconcile(
             "cleanup_without_matching_recovery_archive_or_fresh_dry_run",
             "authority_over_foreign_owners",
         ],
+    }
+
+
+def _run_checkout_binding_terminal_preview(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    checkout_key = _string_parameter(parameters, "checkout_key")
+    try:
+        output = grabowski_checkouts.grabowski_checkout_binding_terminal_preview(
+            checkout_key
+        )
+    except (ValueError, PermissionError, RuntimeError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    if output.get("checkout_key") != checkout_key:
+        raise GripActionError("checkout terminal preview identity mismatch")
+    _check(receipt, "checkout-key-bound", "pass", checkout_key)
+    _check(
+        receipt,
+        "preview-read-only",
+        "pass",
+        f"status={output.get('status')} safe_to_apply={output.get('safe_to_apply')}",
+    )
+    if output.get("status") == "already_applied":
+        _check(
+            receipt,
+            "terminal-evidence-visible",
+            "skip",
+            "terminal reconciliation is already applied and exposes its existing receipt",
+        )
+        _check(receipt, "coordination-visible", "skip", "already applied")
+        _check(receipt, "preview-digest-bound", "skip", "already applied")
+        return {**output, "receipt_status": "passed"}
+    source_evidence = output.get("source_evidence")
+    if not isinstance(source_evidence, dict) or not _is_sha256_hex(
+        source_evidence.get("evidence_sha256")
+    ):
+        raise GripActionError("checkout terminal preview lacks source evidence digest")
+    coordination = output.get("coordination")
+    if not isinstance(coordination, dict) or not isinstance(
+        coordination.get("blocking"), bool
+    ):
+        raise GripActionError("checkout terminal preview lacks coordination state")
+    preview_sha256 = output.get("preview_sha256")
+    preview_created_at_unix = output.get("preview_created_at_unix")
+    if not _is_sha256_hex(preview_sha256) or type(preview_created_at_unix) is not int:
+        raise GripActionError("checkout terminal preview lacks exact digest/time binding")
+    _check(
+        receipt,
+        "terminal-evidence-visible",
+        "pass",
+        str(source_evidence["evidence_sha256"]),
+    )
+    _check(
+        receipt,
+        "coordination-visible",
+        "pass",
+        f"blocking={str(coordination['blocking']).lower()}",
+    )
+    _check(
+        receipt,
+        "preview-digest-bound",
+        "pass",
+        f"{preview_sha256}@{preview_created_at_unix}",
+    )
+    return {**output, "receipt_status": "passed"}
+
+
+def _run_checkout_binding_terminal_apply(
+    spec: GripSpec,
+    parameters: dict[str, Any],
+    receipt: Receipt,
+    runner: CommandRunner,
+) -> dict[str, Any]:
+    del spec, runner
+    import grabowski_checkouts
+
+    checkout_key = _string_parameter(parameters, "checkout_key")
+    owner_id = _string_parameter(parameters, "owner_id")
+    expected_preview_sha256 = _string_parameter(
+        parameters, "expected_preview_sha256"
+    )
+    confirmation = _string_parameter(parameters, "confirmation")
+    preview_created_at_unix = parameters.get("preview_created_at_unix")
+    if type(preview_created_at_unix) is not int or preview_created_at_unix < 0:
+        raise GripPreflightError(
+            "preview_created_at_unix must be a non-negative integer"
+        )
+    try:
+        output = grabowski_checkouts.grabowski_checkout_binding_terminal_apply(
+            checkout_key,
+            owner_id,
+            expected_preview_sha256,
+            preview_created_at_unix,
+            confirmation,
+        )
+    except (ValueError, PermissionError) as exc:
+        raise GripPreflightError(str(exc)) from exc
+    except RuntimeError as exc:
+        raise GripActionError(str(exc)) from exc
+    terminal_receipt = output.get("receipt")
+    if not isinstance(terminal_receipt, dict):
+        raise GripActionError("checkout terminal apply returned no durable receipt")
+    if terminal_receipt.get("checkout_key") != checkout_key:
+        raise GripActionError("checkout terminal apply receipt identity mismatch")
+    if (
+        terminal_receipt.get("preview_sha256") != expected_preview_sha256
+        or terminal_receipt.get("preview_created_at_unix") != preview_created_at_unix
+    ):
+        raise GripActionError("checkout terminal apply receipt preview binding mismatch")
+    source_evidence_sha256 = terminal_receipt.get("source_evidence_sha256")
+    if not _is_sha256_hex(source_evidence_sha256):
+        raise GripActionError("checkout terminal apply lacks source evidence digest")
+    effects = terminal_receipt.get("effects")
+    if effects != ["lifecycle_phase_transition"]:
+        raise GripActionError("checkout terminal apply exceeded lifecycle-only effect")
+    binding_before = terminal_receipt.get("binding_before")
+    binding_after = terminal_receipt.get("binding_after")
+    if not isinstance(binding_before, dict) or not isinstance(binding_after, dict):
+        raise GripActionError("checkout terminal apply lacks lifecycle before/after state")
+    if binding_after.get("phase") != "externally_terminal_missing":
+        raise GripActionError("checkout terminal apply post-state is not externally terminal")
+    receipt_sha256 = terminal_receipt.get("receipt_sha256")
+    if not _is_sha256_hex(receipt_sha256):
+        raise GripActionError("checkout terminal apply lacks durable receipt digest")
+    active_binding_released = (
+        binding_before.get("phase") == "active"
+        and binding_after.get("phase") == "externally_terminal_missing"
+    )
+    _check(receipt, "checkout-key-bound", "pass", checkout_key)
+    _check(
+        receipt,
+        "preview-cas-bound",
+        "pass",
+        f"{expected_preview_sha256}@{preview_created_at_unix}",
+    )
+    _check(
+        receipt,
+        "terminal-source-revalidated",
+        "pass",
+        str(source_evidence_sha256),
+    )
+    _check(receipt, "lifecycle-only-effect", "pass", "lifecycle_phase_transition")
+    _check(
+        receipt,
+        "active-capacity-transition",
+        "pass" if active_binding_released else "skip",
+        f"{binding_before.get('phase')}->{binding_after.get('phase')}",
+    )
+    _check(receipt, "durable-receipt", "pass", str(receipt_sha256))
+    return {
+        **output,
+        "capacity_effect": {
+            "from_phase": binding_before.get("phase"),
+            "to_phase": binding_after.get("phase"),
+            "active_binding_released": active_binding_released,
+        },
+        "receipt_status": "passed",
     }
 
 
@@ -8773,6 +8988,8 @@ _RUNNERS = {
     "work_acquire": _run_work_acquire,
     "worktree_ensure": _run_worktree_ensure,
     "worktree_hygiene_reconcile": _run_worktree_hygiene_reconcile,
+    "checkout_binding_terminal_preview": _run_checkout_binding_terminal_preview,
+    "checkout_binding_terminal_apply": _run_checkout_binding_terminal_apply,
     "post_merge_sync": _run_post_merge_sync,
     "situation": _run_situation,
     "scout": _run_scout,
