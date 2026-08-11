@@ -178,6 +178,21 @@ class FakeSocket:
         return False
 
 
+class FakeIngressHealthResponse:
+    def __init__(self, raw: bytes, *, status: int = 200) -> None:
+        self.status = status
+        self.raw = raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, limit: int) -> bytes:
+        return self.raw[:limit]
+
+
 class OperatorListenerGateTests(unittest.TestCase):
     def test_listener_gate_waits_for_two_consecutive_successful_samples(self) -> None:
         with (
@@ -215,6 +230,84 @@ class OperatorListenerGateTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(core.DeployError, "Operator-Listener"):
                 dual.require_operator_listener(timeout_seconds=0.3)
+
+
+class TransportIngressHealthGateTests(unittest.TestCase):
+    def healthy_response(self) -> FakeIngressHealthResponse:
+        return FakeIngressHealthResponse(
+            json.dumps(
+                {
+                    "healthy": True,
+                    "assertion_version": "signed-one-call-v1",
+                }
+            ).encode("utf-8")
+        )
+
+    def test_health_gate_retries_transient_transport_until_ready(self) -> None:
+        with (
+            mock.patch.object(
+                dual,
+                "urlopen",
+                side_effect=[dual.URLError("connection refused"), self.healthy_response()],
+            ) as opener,
+            mock.patch.object(
+                dual.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 0.1, 0.1],
+            ),
+            mock.patch.object(dual.time, "sleep") as sleep,
+        ):
+            result = dual.require_transport_ingress_health(timeout_seconds=1.0)
+        self.assertTrue(result["healthy"])
+        self.assertEqual(2, opener.call_count)
+        sleep.assert_called_once_with(dual.TRANSPORT_INGRESS_HEALTH_POLL_INTERVAL_SECONDS)
+
+    def test_health_gate_transport_timeout_preserves_last_error(self) -> None:
+        with (
+            mock.patch.object(
+                dual,
+                "urlopen",
+                side_effect=dual.URLError("connection refused"),
+            ) as opener,
+            mock.patch.object(
+                dual.time,
+                "monotonic",
+                side_effect=[0.0, 0.0, 0.1, 0.2, 0.31],
+            ),
+            mock.patch.object(dual.time, "sleep"),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.require_transport_ingress_health(timeout_seconds=0.3)
+        self.assertEqual(2, opener.call_count)
+        self.assertEqual(2, raised.exception.details["attempts"])
+        self.assertEqual("URLError", raised.exception.details["error_type"])
+        self.assertIn("connection refused", raised.exception.details["last_error"])
+
+    def test_health_gate_does_not_retry_semantic_failures(self) -> None:
+        invalid_cases = [
+            FakeIngressHealthResponse(b"{"),
+            FakeIngressHealthResponse(
+                json.dumps(
+                    {
+                        "healthy": False,
+                        "assertion_version": "signed-one-call-v1",
+                    }
+                ).encode("utf-8")
+            ),
+        ]
+        for response in invalid_cases:
+            with self.subTest(raw=response.raw):
+                with (
+                    mock.patch.object(dual, "urlopen", return_value=response) as opener,
+                    mock.patch.object(
+                        dual.time, "monotonic", side_effect=[0.0, 0.0]
+                    ),
+                    mock.patch.object(dual.time, "sleep") as sleep,
+                ):
+                    with self.assertRaises(core.DeployError):
+                        dual.require_transport_ingress_health(timeout_seconds=1.0)
+                opener.assert_called_once()
+                sleep.assert_not_called()
 
 
 class SafetyObserverUnitTests(unittest.TestCase):
