@@ -237,6 +237,8 @@ OBSERVER_SAFETY_REPAIR_MARKER = "observer_safety_repair_retained_v1"
 OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
 TRANSPORT_INGRESS_LISTENER_PORT = 18180
+TRANSPORT_INGRESS_AUTH_HEADER = "X-Grabowski-Ingress-Auth"
+TRANSPORT_CONNECTOR_TOKEN_PATH = core.HOME / ".local/state/grabowski/transport-connectors/primary.token"
 LEGACY_TUNNEL_OPERATOR_PORT = OPERATOR_LISTENER_PORT
 TUNNEL_TARGET_PORTS = frozenset({LEGACY_TUNNEL_OPERATOR_PORT, TRANSPORT_INGRESS_LISTENER_PORT})
 TRANSPORT_INGRESS_HEALTH_URL = f"http://127.0.0.1:{TRANSPORT_INGRESS_LISTENER_PORT}/_grabowski/transport-ingress"
@@ -2120,6 +2122,100 @@ def _atomic_profile_write(profile_path: Path, value: bytes, *, mode: int) -> Non
             pass
 
 
+def _transport_ingress_auth_reference() -> str:
+    return f"{TRANSPORT_INGRESS_AUTH_HEADER}: file:{TRANSPORT_CONNECTOR_TOKEN_PATH}"
+
+
+def _transport_ingress_auth_block() -> bytes:
+    return (
+        f'  extra_headers:\n    - "{_transport_ingress_auth_reference()}"\n'
+    ).encode("utf-8")
+
+
+def _plain_profile_key(line: bytes, *, indent: int) -> str:
+    if b"\r" in line:
+        core.fail("Tunnelprofil verwendet nicht-kanonische Zeilenenden")
+    prefix = b" " * indent
+    if not line.startswith(prefix):
+        core.fail("Tunnelprofil enthält eine unerwartete YAML-Einrückung")
+    content = line[indent:].rstrip(b"\n")
+    if not content or content.startswith((b" ", b"\t")) or b":" not in content:
+        core.fail("Tunnelprofil enthält einen mehrdeutigen YAML-Schlüssel")
+    raw_key = content.split(b":", 1)[0]
+    allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+    if not raw_key or any(byte not in allowed for byte in raw_key):
+        core.fail("Tunnelprofil enthält einen nicht-kanonischen YAML-Schlüssel")
+    try:
+        return raw_key.decode("ascii")
+    except UnicodeDecodeError:
+        core.fail("Tunnelprofil enthält einen nicht-ASCII YAML-Schlüssel")
+        raise AssertionError
+
+
+def _mcp_profile_block_bounds(value: bytes) -> tuple[int, int]:
+    mcp_start: int | None = None
+    mcp_end: int | None = None
+    offset = 0
+    for line in value.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or line.lstrip(b" ").startswith(b"#"):
+            offset += len(line)
+            continue
+        if line.startswith((b" ", b"\t")):
+            offset += len(line)
+            continue
+        key = _plain_profile_key(line, indent=0)
+        if key == "mcp":
+            if mcp_start is not None or line != b"mcp:\n":
+                core.fail("Tunnelprofil-mcp-Block ist nicht eindeutig kanonisch")
+            mcp_start = offset + len(line)
+        elif mcp_start is not None and mcp_end is None:
+            mcp_end = offset
+        offset += len(line)
+    if mcp_start is None:
+        core.fail("Tunnelprofil besitzt keinen kanonischen mcp-Block")
+    return mcp_start, len(value) if mcp_end is None else mcp_end
+
+
+def _mcp_direct_children(block: bytes) -> list[tuple[str, bytes]]:
+    children: list[tuple[str, bytes]] = []
+    for line in block.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or line.lstrip(b" ").startswith(b"#"):
+            continue
+        leading = line[: len(line) - len(line.lstrip(b" \t"))]
+        if b"\t" in leading:
+            core.fail("Tunnelprofil-mcp-Block verwendet Tab-Einrückung")
+        indent = len(leading)
+        if indent == 2:
+            children.append((_plain_profile_key(line, indent=2), line))
+        elif indent < 4:
+            core.fail("Tunnelprofil-mcp-Block verwendet mehrdeutige Einrückung")
+    return children
+
+
+def _add_transport_ingress_auth(before: bytes) -> bytes:
+    start, end = _mcp_profile_block_bounds(before)
+    block = before[start:end]
+    expected = _transport_ingress_auth_block()
+    auth_children = [line for key, line in _mcp_direct_children(block) if key == "extra_headers"]
+    if auth_children:
+        if auth_children == [b"  extra_headers:\n"] and block.count(expected) == 1:
+            return before
+        core.fail("Tunnelprofil besitzt fremde MCP-Extra-Header; Ingress-Auth wird nicht blind überschrieben")
+    return before[:start] + expected + before[start:]
+
+
+def require_transport_ingress_auth_profile(profile_path: Path) -> None:
+    raw = profile_path.read_bytes()
+    start, end = _mcp_profile_block_bounds(raw)
+    block = raw[start:end]
+    expected = _transport_ingress_auth_block()
+    auth_children = [line for key, line in _mcp_direct_children(block) if key == "extra_headers"]
+    if auth_children != [b"  extra_headers:\n"] or block.count(expected) != 1:
+        core.fail("Tunnelprofil authentisiert den signierten Ingress nicht exakt")
+
+
 def capture_tunnel_profile_cutover(profile_path: Path, runtime: Path) -> TunnelProfileCutover:
     linked = _profile_regular_metadata(profile_path)
     before = profile_path.read_bytes()
@@ -2137,6 +2233,7 @@ def capture_tunnel_profile_cutover(profile_path: Path, runtime: Path) -> TunnelP
         if before.count(legacy) != 1:
             core.fail("Legacy-Tunnelziel ist nicht exakt einmal im Profil gebunden")
         after = before.replace(legacy, target, 1)
+    after = _add_transport_ingress_auth(after)
     return TunnelProfileCutover(
         before=before,
         before_sha256=_profile_bytes_sha256(before),
@@ -2162,6 +2259,7 @@ def apply_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCutov
         if current.count(legacy) != 1:
             core.fail("Legacy-Tunnelziel driftete vor dem Cutover")
         replacement = current.replace(legacy, target, 1)
+    replacement = _add_transport_ingress_auth(replacement)
     if _profile_bytes_sha256(replacement) != cutover.after_sha256:
         core.fail("Tunnelprofil-Cutover stimmt nicht mit dem Preflight überein")
     _atomic_profile_write(profile_path, replacement, mode=cutover.mode)
@@ -3924,6 +4022,7 @@ def deploy_url(
             cutover_topology = profile_topology(profile_path, runtime)
             if cutover_topology.kind != "url" or cutover_topology.server_url_port != TRANSPORT_INGRESS_LISTENER_PORT:
                 core.fail("Tunnelprofil ist nach Cutover nicht an den signierten Ingress gebunden")
+            require_transport_ingress_auth_profile(profile_path)
 
         phase = "start-tunnel"
         start_service(TUNNEL_SERVICE)

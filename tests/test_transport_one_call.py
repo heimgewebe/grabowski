@@ -4,20 +4,52 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+import types
 import tempfile
 import unittest
 from unittest import mock
 
-from starlette.requests import Request
-
-import grabowski_mcp as base
-import grabowski_operator as operator
-import grabowski_transport_assertion as assertion
-import grabowski_transport_roundtrip as roundtrip
-
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+# make validate intentionally runs without runtime dependencies installed.
+# Bind the branch modules to the same minimal MCP double used by the operator
+# contract suite so this test cannot accidentally exercise a deployed runtime.
+from test_operator_contract import _FakeFastMCP, _FakeToolAnnotations
+
+_mcp_names = ("mcp", "mcp.server", "mcp.server.fastmcp", "mcp.types")
+_previous_mcp = {name: sys.modules.get(name) for name in _mcp_names}
+_fake_mcp = types.ModuleType("mcp")
+_fake_server = types.ModuleType("mcp.server")
+_fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+_fake_types = types.ModuleType("mcp.types")
+_fake_fastmcp.FastMCP = _FakeFastMCP
+_fake_types.ToolAnnotations = _FakeToolAnnotations
+sys.modules.update(
+    {
+        "mcp": _fake_mcp,
+        "mcp.server": _fake_server,
+        "mcp.server.fastmcp": _fake_fastmcp,
+        "mcp.types": _fake_types,
+    }
+)
+try:
+    import grabowski_mcp as base
+    import grabowski_operator as operator
+    import grabowski_transport_assertion as assertion
+    import grabowski_transport_roundtrip as roundtrip
+finally:
+    for _name, _previous in _previous_mcp.items():
+        if _previous is None:
+            sys.modules.pop(_name, None)
+        else:
+            sys.modules[_name] = _previous
+
 SPEC = importlib.util.spec_from_file_location(
     "grabowski_transport_ingress_test_module",
     ROOT / "tools/grabowski_transport_ingress.py",
@@ -130,6 +162,15 @@ class TransportAssertionTests(unittest.TestCase):
                 now_unix=100 + assertion.ASSERTION_MAX_AGE_SECONDS + 1,
             )
 
+    def test_replay_tombstone_survives_original_retention_window(self) -> None:
+        first = self._evidence(now=100)
+        assertion.consume_assertion(**first, now_unix=101)
+        later = self._evidence(now=100 + assertion.REPLAY_RETENTION_SECONDS + 1000)
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(
+                **later, now_unix=100 + assertion.REPLAY_RETENTION_SECONDS + 1001
+            )
+
     def test_request_id_is_retry_stable_and_payload_bound(self) -> None:
         first = ingress.signed_tool_headers(
             token=SECRET,
@@ -158,24 +199,30 @@ class TransportAssertionTests(unittest.TestCase):
 
 
 class TransportIngressTests(unittest.TestCase):
+    def test_ingress_client_authentication_is_secret_bound(self) -> None:
+        self.assertFalse(ingress._ingress_client_authenticated({}, SECRET))
+        self.assertFalse(
+            ingress._ingress_client_authenticated(
+                {ingress.INGRESS_AUTH_HEADER: "not-the-owner-secret"}, SECRET
+            )
+        )
+        self.assertTrue(
+            ingress._ingress_client_authenticated(
+                {ingress.INGRESS_AUTH_HEADER: SECRET}, SECRET
+            )
+        )
+
     def test_managed_headers_from_caller_are_stripped(self) -> None:
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/mcp",
-            "raw_path": b"/mcp",
-            "query_string": b"",
-            "headers": [
-                (b"host", b"127.0.0.1:18180"),
-                (b"content-type", b"application/json"),
-                (b"x-grabowski-request-mac", b"attacker"),
-                (b"x-grabowski-connector-capability", b"attacker"),
-            ],
-            "client": ("127.0.0.1", 1),
-            "server": ("127.0.0.1", 18180),
-        }
-        headers = ingress._forward_headers(Request(scope), SECRET)
+        request = SimpleNamespace(
+            headers={
+                "host": "127.0.0.1:18180",
+                "content-type": "application/json",
+                "x-grabowski-request-mac": "attacker",
+                "x-grabowski-connector-capability": "attacker",
+                "x-grabowski-ingress-auth": "attacker",
+            }
+        )
+        headers = ingress._forward_headers(request, SECRET)
         self.assertEqual(headers[ingress.CAPABILITY_HEADER], SECRET)
         self.assertEqual(headers[ingress.INGRESS_VERSION_HEADER], assertion.ASSERTION_VERSION)
         self.assertNotEqual(headers.get(ingress.REQUEST_MAC_HEADER), "attacker")

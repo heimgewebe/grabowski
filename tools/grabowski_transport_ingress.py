@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -12,14 +13,6 @@ import stat
 import time
 from typing import Any
 from urllib.parse import urlsplit
-
-import httpx
-from starlette.applications import Starlette
-from starlette.background import BackgroundTask
-from starlette.requests import Request
-from starlette.responses import JSONResponse, StreamingResponse
-from starlette.routing import Route
-import uvicorn
 
 import grabowski_transport_assertion as assertion
 
@@ -48,6 +41,7 @@ HOP_BY_HOP_HEADERS = frozenset(
 )
 MANAGED_HEADER_PREFIX = "x-grabowski-"
 CAPABILITY_HEADER = "X-Grabowski-Connector-Capability"
+INGRESS_AUTH_HEADER = "X-Grabowski-Ingress-Auth"
 INGRESS_VERSION_HEADER = "X-Grabowski-Ingress-Version"
 REQUEST_ID_HEADER = "X-Grabowski-Request-Id"
 REQUEST_TIMESTAMP_HEADER = "X-Grabowski-Request-Timestamp"
@@ -197,7 +191,7 @@ def _validate_upstream(value: str) -> str:
     return value.rstrip("/")
 
 
-def _forward_headers(request: Request, token: str) -> dict[str, str]:
+def _forward_headers(request: Any, token: str) -> dict[str, str]:
     result: dict[str, str] = {}
     for name, value in request.headers.items():
         lowered = name.lower()
@@ -213,7 +207,7 @@ def _forward_headers(request: Request, token: str) -> dict[str, str]:
     return result
 
 
-def _response_headers(response: httpx.Response) -> dict[str, str]:
+def _response_headers(response: Any) -> dict[str, str]:
     result: dict[str, str] = {}
     for name, value in response.headers.items():
         lowered = name.lower()
@@ -221,6 +215,11 @@ def _response_headers(response: httpx.Response) -> dict[str, str]:
             continue
         result[name] = value
     return result
+
+
+def _ingress_client_authenticated(headers: Any, token: str) -> bool:
+    supplied = headers.get(INGRESS_AUTH_HEADER)
+    return isinstance(supplied, str) and hmac.compare_digest(supplied, token)
 
 
 def _rpc_request_id(payload: dict[str, Any]) -> str:
@@ -302,7 +301,9 @@ class TransportIngress:
             raise IngressConfigurationError("runtime binding digest is invalid")
         self._runtime_binding_sha256 = runtime_binding_sha256
 
-    async def health(self, request: Request) -> JSONResponse:
+    async def health(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
         return JSONResponse(
             {
                 "schema_version": 1,
@@ -314,7 +315,13 @@ class TransportIngress:
             }
         )
 
-    async def proxy(self, request: Request) -> StreamingResponse | JSONResponse:
+    async def proxy(self, request: Any) -> Any:
+        import httpx
+        from starlette.background import BackgroundTask
+        from starlette.responses import JSONResponse, StreamingResponse
+
+        if not _ingress_client_authenticated(request.headers, self._token):
+            return JSONResponse({"error": "unauthorized_ingress_client"}, status_code=401)
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
@@ -370,7 +377,10 @@ class TransportIngress:
         )
 
 
-def build_app(*, token: str, upstream: str, runtime_binding_sha256: str) -> Starlette:
+def build_app(*, token: str, upstream: str, runtime_binding_sha256: str) -> Any:
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+
     ingress = TransportIngress(
         token=token, upstream=upstream, runtime_binding_sha256=runtime_binding_sha256
     )
@@ -393,6 +403,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    import uvicorn
+
     args = _parse_args()
     if args.host != DEFAULT_HOST:
         raise SystemExit("transport ingress must bind to 127.0.0.1")

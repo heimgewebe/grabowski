@@ -3526,7 +3526,14 @@ class SignedIngressProfileCutoverTests(unittest.TestCase):
     def profile(self, root: Path) -> Path:
         path = root / "grabowski.yaml"
         path.write_text(
-            "config_version: 1\nmcp:\n  server_urls:\n    - channel: main\n      url: \"http://127.0.0.1:18181/mcp\"\n",
+            "config_version: 1\n"
+            "control_plane:\n"
+            "  extra_headers:\n"
+            "    OpenAI-Organization: \"org-test\"\n"
+            "mcp:\n"
+            "  server_urls:\n"
+            "    - channel: main\n"
+            "      url: \"http://127.0.0.1:18181/mcp\"\n",
             encoding="utf-8",
         )
         os.chmod(path, 0o600)
@@ -3549,9 +3556,66 @@ class SignedIngressProfileCutoverTests(unittest.TestCase):
             applied = dual.apply_tunnel_profile_cutover(profile, cutover)
             self.assertTrue(applied["changed"])
             self.assertIn(b"127.0.0.1:18180/mcp", profile.read_bytes())
+            self.assertIn(
+                dual._transport_ingress_auth_reference().encode("utf-8"),
+                profile.read_bytes(),
+            )
+            self.assertIn(b"OpenAI-Organization: \"org-test\"", profile.read_bytes())
+            dual.require_transport_ingress_auth_profile(profile)
             restored = dual.restore_tunnel_profile_cutover(profile, cutover)
             self.assertTrue(restored["restored"])
             self.assertEqual(before, profile.read_bytes())
+
+    def test_profile_cutover_refuses_foreign_mcp_extra_headers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = self.profile(Path(directory))
+            value = profile.read_text(encoding="utf-8").replace(
+                "mcp:\n",
+                "mcp:\n  extra_headers:\n    - \"X-Foreign: value\"\n",
+                1,
+            )
+            profile.write_text(value, encoding="utf-8")
+            os.chmod(profile, 0o600)
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                with self.assertRaises(core.DeployError):
+                    dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+
+    def test_profile_cutover_refuses_yaml_key_ambiguity(self) -> None:
+        cases = {
+            "quoted-mcp-child": (
+                "mcp:\n",
+                "mcp:\n  \"extra_headers\":\n    - \"X-Foreign: value\"\n",
+            ),
+            "quoted-top-level-mcp": (
+                "mcp:\n",
+                "\"mcp\":\n  server_urls: []\nmcp:\n",
+            ),
+            "ambiguous-indent": (
+                "mcp:\n",
+                "mcp:\n   extra_headers:\n    - \"X-Foreign: value\"\n",
+            ),
+        }
+        for label, (needle, replacement) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                profile = self.profile(Path(directory))
+                value = profile.read_text(encoding="utf-8").replace(needle, replacement, 1)
+                profile.write_text(value, encoding="utf-8")
+                os.chmod(profile, 0o600)
+                with mock.patch.object(
+                    dual,
+                    "profile_topology",
+                    return_value=dual.ProfileTopology(
+                        "url", server_url_count=1, server_url_port=18181
+                    ),
+                ):
+                    with self.assertRaises(core.DeployError):
+                        dual.capture_tunnel_profile_cutover(profile, RUNTIME)
 
     def test_profile_rollback_refuses_foreign_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

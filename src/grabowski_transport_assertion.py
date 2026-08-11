@@ -221,6 +221,63 @@ def _state_path(scope_sha256: str) -> Path:
     return STATE_ROOT / f"{_sha256(scope_sha256, 'transport client scope hash')}.json"
 
 
+def _tombstone_path(scope_sha256: str, request_id: str) -> Path:
+    scope = _sha256(scope_sha256, "transport client scope hash")
+    request = _request_id(request_id)
+    return STATE_ROOT / scope / f"{request}.json"
+
+
+def _read_tombstone(path: Path) -> dict[str, Any] | None:
+    try:
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    try:
+        meta = os.fstat(fd)
+        _validate_private_file(meta, "transport assertion replay tombstone")
+        if meta.st_size > 4096:
+            raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
+        raw = os.read(fd, 4097)
+        if len(raw) > 4096 or os.read(fd, 1):
+            raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
+    finally:
+        os.close(fd)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TransportAssertionError("transport assertion replay tombstone is invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise TransportAssertionError("transport assertion replay tombstone contract mismatch")
+    return value
+
+
+def _write_tombstone(path: Path, receipt: dict[str, Any]) -> None:
+    _ensure_private_directory(path.parent)
+    raw = _canonical_bytes(receipt) + b"\n"
+    if len(raw) > 4096:
+        raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise TransportAssertionReplay("signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state") from exc
+    try:
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _empty_state(scope_sha256: str) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -338,34 +395,23 @@ def consume_assertion(
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
         raise TransportAssertionError("transport assertion runtime binding mismatch")
 
-    path = _state_path(scope_hash)
+    path = _tombstone_path(scope_hash, material["request_id"])
     with _state_lock():
-        state = _read_state(path, scope_hash)
-        current: list[dict[str, Any]] = []
-        for item in state["consumed"]:
-            if not isinstance(item, dict):
-                raise TransportAssertionError("transport assertion replay record is invalid")
-            expires = item.get("expires_at_unix")
-            if isinstance(expires, bool) or not isinstance(expires, int):
-                raise TransportAssertionError("transport assertion replay expiry is invalid")
-            if expires >= now:
-                current.append(item)
-        matching = [item for item in current if item.get("request_id") == material["request_id"]]
-        if matching:
-            first = matching[0]
+        existing = _read_tombstone(path)
+        if existing is not None:
             exact = (
-                first.get("tool_name") == material["tool_name"]
-                and first.get("arguments_sha256") == material["arguments_sha256"]
-                and first.get("body_sha256") == material["body_sha256"]
-                and first.get("runtime_binding_sha256") == material["runtime_binding_sha256"]
+                existing.get("request_id") == material["request_id"]
+                and existing.get("client_scope_sha256") == scope_hash
+                and existing.get("tool_name") == material["tool_name"]
+                and existing.get("arguments_sha256") == material["arguments_sha256"]
+                and existing.get("body_sha256") == material["body_sha256"]
+                and existing.get("runtime_binding_sha256") == material["runtime_binding_sha256"]
             )
             if not exact:
                 raise TransportAssertionError("transport request id was reused for different evidence")
             raise TransportAssertionReplay(
                 "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
             )
-        if len(current) >= MAX_REPLAY_RECORDS:
-            raise TransportAssertionError("transport assertion replay store is full")
         receipt = {
             "schema_version": SCHEMA_VERSION,
             "kind": CONSUMPTION_KIND,
@@ -374,15 +420,13 @@ def consume_assertion(
             "runtime_binding_sha256": material["runtime_binding_sha256"],
             "issued_at_unix": material["issued_at_unix"],
             "consumed_at_unix": now,
-            "expires_at_unix": now + REPLAY_RETENTION_SECONDS,
             "audience": material["audience"],
             "tool_name": material["tool_name"],
             "arguments_sha256": material["arguments_sha256"],
             "body_sha256": material["body_sha256"],
         }
         receipt["receipt_sha256"] = _sha256_json(receipt)
-        current.append(receipt)
-        _write_state(path, {**state, "consumed": current})
+        _write_tombstone(path, receipt)
     return {
         "schema_version": SCHEMA_VERSION,
         "state": "consumed",
