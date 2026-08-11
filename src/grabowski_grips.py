@@ -4373,7 +4373,7 @@ def _run_checkout_binding_terminal_preview(
         output = grabowski_checkouts.grabowski_checkout_binding_terminal_preview(
             checkout_key
         )
-    except (ValueError, PermissionError, RuntimeError) as exc:
+    except (ValueError, PermissionError, RuntimeError, OSError) as exc:
         raise GripPreflightError(str(exc)) from exc
     if output.get("checkout_key") != checkout_key:
         raise GripActionError("checkout terminal preview identity mismatch")
@@ -4460,11 +4460,101 @@ def _run_checkout_binding_terminal_apply(
     except (ValueError, PermissionError) as exc:
         raise GripPreflightError(str(exc)) from exc
     except RuntimeError as exc:
-        raise GripActionError(str(exc)) from exc
+        try:
+            readback = grabowski_checkouts.grabowski_checkout_binding_terminal_preview(
+                checkout_key
+            )
+        except (ValueError, PermissionError, RuntimeError, OSError):
+            readback = None
+        existing_receipt = (
+            readback.get("existing_receipt")
+            if isinstance(readback, dict)
+            and readback.get("status") == "already_applied"
+            and readback.get("checkout_key") == checkout_key
+            else None
+        )
+        recovered = (
+            isinstance(existing_receipt, dict)
+            and existing_receipt.get("checkout_key") == checkout_key
+            and existing_receipt.get("owner_id") == owner_id
+            and existing_receipt.get("preview_sha256") == expected_preview_sha256
+            and existing_receipt.get("preview_created_at_unix")
+            == preview_created_at_unix
+        )
+        if recovered:
+            output = {
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_result",
+                "status": "already_applied",
+                "idempotent_replay": True,
+                "receipt": existing_receipt,
+                "readback_recovered": True,
+                "apply_error_type": type(exc).__name__,
+            }
+        else:
+            _check(receipt, "checkout-key-bound", "pass", checkout_key)
+            _check(
+                receipt,
+                "preview-cas-bound",
+                "pass",
+                f"{expected_preview_sha256}@{preview_created_at_unix}",
+            )
+            _check(
+                receipt,
+                "terminal-source-revalidated",
+                "skip",
+                "post-error terminal state is not proven",
+            )
+            _check(
+                receipt,
+                "lifecycle-only-effect",
+                "skip",
+                "mutation outcome is unknown",
+            )
+            _check(
+                receipt,
+                "active-capacity-transition",
+                "skip",
+                "mutation outcome is unknown",
+            )
+            _check(
+                receipt,
+                "durable-receipt",
+                "skip",
+                "no matching terminal receipt observed",
+            )
+            return {
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_grip_outcome",
+                "status": "outcome_unknown",
+                "checkout_key": checkout_key,
+                "effect_started": True,
+                "readback_required": True,
+                "required_readback": [
+                    f"checkout_binding_terminal_preview:{checkout_key}"
+                ],
+                "readback_status": (
+                    readback.get("status") if isinstance(readback, dict) else "unavailable"
+                ),
+                "apply_error_type": type(exc).__name__,
+                "receipt_status": "blocked",
+                "decision": "blocked",
+                "blocked_reasons": [
+                    "checkout_binding_terminal_apply_readback_required"
+                ],
+                "does_not_establish": [
+                    "mutation absence",
+                    "successful terminal transition",
+                    "retry authority",
+                ],
+            }
     terminal_receipt = output.get("receipt")
     if not isinstance(terminal_receipt, dict):
         raise GripActionError("checkout terminal apply returned no durable receipt")
-    if terminal_receipt.get("checkout_key") != checkout_key:
+    if (
+        terminal_receipt.get("checkout_key") != checkout_key
+        or terminal_receipt.get("owner_id") != owner_id
+    ):
         raise GripActionError("checkout terminal apply receipt identity mismatch")
     if (
         terminal_receipt.get("preview_sha256") != expected_preview_sha256

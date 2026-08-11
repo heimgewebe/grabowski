@@ -1024,6 +1024,19 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["preview-read-only"]["status"])
         self.assertEqual("pass", checks["preview-digest-bound"]["status"])
 
+    def test_checkout_binding_terminal_preview_blocks_missing_repository(self) -> None:
+        checkout_key = "a" * 64
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_preview",
+            side_effect=FileNotFoundError("repository missing"),
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-preview",
+                {"checkout_key": checkout_key},
+            )
+        self.assertEqual("blocked", result["status"])
+        self.assertIn("repository missing", result["output"]["error"])
+
     def test_checkout_binding_terminal_apply_grip_requires_mutation_and_exact_cas(self) -> None:
         checkout_key = "a" * 64
         expected_preview = "c" * 64
@@ -1077,6 +1090,85 @@ class GripFoundationTests(unittest.TestCase):
         self.assertEqual("pass", checks["preview-cas-bound"]["status"])
         self.assertEqual("pass", checks["lifecycle-only-effect"]["status"])
         self.assertEqual("pass", checks["active-capacity-transition"]["status"])
+
+    def test_checkout_binding_terminal_apply_recovers_applied_runtime_error_by_readback(self) -> None:
+        checkout_key = "a" * 64
+        expected_preview = "c" * 64
+        terminal_receipt = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "source_evidence_sha256": "d" * 64,
+            "binding_before": {"phase": "active"},
+            "binding_after": {"phase": "externally_terminal_missing"},
+            "effects": ["lifecycle_phase_transition"],
+            "receipt_sha256": "e" * 64,
+        }
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": expected_preview,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            side_effect=RuntimeError("post-state readback failed"),
+        ), patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_preview",
+            return_value={
+                "schema_version": 1,
+                "kind": "checkout_terminal_reconciliation_preview",
+                "status": "already_applied",
+                "checkout_key": checkout_key,
+                "safe_to_apply": False,
+                "existing_receipt": terminal_receipt,
+            },
+        ) as terminal_preview:
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("passed", result["status"])
+        self.assertEqual("already_applied", result["output"]["status"])
+        self.assertTrue(result["output"]["readback_recovered"])
+        terminal_preview.assert_called_once_with(checkout_key)
+
+    def test_checkout_binding_terminal_apply_preserves_unknown_runtime_error(self) -> None:
+        checkout_key = "a" * 64
+        parameters = {
+            "checkout_key": checkout_key,
+            "owner_id": "owner-a",
+            "expected_preview_sha256": "c" * 64,
+            "preview_created_at_unix": 100,
+            "confirmation": "reconcile-terminal-missing-checkout",
+        }
+        with patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_apply",
+            side_effect=RuntimeError("post-state readback failed"),
+        ), patch(
+            "grabowski_checkouts.grabowski_checkout_binding_terminal_preview",
+            side_effect=FileNotFoundError("repository unavailable"),
+        ):
+            result = grips.grip_run(
+                "checkout-binding-terminal-apply",
+                parameters,
+                allow_mutation=True,
+            )
+        self.assertEqual("blocked", result["status"])
+        self.assertEqual("outcome_unknown", result["output"]["status"])
+        self.assertTrue(result["output"]["effect_started"])
+        self.assertTrue(result["output"]["readback_required"])
+        self.assertEqual(
+            [f"checkout_binding_terminal_preview:{checkout_key}"],
+            result["output"]["required_readback"],
+        )
+        self.assertEqual(
+            ["checkout_binding_terminal_apply_readback_required"],
+            result["output"]["blocked_reasons"],
+        )
 
     def test_checkout_binding_terminal_apply_rejects_bad_time_before_dispatch(self) -> None:
         with patch(
