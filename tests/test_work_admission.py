@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import ast
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,10 @@ class WorkAdmissionTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.repo = Path(self.temporary.name) / "repo"
         self.repo.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)],
+            check=True,
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()

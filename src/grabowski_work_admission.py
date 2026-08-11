@@ -1009,12 +1009,15 @@ def assess_repository_admission(
         blockers.append({"code": "inventory-unobservable", "detail": "worktree inventory is unavailable"})
         worktrees = []
     else:
-        inventory_complete = _complete_repository_inventory(
-            inventory,
-            repository=repository,
-            worktrees=worktrees,
-            requested_repository=requested_repository,
-            git_common_dir=git_common_dir,
+        inventory_complete = bool(
+            git_common_dir is not None
+            and _complete_repository_inventory(
+                inventory,
+                repository=repository,
+                worktrees=worktrees,
+                requested_repository=requested_repository,
+                git_common_dir=git_common_dir,
+            )
         )
         if inventory_completeness_reported and not inventory_complete:
             blockers.append(
