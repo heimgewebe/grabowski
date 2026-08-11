@@ -3229,6 +3229,169 @@ class ResourceTests(unittest.TestCase):
         self.assertIn("metadata_sha256", result["leases"][0])
         self.assertNotIn("private", str(audit.call_args.args[0]))
 
+    def test_public_nonconflict_live_path_deny_is_structured_and_fail_closed(self) -> None:
+        path = self.root / "owned.py"
+        key = f"path:{path}"
+        resources.acquire_resources(
+            "owner-a", [key], purpose="live exact path", ttl_seconds=120
+        )
+        before = resources.inspect_resource(key)
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ) as append_audit:
+            result = resources.grabowski_resource_nonconflict_assess(
+                key, "owner-b", [key], "request path", {}, False
+            )
+        after = resources.inspect_resource(key)
+        self.assertEqual("deny", result["decision"])
+        self.assertEqual("exact-path-owner-release-required", result["code"])
+        self.assertEqual("exact_path_lease", result["blocker_type"])
+        self.assertNotIn("proof", result)
+        self.assertEqual("owner-a", result["blocked_lease"]["owner_id"])
+        self.assertEqual(before, after)
+        self.assertIn("permission_to_release_other_owner", result["does_not_establish"])
+        self.assertIn("retry_authority", result["does_not_establish"])
+        with self.assertRaises(resources.ResourceConflict):
+            resources.acquire_resources(
+                "owner-b", [key], purpose="must remain blocked", ttl_seconds=60
+            )
+        audit = append_audit.call_args.args[0]
+        self.assertEqual("deny", audit["decision"])
+        self.assertEqual("exact-path-owner-release-required", audit["code"])
+        self.assertNotIn("proof_sha256", audit)
+
+    def test_public_nonconflict_absent_path_keeps_stable_code(self) -> None:
+        key = f"path:{self.root / 'absent.py'}"
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ) as append_audit:
+            result = resources.grabowski_resource_nonconflict_assess(
+                key, "owner-b", [key], "request absent path", {}, False
+            )
+        self.assertEqual("deny", result["decision"])
+        self.assertEqual("blocked-path-lease-absent-or-expired", result["code"])
+        self.assertEqual("exact_path_lease", result["blocker_type"])
+        self.assertNotIn("proof", result)
+        self.assertEqual(result["code"], append_audit.call_args.args[0]["code"])
+
+    def test_public_nonconflict_unsupported_blocker_keeps_stable_code(self) -> None:
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ) as append_audit:
+            result = resources.grabowski_resource_nonconflict_assess(
+                "port:9222", "owner-b", ["port:9223"], "unsupported blocker", {}, False
+            )
+        self.assertEqual("deny", result["decision"])
+        self.assertEqual("unsupported-blocker-type", result["code"])
+        self.assertEqual("port", result["blocker_type"])
+        self.assertNotIn("proof", result)
+        self.assertEqual("unsupported-blocker-type", append_audit.call_args.args[0]["code"])
+
+    def test_public_nonconflict_repository_allow_preserves_proof_path(self) -> None:
+        blocked_key = f"repo:{self.root}"
+        existing_path = self.root / "existing.py"
+        requested_path = self.root / "requested.py"
+        existing_scope = self.scope_manifest(
+            self.root, name="existing", path=existing_path
+        )
+        requested_scope = self.scope_manifest(
+            self.root, name="requested", path=requested_path
+        )
+        resources.acquire_resources(
+            "owner-a",
+            [blocked_key],
+            purpose="broad repository blocker",
+            ttl_seconds=120,
+            metadata={
+                "scope_manifest": existing_scope,
+                "scope_manifest_complete": True,
+            },
+        )
+        requested_key = f"path:{requested_path.resolve()}"
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ) as append_audit:
+            result = resources.grabowski_resource_nonconflict_assess(
+                blocked_key,
+                "owner-b",
+                [requested_key],
+                "disjoint repository work",
+                requested_scope,
+                True,
+            )
+        self.assertEqual("allow", result["decision"])
+        self.assertIn("proof", result)
+        self.assertEqual("allow", result["proof"]["decision"])
+        audit = append_audit.call_args.args[0]
+        self.assertEqual(result["proof"]["proof_sha256"], audit["proof_sha256"])
+        self.assertNotIn("code", audit)
+
+    def test_public_nonconflict_repository_deny_remains_typed(self) -> None:
+        blocked_key = f"repo:{self.root}"
+        shared_path = self.root / "shared.py"
+        existing_scope = self.scope_manifest(
+            self.root, name="existing", path=shared_path
+        )
+        requested_scope = self.scope_manifest(
+            self.root, name="requested", path=shared_path
+        )
+        resources.acquire_resources(
+            "owner-a",
+            [blocked_key],
+            purpose="broad repository blocker",
+            ttl_seconds=120,
+            metadata={
+                "scope_manifest": existing_scope,
+                "scope_manifest_complete": True,
+            },
+        )
+        requested_key = f"path:{shared_path.resolve()}"
+        with patch.object(resources.operator, "_require_operator_mutation"), patch.object(
+            resources.base, "_append_audit"
+        ) as append_audit:
+            with self.assertRaises(resources.nonconflict.NonConflictDenied) as raised:
+                resources.grabowski_resource_nonconflict_assess(
+                    blocked_key,
+                    "owner-b",
+                    [requested_key],
+                    "overlapping repository work",
+                    requested_scope,
+                    True,
+                )
+        self.assertEqual("scope-conflict", raised.exception.code)
+        append_audit.assert_not_called()
+
+    def test_public_nonconflict_rejects_malformed_assessor_shapes(self) -> None:
+        common = {
+            "blocked_resource_key": "path:/tmp/example",
+            "requesting_owner": "owner-b",
+        }
+        variants = [
+            ({**common, "decision": "allow"}, "missing its proof"),
+            (
+                {
+                    **common,
+                    "decision": "deny",
+                    "code": "exact-path-owner-release-required",
+                    "blocker_type": "exact_path_lease",
+                    "proof": {},
+                },
+                "must not include a proof",
+            ),
+            ({**common, "decision": "deny"}, "stable classification"),
+        ]
+        for result, message in variants:
+            with self.subTest(result=result), patch.object(
+                resources.operator, "_require_operator_mutation"
+            ), patch.object(
+                resources, "assess_nonconflict", return_value=result
+            ), patch.object(resources.base, "_append_audit") as append_audit:
+                with self.assertRaisesRegex(RuntimeError, message):
+                    resources.grabowski_resource_nonconflict_assess(
+                        "path:/tmp/example", "owner-b", [], "shape", {}, False
+                    )
+                append_audit.assert_not_called()
+
     def _operator_terminal_evidence(
         self, *, status: str = "success"
     ) -> dict[str, object]:
