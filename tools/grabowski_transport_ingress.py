@@ -20,13 +20,18 @@ import grabowski_transport_assertion as assertion
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18180
 DEFAULT_UPSTREAM = "http://127.0.0.1:18181/mcp"
-DEFAULT_TOKEN_FILE = Path.home() / ".local/state/grabowski/transport-connectors/primary.token"
-DEFAULT_DEPLOYMENT_MANIFEST = Path.home() / ".local/share/grabowski-mcp/deployment-manifest.json"
+DEFAULT_TOKEN_FILE = (
+    Path.home() / ".local/state/grabowski/transport-connectors/primary.token"
+)
+DEFAULT_DEPLOYMENT_MANIFEST = (
+    Path.home() / ".local/share/grabowski-mcp/deployment-manifest.json"
+)
 DEPLOYMENT_RELEASE_ROOT = Path.home() / ".local/share/grabowski-mcp-releases"
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 HEAD_RE = re.compile(r"[0-9a-f]{40}\Z")
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 HOP_BY_HOP_HEADERS = frozenset(
     {
         "connection",
@@ -55,11 +60,17 @@ class IngressConfigurationError(RuntimeError):
     pass
 
 
+class RequestBodyTooLarge(ValueError):
+    pass
+
+
 def _read_private_token(path: Path) -> str:
     try:
         linked = os.lstat(path)
     except FileNotFoundError as exc:
-        raise IngressConfigurationError("transport connector token file is missing") from exc
+        raise IngressConfigurationError(
+            "transport connector token file is missing"
+        ) from exc
     if (
         stat.S_ISLNK(linked.st_mode)
         or not stat.S_ISREG(linked.st_mode)
@@ -80,17 +91,25 @@ def _read_private_token(path: Path) -> str:
             or opened.st_uid != linked.st_uid
             or opened.st_nlink != linked.st_nlink
         ):
-            raise IngressConfigurationError("transport connector token changed during open")
+            raise IngressConfigurationError(
+                "transport connector token changed during open"
+            )
         raw = os.read(fd, 257)
         if len(raw) > 256 or os.read(fd, 1):
-            raise IngressConfigurationError("transport connector token exceeds size bound")
+            raise IngressConfigurationError(
+                "transport connector token exceeds size bound"
+            )
     finally:
         os.close(fd)
     try:
-        token = raw.decode("ascii").rstrip("\n")
+        token = raw.decode("ascii")
     except UnicodeDecodeError as exc:
-        raise IngressConfigurationError("transport connector token must be ASCII") from exc
-    if not token or token != token.strip() or len(token) < 16:
+        raise IngressConfigurationError(
+            "transport connector token must be ASCII"
+        ) from exc
+    if token.endswith("\n"):
+        token = token[:-1]
+    if TOKEN_RE.fullmatch(token) is None:
         raise IngressConfigurationError("transport connector token is invalid")
     return token
 
@@ -102,7 +121,9 @@ def _read_runtime_binding(path: Path) -> tuple[dict[str, str], str]:
     except FileNotFoundError as exc:
         raise IngressConfigurationError("deployment manifest is unavailable") from exc
     if resolved == release_root or not resolved.is_relative_to(release_root):
-        raise IngressConfigurationError("deployment manifest is outside the immutable release root")
+        raise IngressConfigurationError(
+            "deployment manifest is outside the immutable release root"
+        )
     linked = resolved.lstat()
     if (
         not stat.S_ISREG(linked.st_mode)
@@ -139,7 +160,9 @@ def _read_runtime_binding(path: Path) -> tuple[dict[str, str], str]:
     repo_head = value.get("repo_head")
     instructions = value.get("agent_instructions")
     entrypoint = value.get("entrypoint_contract")
-    expected_tools = entrypoint.get("expected_tools") if isinstance(entrypoint, dict) else None
+    expected_tools = (
+        entrypoint.get("expected_tools") if isinstance(entrypoint, dict) else None
+    )
     if (
         not isinstance(release_id, str)
         or not release_id
@@ -154,7 +177,9 @@ def _read_runtime_binding(path: Path) -> tuple[dict[str, str], str]:
         or not all(isinstance(item, str) and item for item in expected_tools)
         or len(set(expected_tools)) != len(expected_tools)
     ):
-        raise IngressConfigurationError("deployment manifest runtime binding is invalid")
+        raise IngressConfigurationError(
+            "deployment manifest runtime binding is invalid"
+        )
     registered_names_sha256 = hashlib.sha256(
         json.dumps(
             sorted(expected_tools),
@@ -187,7 +212,9 @@ def _validate_upstream(value: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise IngressConfigurationError("upstream must be the bound loopback Grabowski operator")
+        raise IngressConfigurationError(
+            "upstream must be the bound loopback Grabowski operator"
+        )
     return value.rstrip("/")
 
 
@@ -259,7 +286,11 @@ def signed_tool_headers(
         raise ValueError("tools/call params must be an object")
     tool_name = params.get("name")
     arguments = params.get("arguments", {})
-    if not isinstance(tool_name, str) or not tool_name or len(tool_name.encode("utf-8")) > 256:
+    if (
+        not isinstance(tool_name, str)
+        or not tool_name
+        or len(tool_name.encode("utf-8")) > 256
+    ):
         raise ValueError("tools/call name is invalid")
     if not isinstance(arguments, dict):
         raise ValueError("tools/call arguments must be an object")
@@ -293,8 +324,23 @@ def signed_tool_headers(
     }
 
 
+async def _read_bounded_request_body(request: Any) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not isinstance(chunk, bytes):
+            raise ValueError("request body stream yielded a non-byte chunk")
+        total += len(chunk)
+        if total > MAX_REQUEST_BYTES:
+            raise RequestBodyTooLarge("request body exceeds the size bound")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 class TransportIngress:
-    def __init__(self, *, token: str, upstream: str, runtime_binding_sha256: str) -> None:
+    def __init__(
+        self, *, token: str, upstream: str, runtime_binding_sha256: str
+    ) -> None:
         self._token = token
         self._upstream = _validate_upstream(upstream)
         if SHA256_RE.fullmatch(runtime_binding_sha256) is None:
@@ -321,20 +367,32 @@ class TransportIngress:
         from starlette.responses import JSONResponse, StreamingResponse
 
         if not _ingress_client_authenticated(request.headers, self._token):
-            return JSONResponse({"error": "unauthorized_ingress_client"}, status_code=401)
+            return JSONResponse(
+                {"error": "unauthorized_ingress_client"}, status_code=401
+            )
+        declared_length: int | None = None
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
                 declared_length = int(content_length, 10)
             except ValueError:
-                return JSONResponse({"error": "invalid_content_length"}, status_code=400)
+                return JSONResponse(
+                    {"error": "invalid_content_length"}, status_code=400
+                )
             if declared_length < 0:
-                return JSONResponse({"error": "invalid_content_length"}, status_code=400)
+                return JSONResponse(
+                    {"error": "invalid_content_length"}, status_code=400
+                )
             if declared_length > MAX_REQUEST_BYTES:
                 return JSONResponse({"error": "request_too_large"}, status_code=413)
-        body = await request.body()
-        if len(body) > MAX_REQUEST_BYTES:
+        try:
+            body = await _read_bounded_request_body(request)
+        except RequestBodyTooLarge:
             return JSONResponse({"error": "request_too_large"}, status_code=413)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "invalid_request_body"}, status_code=400)
+        if declared_length is not None and len(body) != declared_length:
+            return JSONResponse({"error": "content_length_mismatch"}, status_code=400)
         headers = _forward_headers(request, self._token)
         try:
             headers.update(
@@ -345,14 +403,16 @@ class TransportIngress:
                     runtime_binding_sha256=self._runtime_binding_sha256,
                 )
             )
-        except ValueError as exc:
+        except (ValueError, assertion.TransportAssertionError) as exc:
             return JSONResponse(
                 {"error": "invalid_mcp_request", "detail": str(exc)},
                 status_code=400,
             )
         query = request.url.query
         url = self._upstream + (f"?{query}" if query else "")
-        client = httpx.AsyncClient(timeout=None, follow_redirects=False, trust_env=False)
+        client = httpx.AsyncClient(
+            timeout=None, follow_redirects=False, trust_env=False
+        )
         outbound = client.build_request(
             request.method,
             url,
@@ -393,12 +453,16 @@ def build_app(*, token: str, upstream: str, runtime_binding_sha256: str) -> Any:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the signed Grabowski transport ingress.")
+    parser = argparse.ArgumentParser(
+        description="Run the signed Grabowski transport ingress."
+    )
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--upstream", default=DEFAULT_UPSTREAM)
     parser.add_argument("--token-file", default=str(DEFAULT_TOKEN_FILE))
-    parser.add_argument("--deployment-manifest", default=str(DEFAULT_DEPLOYMENT_MANIFEST))
+    parser.add_argument(
+        "--deployment-manifest", default=str(DEFAULT_DEPLOYMENT_MANIFEST)
+    )
     return parser.parse_args()
 
 
@@ -419,7 +483,9 @@ def main() -> None:
         upstream=args.upstream,
         runtime_binding_sha256=runtime_binding_sha256,
     )
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", access_log=False)
+    uvicorn.run(
+        app, host=args.host, port=args.port, log_level="warning", access_log=False
+    )
 
 
 if __name__ == "__main__":

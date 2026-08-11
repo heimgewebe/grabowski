@@ -3386,7 +3386,7 @@
       "src/grabowski_tasks.py": "e2539288b2e07d4483b899cf55868adb019037488466d4b7207333cee676be5a",
       "src/grabowski_terminal_convergence.py": "ee5d7e2635077b3c6dbddeb01c2ffece37157a5feffde1cf0c12c5394af4cb62",
       "src/grabowski_text_artifact_reconcile.py": "f775b121fdc4595b5df296ed6290fb67b2b78936589cf48c0593f0843fd11fe3",
-      "src/grabowski_transport_assertion.py": "7d6cad170b0a514d74f5aabbac71f2b7b5946a84abeae8fa8eec61d7b9e1f1d9",
+      "src/grabowski_transport_assertion.py": "3196a3903d6455722e41a17f70effce50855f6eb67432f1b11c85c8c05822e8e",
       "src/grabowski_transport_roundtrip.py": "1c63ba31e7ab80e608b340d9e16c2cc005004b37e766c2748f550d29ed82e782",
       "src/grabowski_work_acquire.py": "f22d5b579b73d487dc17e071728b3bde8cb1c6cf724e081721b7de5a0d280eef",
       "src/grabowski_work_admission.py": "8e9b910e9f7a97fa8b2f4e537159b7e50de31f24e81df06b933e2f5fb24ea8c9",

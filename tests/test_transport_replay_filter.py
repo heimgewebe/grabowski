@@ -108,7 +108,9 @@ class ReplayFilterTests(unittest.TestCase):
         path.chmod(0o600)
         with self.assertRaises(assertion.TransportAssertionReplay):
             assertion.consume_assertion(**item, now_unix=101)
-        self.assertFalse((assertion.STATE_ROOT / assertion.REPLAY_FILTER_FILENAME).exists())
+        self.assertFalse(
+            (assertion.STATE_ROOT / assertion.REPLAY_FILTER_FILENAME).exists()
+        )
 
     def test_corrupt_existing_filter_fails_closed(self) -> None:
         assertion.STATE_ROOT.mkdir(mode=0o700)
@@ -116,7 +118,9 @@ class ReplayFilterTests(unittest.TestCase):
         with path.open("wb") as handle:
             handle.truncate(assertion.REPLAY_FILTER_TOTAL_BYTES)
         path.chmod(0o600)
-        with self.assertRaisesRegex(assertion.TransportAssertionError, "header mismatch"):
+        with self.assertRaisesRegex(
+            assertion.TransportAssertionError, "header mismatch"
+        ):
             assertion.consume_assertion(**_evidence(9), now_unix=101)
 
 

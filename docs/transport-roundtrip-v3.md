@@ -20,14 +20,13 @@ Damit benötigt der normale Owner-Pfad genau **einen** Agentenaufruf. Die Reques
 
 ### Roundtrip-Fallback
 
-Wenn eine Anfrage nicht über den signierten Ingress kommt, bleibt der bisherige `begin`/`ack`- beziehungsweise `begin`/`execute`-Pfad während der Migration fail-closed erhalten. Er ist Recovery-/Kompatibilitätspfad und nicht mehr das Zielmodell. Client-deklarierte Metadaten wie `_meta.client_id` bleiben ohne Autorität.
+Wenn eine Anfrage nicht über den signierten Ingress kommt, bleibt der Roundtrip während der Migration fail-closed erhalten. Für `shared_unlabeled` gilt genau dieser Normalablauf:
 
-### Gemeinsamer unbeschrifteter Client
+1. Der Client ruft das exakte mutierende Ziel einmal normal auf; der Aufruf erzeugt vor jeder Produktwirkung eine Challenge, und der Server hält eine kanonische Kopie von Werkzeug und Argumenten kurzzeitig privat zurück.
+2. Der Client ruft `grip_run(name="transport-roundtrip", action="execute", challenge_receipt_sha256=...)` ohne Zielwerkzeug und Zielargumente auf.
+3. `execute` beansprucht nur das serverseitig zurückgehaltene Ziel, reserviert und verbraucht die Challenge und dispatcht das Ziel im selben In-Prozess-Kontext.
 
-1. `action="begin"` mit exaktem Zielwerkzeug und exakten Argumenten
-2. `action="execute"` mit demselben Ziel, denselben Argumenten und dem zurückgegebenen Challenge-Hash
-
-`execute` reserviert die Challenge, bindet eine daraus abgeleitete Ausführungsfähigkeit an den aktuellen In-Prozess-Kontext, lässt den normalen zentralen Mutations-Gate die Reservierung verbrauchen und dispatcht das Ziel in derselben MCP-Anfrage. Ein separater bestätigter Token wird nicht an den gemeinsamen Pool ausgegeben.
+Eine abgelaufene oder fehlende Retention wird nur dann als wirkungsfrei eingestuft, wenn die noch pending Challenge atomar storniert werden konnte. Andernfalls bleibt der Ausgang mehrdeutig und verlangt zielspezifischen Readback. Der explizite `begin`/`execute`-Pfad mit unveränderten Zielfeldern bleibt nur als Kompatibilitätsweg erhalten. Ein stabiler, servervalidierter Connector-Scope kann weiterhin `begin`/`ack` verwenden. Client-deklarierte Metadaten wie `_meta.client_id` bleiben ohne Autorität, und ein separater bestätigter Token wird nie an den gemeinsamen Pool ausgegeben.
 
 ## Zustands- und Sicherheitsvertrag
 
@@ -62,9 +61,11 @@ Die verbindlichen Tests liegen in:
 
 Der revisionsgebundene Laufnachweis wird unter `docs/proofs/transport-roundtrip-v3-t139-20260804.md` veröffentlicht.
 
-## T142: stabile Connector-Capability
+## T142-Grundlage: stabile Connector-Capability
 
-Für HTTP-Tunnel kann `tunnel-client` mit `mcp.extra-headers` einen statischen, lokal konfigurierten Header aus einer `file:/...`-Quelle an **jede** downstream MCP-Anfrage anhängen. Grabowski nutzt `X-Grabowski-Connector-Capability` als Protokollanker:
+Für HTTP-Tunnel kann `tunnel-client` mit `mcp.extra-headers` einen statischen, lokal konfigurierten Header aus einer `file:/...`-Quelle an **jede** downstream MCP-Anfrage anhängen. Der signierte Normalpfad verwendet dort ausschließlich `X-Grabowski-Ingress-Auth`. Der Loopback-Ingress entfernt alle extern gelieferten `X-Grabowski-*`-Header und setzt anschließend selbst `X-Grabowski-Connector-Capability` sowie die signierte One-Call-Evidenz für den Operator. Ein direkt gesetzter Capability-Header bleibt nur für eingeschriebene lokale Kompatibilitäts-Connectoren vorgesehen.
+
+Die Capability bleibt der Protokollanker:
 
 - jede Connector-Instanz besitzt ein eigenes zufälliges Token in `~/.local/state/grabowski/transport-connectors/<id>.token`;
 - Token-Dateien und Identitätswurzel müssen dem Grabowski-Benutzer gehören, dürfen keine Symlinks sein und sind für Gruppe/Andere unzugänglich;
@@ -74,6 +75,6 @@ Für HTTP-Tunnel kann `tunnel-client` mit `mcp.extra-headers` einen statischen, 
 - `_meta.client_id`, Python-Objektidentität und `mcp-session-id` sind keine Autorität; OpenAI kann pro Tool-Aufruf weiterhin eine neue MCP-Session erzeugen;
 - ein unbekannter Capability-Header scheitert immer fail-closed.
 
-Der Rollout ist absichtlich zweiphasig. Solange der sichere Marker `require-identity` fehlt, bleiben headerlose Aufrufe nur im bisherigen `shared_unlabeled`-Atomic-Pfad, damit die Capability ohne Connector-Ausfall ausgerollt werden kann. Nach Provisionierung und Live-Nachweis beider Tunnel wird der Marker mit Inhalt `required-v1` gesetzt. Ab dann scheitert jede Mutation **vor dem Handshake**, wenn kein gültiger Connector-Capability-Header vorhanden ist. Read-only-Werkzeuge bleiben davon unabhängig.
+Der Rollout ist absichtlich zweiphasig. Solange der sichere Marker `require-identity` fehlt, bleiben headerlose Aufrufe nur im bisherigen `shared_unlabeled`-Atomic-Pfad, damit Ingress und Capability ohne Connector-Ausfall ausgerollt werden können. Nach Provisionierung und Live-Nachweis beider Tunnel wird der Marker mit Inhalt `required-v1` gesetzt. Ab dann scheitert jede Mutation **vor dem Handshake**, wenn der Operator keinen gültigen Connector-Capability-Header beobachtet; im signierten Normalpfad darf dieser Header nur vom lokalen Ingress stammen. Read-only-Werkzeuge bleiben davon unabhängig.
 
 Dieser Vertrag authentifiziert die lokal konfigurierte Tunnelinstanz, nicht die menschliche Person hinter dem entfernten Client. Er schützt nicht gegen kompromittierten Code desselben Betriebssystembenutzers, der die 0600-Token-Dateien lesen kann.

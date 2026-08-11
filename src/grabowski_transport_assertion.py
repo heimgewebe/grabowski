@@ -57,7 +57,9 @@ def _canonical_bytes(value: Any) -> bytes:
             separators=(",", ":"),
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
-        raise TransportAssertionError("transport assertion value is not canonical JSON") from exc
+        raise TransportAssertionError(
+            "transport assertion value is not canonical JSON"
+        ) from exc
 
 
 def _sha256_json(value: Any) -> str:
@@ -84,17 +86,24 @@ def _sha256(value: Any, label: str) -> str:
 
 def _request_id(value: Any) -> str:
     if not isinstance(value, str) or _REQUEST_ID_RE.fullmatch(value) is None:
-        raise TransportAssertionError("transport request id must be 32 lowercase hexadecimal characters")
+        raise TransportAssertionError(
+            "transport request id must be 32 lowercase hexadecimal characters"
+        )
     return value
 
 
 def _secret_bytes(secret: Any) -> bytes:
-    if not isinstance(secret, str) or not 16 <= len(secret.encode("ascii", errors="ignore")) <= 256:
+    if (
+        not isinstance(secret, str)
+        or not 16 <= len(secret.encode("ascii", errors="ignore")) <= 256
+    ):
         raise TransportAssertionError("transport connector secret is invalid")
     try:
         encoded = secret.encode("ascii")
     except UnicodeEncodeError as exc:
-        raise TransportAssertionError("transport connector secret must be ASCII") from exc
+        raise TransportAssertionError(
+            "transport connector secret must be ASCII"
+        ) from exc
     if b"\x00" in encoded or secret != secret.strip():
         raise TransportAssertionError("transport connector secret is invalid")
     return encoded
@@ -145,7 +154,11 @@ def assertion_material(
     runtime_binding_sha256: str,
 ) -> dict[str, Any]:
     rid = _request_id(request_id)
-    if isinstance(issued_at_unix, bool) or not isinstance(issued_at_unix, int) or issued_at_unix < 0:
+    if (
+        isinstance(issued_at_unix, bool)
+        or not isinstance(issued_at_unix, int)
+        or issued_at_unix < 0
+    ):
         raise TransportAssertionError("transport assertion timestamp is invalid")
     return {
         "version": ASSERTION_VERSION,
@@ -153,7 +166,9 @@ def assertion_material(
         "issued_at_unix": issued_at_unix,
         "audience": _text(audience, "transport assertion audience", 128),
         "tool_name": _text(tool_name, "transport assertion tool name", 256),
-        "arguments_sha256": _sha256(arguments_sha256, "transport assertion arguments hash"),
+        "arguments_sha256": _sha256(
+            arguments_sha256, "transport assertion arguments hash"
+        ),
         "body_sha256": _sha256(body_sha256, "transport assertion body hash"),
         "runtime_binding_sha256": _sha256(
             runtime_binding_sha256, "transport assertion runtime binding hash"
@@ -181,7 +196,9 @@ def assertion_mac(
         body_sha256=body_sha256,
         runtime_binding_sha256=runtime_binding_sha256,
     )
-    return hmac.new(_secret_bytes(secret), _canonical_bytes(material), hashlib.sha256).hexdigest()
+    return hmac.new(
+        _secret_bytes(secret), _canonical_bytes(material), hashlib.sha256
+    ).hexdigest()
 
 
 def _validate_private_directory(path: Path) -> None:
@@ -242,18 +259,26 @@ def _read_tombstone(path: Path) -> dict[str, Any] | None:
         meta = os.fstat(fd)
         _validate_private_file(meta, "transport assertion replay tombstone")
         if meta.st_size > LEGACY_TOMBSTONE_MAX_BYTES:
-            raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
+            raise TransportAssertionError(
+                "transport assertion replay tombstone exceeds size limit"
+            )
         raw = os.read(fd, LEGACY_TOMBSTONE_MAX_BYTES + 1)
         if len(raw) > LEGACY_TOMBSTONE_MAX_BYTES or os.read(fd, 1):
-            raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
+            raise TransportAssertionError(
+                "transport assertion replay tombstone exceeds size limit"
+            )
     finally:
         os.close(fd)
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TransportAssertionError("transport assertion replay tombstone is invalid JSON") from exc
+        raise TransportAssertionError(
+            "transport assertion replay tombstone is invalid JSON"
+        ) from exc
     if not isinstance(value, dict):
-        raise TransportAssertionError("transport assertion replay tombstone contract mismatch")
+        raise TransportAssertionError(
+            "transport assertion replay tombstone contract mismatch"
+        )
     return value
 
 
@@ -269,14 +294,20 @@ def _replay_scope_sha256(secret: str) -> str:
 
 def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, ...]:
     if REPLAY_FILTER_BITS <= 0 or REPLAY_FILTER_BITS & (REPLAY_FILTER_BITS - 1):
-        raise TransportAssertionError("transport replay filter size must be a power of two")
+        raise TransportAssertionError(
+            "transport replay filter size must be a power of two"
+        )
     scope = bytes.fromhex(_sha256(scope_sha256, "transport client scope hash"))
     request = bytes.fromhex(_request_id(request_id))
-    digest = hashlib.sha512(b"grabowski-replay-filter-v1\x00" + scope + request).digest()
+    digest = hashlib.sha512(
+        b"grabowski-replay-filter-v1\x00" + scope + request
+    ).digest()
     start = int.from_bytes(digest[:8], "big")
     step = int.from_bytes(digest[8:16], "big") | 1
     mask = REPLAY_FILTER_BITS - 1
-    return tuple((start + index * step) & mask for index in range(REPLAY_FILTER_HASH_COUNT))
+    return tuple(
+        (start + index * step) & mask for index in range(REPLAY_FILTER_HASH_COUNT)
+    )
 
 
 def _open_replay_filter() -> int:
@@ -294,19 +325,27 @@ def _open_replay_filter() -> int:
         if created:
             os.ftruncate(fd, REPLAY_FILTER_TOTAL_BYTES)
             if os.pwrite(fd, REPLAY_FILTER_HEADER, 0) != len(REPLAY_FILTER_HEADER):
-                raise TransportAssertionError("transport assertion replay filter header write was short")
+                raise TransportAssertionError(
+                    "transport assertion replay filter header write was short"
+                )
             os.fsync(fd)
-            directory_fd = os.open(STATE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            directory_fd = os.open(
+                STATE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
             try:
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
         else:
             if meta.st_size != REPLAY_FILTER_TOTAL_BYTES:
-                raise TransportAssertionError("transport assertion replay filter size mismatch")
+                raise TransportAssertionError(
+                    "transport assertion replay filter size mismatch"
+                )
             header = os.pread(fd, REPLAY_FILTER_HEADER_BYTES, 0)
             if header != REPLAY_FILTER_HEADER:
-                raise TransportAssertionError("transport assertion replay filter header mismatch")
+                raise TransportAssertionError(
+                    "transport assertion replay filter header mismatch"
+                )
         return fd
     except BaseException:
         os.close(fd)
@@ -331,7 +370,9 @@ def _consume_replay_filter(scope_sha256: str, request_id: str) -> None:
         for byte_offset, mask in masks.items():
             raw = os.pread(fd, 1, byte_offset)
             if len(raw) != 1:
-                raise TransportAssertionError("transport assertion replay filter read was short")
+                raise TransportAssertionError(
+                    "transport assertion replay filter read was short"
+                )
             value = raw[0]
             observed[byte_offset] = value
             if value & mask != mask:
@@ -346,7 +387,9 @@ def _consume_replay_filter(scope_sha256: str, request_id: str) -> None:
             if value == observed[byte_offset]:
                 continue
             if os.pwrite(fd, bytes((value,)), byte_offset) != 1:
-                raise TransportAssertionError("transport assertion replay filter write was short")
+                raise TransportAssertionError(
+                    "transport assertion replay filter write was short"
+                )
         # The mutation gate is allowed to continue only after every replay bit is
         # durable. A crash before this fsync cannot be followed by target execution.
         os.fsync(fd)
@@ -388,13 +431,19 @@ def consume_assertion(
         raise TransportAssertionError("transport assertion audience mismatch")
     now = int(time.time()) if now_unix is None else now_unix
     if isinstance(now, bool) or not isinstance(now, int) or now < 0:
-        raise TransportAssertionError("transport assertion observation timestamp is invalid")
+        raise TransportAssertionError(
+            "transport assertion observation timestamp is invalid"
+        )
     if issued_at_unix > now + ASSERTION_CLOCK_SKEW_SECONDS:
-        raise TransportAssertionError("transport assertion timestamp is from the future")
+        raise TransportAssertionError(
+            "transport assertion timestamp is from the future"
+        )
     if now - issued_at_unix > ASSERTION_MAX_AGE_SECONDS:
         raise TransportAssertionError("transport assertion is stale")
     supplied_mac = _sha256(mac_sha256, "transport assertion MAC")
-    expected_mac = hmac.new(_secret_bytes(secret), _canonical_bytes(material), hashlib.sha256).hexdigest()
+    expected_mac = hmac.new(
+        _secret_bytes(secret), _canonical_bytes(material), hashlib.sha256
+    ).hexdigest()
     if not hmac.compare_digest(supplied_mac, expected_mac):
         raise TransportAssertionError("transport assertion MAC mismatch")
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
@@ -410,10 +459,13 @@ def consume_assertion(
                 and existing.get("tool_name") == material["tool_name"]
                 and existing.get("arguments_sha256") == material["arguments_sha256"]
                 and existing.get("body_sha256") == material["body_sha256"]
-                and existing.get("runtime_binding_sha256") == material["runtime_binding_sha256"]
+                and existing.get("runtime_binding_sha256")
+                == material["runtime_binding_sha256"]
             )
             if not exact:
-                raise TransportAssertionError("transport request id was reused for different evidence")
+                raise TransportAssertionError(
+                    "transport request id was reused for different evidence"
+                )
             raise TransportAssertionReplay(
                 "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
             )
