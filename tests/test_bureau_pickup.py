@@ -90,6 +90,7 @@ class BureauPickupTests(unittest.TestCase):
             "kind",
             "base_dir",
             "approval_source",
+            "approval_level",
             "lease_ttl_seconds",
             "create_workspace",
             "repository_scope_manifests",
@@ -128,6 +129,7 @@ class BureauPickupTests(unittest.TestCase):
             "kind",
             "base_dir",
             "approval_source",
+            "approval_level",
             "lease_ttl_seconds",
             "create_workspace",
             "repository_scope_manifests",
@@ -139,6 +141,10 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(required, set(request_schema["required"]))
         self.assertTrue(optional.isdisjoint(request_schema["required"]))
         self.assertFalse(request_schema["additionalProperties"])
+        self.assertEqual(
+            ["operator", "break_glass"],
+            request_schema["properties"]["approval_level"]["enum"],
+        )
 
     def test_error_message_preserves_structured_details_at_mcp_boundary(
         self,
@@ -1428,6 +1434,51 @@ class BureauPickupTests(unittest.TestCase):
         self.assertEqual(
             details["runtime_identity"]["manifest"]["source_commit"], "b" * 40
         )
+        acquire.assert_not_called()
+
+    def test_claim_intent_defaults_to_operator_approval_without_escalation(self) -> None:
+        normalized = pickup._normalize_request(self.request())
+        with mock.patch.object(
+            pickup.bureau, "_invoke_bureau", return_value={"status": "claim-intent"}
+        ) as invoke:
+            pickup._claim_intent(normalized)
+        arguments = invoke.call_args.args[0]
+        self.assertIn("--approve", arguments)
+        self.assertNotIn("--break-glass", arguments)
+        self.assertEqual("operator", normalized["approval_level"])
+
+    def test_claim_intent_transports_only_explicit_break_glass(self) -> None:
+        normalized = pickup._normalize_request(
+            self.request(approval_level="break_glass")
+        )
+        with mock.patch.object(
+            pickup.bureau, "_invoke_bureau", return_value={"status": "claim-intent"}
+        ) as invoke:
+            pickup._claim_intent(normalized)
+        arguments = invoke.call_args.args[0]
+        self.assertIn("--break-glass", arguments)
+        self.assertNotIn("--approve", arguments)
+        self.assertEqual("break_glass", normalized["approval_level"])
+
+    def test_invalid_or_mixed_approval_shape_is_rejected_before_effect(self) -> None:
+        with (
+            mock.patch.object(pickup.bureau, "_invoke_bureau") as invoke,
+            mock.patch.object(pickup.resources, "acquire_resources") as acquire,
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "approval_level must be operator or break_glass"
+            ):
+                pickup.grabowski_bureau_pickup_execute(
+                    self.request(approval_level="automatic")
+                )
+            with self.assertRaisesRegex(ValueError, "unsupported request fields"):
+                pickup.grabowski_bureau_pickup_execute(
+                    {
+                        **self.request(approval_level="operator"),
+                        "break_glass": True,
+                    }
+                )
+        invoke.assert_not_called()
         acquire.assert_not_called()
 
     def test_claim_intent_approval_rejection_preserves_required_level(self) -> None:
