@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
@@ -14,6 +15,7 @@ import grabowski_nonconflict as nonconflict
 SCHEMA_VERSION = 1
 MAX_WORKTREES = 256
 MAX_RECONCILIATIONS = 100
+GIT_IDENTITY_TIMEOUT_SECONDS = 5
 INVENTORY_COMPLETENESS_KEYS = frozenset(
     {
         "schema_version",
@@ -531,20 +533,73 @@ def _checkout_paths_overlap(left: Any, right: Any) -> bool:
     )
 
 
+def _git_repository_identity(repository: str) -> tuple[str, str | None]:
+    requested_repository = _canonical_checkout_path(repository)
+    if requested_repository is None:
+        return repository, None
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                requested_repository,
+                "rev-parse",
+                "--show-toplevel",
+                "--git-common-dir",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=GIT_IDENTITY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return requested_repository, None
+    lines = completed.stdout.splitlines()
+    if completed.returncode != 0 or len(lines) != 2:
+        return requested_repository, None
+    try:
+        top_level = Path(lines[0]).expanduser()
+        common_dir = Path(lines[1]).expanduser()
+        if not top_level.is_absolute():
+            return requested_repository, None
+        if not common_dir.is_absolute():
+            common_dir = Path(requested_repository) / common_dir
+        top_level = top_level.resolve(strict=True)
+        common_dir = common_dir.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return requested_repository, None
+    if not top_level.is_dir() or not common_dir.is_dir():
+        return requested_repository, None
+    return str(top_level), str(common_dir)
+
+
 def _complete_repository_inventory(
     inventory: dict[str, Any],
     *,
     repository: str,
     worktrees: list[Any],
+    requested_repository: str | None = None,
+    git_common_dir: str | None = None,
 ) -> bool:
     if not INVENTORY_COMPLETENESS_KEYS.issubset(inventory):
         return False
+    expected_requested_repository = requested_repository or repository
+    observed_git_common_dir = _canonical_checkout_path(
+        inventory.get("git_common_dir")
+    )
     if (
         inventory.get("schema_version") != 1
         or inventory.get("truncated") is not False
         or not _same_checkout_path(inventory.get("repository"), repository)
-        or not _same_checkout_path(inventory.get("requested_repo"), repository)
-        or _canonical_checkout_path(inventory.get("git_common_dir")) is None
+        or not _same_checkout_path(
+            inventory.get("requested_repo"), expected_requested_repository
+        )
+        or observed_git_common_dir is None
+        or (
+            git_common_dir is not None
+            and not _same_checkout_path(observed_git_common_dir, git_common_dir)
+        )
     ):
         return False
 
@@ -883,7 +938,8 @@ def assess_repository_admission(
     system_convergence: dict[str, Any] | None = None,
     convergence_planner: ConvergencePlanner | None = None,
 ) -> dict[str, Any]:
-    repository = str(Path(repo).expanduser().resolve(strict=True))
+    requested_repository = str(Path(repo).expanduser().resolve(strict=True))
+    repository, git_common_dir = _git_repository_identity(requested_repository)
     if not isinstance(owner_id, str) or not owner_id:
         raise ValueError("owner_id must be a non-empty string")
     if not isinstance(operation, str) or not operation:
@@ -912,7 +968,7 @@ def assess_repository_admission(
     inventory_error: str | None = None
     reconciliation_error: str | None = None
     try:
-        inventory = (inventory_loader or _default_inventory)(repository)
+        inventory = (inventory_loader or _default_inventory)(requested_repository)
     except (
         ImportError, OSError, RuntimeError, ValueError, sqlite3.Error
     ) as exc:
@@ -957,6 +1013,8 @@ def assess_repository_admission(
             inventory,
             repository=repository,
             worktrees=worktrees,
+            requested_repository=requested_repository,
+            git_common_dir=git_common_dir,
         )
         if inventory_completeness_reported and not inventory_complete:
             blockers.append(

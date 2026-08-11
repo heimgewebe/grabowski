@@ -813,6 +813,122 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertFalse(linked["lifecycle_decision"]["requires_cleanup_dry_run"])
         self.assertIn("permission_to_cleanup", linked["lifecycle_decision"]["does_not_establish"])
 
+    def test_admission_binds_canonical_inventory_for_requested_subdirectory(
+        self,
+    ) -> None:
+        requested_repo = self.repo / "nested" / "source"
+        requested_repo.mkdir(parents=True)
+        inventory = checkouts.checkout_inventory(
+            requested_repo,
+            include_processes=False,
+            include_tasks=False,
+            include_resources=False,
+        )
+        common_dir = checkouts._git_common_dir(requested_repo)
+        self.assertEqual(inventory["repository"], str(self.repo.resolve()))
+        self.assertEqual(inventory["requested_repo"], str(requested_repo.resolve()))
+        self.assertEqual(inventory["git_common_dir"], str(common_dir))
+
+        target_path = self.root / "worktrees" / "future-target"
+        branch = "feat/future-target"
+        scope = {
+            "schema_version": 1,
+            "repository": str(self.repo.resolve()),
+            "task_id": "GRABOWSKI-ADMISSION-SUBDIR-TEST",
+            "base_head": "0" * 40,
+            "head": "a" * 40,
+            "branch": branch,
+            "worktree": str(target_path),
+            "effects": ["write"],
+            "paths": [str(self.repo / "README.md")],
+            "components": [],
+            "runtime_resources": [],
+            "processes": [],
+            "deployments": [],
+            "migrations": [],
+            "generated_artifacts": [],
+            "shared_gates": [],
+        }
+        reconciliation = {
+            "bindings": [],
+            "pagination": {"has_more": False},
+            "source_snapshot": {"repository_errors": []},
+            "snapshot_sha256": "a" * 64,
+        }
+        inventory_requests: list[str] = []
+        reconciliation_requests: list[str] = []
+
+        def load_inventory(repository: str) -> dict[str, object]:
+            inventory_requests.append(repository)
+            return inventory
+
+        def load_reconciliation(repository: str) -> dict[str, object]:
+            reconciliation_requests.append(repository)
+            return reconciliation
+
+        result = work_admission.assess_repository_admission(
+            repo=str(requested_repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=load_inventory,
+            reconciliation_loader=load_reconciliation,
+        )
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["scope_mode"], "exact_checkout")
+        self.assertEqual(result["repository"], str(self.repo.resolve()))
+        self.assertEqual(inventory_requests, [str(requested_repo.resolve())])
+        self.assertEqual(reconciliation_requests, [str(self.repo.resolve())])
+
+        def rebound_inventory(**updates: object) -> dict[str, object]:
+            body = {
+                key: value
+                for key, value in inventory.items()
+                if key not in {"generated_at_unix", "inventory_sha256"}
+            }
+            body.update(updates)
+            return {
+                **body,
+                "generated_at_unix": inventory["generated_at_unix"],
+                "inventory_sha256": work_admission._digest(body),
+            }
+
+        equivalent_common_dir = common_dir / ".." / common_dir.name
+        normalized = work_admission.assess_repository_admission(
+            repo=str(requested_repo),
+            owner_id="owner-a",
+            operation="broad_repository_lease",
+            requested_scope=scope,
+            inventory_loader=lambda _repo: rebound_inventory(
+                git_common_dir=str(equivalent_common_dir)
+            ),
+            reconciliation_loader=lambda _repo: reconciliation,
+        )
+        self.assertEqual(normalized["decision"], "allow")
+
+        mismatches = {
+            "top-level": rebound_inventory(repository=str(self.checkout)),
+            "requested-path": rebound_inventory(requested_repo=str(self.repo)),
+            "common-dir": rebound_inventory(
+                git_common_dir=str(self.checkout / ".git")
+            ),
+        }
+        for label, mismatched_inventory in mismatches.items():
+            with self.subTest(label=label):
+                blocked = work_admission.assess_repository_admission(
+                    repo=str(requested_repo),
+                    owner_id="owner-a",
+                    operation="broad_repository_lease",
+                    requested_scope=scope,
+                    inventory_loader=lambda _repo, value=mismatched_inventory: value,
+                    reconciliation_loader=lambda _repo: reconciliation,
+                )
+                self.assertEqual(blocked["decision"], "blocked")
+                self.assertIn(
+                    "inventory-unobservable", blocked["blocker_codes"]
+                )
+
     def test_archive_creates_recovery_refs_and_preserves_branch(self) -> None:
         result = self._archive()
         archive = result["archive"]
