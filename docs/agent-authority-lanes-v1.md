@@ -18,7 +18,7 @@ user mandate
 ## Canonical roles
 
 - `controller`: authoritative for planning, delegation, integration, merge, deployment and closeout.
-- `scoped_writer`: authoritative only inside one explicit work lane. It may implement, test, commit, push and create or update a pull request. Merge, deployment and Bureau terminalization require separate delegation.
+- `scoped_writer`: authoritative only inside one explicit work lane. It may implement, test, commit, push and create or update a pull request. Merge, deployment, Bureau terminalization and closeout remain controller-only; granting any of those effects requires a different authority role, not merely a scoped-writer lane.
 - `reviewer`: read-only and advisory.
 - `observer`: read-only evidence collection.
 
@@ -65,20 +65,24 @@ Disjoint lanes may run in parallel. Controller integration remains authoritative
 
 `grabowski_current_work` treats current tasks, leases, checkouts, workers and processes as operational truth. Historical checkout-binding reconciliation without any current physical or authoritative surface is classified as `hygiene` and remains visible without displacing current work.
 
+## Implemented delegation boundary
+
+Direct owner-authorized work does not require a pre-existing Bureau task. `grabowski_work_acquire` can also start a durable scoped-writer process when a writer command is explicitly supplied. The lane identity, resource scope and controller binding remain authoritative; starting a process does not transfer merge, deployment, Bureau terminalization or closeout authority.
+
+Single-call connector authorization is provided by the owner-bound transport contract. Neither transport identity nor model identity creates a work role by itself.
+
 ## Deferred slices
 
 This contract does not claim completion of:
 
-- single-call connector authorization,
 - automatic PR and dirty-state rescue closeout,
-- scoped-writer process start and lane-lease handoff.
+- implicit transfer of controller-only effects to a writer,
+- cleanup without terminal lane evidence.
 
 Blue-green runtime deployment cutover protocol v1 lives in
 `docs/blue-green-deploy-cutover-v1.md` and the bound `src/grabowski_*` modules.
 Host dual-service wiring that starts a second operator process remains a
 separate runtime integration step; the protocol already classifies pre-cutover
 rollback versus post-cutover `outcome_unknown` recovery.
-
-The P0 contract prepares and binds the lane. Starting a delegated writer process and transferring or delegating the lane leases to that process remains a separate follow-up; this document does not claim that launcher path is complete.
 
 Those are separate follow-up slices built on the lane authority introduced here.

@@ -168,6 +168,7 @@ class OperatorContextTests(unittest.TestCase):
                         "merge",
                         "deployment",
                         "bureau_terminalization",
+                        "closeout",
                     ],
                 },
                 "reviewer": {

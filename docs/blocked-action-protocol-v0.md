@@ -12,7 +12,7 @@ Synthese: Wenn ChatGPT ein einzelner Griff verwehrt ist, wird genau dieser Griff
 
 Dieses Protokoll legt fest, wie mit blockierten ChatGPT/Grabowski-Operationen umzugehen ist, ohne ChatGPT als Operator abzugeben.
 
-Es etabliert keinen neuen Privilegienpfad, keine dauerhafte Agentenautonomie und keinen Ersatz fuer bestehende Grabowski-Policies. Es beschreibt eine Betriebsregel: ChatGPT/Grabowski fuehrt autoritative Arbeit immer direkt aus. Nur ein technisch blockierter Einzelgriff darf als begrenzter Micro-Handoff ausgefuehrt werden; externe Modelle duerfen darueber hinaus ausschliesslich beraten, reviewen oder einen ausdruecklich angeforderten isolierten Kontrast liefern.
+Es etabliert keinen neuen Privilegienpfad, keine dauerhafte Agentenautonomie und keinen Ersatz fuer bestehende Grabowski-Policies. Es beschreibt eine Betriebsregel: Der explizit gebundene Controller bleibt autoritativ fuer Planung, Integration, Merge, Deployment und Closeout. Implementierung darf innerhalb einer expliziten, ressourcengebundenen Work-Lane an einen scoped Writer delegiert werden; Modellidentitaet verleiht dabei keine Autoritaet. Reviewer und Observer bleiben read-only. Ein technisch blockierter Einzelgriff kann weiterhin als begrenzter Micro-Handoff ausgefuehrt werden.
 
 ## Nutzer-Eskalationsgrenze
 
@@ -63,16 +63,16 @@ Die kleinste Handlung muss beantworten:
 Danach wird nach Aufgabenklasse geroutet.
 
 4. **ChatGPT Operator**
-   - Autoritativer Standard fuer alle Lanes und jede Aufgabengroesse: Captain, Writer, Tests, kritischer Review, Integration, Merge, Deployment, Closeout und Recovery.
-   - Ein gemeinsamer Operator-Kontext ist der Normalfall; grosse Arbeit wird zerlegt und isoliert, aber nicht wegen Umfang oder Kapazitaet an einen externen Writer abgegeben.
-   - Der Operator bleibt fuer Livezustand, Scope, Planung, Aenderung, Receipts, Tests und jede Wirkung verantwortlich.
+   - Controller-Standard fuer alle Lanes und jede Aufgabengroesse: Livezustand, Scope, Planung, Delegation, Integration, Merge, Deployment, Closeout und Recovery bleiben controllergebunden.
+   - Ein gemeinsamer Operator-Kontext ist der Normalfall; Implementierung kann bei belegter Isolation an einen explizit lane- und ressourcengebundenen scoped Writer delegiert werden.
+   - Der Controller bleibt fuer Receipts, Integration und alle controller-only Wirkungen verantwortlich; der scoped Writer darf innerhalb seiner Lane implementieren, testen, committen, pushen und einen Pull Request erstellen oder aktualisieren.
 
-5. **Externe Review- und Kontrastagenten**
-   - Externe Modelle sind standardmaessig aus und besitzen keine autoritative Writer-Rolle und keinen Kapazitaets-Fallback.
-   - Auch bei expliziter Aktivierung erhalten sie keine Kopien dieses ChatGPT-Kontexts, sondern nur einen begrenzten, zweckgebundenen Review- oder Kontrastauftrag.
-   - Zulassige Rollen sind unabhaengiger Review sowie ausdruecklich angeforderte isolierte Kontrast- oder Wettbewerbsprogrammierung.
-   - Auswahlprioritaet innerhalb dieser beratenden Rollen: **Claude -> Codex -> Antigravity -> OpenCode -> OpenHands -> Cline**.
-   - Ergebnisse bleiben advisory-only: keine automatische Patchuebernahme, kein Commit, kein Push, kein Merge und kein Deploy.
+5. **Externe Agentenrollen**
+   - Externe Modelle sind standardmaessig aus; Modellidentitaet allein besitzt weder Writer- noch Integrationsautoritaet.
+   - Auch bei expliziter Aktivierung erhalten sie keine Kopien dieses ChatGPT-Kontexts, sondern nur den fuer ihre Rolle erforderlichen lane- oder reviewgebundenen Kontext.
+   - Zulassige Rollen sind scoped Writer innerhalb einer expliziten Work-Lane sowie unabhaengiger Review, Observer oder ausdruecklich angeforderte isolierte Kontrastprogrammierung.
+   - Routingpraeferenz fuer externe Modelle: **Claude -> Codex -> Antigravity -> OpenCode -> OpenHands -> Cline**; diese Reihenfolge verleiht keine Autoritaet.
+   - Reviewer, Observer und Kontrastresultate bleiben advisory-only. Ein explizit gebundener scoped Writer darf innerhalb seiner Lane committen und pushen; Merge, Deployment, Bureau-Terminalisierung und Closeout bleiben controllergebunden.
 
 6. **Antigravity, OpenCode, OpenHands / lokale KI**
    - `agy --print` (Antigravity CLI) und lokale Modelle duerfen kurze beratende Denk-, Sortier- oder Kontrastgriffe liefern.
@@ -103,7 +103,7 @@ Danach wird nach Aufgabenklasse geroutet.
 | Status/Health blockiert | engeres Typed Tool oder Micro-Task | geringes Risiko, sofort pruefbar | Status JSON oder Logtail |
 | Repo-/Branch-Lage fuer Zielrepo unklar | Reposkop target-bound report | leichtes read-only Lagebild ohne Freigabe | Reposkop report JSON, nur explizites Ziel |
 | kurzer Shell-Griff blockiert | Grabowski Micro-Task | bleibt unter Grabowski-Audit | task_id, status, logs |
-| komplexer Code-/Repo-Slice | ChatGPT/Grabowski direkt | Auch grosse Implementierungen bleiben operatorseitig; externe Modelle duerfen nur Review oder ausdruecklichen Kontrast liefern | diff, changed files, Tests |
+| komplexer Code-/Repo-Slice | Controller direkt oder lane-gebundener scoped Writer | Autoritaet folgt der Rolle und dem Ressourcenscope, nicht dem Modell; Integration bleibt beim Controller | diff, changed files, Tests |
 | lokaler Patch aus Chat/Artefakt | operator_patch_relay.py | prueft und wendet lokal mit Head- und Dirty-Gates an | JSON-Receipt plus Git-Diff |
 | Review-/Architekturunsicherheit | Claude Review | bessere Kontrastpruefung | Review mit konkreten Befunden |
 | interaktive Sessionfrage | tmux capture, Antigravity bei besserem Resume | Resume-naehe | Capture-Auszug, naechste Eingabe |
@@ -196,23 +196,23 @@ Freie Fantasietypen sind ungueltig. Ein fehlgeschlagener Resource-Key ist kein P
 
 ### ChatGPT Operator
 
-ChatGPT/Grabowski ist der autoritative Ausfuehrer aller Lanes und aller Aufgabengroessen. Der Operator prueft den Livezustand, plant, programmiert, testet, integriert, reviewed kritisch, merged, deployt und schliesst ab. Ein Workspace darf Isolation liefern, aber keinen externen Primaer-Writer erzeugen.
+ChatGPT/Grabowski ist der Standardcontroller fuer alle Lanes und alle Aufgabengroessen. Der Controller prueft den Livezustand, plant, delegiert optional eine isolierte Writer-Lane, integriert, reviewed kritisch, merged, deployt und schliesst ab. Ein scoped Writer kann intern oder extern ausgefuehrt werden; seine Autoritaet entsteht ausschliesslich aus der expliziten Lane-, Ressourcen- und Controllerbindung.
 
 ### Claude
 
-Claude ist eine bevorzugte unabhaengige Review- und Urteilsroute fuer schwierige Invarianten, Sicherheitslogik, Architektur und Quellen. Mutierende Nutzung ist nur als ausdruecklich angeforderter, isolierter Kontrast erlaubt; das Resultat bleibt advisory-only.
+Claude ist eine bevorzugte unabhaengige Review- und Urteilsroute fuer schwierige Invarianten, Sicherheitslogik, Architektur und Quellen. Als Reviewer bleibt Claude advisory-only; als explizit gebundener scoped Writer darf Claude innerhalb der zugewiesenen Work-Lane die Writer-Wirkungen ausfuehren, aber keine Controller-Wirkungen.
 
 ### Codex
 
-Codex ist eine Review- und Kontrastroute fuer Code- und Repo-Slices. `review` ist der Normalfall; ein mutierender Gegenentwurf muss isoliert, ausdruecklich angefordert und auf Diff/Test begrenzt sein. Er besitzt keine Integrationsautoritaet.
+Codex ist eine Review-, Kontrast- und moegliche scoped-Writer-Route fuer Code- und Repo-Slices. `review` ist der Normalfall; mutierende Nutzung braucht eine explizite Work-Lane und bleibt auf deren Writer-Wirkungen begrenzt. Codex besitzt durch Modellidentitaet keine Integrationsautoritaet.
 
 ### Antigravity
 
-Antigravity vereinheitlicht externe Review- und Kontrastrouten und kann kurze beratende One-Shots liefern. Es ist kein Kapazitaetsersatz fuer direkte Operatorarbeit und darf keine autoritative Writerrolle erzeugen.
+Antigravity vereinheitlicht externe Review-, Kontrast- und optionale scoped-Writer-Routen und kann kurze beratende One-Shots liefern. Eine Writerrolle entsteht nur durch explizite Lane-, Ressourcen- und Controllerbindung; ohne diese Bindung bleibt Antigravity advisory-only.
 
 ### Cline
 
-Cline ist eine nachrangige Review- oder Kontrastroute, wenn die bevorzugten Wege nicht geeignet sind. Auch hier bleiben Scope, Patchuebernahme und alle Wirkungen beim Operator.
+Cline ist eine nachrangige Review-, Kontrast- oder scoped-Writer-Route, wenn die bevorzugten Wege nicht geeignet sind. Ohne explizite Writer-Lane bleibt Cline advisory-only; Merge, Deployment und Closeout bleiben controllergebunden.
 
 ### Lokale KI / Goose / Ollama
 
@@ -264,4 +264,4 @@ Dieses Protokoll etabliert nicht:
 
 ## Kurzform
 
-Grabowski bleibt die Hand. ChatGPT fuehrt jede autoritative Arbeit direkt aus, auch grosse. Externe Modelle sind auf unabhaengigen Review und ausdruecklich angeforderten isolierten Kontrast beschraenkt; lokale KI bleibt Hilfslicht.
+Grabowski bleibt die Hand. Der Controller traegt die Integrationsautoritaet; Implementierung kann an einen explizit gebundenen scoped Writer delegiert werden. Modellnamen steuern Routingpraeferenzen, nicht Autoritaet; Reviewer und Observer bleiben read-only.

@@ -42,6 +42,24 @@ def operator_relay_protocol() -> dict[str, Any]:
         "coding_agent_priority_semantics": "routing_preference_not_authority",
         "execution_priority_semantics": "routing_preference_not_model_authority",
         "authority_principle": "model_identity_does_not_grant_authority",
+        "bureau_task_required_for_direct_user_work": False,
+        "owner_authorized_automatic_execution": True,
+        "delegated_scoped_writers_allowed": True,
+        "direct_user_lifecycle_source": "work_lane",
+        "controller_only_effects": [
+            "merge",
+            "deployment",
+            "bureau_terminalization",
+            "closeout",
+        ],
+        "overlapping_writer_invariant": "one_authoritative_mutating_writer_per_overlapping_resource_lane",
+        "parallel_disjoint_lanes_allowed": True,
+        "fail_closed_conditions": [
+            "live_overlapping_foreign_writer_or_lease",
+            "outcome_unknown",
+            "invalid_runtime_or_audit_state",
+            "missing_cost_approval",
+        ],
         "authority_roles": {
             "controller": {
                 "authoritative": True,
@@ -72,6 +90,7 @@ def operator_relay_protocol() -> dict[str, Any]:
                     "merge",
                     "deployment",
                     "bureau_terminalization",
+                    "closeout",
                 ],
             },
             "reviewer": {
