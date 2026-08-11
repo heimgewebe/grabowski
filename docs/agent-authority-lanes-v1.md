@@ -18,7 +18,7 @@ user mandate
 ## Canonical roles
 
 - `controller`: authoritative for planning, delegation, integration, merge, deployment and closeout.
-- `scoped_writer`: authoritative only inside one explicit work lane. It may implement, test, commit, push and create or update a pull request. Merge, deployment, Bureau terminalization and closeout remain controller-only unless separately delegated by the controller.
+- `scoped_writer`: authoritative only inside one explicit work lane. It may implement, test, commit, push and create or update a pull request. Merge, deployment, Bureau terminalization and closeout remain controller-only; granting any of those effects requires a different authority role, not merely a scoped-writer lane.
 - `reviewer`: read-only and advisory.
 - `observer`: read-only evidence collection.
 
