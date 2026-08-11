@@ -554,9 +554,18 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
     }
     if subject_component:
         reuse_match["component"] = subject_component
-    terminal_signature: dict[str, Any] = {"outcome": outcome}
-    if blocker:
-        terminal_signature["blocker_code"] = blocker
+    terminal_signature: dict[str, Any] | None = None
+    if outcome != "started":
+        terminal_signature = {"outcome": outcome}
+        if blocker:
+            terminal_signature["blocker_code"] = blocker
+
+    reuse_condition: dict[str, Any] = {
+        "match": reuse_match,
+        "requires_live_recheck": True,
+    }
+    if terminal_signature is not None:
+        reuse_condition["terminal_signature"] = terminal_signature
 
     result_text = f"Historical outcome: {outcome}."
     if blocker:
@@ -614,11 +623,7 @@ def _validated_chronik_event_recall(event: dict[str, Any]) -> dict[str, Any]:
         },
         "historical_pattern": historical_pattern,
         "pattern_fingerprint": pattern_fingerprint,
-        "reuse_condition": {
-            "match": reuse_match,
-            "terminal_signature": terminal_signature,
-            "requires_live_recheck": True,
-        },
+        "reuse_condition": reuse_condition,
         "evidence_refs": [
             _evidence_ref("chronik_event", event_id, sha256=event_id.removeprefix("sha256:"))
         ],

@@ -402,6 +402,26 @@ class RecallTests(unittest.TestCase):
         self.assertNotIn("pr_number", item["reuse_condition"]["match"])
         self.assertIn("root_cause", item["does_not_establish"])
 
+    def test_chronik_history_started_event_has_no_terminal_signature(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["kind"] = "agent.run.started"
+        event["data"]["result"] = "started"
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        item = result["items"][0]
+
+        self.assertEqual(item["historical_context"]["outcome"], "started")
+        self.assertNotIn("terminal_signature", item["reuse_condition"])
+        self.assertTrue(item["reuse_condition"]["requires_live_recheck"])
+        self.assertIn("not outcome evidence", item["learned_rule"])
+
     def test_chronik_history_recall_counts_repeated_semantic_patterns_only_within_result(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)
