@@ -37,6 +37,14 @@ class ScopedWriterStartPreflight(ValueError):
     """Writer launch validation failed before any launch effect."""
 
 
+class LeaseAcquisitionOutcomeUnknown(RuntimeError):
+    """A resource acquisition returned without trustworthy lease evidence."""
+
+
+class LeaseCompensationOutcomeUnknown(RuntimeError):
+    """A guarded resource release returned without trustworthy evidence."""
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -644,6 +652,294 @@ def _effect_observed(output: dict[str, Any]) -> bool:
     )
 
 
+def _resource_acquisition_plan(resource_keys: list[str]) -> list[dict[str, Any]]:
+    keys = resources.normalize_resource_keys(resource_keys)
+    bureau_keys = resources.bureau_leases.bureau_resource_keys(keys)
+    if (
+        not isinstance(bureau_keys, list)
+        or any(not isinstance(key, str) for key in bureau_keys)
+        or len(set(bureau_keys)) != len(bureau_keys)
+        or not set(bureau_keys).issubset(keys)
+    ):
+        raise RuntimeError("Bureau resource classification returned an invalid partition")
+    bureau_keys = sorted(bureau_keys)
+    bureau_key_set = set(bureau_keys)
+    standard_keys = [key for key in keys if key not in bureau_key_set]
+    return [
+        {"contract_group": contract_group, "resource_keys": group_keys}
+        for contract_group, group_keys in (
+            ("bureau", bureau_keys),
+            ("standard", standard_keys),
+        )
+        if group_keys
+    ]
+
+
+def _lease_snapshot(lease: Any, *, owner_id: str) -> dict[str, Any]:
+    if not isinstance(lease, dict) or not resources.LEASE_SNAPSHOT_KEYS.issubset(lease):
+        raise LeaseAcquisitionOutcomeUnknown("acquisition lease snapshot is malformed")
+    snapshot = {
+        key: lease[key] for key in sorted(resources.LEASE_SNAPSHOT_KEYS)
+    }
+    if snapshot["owner_id"] != owner_id:
+        raise LeaseAcquisitionOutcomeUnknown(
+            "acquisition lease snapshot is owned by another owner"
+        )
+    for key in ("acquired_at_unix", "updated_at_unix", "expires_at_unix"):
+        if type(snapshot[key]) is not int:
+            raise LeaseAcquisitionOutcomeUnknown(
+                f"acquisition lease {key} is invalid"
+            )
+    if not (
+        snapshot["acquired_at_unix"]
+        <= snapshot["updated_at_unix"]
+        < snapshot["expires_at_unix"]
+    ):
+        raise LeaseAcquisitionOutcomeUnknown(
+            "acquisition lease timestamps are inconsistent"
+        )
+    metadata_sha256 = snapshot["metadata_sha256"]
+    if (
+        not isinstance(metadata_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata_sha256) is None
+    ):
+        raise LeaseAcquisitionOutcomeUnknown(
+            "acquisition lease metadata SHA-256 is invalid"
+        )
+    return snapshot
+
+
+def _acquisition_evidence(
+    group: dict[str, Any], receipt: Any, *, owner_id: str
+) -> dict[str, Any]:
+    if not isinstance(receipt, dict) or receipt.get("owner_id") != owner_id:
+        raise LeaseAcquisitionOutcomeUnknown(
+            "resource acquisition omitted the expected owner identity"
+        )
+    leases = receipt.get("leases")
+    if not isinstance(leases, list):
+        raise LeaseAcquisitionOutcomeUnknown(
+            "resource acquisition omitted exact lease evidence"
+        )
+    snapshots = [_lease_snapshot(lease, owner_id=owner_id) for lease in leases]
+    snapshots.sort(key=lambda item: item["resource_key"])
+    expected_keys = list(group["resource_keys"])
+    if [item["resource_key"] for item in snapshots] != expected_keys:
+        raise LeaseAcquisitionOutcomeUnknown(
+            "resource acquisition lease evidence does not match its contract group"
+        )
+    preserved = receipt.get("preserved")
+    if (
+        not isinstance(preserved, list)
+        or any(not isinstance(key, str) for key in preserved)
+        or len(set(preserved)) != len(preserved)
+        or not set(preserved).issubset(expected_keys)
+    ):
+        raise LeaseAcquisitionOutcomeUnknown(
+            "resource acquisition preserved-set evidence is invalid"
+        )
+    contract_group = group["contract_group"]
+    bureau_contract = receipt.get("bureau_contract")
+    if contract_group == "bureau" and not isinstance(bureau_contract, dict):
+        raise LeaseAcquisitionOutcomeUnknown(
+            "Bureau resource acquisition omitted its contract evidence"
+        )
+    if contract_group == "standard" and bureau_contract is not None:
+        raise LeaseAcquisitionOutcomeUnknown(
+            "standard resource acquisition returned a Bureau contract"
+        )
+    preserved_set = set(preserved)
+    return {
+        "contract_group": contract_group,
+        "resource_keys": expected_keys,
+        "receipt": receipt,
+        "attempt_lease_snapshots": [
+            snapshot
+            for snapshot in snapshots
+            if snapshot["resource_key"] not in preserved_set
+        ],
+    }
+
+
+def _acquisition_bundle(
+    owner_id: str,
+    plan: list[dict[str, Any]],
+    acquisitions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if len(plan) == 1 and len(acquisitions) == 1:
+        return acquisitions[0]["receipt"]
+    return {
+        "schema_version": 1,
+        "kind": "grabowski.work_lane.lease_bundle",
+        "owner_id": owner_id,
+        "leases": [
+            lease
+            for acquisition in acquisitions
+            for lease in acquisition["receipt"]["leases"]
+        ],
+        "preserved": sorted(
+            {
+                key
+                for acquisition in acquisitions
+                for key in acquisition["receipt"]["preserved"]
+            }
+        ),
+        "reclaimed": [
+            reclaimed
+            for acquisition in acquisitions
+            for reclaimed in acquisition["receipt"].get("reclaimed", [])
+        ],
+        "acquisitions": [acquisition["receipt"] for acquisition in acquisitions],
+        "resource_classes": {
+            acquisition["contract_group"]: list(acquisition["resource_keys"])
+            for acquisition in acquisitions
+        },
+    }
+
+
+def _group_evidence_fields(
+    plan: list[dict[str, Any]], acquisitions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    if len(plan) == 1:
+        return {}
+    return {
+        "acquisition_plan": plan,
+        "lease_acquisition_groups": acquisitions,
+    }
+
+
+def _definite_acquisition_failure(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            ValueError,
+            PermissionError,
+            resources.ResourceConflict,
+            resources.bureau_leases.BureauLeaseContractError,
+            work_admission.WorkAdmissionBlocked,
+        ),
+    )
+
+
+def _verified_release_receipt(
+    receipt: Any,
+    *,
+    owner_id: str,
+    expected_leases: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("owner_id") != owner_id
+        or receipt.get("snapshot_guarded") is not True
+        or not isinstance(receipt.get("released"), list)
+    ):
+        raise LeaseCompensationOutcomeUnknown(
+            "guarded lease release omitted exact outcome evidence"
+        )
+    try:
+        released = [
+            _lease_snapshot(lease, owner_id=owner_id)
+            for lease in receipt["released"]
+        ]
+    except LeaseAcquisitionOutcomeUnknown as exc:
+        raise LeaseCompensationOutcomeUnknown(str(exc)) from exc
+    released.sort(key=lambda item: item["resource_key"])
+    if released != expected_leases:
+        raise LeaseCompensationOutcomeUnknown(
+            "guarded lease release evidence does not match the requested snapshots"
+        )
+    return receipt
+
+
+def _compensate_acquisitions(
+    *,
+    owner_id: str,
+    plan: list[dict[str, Any]],
+    acquisitions: list[dict[str, Any]],
+    release_resources_fn: Callable[..., dict[str, Any]],
+    receipt_path: Path,
+    base_record: dict[str, Any],
+    lease_receipt: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    released_groups: list[dict[str, Any]] = []
+    preserved_keys = sorted(
+        {
+            key
+            for acquisition in acquisitions
+            for key in acquisition["receipt"]["preserved"]
+        }
+    )
+    for acquisition in reversed(acquisitions):
+        expected_leases = list(acquisition["attempt_lease_snapshots"])
+        if not expected_leases:
+            continue
+        resource_keys = [item["resource_key"] for item in expected_leases]
+        in_flight = {
+            "state": "group_in_flight",
+            "contract_group": acquisition["contract_group"],
+            "resource_keys": resource_keys,
+            "expected_leases": expected_leases,
+            "released_groups": released_groups,
+            "preserved_resource_keys": preserved_keys,
+        }
+        _write_state(
+            receipt_path,
+            {
+                **base_record,
+                "state": "compensating",
+                "decision": "HARD_BLOCK",
+                "lease_receipt": lease_receipt,
+                **_group_evidence_fields(plan, acquisitions),
+                "compensation": in_flight,
+                "next_action": "complete_guarded_lease_compensation",
+            },
+        )
+        try:
+            release_receipt = release_resources_fn(
+                owner_id,
+                resource_keys,
+                expected_leases=expected_leases,
+            )
+            release_receipt = _verified_release_receipt(
+                release_receipt,
+                owner_id=owner_id,
+                expected_leases=expected_leases,
+            )
+        except Exception as exc:
+            return (
+                {
+                    **in_flight,
+                    "state": "outcome_unknown",
+                    "error_class": type(exc).__name__,
+                    "error": str(exc)[:2048],
+                },
+                False,
+            )
+        released_groups.append(
+            {
+                "contract_group": acquisition["contract_group"],
+                "resource_keys": resource_keys,
+                "expected_leases": expected_leases,
+                "release_receipt": release_receipt,
+            }
+        )
+    released = [
+        lease
+        for group in released_groups
+        for lease in group["release_receipt"]["released"]
+    ]
+    return (
+        {
+            "state": "complete",
+            "snapshot_guarded": True,
+            "released": released,
+            "released_groups": released_groups,
+            "preserved_resource_keys": preserved_keys,
+        },
+        True,
+    )
+
+
 def acquire_work(
     parameters: dict[str, Any],
     *,
@@ -660,6 +956,7 @@ def acquire_work(
     lane_id = inputs["lane_id"]
     inputs_sha256 = _sha(inputs)
     lifecycle_source = _lifecycle_source(inputs)
+    acquisition_plan = _resource_acquisition_plan(inputs["resource_keys"])
     with _lane_lock(lane_id) as receipt_path:
         existing = _read_state(receipt_path)
         if existing is not None and existing.get("inputs_sha256") != inputs_sha256:
@@ -702,6 +999,31 @@ def acquire_work(
                 "durable_receipt_path": str(receipt_path),
                 "replayed": True,
             }
+        if existing is not None and existing.get("state") == "outcome_unknown":
+            return {
+                **existing,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": True,
+            }
+        if existing is not None and existing.get("state") in {
+            "acquiring",
+            "compensating",
+        }:
+            record = _write_state(
+                receipt_path,
+                {
+                    **existing,
+                    "state": "outcome_unknown",
+                    "decision": "HARD_BLOCK",
+                    "updated_at_unix": int(time.time()),
+                    "next_action": "reconcile_resource_leases_before_retry",
+                },
+            )
+            return {
+                **record,
+                "durable_receipt_path": str(receipt_path),
+                "replayed": True,
+            }
         attempt = int(existing.get("attempt_count", 0)) + 1 if existing else 1
         base_record = {
             "kind": LANE_KIND,
@@ -724,7 +1046,6 @@ def acquire_work(
                 else {}
             ),
         }
-        _write_state(receipt_path, {**base_record, "state": "acquiring"})
         metadata = {
             "schema_version": 1,
             "kind": LANE_KIND,
@@ -738,29 +1059,152 @@ def acquire_work(
             "branch": inputs["branch"],
             "target_path": inputs["target_path"],
         }
-        try:
-            acquired = acquire_resources_fn(
-                inputs["lease_owner_id"],
-                inputs["resource_keys"],
-                purpose=inputs["purpose"],
-                ttl_seconds=inputs["ttl_seconds"],
-                metadata=metadata,
-            )
-        except Exception as exc:
-            record = _write_state(
+        acquisitions: list[dict[str, Any]] = []
+        for group_index, group in enumerate(acquisition_plan):
+            _write_state(
                 receipt_path,
                 {
                     **base_record,
-                    "state": "blocked",
-                    "decision": "HARD_BLOCK",
-                    "error_class": type(exc).__name__,
-                    "error": str(exc)[:2048],
-                    "leases_acquired": False,
+                    "state": "acquiring",
+                    **_group_evidence_fields(acquisition_plan, acquisitions),
+                    "acquisition": {
+                        "state": "group_in_flight",
+                        "group_index": group_index,
+                        "contract_group": group["contract_group"],
+                        "resource_keys": group["resource_keys"],
+                        "completed_group_count": len(acquisitions),
+                    },
+                    "next_action": "acquire_resource_contract_group",
                 },
             )
-            if audit_fn is not None:
-                audit_fn({"operation": "work-acquire", "lane_id": lane_id, "state": "blocked", "inputs_sha256": inputs_sha256})
-            return {**record, "durable_receipt_path": str(receipt_path), "replayed": existing is not None}
+            try:
+                acquisition_receipt = acquire_resources_fn(
+                    inputs["lease_owner_id"],
+                    group["resource_keys"],
+                    purpose=inputs["purpose"],
+                    ttl_seconds=inputs["ttl_seconds"],
+                    metadata=metadata,
+                )
+                acquisition = _acquisition_evidence(
+                    group,
+                    acquisition_receipt,
+                    owner_id=inputs["lease_owner_id"],
+                )
+            except Exception as exc:
+                lease_receipt = (
+                    _acquisition_bundle(
+                        inputs["lease_owner_id"], acquisition_plan, acquisitions
+                    )
+                    if acquisitions
+                    else None
+                )
+                compensation: dict[str, Any] | None = None
+                compensation_complete = True
+                if acquisitions:
+                    assert lease_receipt is not None
+                    compensation, compensation_complete = _compensate_acquisitions(
+                        owner_id=inputs["lease_owner_id"],
+                        plan=acquisition_plan,
+                        acquisitions=acquisitions,
+                        release_resources_fn=release_resources_fn,
+                        receipt_path=receipt_path,
+                        base_record=base_record,
+                        lease_receipt=lease_receipt,
+                    )
+                definite_failure = _definite_acquisition_failure(exc)
+                state = (
+                    "blocked"
+                    if definite_failure and compensation_complete
+                    else "outcome_unknown"
+                )
+                failure_evidence = {
+                    "state": (
+                        "failed" if definite_failure else "outcome_unknown"
+                    ),
+                    "group_index": group_index,
+                    "contract_group": group["contract_group"],
+                    "resource_keys": group["resource_keys"],
+                    "completed_group_count": len(acquisitions),
+                }
+                record = _write_state(
+                    receipt_path,
+                    {
+                        **base_record,
+                        "state": state,
+                        "decision": "HARD_BLOCK",
+                        **(
+                            {"lease_receipt": lease_receipt}
+                            if lease_receipt is not None
+                            else {}
+                        ),
+                        **_group_evidence_fields(acquisition_plan, acquisitions),
+                        "acquisition": failure_evidence,
+                        "error_class": type(exc).__name__,
+                        "error": str(exc)[:2048],
+                        "leases_acquired": (
+                            False
+                            if definite_failure and compensation_complete
+                            else None
+                        ),
+                        "compensation": compensation,
+                        **(
+                            {
+                                "next_action": (
+                                    "reconcile_lease_compensation_before_retry"
+                                    if not compensation_complete
+                                    else "retry_after_resource_conflict_changes"
+                                    if definite_failure
+                                    else "reconcile_resource_acquisition_before_retry"
+                                )
+                            }
+                            if state == "outcome_unknown"
+                            else {}
+                        ),
+                    },
+                )
+                if audit_fn is not None:
+                    audit_fn(
+                        {
+                            "operation": "work-acquire",
+                            "lane_id": lane_id,
+                            "state": state,
+                            "inputs_sha256": inputs_sha256,
+                        }
+                    )
+                return {
+                    **record,
+                    "durable_receipt_path": str(receipt_path),
+                    "replayed": existing is not None,
+                }
+            acquisitions.append(acquisition)
+            acquired_so_far = _acquisition_bundle(
+                inputs["lease_owner_id"], acquisition_plan, acquisitions
+            )
+            _write_state(
+                receipt_path,
+                {
+                    **base_record,
+                    "state": "acquiring",
+                    "lease_receipt": acquired_so_far,
+                    **_group_evidence_fields(acquisition_plan, acquisitions),
+                    "acquisition": {
+                        "state": "group_acquired",
+                        "group_index": group_index,
+                        "contract_group": group["contract_group"],
+                        "resource_keys": group["resource_keys"],
+                        "completed_group_count": len(acquisitions),
+                    },
+                    "next_action": (
+                        "acquire_resource_contract_group"
+                        if len(acquisitions) < len(acquisition_plan)
+                        else "ensure_worktree"
+                    ),
+                },
+            )
+        acquired = _acquisition_bundle(
+            inputs["lease_owner_id"], acquisition_plan, acquisitions
+        )
+        group_evidence = _group_evidence_fields(acquisition_plan, acquisitions)
 
         ensure_parameters = {
             "repo": inputs["repo"],
@@ -787,41 +1231,45 @@ def acquire_work(
                 inspect_resource_fn,
             )
         except worktree_ensure.WorktreeEnsurePreflight as exc:
-            try:
-                compensation = release_resources_fn(
-                    inputs["lease_owner_id"],
-                    inputs["resource_keys"],
-                    expected_leases=[
-                        {
-                            key: lease[key]
-                            for key in sorted(resources.LEASE_SNAPSHOT_KEYS)
-                        }
-                        for lease in acquired.get("leases", [])
-                    ],
-                )
-            except Exception as release_exc:
-                compensation = {
-                    "released": False,
-                    "error": f"{type(release_exc).__name__}: {release_exc}"[:2048],
-                }
+            compensation, compensation_complete = _compensate_acquisitions(
+                owner_id=inputs["lease_owner_id"],
+                plan=acquisition_plan,
+                acquisitions=acquisitions,
+                release_resources_fn=release_resources_fn,
+                receipt_path=receipt_path,
+                base_record=base_record,
+                lease_receipt=acquired,
+            )
             record = _write_state(
                 receipt_path,
                 {
                     **base_record,
-                    "state": "blocked",
-                    "decision": "AUTO_PREPARE_FAILED",
+                    "state": "blocked" if compensation_complete else "outcome_unknown",
+                    "decision": (
+                        "AUTO_PREPARE_FAILED"
+                        if compensation_complete
+                        else "HARD_BLOCK"
+                    ),
                     "lease_receipt": acquired,
+                    **group_evidence,
                     "error_class": type(exc).__name__,
                     "error": str(exc)[:2048],
                     "effect_observed": False,
                     "compensation": compensation,
+                    **(
+                        {
+                            "next_action": "reconcile_lease_compensation_before_retry"
+                        }
+                        if not compensation_complete
+                        else {}
+                    ),
                 },
             )
             if audit_fn is not None:
                 audit_fn({
                     "operation": "work-acquire",
                     "lane_id": lane_id,
-                    "state": "blocked",
+                    "state": record["state"],
                     "inputs_sha256": inputs_sha256,
                     "effect_observed": False,
                 })
@@ -834,6 +1282,7 @@ def acquire_work(
                     "state": "outcome_unknown",
                     "decision": "HARD_BLOCK",
                     "lease_receipt": acquired,
+                    **group_evidence,
                     "error_class": type(exc).__name__,
                     "error": str(exc)[:2048],
                     "effect_observed": None,
@@ -857,6 +1306,7 @@ def acquire_work(
                     "state": "outcome_unknown",
                     "decision": "HARD_BLOCK",
                     "lease_receipt": acquired,
+                    **group_evidence,
                     "error_class": "InvalidWorktreeEnsureResult",
                     "error": "worktree ensure returned a non-object result",
                     "effect_observed": None,
@@ -910,6 +1360,7 @@ def acquire_work(
                         "state": "writer_starting",
                         "decision": decision,
                         "lease_receipt": acquired,
+                        **group_evidence,
                         "worktree_receipt": output,
                         "authority": authority,
                         "writer_start": {"state": "starting"},
@@ -932,6 +1383,7 @@ def acquire_work(
                             "state": "ready",
                             "decision": decision,
                             "lease_receipt": acquired,
+                            **group_evidence,
                             "worktree_receipt": output,
                             "authority": authority,
                             "writer_start": {
@@ -955,6 +1407,7 @@ def acquire_work(
                             "state": "outcome_unknown",
                             "decision": "HARD_BLOCK",
                             "lease_receipt": acquired,
+                            **group_evidence,
                             "worktree_receipt": output,
                             "authority": authority,
                             "writer_start": {
@@ -978,6 +1431,7 @@ def acquire_work(
                             "state": "outcome_unknown",
                             "decision": "HARD_BLOCK",
                             "lease_receipt": acquired,
+                            **group_evidence,
                             "worktree_receipt": output,
                             "authority": authority,
                             "writer_start": {
@@ -1003,6 +1457,7 @@ def acquire_work(
                             "state": "outcome_unknown",
                             "decision": "HARD_BLOCK",
                             "lease_receipt": acquired,
+                            **group_evidence,
                             "worktree_receipt": output,
                             "authority": authority,
                             "writer_start": {
@@ -1029,6 +1484,7 @@ def acquire_work(
                     "state": "ready",
                     "decision": decision,
                     "lease_receipt": acquired,
+                    **group_evidence,
                     "worktree_receipt": output,
                     "authority": authority,
                     **({"writer_job": writer_job} if writer_job is not None else {}),
@@ -1049,32 +1505,35 @@ def acquire_work(
         mutation_attempted = isinstance(output.get("mutation"), dict)
         effect_observed = mutation_attempted and _effect_observed(output)
         compensation: dict[str, Any] | None = None
+        compensation_complete = True
         if not effect_observed:
-            try:
-                compensation = release_resources_fn(
-                    inputs["lease_owner_id"],
-                    inputs["resource_keys"],
-                    expected_leases=[
-                        {
-                            key: lease[key]
-                            for key in sorted(resources.LEASE_SNAPSHOT_KEYS)
-                        }
-                        for lease in acquired.get("leases", [])
-                    ],
-                )
-            except Exception as exc:
-                compensation = {"released": False, "error": f"{type(exc).__name__}: {exc}"[:2048]}
+            compensation, compensation_complete = _compensate_acquisitions(
+                owner_id=inputs["lease_owner_id"],
+                plan=acquisition_plan,
+                acquisitions=acquisitions,
+                release_resources_fn=release_resources_fn,
+                receipt_path=receipt_path,
+                base_record=base_record,
+                lease_receipt=acquired,
+            )
+        outcome_unknown = effect_observed or not compensation_complete
         record = _write_state(
             receipt_path,
             {
                 **base_record,
-                "state": "outcome_unknown" if effect_observed else "blocked",
-                "decision": "HARD_BLOCK" if effect_observed else "AUTO_PREPARE_FAILED",
+                "state": "outcome_unknown" if outcome_unknown else "blocked",
+                "decision": "HARD_BLOCK" if outcome_unknown else "AUTO_PREPARE_FAILED",
                 "lease_receipt": acquired,
+                **group_evidence,
                 "worktree_receipt": output,
                 "mutation_attempted": mutation_attempted,
                 "effect_observed": effect_observed,
                 "compensation": compensation,
+                **(
+                    {"next_action": "reconcile_lease_compensation_before_retry"}
+                    if not effect_observed and not compensation_complete
+                    else {}
+                ),
             },
         )
         if audit_fn is not None:
