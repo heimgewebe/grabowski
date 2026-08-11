@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import stat
 import time
 from typing import Any, Iterator
@@ -19,13 +18,23 @@ ASSERTION_VERSION = "signed-one-call-v1"
 ASSERTION_AUDIENCE = "grabowski-mcp"
 ASSERTION_MAX_AGE_SECONDS = 90
 ASSERTION_CLOCK_SKEW_SECONDS = 30
+# Kept as a public compatibility constant for tests/documentation that refer to
+# the original short replay window. The durable replay filter never expires.
 REPLAY_RETENTION_SECONDS = 900
-MAX_REPLAY_RECORDS = 512
-MAX_STATE_BYTES = 512 * 1024
-STATE_KIND = "grabowski_transport_one_call_state"
 CONSUMPTION_KIND = "grabowski_transport_one_call_consumption"
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-one-call"
 LOCK_PATH = STATE_ROOT / ".lock"
+REPLAY_FILTER_FILENAME = "replay-filter-v1.bin"
+REPLAY_FILTER_BITS = 1 << 29  # 64 MiB of monotone replay bits.
+REPLAY_FILTER_HASH_COUNT = 7
+REPLAY_FILTER_HEADER_BYTES = 128
+REPLAY_FILTER_BYTES = REPLAY_FILTER_BITS // 8
+REPLAY_FILTER_TOTAL_BYTES = REPLAY_FILTER_HEADER_BYTES + REPLAY_FILTER_BYTES
+REPLAY_FILTER_HEADER = (
+    b"grabowski-transport-replay-filter-v1\n"
+    + f"bits={REPLAY_FILTER_BITS}\nhashes={REPLAY_FILTER_HASH_COUNT}\n".encode("ascii")
+).ljust(REPLAY_FILTER_HEADER_BYTES, b"\x00")
+LEGACY_TOMBSTONE_MAX_BYTES = 4096
 _REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -217,10 +226,6 @@ def _state_lock() -> Iterator[None]:
             os.close(fd)
 
 
-def _state_path(scope_sha256: str) -> Path:
-    return STATE_ROOT / f"{_sha256(scope_sha256, 'transport client scope hash')}.json"
-
-
 def _tombstone_path(scope_sha256: str, request_id: str) -> Path:
     scope = _sha256(scope_sha256, "transport client scope hash")
     request = _request_id(request_id)
@@ -236,10 +241,10 @@ def _read_tombstone(path: Path) -> dict[str, Any] | None:
     try:
         meta = os.fstat(fd)
         _validate_private_file(meta, "transport assertion replay tombstone")
-        if meta.st_size > 4096:
+        if meta.st_size > LEGACY_TOMBSTONE_MAX_BYTES:
             raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
-        raw = os.read(fd, 4097)
-        if len(raw) > 4096 or os.read(fd, 1):
+        raw = os.read(fd, LEGACY_TOMBSTONE_MAX_BYTES + 1)
+        if len(raw) > LEGACY_TOMBSTONE_MAX_BYTES or os.read(fd, 1):
             raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
     finally:
         os.close(fd)
@@ -252,102 +257,95 @@ def _read_tombstone(path: Path) -> dict[str, Any] | None:
     return value
 
 
-def _write_tombstone(path: Path, receipt: dict[str, Any]) -> None:
-    _ensure_private_directory(path.parent)
-    raw = _canonical_bytes(receipt) + b"\n"
-    if len(raw) > 4096:
-        raise TransportAssertionError("transport assertion replay tombstone exceeds size limit")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+def _replay_filter_path() -> Path:
+    return STATE_ROOT / REPLAY_FILTER_FILENAME
+
+
+def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, ...]:
+    if REPLAY_FILTER_BITS <= 0 or REPLAY_FILTER_BITS & (REPLAY_FILTER_BITS - 1):
+        raise TransportAssertionError("transport replay filter size must be a power of two")
+    scope = bytes.fromhex(_sha256(scope_sha256, "transport client scope hash"))
+    request = bytes.fromhex(_request_id(request_id))
+    digest = hashlib.sha512(b"grabowski-replay-filter-v1\x00" + scope + request).digest()
+    start = int.from_bytes(digest[:8], "big")
+    step = int.from_bytes(digest[8:16], "big") | 1
+    mask = REPLAY_FILTER_BITS - 1
+    return tuple((start + index * step) & mask for index in range(REPLAY_FILTER_HASH_COUNT))
+
+
+def _open_replay_filter() -> int:
+    path = _replay_filter_path()
+    base_flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    created = False
     try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError as exc:
-        raise TransportAssertionReplay("signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state") from exc
-    try:
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            fd = -1
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-
-def _empty_state(scope_sha256: str) -> dict[str, Any]:
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "kind": STATE_KIND,
-        "client_scope_sha256": _sha256(scope_sha256, "transport client scope hash"),
-        "consumed": [],
-    }
-
-
-def _read_state(path: Path, scope_sha256: str) -> dict[str, Any]:
-    try:
-        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        return _empty_state(scope_sha256)
+        fd = os.open(path, base_flags | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(path, base_flags)
     try:
         meta = os.fstat(fd)
-        _validate_private_file(meta, "transport assertion state")
-        if meta.st_size > MAX_STATE_BYTES:
-            raise TransportAssertionError("transport assertion state exceeds size limit")
-        raw = os.read(fd, MAX_STATE_BYTES + 1)
-        if len(raw) > MAX_STATE_BYTES or os.read(fd, 1):
-            raise TransportAssertionError("transport assertion state exceeds size limit")
+        _validate_private_file(meta, "transport assertion replay filter")
+        if created:
+            os.ftruncate(fd, REPLAY_FILTER_TOTAL_BYTES)
+            if os.pwrite(fd, REPLAY_FILTER_HEADER, 0) != len(REPLAY_FILTER_HEADER):
+                raise TransportAssertionError("transport assertion replay filter header write was short")
+            os.fsync(fd)
+            directory_fd = os.open(STATE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        else:
+            if meta.st_size != REPLAY_FILTER_TOTAL_BYTES:
+                raise TransportAssertionError("transport assertion replay filter size mismatch")
+            header = os.pread(fd, REPLAY_FILTER_HEADER_BYTES, 0)
+            if header != REPLAY_FILTER_HEADER:
+                raise TransportAssertionError("transport assertion replay filter header mismatch")
+        return fd
+    except BaseException:
+        os.close(fd)
+        if created:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def _consume_replay_filter(scope_sha256: str, request_id: str) -> None:
+    masks: dict[int, int] = {}
+    for bit in _replay_filter_positions(scope_sha256, request_id):
+        byte_offset = REPLAY_FILTER_HEADER_BYTES + bit // 8
+        masks[byte_offset] = masks.get(byte_offset, 0) | (1 << (bit % 8))
+
+    fd = _open_replay_filter()
+    try:
+        observed: dict[int, int] = {}
+        already_consumed = True
+        for byte_offset, mask in masks.items():
+            raw = os.pread(fd, 1, byte_offset)
+            if len(raw) != 1:
+                raise TransportAssertionError("transport assertion replay filter read was short")
+            value = raw[0]
+            observed[byte_offset] = value
+            if value & mask != mask:
+                already_consumed = False
+        if already_consumed:
+            raise TransportAssertionReplay(
+                "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
+            )
+
+        for byte_offset, mask in masks.items():
+            value = observed[byte_offset] | mask
+            if value == observed[byte_offset]:
+                continue
+            if os.pwrite(fd, bytes((value,)), byte_offset) != 1:
+                raise TransportAssertionError("transport assertion replay filter write was short")
+        # The mutation gate is allowed to continue only after every replay bit is
+        # durable. A crash before this fsync cannot be followed by target execution.
+        os.fsync(fd)
     finally:
         os.close(fd)
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TransportAssertionError("transport assertion state is invalid JSON") from exc
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"schema_version", "kind", "client_scope_sha256", "consumed"}
-        or value.get("schema_version") != SCHEMA_VERSION
-        or value.get("kind") != STATE_KIND
-        or value.get("client_scope_sha256") != scope_sha256
-        or not isinstance(value.get("consumed"), list)
-        or len(value["consumed"]) > MAX_REPLAY_RECORDS
-    ):
-        raise TransportAssertionError("transport assertion state contract mismatch")
-    return value
-
-
-def _write_state(path: Path, state: dict[str, Any]) -> None:
-    raw = json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
-    if len(raw) > MAX_STATE_BYTES:
-        raise TransportAssertionError("transport assertion state exceeds size limit")
-    if path.exists() or path.is_symlink():
-        _validate_private_file(path.lstat(), "existing transport assertion state")
-    tmp = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(16)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(tmp, flags, 0o600)
-    try:
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            fd = -1
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def consume_assertion(
@@ -395,9 +393,9 @@ def consume_assertion(
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
         raise TransportAssertionError("transport assertion runtime binding mismatch")
 
-    path = _tombstone_path(scope_hash, material["request_id"])
+    legacy_path = _tombstone_path(scope_hash, material["request_id"])
     with _state_lock():
-        existing = _read_tombstone(path)
+        existing = _read_tombstone(legacy_path)
         if existing is not None:
             exact = (
                 existing.get("request_id") == material["request_id"]
@@ -412,21 +410,22 @@ def consume_assertion(
             raise TransportAssertionReplay(
                 "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
             )
-        receipt = {
-            "schema_version": SCHEMA_VERSION,
-            "kind": CONSUMPTION_KIND,
-            "request_id": material["request_id"],
-            "client_scope_sha256": scope_hash,
-            "runtime_binding_sha256": material["runtime_binding_sha256"],
-            "issued_at_unix": material["issued_at_unix"],
-            "consumed_at_unix": now,
-            "audience": material["audience"],
-            "tool_name": material["tool_name"],
-            "arguments_sha256": material["arguments_sha256"],
-            "body_sha256": material["body_sha256"],
-        }
-        receipt["receipt_sha256"] = _sha256_json(receipt)
-        _write_tombstone(path, receipt)
+        _consume_replay_filter(scope_hash, material["request_id"])
+
+    receipt = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": CONSUMPTION_KIND,
+        "request_id": material["request_id"],
+        "client_scope_sha256": scope_hash,
+        "runtime_binding_sha256": material["runtime_binding_sha256"],
+        "issued_at_unix": material["issued_at_unix"],
+        "consumed_at_unix": now,
+        "audience": material["audience"],
+        "tool_name": material["tool_name"],
+        "arguments_sha256": material["arguments_sha256"],
+        "body_sha256": material["body_sha256"],
+    }
+    receipt["receipt_sha256"] = _sha256_json(receipt)
     return {
         "schema_version": SCHEMA_VERSION,
         "state": "consumed",
