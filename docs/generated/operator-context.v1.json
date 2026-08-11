@@ -2503,6 +2503,7 @@
         ]
       }
     },
+    "bureau_task_required_for_direct_user_work": false,
     "coding_agent_priority": [
       "claude",
       "codex",
@@ -2517,6 +2518,14 @@
       "grabowski_micro_task",
       "receipt_before_next_step"
     ],
+    "controller_only_effects": [
+      "merge",
+      "deployment",
+      "bureau_terminalization",
+      "closeout"
+    ],
+    "delegated_scoped_writers_allowed": true,
+    "direct_user_lifecycle_source": "work_lane",
     "doc_path": "docs/blocked-action-protocol-v0.md",
     "does_not_establish": [
       "new_privileges",
@@ -2538,6 +2547,12 @@
       "cline"
     ],
     "execution_priority_semantics": "routing_preference_not_model_authority",
+    "fail_closed_conditions": [
+      "live_overlapping_foreign_writer_or_lease",
+      "outcome_unknown",
+      "invalid_runtime_or_audit_state",
+      "missing_cost_approval"
+    ],
     "name": "Operator Relay v0",
     "operator_first_for": [
       "task_decomposition",
@@ -2547,6 +2562,9 @@
       "closeout",
       "recovery"
     ],
+    "overlapping_writer_invariant": "one_authoritative_mutating_writer_per_overlapping_resource_lane",
+    "owner_authorized_automatic_execution": true,
+    "parallel_disjoint_lanes_allowed": true,
     "review_and_contrast_agent_priority": [
       "claude",
       "codex",
@@ -3283,7 +3301,7 @@
   "sources": {
     "blocked_action_protocol": {
       "path": "docs/blocked-action-protocol-v0.md",
-      "sha256": "c036ac1909ec2ffc45332f8e44c1c2e9f4ae776411f9a31149f5d71433be2a87"
+      "sha256": "f65605ffd172e556061ccf0ffcec7c4d7bfc3e6db5352a8dffd483bf960a3989"
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
@@ -3365,7 +3383,7 @@
       "src/grabowski_operator.py": "53bc0020eddddea707730e28a7bb01240198033d8e1c9f622d8b040ec5be5cad",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
-      "src/grabowski_operator_relay.py": "2b2516dd095eddbed08f46d6b9661248efad8a8846777bef5bad802c9491cc59",
+      "src/grabowski_operator_relay.py": "b34fad9dcb4c7a85e58b680559ea233207a34a950a4be5024cae47f63e4994e0",
       "src/grabowski_operator_routing_shadow_capture.py": "1fa2d18cd459873eab3a2535b6e48df5363ae151a24914fbd7693020c29da5b0",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "d37394179cfd7136daa717cf355c759568383fc92618249e8543bd244ac398f3",
