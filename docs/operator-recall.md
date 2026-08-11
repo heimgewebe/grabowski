@@ -29,3 +29,24 @@ The published tool checks its runtime capability helper before querying Chronik.
 Deployment-facing tests execute the published tool function through its real call path. Post-deploy verification invokes the public MCP tool by name. Static source-set tests additionally detect missing imported runtime modules and unqualified capability-helper calls.
 
 Historical recall never establishes current Git state, CI state, runtime state, safe retry, merge readiness, task completion, routing authority or policy authority. Any effect still requires fresh live preflight evidence and the normal current authorization gates.
+
+## Structured historical recall
+
+Chronik-backed recall keeps the event digest as the evidence anchor but exposes the
+already-bound historical context needed for useful matching: observation time, run
+ID, operation, task class, subject scope/component, optional PR number, outcome,
+blocker code and the original task/unit support references. These fields are
+derived only from the validated hash-bound event; they do not add a root-cause or
+current-state claim.
+
+Each historical item also carries a deterministic semantic pattern fingerprint.
+The fingerprint deliberately excludes run ID, timestamp and PR number so repeated
+outcomes for the same target/component/operation/task-class/blocker shape can be
+recognized across runs. `pattern_occurrence_count` and `pattern_summary` count only
+within the bounded query result; they are not global frequency claims. A
+`reuse_condition` describes the fields that should match before the history is
+used as an advisory hint and always requires a fresh live-state and authorization
+check. Historical support references are bounded to six per item; the aggregate
+pattern summary is bounded to 50 entries and exposes an explicit truncation flag,
+while per-item occurrence counts still refer only to the bounded query result. A
+`started` event is explicitly not treated as outcome evidence.
