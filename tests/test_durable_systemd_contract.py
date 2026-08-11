@@ -58,16 +58,16 @@ class DurableSystemdContractTests(unittest.TestCase):
         self.assertIn("--service tunnel-client-grabowski.service", tunnel)
         self.assertNotIn("grabowski-operator.service", tunnel)
 
-    def test_tunnel_restart_follows_operator_without_failure_binding(self) -> None:
+    def test_tunnel_restart_follows_signed_ingress_without_failure_binding(self) -> None:
         text = (
             ROOT
             / "systemd"
             / "tunnel-client-grabowski.service.d"
             / "70-operator-dependency.conf.example"
         ).read_text(encoding="utf-8")
-        self.assertIn("Wants=grabowski-operator.service", text)
-        self.assertIn("After=grabowski-operator.service", text)
-        self.assertIn("PartOf=grabowski-operator.service", text)
+        self.assertIn("Wants=grabowski-transport-ingress.service", text)
+        self.assertIn("After=grabowski-transport-ingress.service", text)
+        self.assertIn("PartOf=grabowski-transport-ingress.service", text)
         self.assertNotIn("BindsTo=", text)
 
     def test_watchdog_cadence_matches_probe_cost(self) -> None:

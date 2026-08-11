@@ -500,7 +500,6 @@ def _require_transport_roundtrip_for_tool(
             "readOnlyHint annotation"
         )
     _require_current_serving_process()
-    client_scope = base._transport_roundtrip_client_scope(context)
     runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
         arguments_sha256 = (
@@ -509,6 +508,17 @@ def _require_transport_roundtrip_for_tool(
             )
         )
         tool_name_text = str(tool_name)
+        signed_transport = getattr(base, "_transport_signed_one_call_evidence", None)
+        if callable(signed_transport):
+            signed_evidence = signed_transport(
+                context,
+                tool_name=tool_name_text,
+                arguments_sha256=arguments_sha256,
+                runtime_binding=runtime_binding,
+            )
+            if signed_evidence is not None:
+                return signed_evidence
+        client_scope = base._transport_roundtrip_client_scope(context)
         return grabowski_transport_roundtrip.consume_verified(
             client_scope=client_scope,
             runtime_binding=runtime_binding,

@@ -63,6 +63,7 @@ class WatchdogHostAssetProjection:
 
 TUNNEL_SERVICE = "tunnel-client-grabowski.service"
 OPERATOR_SERVICE = "grabowski-operator.service"
+TRANSPORT_INGRESS_SERVICE = "grabowski-transport-ingress.service"
 SAFETY_OBSERVER_SERVICE = "grabowski-safety-observer.service"
 SAFETY_OBSERVER_UNIT_RELATIVE = Path("systemd/grabowski-safety-observer.service.example")
 SAFETY_OBSERVER_UNIT_PATH = core.HOME / ".config/systemd/user/grabowski-safety-observer.service"
@@ -75,9 +76,9 @@ TUNNEL_OPERATOR_DEPENDENCY_PATH = (
 )
 TUNNEL_OPERATOR_DEPENDENCY_EXPECTED_DIRECTIVES = {
     "Unit": {
-        "Wants": OPERATOR_SERVICE,
-        "After": OPERATOR_SERVICE,
-        "PartOf": OPERATOR_SERVICE,
+        "Wants": TRANSPORT_INGRESS_SERVICE,
+        "After": TRANSPORT_INGRESS_SERVICE,
+        "PartOf": TRANSPORT_INGRESS_SERVICE,
     }
 }
 TUNNEL_OPERATOR_DEPENDENCY_EFFECTIVE_PROPERTIES = (
@@ -90,6 +91,17 @@ TUNNEL_OPERATOR_DEPENDENCY_EFFECTIVE_PROPERTIES = (
 )
 WATCHDOG_HOST_ASSET_MAX_BYTES = 1_048_576
 WATCHDOG_HOST_ASSETS = (
+    WatchdogHostAsset(
+        source=Path("tools/grabowski_transport_ingress.py"),
+        target=core.HOME / ".local/libexec/grabowski/grabowski_transport_ingress.py",
+        mode=0o700,
+    ),
+    WatchdogHostAsset(
+        source=Path("systemd/grabowski-transport-ingress.service.example"),
+        target=core.HOME / ".config/systemd/user/grabowski-transport-ingress.service",
+        mode=0o600,
+        unit=TRANSPORT_INGRESS_SERVICE,
+    ),
     WatchdogHostAsset(
         source=Path("tools/watchdog_admission_recovery.py"),
         target=(
@@ -224,6 +236,12 @@ OBSERVER_USER_CAPABILITY_INCOMPATIBLE_DIRECTIVES = frozenset(
 OBSERVER_SAFETY_REPAIR_MARKER = "observer_safety_repair_retained_v1"
 OPERATOR_LISTENER_HOST = "127.0.0.1"
 OPERATOR_LISTENER_PORT = 18181
+TRANSPORT_INGRESS_LISTENER_PORT = 18180
+TRANSPORT_INGRESS_AUTH_HEADER = "X-Grabowski-Ingress-Auth"
+TRANSPORT_CONNECTOR_TOKEN_PATH = core.HOME / ".local/state/grabowski/transport-connectors/primary.token"
+LEGACY_TUNNEL_OPERATOR_PORT = OPERATOR_LISTENER_PORT
+TUNNEL_TARGET_PORTS = frozenset({LEGACY_TUNNEL_OPERATOR_PORT, TRANSPORT_INGRESS_LISTENER_PORT})
+TRANSPORT_INGRESS_HEALTH_URL = f"http://127.0.0.1:{TRANSPORT_INGRESS_LISTENER_PORT}/_grabowski/transport-ingress"
 OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
 TUNNEL_METRICS_URL = core.HEALTH_URL.rsplit("/", 1)[0] + "/metrics"
 TUNNEL_DRAIN_QUEUE_GAUGE_NAME = "commands_queue_length"
@@ -295,6 +313,18 @@ class ProfileTopology:
     kind: str
     legacy_entrypoint: core.EntryPoint | None = None
     server_url_count: int = 0
+    server_url_port: int | None = None
+
+
+@dataclass(frozen=True)
+class TunnelProfileCutover:
+    before: bytes
+    before_sha256: str
+    before_identity: tuple[int, int]
+    after_sha256: str
+    mode: int
+    before_port: int
+    after_port: int
 
 
 @dataclass(frozen=True)
@@ -1559,11 +1589,11 @@ def verify_tunnel_operator_dependency(
     if observed["LoadState"] != ("loaded",):
         violations.append("LoadState")
     for name in ("Wants", "After"):
-        if OPERATOR_SERVICE not in observed[name]:
+        if TRANSPORT_INGRESS_SERVICE not in observed[name]:
             violations.append(name)
-    if observed["PartOf"] != (OPERATOR_SERVICE,):
+    if observed["PartOf"] != (TRANSPORT_INGRESS_SERVICE,):
         violations.append("PartOf")
-    if OPERATOR_SERVICE in observed["BindsTo"]:
+    if TRANSPORT_INGRESS_SERVICE in observed["BindsTo"]:
         violations.append("BindsTo")
     expected_dropin = str(asset.target.resolve())
     loaded_dropins = {str(Path(path).resolve()) for path in observed["DropInPaths"]}
@@ -1978,9 +2008,28 @@ def _server_url_count(data: Any) -> int:
         port = parsed.port
     except ValueError:
         core.fail("Tunnelprofil server_urls-Eintrag ist keine gültige URL")
-    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or port != 18181 or parsed.path.rstrip("/") != "/mcp" or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None):
-        core.fail("Tunnelprofil server_urls ist nicht der gebundene Loopback-Operator")
+    if (parsed.scheme != "http" or parsed.hostname != "127.0.0.1" or port not in TUNNEL_TARGET_PORTS or parsed.path.rstrip("/") != "/mcp" or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None):
+        core.fail("Tunnelprofil server_urls ist weder der gebundene Legacy-Operator noch der signierte Loopback-Ingress")
     return 1
+
+
+def _server_url_port(data: Any) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    mcp = data.get("mcp")
+    if not isinstance(mcp, dict):
+        return None
+    values = mcp.get("server_urls")
+    if not isinstance(values, list) or len(values) != 1:
+        return None
+    item = values[0]
+    url = item if isinstance(item, str) else item.get("url") if isinstance(item, dict) else None
+    if not isinstance(url, str):
+        return None
+    try:
+        return urlsplit(url).port
+    except ValueError:
+        return None
 
 
 def profile_topology(profile_path: Path, runtime: Path) -> ProfileTopology:
@@ -1995,13 +2044,16 @@ def profile_topology(profile_path: Path, runtime: Path) -> ProfileTopology:
         core.fail("Tunnelprofil enthält mehr als einen strukturierten command")
 
     server_url_count = _server_url_count(data)
+    server_url_port = _server_url_port(data)
     if typed_commands and server_url_count:
         core.fail("Tunnelprofil mischt command- und server_urls-Topologie")
     if typed_commands == 0 and server_url_count == 0:
         core.fail("Tunnelprofil enthält weder command noch server_urls")
 
     if server_url_count:
-        return ProfileTopology("url", server_url_count=server_url_count)
+        return ProfileTopology(
+            "url", server_url_count=server_url_count, server_url_port=server_url_port
+        )
 
     if string_commands:
         argv = shlex.split(string_commands[0])
@@ -2025,6 +2077,362 @@ def profile_topology(profile_path: Path, runtime: Path) -> ProfileTopology:
             module=argv[2],
         ),
     )
+
+
+def _profile_bytes_sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _profile_regular_metadata(profile_path: Path) -> os.stat_result:
+    linked = profile_path.lstat()
+    if (
+        statmod.S_ISLNK(linked.st_mode)
+        or not statmod.S_ISREG(linked.st_mode)
+        or linked.st_uid != os.geteuid()
+        or linked.st_nlink != 1
+        or statmod.S_IMODE(linked.st_mode) & 0o022
+        or linked.st_size > 1_048_576
+    ):
+        core.fail("Tunnelprofil ist keine sichere eigentümerkontrollierte Datei")
+    return linked
+
+
+def _read_profile_revision(profile_path: Path) -> tuple[bytes, os.stat_result]:
+    linked = _profile_regular_metadata(profile_path)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(profile_path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino):
+            core.fail("Tunnelprofil driftete während des sicheren Öffnens")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > 1_048_576:
+                core.fail("Tunnelprofil überschreitet die Größenbegrenzung")
+        verified = os.fstat(descriptor)
+        remapped = profile_path.lstat()
+        if (
+            (verified.st_dev, verified.st_ino) != (linked.st_dev, linked.st_ino)
+            or (remapped.st_dev, remapped.st_ino) != (linked.st_dev, linked.st_ino)
+            or verified.st_size != total
+            or verified.st_mtime_ns != linked.st_mtime_ns
+        ):
+            core.fail("Tunnelprofil driftete während des sicheren Lesens")
+        return b"".join(chunks), verified
+    finally:
+        os.close(descriptor)
+
+
+def _descriptor_bound_profile_write(
+    profile_path: Path,
+    value: bytes,
+    *,
+    mode: int,
+    expected_identity: tuple[int, int],
+    expected_sha256: str,
+) -> None:
+    parent_linked = profile_path.parent.lstat()
+    if statmod.S_ISLNK(parent_linked.st_mode) or not statmod.S_ISDIR(parent_linked.st_mode):
+        core.fail("Tunnelprofil-Verzeichnis ist nicht sicher")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(profile_path.parent, directory_flags)
+    descriptor = -1
+    try:
+        parent_opened = os.fstat(directory_fd)
+        if (parent_opened.st_dev, parent_opened.st_ino) != (
+            parent_linked.st_dev,
+            parent_linked.st_ino,
+        ):
+            core.fail("Tunnelprofil-Verzeichnis driftete während des Öffnens")
+        linked = os.stat(
+            profile_path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not statmod.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.geteuid()
+            or linked.st_nlink != 1
+            or statmod.S_IMODE(linked.st_mode) & 0o022
+            or linked.st_size > 1_048_576
+        ):
+            core.fail("Tunnelprofil ist vor dem descriptorgebundenen Commit unsicher")
+        flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(profile_path.name, flags, dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if opened_identity != expected_identity or opened_identity != (
+            linked.st_dev,
+            linked.st_ino,
+        ):
+            core.fail("Tunnelprofil driftete vor dem descriptorgebundenen Commit")
+        current = bytearray()
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 65536, offset)
+            if not chunk:
+                break
+            current.extend(chunk)
+            offset += len(chunk)
+            if len(current) > 1_048_576:
+                core.fail("Tunnelprofil überschreitet die Größenbegrenzung")
+        before_write = os.stat(
+            profile_path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (before_write.st_dev, before_write.st_ino) != expected_identity:
+            core.fail("Tunnelprofil driftete vor dem descriptorgebundenen Commit")
+        if (
+            _profile_bytes_sha256(bytes(current)) != expected_sha256
+            or statmod.S_IMODE(opened.st_mode) != mode
+        ):
+            core.fail("Tunnelprofil-Preimage stimmt vor dem Commit nicht überein")
+        view = memoryview(value)
+        offset = 0
+        while view:
+            written = os.pwrite(descriptor, view, offset)
+            if written <= 0:
+                core.fail("Tunnelprofil wurde nicht vollständig geschrieben")
+            view = view[written:]
+            offset += written
+        os.ftruncate(descriptor, len(value))
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        installed = os.fstat(descriptor)
+        installed_value = bytearray()
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 65536, offset)
+            if not chunk:
+                break
+            installed_value.extend(chunk)
+            offset += len(chunk)
+            if len(installed_value) > 1_048_576:
+                core.fail("Installiertes Tunnelprofil überschreitet die Größenbegrenzung")
+        remapped = os.stat(
+            profile_path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (remapped.st_dev, remapped.st_ino) != expected_identity:
+            core.fail(
+                "Tunnelprofilpfad driftete während des descriptorgebundenen Commits; fremder Pfadzustand blieb unangetastet"
+            )
+        if (
+            (installed.st_dev, installed.st_ino) != expected_identity
+            or bytes(installed_value) != value
+            or installed.st_size != len(value)
+            or statmod.S_IMODE(installed.st_mode) != mode
+        ):
+            core.fail(
+                "Tunnelprofil-Commit konnte am gebundenen Inode nicht verifiziert werden"
+            )
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _transport_ingress_auth_reference() -> str:
+    return f"{TRANSPORT_INGRESS_AUTH_HEADER}: file:{TRANSPORT_CONNECTOR_TOKEN_PATH}"
+
+
+def _transport_ingress_auth_block() -> bytes:
+    return (
+        f'  extra_headers:\n    - "{_transport_ingress_auth_reference()}"\n'
+    ).encode("utf-8")
+
+
+def _plain_profile_key(line: bytes, *, indent: int) -> str:
+    if b"\r" in line:
+        core.fail("Tunnelprofil verwendet nicht-kanonische Zeilenenden")
+    prefix = b" " * indent
+    if not line.startswith(prefix):
+        core.fail("Tunnelprofil enthält eine unerwartete YAML-Einrückung")
+    content = line[indent:].rstrip(b"\n")
+    if not content or content.startswith((b" ", b"\t")) or b":" not in content:
+        core.fail("Tunnelprofil enthält einen mehrdeutigen YAML-Schlüssel")
+    raw_key = content.split(b":", 1)[0]
+    allowed = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+    if not raw_key or any(byte not in allowed for byte in raw_key):
+        core.fail("Tunnelprofil enthält einen nicht-kanonischen YAML-Schlüssel")
+    try:
+        return raw_key.decode("ascii")
+    except UnicodeDecodeError:
+        core.fail("Tunnelprofil enthält einen nicht-ASCII YAML-Schlüssel")
+        raise AssertionError
+
+
+def _mcp_profile_block_bounds(value: bytes) -> tuple[int, int]:
+    mcp_start: int | None = None
+    mcp_end: int | None = None
+    offset = 0
+    for line in value.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or line.lstrip(b" ").startswith(b"#"):
+            offset += len(line)
+            continue
+        if line.startswith((b" ", b"\t")):
+            offset += len(line)
+            continue
+        key = _plain_profile_key(line, indent=0)
+        if key == "mcp":
+            if mcp_start is not None or line != b"mcp:\n":
+                core.fail("Tunnelprofil-mcp-Block ist nicht eindeutig kanonisch")
+            mcp_start = offset + len(line)
+        elif mcp_start is not None and mcp_end is None:
+            mcp_end = offset
+        offset += len(line)
+    if mcp_start is None:
+        core.fail("Tunnelprofil besitzt keinen kanonischen mcp-Block")
+    return mcp_start, len(value) if mcp_end is None else mcp_end
+
+
+def _mcp_direct_children(block: bytes) -> list[tuple[str, bytes]]:
+    children: list[tuple[str, bytes]] = []
+    for line in block.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped or line.lstrip(b" ").startswith(b"#"):
+            continue
+        leading = line[: len(line) - len(line.lstrip(b" \t"))]
+        if b"\t" in leading:
+            core.fail("Tunnelprofil-mcp-Block verwendet Tab-Einrückung")
+        indent = len(leading)
+        if indent == 2:
+            children.append((_plain_profile_key(line, indent=2), line))
+        elif indent < 4:
+            core.fail("Tunnelprofil-mcp-Block verwendet mehrdeutige Einrückung")
+    return children
+
+
+def _add_transport_ingress_auth(before: bytes) -> bytes:
+    start, end = _mcp_profile_block_bounds(before)
+    block = before[start:end]
+    expected = _transport_ingress_auth_block()
+    auth_children = [line for key, line in _mcp_direct_children(block) if key == "extra_headers"]
+    if auth_children:
+        if auth_children == [b"  extra_headers:\n"] and block.count(expected) == 1:
+            return before
+        core.fail("Tunnelprofil besitzt fremde MCP-Extra-Header; Ingress-Auth wird nicht blind überschrieben")
+    return before[:start] + expected + before[start:]
+
+
+def require_transport_ingress_auth_profile(profile_path: Path) -> None:
+    raw = profile_path.read_bytes()
+    start, end = _mcp_profile_block_bounds(raw)
+    block = raw[start:end]
+    expected = _transport_ingress_auth_block()
+    auth_children = [line for key, line in _mcp_direct_children(block) if key == "extra_headers"]
+    if auth_children != [b"  extra_headers:\n"] or block.count(expected) != 1:
+        core.fail("Tunnelprofil authentisiert den signierten Ingress nicht exakt")
+
+
+def capture_tunnel_profile_cutover(profile_path: Path, runtime: Path) -> TunnelProfileCutover:
+    before, linked = _read_profile_revision(profile_path)
+    topology = profile_topology(profile_path, runtime)
+    if topology.kind != "url" or topology.server_url_port not in TUNNEL_TARGET_PORTS:
+        core.fail("Tunnelprofil besitzt keine cutover-fähige URL-Topologie")
+    before_port = int(topology.server_url_port)
+    if before_port == TRANSPORT_INGRESS_LISTENER_PORT:
+        after = before
+    else:
+        legacy = b"http://127.0.0.1:18181/mcp"
+        target = b"http://127.0.0.1:18180/mcp"
+        if before.count(legacy) != 1:
+            core.fail("Legacy-Tunnelziel ist nicht exakt einmal im Profil gebunden")
+        after = before.replace(legacy, target, 1)
+    after = _add_transport_ingress_auth(after)
+    return TunnelProfileCutover(
+        before=before,
+        before_sha256=_profile_bytes_sha256(before),
+        before_identity=(linked.st_dev, linked.st_ino),
+        after_sha256=_profile_bytes_sha256(after),
+        mode=statmod.S_IMODE(linked.st_mode),
+        before_port=before_port,
+        after_port=TRANSPORT_INGRESS_LISTENER_PORT,
+    )
+
+
+def apply_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCutover) -> dict[str, Any]:
+    current, current_info = _read_profile_revision(profile_path)
+    digest = _profile_bytes_sha256(current)
+    if (current_info.st_dev, current_info.st_ino) != cutover.before_identity:
+        core.fail("Tunnelprofil-Identität driftete seit dem Cutover-Preflight")
+    if digest == cutover.after_sha256:
+        return {"changed": False, "profile_sha256": digest, "port": cutover.after_port}
+    if digest != cutover.before_sha256:
+        core.fail("Tunnelprofil driftete vor dem signierten Ingress-Cutover")
+    legacy = b"http://127.0.0.1:18181/mcp"
+    target = b"http://127.0.0.1:18180/mcp"
+    if cutover.before_port == TRANSPORT_INGRESS_LISTENER_PORT:
+        replacement = current
+    else:
+        if current.count(legacy) != 1:
+            core.fail("Legacy-Tunnelziel driftete vor dem Cutover")
+        replacement = current.replace(legacy, target, 1)
+    replacement = _add_transport_ingress_auth(replacement)
+    if _profile_bytes_sha256(replacement) != cutover.after_sha256:
+        core.fail("Tunnelprofil-Cutover stimmt nicht mit dem Preflight überein")
+    _descriptor_bound_profile_write(
+        profile_path,
+        replacement,
+        mode=cutover.mode,
+        expected_identity=cutover.before_identity,
+        expected_sha256=cutover.before_sha256,
+    )
+    installed, _ = _read_profile_revision(profile_path)
+    if _profile_bytes_sha256(installed) != cutover.after_sha256:
+        core.fail("Tunnelprofil-Cutover-Readback ist inkonsistent")
+    return {"changed": replacement != current, "profile_sha256": cutover.after_sha256, "port": cutover.after_port}
+
+
+def restore_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCutover) -> dict[str, Any]:
+    current, current_info = _read_profile_revision(profile_path)
+    digest = _profile_bytes_sha256(current)
+    if (current_info.st_dev, current_info.st_ino) != cutover.before_identity:
+        core.fail(
+            "Tunnelprofil-Identität driftete während des Rollbacks; fremder Zustand wird nicht überschrieben"
+        )
+    if digest == cutover.before_sha256:
+        return {"restored": False, "profile_sha256": digest, "port": cutover.before_port}
+    if digest != cutover.after_sha256:
+        core.fail("Tunnelprofil driftete während des Rollbacks; fremder Zustand wird nicht überschrieben")
+    _descriptor_bound_profile_write(
+        profile_path,
+        cutover.before,
+        mode=cutover.mode,
+        expected_identity=cutover.before_identity,
+        expected_sha256=cutover.after_sha256,
+    )
+    restored, _ = _read_profile_revision(profile_path)
+    if _profile_bytes_sha256(restored) != cutover.before_sha256:
+        core.fail("Tunnelprofil-Rollback-Readback ist inkonsistent")
+    return {"restored": True, "profile_sha256": cutover.before_sha256, "port": cutover.before_port}
+
+
+def require_transport_ingress_health() -> dict[str, Any]:
+    request = Request(TRANSPORT_INGRESS_HEALTH_URL, headers={"Cache-Control": "no-store", "Accept": "application/json"}, method="GET")
+    try:
+        with urlopen(request, timeout=2) as response:
+            status = int(response.status)
+            raw = response.read(8193)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        core.fail("Signierter Transport-Ingress ist nicht erreichbar", details={"error_type": type(exc).__name__})
+    if status != 200 or len(raw) > 8192:
+        core.fail("Signierter Transport-Ingress lieferte keinen gültigen Health-Status")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        core.fail("Transport-Ingress-Health ist kein gültiges JSON", details={"error_type": type(exc).__name__})
+    if not isinstance(value, dict) or value.get("healthy") is not True or value.get("assertion_version") != "signed-one-call-v1":
+        core.fail("Transport-Ingress-Health entspricht nicht dem One-Call-Vertrag")
+    return value
 
 
 def require_topology_matches_contract(
@@ -3483,6 +3891,8 @@ def rollback_url(
     contract: core.RuntimeContract,
     timeout_seconds: int,
     admission_marker: dict[str, Any] | None = None,
+    profile_path: Path | None = None,
+    profile_cutover: TunnelProfileCutover | None = None,
 ) -> NoReturn:
     phases: dict[str, Any] = {}
     errors: list[dict[str, Any]] = []
@@ -3499,6 +3909,14 @@ def rollback_url(
         return True, value
 
     tunnel_ok, tunnel = step("stop-tunnel", lambda: stop_service(TUNNEL_SERVICE))
+    if profile_cutover is not None:
+        step("stop-transport-ingress", lambda: stop_service(TRANSPORT_INGRESS_SERVICE))
+    profile_restore_ok = True
+    if profile_path is not None and profile_cutover is not None:
+        profile_restore_ok, _ = step(
+            "restore-tunnel-profile",
+            lambda: restore_tunnel_profile_cutover(profile_path, profile_cutover),
+        )
     operator_ok, operator = step("stop-operator", lambda: stop_service(OPERATOR_SERVICE))
     if not (tunnel_ok and isinstance(tunnel, core.ServiceObservation) and tunnel.confirmed_inactive and operator_ok and isinstance(operator, core.ServiceObservation) and operator.confirmed_inactive):
         payload = {"original": _error_summary(original), "phases": phases, "errors": errors, "pointer_restore": "not-attempted"}
@@ -3533,7 +3951,23 @@ def rollback_url(
             )
     tunnel_start_ok = False
     started_tunnel = None
-    if listener_ok and listener is not None and admission_ok:
+    ingress_ready = profile_restore_ok
+    if (
+        profile_restore_ok
+        and profile_cutover is not None
+        and profile_cutover.before_port == TRANSPORT_INGRESS_LISTENER_PORT
+    ):
+        ingress_ok, _ = step("start-transport-ingress", lambda: start_service(TRANSPORT_INGRESS_SERVICE))
+        if ingress_ok:
+            ingress_ok, _ = step("transport-ingress-health", require_transport_ingress_health)
+        ingress_ready = ingress_ok
+    if (
+        listener_ok
+        and listener is not None
+        and admission_ok
+        and profile_restore_ok
+        and ingress_ready
+    ):
         tunnel_start_ok, started_tunnel = step("start-tunnel", lambda: start_service(TUNNEL_SERVICE))
         if tunnel_start_ok and started_tunnel is not None and admission_marker is not None:
             admission_ok, admission = step(
@@ -3581,6 +4015,7 @@ def rollback_url(
         "pointer_restore": "restored",
         "operator_identity": "verified" if identity_ok and identity is not None else "failed",
         "operator_admission": "verified" if admission_ok else "failed",
+        "tunnel_profile_restore": "verified" if profile_restore_ok else "failed",
         "readiness": "verified" if ready_ok and isinstance(ready, DualReadiness) and ready.ok else "failed",
         "admission_release": admission_release,
     }
@@ -3618,6 +4053,11 @@ def deploy_url(
     timeout_seconds: int,
 ) -> None:
     snapshot, runtime, topology = preflight_url(repo, runtime, profile_path)
+    profile_cutover = (
+        capture_tunnel_profile_cutover(profile_path, runtime)
+        if topology.kind == "url" and topology.server_url_port in TUNNEL_TARGET_PORTS
+        else None
+    )
     if topology.kind == "legacy-stdio":
         core.deploy(
             repo,
@@ -3690,6 +4130,9 @@ def deploy_url(
             verify_operator_deployment_admission(admission_marker)
         phase = "stop-tunnel"
         stop_service(TUNNEL_SERVICE)
+        if profile_cutover is not None:
+            phase = "stop-transport-ingress"
+            stop_service(TRANSPORT_INGRESS_SERVICE)
         phase = "stop-operator"
         stop_service(OPERATOR_SERVICE)
 
@@ -3718,6 +4161,18 @@ def deploy_url(
         require_operator_listener(timeout_seconds=timeout_seconds)
         phase = "operator-admission-replacement-guard"
         verify_operator_deployment_admission(admission_marker)
+
+        if profile_cutover is not None:
+            phase = "start-transport-ingress"
+            start_service(TRANSPORT_INGRESS_SERVICE)
+            require_service_active(TRANSPORT_INGRESS_SERVICE)
+            require_transport_ingress_health()
+            phase = "cutover-tunnel-profile"
+            apply_tunnel_profile_cutover(profile_path, profile_cutover)
+            cutover_topology = profile_topology(profile_path, runtime)
+            if cutover_topology.kind != "url" or cutover_topology.server_url_port != TRANSPORT_INGRESS_LISTENER_PORT:
+                core.fail("Tunnelprofil ist nach Cutover nicht an den signierten Ingress gebunden")
+            require_transport_ingress_auth_profile(profile_path)
 
         phase = "start-tunnel"
         start_service(TUNNEL_SERVICE)
@@ -3834,6 +4289,8 @@ def deploy_url(
             contract=snapshot.contract,
             timeout_seconds=timeout_seconds,
             admission_marker=admission_marker,
+            profile_path=profile_path,
+            profile_cutover=profile_cutover,
         )
 
 

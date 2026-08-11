@@ -1,0 +1,32 @@
+[Unit]
+Description=Grabowski signed transport ingress
+After=grabowski-operator.service
+Wants=grabowski-operator.service
+PartOf=grabowski-operator.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+ExecStart=%h/.local/share/grabowski-mcp/.venv/bin/python %h/.local/libexec/grabowski/grabowski_transport_ingress.py --host 127.0.0.1 --port 18180 --upstream http://127.0.0.1:18181/mcp --token-file %h/.local/state/grabowski/transport-connectors/primary.token
+Restart=on-failure
+RestartSec=2
+TimeoutStartSec=20
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+LimitCORE=0
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target
