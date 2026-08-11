@@ -2247,7 +2247,8 @@ def _transport_ingress_auth_reference() -> str:
 
 def _transport_ingress_auth_block() -> bytes:
     return (
-        f'  extra_headers:\n    - "{_transport_ingress_auth_reference()}"\n'
+        "  extra_headers:\n"
+        f'    "{TRANSPORT_INGRESS_AUTH_HEADER}": "file:{TRANSPORT_CONNECTOR_TOKEN_PATH}"\n'
     ).encode("utf-8")
 
 

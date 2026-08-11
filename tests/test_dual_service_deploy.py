@@ -3697,8 +3697,15 @@ class SignedIngressProfileCutoverTests(unittest.TestCase):
             applied = dual.apply_tunnel_profile_cutover(profile, cutover)
             self.assertTrue(applied["changed"])
             self.assertIn(b"127.0.0.1:18180/mcp", profile.read_bytes())
-            self.assertIn(
-                dual._transport_ingress_auth_reference().encode("utf-8"),
+            expected_auth_block = (
+                "  extra_headers:\n"
+                f'    "{dual.TRANSPORT_INGRESS_AUTH_HEADER}": '
+                f'"file:{dual.TRANSPORT_CONNECTOR_TOKEN_PATH}"\n'
+            ).encode("utf-8")
+            self.assertEqual(expected_auth_block, dual._transport_ingress_auth_block())
+            self.assertIn(expected_auth_block, profile.read_bytes())
+            self.assertNotIn(
+                f'    - "{dual._transport_ingress_auth_reference()}"'.encode("utf-8"),
                 profile.read_bytes(),
             )
             self.assertIn(b"OpenAI-Organization: \"org-test\"", profile.read_bytes())
