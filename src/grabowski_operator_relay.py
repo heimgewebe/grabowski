@@ -90,6 +90,7 @@ def operator_relay_protocol() -> dict[str, Any]:
                     "merge",
                     "deployment",
                     "bureau_terminalization",
+                    "closeout",
                 ],
             },
             "reviewer": {

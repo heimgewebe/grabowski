@@ -2494,7 +2494,8 @@
         "forbidden_without_controller": [
           "merge",
           "deployment",
-          "bureau_terminalization"
+          "bureau_terminalization",
+          "closeout"
         ],
         "requires": [
           "explicit_lane",
@@ -3383,7 +3384,7 @@
       "src/grabowski_operator.py": "53bc0020eddddea707730e28a7bb01240198033d8e1c9f622d8b040ec5be5cad",
       "src/grabowski_operator_obligation.py": "6e7fb48bb6340ce04607b75a65a8e4f37dd8e80be34607d0c0771c41c105c8b7",
       "src/grabowski_operator_optimization.py": "f20ef7413ec8d38aeea9e68f1294f729eced48047844e4a17de0890e3fb697b8",
-      "src/grabowski_operator_relay.py": "b34fad9dcb4c7a85e58b680559ea233207a34a950a4be5024cae47f63e4994e0",
+      "src/grabowski_operator_relay.py": "66d61095b1bc12545e81ec1072fc4330ec88f1f27b460a6487fe8fbbf0ed1bc2",
       "src/grabowski_operator_routing_shadow_capture.py": "1fa2d18cd459873eab3a2535b6e48df5363ae151a24914fbd7693020c29da5b0",
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "d37394179cfd7136daa717cf355c759568383fc92618249e8543bd244ac398f3",

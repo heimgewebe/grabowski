@@ -53,10 +53,9 @@ class OperatorRelayTests(unittest.TestCase):
                 "pull_request_create_or_update",
             ],
         )
-        self.assertEqual(
-            self.protocol["controller_only_effects"],
-            ["merge", "deployment", "bureau_terminalization", "closeout"],
-        )
+        controller_only = ["merge", "deployment", "bureau_terminalization", "closeout"]
+        self.assertEqual(self.protocol["controller_only_effects"], controller_only)
+        self.assertEqual(writer["forbidden_without_controller"], controller_only)
         self.assertTrue(writer["authoritative_within_lane"])
         self.assertEqual(
             writer["requires"],
