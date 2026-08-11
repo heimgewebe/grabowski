@@ -29,6 +29,19 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SUCCESS_STATES = frozenset({"CREATED", "ALREADY_CORRECT"})
 TERMINAL_STATES = frozenset({"CREATED", "ALREADY_CORRECT", "CONFLICT", "REJECTED_BY_LEASE", "NOT_ACCEPTED"})
 MAX_RECEIPT_BYTES = 1_048_576
+LEASE_STATUS_OK = "ok"
+LEASE_STATUS_MISSING = "missing"
+LEASE_STATUS_EXPIRED = "expired"
+LEASE_STATUS_FOREIGN_OWNER = "foreign_owner"
+LEASE_STATUS_UNREADABLE = "unreadable"
+LEASE_BLOCKING_STATUSES = (
+    LEASE_STATUS_MISSING,
+    LEASE_STATUS_EXPIRED,
+    LEASE_STATUS_FOREIGN_OWNER,
+    LEASE_STATUS_UNREADABLE,
+)
+LEASE_REMEDIATION_MAX_KEYS = 16
+LEASE_ACQUIRING_GRIP = "work-acquire"
 
 
 class WorktreeEnsurePreflight(ValueError):
@@ -480,20 +493,103 @@ def _observe_after_possible_effect(
         ) from exc
 
 
+def _lease_remediation(owner_id: str, checked: list[dict[str, Any]]) -> dict[str, Any]:
+    """Turn a failed lease precondition into one typed, actionable next step.
+
+    The gate itself is correct; without this the caller only learns *that* it was
+    rejected and repeats the same unacquired call.
+    """
+    buckets = {
+        status: [
+            str(entry.get("resource_key"))
+            for entry in checked
+            if entry.get("status") == status
+        ][:LEASE_REMEDIATION_MAX_KEYS]
+        for status in LEASE_BLOCKING_STATUSES
+    }
+    blocking = [status for status in LEASE_BLOCKING_STATUSES if buckets[status]]
+    remediation: dict[str, Any] = {
+        "schema_version": 1,
+        "lease_owner_id": owner_id,
+        "satisfied": not blocking,
+        "blocking_statuses": blocking,
+        "missing_resource_keys": buckets[LEASE_STATUS_MISSING],
+        "expired_resource_keys": buckets[LEASE_STATUS_EXPIRED],
+        "foreign_owner_resource_keys": buckets[LEASE_STATUS_FOREIGN_OWNER],
+        "unreadable_resource_keys": buckets[LEASE_STATUS_UNREADABLE],
+        "acquiring_grip": None,
+        "retry_safe_after_remediation": False,
+        "does_not_establish": [
+            "lease acquisition authority",
+            "permission to override a live foreign lease",
+            "absence of a later lease change before mutation",
+        ],
+    }
+    if not blocking:
+        remediation["retry_safe_after_remediation"] = True
+        remediation["recommended_next_action"] = (
+            "lease precondition is satisfied; no remediation is required"
+        )
+        return remediation
+
+    if buckets[LEASE_STATUS_UNREADABLE]:
+        remediation["recommended_next_action"] = (
+            "do not retry: the lease store could not be read for "
+            f"{', '.join(buckets[LEASE_STATUS_UNREADABLE])}; repair lease-store access first, "
+            "because an unreadable lease is not evidence of an acquirable resource"
+        )
+        return remediation
+
+    if buckets[LEASE_STATUS_FOREIGN_OWNER]:
+        remediation["recommended_next_action"] = (
+            "do not retry unchanged: a live lease owned by another owner holds "
+            f"{', '.join(buckets[LEASE_STATUS_FOREIGN_OWNER])}; coordinate with that owner or wait "
+            "for expiry, then re-read the lease before any retry"
+        )
+        return remediation
+
+    # Missing and expired keys are both *acquired*, never renewed: a lease that has
+    # already expired is rejected by grabowski_resource_renew, and acquisition only
+    # conflicts with a live lease held by another owner.
+    acquirable = buckets[LEASE_STATUS_MISSING] + buckets[LEASE_STATUS_EXPIRED]
+    remediation["acquiring_grip"] = LEASE_ACQUIRING_GRIP
+    remediation["retry_safe_after_remediation"] = True
+    remediation["recommended_next_action"] = (
+        f"acquire the leases for {', '.join(acquirable)} — run the {LEASE_ACQUIRING_GRIP} grip "
+        "with the same repo, branch and target_path to bind lane, leases and worktree atomically "
+        "in one call, or acquire the exact resource keys with grabowski_resource_acquire (an "
+        "expired lease is re-acquired, not renewed: grabowski_resource_renew rejects a lease that "
+        "has already expired); then retry with a new idempotency_key, because this rejection is "
+        "durable evidence and the current key replays it unchanged without re-reading the leases"
+    )
+    return remediation
+
+
 def _lease_state(inputs: dict[str, Any], inspect_lease: LeaseInspector) -> dict[str, Any]:
     now = int(time.time())
     owner = inputs["lease_owner_id"]
     checked: list[dict[str, Any]] = []
     reasons: list[str] = []
     for resource_key in inputs["required_resource_keys"]:
+        unreadable = False
         try:
             lease = inspect_lease(resource_key)
         except Exception as exc:
             lease = None
+            unreadable = True
             reasons.append(f"lease read failed for {resource_key}: {_bounded_text(exc, 512)}")
         if not isinstance(lease, dict):
             reasons.append(f"missing lease: {resource_key}")
-            checked.append({"resource_key": resource_key, "owned": False, "live": False})
+            checked.append(
+                {
+                    "resource_key": resource_key,
+                    "owned": False,
+                    "live": False,
+                    "status": (
+                        LEASE_STATUS_UNREADABLE if unreadable else LEASE_STATUS_MISSING
+                    ),
+                }
+            )
             continue
         actual_owner = lease.get("owner_id")
         expires = lease.get("expires_at_unix")
@@ -503,6 +599,14 @@ def _lease_state(inputs: dict[str, Any], inspect_lease: LeaseInspector) -> dict[
             reasons.append(f"lease owner mismatch: {resource_key}")
         if not live:
             reasons.append(f"lease expired or invalid: {resource_key}")
+        if not live:
+            # A dead lease is acquirable regardless of who last owned it; only a live
+            # foreign lease genuinely blocks this caller.
+            status = LEASE_STATUS_EXPIRED
+        elif not owned:
+            status = LEASE_STATUS_FOREIGN_OWNER
+        else:
+            status = LEASE_STATUS_OK
         checked.append(
             {
                 "resource_key": resource_key,
@@ -510,9 +614,26 @@ def _lease_state(inputs: dict[str, Any], inspect_lease: LeaseInspector) -> dict[
                 "expires_at_unix": expires if isinstance(expires, int) else None,
                 "owned": owned,
                 "live": live,
+                "status": status,
             }
         )
-    return {"valid": not reasons, "owner_id": owner, "checked": checked, "reasons": reasons}
+    return {
+        "valid": not reasons,
+        "owner_id": owner,
+        "checked": checked,
+        "reasons": reasons,
+        "remediation": _lease_remediation(owner, checked),
+    }
+
+
+def _lease_friction_notes(lease_state: dict[str, Any]) -> list[str]:
+    remediation = lease_state.get("remediation")
+    action = ""
+    if isinstance(remediation, dict):
+        action = str(remediation.get("recommended_next_action") or "")
+    reasons = [str(reason) for reason in lease_state.get("reasons") or []]
+    # The action goes first so it survives the bounded note truncation.
+    return ([f"remediation: {action}"] if action else []) + reasons
 
 
 def _record_friction(
@@ -604,6 +725,12 @@ def _public_output(
 ) -> dict[str, Any]:
     result_state = record.get("result_state")
     receipt_status = "passed" if result_state in SUCCESS_STATES else ("blocked" if result_state in {"CONFLICT", "REJECTED_BY_LEASE"} else "failed")
+    # The pre-mutation recheck is the authoritative lease state whenever it ran and
+    # rejected; otherwise the admission check is.
+    effective_lease = record.get("pre_mutation_lease") or record.get("lease")
+    lease_remediation = (
+        effective_lease.get("remediation") if isinstance(effective_lease, dict) else None
+    )
     stored_lifecycle = record.get("lifecycle")
     lifecycle = lifecycle_override or stored_lifecycle
     lifecycle_bound = isinstance(stored_lifecycle, dict) and lifecycle_override is None
@@ -633,6 +760,8 @@ def _public_output(
             ),
             "bound_to_durable_receipt": lifecycle_bound,
         },
+        "lease": effective_lease,
+        "lease_remediation": lease_remediation,
         "friction": record.get("friction"),
         "friction_closeout": record.get("friction_closeout"),
         "non_claims": [
@@ -915,7 +1044,7 @@ def ensure_worktree(
                 record_friction,
                 result_state="REJECTED_BY_LEASE",
                 symptom="worktree ensure rejected because required leases are not live and owner-bound",
-                notes=lease["reasons"],
+                notes=_lease_friction_notes(lease),
             )
             record = _durable_record(
                 inputs=inputs,
@@ -1056,7 +1185,7 @@ def ensure_worktree(
                 record_friction,
                 result_state="REJECTED_BY_LEASE",
                 symptom="worktree ensure lease changed before mutation",
-                notes=pre_mutation_lease["reasons"],
+                notes=_lease_friction_notes(pre_mutation_lease),
             )
             record = _durable_record(
                 inputs=inputs,
