@@ -574,7 +574,6 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         self.base._TRANSPORT_CONNECTOR_ENFORCEMENT_MARKER = (
             self.root / "require-identity"
         )
-        self.base._TRANSPORT_SERVER_INSTANCE_ID = "server-instance-a"
         state_root = Path(temporary.name) / "roundtrip-state"
         self.state_root_patch = mock.patch.object(roundtrip, "STATE_ROOT", state_root)
         self.lock_path_patch = mock.patch.object(
@@ -646,16 +645,33 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         self.assertEqual(johannes["kind"], "connector_capability")
         self.assertNotEqual(primary["label"], johannes["label"])
 
-    def test_server_restart_changes_connector_scope(self) -> None:
+    def test_server_restart_preserves_connector_scope(self) -> None:
         self.enroll(primary=self.TOKEN_A)
         first = self.base._transport_roundtrip_client_scope(
             self.context(self.TOKEN_A)
         )
-        self.base._TRANSPORT_SERVER_INSTANCE_ID = "server-instance-b"
-        second = self.base._transport_roundtrip_client_scope(
+        restarted = _load_grabowski_mcp()
+        restarted._TRANSPORT_CONNECTOR_IDENTITY_ROOT = self.root
+        restarted._TRANSPORT_CONNECTOR_ENFORCEMENT_MARKER = (
+            self.root / "require-identity"
+        )
+        second = restarted._transport_roundtrip_client_scope(
             self.context(self.TOKEN_A)
         )
-        self.assertNotEqual(first["label"], second["label"])
+        self.assertEqual(first, second)
+
+    def test_capability_rotation_preserves_connector_identity_scope(self) -> None:
+        self.enroll(primary=self.TOKEN_A)
+        first = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_A)
+        )
+        token_path = self.root / "primary.token"
+        token_path.write_text(self.TOKEN_B, encoding="ascii")
+        os.chmod(token_path, 0o600)
+        rotated = self.base._transport_roundtrip_client_scope(
+            self.context(self.TOKEN_B)
+        )
+        self.assertEqual(first, rotated)
 
     def test_unknown_connector_capability_fails_closed(self) -> None:
         self.enroll(primary=self.TOKEN_A)
@@ -762,7 +778,7 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
         )
         self.assertTrue(consumed["consumption_receipt_sha256"])
 
-    def test_server_restart_invalidates_verified_connector_scope(self) -> None:
+    def test_server_restart_preserves_single_use_verified_connector_scope(self) -> None:
         self.enroll(primary=self.TOKEN_A)
         before_restart = self.base._transport_roundtrip_client_scope(
             self.context(self.TOKEN_A)
@@ -780,16 +796,27 @@ class ConnectorCapabilityScopeTests(unittest.TestCase):
             runtime_binding=BINDING,
             now_unix=101,
         )
-        self.base._TRANSPORT_SERVER_INSTANCE_ID = "server-instance-b"
-        after_restart = self.base._transport_roundtrip_client_scope(
+        restarted = _load_grabowski_mcp()
+        restarted._TRANSPORT_CONNECTOR_IDENTITY_ROOT = self.root
+        restarted._TRANSPORT_CONNECTOR_ENFORCEMENT_MARKER = (
+            self.root / "require-identity"
+        )
+        after_restart = restarted._transport_roundtrip_client_scope(
             self.context(self.TOKEN_A)
         )
-        self.assertNotEqual(before_restart, after_restart)
+        self.assertEqual(before_restart, after_restart)
+        consumed = roundtrip.consume_verified(
+            client_scope=after_restart,
+            runtime_binding=BINDING,
+            now_unix=102,
+            **intent,
+        )
+        self.assertTrue(consumed["consumption_receipt_sha256"])
         with self.assertRaises(roundtrip.TransportRoundtripRequired):
             roundtrip.consume_verified(
                 client_scope=after_restart,
                 runtime_binding=BINDING,
-                now_unix=102,
+                now_unix=103,
                 **intent,
             )
 

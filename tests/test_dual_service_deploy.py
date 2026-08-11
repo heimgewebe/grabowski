@@ -3458,6 +3458,54 @@ class DeploymentSequenceTests(unittest.TestCase):
         release.assert_not_called()
         self.assertIn('"operator_admission": "failed"', str(raised.exception))
 
+    def test_rollback_keeps_tunnel_stopped_when_profile_restore_fails(self) -> None:
+        events: list[str] = []
+        active = observation(True)
+        inactive = observation(False)
+        activation = SimpleNamespace(runtime=RUNTIME, previous=SimpleNamespace())
+        cutover = SimpleNamespace(before_port=18181)
+        with (
+            mock.patch.object(
+                dual,
+                "stop_service",
+                side_effect=lambda unit: events.append(f"stop:{unit}") or inactive,
+            ),
+            mock.patch.object(core, "restore_pointer"),
+            mock.patch.object(core, "verify_pointer_state"),
+            mock.patch.object(
+                dual,
+                "restore_tunnel_profile_cutover",
+                side_effect=core.DeployError("foreign profile drift"),
+            ),
+            mock.patch.object(
+                dual,
+                "start_service",
+                side_effect=lambda unit: events.append(f"start:{unit}") or active,
+            ),
+            mock.patch.object(
+                dual, "verify_operator_process", return_value={"pid": 1}
+            ),
+            mock.patch.object(
+                dual,
+                "require_operator_listener",
+                return_value={"successful_samples": 2},
+            ),
+            mock.patch.object(dual, "wait_until_ready") as readiness,
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.rollback_url(
+                    core.DeployError("primary"),
+                    activation=activation,
+                    contract=CONTRACT,
+                    timeout_seconds=1,
+                    profile_path=Path("/tmp/not-read-profile"),
+                    profile_cutover=cutover,
+                )
+        self.assertNotIn(f"start:{dual.TUNNEL_SERVICE}", events)
+        self.assertNotIn(f"start:{dual.TRANSPORT_INGRESS_SERVICE}", events)
+        readiness.assert_not_called()
+        self.assertIn('"tunnel_profile_restore": "failed"', str(raised.exception))
+
     def test_rollback_stops_both_restores_then_starts_operator_before_tunnel(self) -> None:
         events: list[str] = []
         active = observation(True)
@@ -3635,6 +3683,139 @@ class SignedIngressProfileCutoverTests(unittest.TestCase):
             with self.assertRaises(core.DeployError):
                 dual.restore_tunnel_profile_cutover(profile, cutover)
             self.assertEqual(drifted, profile.read_bytes())
+
+    def test_profile_rollback_preserves_replaced_inode_with_matching_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = self.profile(root)
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                cutover = dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+            dual.apply_tunnel_profile_cutover(profile, cutover)
+            foreign = profile.read_bytes()
+            competitor = root / f".{profile.name}.competitor"
+            competitor.write_bytes(foreign)
+            os.chmod(competitor, 0o600)
+            os.replace(competitor, profile)
+            foreign_identity = (profile.stat().st_dev, profile.stat().st_ino)
+
+            with self.assertRaisesRegex(
+                core.DeployError, "fremder Zustand wird nicht überschrieben"
+            ):
+                dual.restore_tunnel_profile_cutover(profile, cutover)
+            self.assertEqual(foreign, profile.read_bytes())
+            self.assertEqual(
+                foreign_identity, (profile.stat().st_dev, profile.stat().st_ino)
+            )
+            self.assertEqual([profile], list(root.iterdir()))
+
+    def test_profile_cutover_rejects_replaced_inode_with_target_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = self.profile(root)
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                cutover = dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+            target = dual._add_transport_ingress_auth(
+                profile.read_bytes().replace(
+                    b"http://127.0.0.1:18181/mcp",
+                    b"http://127.0.0.1:18180/mcp",
+                    1,
+                )
+            )
+            competitor = root / f".{profile.name}.competitor"
+            competitor.write_bytes(target)
+            os.chmod(competitor, 0o600)
+            os.replace(competitor, profile)
+            foreign_identity = (profile.stat().st_dev, profile.stat().st_ino)
+
+            with self.assertRaisesRegex(core.DeployError, "Identität driftete"):
+                dual.apply_tunnel_profile_cutover(profile, cutover)
+            self.assertEqual(target, profile.read_bytes())
+            self.assertEqual(
+                foreign_identity, (profile.stat().st_dev, profile.stat().st_ino)
+            )
+
+    def test_profile_rollback_rejects_replaced_inode_with_preimage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = self.profile(root)
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                cutover = dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+            dual.apply_tunnel_profile_cutover(profile, cutover)
+            competitor = root / f".{profile.name}.competitor"
+            competitor.write_bytes(cutover.before)
+            os.chmod(competitor, 0o600)
+            os.replace(competitor, profile)
+            foreign_identity = (profile.stat().st_dev, profile.stat().st_ino)
+
+            with self.assertRaisesRegex(
+                core.DeployError, "fremder Zustand wird nicht überschrieben"
+            ):
+                dual.restore_tunnel_profile_cutover(profile, cutover)
+            self.assertEqual(cutover.before, profile.read_bytes())
+            self.assertEqual(
+                foreign_identity, (profile.stat().st_dev, profile.stat().st_ino)
+            )
+
+    def test_profile_cutover_preserves_concurrent_live_inode_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = self.profile(root)
+            with mock.patch.object(
+                dual,
+                "profile_topology",
+                return_value=dual.ProfileTopology(
+                    "url", server_url_count=1, server_url_port=18181
+                ),
+            ):
+                cutover = dual.capture_tunnel_profile_cutover(profile, RUNTIME)
+            foreign = b"foreign-concurrent-profile\n"
+            original_pwrite = os.pwrite
+            injected = False
+
+            def competing_pwrite(
+                descriptor: int, value: bytes | memoryview, offset: int
+            ) -> int:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    competitor = root / f".{profile.name}.competitor"
+                    competitor_fd = os.open(
+                        competitor, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                    )
+                    try:
+                        os.write(competitor_fd, foreign)
+                        os.fsync(competitor_fd)
+                    finally:
+                        os.close(competitor_fd)
+                    os.replace(competitor, profile)
+                return original_pwrite(descriptor, value, offset)
+
+            with mock.patch.object(dual.os, "pwrite", side_effect=competing_pwrite):
+                with self.assertRaisesRegex(
+                    core.DeployError, "fremder Pfadzustand blieb unangetastet"
+                ):
+                    dual.apply_tunnel_profile_cutover(profile, cutover)
+            self.assertTrue(injected)
+            self.assertEqual(foreign, profile.read_bytes())
+            self.assertEqual([profile], list(root.iterdir()))
 
 
 if __name__ == "__main__":

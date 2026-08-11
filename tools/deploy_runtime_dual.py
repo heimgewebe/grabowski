@@ -320,6 +320,7 @@ class ProfileTopology:
 class TunnelProfileCutover:
     before: bytes
     before_sha256: str
+    before_identity: tuple[int, int]
     after_sha256: str
     mode: int
     before_port: int
@@ -2096,30 +2097,146 @@ def _profile_regular_metadata(profile_path: Path) -> os.stat_result:
     return linked
 
 
-def _atomic_profile_write(profile_path: Path, value: bytes, *, mode: int) -> None:
-    temporary = profile_path.parent / f".{profile_path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(temporary, flags, mode)
+def _read_profile_revision(profile_path: Path) -> tuple[bytes, os.stat_result]:
+    linked = _profile_regular_metadata(profile_path)
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(profile_path, flags)
     try:
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            descriptor = -1
-            handle.write(value)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, profile_path)
-        directory = os.open(profile_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino):
+            core.fail("Tunnelprofil driftete während des sicheren Öffnens")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > 1_048_576:
+                core.fail("Tunnelprofil überschreitet die Größenbegrenzung")
+        verified = os.fstat(descriptor)
+        remapped = profile_path.lstat()
+        if (
+            (verified.st_dev, verified.st_ino) != (linked.st_dev, linked.st_ino)
+            or (remapped.st_dev, remapped.st_ino) != (linked.st_dev, linked.st_ino)
+            or verified.st_size != total
+            or verified.st_mtime_ns != linked.st_mtime_ns
+        ):
+            core.fail("Tunnelprofil driftete während des sicheren Lesens")
+        return b"".join(chunks), verified
+    finally:
+        os.close(descriptor)
+
+
+def _descriptor_bound_profile_write(
+    profile_path: Path,
+    value: bytes,
+    *,
+    mode: int,
+    expected_identity: tuple[int, int],
+    expected_sha256: str,
+) -> None:
+    parent_linked = profile_path.parent.lstat()
+    if statmod.S_ISLNK(parent_linked.st_mode) or not statmod.S_ISDIR(parent_linked.st_mode):
+        core.fail("Tunnelprofil-Verzeichnis ist nicht sicher")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_CLOEXEC
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory_fd = os.open(profile_path.parent, directory_flags)
+    descriptor = -1
+    try:
+        parent_opened = os.fstat(directory_fd)
+        if (parent_opened.st_dev, parent_opened.st_ino) != (
+            parent_linked.st_dev,
+            parent_linked.st_ino,
+        ):
+            core.fail("Tunnelprofil-Verzeichnis driftete während des Öffnens")
+        linked = os.stat(
+            profile_path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not statmod.S_ISREG(linked.st_mode)
+            or linked.st_uid != os.geteuid()
+            or linked.st_nlink != 1
+            or statmod.S_IMODE(linked.st_mode) & 0o022
+            or linked.st_size > 1_048_576
+        ):
+            core.fail("Tunnelprofil ist vor dem descriptorgebundenen Commit unsicher")
+        flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(profile_path.name, flags, dir_fd=directory_fd)
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if opened_identity != expected_identity or opened_identity != (
+            linked.st_dev,
+            linked.st_ino,
+        ):
+            core.fail("Tunnelprofil driftete vor dem descriptorgebundenen Commit")
+        current = bytearray()
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 65536, offset)
+            if not chunk:
+                break
+            current.extend(chunk)
+            offset += len(chunk)
+            if len(current) > 1_048_576:
+                core.fail("Tunnelprofil überschreitet die Größenbegrenzung")
+        before_write = os.stat(
+            profile_path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (before_write.st_dev, before_write.st_ino) != expected_identity:
+            core.fail("Tunnelprofil driftete vor dem descriptorgebundenen Commit")
+        if (
+            _profile_bytes_sha256(bytes(current)) != expected_sha256
+            or statmod.S_IMODE(opened.st_mode) != mode
+        ):
+            core.fail("Tunnelprofil-Preimage stimmt vor dem Commit nicht überein")
+        view = memoryview(value)
+        offset = 0
+        while view:
+            written = os.pwrite(descriptor, view, offset)
+            if written <= 0:
+                core.fail("Tunnelprofil wurde nicht vollständig geschrieben")
+            view = view[written:]
+            offset += written
+        os.ftruncate(descriptor, len(value))
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        installed = os.fstat(descriptor)
+        installed_value = bytearray()
+        offset = 0
+        while True:
+            chunk = os.pread(descriptor, 65536, offset)
+            if not chunk:
+                break
+            installed_value.extend(chunk)
+            offset += len(chunk)
+            if len(installed_value) > 1_048_576:
+                core.fail("Installiertes Tunnelprofil überschreitet die Größenbegrenzung")
+        remapped = os.stat(
+            profile_path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (remapped.st_dev, remapped.st_ino) != expected_identity:
+            core.fail(
+                "Tunnelprofilpfad driftete während des descriptorgebundenen Commits; fremder Pfadzustand blieb unangetastet"
+            )
+        if (
+            (installed.st_dev, installed.st_ino) != expected_identity
+            or bytes(installed_value) != value
+            or installed.st_size != len(value)
+            or statmod.S_IMODE(installed.st_mode) != mode
+        ):
+            core.fail(
+                "Tunnelprofil-Commit konnte am gebundenen Inode nicht verifiziert werden"
+            )
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        os.close(directory_fd)
 
 
 def _transport_ingress_auth_reference() -> str:
@@ -2217,10 +2334,7 @@ def require_transport_ingress_auth_profile(profile_path: Path) -> None:
 
 
 def capture_tunnel_profile_cutover(profile_path: Path, runtime: Path) -> TunnelProfileCutover:
-    linked = _profile_regular_metadata(profile_path)
-    before = profile_path.read_bytes()
-    if len(before) != linked.st_size:
-        core.fail("Tunnelprofil driftete während des Cutover-Preimages")
+    before, linked = _read_profile_revision(profile_path)
     topology = profile_topology(profile_path, runtime)
     if topology.kind != "url" or topology.server_url_port not in TUNNEL_TARGET_PORTS:
         core.fail("Tunnelprofil besitzt keine cutover-fähige URL-Topologie")
@@ -2237,6 +2351,7 @@ def capture_tunnel_profile_cutover(profile_path: Path, runtime: Path) -> TunnelP
     return TunnelProfileCutover(
         before=before,
         before_sha256=_profile_bytes_sha256(before),
+        before_identity=(linked.st_dev, linked.st_ino),
         after_sha256=_profile_bytes_sha256(after),
         mode=statmod.S_IMODE(linked.st_mode),
         before_port=before_port,
@@ -2245,8 +2360,10 @@ def capture_tunnel_profile_cutover(profile_path: Path, runtime: Path) -> TunnelP
 
 
 def apply_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCutover) -> dict[str, Any]:
-    current = profile_path.read_bytes()
+    current, current_info = _read_profile_revision(profile_path)
     digest = _profile_bytes_sha256(current)
+    if (current_info.st_dev, current_info.st_ino) != cutover.before_identity:
+        core.fail("Tunnelprofil-Identität driftete seit dem Cutover-Preflight")
     if digest == cutover.after_sha256:
         return {"changed": False, "profile_sha256": digest, "port": cutover.after_port}
     if digest != cutover.before_sha256:
@@ -2262,21 +2379,39 @@ def apply_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCutov
     replacement = _add_transport_ingress_auth(replacement)
     if _profile_bytes_sha256(replacement) != cutover.after_sha256:
         core.fail("Tunnelprofil-Cutover stimmt nicht mit dem Preflight überein")
-    _atomic_profile_write(profile_path, replacement, mode=cutover.mode)
-    if _profile_bytes_sha256(profile_path.read_bytes()) != cutover.after_sha256:
+    _descriptor_bound_profile_write(
+        profile_path,
+        replacement,
+        mode=cutover.mode,
+        expected_identity=cutover.before_identity,
+        expected_sha256=cutover.before_sha256,
+    )
+    installed, _ = _read_profile_revision(profile_path)
+    if _profile_bytes_sha256(installed) != cutover.after_sha256:
         core.fail("Tunnelprofil-Cutover-Readback ist inkonsistent")
     return {"changed": replacement != current, "profile_sha256": cutover.after_sha256, "port": cutover.after_port}
 
 
 def restore_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCutover) -> dict[str, Any]:
-    current = profile_path.read_bytes()
+    current, current_info = _read_profile_revision(profile_path)
     digest = _profile_bytes_sha256(current)
+    if (current_info.st_dev, current_info.st_ino) != cutover.before_identity:
+        core.fail(
+            "Tunnelprofil-Identität driftete während des Rollbacks; fremder Zustand wird nicht überschrieben"
+        )
     if digest == cutover.before_sha256:
         return {"restored": False, "profile_sha256": digest, "port": cutover.before_port}
     if digest != cutover.after_sha256:
         core.fail("Tunnelprofil driftete während des Rollbacks; fremder Zustand wird nicht überschrieben")
-    _atomic_profile_write(profile_path, cutover.before, mode=cutover.mode)
-    if _profile_bytes_sha256(profile_path.read_bytes()) != cutover.before_sha256:
+    _descriptor_bound_profile_write(
+        profile_path,
+        cutover.before,
+        mode=cutover.mode,
+        expected_identity=cutover.before_identity,
+        expected_sha256=cutover.after_sha256,
+    )
+    restored, _ = _read_profile_revision(profile_path)
+    if _profile_bytes_sha256(restored) != cutover.before_sha256:
         core.fail("Tunnelprofil-Rollback-Readback ist inkonsistent")
     return {"restored": True, "profile_sha256": cutover.before_sha256, "port": cutover.before_port}
 
@@ -3776,8 +3911,12 @@ def rollback_url(
     tunnel_ok, tunnel = step("stop-tunnel", lambda: stop_service(TUNNEL_SERVICE))
     if profile_cutover is not None:
         step("stop-transport-ingress", lambda: stop_service(TRANSPORT_INGRESS_SERVICE))
+    profile_restore_ok = True
     if profile_path is not None and profile_cutover is not None:
-        step("restore-tunnel-profile", lambda: restore_tunnel_profile_cutover(profile_path, profile_cutover))
+        profile_restore_ok, _ = step(
+            "restore-tunnel-profile",
+            lambda: restore_tunnel_profile_cutover(profile_path, profile_cutover),
+        )
     operator_ok, operator = step("stop-operator", lambda: stop_service(OPERATOR_SERVICE))
     if not (tunnel_ok and isinstance(tunnel, core.ServiceObservation) and tunnel.confirmed_inactive and operator_ok and isinstance(operator, core.ServiceObservation) and operator.confirmed_inactive):
         payload = {"original": _error_summary(original), "phases": phases, "errors": errors, "pointer_restore": "not-attempted"}
@@ -3812,13 +3951,23 @@ def rollback_url(
             )
     tunnel_start_ok = False
     started_tunnel = None
-    ingress_ready = True
-    if profile_cutover is not None and profile_cutover.before_port == TRANSPORT_INGRESS_LISTENER_PORT:
+    ingress_ready = profile_restore_ok
+    if (
+        profile_restore_ok
+        and profile_cutover is not None
+        and profile_cutover.before_port == TRANSPORT_INGRESS_LISTENER_PORT
+    ):
         ingress_ok, _ = step("start-transport-ingress", lambda: start_service(TRANSPORT_INGRESS_SERVICE))
         if ingress_ok:
             ingress_ok, _ = step("transport-ingress-health", require_transport_ingress_health)
         ingress_ready = ingress_ok
-    if listener_ok and listener is not None and admission_ok and ingress_ready:
+    if (
+        listener_ok
+        and listener is not None
+        and admission_ok
+        and profile_restore_ok
+        and ingress_ready
+    ):
         tunnel_start_ok, started_tunnel = step("start-tunnel", lambda: start_service(TUNNEL_SERVICE))
         if tunnel_start_ok and started_tunnel is not None and admission_marker is not None:
             admission_ok, admission = step(
@@ -3866,6 +4015,7 @@ def rollback_url(
         "pointer_restore": "restored",
         "operator_identity": "verified" if identity_ok and identity is not None else "failed",
         "operator_admission": "verified" if admission_ok else "failed",
+        "tunnel_profile_restore": "verified" if profile_restore_ok else "failed",
         "readiness": "verified" if ready_ok and isinstance(ready, DualReadiness) and ready.ok else "failed",
         "admission_release": admission_release,
     }

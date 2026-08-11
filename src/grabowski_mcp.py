@@ -166,7 +166,6 @@ _TRANSPORT_CONNECTOR_TOKEN_SUFFIX = ".token"
 _TRANSPORT_CONNECTOR_MAX_IDENTITIES = 32
 _TRANSPORT_CONNECTOR_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43,128}\Z")
 _TRANSPORT_CONNECTOR_ID_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
-_TRANSPORT_SERVER_INSTANCE_ID = uuid.uuid4().hex
 
 
 class _RetainedTransportTargetMissing(RuntimeError):
@@ -5247,14 +5246,8 @@ def _transport_connector_capability_scope(
         raise RuntimeError("transport connector capability is not enrolled")
     connector_id = matches[0]
     label = hashlib.sha256(
-        (
-            "grabowski-connector-capability-v1\\0"
-            + connector_id
-            + "\\0"
-            + _TRANSPORT_SERVER_INSTANCE_ID
-            + "\\0"
-            + supplied
-        ).encode("utf-8")
+        b"grabowski-connector-identity-scope-v2\x00"
+        + connector_id.encode("utf-8")
     ).hexdigest()
     return grabowski_transport_roundtrip.validate_client_scope(
         {"kind": "connector_capability", "label": label}

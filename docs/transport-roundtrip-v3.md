@@ -69,9 +69,9 @@ Die Capability bleibt der Protokollanker:
 
 - jede Connector-Instanz besitzt ein eigenes zufälliges Token in `~/.local/state/grabowski/transport-connectors/<id>.token`;
 - Token-Dateien und Identitätswurzel müssen dem Grabowski-Benutzer gehören, dürfen keine Symlinks sein und sind für Gruppe/Andere unzugänglich;
-- der rohe Tokenwert erscheint nie im Transportzustand oder Receipt; die Scope-ID ist ein SHA-256-Digest aus Connector-ID, Token und einer zufälligen Server-Instanz-ID;
-- zwei Tunnel mit verschiedenen Token erhalten verschiedene `connector_capability`-Scopes;
-- ein Server-Neustart ändert die Instanz-ID und macht alte Connector-Scopes unverwendbar;
+- der rohe Tokenwert erscheint nie im Transportzustand oder Receipt; die Scope-ID ist ein domänengebundener SHA-256-Digest ausschließlich der stabilen Connector-ID;
+- zwei verschiedene Connector-IDs erhalten auch bei Tokenwechseln getrennte `connector_capability`-Scopes;
+- ein Server-Neustart oder die Rotation des Capability-Tokens erhält den Scope derselben Connector-ID und damit die dauerhafte Einmalverbrauchsgrenze;
 - `_meta.client_id`, Python-Objektidentität und `mcp-session-id` sind keine Autorität; OpenAI kann pro Tool-Aufruf weiterhin eine neue MCP-Session erzeugen;
 - ein unbekannter Capability-Header scheitert immer fail-closed.
 

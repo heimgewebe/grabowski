@@ -25,6 +25,10 @@ CONSUMPTION_KIND = "grabowski_transport_one_call_consumption"
 STATE_ROOT = Path.home() / ".local/state/grabowski/transport-one-call"
 LOCK_PATH = STATE_ROOT / ".lock"
 REPLAY_FILTER_FILENAME = "replay-filter-v1.bin"
+REPLAY_FILTER_INTEGRITY_FILENAME = "replay-filter-v1.integrity"
+REPLAY_FILTER_INTEGRITY_ROOT_FILENAME = "replay-filter-v1.integrity-root"
+REPLAY_FILTER_INTEGRITY_MARKER_FILENAME = "integrity-required-v1"
+REPLAY_FILTER_TRANSACTION_FILENAME = "mutation-in-progress-v1"
 REPLAY_FILTER_BITS = 1 << 29  # 64 MiB of monotone replay bits.
 REPLAY_FILTER_HASH_COUNT = 7
 REPLAY_FILTER_HEADER_BYTES = 128
@@ -34,9 +38,35 @@ REPLAY_FILTER_HEADER = (
     b"grabowski-transport-replay-filter-v1\n"
     + f"bits={REPLAY_FILTER_BITS}\nhashes={REPLAY_FILTER_HASH_COUNT}\n".encode("ascii")
 ).ljust(REPLAY_FILTER_HEADER_BYTES, b"\x00")
+REPLAY_FILTER_PAGE_BYTES = 4096
+REPLAY_FILTER_PAGE_COUNT = REPLAY_FILTER_BYTES // REPLAY_FILTER_PAGE_BYTES
+REPLAY_FILTER_INTEGRITY_DIGEST_BYTES = hashlib.sha256().digest_size
+REPLAY_FILTER_INTEGRITY_HEADER_BYTES = 256
+REPLAY_FILTER_INTEGRITY_HEADER = (
+    b"grabowski-transport-replay-integrity-v1\n"
+    + f"page_bytes={REPLAY_FILTER_PAGE_BYTES}\npage_count={REPLAY_FILTER_PAGE_COUNT}\n".encode(
+        "ascii"
+    )
+    + b"filter_header_sha256="
+    + hashlib.sha256(REPLAY_FILTER_HEADER).hexdigest().encode("ascii")
+    + b"\n"
+).ljust(REPLAY_FILTER_INTEGRITY_HEADER_BYTES, b"\x00")
+REPLAY_FILTER_INTEGRITY_TOTAL_BYTES = (
+    REPLAY_FILTER_INTEGRITY_HEADER_BYTES
+    + REPLAY_FILTER_PAGE_COUNT * REPLAY_FILTER_INTEGRITY_DIGEST_BYTES
+)
+REPLAY_FILTER_INTEGRITY_MARKER = b"grabowski-replay-integrity-required-v1\n"
+REPLAY_FILTER_INTEGRITY_ROOT_PREFIX = b"grabowski-replay-integrity-root-v1\nsha256="
+REPLAY_FILTER_INTEGRITY_ROOT_BYTES = (
+    len(REPLAY_FILTER_INTEGRITY_ROOT_PREFIX) + 64 + 1
+)
+REPLAY_FILTER_TRANSACTION_MARKER = b"grabowski-replay-mutation-in-progress-v1\n"
 LEGACY_TOMBSTONE_MAX_BYTES = 4096
+LEGACY_SCOPE_DIRECTORY_MAX = 4096
+LEGACY_TOMBSTONE_TOTAL_MAX = 4096
 _REQUEST_ID_RE = re.compile(r"[0-9a-f]{32}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_LEGACY_TOMBSTONE_NAME_RE = re.compile(r"[0-9a-f]{32}\.json\Z")
 
 
 class TransportAssertionError(RuntimeError):
@@ -212,8 +242,44 @@ def _validate_private_directory(path: Path) -> None:
         raise TransportAssertionError("transport assertion state directory is unsafe")
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        meta = os.fstat(fd)
+        if not stat.S_ISDIR(meta.st_mode):
+            raise TransportAssertionError(
+                "transport assertion durability target is not a directory"
+            )
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _ensure_private_directory(path: Path) -> None:
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    missing: list[Path] = []
+    cursor = path
+    while True:
+        try:
+            cursor.lstat()
+            break
+        except FileNotFoundError:
+            missing.append(cursor)
+            parent = cursor.parent
+            if parent == cursor:
+                raise TransportAssertionError(
+                    "transport assertion state directory has no existing ancestor"
+                )
+            cursor = parent
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, mode=0o700)
+        except FileExistsError:
+            pass
+        _validate_private_directory(directory)
+        # The child directory must survive a crash before any replay file can
+        # become authoritative, so persist each newly introduced name edge.
+        _fsync_directory(directory.parent)
     _validate_private_directory(path)
 
 
@@ -231,9 +297,17 @@ def _validate_private_file(meta: os.stat_result, label: str) -> None:
 def _state_lock() -> Iterator[None]:
     _ensure_private_directory(STATE_ROOT)
     flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(LOCK_PATH, flags, 0o600)
+    created = False
+    try:
+        fd = os.open(LOCK_PATH, flags | os.O_EXCL, 0o600)
+        created = True
+    except FileExistsError:
+        fd = os.open(LOCK_PATH, flags, 0o600)
     try:
         _validate_private_file(os.fstat(fd), "transport assertion lock")
+        if created:
+            os.fsync(fd)
+            _fsync_directory(STATE_ROOT)
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
@@ -282,8 +356,122 @@ def _read_tombstone(path: Path) -> dict[str, Any] | None:
     return value
 
 
+def _legacy_tombstone_inventory(
+    scope_sha256: str, request_id: str
+) -> list[tuple[str, Path]]:
+    current_scope = _sha256(scope_sha256, "transport client scope hash")
+    request = _request_id(request_id)
+    candidates = [(current_scope, _tombstone_path(current_scope, request))]
+    allowed_files = {
+        LOCK_PATH.name,
+        REPLAY_FILTER_FILENAME,
+        REPLAY_FILTER_INTEGRITY_FILENAME,
+        REPLAY_FILTER_INTEGRITY_ROOT_FILENAME,
+        REPLAY_FILTER_INTEGRITY_MARKER_FILENAME,
+        REPLAY_FILTER_TRANSACTION_FILENAME,
+    }
+    entries = sorted(os.scandir(STATE_ROOT), key=lambda entry: entry.name)
+    if len(entries) > LEGACY_SCOPE_DIRECTORY_MAX + len(allowed_files):
+        raise TransportAssertionError(
+            "transport assertion legacy replay scope inventory exceeds bound"
+        )
+    tombstone_count = 0
+    for entry in entries:
+        if entry.name in allowed_files:
+            continue
+        if _SHA256_RE.fullmatch(entry.name) is None:
+            raise TransportAssertionError(
+                "transport assertion state contains an unknown entry"
+            )
+        try:
+            meta = entry.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            raise TransportAssertionError(
+                "transport assertion legacy replay scope drifted during lookup"
+            )
+        if (
+            not stat.S_ISDIR(meta.st_mode)
+            or stat.S_ISLNK(meta.st_mode)
+            or meta.st_uid != os.getuid()
+            or stat.S_IMODE(meta.st_mode) & 0o077
+        ):
+            raise TransportAssertionError(
+                "transport assertion legacy replay scope is unsafe"
+            )
+        tombstones = sorted(os.scandir(entry.path), key=lambda item: item.name)
+        for tombstone in tombstones:
+            tombstone_count += 1
+            if tombstone_count > LEGACY_TOMBSTONE_TOTAL_MAX:
+                raise TransportAssertionError(
+                    "transport assertion legacy replay inventory exceeds bound"
+                )
+            if _LEGACY_TOMBSTONE_NAME_RE.fullmatch(tombstone.name) is None:
+                raise TransportAssertionError(
+                    "transport assertion legacy replay scope contains an unknown entry"
+                )
+            candidate = (entry.name, Path(tombstone.path))
+            if candidate != candidates[0]:
+                candidates.append(candidate)
+    return candidates
+
+
+def _validated_legacy_tombstone(
+    value: dict[str, Any], scope_sha256: str, path: Path
+) -> dict[str, str]:
+    try:
+        evidence = {
+            "request_id": _request_id(value.get("request_id")),
+            "client_scope_sha256": _sha256(
+                value.get("client_scope_sha256"),
+                "legacy transport client scope hash",
+            ),
+            "tool_name": _text(
+                value.get("tool_name"), "legacy transport assertion tool name", 256
+            ),
+            "arguments_sha256": _sha256(
+                value.get("arguments_sha256"),
+                "legacy transport assertion arguments hash",
+            ),
+            "body_sha256": _sha256(
+                value.get("body_sha256"), "legacy transport assertion body hash"
+            ),
+            "runtime_binding_sha256": _sha256(
+                value.get("runtime_binding_sha256"),
+                "legacy transport assertion runtime binding hash",
+            ),
+        }
+    except TransportAssertionError as exc:
+        raise TransportAssertionError(
+            "transport assertion legacy replay tombstone contract mismatch"
+        ) from exc
+    if (
+        evidence["client_scope_sha256"] != scope_sha256
+        or path.name != f'{evidence["request_id"]}.json'
+    ):
+        raise TransportAssertionError(
+            "transport assertion legacy replay tombstone binding mismatch"
+        )
+    return evidence
+
+
 def _replay_filter_path() -> Path:
     return STATE_ROOT / REPLAY_FILTER_FILENAME
+
+
+def _replay_filter_integrity_path() -> Path:
+    return STATE_ROOT / REPLAY_FILTER_INTEGRITY_FILENAME
+
+
+def _replay_filter_integrity_root_path() -> Path:
+    return STATE_ROOT / REPLAY_FILTER_INTEGRITY_ROOT_FILENAME
+
+
+def _replay_filter_integrity_marker_path() -> Path:
+    return STATE_ROOT / REPLAY_FILTER_INTEGRITY_MARKER_FILENAME
+
+
+def _replay_filter_transaction_path() -> Path:
+    return STATE_ROOT / REPLAY_FILTER_TRANSACTION_FILENAME
 
 
 def _replay_scope_sha256(secret: str) -> str:
@@ -310,10 +498,350 @@ def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, .
     )
 
 
-def _open_replay_filter() -> int:
+def _stable_scope_replay_id(body_sha256: str) -> str:
+    body = bytes.fromhex(_sha256(body_sha256, "transport assertion body hash"))
+    return hashlib.sha256(
+        b"grabowski-stable-client-scope-body-replay-id-v1\x00" + body
+    ).hexdigest()[:32]
+
+
+def _pread_exact(fd: int, size: int, offset: int, label: str) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    cursor = offset
+    while remaining:
+        chunk = os.pread(fd, remaining, cursor)
+        if not chunk:
+            raise TransportAssertionError(f"{label} read was short")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        cursor += len(chunk)
+    return b"".join(chunks)
+
+
+def _pwrite_exact(fd: int, value: bytes, offset: int, label: str) -> None:
+    view = memoryview(value)
+    cursor = offset
+    while view:
+        written = os.pwrite(fd, view, cursor)
+        if written <= 0:
+            raise TransportAssertionError(f"{label} write was short")
+        view = view[written:]
+        cursor += written
+
+
+def _replay_page_digest(page_index: int, value: bytes) -> bytes:
+    if len(value) != REPLAY_FILTER_PAGE_BYTES:
+        raise TransportAssertionError("transport replay filter page size mismatch")
+    return hashlib.sha256(
+        b"grabowski-replay-filter-page-v1\x00"
+        + page_index.to_bytes(8, "big")
+        + REPLAY_FILTER_HEADER
+        + value
+    ).digest()
+
+
+def _replay_page_offset(page_index: int) -> int:
+    return REPLAY_FILTER_HEADER_BYTES + page_index * REPLAY_FILTER_PAGE_BYTES
+
+
+def _integrity_digest_offset(page_index: int) -> int:
+    return (
+        REPLAY_FILTER_INTEGRITY_HEADER_BYTES
+        + page_index * REPLAY_FILTER_INTEGRITY_DIGEST_BYTES
+    )
+
+
+def _read_replay_page(filter_fd: int, page_index: int) -> bytes:
+    return _pread_exact(
+        filter_fd,
+        REPLAY_FILTER_PAGE_BYTES,
+        _replay_page_offset(page_index),
+        "transport replay filter page",
+    )
+
+
+def _validate_replay_page(
+    filter_fd: int, integrity_fd: int, page_index: int
+) -> bytes:
+    page = _read_replay_page(filter_fd, page_index)
+    observed = _pread_exact(
+        integrity_fd,
+        REPLAY_FILTER_INTEGRITY_DIGEST_BYTES,
+        _integrity_digest_offset(page_index),
+        "transport replay integrity digest",
+    )
+    expected = _replay_page_digest(page_index, page)
+    if not hmac.compare_digest(observed, expected):
+        raise TransportAssertionError(
+            "transport assertion replay filter integrity mismatch; state is fail-closed"
+        )
+    return page
+
+
+def _validate_all_replay_pages(filter_fd: int, integrity_fd: int) -> None:
+    for page_index in range(REPLAY_FILTER_PAGE_COUNT):
+        _validate_replay_page(filter_fd, integrity_fd, page_index)
+
+
+def _initialize_replay_integrity(filter_fd: int, path: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    integrity_fd = os.open(path, flags, 0o600)
+    try:
+        _validate_private_file(
+            os.fstat(integrity_fd), "transport assertion replay integrity"
+        )
+        digests = bytearray()
+        for page_index in range(REPLAY_FILTER_PAGE_COUNT):
+            digests.extend(
+                _replay_page_digest(page_index, _read_replay_page(filter_fd, page_index))
+            )
+        os.ftruncate(integrity_fd, REPLAY_FILTER_INTEGRITY_TOTAL_BYTES)
+        _pwrite_exact(
+            integrity_fd,
+            REPLAY_FILTER_INTEGRITY_HEADER + bytes(digests),
+            0,
+            "transport replay integrity initialization",
+        )
+        os.fsync(integrity_fd)
+        return integrity_fd
+    except BaseException:
+        os.close(integrity_fd)
+        raise
+
+
+def _open_existing_replay_integrity(path: Path) -> int:
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        meta = os.fstat(fd)
+        _validate_private_file(meta, "transport assertion replay integrity")
+        if meta.st_size != REPLAY_FILTER_INTEGRITY_TOTAL_BYTES:
+            raise TransportAssertionError(
+                "transport assertion replay integrity size mismatch"
+            )
+        header = _pread_exact(
+            fd,
+            REPLAY_FILTER_INTEGRITY_HEADER_BYTES,
+            0,
+            "transport replay integrity header",
+        )
+        if header != REPLAY_FILTER_INTEGRITY_HEADER:
+            raise TransportAssertionError(
+                "transport assertion replay integrity header mismatch"
+            )
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _replay_integrity_root_value(integrity_fd: int) -> bytes:
+    image = _pread_exact(
+        integrity_fd,
+        REPLAY_FILTER_INTEGRITY_TOTAL_BYTES,
+        0,
+        "transport replay integrity image",
+    )
+    digest = hashlib.sha256(
+        b"grabowski-replay-integrity-root-v1\x00" + image
+    ).hexdigest()
+    return REPLAY_FILTER_INTEGRITY_ROOT_PREFIX + digest.encode("ascii") + b"\n"
+
+
+def _initialize_replay_integrity_root(integrity_fd: int, path: Path) -> int:
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    root_fd = os.open(path, flags, 0o600)
+    try:
+        _validate_private_file(
+            os.fstat(root_fd), "transport assertion replay integrity root"
+        )
+        value = _replay_integrity_root_value(integrity_fd)
+        _pwrite_exact(
+            root_fd,
+            value,
+            0,
+            "transport replay integrity root initialization",
+        )
+        os.ftruncate(root_fd, len(value))
+        os.fsync(root_fd)
+        return root_fd
+    except BaseException:
+        os.close(root_fd)
+        raise
+
+
+def _open_existing_replay_integrity_root(path: Path, integrity_fd: int) -> int:
+    flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(path, flags)
+    try:
+        meta = os.fstat(root_fd)
+        _validate_private_file(meta, "transport assertion replay integrity root")
+        if meta.st_size != REPLAY_FILTER_INTEGRITY_ROOT_BYTES:
+            raise TransportAssertionError(
+                "transport assertion replay integrity root size mismatch"
+            )
+        observed = _pread_exact(
+            root_fd,
+            REPLAY_FILTER_INTEGRITY_ROOT_BYTES,
+            0,
+            "transport replay integrity root",
+        )
+        expected = _replay_integrity_root_value(integrity_fd)
+        if not hmac.compare_digest(observed, expected):
+            raise TransportAssertionError(
+                "transport assertion replay integrity root mismatch; state is fail-closed"
+            )
+        return root_fd
+    except BaseException:
+        os.close(root_fd)
+        raise
+
+
+def _refresh_replay_integrity_root(integrity_fd: int, root_fd: int) -> None:
+    value = _replay_integrity_root_value(integrity_fd)
+    _pwrite_exact(
+        root_fd,
+        value,
+        0,
+        "transport replay integrity root",
+    )
+    os.ftruncate(root_fd, len(value))
+    os.fsync(root_fd)
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _install_integrity_marker() -> None:
+    path = _replay_filter_integrity_marker_path()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    fd = os.open(path, flags, 0o600)
+    try:
+        _validate_private_file(
+            os.fstat(fd), "transport assertion replay integrity marker"
+        )
+        _pwrite_exact(
+            fd,
+            REPLAY_FILTER_INTEGRITY_MARKER,
+            0,
+            "transport replay integrity marker",
+        )
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_directory(STATE_ROOT)
+
+
+def _require_integrity_marker() -> None:
+    path = _replay_filter_integrity_marker_path()
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        meta = os.fstat(fd)
+        _validate_private_file(
+            meta, "transport assertion replay integrity marker"
+        )
+        if meta.st_size != len(REPLAY_FILTER_INTEGRITY_MARKER):
+            raise TransportAssertionError(
+                "transport assertion replay integrity marker size mismatch"
+            )
+        value = _pread_exact(
+            fd,
+            len(REPLAY_FILTER_INTEGRITY_MARKER),
+            0,
+            "transport replay integrity marker",
+        )
+        if value != REPLAY_FILTER_INTEGRITY_MARKER:
+            raise TransportAssertionError(
+                "transport assertion replay integrity marker mismatch"
+            )
+    finally:
+        os.close(fd)
+
+
+def _install_replay_transaction_marker() -> None:
+    path = _replay_filter_transaction_path()
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(
+        os, "O_NOFOLLOW", 0
+    )
+    fd = os.open(path, flags, 0o600)
+    try:
+        _validate_private_file(
+            os.fstat(fd), "transport assertion replay transaction marker"
+        )
+        _pwrite_exact(
+            fd,
+            REPLAY_FILTER_TRANSACTION_MARKER,
+            0,
+            "transport replay transaction marker",
+        )
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_directory(STATE_ROOT)
+
+
+def _require_replay_transaction_marker() -> None:
+    path = _replay_filter_transaction_path()
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        meta = os.fstat(fd)
+        _validate_private_file(
+            meta, "transport assertion replay transaction marker"
+        )
+        if meta.st_size != len(REPLAY_FILTER_TRANSACTION_MARKER):
+            raise TransportAssertionError(
+                "transport assertion replay transaction marker size mismatch"
+            )
+        value = _pread_exact(
+            fd,
+            len(REPLAY_FILTER_TRANSACTION_MARKER),
+            0,
+            "transport replay transaction marker",
+        )
+        if value != REPLAY_FILTER_TRANSACTION_MARKER:
+            raise TransportAssertionError(
+                "transport assertion replay transaction marker mismatch"
+            )
+    finally:
+        os.close(fd)
+
+
+def _clear_replay_transaction_marker() -> None:
+    path = _replay_filter_transaction_path()
+    _require_replay_transaction_marker()
+    path.unlink()
+    _fsync_directory(STATE_ROOT)
+
+
+def _open_replay_filter() -> tuple[int, int, int]:
     path = _replay_filter_path()
+    integrity_path = _replay_filter_integrity_path()
+    integrity_root_path = _replay_filter_integrity_root_path()
+    marker_path = _replay_filter_integrity_marker_path()
+    transaction_path = _replay_filter_transaction_path()
+    if _path_entry_exists(transaction_path):
+        _require_replay_transaction_marker()
+        raise TransportAssertionError(
+            "transport assertion replay mutation was interrupted; state is fail-closed"
+        )
     base_flags = os.O_RDWR | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     created = False
+    integrity_fd = -1
+    integrity_root_fd = -1
     try:
         fd = os.open(path, base_flags | os.O_CREAT | os.O_EXCL, 0o600)
         created = True
@@ -324,18 +852,13 @@ def _open_replay_filter() -> int:
         _validate_private_file(meta, "transport assertion replay filter")
         if created:
             os.ftruncate(fd, REPLAY_FILTER_TOTAL_BYTES)
-            if os.pwrite(fd, REPLAY_FILTER_HEADER, 0) != len(REPLAY_FILTER_HEADER):
-                raise TransportAssertionError(
-                    "transport assertion replay filter header write was short"
-                )
-            os.fsync(fd)
-            directory_fd = os.open(
-                STATE_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            _pwrite_exact(
+                fd,
+                REPLAY_FILTER_HEADER,
+                0,
+                "transport replay filter header",
             )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.fsync(fd)
         else:
             if meta.st_size != REPLAY_FILTER_TOTAL_BYTES:
                 raise TransportAssertionError(
@@ -346,55 +869,135 @@ def _open_replay_filter() -> int:
                 raise TransportAssertionError(
                     "transport assertion replay filter header mismatch"
                 )
-        return fd
-    except BaseException:
-        os.close(fd)
+        integrity_exists = _path_entry_exists(integrity_path)
+        integrity_root_exists = _path_entry_exists(integrity_root_path)
+        marker_exists = _path_entry_exists(marker_path)
         if created:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
+            if integrity_exists or integrity_root_exists or marker_exists:
+                raise TransportAssertionError(
+                    "transport assertion replay integrity has an orphaned entry"
+                )
+            integrity_fd = _initialize_replay_integrity(fd, integrity_path)
+            integrity_root_fd = _initialize_replay_integrity_root(
+                integrity_fd, integrity_root_path
+            )
+            _install_integrity_marker()
+        elif marker_exists:
+            _require_integrity_marker()
+            if not integrity_exists or not integrity_root_exists:
+                raise TransportAssertionError(
+                    "transport assertion replay integrity is required but missing"
+                )
+            integrity_fd = _open_existing_replay_integrity(integrity_path)
+            integrity_root_fd = _open_existing_replay_integrity_root(
+                integrity_root_path, integrity_fd
+            )
+        else:
+            # One-time upgrade of the prior replay-filter-v1 format. The
+            # current durable image becomes the migration baseline; after the
+            # marker is installed, missing or corrupt metadata is never rebuilt.
+            if integrity_exists:
+                integrity_fd = _open_existing_replay_integrity(integrity_path)
+                _validate_all_replay_pages(fd, integrity_fd)
+            else:
+                if integrity_root_exists:
+                    raise TransportAssertionError(
+                        "transport assertion replay integrity root is orphaned"
+                    )
+                integrity_fd = _initialize_replay_integrity(fd, integrity_path)
+            if integrity_root_exists:
+                integrity_root_fd = _open_existing_replay_integrity_root(
+                    integrity_root_path, integrity_fd
+                )
+            else:
+                integrity_root_fd = _initialize_replay_integrity_root(
+                    integrity_fd, integrity_root_path
+                )
+            _install_integrity_marker()
+        _fsync_directory(STATE_ROOT)
+        return fd, integrity_fd, integrity_root_fd
+    except BaseException:
+        if integrity_root_fd >= 0:
+            os.close(integrity_root_fd)
+        if integrity_fd >= 0:
+            os.close(integrity_fd)
+        os.close(fd)
         raise
 
 
-def _consume_replay_filter(scope_sha256: str, request_id: str) -> None:
-    masks: dict[int, int] = {}
-    for bit in _replay_filter_positions(scope_sha256, request_id):
-        byte_offset = REPLAY_FILTER_HEADER_BYTES + bit // 8
-        masks[byte_offset] = masks.get(byte_offset, 0) | (1 << (bit % 8))
+def _consume_replay_filter(
+    scope_replay_ids: tuple[tuple[str, str], ...],
+) -> None:
+    masks_by_scope: list[dict[tuple[int, int], int]] = []
+    all_masks: dict[tuple[int, int], int] = {}
+    for scope_sha256, replay_id in dict.fromkeys(scope_replay_ids):
+        scope_masks: dict[tuple[int, int], int] = {}
+        for bit in _replay_filter_positions(scope_sha256, replay_id):
+            byte_index = bit // 8
+            page_index = byte_index // REPLAY_FILTER_PAGE_BYTES
+            page_byte_index = byte_index % REPLAY_FILTER_PAGE_BYTES
+            key = (page_index, page_byte_index)
+            mask = 1 << (bit % 8)
+            scope_masks[key] = scope_masks.get(key, 0) | mask
+            all_masks[key] = all_masks.get(key, 0) | mask
+        masks_by_scope.append(scope_masks)
 
-    fd = _open_replay_filter()
+    fd, integrity_fd, integrity_root_fd = _open_replay_filter()
     try:
-        observed: dict[int, int] = {}
-        already_consumed = True
-        for byte_offset, mask in masks.items():
-            raw = os.pread(fd, 1, byte_offset)
-            if len(raw) != 1:
-                raise TransportAssertionError(
-                    "transport assertion replay filter read was short"
-                )
-            value = raw[0]
-            observed[byte_offset] = value
-            if value & mask != mask:
-                already_consumed = False
-        if already_consumed:
-            raise TransportAssertionReplay(
-                "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
+        pages = {
+            page_index: bytearray(
+                _validate_replay_page(fd, integrity_fd, page_index)
             )
-
-        for byte_offset, mask in masks.items():
-            value = observed[byte_offset] | mask
-            if value == observed[byte_offset]:
-                continue
-            if os.pwrite(fd, bytes((value,)), byte_offset) != 1:
-                raise TransportAssertionError(
-                    "transport assertion replay filter write was short"
+            for page_index in sorted({key[0] for key in all_masks})
+        }
+        for scope_masks in masks_by_scope:
+            if all(
+                pages[page_index][page_byte_index] & mask == mask
+                for (page_index, page_byte_index), mask in scope_masks.items()
+            ):
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed or conservatively rejected by the durable replay filter; do not repeat the mutation; reconcile target state"
                 )
-        # The mutation gate is allowed to continue only after every replay bit is
-        # durable. A crash before this fsync cannot be followed by target execution.
+
+        changed_pages: set[int] = set()
+        for (page_index, page_byte_index), mask in all_masks.items():
+            before = pages[page_index][page_byte_index]
+            after = before | mask
+            if after != before:
+                pages[page_index][page_byte_index] = after
+                changed_pages.add(page_index)
+        _install_replay_transaction_marker()
+        for page_index in sorted(changed_pages):
+            _pwrite_exact(
+                fd,
+                bytes(pages[page_index]),
+                _replay_page_offset(page_index),
+                "transport replay filter page",
+            )
+        # Data is durable before its integrity record. A crash in the following
+        # window yields a digest mismatch and therefore fails closed.
         os.fsync(fd)
+        for page_index in sorted(changed_pages):
+            _pwrite_exact(
+                integrity_fd,
+                _replay_page_digest(page_index, bytes(pages[page_index])),
+                _integrity_digest_offset(page_index),
+                "transport replay integrity digest",
+            )
+        # Mutation is admitted only after both replay bits and their bound
+        # integrity metadata are durable. The global root makes corruption in
+        # any digest record visible before an unrelated later request can run.
+        os.fsync(integrity_fd)
+        _refresh_replay_integrity_root(integrity_fd, integrity_root_fd)
+        _clear_replay_transaction_marker()
     finally:
-        os.close(fd)
+        try:
+            os.close(integrity_root_fd)
+        finally:
+            try:
+                os.close(integrity_fd)
+            finally:
+                os.close(fd)
 
 
 def consume_assertion(
@@ -413,7 +1016,7 @@ def consume_assertion(
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     scope_hash = _sha256(client_scope_sha256, "transport client scope hash")
-    replay_scope_hash = _replay_scope_sha256(secret)
+    legacy_replay_scope_hash = _replay_scope_sha256(secret)
     runtime_hash = _sha256(runtime_binding_sha256, "transport runtime binding hash")
     asserted_runtime_hash = _sha256(
         asserted_runtime_binding_sha256, "asserted transport runtime binding hash"
@@ -449,27 +1052,48 @@ def consume_assertion(
     if not hmac.compare_digest(asserted_runtime_hash, runtime_hash):
         raise TransportAssertionError("transport assertion runtime binding mismatch")
 
-    legacy_path = _tombstone_path(scope_hash, material["request_id"])
     with _state_lock():
-        existing = _read_tombstone(legacy_path)
-        if existing is not None:
-            exact = (
-                existing.get("request_id") == material["request_id"]
-                and existing.get("client_scope_sha256") == scope_hash
-                and existing.get("tool_name") == material["tool_name"]
-                and existing.get("arguments_sha256") == material["arguments_sha256"]
-                and existing.get("body_sha256") == material["body_sha256"]
-                and existing.get("runtime_binding_sha256")
+        for legacy_scope_hash, legacy_path in _legacy_tombstone_inventory(
+            scope_hash, material["request_id"]
+        ):
+            existing = _read_tombstone(legacy_path)
+            if existing is None:
+                continue
+            legacy = _validated_legacy_tombstone(
+                existing, legacy_scope_hash, legacy_path
+            )
+            same_target = (
+                legacy["tool_name"] == material["tool_name"]
+                and legacy["arguments_sha256"] == material["arguments_sha256"]
+                and legacy["body_sha256"] == material["body_sha256"]
+                and legacy["runtime_binding_sha256"]
                 == material["runtime_binding_sha256"]
             )
-            if not exact:
+            if legacy["request_id"] == material["request_id"] and not same_target:
                 raise TransportAssertionError(
                     "transport request id was reused for different evidence"
                 )
-            raise TransportAssertionReplay(
-                "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+            if legacy["body_sha256"] == material["body_sha256"]:
+                if not same_target:
+                    raise TransportAssertionError(
+                        "transport request body was rebound to different legacy evidence"
+                    )
+                # Legacy receipts predate stable connector identities, so token
+                # rotation cannot be linked back to one connector scope. Exact
+                # body-and-target evidence is conservatively authoritative
+                # across the bounded legacy inventory.
+                raise TransportAssertionReplay(
+                    "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
+                )
+        _consume_replay_filter(
+            (
+                (legacy_replay_scope_hash, material["request_id"]),
+                (
+                    scope_hash,
+                    _stable_scope_replay_id(material["body_sha256"]),
+                ),
             )
-        _consume_replay_filter(replay_scope_hash, material["request_id"])
+        )
 
     receipt = {
         "schema_version": SCHEMA_VERSION,
