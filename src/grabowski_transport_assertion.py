@@ -261,6 +261,12 @@ def _replay_filter_path() -> Path:
     return STATE_ROOT / REPLAY_FILTER_FILENAME
 
 
+def _replay_scope_sha256(secret: str) -> str:
+    return hashlib.sha256(
+        b"grabowski-one-call-replay-scope-v1\x00" + _secret_bytes(secret)
+    ).hexdigest()
+
+
 def _replay_filter_positions(scope_sha256: str, request_id: str) -> tuple[int, ...]:
     if REPLAY_FILTER_BITS <= 0 or REPLAY_FILTER_BITS & (REPLAY_FILTER_BITS - 1):
         raise TransportAssertionError("transport replay filter size must be a power of two")
@@ -364,6 +370,7 @@ def consume_assertion(
     now_unix: int | None = None,
 ) -> dict[str, Any]:
     scope_hash = _sha256(client_scope_sha256, "transport client scope hash")
+    replay_scope_hash = _replay_scope_sha256(secret)
     runtime_hash = _sha256(runtime_binding_sha256, "transport runtime binding hash")
     asserted_runtime_hash = _sha256(
         asserted_runtime_binding_sha256, "asserted transport runtime binding hash"
@@ -410,7 +417,7 @@ def consume_assertion(
             raise TransportAssertionReplay(
                 "signed one-call transport request was already consumed; do not repeat the mutation; reconcile target state"
             )
-        _consume_replay_filter(scope_hash, material["request_id"])
+        _consume_replay_filter(replay_scope_hash, material["request_id"])
 
     receipt = {
         "schema_version": SCHEMA_VERSION,

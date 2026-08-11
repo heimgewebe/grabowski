@@ -71,6 +71,25 @@ class ReplayFilterTests(unittest.TestCase):
         with self.assertRaises(assertion.TransportAssertionReplay):
             assertion.consume_assertion(**_evidence(17, now=5000), now_unix=5001)
 
+    def test_replay_filter_survives_client_scope_restart(self) -> None:
+        first = _evidence(4)
+        assertion.consume_assertion(**first, now_unix=101)
+        restarted = dict(first)
+        restarted["client_scope_sha256"] = "3" * 64
+        restarted["issued_at_unix"] = 5000
+        restarted["mac_sha256"] = assertion.assertion_mac(
+            secret=SECRET,
+            request_id=str(restarted["request_id"]),
+            issued_at_unix=5000,
+            audience=assertion.ASSERTION_AUDIENCE,
+            tool_name="grabowski_terminal_run",
+            arguments_sha256=ARGS,
+            body_sha256=str(restarted["body_sha256"]),
+            runtime_binding_sha256=RUNTIME,
+        )
+        with self.assertRaises(assertion.TransportAssertionReplay):
+            assertion.consume_assertion(**restarted, now_unix=5001)
+
     def test_legacy_tombstone_remains_authoritative(self) -> None:
         item = _evidence(2)
         assertion.STATE_ROOT.mkdir(mode=0o700)
