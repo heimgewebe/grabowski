@@ -75,28 +75,79 @@ class WorkAcquireTests(unittest.TestCase):
         return inputs, receipt
 
     @staticmethod
-    def acquired(owner: str, keys: list[str]) -> dict[str, object]:
+    def acquired(
+        owner: str,
+        keys: list[str],
+        *,
+        preserved: list[str] | None = None,
+        bureau_contract: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        now = int(time.time())
         leases = [
             {
                 "resource_key": key,
                 "owner_id": owner,
                 "purpose": "direct user implementation lane",
-                "acquired_at_unix": int(time.time()),
-                "updated_at_unix": int(time.time()),
-                "expires_at_unix": int(time.time()) + 1200,
+                "acquired_at_unix": now,
+                "updated_at_unix": now,
+                "expires_at_unix": now + 1200,
                 "metadata_sha256": "d" * 64,
                 "reclaimed_from_owner": None,
             }
             for key in keys
         ]
-        return {"owner_id": owner, "leases": leases, "preserved": [], "reclaimed": []}
+        return {
+            "owner_id": owner,
+            "leases": leases,
+            "preserved": list(preserved or []),
+            "reclaimed": [],
+            "bureau_contract": bureau_contract,
+        }
+
+    @staticmethod
+    def released(
+        owner: str, expected_leases: list[dict[str, object]]
+    ) -> dict[str, object]:
+        return {
+            "owner_id": owner,
+            "force": False,
+            "snapshot_guarded": True,
+            "released": [
+                {
+                    **snapshot,
+                    "purpose": "direct user implementation lane",
+                    "reclaimed_from_owner": None,
+                }
+                for snapshot in expected_leases
+            ],
+        }
+
+    def release(
+        self,
+        owner: str,
+        keys: list[str],
+        *,
+        expected_leases: list[dict[str, object]],
+    ) -> dict[str, object]:
+        self.assertEqual(
+            keys, [str(snapshot["resource_key"]) for snapshot in expected_leases]
+        )
+        return self.released(owner, expected_leases)
+
+    @staticmethod
+    def bureau_path_resources(keys: list[str]) -> list[str]:
+        return sorted(key for key in keys if key.startswith("path:"))
 
     def acquire(self, owner: str, keys: list[str], **kwargs: object) -> dict[str, object]:
         return self.acquired(owner, keys)
 
     def test_acquires_narrow_resources_and_returns_ready_lane(self) -> None:
         seen: dict[str, object] = {}
+        acquire_calls = 0
+
         def acquire(owner: str, keys: list[str], **kwargs: object) -> dict[str, object]:
+            nonlocal acquire_calls
+            acquire_calls += 1
             seen.update(owner=owner, keys=keys, kwargs=kwargs)
             return self.acquired(owner, keys)
         ensure = Mock(return_value={
@@ -112,6 +163,7 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(result["state"], "ready")
         self.assertEqual(result["decision"], "AUTO_PREPARE_AND_EXECUTE")
         self.assertEqual(result["authority"]["scoped_writer"]["role"], "scoped_writer")
+        self.assertEqual(acquire_calls, 1)
         self.assertIn(f"path:{self.target}", seen["keys"])
         self.assertIn(f"repo:{self.repo}:branch:feat/authority-p0", seen["keys"])
         self.assertNotIn(f"repo:{self.repo}", seen["keys"])
@@ -131,6 +183,415 @@ class WorkAcquireTests(unittest.TestCase):
             ensure_parameters["system_convergence_plan_sha256"],
             result["inputs"]["system_convergence_plan"]["plan_sha256"],
         )
+
+    def test_bureau_path_and_branch_use_same_owner_separate_contract_groups(self) -> None:
+        calls: list[dict[str, object]] = []
+        events: list[str] = []
+
+        def acquire(
+            owner: str, keys: list[str], **kwargs: object
+        ) -> dict[str, object]:
+            contract_group = "bureau" if self.bureau_path_resources(keys) else "standard"
+            events.append(f"acquire:{contract_group}")
+            calls.append(
+                {
+                    "owner": owner,
+                    "keys": list(keys),
+                    "kwargs": dict(kwargs),
+                    "contract_group": contract_group,
+                }
+            )
+            return self.acquired(
+                owner,
+                keys,
+                bureau_contract=(
+                    {"phase": "work", "resource_keys": list(keys)}
+                    if contract_group == "bureau"
+                    else None
+                ),
+            )
+
+        def ensure(*_args: object) -> dict[str, object]:
+            events.append("ensure")
+            return {
+                "result_state": "CREATED",
+                "durable_receipt_sha256": "b" * 64,
+                "post_state": {
+                    "target_registered": True,
+                    "target_path_exists": True,
+                },
+            }
+
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            result = work_acquire.acquire_work(
+                self.parameters(),
+                acquire_resources_fn=acquire,
+                release_resources_fn=Mock(),
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(events, ["acquire:bureau", "acquire:standard", "ensure"])
+        self.assertEqual(result["state"], "ready")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            {str(call["owner"]) for call in calls},
+            {result["inputs"]["lease_owner_id"]},
+        )
+        self.assertTrue(all(str(key).startswith("path:") for key in calls[0]["keys"]))
+        self.assertEqual(
+            calls[1]["keys"],
+            [f"repo:{self.repo}:branch:feat/authority-p0"],
+        )
+        first_kwargs = calls[0]["kwargs"]
+        second_kwargs = calls[1]["kwargs"]
+        self.assertEqual(first_kwargs, second_kwargs)
+        self.assertEqual(first_kwargs["purpose"], self.parameters()["purpose"])
+        self.assertEqual(first_kwargs["ttl_seconds"], 1200)
+        metadata = first_kwargs["metadata"]
+        self.assertEqual(metadata["lane_id"], result["lane_id"])
+        self.assertEqual(metadata["branch"], "feat/authority-p0")
+        groups = result["lease_acquisition_groups"]
+        self.assertEqual(
+            [group["contract_group"] for group in groups],
+            ["bureau", "standard"],
+        )
+        self.assertEqual(groups[0]["receipt"]["bureau_contract"]["phase"], "work")
+        self.assertIsNone(groups[1]["receipt"]["bureau_contract"])
+        self.assertEqual(
+            result["lease_receipt"]["kind"],
+            "grabowski.work_lane.lease_bundle",
+        )
+
+    def test_second_contract_group_failure_compensates_first_exactly(self) -> None:
+        first_receipt: dict[str, object] = {}
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+
+        def acquire(
+            owner: str, keys: list[str], **_kwargs: object
+        ) -> dict[str, object]:
+            nonlocal first_receipt
+            if self.bureau_path_resources(keys):
+                first_receipt = self.acquired(
+                    owner,
+                    keys,
+                    bureau_contract={"phase": "work", "resource_keys": list(keys)},
+                )
+                return first_receipt
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200
+            )
+
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            result = work_acquire.acquire_work(
+                self.parameters(),
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(result["acquisition"]["contract_group"], "standard")
+        ensure.assert_not_called()
+        release.assert_called_once()
+        expected = release.call_args.kwargs["expected_leases"]
+        self.assertEqual(
+            expected,
+            [
+                {
+                    key: lease[key]
+                    for key in sorted(work_acquire.resources.LEASE_SNAPSHOT_KEYS)
+                }
+                for lease in first_receipt["leases"]
+            ],
+        )
+        self.assertEqual(
+            release.call_args.args[0], result["inputs"]["lease_owner_id"]
+        )
+        self.assertEqual(result["compensation"]["state"], "complete")
+
+    def test_worktree_rejection_compensates_split_groups_in_reverse_order(self) -> None:
+        acquired_receipts: dict[str, dict[str, object]] = {}
+        release_calls: list[tuple[str, list[str], list[dict[str, object]]]] = []
+
+        def acquire(
+            owner: str, keys: list[str], **_kwargs: object
+        ) -> dict[str, object]:
+            contract_group = "bureau" if self.bureau_path_resources(keys) else "standard"
+            receipt = self.acquired(
+                owner,
+                keys,
+                bureau_contract=(
+                    {"phase": "work", "resource_keys": list(keys)}
+                    if contract_group == "bureau"
+                    else None
+                ),
+            )
+            acquired_receipts[contract_group] = receipt
+            return receipt
+
+        def release(
+            owner: str,
+            keys: list[str],
+            *,
+            expected_leases: list[dict[str, object]],
+        ) -> dict[str, object]:
+            release_calls.append((owner, list(keys), expected_leases))
+            return self.release(owner, keys, expected_leases=expected_leases)
+
+        ensure = Mock(
+            return_value={
+                "result_state": "NOT_ACCEPTED",
+                "post_state": {
+                    "target_registered": False,
+                    "target_path_exists": False,
+                    "branch_ref_head": None,
+                },
+            }
+        )
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            result = work_acquire.acquire_work(
+                self.parameters(),
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        self.assertEqual(
+            [keys for _owner, keys, _expected in release_calls],
+            [
+                [
+                    lease["resource_key"]
+                    for lease in acquired_receipts["standard"]["leases"]
+                ],
+                [
+                    lease["resource_key"]
+                    for lease in acquired_receipts["bureau"]["leases"]
+                ],
+            ],
+        )
+        self.assertEqual(
+            [group["contract_group"] for group in result["compensation"]["released_groups"]],
+            ["standard", "bureau"],
+        )
+
+    def test_compensation_unknown_hard_blocks_and_replay_has_no_effects(self) -> None:
+        acquire = Mock()
+        ensure = Mock()
+        release = Mock(side_effect=RuntimeError("Resource lease changed before release"))
+
+        def acquire_group(
+            owner: str, keys: list[str], **_kwargs: object
+        ) -> dict[str, object]:
+            if self.bureau_path_resources(keys):
+                return self.acquired(
+                    owner,
+                    keys,
+                    bureau_contract={"phase": "work", "resource_keys": list(keys)},
+                )
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200
+            )
+
+        acquire.side_effect = acquire_group
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            first = work_acquire.acquire_work(self.parameters(), **kwargs)
+            second = work_acquire.acquire_work(self.parameters(), **kwargs)
+
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["decision"], "HARD_BLOCK")
+        self.assertEqual(first["compensation"]["state"], "outcome_unknown")
+        self.assertEqual(
+            first["next_action"], "reconcile_lease_compensation_before_retry"
+        )
+        self.assertTrue(second["replayed"])
+        self.assertEqual(acquire.call_count, 2)
+        self.assertEqual(release.call_count, 1)
+        ensure.assert_not_called()
+
+    def test_ambiguous_later_acquisition_compensates_known_group_then_blocks(self) -> None:
+        acquire = Mock()
+        release = Mock(side_effect=self.release)
+        ensure = Mock()
+
+        def acquire_group(
+            owner: str, keys: list[str], **_kwargs: object
+        ) -> dict[str, object]:
+            if self.bureau_path_resources(keys):
+                return self.acquired(
+                    owner,
+                    keys,
+                    bureau_contract={"phase": "work", "resource_keys": list(keys)},
+                )
+            raise RuntimeError("acquisition response lost")
+
+        acquire.side_effect = acquire_group
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            result = work_acquire.acquire_work(
+                self.parameters(),
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(result["state"], "outcome_unknown")
+        self.assertEqual(result["acquisition"]["state"], "outcome_unknown")
+        self.assertEqual(result["compensation"]["state"], "complete")
+        release.assert_called_once()
+        ensure.assert_not_called()
+
+    def test_preserved_same_owner_group_is_not_released_on_later_failure(self) -> None:
+        release = Mock()
+        ensure = Mock()
+
+        def acquire(
+            owner: str, keys: list[str], **_kwargs: object
+        ) -> dict[str, object]:
+            if self.bureau_path_resources(keys):
+                return self.acquired(
+                    owner,
+                    keys,
+                    preserved=list(keys),
+                    bureau_contract={"phase": "work", "resource_keys": list(keys)},
+                )
+            raise work_acquire.resources.ResourceConflict(
+                keys[0], "foreign-owner", int(time.time()) + 1200
+            )
+
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            result = work_acquire.acquire_work(
+                self.parameters(),
+                acquire_resources_fn=acquire,
+                release_resources_fn=release,
+                inspect_resource_fn=Mock(),
+                ensure_worktree_fn=ensure,
+                runner=Mock(),
+            )
+
+        self.assertEqual(result["state"], "blocked")
+        release.assert_not_called()
+        ensure.assert_not_called()
+        self.assertEqual(
+            result["compensation"]["preserved_resource_keys"],
+            result["acquisition_plan"][0]["resource_keys"],
+        )
+
+    def test_foreign_acquisition_snapshot_is_not_released_or_retried(self) -> None:
+        acquire = Mock()
+        release = Mock()
+        ensure = Mock()
+
+        def acquire_group(
+            _owner: str, keys: list[str], **_kwargs: object
+        ) -> dict[str, object]:
+            return self.acquired(
+                "foreign-owner",
+                keys,
+                bureau_contract={"phase": "work", "resource_keys": list(keys)},
+            )
+
+        acquire.side_effect = acquire_group
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+        with patch.object(
+            work_acquire.resources.bureau_leases,
+            "bureau_resource_keys",
+            side_effect=self.bureau_path_resources,
+        ):
+            first = work_acquire.acquire_work(self.parameters(), **kwargs)
+            second = work_acquire.acquire_work(self.parameters(), **kwargs)
+
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertEqual(first["error_class"], "LeaseAcquisitionOutcomeUnknown")
+        self.assertTrue(second["replayed"])
+        self.assertEqual(acquire.call_count, 1)
+        release.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_incomplete_resource_effect_receipt_does_not_retry_effect(self) -> None:
+        for incomplete_state in ("acquiring", "compensating"):
+            with self.subTest(incomplete_state=incomplete_state):
+                params = self.parameters()
+                params["idempotency_key"] = f"incomplete-{incomplete_state}"
+                inputs = work_acquire._normalize(params)
+                inputs.pop("_scoped_writer_argv")
+                work_acquire._private_directory(self.state)
+                work_acquire._write_state(
+                    self.state / f"{inputs['lane_id']}.json",
+                    {
+                        "kind": work_acquire.LANE_KIND,
+                        "schema_version": work_acquire.SCHEMA_VERSION,
+                        "lane_id": inputs["lane_id"],
+                        "inputs_sha256": work_acquire._sha(inputs),
+                        "inputs": inputs,
+                        "attempt_count": 1,
+                        "created_at_unix": int(time.time()),
+                        "updated_at_unix": int(time.time()),
+                        "state": incomplete_state,
+                    },
+                )
+                acquire = Mock()
+                release = Mock()
+                ensure = Mock()
+                result = work_acquire.acquire_work(
+                    params,
+                    acquire_resources_fn=acquire,
+                    release_resources_fn=release,
+                    inspect_resource_fn=Mock(),
+                    ensure_worktree_fn=ensure,
+                    runner=Mock(),
+                )
+                self.assertEqual(result["state"], "outcome_unknown")
+                self.assertEqual(result["decision"], "HARD_BLOCK")
+                self.assertTrue(result["replayed"])
+                acquire.assert_not_called()
+                release.assert_not_called()
+                ensure.assert_not_called()
 
 
     def test_legacy_direct_user_source_uses_lane_lifecycle_evidence(self) -> None:
@@ -386,7 +847,13 @@ class WorkAcquireTests(unittest.TestCase):
         )
         second = work_acquire.acquire_work(
             params,
-            acquire_resources_fn=Mock(side_effect=RuntimeError("resource conflict")),
+            acquire_resources_fn=Mock(
+                side_effect=work_acquire.resources.ResourceConflict(
+                    f"path:{self.target}",
+                    "foreign-owner",
+                    int(time.time()) + 1200,
+                )
+            ),
             release_resources_fn=Mock(),
             inspect_resource_fn=Mock(),
             ensure_worktree_fn=Mock(),
@@ -539,7 +1006,7 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertEqual(second["attempt_count"], 2)
 
     def test_pre_effect_failure_releases_exact_acquired_leases(self) -> None:
-        release = Mock(return_value={"released": True})
+        release = Mock(side_effect=self.release)
         ensure = Mock(return_value={
             "result_state": "NOT_ACCEPTED",
             "post_state": {"target_registered": False, "target_path_exists": False, "branch_ref_head": None},
@@ -555,7 +1022,7 @@ class WorkAcquireTests(unittest.TestCase):
         self.assertIsInstance(release.call_args.kwargs["expected_leases"], list)
 
     def test_preexisting_conflict_is_compensated(self) -> None:
-        release = Mock(return_value={"released": True})
+        release = Mock(side_effect=self.release)
         ensure = Mock(return_value={
             "result_state": "CONFLICT",
             "post_state": {"target_registered": True, "target_path_exists": True, "branch_ref_head": SHA},
@@ -586,18 +1053,27 @@ class WorkAcquireTests(unittest.TestCase):
         release.assert_not_called()
 
     def test_exception_after_lease_acquisition_preserves_for_reconciliation(self) -> None:
+        acquire = Mock(side_effect=self.acquire)
         release = Mock()
-        result = work_acquire.acquire_work(
-            self.parameters(), acquire_resources_fn=self.acquire,
-            release_resources_fn=release, inspect_resource_fn=Mock(),
-            ensure_worktree_fn=Mock(side_effect=RuntimeError("lost response")), runner=Mock(),
-        )
-        self.assertEqual(result["state"], "outcome_unknown")
-        self.assertIsNone(result["effect_observed"])
+        ensure = Mock(side_effect=RuntimeError("lost response"))
+        kwargs = {
+            "acquire_resources_fn": acquire,
+            "release_resources_fn": release,
+            "inspect_resource_fn": Mock(),
+            "ensure_worktree_fn": ensure,
+            "runner": Mock(),
+        }
+        first = work_acquire.acquire_work(self.parameters(), **kwargs)
+        second = work_acquire.acquire_work(self.parameters(), **kwargs)
+        self.assertEqual(first["state"], "outcome_unknown")
+        self.assertIsNone(first["effect_observed"])
+        self.assertTrue(second["replayed"])
+        self.assertEqual(acquire.call_count, 1)
+        self.assertEqual(ensure.call_count, 1)
         release.assert_not_called()
 
     def test_preflight_exception_after_lease_acquisition_is_compensated(self) -> None:
-        release = Mock(return_value={"released": True})
+        release = Mock(side_effect=self.release)
         result = work_acquire.acquire_work(
             self.parameters(), acquire_resources_fn=self.acquire,
             release_resources_fn=release, inspect_resource_fn=Mock(),
