@@ -439,6 +439,10 @@
       "source": "src/grabowski_systemkatalog.py"
     },
     {
+      "module": "grabowski_bureau_launcher_contract",
+      "source": "src/grabowski_bureau_launcher_contract.py"
+    },
+    {
       "module": "grabowski_bureau_leases",
       "source": "src/grabowski_bureau_leases.py"
     },
