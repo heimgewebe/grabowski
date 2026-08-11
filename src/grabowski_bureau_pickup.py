@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import stat
 import time
-from typing import Any
+from typing import Any, Literal
 
 try:
     from typing_extensions import TypedDict
@@ -147,6 +147,7 @@ class BureauPickupRequest(_RequiredBureauPickupRequest, total=False):
     kind: str
     base_dir: str | None
     approval_source: str
+    approval_level: Literal["operator", "break_glass"]
     lease_ttl_seconds: int
     create_workspace: bool
     repository_scope_manifests: dict[str, dict[str, Any]] | None
@@ -1277,6 +1278,7 @@ def _normalize_request(
         "kind",
         "base_dir",
         "approval_source",
+        "approval_level",
         "lease_ttl_seconds",
         "create_workspace",
         "repository_scope_manifests",
@@ -1303,6 +1305,13 @@ def _normalize_request(
         label="approval_source",
         maximum=512,
     )
+    approval_level = _text(
+        request.get("approval_level", "operator"),
+        label="approval_level",
+        maximum=32,
+    )
+    if approval_level not in {"operator", "break_glass"}:
+        raise ValueError("approval_level must be operator or break_glass")
     registry_root = _normalize_registry_root(
         request.get("registry_root", str(bureau.BUREAU_ROOT))
     )
@@ -1329,6 +1338,7 @@ def _normalize_request(
         "kind": kind,
         "base_dir": base_dir,
         "approval_source": approval_source,
+        "approval_level": approval_level,
         "registry_root": registry_root,
         "coordination_root": coordination_root,
         "lease_ttl_seconds": _ttl(request.get("lease_ttl_seconds", 900)),
@@ -1368,7 +1378,10 @@ def _claim_intent(request: dict[str, Any]) -> dict[str, Any]:
         arguments.extend(["--resource", request["resource"]])
     if request["base_dir"]:
         arguments.extend(["--base-dir", request["base_dir"]])
-    arguments.extend(["--approve", "--approval-source", request["approval_source"]])
+    arguments.append(
+        "--break-glass" if request["approval_level"] == "break_glass" else "--approve"
+    )
+    arguments.extend(["--approval-source", request["approval_source"]])
     return bureau._invoke_bureau(arguments, include_runtime_identity=True)
 
 
