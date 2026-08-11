@@ -371,6 +371,103 @@ class RecallTests(unittest.TestCase):
         self.assertIn("safe_retry", result["does_not_establish"])
         self.assertIn("policy_change", item["does_not_establish"])
 
+    def test_chronik_history_recall_exposes_structured_hash_bound_context(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["subject"]["pr_number"] = 200
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        item = result["items"][0]
+
+        self.assertEqual(item["historical_context"]["observed_at"], "2026-07-23T12:00:00Z")
+        self.assertEqual(
+            item["historical_context"]["run_id"],
+            "task-0123456789abcdef01234567-a1",
+        )
+        self.assertEqual(item["historical_context"]["operation"], "implement")
+        self.assertEqual(item["historical_context"]["task_class"], "coding")
+        self.assertEqual(item["historical_context"]["subject"]["component"], "chronik")
+        self.assertEqual(item["historical_context"]["subject"]["pr_number"], 200)
+        self.assertEqual(len(item["historical_context"]["support_refs"]), 2)
+        self.assertTrue(item["pattern_fingerprint"].startswith("sha256:"))
+        self.assertEqual(item["pattern_occurrence_count"], 1)
+        self.assertEqual(item["pattern_scope"], "bounded_query_result")
+        self.assertTrue(item["reuse_condition"]["requires_live_recheck"])
+        self.assertNotIn("pr_number", item["reuse_condition"]["match"])
+        self.assertIn("root_cause", item["does_not_establish"])
+
+    def test_chronik_history_recall_counts_repeated_semantic_patterns_only_within_result(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        first = history["events"][0]
+        first["kind"] = "agent.run.blocked"
+        first["data"]["result"] = "blocked"
+        first["data"]["blocker_code"] = "task-failed"
+        first["event_id"] = module._chronik_event_id(first)
+
+        second = {
+            **first,
+            "source": {**first["source"], "run_id": "task-fedcba9876543210fedcba98-a1"},
+            "ts": "2026-07-23T13:00:00Z",
+        }
+        second["event_id"] = module._chronik_event_id(second)
+        history["events"] = [first, second]
+        history["history"]["event_ids"] = [first["event_id"], second["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+
+        self.assertEqual(result["returned"], 2)
+        self.assertEqual(result["pattern_count"], 1)
+        self.assertEqual(result["pattern_summary"][0]["occurrences"], 2)
+        self.assertEqual(result["pattern_scope"], "bounded_query_result")
+        self.assertEqual(result["items"][0]["pattern_fingerprint"], result["items"][1]["pattern_fingerprint"])
+        self.assertEqual(result["items"][0]["pattern_occurrence_count"], 2)
+        self.assertEqual(result["items"][1]["pattern_occurrence_count"], 2)
+        self.assertIn("task-failed", result["items"][0]["learned_rule"])
+
+    def test_chronik_history_recall_bounds_support_refs(self) -> None:
+        module = self._load_module()
+        history = self._chronik_history_result(module)
+        event = history["events"][0]
+        event["evidence_refs"] = [f"grabowski-task:ref-{index}" for index in range(10)]
+        event["event_id"] = module._chronik_event_id(event)
+        history["history"]["event_ids"] = [event["event_id"]]
+        unsigned = dict(history)
+        unsigned.pop("result_sha256", None)
+        history["result_sha256"] = module._sha256_json(unsigned)
+
+        result = module.export_chronik_history_recall(history)
+        context = result["items"][0]["historical_context"]
+
+        self.assertEqual(len(context["support_refs"]), module.MAX_HISTORICAL_SUPPORT_REFS)
+        self.assertTrue(context["support_refs_truncated"])
+
+    def test_chronik_history_pattern_summary_is_bounded(self) -> None:
+        module = self._load_module()
+        items = [
+            {
+                "pattern_fingerprint": f"sha256:{index:064x}",
+                "historical_pattern": {"operation": f"operation-{index}"},
+            }
+            for index in range(module.MAX_HISTORICAL_PATTERN_SUMMARY + 3)
+        ]
+
+        summary, total = module._historical_pattern_summary(items)
+
+        self.assertEqual(total, module.MAX_HISTORICAL_PATTERN_SUMMARY + 3)
+        self.assertEqual(len(summary), module.MAX_HISTORICAL_PATTERN_SUMMARY)
+        self.assertEqual(items[0]["pattern_occurrence_count"], 1)
+        self.assertEqual(items[0]["pattern_scope"], "bounded_query_result")
+
     def test_chronik_history_recall_bounds_long_valid_subject_without_rejecting_event(self) -> None:
         module = self._load_module()
         history = self._chronik_history_result(module)
