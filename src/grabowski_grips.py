@@ -132,7 +132,10 @@ GRIP_SPECS: dict[str, GripSpec] = {
     "worktree-ensure": GripSpec(
         name="worktree-ensure",
         version="1.0",
-        summary="Ensure one exact lease-bound Git worktree with durable idempotent recovery.",
+        summary=(
+            "Ensure one exact Git worktree under pre-acquired owner-bound leases with durable "
+            "idempotent recovery; use work-acquire when the leases do not exist yet."
+        ),
         effect=MUTATING,
         required_parameters=(
             "repo",
@@ -698,6 +701,13 @@ GRIP_RECOVERY_PATHS_BY_NAME = {
 # Conditional requirements cannot be expressed as static required_parameters,
 # so the published contract carries them explicitly per action.
 GRIP_CONDITIONAL_PRECONDITIONS = {
+    "worktree-ensure": (
+        "the leases for path:<target_path> and repo:<repo>:branch:<branch> must already be live "
+        "and owned by lease_owner_id; worktree-ensure never creates or renews leases and rejects "
+        "fail-closed with a typed lease_remediation otherwise",
+        "prefer the work-acquire grip, which binds source, controller lane, both leases and the "
+        "exact worktree atomically in one call",
+    ),
     "work-acquire": (
         "source_kind must be one of bureau_task, github_issue, operator_obligation, thread_focus; "
         "other source kinds have no immutable terminal evidence observer and are rejected before checkout creation",

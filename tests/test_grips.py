@@ -986,6 +986,11 @@ class GripFoundationTests(unittest.TestCase):
         for source_kind in ("bureau_task", "github_issue", "operator_obligation", "thread_focus"):
             self.assertIn(source_kind, work_acquire_preconditions)
         self.assertIn("immutable terminal evidence observer", work_acquire_preconditions)
+        worktree_ensure_preconditions = " ".join(specs["worktree-ensure"]["preconditions"])
+        self.assertIn("must already be live", worktree_ensure_preconditions)
+        self.assertIn("never creates or renews leases", worktree_ensure_preconditions)
+        self.assertIn("work-acquire", worktree_ensure_preconditions)
+        self.assertIn("work-acquire", specs["worktree-ensure"]["summary"])
 
     def test_work_acquire_grip_exposes_existing_lane_contract(self) -> None:
         parameters = {
