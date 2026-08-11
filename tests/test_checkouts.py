@@ -793,6 +793,13 @@ class CheckoutLifecycleTests(unittest.TestCase):
             include_resources=False,
         )
         self.assertEqual(first["inventory_sha256"], second["inventory_sha256"])
+        self.assertTrue(
+            work_admission._complete_repository_inventory(
+                first,
+                repository=str(self.repo.resolve()),
+                worktrees=first["worktrees"],
+            )
+        )
         paths = [item["path"] for item in first["worktrees"]]
         self.assertEqual(paths, sorted(paths))
         linked = next(item for item in first["worktrees"] if item["path"] == str(self.checkout))
