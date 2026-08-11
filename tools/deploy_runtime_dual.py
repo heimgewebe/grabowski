@@ -242,6 +242,8 @@ TRANSPORT_CONNECTOR_TOKEN_PATH = core.HOME / ".local/state/grabowski/transport-c
 LEGACY_TUNNEL_OPERATOR_PORT = OPERATOR_LISTENER_PORT
 TUNNEL_TARGET_PORTS = frozenset({LEGACY_TUNNEL_OPERATOR_PORT, TRANSPORT_INGRESS_LISTENER_PORT})
 TRANSPORT_INGRESS_HEALTH_URL = f"http://127.0.0.1:{TRANSPORT_INGRESS_LISTENER_PORT}/_grabowski/transport-ingress"
+TRANSPORT_INGRESS_HEALTH_TIMEOUT_SECONDS = 5.0
+TRANSPORT_INGRESS_HEALTH_POLL_INTERVAL_SECONDS = 0.1
 OPERATOR_LISTENER_REQUIRED_SAMPLES = 2
 TUNNEL_METRICS_URL = core.HEALTH_URL.rsplit("/", 1)[0] + "/metrics"
 TUNNEL_DRAIN_QUEUE_GAUGE_NAME = "commands_queue_length"
@@ -2416,23 +2418,63 @@ def restore_tunnel_profile_cutover(profile_path: Path, cutover: TunnelProfileCut
     return {"restored": True, "profile_sha256": cutover.before_sha256, "port": cutover.before_port}
 
 
-def require_transport_ingress_health() -> dict[str, Any]:
+def require_transport_ingress_health(
+    *, timeout_seconds: float = TRANSPORT_INGRESS_HEALTH_TIMEOUT_SECONDS
+) -> dict[str, Any]:
     request = Request(TRANSPORT_INGRESS_HEALTH_URL, headers={"Cache-Control": "no-store", "Accept": "application/json"}, method="GET")
-    try:
-        with urlopen(request, timeout=2) as response:
-            status = int(response.status)
-            raw = response.read(8193)
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        core.fail("Signierter Transport-Ingress ist nicht erreichbar", details={"error_type": type(exc).__name__})
-    if status != 200 or len(raw) > 8192:
-        core.fail("Signierter Transport-Ingress lieferte keinen gültigen Health-Status")
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
-        core.fail("Transport-Ingress-Health ist kein gültiges JSON", details={"error_type": type(exc).__name__})
-    if not isinstance(value, dict) or value.get("healthy") is not True or value.get("assertion_version") != "signed-one-call-v1":
-        core.fail("Transport-Ingress-Health entspricht nicht dem One-Call-Vertrag")
-    return value
+    deadline = time.monotonic() + timeout_seconds
+    attempts = 0
+    last_error_type: str | None = None
+    last_error: str | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        attempts += 1
+        try:
+            with urlopen(request, timeout=max(0.01, min(2.0, remaining))) as response:
+                status = int(response.status)
+                raw = response.read(8193)
+        except HTTPError as exc:
+            core.fail(
+                "Signierter Transport-Ingress lieferte keinen gültigen Health-Status",
+                details={"error_type": type(exc).__name__, "http_status": exc.code},
+            )
+        except (URLError, TimeoutError, OSError) as exc:
+            last_error_type = type(exc).__name__
+            message = core.redact_text(str(exc)).strip()
+            last_error = message[:256] if message else last_error_type
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(TRANSPORT_INGRESS_HEALTH_POLL_INTERVAL_SECONDS, remaining))
+            continue
+        if status != 200 or len(raw) > 8192:
+            core.fail(
+                "Signierter Transport-Ingress lieferte keinen gültigen Health-Status",
+                details={"attempts": attempts, "http_status": status},
+            )
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            core.fail(
+                "Transport-Ingress-Health ist kein gültiges JSON",
+                details={"attempts": attempts, "error_type": type(exc).__name__},
+            )
+        if not isinstance(value, dict) or value.get("healthy") is not True or value.get("assertion_version") != "signed-one-call-v1":
+            core.fail(
+                "Transport-Ingress-Health entspricht nicht dem One-Call-Vertrag",
+                details={"attempts": attempts},
+            )
+        return value
+    core.fail(
+        "Signierter Transport-Ingress ist nicht erreichbar",
+        details={
+            "attempts": attempts,
+            "error_type": last_error_type or "ReadinessTimeout",
+            "last_error": last_error or "readiness deadline elapsed",
+        },
+    )
 
 
 def require_topology_matches_contract(
