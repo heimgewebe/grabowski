@@ -2364,7 +2364,12 @@ def _browser_semantic_handle_key(record: dict[str, Any]) -> bytes:
     key_path = directory / ".semantic-handle-key"
     if key_path.is_symlink():
         raise PermissionError("browser semantic handle key may not be a symlink")
-    metadata = key_path.stat()
+    try:
+        metadata = key_path.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "browser worker predates semantic handle keys; start a fresh browser worker"
+        ) from exc
     if (
         not stat.S_ISREG(metadata.st_mode)
         or metadata.st_uid != os.geteuid()

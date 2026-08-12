@@ -1945,6 +1945,20 @@ globalThis.fetch = async () => ({
         rendered = json.dumps(worker_a)
         self.assertNotIn(key_a.hex(), rendered)
 
+    def test_browser_semantic_legacy_worker_without_handle_key_fails_before_transport(self) -> None:
+        worker = self._running_browser(port=9357)
+        record = workers._row(worker["worker_id"])
+        key_path = Path(record["config_path"]).parent / ".semantic-handle-key"
+        key_path.unlink()
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(workers, "_run_node_browser_semantic") as run:
+            with self.assertRaisesRegex(
+                RuntimeError, "predates semantic handle keys; start a fresh browser worker"
+            ):
+                workers.browser_semantic_observe(worker["worker_id"])
+        run.assert_not_called()
+
     def test_browser_semantic_observe_bounds_and_redacts_element_projection(self) -> None:
         worker = self._running_browser(port=9360)
         raw_elements = [
