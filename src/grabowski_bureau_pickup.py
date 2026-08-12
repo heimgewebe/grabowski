@@ -2224,10 +2224,10 @@ def _recover_after_commit(
 
 
 def _lease_snapshot(value: dict[str, Any]) -> dict[str, Any]:
-    snapshot = {key: value[key] for key in LEASE_IDENTITY_FIELDS}
-    if "reclaimed_from_owner" in value:
-        snapshot["reclaimed_from_owner"] = value["reclaimed_from_owner"]
-    return snapshot
+    # Resource CAS mutation helpers accept exactly the canonical lease snapshot
+    # fields.  reclaimed_from_owner is historical provenance, not lease identity
+    # for renew/rebind CAS.
+    return {key: value[key] for key in LEASE_IDENTITY_FIELDS}
 
 
 def _owner_lease_matches_snapshot(
@@ -2654,6 +2654,85 @@ def _require_active_execution_binding(
         },
     )
 
+def _persisted_resource_lease(resource_key: str) -> dict[str, Any] | None:
+    """Read one persisted lease row without treating expiry as authority.
+
+    Public inspect_resource deliberately hides expired rows.  Existing-assignment
+    recovery still needs the expired row as provenance before restoring the same
+    owner.  This helper is read-only; the later rebind performs the authoritative
+    CAS inside the resource store transaction.
+    """
+    key = resources.normalize_resource_key(resource_key)
+    try:
+        with resources._resource_inventory_readonly_sqlite(
+            resources.RESOURCE_DB
+        ) as connection:
+            if (
+                resources._resource_schema_version(connection)
+                != resources.RESOURCE_CURRENT_SCHEMA_VERSION
+            ):
+                raise RuntimeError("Resource database schema is not current")
+            resources._validate_resource_schema_current(connection)
+            row = connection.execute(
+                "SELECT resource_key, owner_id, purpose, acquired_at_unix, "
+                "updated_at_unix, expires_at_unix, metadata_sha256 "
+                "FROM leases WHERE resource_key=?",
+                (key,),
+            ).fetchone()
+    except Exception as exc:
+        raise BureauPickupError(
+            "existing-assignment-lease-history-read-failed",
+            details={
+                "resource_key": key,
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
+    if row is None:
+        return None
+    try:
+        value = dict(row)
+        snapshot = _lease_snapshot(value)
+        purpose = value["purpose"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise BureauPickupError(
+            "existing-assignment-lease-history-invalid",
+            details={
+                "resource_key": key,
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
+    if snapshot.get("resource_key") != key:
+        raise BureauPickupError(
+            "existing-assignment-lease-history-invalid",
+            details={"resource_key": key, "reason": "resource-key-drift"},
+        )
+    if (
+        not isinstance(snapshot.get("owner_id"), str)
+        or not isinstance(purpose, str)
+        or not purpose
+        or any(
+            type(snapshot.get(field)) is not int
+            for field in (
+                "acquired_at_unix",
+                "updated_at_unix",
+                "expires_at_unix",
+            )
+        )
+        or not (
+            snapshot["acquired_at_unix"]
+            <= snapshot["updated_at_unix"]
+            < snapshot["expires_at_unix"]
+        )
+        or not isinstance(snapshot.get("metadata_sha256"), str)
+        or SHA256_RE.fullmatch(snapshot["metadata_sha256"]) is None
+    ):
+        raise BureauPickupError(
+            "existing-assignment-lease-history-invalid",
+            details={"resource_key": key},
+        )
+    return {**snapshot, "purpose": purpose}
+
+
 def _repair_existing_assignment_lease_binding(
     coordination: dict[str, Any],
     intent: dict[str, Any],
@@ -2716,7 +2795,154 @@ def _repair_existing_assignment_lease_binding(
             )
         return keys, purpose, original
 
-    if error_code in {"lease-expired", "lease-resources-missing"}:
+    if error_code == "lease-expired":
+        reacquired: list[dict[str, Any]] = []
+        compensation_entries: list[dict[str, Any]] = []
+        try:
+            for index, group in enumerate(groups, start=1):
+                keys, purpose, _original = original_group(group)
+                expired_keys: list[str] = []
+                expired_snapshots: list[dict[str, Any]] = []
+                for key in keys:
+                    observed = resources.inspect_resource(key)
+                    if observed is not None:
+                        if observed.get("owner_id") != intent["lease_owner_id"]:
+                            raise BureauPickupError(
+                                "existing-assignment-lease-foreign-owner",
+                                details={
+                                    "resource_key": key,
+                                    "owner_id": observed.get("owner_id"),
+                                },
+                            )
+                        if observed.get("purpose") != purpose or observed.get(
+                            "metadata_sha256"
+                        ) != original_by_key[key].get("metadata_sha256"):
+                            raise BureauPickupError(
+                                "existing-assignment-lease-live-binding-mismatch",
+                                details={
+                                    "group": group["name"],
+                                    "resource_key": key,
+                                },
+                            )
+                        continue
+                    persisted = _persisted_resource_lease(key)
+                    if persisted is None:
+                        raise BureauPickupError(
+                            "existing-assignment-expired-lease-history-missing",
+                            details={
+                                "group": group["name"],
+                                "resource_key": key,
+                            },
+                        )
+                    if persisted["expires_at_unix"] > resources._now():
+                        raise BureauPickupError(
+                            "existing-assignment-lease-current-readback-drift",
+                            details={
+                                "group": group["name"],
+                                "resource_key": key,
+                            },
+                        )
+                    if persisted.get("owner_id") != intent["lease_owner_id"]:
+                        raise BureauPickupError(
+                            "existing-assignment-lease-foreign-owner",
+                            details={
+                                "resource_key": key,
+                                "owner_id": persisted.get("owner_id"),
+                            },
+                        )
+                    if persisted.get("purpose") != purpose or persisted.get(
+                        "metadata_sha256"
+                    ) != original_by_key[key].get("metadata_sha256"):
+                        raise BureauPickupError(
+                            "existing-assignment-lease-history-binding-mismatch",
+                            details={
+                                "group": group["name"],
+                                "resource_key": key,
+                            },
+                        )
+                    expired_keys.append(key)
+                    expired_snapshots.append(_lease_snapshot(persisted))
+                if not expired_keys:
+                    continue
+                rebound_group = {**group, "resource_keys": expired_keys}
+                result = resources.rebind_same_owner_resources(
+                    intent["lease_owner_id"],
+                    expired_keys,
+                    purpose=purpose,
+                    ttl_seconds=group["ttl_seconds"],
+                    metadata=group["metadata"],
+                    expected_current_leases=expired_snapshots,
+                    expected_original_leases=[
+                        _lease_snapshot(original_by_key[key]) for key in expired_keys
+                    ],
+                )
+                _validate_acquired_group(
+                    intent["lease_owner_id"], rebound_group, result
+                )
+                leases = result["leases"]
+                if any(
+                    item.get("purpose") != purpose
+                    or item.get("metadata_sha256")
+                    != original_by_key[item["resource_key"]].get("metadata_sha256")
+                    for item in leases
+                ):
+                    raise BureauPickupError(
+                        "existing-assignment-lease-reacquire-mismatch",
+                        details={"group": group["name"]},
+                    )
+                entry = {
+                    "group": group["name"],
+                    "resource_keys": keys,
+                    "reacquired_resource_keys": expired_keys,
+                    "method": "same-owner-rebind",
+                    "result": result,
+                }
+                reacquired.append(entry)
+                compensation_entries.append(
+                    {"group": group["name"], "resource_keys": expired_keys}
+                )
+                _write_bound_json(
+                    run_dir / f"lease-reacquired-{index:02d}.json", entry
+                )
+        except Exception as exc:
+            compensation = _compensate_acquisitions(
+                intent["lease_owner_id"], compensation_entries, run_dir
+            )
+            raise BureauPickupError(
+                "existing-assignment-lease-reacquire-failed",
+                details={
+                    "error_type": type(exc).__name__,
+                    "cause_code": getattr(exc, "code", None),
+                    "reacquired_group_count": len(reacquired),
+                    "compensation": compensation,
+                },
+            ) from exc
+        if not reacquired:
+            return False
+        receipt = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "grabowski_bureau_pickup_lease_reacquire",
+            "run_id": intent["run_id"],
+            "task_id": intent["task_id"],
+            "claim_intent_sha256": intent["intent_sha256"],
+            "groups": [
+                {
+                    "group": entry["group"],
+                    "resource_keys": entry["resource_keys"],
+                    "reacquired_resource_keys": entry["reacquired_resource_keys"],
+                    "method": entry["method"],
+                }
+                for entry in reacquired
+            ],
+            "resource_keys": sorted(
+                key for entry in reacquired for key in entry["reacquired_resource_keys"]
+            ),
+        }
+        receipt["receipt_sha256"] = _sha256(receipt)
+        _write_bound_json(run_dir / "lease-reacquire.json", receipt)
+        return True
+
+    if error_code == "lease-resources-missing":
         reacquired: list[dict[str, Any]] = []
         compensation_entries: list[dict[str, Any]] = []
         try:
@@ -2757,6 +2983,7 @@ def _repair_existing_assignment_lease_binding(
                     "group": group["name"],
                     "resource_keys": keys,
                     "reacquired_resource_keys": missing_before,
+                    "method": "acquire",
                     "result": result,
                 }
                 reacquired.append(entry)
@@ -2792,6 +3019,7 @@ def _repair_existing_assignment_lease_binding(
                 "existing-assignment-lease-reacquire-failed",
                 details={
                     "error_type": type(exc).__name__,
+                    "cause_code": getattr(exc, "code", None),
                     "reacquired_group_count": len(reacquired),
                     "compensation": compensation,
                 },
@@ -2809,6 +3037,7 @@ def _repair_existing_assignment_lease_binding(
                     "group": entry["group"],
                     "resource_keys": entry["resource_keys"],
                     "reacquired_resource_keys": entry["reacquired_resource_keys"],
+                    "method": entry["method"],
                 }
                 for entry in reacquired
             ],
