@@ -4073,8 +4073,19 @@ def preflight_url(
     repo: Path,
     runtime: Path,
     profile_path: Path,
+    *,
+    expected_head: str | None = None,
 ) -> tuple[core.Snapshot, Path, ProfileTopology]:
     snapshot = core.snapshot_from_git(repo)
+    if expected_head is not None and snapshot.repo_head != expected_head:
+        core.fail(
+            "Deployment source HEAD differs from expected_head",
+            phase="expected-head",
+            details={
+                "expected_head": expected_head,
+                "observed_head": snapshot.repo_head,
+            },
+        )
     runtime = core.require_runtime_replaceable(runtime)
     topology = profile_topology(profile_path, runtime)
     require_topology_matches_contract(topology, runtime, snapshot.contract)
@@ -4094,8 +4105,14 @@ def deploy_url(
     profile_path: Path,
     *,
     timeout_seconds: int,
+    expected_head: str | None = None,
 ) -> None:
-    snapshot, runtime, topology = preflight_url(repo, runtime, profile_path)
+    snapshot, runtime, topology = preflight_url(
+        repo,
+        runtime,
+        profile_path,
+        expected_head=expected_head,
+    )
     profile_cutover = (
         capture_tunnel_profile_cutover(profile_path, runtime)
         if topology.kind == "url" and topology.server_url_port in TUNNEL_TARGET_PORTS
@@ -4366,6 +4383,10 @@ def parse_args() -> argparse.Namespace:
         default=core.DEFAULT_LOCK_FILE,
     )
     parser.add_argument("--timeout", type=int, default=40)
+    parser.add_argument(
+        "--expected-head",
+        help="Require this exact source HEAD at the apply snapshot boundary.",
+    )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--preflight", action="store_true")
@@ -4380,6 +4401,12 @@ def main() -> int:
     profile_path = core.absolute_no_resolve(args.profile_path)
     lock_file = core.absolute_no_resolve(args.lock_file)
     try:
+        expected_head = getattr(args, "expected_head", None)
+        if expected_head is not None:
+            if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", expected_head) is None:
+                raise ValueError("--expected-head must be a lowercase Git object ID")
+            if not args.apply:
+                raise ValueError("--expected-head is only valid with --apply")
         if args.check:
             core.check(repo, runtime)
         elif args.preflight:
@@ -4389,13 +4416,19 @@ def main() -> int:
             print(f"Topologie:       {topology.kind}")
             print(f"Entry-Point:     {snapshot.contract.describe()}")
         else:
-            preflight_url(repo, runtime, profile_path)
+            preflight_url(
+                repo,
+                runtime,
+                profile_path,
+                expected_head=expected_head,
+            )
             with core.deployment_lock(lock_file):
                 deploy_url(
                     repo,
                     runtime,
                     profile_path,
                     timeout_seconds=args.timeout,
+                    expected_head=expected_head,
                 )
     except core.DeployError as exc:
         print(

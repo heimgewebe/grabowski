@@ -30,6 +30,17 @@
       ],
       "timeout_seconds": 30
     },
+    "runtime_bootstrap_recover": {
+      "enabled": true,
+      "mode": "template",
+      "target_pattern": "\\{.{1,4096}\\}",
+      "argv": [
+        "/usr/local/libexec/grabowski-runtime-bootstrap-recover",
+        "root-execute",
+        "{target}"
+      ],
+      "timeout_seconds": 3600
+    },
     "publish_recovery_marker": {
       "enabled": true,
       "mode": "recovery-marker-publish",
