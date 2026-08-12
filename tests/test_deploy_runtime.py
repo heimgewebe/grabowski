@@ -209,6 +209,39 @@ class DeployRuntimeTests(unittest.TestCase):
             ["/release/.venv/bin/python", "-m", "grabowski_mcp"],
         )
 
+    def test_browser_operator_default_survives_deployment_manifest_roundtrip(self) -> None:
+        raw = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        contract = deploy_runtime.load_contract(ROOT / "config" / "runtime-entrypoint.json")
+        self.assertEqual(contract.browser_operator_default, raw["browser_operator_default"])
+        serialized = contract.to_manifest()
+        self.assertEqual(serialized["browser_operator_default"], raw["browser_operator_default"])
+
+        # The manifest projection must be detached from the frozen contract object.
+        serialized["browser_operator_default"]["authority"] = "changed"
+        self.assertEqual(contract.browser_operator_default["authority"], "grabowski")
+
+        snapshot = deploy_runtime.Snapshot(
+            repo_head="a" * 40,
+            dirty=False,
+            contract=contract,
+            contract_bytes=(ROOT / "config" / "runtime-entrypoint.json").read_bytes(),
+            runtime_input_bytes=b"mcp==1.27.2\n",
+            runtime_lock_bytes=b"lock\n",
+            source_bytes=b"print('snapshot')\n",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            self._write_manifest(release, snapshot, root / "grabowski-mcp")
+            manifest = deploy_runtime.read_manifest(release)
+            self.assertEqual(
+                manifest["entrypoint_contract"]["browser_operator_default"],
+                raw["browser_operator_default"],
+            )
+
     def test_runtime_asset_contract_loads_and_rejects_traversal(self) -> None:
         raw = json.dumps({
             "schema_version": 3, "mode": "module", "module": "grabowski_mcp",
