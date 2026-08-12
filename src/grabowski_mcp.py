@@ -7018,11 +7018,18 @@ def _repoground_validate_repo(repo: str | None) -> str | None:
             raise ValueError(
                 "repo must be a repository name, owner__repository, or owner/repository identity"
             )
-        return repo
+        canonical = f"{owner}__{repository}"
+        canonical = repoground_catalog.RETIRED_CANONICAL_REPOSITORY_ALIASES.get(
+            canonical, canonical
+        )
+        canonical_owner, canonical_repository = canonical.split("__", 1)
+        return f"{canonical_owner}/{canonical_repository}"
     if not _REPOGROUND_REPO_RE.fullmatch(repo):
         raise ValueError(
             "repo must be a repository name, owner__repository, or owner/repository identity"
         )
+    if "__" in repo:
+        return repoground_catalog.RETIRED_CANONICAL_REPOSITORY_ALIASES.get(repo, repo)
     return repo
 
 
