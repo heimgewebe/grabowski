@@ -335,6 +335,7 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
                 "--repo",
                 str(worktree),
                 "--apply",
+                "--bootstrap-recovery",
                 "--expected-head",
                 self.head,
             ],

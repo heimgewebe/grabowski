@@ -66,11 +66,18 @@ Root never runs Git, Make, the candidate runtime or a caller-controlled shell.
 9. revalidates detached HEAD, common-dir, origin/main, origin URL and cleanliness;
 10. builds the normal deploy-tooling environment;
 11. checks the kill switches again immediately before the deployment effect;
-12. invokes the existing dual deploy engine with `--apply --expected-head`;
-13. revalidates the recovery worktree after the effect;
-14. requires the installed deployment manifest to be complete and bound to the exact
+12. invokes the existing dual deploy engine with `--apply --bootstrap-recovery --expected-head`;
+    this mode uses normal admission/drain semantics when the predecessor is coherently active;
+    when the operator is confirmed inactive, it treats the active release as unavailable and
+    quiesces any still-active tunnel/signed-ingress services itself; unreadable service state
+    and mixed state with a still-active operator fail closed;
+13. after out-of-band quiescence, proves that all relevant predecessor services are inactive
+    immediately before pointer activation, then uses the ordinary activation/start/readback
+    sequence without depending on the unavailable predecessor's admission endpoint;
+14. revalidates the recovery worktree after the effect;
+15. requires the installed deployment manifest to be complete and bound to the exact
     `expected_head`;
-15. removes the worktree without force only after proven success; otherwise it is
+16. removes the worktree without force only after proven success; otherwise it is
     retained for forensic readback.
 
 ## Failure semantics

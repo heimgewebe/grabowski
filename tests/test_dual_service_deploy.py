@@ -2630,6 +2630,117 @@ class DeploymentSequenceTests(unittest.TestCase):
             ],
         )
 
+    def test_bootstrap_recovery_preflight_accepts_fully_inactive_runtime(self) -> None:
+        snapshot = self.snapshot()
+        topology = dual.ProfileTopology(
+            "url",
+            server_url_count=1,
+            server_url_port=dual.TRANSPORT_INGRESS_LISTENER_PORT,
+        )
+        inactive = observation(False)
+        with (
+            mock.patch.object(
+                dual,
+                "_preflight_source_topology",
+                return_value=(snapshot, RUNTIME, topology),
+            ),
+            mock.patch.object(dual, "observe_service", return_value=inactive) as observe,
+            mock.patch.object(dual, "verify_operator_process") as verify_operator,
+            mock.patch.object(dual, "require_operator_listener") as listener,
+            mock.patch.object(dual, "verify_tunnel_process") as verify_tunnel,
+        ):
+            result = dual.preflight_bootstrap_recovery_url(
+                ROOT,
+                RUNTIME,
+                Path("profile.yaml"),
+                expected_head="a" * 40,
+            )
+        self.assertEqual(result[:4], (snapshot, RUNTIME, topology, "operator-inactive"))
+        self.assertEqual(
+            set(result[4]),
+            {
+                dual.OPERATOR_SERVICE,
+                dual.TRANSPORT_INGRESS_SERVICE,
+                dual.TUNNEL_SERVICE,
+            },
+        )
+        self.assertEqual(observe.call_count, 3)
+        verify_operator.assert_not_called()
+        listener.assert_not_called()
+        verify_tunnel.assert_not_called()
+
+    def test_bootstrap_recovery_preflight_rejects_mixed_runtime_state(self) -> None:
+        snapshot = self.snapshot()
+        topology = dual.ProfileTopology(
+            "url",
+            server_url_count=1,
+            server_url_port=dual.TRANSPORT_INGRESS_LISTENER_PORT,
+        )
+        states = {
+            dual.OPERATOR_SERVICE: observation(True),
+            dual.TRANSPORT_INGRESS_SERVICE: observation(True),
+            dual.TUNNEL_SERVICE: observation(False),
+        }
+        with (
+            mock.patch.object(
+                dual,
+                "_preflight_source_topology",
+                return_value=(snapshot, RUNTIME, topology),
+            ),
+            mock.patch.object(
+                dual,
+                "observe_service",
+                side_effect=lambda unit: states[unit],
+            ),
+        ):
+            with self.assertRaises(core.DeployError) as raised:
+                dual.preflight_bootstrap_recovery_url(
+                    ROOT,
+                    RUNTIME,
+                    Path("profile.yaml"),
+                    expected_head="a" * 40,
+                )
+        self.assertEqual(
+            raised.exception.phase,
+            "bootstrap-recovery-predecessor-state",
+        )
+
+    def test_bootstrap_recovery_quiesces_residual_transport_when_operator_is_down(self) -> None:
+        topology = dual.ProfileTopology(
+            "url",
+            server_url_count=1,
+            server_url_port=dual.TRANSPORT_INGRESS_LISTENER_PORT,
+        )
+        states = {
+            dual.OPERATOR_SERVICE: observation(False),
+            dual.TRANSPORT_INGRESS_SERVICE: observation(True),
+            dual.TUNNEL_SERVICE: observation(True),
+        }
+        stopped: list[str] = []
+
+        def observe(unit: str):
+            return states[unit]
+
+        def stop(unit: str):
+            stopped.append(unit)
+            states[unit] = observation(False)
+            return states[unit]
+
+        with (
+            mock.patch.object(dual, "observe_service", side_effect=observe),
+            mock.patch.object(dual, "stop_service", side_effect=stop),
+        ):
+            result = dual.quiesce_bootstrap_recovery_predecessor(topology)
+        self.assertEqual(
+            stopped,
+            [
+                dual.TUNNEL_SERVICE,
+                dual.TRANSPORT_INGRESS_SERVICE,
+                dual.OPERATOR_SERVICE,
+            ],
+        )
+        self.assertTrue(all(item["confirmed_inactive"] for item in result.values()))
+
     def test_url_runtime_identity_binds_expected_agent_instructions(self) -> None:
         import tempfile
 
@@ -3052,6 +3163,185 @@ class DeploymentSequenceTests(unittest.TestCase):
         install.assert_called_once_with(ROOT, snapshot)
         install_watchdogs.assert_called_once_with(ROOT, snapshot)
         restore_watchdogs.assert_not_called()
+
+    def test_bootstrap_full_down_skips_predecessor_admission_and_restarts_target(self) -> None:
+        events: list[str] = []
+        snapshot = self.snapshot()
+        topology = dual.ProfileTopology(
+            "url",
+            server_url_count=1,
+            server_url_port=dual.TRANSPORT_INGRESS_LISTENER_PORT,
+        )
+        inactive = observation(False)
+        active = observation(True)
+        ready = dual.DualReadiness(True, active, active, "live", "ready")
+        cutover = SimpleNamespace(before_port=dual.TRANSPORT_INGRESS_LISTENER_PORT)
+        predecessor = {
+            dual.OPERATOR_SERVICE: inactive.to_dict(),
+            dual.TRANSPORT_INGRESS_SERVICE: inactive.to_dict(),
+            dual.TUNNEL_SERVICE: inactive.to_dict(),
+        }
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "preflight_bootstrap_recovery_url",
+                    return_value=(snapshot, RUNTIME, topology, "operator-inactive", predecessor),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual, "capture_tunnel_profile_cutover", return_value=cutover
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(core, "build_release", return_value=self.build())
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    core,
+                    "verify_apply_snapshot_unchanged",
+                    side_effect=lambda *args: events.append("verify:snapshot"),
+                )
+            )
+            stack.enter_context(mock.patch.object(core, "verify_manifest"))
+            stack.enter_context(
+                mock.patch.object(core, "capture_pointer", return_value=SimpleNamespace())
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "install_watchdog_host_assets",
+                    return_value=self.watchdog_projection(),
+                )
+            )
+            restore_watchdogs = stack.enter_context(
+                mock.patch.object(dual, "restore_watchdog_host_assets")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "install_safety_observer_unit",
+                    return_value={
+                        "changed": False,
+                        "repo_head": "a" * 40,
+                        "sha256": "d" * 64,
+                    },
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "quiesce_bootstrap_recovery_predecessor",
+                    side_effect=lambda value: events.append("quiesce:predecessor")
+                    or predecessor,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "_require_bootstrap_recovery_predecessor_inactive",
+                    side_effect=lambda value: events.append("guard:inactive")
+                    or predecessor,
+                )
+            )
+            admission = stack.enter_context(
+                mock.patch.object(dual, "engage_operator_deployment_admission")
+            )
+            drain = stack.enter_context(
+                mock.patch.object(dual, "wait_for_tunnel_dispatcher_idle")
+            )
+            drain_guard = stack.enter_context(
+                mock.patch.object(dual, "verify_tunnel_drain_final_guard")
+            )
+            stop = stack.enter_context(mock.patch.object(dual, "stop_service"))
+            stack.enter_context(
+                mock.patch.object(dual, "profile_topology", return_value=topology)
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "require_topology_matches_contract")
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    core,
+                    "activate_pointer",
+                    side_effect=lambda activation: events.append("activate"),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "start_service",
+                    side_effect=lambda unit: events.append(f"start:{unit}") or active,
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "verify_operator_process", return_value={"pid": 1})
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "require_operator_listener",
+                    return_value={"successful_samples": 2},
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "require_service_active", return_value=active)
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "require_transport_ingress_health", return_value={})
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "apply_tunnel_profile_cutover", return_value={})
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "require_transport_ingress_auth_profile")
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "verify_tunnel_process", return_value={"pid": 2})
+            )
+            stack.enter_context(
+                mock.patch.object(dual, "wait_until_ready", return_value=ready)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    dual,
+                    "verify_url_runtime_identity",
+                    return_value={"process": {"pid": 1}},
+                )
+            )
+            verify_admission = stack.enter_context(
+                mock.patch.object(dual, "verify_operator_deployment_admission")
+            )
+            dual.deploy_url(
+                ROOT,
+                RUNTIME,
+                Path("profile.yaml"),
+                timeout_seconds=1,
+                expected_head="a" * 40,
+                bootstrap_recovery=True,
+            )
+        admission.assert_not_called()
+        drain.assert_not_called()
+        drain_guard.assert_not_called()
+        stop.assert_not_called()
+        verify_admission.assert_not_called()
+        restore_watchdogs.assert_not_called()
+        self.assertIn("quiesce:predecessor", events)
+        self.assertIn("activate", events)
+        self.assertEqual(
+            [event for event in events if event.startswith("start:")],
+            [
+                f"start:{dual.OPERATOR_SERVICE}",
+                f"start:{dual.TRANSPORT_INGRESS_SERVICE}",
+                f"start:{dual.TUNNEL_SERVICE}",
+            ],
+        )
+        self.assertLess(
+            events.index("quiesce:predecessor"),
+            events.index("guard:inactive"),
+        )
+        self.assertLess(events.index("guard:inactive"), events.index("activate"))
 
     def test_legacy_stdio_deploy_never_installs_observer_unit(self) -> None:
         snapshot = self.snapshot()

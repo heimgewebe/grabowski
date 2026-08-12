@@ -378,6 +378,7 @@ def _deploy_exact(worktree: Path, expected_head: str) -> dict[str, Any]:
             "--repo",
             str(worktree),
             "--apply",
+            "--bootstrap-recovery",
             "--expected-head",
             expected_head,
         ],
