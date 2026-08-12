@@ -67,6 +67,17 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
         (directory / "requirements" / "runtime.lock.txt").write_text(
             "\n".join(lines) + "\n", encoding="utf-8"
         )
+        pyproject_lines = [
+            "[project]",
+            'name = "fixture"',
+            "dependencies = [",
+            *(f'  "{line}",' for line in lines),
+            "]",
+            "",
+        ]
+        (directory / "pyproject.toml").write_text(
+            "\n".join(pyproject_lines), encoding="utf-8"
+        )
         return directory
 
     def test_missing_direct_pin_is_rejected_even_when_lock_contains_it(self) -> None:
