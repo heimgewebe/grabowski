@@ -627,6 +627,43 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(1, resources.count_resources())
         self.assertEqual(2, resources.count_resources(include_expired=True))
 
+    def test_exact_batch_inspection_uses_one_store_snapshot(self) -> None:
+        first_key = "component:batch-inspection-first"
+        second_key = "component:batch-inspection-second"
+        resources.acquire_resources(
+            "owner-a", [first_key], purpose="batch first", ttl_seconds=60
+        )
+        resources.acquire_resources(
+            "owner-b", [second_key], purpose="batch second", ttl_seconds=60
+        )
+
+        with patch.object(resources, "_database", wraps=resources._database) as database:
+            observed = resources.inspect_resources(
+                [second_key, first_key, first_key]
+            )
+        self.assertEqual(database.call_count, 1)
+        self.assertEqual(sorted(observed), [first_key, second_key])
+        self.assertEqual(observed[first_key]["owner_id"], "owner-a")
+        self.assertEqual(observed[second_key]["owner_id"], "owner-b")
+        self.assertEqual(resources.inspect_resources([]), {})
+        with self.assertRaisesRegex(ValueError, "sequence"):
+            resources.inspect_resources(first_key)
+        with self.assertRaisesRegex(ValueError, "128"):
+            resources.inspect_resources(
+                [f"component:batch-overflow-{index}" for index in range(129)]
+            )
+
+    def test_exact_batch_inspection_uses_current_lease_boundary(self) -> None:
+        key = "component:batch-liveness-boundary"
+        with patch.object(resources, "_now", return_value=100):
+            acquired = resources.acquire_resources(
+                "owner-a", [key], purpose="batch boundary", ttl_seconds=30
+            )
+        with patch.object(resources, "_now", return_value=129):
+            self.assertEqual(resources.inspect_resources([key])[key], acquired["leases"][0])
+        with patch.object(resources, "_now", return_value=130):
+            self.assertEqual(resources.inspect_resources([key]), {})
+
     def test_current_readers_share_expiry_boundary_and_preserve_history(self) -> None:
         key = "component:lease-liveness-boundary"
         with patch.object(resources, "_now", return_value=100):

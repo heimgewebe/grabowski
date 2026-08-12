@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import logging
+from pathlib import Path
+import re
 from typing import Any
 
 import grabowski_effect_receipt as receipts
@@ -10,6 +12,9 @@ import grabowski_effect_receipt as receipts
 
 LOGGER = logging.getLogger(__name__)
 MAX_INFERRED_RESOURCE_KEYS = 32
+MAX_LANE_RESOURCE_PROBES = 128
+MAX_LANE_PATH_ANCESTORS = 16
+LANE_OWNER_RE = re.compile(r"lane:([0-9a-f]{32})\Z")
 RESOURCE_FIELDS = (
     ("path", "path"),
     ("target_path", "path"),
@@ -27,6 +32,8 @@ LANE_FIELDS = (
 
 AuditAppender = Callable[[dict[str, Any]], str | None]
 CompletionErrorHandler = Callable[[BaseException], None]
+ResourceInspector = Callable[[str], Mapping[str, Any] | None]
+LaneInputsReader = Callable[[str], Mapping[str, Any]]
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -65,7 +72,12 @@ def actor_id(arguments: Any, context: Any = None) -> str:
     return f"client:{digest}"
 
 
-def lane_id(arguments: Any) -> str:
+def lane_id(
+    arguments: Any,
+    *,
+    resource_inspector: ResourceInspector | None = None,
+    lane_inputs_reader: LaneInputsReader | None = None,
+) -> str:
     data = _mapping(arguments)
     for field, prefix in LANE_FIELDS:
         value = _bounded_text(data.get(field), maximum=384)
@@ -76,7 +88,11 @@ def lane_id(arguments: Any) -> str:
         value = _bounded_text(nested.get("lane_id"), maximum=384)
         if value is not None:
             return value
-    return "unbound"
+    return _implicit_lane_id(
+        data,
+        resource_inspector=resource_inspector,
+        lane_inputs_reader=lane_inputs_reader,
+    )
 
 
 def _explicit_resource_keys(data: Mapping[str, Any]) -> list[str]:
@@ -105,6 +121,143 @@ def resource_keys(arguments: Any) -> list[str]:
     return sorted(values)[:MAX_INFERRED_RESOURCE_KEYS]
 
 
+def _absolute_resource_path(resource_key: str) -> Path | None:
+    if not resource_key.startswith("path:"):
+        return None
+    raw = resource_key[5:]
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        return None
+    try:
+        return path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _lane_resource_probe_keys(arguments: Mapping[str, Any]) -> list[str] | None:
+    explicit = _explicit_resource_keys(arguments)
+    if len(explicit) > MAX_INFERRED_RESOURCE_KEYS:
+        return None
+    probes = set(resource_keys(arguments))
+    for field in ("repo", "repository"):
+        raw = _bounded_text(arguments.get(field), maximum=2048)
+        if raw is None:
+            continue
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            try:
+                probes.add(f"path:{candidate.resolve(strict=False)}")
+            except (OSError, RuntimeError):
+                return None
+    for resource_key in list(probes):
+        path = _absolute_resource_path(resource_key)
+        if path is None:
+            continue
+        current = path
+        for _index in range(MAX_LANE_PATH_ANCESTORS):
+            if str(current) == "/":
+                break
+            probes.add(f"path:{current}")
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        if len(probes) > MAX_LANE_RESOURCE_PROBES:
+            return None
+    return sorted(probes)
+
+
+def _default_resource_snapshots(
+    resource_keys: Sequence[str],
+) -> Mapping[str, Mapping[str, Any]]:
+    import grabowski_resources as resources
+
+    return resources.inspect_resources(resource_keys)
+
+
+def _default_lane_inputs_reader(lane: str) -> Mapping[str, Any]:
+    import grabowski_work_acquire as work_acquire
+
+    return work_acquire._stored_lane_inputs(lane)
+
+
+def _verified_lane_for_lease(
+    lease: Mapping[str, Any],
+    *,
+    lane_inputs_reader: LaneInputsReader,
+) -> str | None:
+    owner = _bounded_text(lease.get("owner_id"), maximum=128)
+    match = LANE_OWNER_RE.fullmatch(owner or "")
+    if match is None:
+        return None
+    lane = match.group(1)
+    inputs = lane_inputs_reader(lane)
+    if not isinstance(inputs, Mapping):
+        raise RuntimeError("work-lane inputs reader returned a non-mapping")
+    if inputs.get("lane_id") != lane or inputs.get("lease_owner_id") != owner:
+        raise RuntimeError("work-lane receipt identity does not match its lease owner")
+    stored_resources = inputs.get("resource_keys")
+    if (
+        not isinstance(stored_resources, list)
+        or not all(isinstance(item, str) for item in stored_resources)
+        or lease.get("resource_key") not in stored_resources
+    ):
+        raise RuntimeError("work-lane receipt does not bind the observed lease")
+    return lane
+
+
+def _implicit_lane_id(
+    arguments: Mapping[str, Any],
+    *,
+    resource_inspector: ResourceInspector | None = None,
+    lane_inputs_reader: LaneInputsReader | None = None,
+) -> str:
+    """Resolve audit attribution only; never establish mutation authority."""
+    probes = _lane_resource_probe_keys(arguments)
+    if not probes:
+        return "unbound"
+    read_lane = lane_inputs_reader or _default_lane_inputs_reader
+    candidates: set[str] = set()
+    seen_leases: set[str] = set()
+    try:
+        snapshots = (
+            None
+            if resource_inspector is not None
+            else _default_resource_snapshots(probes)
+        )
+        for resource_key in probes:
+            lease = (
+                resource_inspector(resource_key)
+                if resource_inspector is not None
+                else snapshots.get(resource_key) if snapshots is not None else None
+            )
+            if lease is None:
+                continue
+            if not isinstance(lease, Mapping) or lease.get("resource_key") != resource_key:
+                return "unbound"
+            observed_key = _bounded_text(lease.get("resource_key"), maximum=2048)
+            if observed_key is None or observed_key in seen_leases:
+                continue
+            seen_leases.add(observed_key)
+            owner = _bounded_text(lease.get("owner_id"), maximum=128)
+            if LANE_OWNER_RE.fullmatch(owner or "") is None:
+                continue
+            lane = _verified_lane_for_lease(
+                lease,
+                lane_inputs_reader=read_lane,
+            )
+            if lane is None:
+                continue
+            candidates.add(lane)
+            if len(candidates) > 1:
+                return "unbound"
+    except Exception:
+        return "unbound"
+    return next(iter(candidates)) if len(candidates) == 1 else "unbound"
+
+
 def _transport_digest(evidence: Mapping[str, Any]) -> str:
     value = evidence.get("consumption_receipt_sha256")
     if not isinstance(value, str):
@@ -126,6 +279,8 @@ def admit_mutation(
     transport_evidence: Mapping[str, Any],
     context: Any = None,
     append_audit: AuditAppender | None = None,
+    resource_inspector: ResourceInspector | None = None,
+    lane_inputs_reader: LaneInputsReader | None = None,
 ) -> dict[str, Any]:
     return receipts.admit(
         tool=tool_name,
@@ -133,7 +288,11 @@ def admit_mutation(
         runtime_sha256=_runtime_digest(transport_evidence),
         transport_receipt_sha256=_transport_digest(transport_evidence),
         effect_class="mutating",
-        lane_id=lane_id(arguments),
+        lane_id=lane_id(
+            arguments,
+            resource_inspector=resource_inspector,
+            lane_inputs_reader=lane_inputs_reader,
+        ),
         actor_id=actor_id(arguments, context),
         resource_keys=resource_keys(arguments),
         append_audit=append_audit,

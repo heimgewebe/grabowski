@@ -5244,6 +5244,31 @@ def inspect_resource(resource_key: str) -> dict[str, Any] | None:
     return _public(row)
 
 
+def inspect_resources(resource_keys: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """Read a bounded exact set of current leases through one store snapshot."""
+    if isinstance(resource_keys, (str, bytes)):
+        raise ValueError("resource_keys must be a sequence")
+    keys = sorted({normalize_resource_key(value) for value in resource_keys})
+    if len(keys) > 128:
+        raise ValueError("resource_keys batch exceeds 128 entries")
+    if not keys:
+        return {}
+    now = _now()
+    placeholders = ",".join("?" for _item in keys)
+    with _database() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM leases WHERE resource_key IN ({placeholders})",
+            keys,
+        ).fetchall()
+    return {
+        row["resource_key"]: _public(row)
+        for row in rows
+        if _is_live_lease(
+            expires_at_unix=row["expires_at_unix"], now_unix=now
+        )
+    }
+
+
 def count_resources(
     *,
     owner_id: str | None = None,
