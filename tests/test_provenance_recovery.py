@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 from pathlib import Path
+import stat
 import sys
 import tempfile
 import types
@@ -631,6 +632,31 @@ class TrustAnchorTests(unittest.TestCase):
         )
         self.assertFalse(gate["allowed"])
         self.assertIn("target_schema_judgeable", gate["reasons"])
+
+    def test_anchor_verification_rejects_symlinked_parent(self) -> None:
+        target = provenance_recovery.TRUST_ANCHOR
+
+        def fake_lstat(path):
+            if path == target:
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o644, st_nlink=1, st_uid=0
+                )
+            if path == target.parent:
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFLNK | 0o777, st_nlink=1, st_uid=0
+                )
+            return types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755, st_nlink=1, st_uid=0
+            )
+
+        with patch.object(Path, "is_symlink", autospec=True, return_value=False), patch.object(
+            Path, "lstat", autospec=True, side_effect=fake_lstat
+        ):
+            evidence = provenance_recovery._verified_trust_anchor(target)
+
+        self.assertFalse(evidence["verified"])
+        self.assertIn("parent", evidence["reason"])
+        self.assertIn("symlink", evidence["reason"])
 
     def test_anchor_verification_rejects_unsafe_provenance(self) -> None:
         import tempfile

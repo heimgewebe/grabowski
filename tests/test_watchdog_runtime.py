@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import stat
 import importlib.util
 import json
 import shutil
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -392,6 +394,30 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
 
         self.assertIsNone(observed)
         self.assertIn("root-owned", state)
+
+    def test_symlinked_parent_anchor_is_refused(self) -> None:
+        target = TRUST_ANCHOR
+
+        def fake_lstat(path):
+            if path == target:
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o644, st_nlink=1, st_uid=0
+                )
+            if path == target.parent:
+                return types.SimpleNamespace(
+                    st_mode=stat.S_IFLNK | 0o777, st_nlink=1, st_uid=0
+                )
+            return types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755, st_nlink=1, st_uid=0
+            )
+
+        with patch.object(Path, "is_symlink", autospec=True, return_value=False), patch.object(
+            Path, "lstat", autospec=True, side_effect=fake_lstat
+        ):
+            observed, state = watchdog.verified_trust_anchor(target)
+
+        self.assertIsNone(observed)
+        self.assertEqual(state, "anchor-parent-is-symlink")
 
     def test_symlinked_anchor_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

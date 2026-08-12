@@ -180,6 +180,12 @@ def _verified_trust_anchor(path: Path = TRUST_ANCHOR) -> dict[str, Any]:
             return evidence
         for parent in path.parents:
             parent_info = parent.lstat()
+            if stat.S_ISLNK(parent_info.st_mode):
+                evidence["reason"] = f"anchor parent {parent} is a symlink"
+                return evidence
+            if not stat.S_ISDIR(parent_info.st_mode):
+                evidence["reason"] = f"anchor parent {parent} is not a directory"
+                return evidence
             if parent_info.st_uid != 0:
                 evidence["reason"] = f"anchor parent {parent} is not root-owned"
                 return evidence

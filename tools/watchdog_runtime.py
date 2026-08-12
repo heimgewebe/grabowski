@@ -295,6 +295,10 @@ def verified_trust_anchor(path: Path) -> tuple[bytes | None, str]:
             return None, "anchor-writable-by-others"
         for parent in path.parents:
             parent_info = parent.lstat()
+            if statmod.S_ISLNK(parent_info.st_mode):
+                return None, "anchor-parent-is-symlink"
+            if not statmod.S_ISDIR(parent_info.st_mode):
+                return None, "anchor-parent-not-directory"
             if parent_info.st_uid != 0:
                 return None, "anchor-parent-not-root-owned"
             if parent_info.st_mode & (statmod.S_IWGRP | statmod.S_IWOTH):
