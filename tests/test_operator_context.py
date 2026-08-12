@@ -91,7 +91,11 @@ class OperatorContextTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('"browser_operator_contract": browser_operator_contract', runtime)
-        self.assertIn('"browser_operator_contract",\n            "warnings"', runtime)
+        consumer = (ROOT / "src" / "grabowski_consumer_surface.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('CONTEXT_REQUIRED_FIELDS = (', consumer)
+        self.assertIn('required=consumer_surface.CONTEXT_REQUIRED_FIELDS', runtime)
 
     def test_secret_reveal_is_not_read_only_in_generated_contracts(self) -> None:
         catalog = json.loads(CATALOG.read_text(encoding="utf-8"))

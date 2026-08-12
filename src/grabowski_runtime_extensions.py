@@ -314,16 +314,7 @@ def grabowski_context(
     return consumer_surface.project_fields(
         payload,
         fields=fields,
-        required=(
-            "schema_version",
-            "profile",
-            "view",
-            "browser_operator_contract",
-            "warnings",
-            "known_gaps",
-            "recommended_next_action",
-            "does_not_establish",
-        ),
+        required=consumer_surface.CONTEXT_REQUIRED_FIELDS,
     )
 
 
