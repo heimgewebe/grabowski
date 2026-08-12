@@ -7,6 +7,7 @@ become a way around the gate for anything else.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 import sys
@@ -58,6 +59,7 @@ def _load_provenance_recovery():
     operator._safe_environment = lambda: dict(os.environ)
     operator._jobs_root = lambda: Path("/nonexistent-jobs-root")
     operator._start_job = lambda *args, **kwargs: {}
+    operator._require_operator_capability = lambda capability: None
     base = types.ModuleType("grabowski_mcp")
     base.AUDIT_LOG = Path("/nonexistent-audit.jsonl")
     base._deployment_metadata = lambda: {}
@@ -82,6 +84,7 @@ def _load_provenance_recovery():
     self_deploy._deploy_command = lambda *args, **kwargs: ["python3"]
     self_deploy._deploy_index = lambda root: {"units": [], "pending_unit": None}
     self_deploy._write_deploy_index = lambda *args, **kwargs: None
+    self_deploy._deploy_schedule_lock = contextlib.nullcontext
 
     name = "grabowski_provenance_recovery_test"
     spec = importlib.util.spec_from_file_location(
@@ -337,6 +340,53 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
         )
 
 
+class VolatileGateRecheckTests(unittest.TestCase):
+    """Gates that can flip between assessment and dispatch are re-read."""
+
+    def _repair_with_recheck(self, recheck: dict):
+        allowed_gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=allowed_gate),
+            patch.object(
+                provenance_recovery, "_volatile_gate_recheck", return_value=recheck
+            ),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.operator, "_start_job") as start_job,
+        ):
+            raised = None
+            try:
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+            except provenance_recovery.ProvenanceRecoveryDenied as exc:
+                raised = exc
+        return raised, start_job, audit
+
+    def test_kill_switch_engaged_after_assessment_aborts_dispatch(self) -> None:
+        raised, start_job, audit = self._repair_with_recheck(
+            {"reasons": ["kill_switch_clear"], "checks": {}}
+        )
+
+        self.assertIsNotNone(raised)
+        self.assertEqual(raised.reasons, ["kill_switch_clear"])
+        start_job.assert_not_called()
+        self.assertEqual(
+            audit.call_args[0][0]["operation"],
+            "provenance-recovery-aborted-before-dispatch",
+        )
+
+    def test_competing_deployment_appearing_late_aborts_dispatch(self) -> None:
+        raised, start_job, _audit = self._repair_with_recheck(
+            {"reasons": ["no_competing_deployment"], "checks": {}}
+        )
+
+        self.assertIsNotNone(raised)
+        start_job.assert_not_called()
+
+
 class TargetContractEvidenceTests(unittest.TestCase):
     """The repair target is judged before it is ever built."""
 
@@ -364,6 +414,72 @@ class TargetContractEvidenceTests(unittest.TestCase):
 
         self.assertFalse(evidence["contract_valid"])
         self.assertIn("canonical contract validator", evidence["error"])
+
+    def test_validator_raising_at_module_scope_fails_closed(self) -> None:
+        """A broken target validator must fail the check, not crash the gate.
+
+        The assessment surface is what an operator reaches for when the runtime
+        is already broken; if a bad commit could crash it, the repair path goes
+        down with the runtime.
+        """
+        broken = b"raise RuntimeError('validator exploded at import')\n"
+        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+            git_bytes.side_effect = lambda repo, *args: (
+                b"{}" if args[-1].endswith(".json") else broken
+            )
+            evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+        self.assertFalse(evidence["contract_valid"])
+        self.assertIn("unusable", evidence["error"])
+        self.assertIn("validator exploded", evidence["error"])
+
+    def test_validator_with_name_error_fails_closed(self) -> None:
+        """Syntactically valid but broken code raises NameError, not SyntaxError."""
+        broken = b"CANONICAL_VALIDATOR_MODULE = undefined_name\n"
+        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+            git_bytes.side_effect = lambda repo, *args: (
+                b"{}" if args[-1].endswith(".json") else broken
+            )
+            evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+        self.assertFalse(evidence["contract_valid"])
+        self.assertIn("unusable", evidence["error"])
+
+    def test_candidate_code_never_runs_in_the_operator_process(self) -> None:
+        """Assessment must not execute the target revision in-process.
+
+        The read-only assess tool is reachable while a gate would still deny
+        recovery, so a candidate that writes files or mutates state on import
+        must not be able to do so merely by being assessed.
+        """
+        # If this ran in-process it would terminate the interpreter outright,
+        # so reaching the assertions at all is the proof of isolation.
+        candidate = b"import os\nos._exit(9)\n"
+
+        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+            git_bytes.side_effect = lambda repo, *args: (
+                b"{}" if args[-1].endswith(".json") else candidate
+            )
+            evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+        self.assertFalse(evidence["contract_valid"])
+        self.assertIn("unusable", evidence["error"])
+        # Nothing from the candidate leaked into this module's namespace either.
+        self.assertFalse(hasattr(provenance_recovery, "contract_error"))
+
+    def test_isolated_verdict_survives_a_hostile_candidate(self) -> None:
+        """A candidate that exits, loops or prints garbage yields a safe verdict."""
+        cases = {
+            "sys.exit": b"import sys; sys.exit(3)\n",
+            "no output": b"pass\n",
+            "garbage output": b"print('not json')\n",
+        }
+        for label, candidate in cases.items():
+            with self.subTest(label):
+                verdict = provenance_recovery._isolated_contract_verdict(
+                    candidate, b"{}"
+                )
+                self.assertTrue(verdict.get("error"))
 
     def test_invalid_target_contract_is_refused(self) -> None:
         """A target whose own schema rejects its own contract is not a repair."""
@@ -407,7 +523,10 @@ class ToolSurfaceTests(unittest.TestCase):
             "power_run",
             "terminal_run",
             "opaque_command",
-            "_require_operator_capability",
+            # _require_operator_mutation binds to the blockade *and* provenance
+            # path this lane exists to repair; the plain capability check is a
+            # restriction and is used deliberately.
+            "_require_operator_mutation",
         }
         self.assertEqual(identifiers & forbidden, set())
 

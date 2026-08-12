@@ -38,6 +38,7 @@ from typing import Any, Iterable, Mapping, NoReturn, Sequence
 
 __all__ = [
     "CANONICAL_VALIDATOR_MODULE",
+    "DEPLOYMENT_MANIFEST_SCHEMA_VERSION",
     "CONTRACT_SCHEMA_VERSIONS",
     "LATEST_CONTRACT_SCHEMA_VERSION",
     "MODULE_RE",
@@ -50,8 +51,11 @@ __all__ = [
     "contract_module_sources",
     "contract_modules",
     "contract_runtime_asset_destinations",
+    "manifest_errors",
+    "manifest_is_valid",
     "optional_contract_fields",
     "required_contract_fields",
+    "valid_agent_instructions_identity",
     "validate_contract",
 ]
 
@@ -150,7 +154,8 @@ def _fail(message: str) -> NoReturn:
 
 
 def _require_text(value: Any, *, label: str, maximum: int = _MAX_TEXT) -> str:
-    if not isinstance(value, str) or isinstance(value, bool):
+    # No bool guard here: unlike int, bool does not subclass str.
+    if not isinstance(value, str):
         _fail(f"{label} must be a string")
     if not value or len(value) > maximum:
         _fail(f"{label} must be a non-empty string of at most {maximum} characters")
@@ -614,6 +619,224 @@ def validate_contract(raw: Any) -> None:
 
     if "browser_operator_default" in contract:
         _validate_browser_operator_default(contract["browser_operator_default"])
+
+
+DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
+AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
+AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
+AGENT_INSTRUCTIONS_HEADER_RE = re.compile(
+    r"^Grabowski agent-facing contract "
+    r"(?P<version>[a-z0-9][a-z0-9-]{0,127}) "
+    r"\(schema (?P<schema>[1-9][0-9]*)\)\.$"
+)
+
+_MANIFEST_REQUIRED_TYPES: dict[str, type | tuple[type, ...]] = {
+    "schema_version": int,
+    "release_id": str,
+    "repo_head": str,
+    "entrypoint_contract": dict,
+    "entrypoint_contract_sha256": str,
+    "agent_instructions": dict,
+    "source_sha256": str,
+    "source_sha256s": dict,
+    "runtime_asset_sha256s": dict,
+    "runtime_asset_paths": dict,
+    "runtime_input_sha256": str,
+    "runtime_lock_sha256": str,
+    "snapshot_paths": dict,
+    "immutable_release_path": str,
+    "expected_stable_runtime_path": str,
+    "release_python_path": str,
+    "entrypoint_path": str,
+    "module_paths": dict,
+    "platform": str,
+    "python_version": str,
+    "python_implementation": str,
+    "mcp_protocol_version": str,
+    "created_at_unix": int,
+    "completion_status": str,
+    "executable": str,
+    "pip_version": str,
+}
+
+_SNAPSHOT_PATH_KEYS = frozenset(
+    {
+        "runtime_entrypoint",
+        "runtime_input",
+        "runtime_lock",
+        "source",
+        "supporting_sources",
+        "runtime_assets",
+    }
+)
+
+
+def _is_lower_hex(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def valid_agent_instructions_identity(value: Any) -> bool:
+    """Validate the *shape* of the agent-instructions identity block.
+
+    Deliberately structural: which exact contract version a release must carry
+    is a runtime identity question, checked separately against the deployed
+    AGENTS.md.  Pinning a version here as well would let a perfectly consistent
+    release be judged schema-invalid, which is the failure mode this module
+    exists to prevent.
+    """
+    if not isinstance(value, dict):
+        return False
+    if set(value) != {"schema_version", "version", "sha256", "bytes", "max_bytes"}:
+        return False
+    schema_version = value.get("schema_version")
+    version = value.get("version")
+    if (
+        schema_version != AGENT_INSTRUCTIONS_SCHEMA_VERSION
+        or not isinstance(version, str)
+        or AGENT_INSTRUCTIONS_HEADER_RE.fullmatch(
+            f"Grabowski agent-facing contract {version} (schema {schema_version})."
+        )
+        is None
+    ):
+        return False
+    size = value.get("bytes")
+    return (
+        _is_lower_hex(value.get("sha256"), 64)
+        and isinstance(size, int)
+        and not isinstance(size, bool)
+        and 0 < size <= AGENT_INSTRUCTIONS_MAX_BYTES
+        and value.get("max_bytes") == AGENT_INSTRUCTIONS_MAX_BYTES
+    )
+
+
+def manifest_errors(raw: Any) -> list[str]:
+    """Return the manifest fields that violate the deployment manifest schema.
+
+    This is the single definition used by the deployment builder, the runtime
+    provenance validator and the watchdog, so none of them can judge the same
+    release differently.  It validates structure and internal consistency only;
+    identity questions that require reading the release from disk (hashes of
+    installed files, python/platform binding) stay with their callers.
+    """
+    if not isinstance(raw, dict):
+        return ["manifest"]
+
+    errors: list[str] = []
+    for key, kind in _MANIFEST_REQUIRED_TYPES.items():
+        value = raw.get(key)
+        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+            errors.append(key)
+
+    if raw.get("schema_version") != DEPLOYMENT_MANIFEST_SCHEMA_VERSION:
+        errors.append("schema_version")
+    if raw.get("completion_status") != "complete":
+        errors.append("completion_status")
+    if not _is_lower_hex(raw.get("repo_head"), 40):
+        errors.append("repo_head")
+    for key in (
+        "entrypoint_contract_sha256",
+        "source_sha256",
+        "runtime_input_sha256",
+        "runtime_lock_sha256",
+    ):
+        if not _is_lower_hex(raw.get(key), 64):
+            errors.append(key)
+    if not valid_agent_instructions_identity(raw.get("agent_instructions")):
+        errors.append("agent_instructions")
+
+    contract = raw.get("entrypoint_contract")
+    modules: set[str] = set()
+    main_module: str | None = None
+    supporting_modules: set[str] = set()
+    destinations: set[str] = set()
+    if contract_error(contract) is not None:
+        errors.append("entrypoint_contract")
+    else:
+        main_module = str(contract["module"])
+        modules = set(contract_modules(contract))
+        supporting_modules = modules - {main_module}
+        destinations = set(contract_runtime_asset_destinations(contract))
+
+    source_hashes = raw.get("source_sha256s")
+    if (
+        not isinstance(source_hashes, dict)
+        or set(source_hashes) != modules
+        or not all(_is_lower_hex(value, 64) for value in source_hashes.values())
+        or (
+            main_module is not None
+            and source_hashes.get(main_module) != raw.get("source_sha256")
+        )
+    ):
+        errors.append("source_sha256s")
+
+    asset_hashes = raw.get("runtime_asset_sha256s")
+    if (
+        not isinstance(asset_hashes, dict)
+        or set(asset_hashes) != destinations
+        or not all(_is_lower_hex(value, 64) for value in asset_hashes.values())
+    ):
+        errors.append("runtime_asset_sha256s")
+
+    asset_paths = raw.get("runtime_asset_paths")
+    if (
+        not isinstance(asset_paths, dict)
+        or set(asset_paths) != destinations
+        or not all(isinstance(value, str) and value for value in asset_paths.values())
+    ):
+        errors.append("runtime_asset_paths")
+
+    module_paths = raw.get("module_paths")
+    if (
+        not isinstance(module_paths, dict)
+        or set(module_paths) != modules
+        or not all(isinstance(value, str) and value for value in module_paths.values())
+        or (
+            main_module is not None
+            and module_paths.get(main_module) != raw.get("entrypoint_path")
+        )
+    ):
+        errors.append("module_paths")
+
+    snapshot_paths = raw.get("snapshot_paths")
+    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != _SNAPSHOT_PATH_KEYS:
+        errors.append("snapshot_paths")
+    else:
+        supporting_paths = snapshot_paths.get("supporting_sources")
+        asset_snapshot_paths = snapshot_paths.get("runtime_assets")
+        if (
+            not all(
+                isinstance(snapshot_paths.get(key), str) and snapshot_paths.get(key)
+                for key in ("runtime_entrypoint", "runtime_input", "runtime_lock", "source")
+            )
+            or not isinstance(supporting_paths, dict)
+            or set(supporting_paths) != supporting_modules
+            or not all(
+                isinstance(value, str) and value for value in supporting_paths.values()
+            )
+            or not isinstance(asset_snapshot_paths, dict)
+            or set(asset_snapshot_paths) != destinations
+            or not all(
+                isinstance(value, str) and value
+                for value in asset_snapshot_paths.values()
+            )
+        ):
+            errors.append("snapshot_paths")
+
+    created = raw.get("created_at_unix")
+    if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
+        errors.append("created_at_unix")
+
+    return sorted(set(errors))
+
+
+def manifest_is_valid(raw: Any) -> bool:
+    """Return whether ``raw`` satisfies the deployment manifest schema."""
+
+    return not manifest_errors(raw)
 
 
 def contract_error(raw: Any) -> str | None:

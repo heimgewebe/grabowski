@@ -677,6 +677,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_task_reconcile_resume": ("durable_job",),
     "grabowski_recovery_status": ("audit_verify",),
     "grabowski_recovery_server_probe": ("file_write", "secret_use", "terminal_execute"),
+    "grabowski_recovery_provenance_assess": ("audit_verify",),
+    "grabowski_recovery_provenance_repair": ("durable_job", "git_cli"),
     "grabowski_operator_blockade_status": ("audit_verify",),
     "grabowski_operator_blockade_engage": ("audit_verify", "file_write"),
     "grabowski_operator_blockade_disarm": ("audit_verify", "file_move"),
@@ -747,6 +749,8 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_service_status",
     "grabowski_service_logs",
     "grabowski_runtime_deploy_schedule",
+    "grabowski_recovery_provenance_assess",
+    "grabowski_recovery_provenance_repair",
     "grabowski_agent_workspace_create",
     "grabowski_agent_workspace_status",
     "grabowski_agent_workspace_attach",
@@ -4295,157 +4299,14 @@ def _safe_relative_path(value: Any) -> bool:
     return not path.is_absolute() and ".." not in path.parts and path.as_posix() != "."
 
 
-def _valid_agent_instructions_identity(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value)
-        == {
-            "schema_version",
-            "version",
-            "sha256",
-            "bytes",
-            "max_bytes",
-        }
-        and value.get("schema_version") == AGENT_INSTRUCTIONS_SCHEMA_VERSION
-        and value.get("version") == AGENT_INSTRUCTIONS_VERSION
-        and _is_lower_hex(value.get("sha256"), 64)
-        and isinstance(value.get("bytes"), int)
-        and not isinstance(value.get("bytes"), bool)
-        and 0 < value["bytes"] <= AGENT_INSTRUCTIONS_MAX_BYTES
-        and value.get("max_bytes") == AGENT_INSTRUCTIONS_MAX_BYTES
-    )
-
-
 def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
-    required = {
-        "schema_version": int,
-        "release_id": str,
-        "repo_head": str,
-        "entrypoint_contract": dict,
-        "entrypoint_contract_sha256": str,
-        "agent_instructions": dict,
-        "source_sha256": str,
-        "source_sha256s": dict,
-        "runtime_asset_sha256s": dict,
-        "runtime_asset_paths": dict,
-        "runtime_input_sha256": str,
-        "runtime_lock_sha256": str,
-        "snapshot_paths": dict,
-        "immutable_release_path": str,
-        "expected_stable_runtime_path": str,
-        "release_python_path": str,
-        "entrypoint_path": str,
-        "module_paths": dict,
-        "platform": str,
-        "python_version": str,
-        "python_implementation": str,
-        "mcp_protocol_version": str,
-        "created_at_unix": int,
-        "completion_status": str,
-        "executable": str,
-        "pip_version": str,
-    }
-    for key, kind in required.items():
-        value = raw.get(key)
-        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
-            return False
-    if (
-        raw.get("schema_version") != DEPLOYMENT_MANIFEST_SCHEMA_VERSION
-        or raw.get("completion_status") != "complete"
-    ):
-        return False
-    if not _is_lower_hex(raw.get("repo_head"), 40):
-        return False
-    for key in (
-        "entrypoint_contract_sha256",
-        "source_sha256",
-        "runtime_input_sha256",
-        "runtime_lock_sha256",
-    ):
-        if not _is_lower_hex(raw.get(key), 64):
-            return False
-    if not _valid_agent_instructions_identity(raw.get("agent_instructions")):
-        return False
-    # The contract shape itself is defined once, in grabowski_runtime_contract,
-    # and validated identically by the deployment builder.  Keeping a second
-    # field list here is what previously let a release be built valid and then
-    # be rejected by the very runtime it produced.
-    contract = raw.get("entrypoint_contract")
-    try:
-        grabowski_runtime_contract.validate_contract(contract)
-        module = str(contract["module"])
-        modules = set(grabowski_runtime_contract.contract_modules(contract))
-        runtime_asset_destinations = set(
-            grabowski_runtime_contract.contract_runtime_asset_destinations(contract)
-        )
-    except grabowski_runtime_contract.RuntimeContractError:
-        return False
-    supporting_modules = modules - {module}
+    """Validate the manifest against the one canonical deployment schema.
 
-    hashes = raw.get("source_sha256s")
-    if (
-        not isinstance(hashes, dict)
-        or set(hashes) != modules
-        or not all(_is_lower_hex(value, 64) for value in hashes.values())
-        or hashes.get(module) != raw.get("source_sha256")
-    ):
-        return False
-    asset_hashes = raw.get("runtime_asset_sha256s")
-    if (
-        not isinstance(asset_hashes, dict)
-        or set(asset_hashes) != runtime_asset_destinations
-        or not all(_is_lower_hex(value, 64) for value in asset_hashes.values())
-    ):
-        return False
-    asset_paths = raw.get("runtime_asset_paths")
-    if (
-        not isinstance(asset_paths, dict)
-        or set(asset_paths) != runtime_asset_destinations
-        or not all(isinstance(value, str) and value for value in asset_paths.values())
-    ):
-        return False
-    module_paths = raw.get("module_paths")
-    if (
-        not isinstance(module_paths, dict)
-        or set(module_paths) != modules
-        or not all(isinstance(value, str) and value for value in module_paths.values())
-        or module_paths.get(module) != raw.get("entrypoint_path")
-    ):
-        return False
-    snapshot_paths = raw.get("snapshot_paths")
-    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint",
-        "runtime_input",
-        "runtime_lock",
-        "source",
-        "supporting_sources",
-        "runtime_assets",
-    }:
-        return False
-    if not all(
-        isinstance(snapshot_paths.get(key), str) and snapshot_paths.get(key)
-        for key in ("runtime_entrypoint", "runtime_input", "runtime_lock", "source")
-    ):
-        return False
-    support_paths = snapshot_paths.get("supporting_sources")
-    if (
-        not isinstance(support_paths, dict)
-        or set(support_paths) != supporting_modules
-        or not all(isinstance(value, str) and value for value in support_paths.values())
-    ):
-        return False
-    runtime_asset_snapshot_paths = snapshot_paths.get("runtime_assets")
-    if (
-        not isinstance(runtime_asset_snapshot_paths, dict)
-        or set(runtime_asset_snapshot_paths) != runtime_asset_destinations
-        or not all(
-            isinstance(value, str) and value
-            for value in runtime_asset_snapshot_paths.values()
-        )
-    ):
-        return False
-    created = raw.get("created_at_unix")
-    return isinstance(created, int) and not isinstance(created, bool) and created > 0
+    Both the deployment builder and the watchdog validate with this same
+    definition, so a release cannot be judged differently depending on which
+    layer is looking at it.
+    """
+    return grabowski_runtime_contract.manifest_is_valid(raw)
 
 
 def _read_bound_regular_file(

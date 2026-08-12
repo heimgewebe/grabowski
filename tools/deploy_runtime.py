@@ -504,7 +504,7 @@ def load_contract_validator_bytes(data: bytes) -> types.SimpleNamespace:
             data.decode("utf-8"), str(CONTRACT_VALIDATOR_RELATIVE), "exec"
         )
         exec(compiled, namespace)  # noqa: S102 - revision-bound canonical schema
-    except (UnicodeDecodeError, SyntaxError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001 - deployed revision code must fail the build, not crash it
         fail(f"Kanonischer Contract-Validator ist ungültig: {exc}")
     module = types.SimpleNamespace(**namespace)
     for attribute in (
@@ -1370,29 +1370,8 @@ def stop_process(proc: subprocess.Popen[bytes]) -> None:
 
 
 def _valid_agent_instructions_identity(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value) == {
-            "schema_version",
-            "version",
-            "sha256",
-            "bytes",
-            "max_bytes",
-        }
-        and value.get("schema_version") == AGENT_INSTRUCTIONS_SCHEMA_VERSION
-        and isinstance(value.get("version"), str)
-        and AGENT_INSTRUCTIONS_HEADER_RE.fullmatch(
-            "Grabowski agent-facing contract "
-            f"{value.get('version')} "
-            f"(schema {value.get('schema_version')})."
-        )
-        is not None
-        and _is_lower_hex(value.get("sha256"), 64)
-        and isinstance(value.get("bytes"), int)
-        and not isinstance(value.get("bytes"), bool)
-        and 0 < value["bytes"] <= AGENT_INSTRUCTIONS_MAX_BYTES
-        and value.get("max_bytes") == AGENT_INSTRUCTIONS_MAX_BYTES
-    )
+    """Defer to the canonical schema so build and runtime agree on this too."""
+    return local_contract_validator().valid_agent_instructions_identity(value)
 
 
 def agent_instructions_identity(instructions: Any) -> dict[str, Any]:
@@ -1875,144 +1854,20 @@ def _is_lower_hex(value: Any, length: int) -> bool:
 def validate_manifest_schema(
     manifest: dict[str, Any], *, validator: types.SimpleNamespace | None = None
 ) -> list[str]:
-    required = {
-        "schema_version": int,
-        "release_id": str,
-        "repo_head": str,
-        "entrypoint_contract": dict,
-        "entrypoint_contract_sha256": str,
-        "agent_instructions": dict,
-        "source_sha256": str,
-        "source_sha256s": dict,
-        "runtime_asset_sha256s": dict,
-        "runtime_asset_paths": dict,
-        "runtime_input_sha256": str,
-        "runtime_lock_sha256": str,
-        "snapshot_paths": dict,
-        "immutable_release_path": str,
-        "expected_stable_runtime_path": str,
-        "release_python_path": str,
-        "entrypoint_path": str,
-        "module_paths": dict,
-        "platform": str,
-        "python_version": str,
-        "python_implementation": str,
-        "mcp_protocol_version": str,
-        "created_at_unix": int,
-        "completion_status": str,
-        "executable": str,
-        "pip_version": str,
-    }
-    errors: list[str] = []
-    for key, kind in required.items():
-        value = manifest.get(key)
-        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
-            errors.append(key)
-    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
-        errors.append("schema_version")
-    if manifest.get("completion_status") != "complete":
-        errors.append("completion_status")
-    if manifest.get("mcp_protocol_version") not in MCP_PROTOCOL_VERSIONS:
-        errors.append("mcp_protocol_version")
-    if not _is_lower_hex(manifest.get("repo_head"), 40):
-        errors.append("repo_head")
-    for key in (
-        "entrypoint_contract_sha256",
-        "source_sha256",
-        "runtime_input_sha256",
-        "runtime_lock_sha256",
-    ):
-        if not _is_lower_hex(manifest.get(key), 64):
-            errors.append(key)
-    if not _valid_agent_instructions_identity(manifest.get("agent_instructions")):
-        errors.append("agent_instructions")
+    """Validate the manifest against the one canonical deployment schema.
 
-    # Contract shape is owned by grabowski_runtime_contract; this function only
-    # cross-checks the manifest fields that must agree with it.
-    contract = manifest.get("entrypoint_contract")
-    modules: set[str] = set()
-    main_module: str | None = None
-    supporting_modules: set[str] = set()
-    runtime_asset_destinations: set[str] = set()
+    The runtime provenance validator and the watchdog use this same definition,
+    so a manifest this builder accepts cannot be rejected by the runtime it
+    produces.  The MCP protocol allowlist is deliberately *not* part of the
+    schema: it is a build-time policy, and baking it into shared schema
+    validity would let a lagging allowlist lock out an otherwise consistent
+    runtime -- the exact failure class this module exists to prevent.
+    """
     if validator is None:
         validator = local_contract_validator()
-    if validator.contract_error(contract) is not None:
-        errors.append("entrypoint_contract")
-    else:
-        main_module = contract["module"]
-        modules = set(validator.contract_modules(contract))
-        supporting_modules = modules - {main_module}
-        runtime_asset_destinations = set(
-            validator.contract_runtime_asset_destinations(contract)
-        )
-
-    source_hashes = manifest.get("source_sha256s")
-    if (
-        not isinstance(source_hashes, dict)
-        or set(source_hashes) != modules
-        or not all(
-            isinstance(module, str) and _is_lower_hex(value, 64)
-            for module, value in source_hashes.items()
-        )
-        or (main_module is not None and source_hashes.get(main_module) != manifest.get("source_sha256"))
-    ):
-        errors.append("source_sha256s")
-
-    runtime_asset_hashes = manifest.get("runtime_asset_sha256s")
-    if (
-        not isinstance(runtime_asset_hashes, dict)
-        or set(runtime_asset_hashes) != runtime_asset_destinations
-        or not all(_is_lower_hex(value, 64) for value in runtime_asset_hashes.values())
-    ):
-        errors.append("runtime_asset_sha256s")
-
-    runtime_asset_paths = manifest.get("runtime_asset_paths")
-    if (
-        not isinstance(runtime_asset_paths, dict)
-        or set(runtime_asset_paths) != runtime_asset_destinations
-        or not all(isinstance(value, str) and value for value in runtime_asset_paths.values())
-    ):
-        errors.append("runtime_asset_paths")
-
-    module_paths = manifest.get("module_paths")
-    if (
-        not isinstance(module_paths, dict)
-        or set(module_paths) != modules
-        or not all(isinstance(value, str) and value for value in module_paths.values())
-    ):
-        errors.append("module_paths")
-
-    snapshot_paths = manifest.get("snapshot_paths")
-    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint",
-        "runtime_input",
-        "runtime_lock",
-        "source",
-        "supporting_sources",
-        "runtime_assets",
-    }:
-        errors.append("snapshot_paths")
-    else:
-        scalar_keys = ("runtime_entrypoint", "runtime_input", "runtime_lock", "source")
-        supporting_paths = snapshot_paths.get("supporting_sources")
-        runtime_asset_snapshot_paths = snapshot_paths.get("runtime_assets")
-        if (
-            not all(isinstance(snapshot_paths.get(key), str) for key in scalar_keys)
-            or not isinstance(supporting_paths, dict)
-            or set(supporting_paths) != supporting_modules
-            or not all(isinstance(value, str) and value for value in supporting_paths.values())
-            or not isinstance(runtime_asset_snapshot_paths, dict)
-            or set(runtime_asset_snapshot_paths) != runtime_asset_destinations
-            or not all(
-                isinstance(value, str) and value
-                for value in runtime_asset_snapshot_paths.values()
-            )
-        ):
-            errors.append("snapshot_paths")
-
-    created = manifest.get("created_at_unix")
-    if not isinstance(created, int) or isinstance(created, bool) or created <= 0:
-        errors.append("created_at_unix")
+    errors = list(validator.manifest_errors(manifest))
+    if manifest.get("mcp_protocol_version") not in MCP_PROTOCOL_VERSIONS:
+        errors.append("mcp_protocol_version")
     return sorted(set(errors))
 
 

@@ -3761,6 +3761,7 @@ def _start_job(
     finalization_expected_head: str | None = None,
     reserved_unit: str | None = None,
     allow_reserved_runtime_deploy: bool = False,
+    invoker_tool: str | None = None,
     deployment_observer_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Start an already-authorized durable job."""
@@ -3801,11 +3802,15 @@ def _start_job(
         "argv_sha256": argv_sha256,
         "runtime_seconds": runtime,
     }
-    invoker_tool = (
-        "grabowski_runtime_deploy_schedule"
-        if allow_reserved_runtime_deploy
-        else "grabowski_job_start"
-    )
+    # The origin record must name the tool that actually authorized the job, so
+    # a reserved deploy started by the provenance repair lane is not attributed
+    # to the ordinary self-deploy scheduler.
+    if invoker_tool is None:
+        invoker_tool = (
+            "grabowski_runtime_deploy_schedule"
+            if allow_reserved_runtime_deploy
+            else "grabowski_job_start"
+        )
     origin, origin_sha256 = job_origin.build_origin(
         unit=unit,
         owner=identity["owner"],

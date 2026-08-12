@@ -57,6 +57,59 @@ Alle Gate-Bedingungen (fail-closed, alle müssen erfüllt sein):
 | `target_deploys_canonical_validator` | Ziel deployt sein eigenes Validierungsschema |
 | `no_competing_deployment` | Deploy-Lock frei, kein laufender Deploy-Job |
 
+### Bootstrap-Grenze: diese Lane repariert den *aktuellen* Deadlock nicht
+
+Die Tools werden über den normalen Importpfad
+(`grabowski_runtime` → `grabowski_provenance_recovery`) registriert. Sie
+existieren also erst in einer Runtime, die dieses Release bereits deployt hat.
+
+Konsequenz:
+
+* Der am 2026-08-12 beobachtete Deadlock musste **einmalig von außen** behoben
+  werden — über den direkten Deploy-Pfad (`make deploy-apply`), der als
+  Werkzeug des Operators außerhalb des MCP-Gatesystems läuft.
+* Diese Lane rettet **zukünftige** Deadlocks derselben Klasse, nicht den, der
+  sie ausgelöst hat.
+
+Ein In-Band-Pfad, der auch den allerersten Deadlock auffängt, müsste außerhalb
+des Release-Artefakts liegen (z. B. im Privileged Broker). Das ist bewusst
+nicht Teil dieser Arbeit.
+
+### Operator-Checkliste
+
+1. `grabowski_recovery_provenance_assess` mit dem exakten Ziel-Commit aufrufen.
+2. Bei `allowed=false` die `reasons` lesen — jeder Eintrag benennt genau eine
+   nicht erfüllte, unabhängige Bedingung.
+3. `grabowski_recovery_provenance_repair` mit demselben Commit aufrufen.
+4. Job bis zum Terminalzustand beobachten.
+5. `grabowski_deployment_identity` lesen.
+6. Bei gültiger Provenienz gelten wieder die normalen Gates.
+
+### Akzeptiertes Risiko: `exec` des Ziel-Validators
+
+`_target_contract_evidence` kompiliert und führt
+`src/grabowski_runtime_contract.py` **aus dem Ziel-Commit** im aktuellen
+Operator-Prozess aus. Das ist notwendig, damit ein Commit nach den Regeln
+seiner eigenen Epoche beurteilt wird.
+
+Warum das keine neue Vertrauensgrenze eröffnet:
+
+* Der Ziel-Commit muss `origin/main` sein und wird unmittelbar danach ohnehin
+  vollständig deployt und als Runtime ausgeführt.
+* Der Code, der hier läuft, ist also exakt der Code, der gleich mit voller
+  Autorität läuft.
+
+Was trotzdem gilt:
+
+* Der Namespace ist minimal (`{"__name__": ...}`), aber **keine** Sandbox —
+  das Modul braucht `import`, also echte Builtins.
+* Jede Exception aus `exec` wird generisch gefangen und in
+  `contract_valid=false` übersetzt; ein fehlerhafter Ziel-Commit lässt die
+  Diagnose fail-closed werden, statt den Prozess zu töten.
+
+Eine stärkere Isolation (Subprozess mit Zeit- und Ressourcenlimit) wäre möglich
+und ist als Folgetask registriert.
+
 ### Bewusste Grenzen
 
 * Die Lane verweigert, wenn die Runtime **nicht** integritätsungültig ist. Sie

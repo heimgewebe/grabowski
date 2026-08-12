@@ -41,11 +41,13 @@ class LockBusy(WatchdogError):
 class IntegrityResult:
     """Whether the runtime that is alive is also operative.
 
-    ``valid`` is a manifest-level verdict, deliberately narrower than the
-    runtime's own provenance verdict: the watchdog runs on the system
-    interpreter and cannot import the release, so it re-uses the canonical
-    contract schema rather than the full provenance validator.  It can
-    therefore prove a runtime *invalid*, and a ``valid`` result means "no
+    ``valid`` is a manifest-level verdict.  The watchdog runs on the system
+    interpreter and cannot import the release, so it applies the same canonical
+    manifest schema the runtime uses, plus the contract hash and embedded-copy
+    checks -- but not the on-disk identity checks (hashes of installed modules,
+    python and platform binding) that require the release itself.
+
+    It can therefore prove a runtime *invalid*; a ``valid`` result means "no
     manifest-level integrity fault", not "provenance_valid".
     """
 
@@ -258,7 +260,9 @@ def _canonical_contract_schema(runtime_root: Path) -> Any:
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             return module
-        except (OSError, SyntaxError, ValueError, ImportError):
+        except Exception:  # noqa: BLE001 - a broken schema must not kill the watchdog
+            # Executing release code can raise anything at module scope.  The
+            # watchdog reports integrity; it must never become the outage.
             continue
     return None
 
@@ -286,16 +290,25 @@ def probe_integrity(runtime_root: Path) -> IntegrityResult:
     if raw.get("completion_status") != "complete":
         return IntegrityResult(False, "deployment-incomplete", release_id)
 
-    contract = raw.get("entrypoint_contract")
-    if not isinstance(contract, dict):
-        return IntegrityResult(False, "entrypoint-contract-missing", release_id)
-
     schema = _canonical_contract_schema(runtime_root)
     if schema is None:
         return IntegrityResult(False, "canonical-contract-schema-unavailable", release_id)
-    error = schema.contract_error(contract)
-    if error is not None:
-        return IntegrityResult(False, "entrypoint-contract-invalid", release_id)
+
+    # Validate the whole manifest, not just the contract: any manifest field the
+    # runtime rejects also disables normal effects, so a narrower check here
+    # would report an inoperative runtime as healthy.
+    manifest_errors = schema.manifest_errors(raw)
+    if manifest_errors:
+        # An invalid contract cascades into every manifest field derived from
+        # it, so report the root cause rather than the wreckage.
+        if "entrypoint_contract" in manifest_errors:
+            return IntegrityResult(False, "entrypoint-contract-invalid", release_id)
+        return IntegrityResult(
+            False,
+            "manifest-schema-invalid:" + ",".join(manifest_errors[:8]),
+            release_id,
+        )
+    contract = raw["entrypoint_contract"]
 
     snapshot_paths = raw.get("snapshot_paths")
     recorded = (
@@ -305,10 +318,19 @@ def probe_integrity(runtime_root: Path) -> IntegrityResult:
     )
     if not isinstance(recorded, str):
         return IntegrityResult(False, "contract-snapshot-path-missing", release_id)
+    recorded_path = Path(recorded)
     try:
-        contract_bytes = Path(recorded).read_bytes()
+        contract_bytes = recorded_path.read_bytes()
     except OSError:
-        return IntegrityResult(False, "contract-snapshot-unreadable", release_id)
+        # Distinguish "the release moved" from "the file is broken": a manifest
+        # records absolute snapshot paths at deploy time, so a relocated or
+        # replaced release reads as stale rather than as content corruption.
+        reason = (
+            "contract-snapshot-unreadable"
+            if recorded_path.exists()
+            else "contract-snapshot-path-stale"
+        )
+        return IntegrityResult(False, reason, release_id)
     if hashlib.sha256(contract_bytes).hexdigest() != raw.get("entrypoint_contract_sha256"):
         return IntegrityResult(False, "contract-hash-drift", release_id)
     try:

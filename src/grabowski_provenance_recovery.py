@@ -41,6 +41,7 @@ import fcntl
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 import uuid
 from typing import Annotated, Any
@@ -124,6 +125,91 @@ def _git_bytes(repository: Path, *args: str) -> bytes | None:
     return completed.stdout
 
 
+_VALIDATOR_DRIVER = """
+import json, sys, types
+
+payload = json.loads(sys.stdin.read())
+namespace = {"__name__": "grabowski_runtime_contract_candidate"}
+try:
+    exec(compile(payload["validator"], "grabowski_runtime_contract.py", "exec"), namespace)
+    contract_error = namespace["contract_error"]
+    canonical_module = namespace["CANONICAL_VALIDATOR_MODULE"]
+except BaseException as exc:
+    print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+    raise SystemExit(0)
+
+try:
+    raw = json.loads(payload["contract"])
+    error = contract_error(raw)
+    if error is None:
+        # Validated above, so these are typed accesses: .get() here could
+        # smuggle None into the deployed-module set.
+        deployed = {raw["module"]} | {
+            item["module"] for item in raw.get("supporting_sources", [])
+        }
+    else:
+        deployed = set()
+except BaseException as exc:
+    print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+    raise SystemExit(0)
+
+print(json.dumps({
+    "error": None,
+    "contract_error": error,
+    "canonical_module": canonical_module,
+    "deploys_canonical_validator": canonical_module in deployed,
+}))
+"""
+
+VALIDATOR_ISOLATION_TIMEOUT_SECONDS = 20
+
+
+def _isolated_contract_verdict(
+    validator_bytes: bytes, contract_bytes: bytes
+) -> dict[str, Any]:
+    """Run the candidate validator out of process and return only its verdict.
+
+    Nothing from the target revision executes in the operator process: the
+    subprocess receives source text on stdin and answers with JSON, so a
+    malicious or merely broken candidate can at worst produce an unusable
+    verdict.
+    """
+    try:
+        payload = json.dumps(
+            {
+                "validator": validator_bytes.decode("utf-8"),
+                "contract": contract_bytes.decode("utf-8"),
+            }
+        )
+    except UnicodeDecodeError as exc:
+        return {"error": f"candidate sources are not valid UTF-8: {exc}"}
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", _VALIDATOR_DRIVER],
+            input=payload,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=VALIDATOR_ISOLATION_TIMEOUT_SECONDS,
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": "candidate validator exceeded its evaluation timeout"}
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"error": f"candidate validator could not be evaluated: {exc}"}
+    if completed.returncode != 0:
+        return {"error": f"candidate validator exited {completed.returncode}"}
+    try:
+        verdict = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return {"error": "candidate validator produced no usable verdict"}
+    if not isinstance(verdict, dict):
+        return {"error": "candidate validator verdict was not an object"}
+    return verdict
+
+
 def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str, Any]:
     """Validate the target commit's contract with that commit's own schema.
 
@@ -153,37 +239,23 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
         return evidence
     evidence["validator_readable"] = True
 
-    namespace: dict[str, Any] = {"__name__": "grabowski_runtime_contract_recovery"}
-    try:
-        compiled = compile(
-            validator_bytes.decode("utf-8"), CANONICAL_VALIDATOR_RELATIVE, "exec"
-        )
-        exec(compiled, namespace)  # noqa: S102 - revision-bound canonical schema
-        contract_error = namespace["contract_error"]
-        canonical_module = namespace["CANONICAL_VALIDATOR_MODULE"]
-    except (UnicodeDecodeError, SyntaxError, ValueError, KeyError) as exc:
-        evidence["error"] = f"target canonical validator is unusable: {exc}"
+    # The candidate validator is *not* executed in this process.  This tool is
+    # read-only and reachable while a gate would ultimately deny recovery, so
+    # running an arbitrary origin/main revision's module-scope code here would
+    # let assessment alone cause side effects in the live operator.  Run it in a
+    # short-lived, resource-bounded subprocess instead and trust only its JSON.
+    verdict = _isolated_contract_verdict(validator_bytes, contract_bytes)
+    if verdict.get("error"):
+        evidence["error"] = f"target canonical validator is unusable: {verdict['error']}"
         return evidence
-
-    try:
-        raw = json.loads(contract_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        evidence["error"] = f"target contract is not valid JSON: {exc}"
-        return evidence
-
-    error = contract_error(raw)
-    if error is not None:
-        evidence["error"] = f"target contract is invalid: {error}"
+    if verdict.get("contract_error"):
+        evidence["error"] = f"target contract is invalid: {verdict['contract_error']}"
         return evidence
     evidence["contract_valid"] = True
-
-    deployed_modules = {raw.get("module")} | {
-        item.get("module") for item in raw.get("supporting_sources", [])
-    }
-    if canonical_module not in deployed_modules:
+    if not verdict.get("deploys_canonical_validator"):
         evidence["error"] = (
-            f"target contract does not deploy {canonical_module}; the repaired "
-            "runtime could not validate itself"
+            f"target contract does not deploy {verdict.get('canonical_module')}; "
+            "the repaired runtime could not validate itself"
         )
         return evidence
     evidence["validator_is_deployed"] = True
@@ -244,6 +316,29 @@ def _blockade_evidence(repository: Path | None) -> dict[str, Any]:
     except (RuntimeError, ValueError, OSError) as exc:
         evidence["error"] = f"blockade evaluation failed: {exc}"
     return evidence
+
+
+def _volatile_gate_recheck(repository: Path | None) -> dict[str, Any]:
+    """Re-read the gates that can change between assessment and dispatch."""
+    kill_switch = base._kill_switch_state()
+    blockade = _blockade_evidence(repository)
+    competing = _competing_deployment_evidence()
+    checks = {
+        "kill_switch_clear": not bool(kill_switch.get("engaged")),
+        "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
+        "no_competing_deployment": (
+            bool(competing.get("deploy_lock_free"))
+            and not competing.get("inflight_deploy_jobs")
+            and competing.get("error") is None
+        ),
+    }
+    return {
+        "checked_at_unix": int(time.time()),
+        "checks": checks,
+        "reasons": sorted(name for name, passed in checks.items() if not passed),
+        "operator_blockade": blockade,
+        "competing_deployment": competing,
+    }
 
 
 def _integrity_evidence() -> dict[str, Any]:
@@ -373,6 +468,10 @@ def grabowski_recovery_provenance_assess(
     source_lease_owner_id: SourceLeaseOwner | None = None,
 ) -> dict[str, Any]:
     """Report whether the provenance repair lane would admit this exact commit."""
+    # Access-policy capability only.  This check reads the active profile and
+    # never consults deployment provenance, so requiring it here restricts the
+    # lane without reintroducing the circularity it exists to break.
+    operator._require_operator_capability("audit_verify")
     return evaluate_gate(expected_head, source_repository, source_lease_owner_id)
 
 
@@ -392,6 +491,28 @@ def grabowski_recovery_provenance_repair(
     or power-worker authority, and refuses unless the deployed runtime is
     actually integrity-invalid.
     """
+    # Access-policy capabilities only.  Deliberately not
+    # _require_operator_mutation: that binds to the blockade *and* provenance
+    # path this lane exists to repair.  Blockades are evaluated explicitly in
+    # the gate instead, so an operator blockade still stops the lane.
+    operator._require_operator_capability("durable_job")
+    operator._require_operator_capability("git_cli")
+    # Serialize on the same lock the ordinary self-deploy scheduler uses.
+    # Without it, two concurrent recovery requests could each observe a clear
+    # deploy index, then both reserve a unit and start duplicate deployments.
+    with self_deploy._deploy_schedule_lock():
+        return _repair_under_schedule_lock(
+            expected_head, source_repository, source_lease_owner_id, delay_seconds
+        )
+
+
+def _repair_under_schedule_lock(
+    expected_head: str,
+    source_repository: str | None,
+    source_lease_owner_id: str | None,
+    delay_seconds: int,
+) -> dict[str, Any]:
+    """Gate, reserve and dispatch, all under the deploy schedule lock."""
     gate = evaluate_gate(expected_head, source_repository, source_lease_owner_id)
     if not gate["allowed"]:
         base._append_audit(
@@ -434,11 +555,30 @@ def grabowski_recovery_provenance_repair(
     }
     intent_sha256 = base._append_audit_with_digest(intent)
 
+    # Re-check the volatile gates immediately before dispatch.  Evaluating the
+    # full gate takes measurable time (git reads, broker probe), and a kill
+    # switch, a blockade or a competing deployment can appear inside that
+    # window.  These three are cheap, so there is no reason to act on a stale
+    # reading of them.
+    volatile = _volatile_gate_recheck(repository)
+    if volatile["reasons"]:
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "provenance-recovery-aborted-before-dispatch",
+                "expected_head": expected_head,
+                "reasons": volatile["reasons"],
+                "intent_sha256": intent_sha256,
+            }
+        )
+        raise ProvenanceRecoveryDenied(volatile["reasons"], {**gate, "recheck": volatile})
+
     jobs_root = operator._jobs_root()
-    index = self_deploy._deploy_index(jobs_root)
     reserved_unit = self_deploy.DEPLOY_JOB_PREFIX + uuid.uuid4().hex[:12]
     self_deploy._write_deploy_index(
-        jobs_root, units=index["units"], pending_unit=reserved_unit
+        jobs_root,
+        units=self_deploy._deploy_index(jobs_root)["units"],
+        pending_unit=reserved_unit,
     )
     try:
         job = operator._start_job(
@@ -448,14 +588,22 @@ def grabowski_recovery_provenance_repair(
             finalization_expected_head=expected_head,
             reserved_unit=reserved_unit,
             allow_reserved_runtime_deploy=True,
+            invoker_tool="grabowski_recovery_provenance_repair",
         )
     except Exception:
+        # Re-read rather than restoring the snapshot taken before _start_job:
+        # another deploy may have finished and removed itself meanwhile, and
+        # writing back the stale unit list would resurrect it.
         self_deploy._write_deploy_index(
-            jobs_root, units=index["units"], pending_unit=None
+            jobs_root,
+            units=self_deploy._deploy_index(jobs_root)["units"],
+            pending_unit=None,
         )
         raise
     self_deploy._write_deploy_index(
-        jobs_root, units=[*index["units"], reserved_unit], pending_unit=None
+        jobs_root,
+        units=[*self_deploy._deploy_index(jobs_root)["units"], reserved_unit],
+        pending_unit=None,
     )
 
     scheduled = {
