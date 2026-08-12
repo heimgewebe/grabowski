@@ -88,6 +88,15 @@ _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="grabowski-sync-tool",
 )
 JOB_PREFIX = "grabowski-job-"
+
+#: Tools that may appear as the authorizing invoker in a durable job origin.
+JOB_INVOKER_TOOLS = frozenset(
+    {
+        "grabowski_job_start",
+        "grabowski_runtime_deploy_schedule",
+        "grabowski_recovery_provenance_repair",
+    }
+)
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
 TRUSTED_MAX_TIMEOUT = 86_400
@@ -3804,13 +3813,17 @@ def _start_job(
     }
     # The origin record must name the tool that actually authorized the job, so
     # a reserved deploy started by the provenance repair lane is not attributed
-    # to the ordinary self-deploy scheduler.
+    # to the ordinary self-deploy scheduler.  The value is constrained to the
+    # tools that may legitimately start a job: audit attribution is evidence,
+    # and evidence a caller can write freely is not evidence.
     if invoker_tool is None:
         invoker_tool = (
             "grabowski_runtime_deploy_schedule"
             if allow_reserved_runtime_deploy
             else "grabowski_job_start"
         )
+    elif invoker_tool not in JOB_INVOKER_TOOLS:
+        raise PermissionError(f"unknown job invoker tool: {invoker_tool}")
     origin, origin_sha256 = job_origin.build_origin(
         unit=unit,
         owner=identity["owner"],

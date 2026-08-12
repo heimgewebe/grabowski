@@ -13,20 +13,25 @@ action -- replace the deployed runtime with a build of an exact, verified commit
 under repair:
 
 * the audit chain is valid and writable,
-* the kill switch is clear,
-* local backup and restore evidence is fresh,
+* the kill switch is clear and no typed operator blockade applies,
+* a local backup freshness marker is present (a marker -- not a proven restore),
 * the privileged broker is fully healthy,
 * the caller names an exact target commit,
 * the source repository is clean and revision-bound to that commit,
 * the expected head is the head actually used,
-* the target commit's own contract validates under its own canonical schema,
+* the target commit ships the byte-identical canonical schema this process runs,
+  and its contract validates under that schema,
 * no competing deployment mutation is in flight,
 * no foreign lease or writer collides with the source.
 
+Nothing here executes code from the target commit or from the runtime under
+repair.  A read path that could be made to act merely by being consulted would
+not be a read path; see ``_target_contract_evidence``.
+
 Deliberate limits:
 
-* The lane refuses to run when the runtime is *not* integrity-invalid, so it can
-  never be used to route around gates that currently apply.
+* The lane refuses unless the runtime is *proven* integrity-invalid.  Unknown or
+  unreadable integrity is indeterminate, and indeterminate is not a warrant.
 * It grants no shell, command or power authority.  Its only effect is a
   revision-bound deployment of the named commit.
 * It does not consult ``provenance_valid`` for authority -- only to establish
@@ -38,10 +43,10 @@ Deliberate limits:
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 from pathlib import Path
 import subprocess
-import sys
 import time
 import uuid
 from typing import Annotated, Any
@@ -57,6 +62,7 @@ import grabowski_mcp as base
 import grabowski_operator_core as operator
 import grabowski_privileged as privileged
 import grabowski_recovery as recovery
+import grabowski_runtime_contract as runtime_contract
 import grabowski_self_deploy as self_deploy
 
 
@@ -95,7 +101,6 @@ REPAIRABLE_INTEGRITY_FLAGS = (
 )
 
 CONTRACT_RELATIVE = "config/runtime-entrypoint.json"
-CANONICAL_VALIDATOR_RELATIVE = "src/grabowski_runtime_contract.py"
 
 
 class ProvenanceRecoveryDenied(PermissionError):
@@ -125,102 +130,46 @@ def _git_bytes(repository: Path, *args: str) -> bytes | None:
     return completed.stdout
 
 
-_VALIDATOR_DRIVER = """
-import json, sys, types
-
-payload = json.loads(sys.stdin.read())
-namespace = {"__name__": "grabowski_runtime_contract_candidate"}
-try:
-    exec(compile(payload["validator"], "grabowski_runtime_contract.py", "exec"), namespace)
-    contract_error = namespace["contract_error"]
-    canonical_module = namespace["CANONICAL_VALIDATOR_MODULE"]
-except BaseException as exc:
-    print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
-    raise SystemExit(0)
-
-try:
-    raw = json.loads(payload["contract"])
-    error = contract_error(raw)
-    if error is None:
-        # Validated above, so these are typed accesses: .get() here could
-        # smuggle None into the deployed-module set.
-        deployed = {raw["module"]} | {
-            item["module"] for item in raw.get("supporting_sources", [])
-        }
-    else:
-        deployed = set()
-except BaseException as exc:
-    print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
-    raise SystemExit(0)
-
-print(json.dumps({
-    "error": None,
-    "contract_error": error,
-    "canonical_module": canonical_module,
-    "deploys_canonical_validator": canonical_module in deployed,
-}))
-"""
-
-VALIDATOR_ISOLATION_TIMEOUT_SECONDS = 20
+#: The canonical validator's identity is fixed here, in trusted code.  Reading
+#: it out of the candidate would let the artifact under review decide what
+#: counts as proof that its own schema is present.
+CANONICAL_VALIDATOR_MODULE = "grabowski_runtime_contract"
+CANONICAL_VALIDATOR_SOURCE = "src/grabowski_runtime_contract.py"
 
 
-def _isolated_contract_verdict(
-    validator_bytes: bytes, contract_bytes: bytes
-) -> dict[str, Any]:
-    """Run the candidate validator out of process and return only its verdict.
-
-    Nothing from the target revision executes in the operator process: the
-    subprocess receives source text on stdin and answers with JSON, so a
-    malicious or merely broken candidate can at worst produce an unusable
-    verdict.
-    """
+def _trusted_validator_source() -> bytes | None:
+    """Return the source of the canonical validator running in this process."""
     try:
-        payload = json.dumps(
-            {
-                "validator": validator_bytes.decode("utf-8"),
-                "contract": contract_bytes.decode("utf-8"),
-            }
-        )
-    except UnicodeDecodeError as exc:
-        return {"error": f"candidate sources are not valid UTF-8: {exc}"}
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-I", "-S", "-c", _VALIDATOR_DRIVER],
-            input=payload,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=VALIDATOR_ISOLATION_TIMEOUT_SECONDS,
-            cwd="/",
-            env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-    except subprocess.TimeoutExpired:
-        return {"error": "candidate validator exceeded its evaluation timeout"}
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"error": f"candidate validator could not be evaluated: {exc}"}
-    if completed.returncode != 0:
-        return {"error": f"candidate validator exited {completed.returncode}"}
-    try:
-        verdict = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return {"error": "candidate validator produced no usable verdict"}
-    if not isinstance(verdict, dict):
-        return {"error": "candidate validator verdict was not an object"}
-    return verdict
+        return Path(runtime_contract.__file__).read_bytes()
+    except (OSError, TypeError):
+        return None
 
 
 def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str, Any]:
-    """Validate the target commit's contract with that commit's own schema.
+    """Judge the target commit's contract without ever executing that commit.
 
-    Repairing into a second self-inconsistent release would only move the
-    deadlock, so the target is judged before it is ever built.
+    The earlier design loaded the target revision's own validator so a commit
+    would be judged by the schema of its own epoch.  That guarantee is real, but
+    the price was executing arbitrary repository code -- and this function is
+    reached from a ``read_only`` tool that runs even when a gate will ultimately
+    deny recovery.  A subprocess did not fix that: same UID, same filesystem, so
+    a candidate could still write files, spawn processes or reach the network
+    merely by being assessed.
+
+    The anti-skew guarantee is preserved differently: the candidate's schema
+    module is compared byte-for-byte with the trusted one already running here.
+    Identical means this process's verdict *is* the target's verdict.  Different
+    means the schema itself changed, and the honest answer is "I cannot judge
+    this" -- reported as indeterminate, never resolved by running the candidate.
     """
     evidence: dict[str, Any] = {
         "contract_readable": False,
         "validator_readable": False,
+        "validator_matches_trusted_schema": False,
         "contract_valid": False,
         "validator_is_deployed": False,
+        "indeterminate": False,
+        "executed_candidate_code": False,
         "error": None,
     }
     contract_bytes = _git_bytes(
@@ -232,30 +181,58 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
     evidence["contract_readable"] = True
 
     validator_bytes = _git_bytes(
-        repository, "show", f"{expected_head}:{CANONICAL_VALIDATOR_RELATIVE}"
+        repository, "show", f"{expected_head}:{CANONICAL_VALIDATOR_SOURCE}"
     )
     if validator_bytes is None:
         evidence["error"] = "target commit ships no canonical contract validator"
         return evidence
     evidence["validator_readable"] = True
 
-    # The candidate validator is *not* executed in this process.  This tool is
-    # read-only and reachable while a gate would ultimately deny recovery, so
-    # running an arbitrary origin/main revision's module-scope code here would
-    # let assessment alone cause side effects in the live operator.  Run it in a
-    # short-lived, resource-bounded subprocess instead and trust only its JSON.
-    verdict = _isolated_contract_verdict(validator_bytes, contract_bytes)
-    if verdict.get("error"):
-        evidence["error"] = f"target canonical validator is unusable: {verdict['error']}"
+    trusted = _trusted_validator_source()
+    if trusted is None:
+        evidence["indeterminate"] = True
+        evidence["error"] = "trusted canonical validator source is unreadable"
         return evidence
-    if verdict.get("contract_error"):
-        evidence["error"] = f"target contract is invalid: {verdict['contract_error']}"
+    evidence["target_validator_sha256"] = hashlib.sha256(validator_bytes).hexdigest()
+    evidence["trusted_validator_sha256"] = hashlib.sha256(trusted).hexdigest()
+    if validator_bytes != trusted:
+        # Not a rejection: the target may be perfectly fine.  This process simply
+        # is not the right judge of a schema it does not implement, and it will
+        # not run the candidate to find out.
+        evidence["indeterminate"] = True
+        evidence["error"] = (
+            "target ships a different canonical contract schema than this "
+            "runtime; a schema change must be reviewed and deployed through the "
+            "ordinary path rather than judged by executing the candidate"
+        )
+        return evidence
+    evidence["validator_matches_trusted_schema"] = True
+
+    try:
+        raw = json.loads(contract_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        evidence["error"] = f"target contract is not valid JSON: {exc}"
+        return evidence
+
+    error = runtime_contract.contract_error(raw)
+    if error is not None:
+        evidence["error"] = f"target contract is invalid: {error}"
         return evidence
     evidence["contract_valid"] = True
-    if not verdict.get("deploys_canonical_validator"):
+
+    deployed_modules = set(runtime_contract.contract_modules(raw))
+    if CANONICAL_VALIDATOR_MODULE not in deployed_modules:
         evidence["error"] = (
-            f"target contract does not deploy {verdict.get('canonical_module')}; "
+            f"target contract does not deploy {CANONICAL_VALIDATOR_MODULE}; "
             "the repaired runtime could not validate itself"
+        )
+        return evidence
+    sources = runtime_contract.contract_module_sources(raw)
+    if sources.get(CANONICAL_VALIDATOR_MODULE) != CANONICAL_VALIDATOR_SOURCE:
+        evidence["error"] = (
+            f"target contract maps {CANONICAL_VALIDATOR_MODULE} to "
+            f"{sources.get(CANONICAL_VALIDATOR_MODULE)!r} instead of the "
+            f"canonical {CANONICAL_VALIDATOR_SOURCE!r}"
         )
         return evidence
     evidence["validator_is_deployed"] = True
@@ -342,16 +319,39 @@ def _volatile_gate_recheck(repository: Path | None) -> dict[str, Any]:
 
 
 def _integrity_evidence() -> dict[str, Any]:
-    """Establish that a repair is warranted, without deriving authority from it."""
+    """Classify runtime integrity as valid, invalid or indeterminate.
+
+    "Not True" is not the same as "proven broken".  A flag can be absent because
+    the metadata probe itself failed -- unreadable manifest, partial deployment,
+    an error containment path -- and treating that as a positive finding of
+    corruption would let a transient read failure authorise a deployment.
+
+    Only an explicit ``False`` warrants repair.  Anything unknown is
+    indeterminate and fails closed: the lane declines rather than guesses.
+    """
     deployment = base._deployment_metadata()
-    failed = [
-        flag
-        for flag in REPAIRABLE_INTEGRITY_FLAGS
-        if deployment.get(flag) is not True
-    ]
+    invalid: list[str] = []
+    unknown: list[str] = []
+    for flag in REPAIRABLE_INTEGRITY_FLAGS:
+        value = deployment.get(flag)
+        if value is False:
+            invalid.append(flag)
+        elif value is not True:
+            unknown.append(flag)
+
+    if unknown:
+        state = "indeterminate"
+    elif invalid:
+        state = "invalid"
+    else:
+        state = "valid"
+
     return {
-        "repair_warranted": bool(failed),
-        "failed_integrity_flags": failed,
+        # Only a proven defect is a warrant; indeterminate never is.
+        "repair_warranted": state == "invalid",
+        "integrity_state": state,
+        "failed_integrity_flags": invalid,
+        "indeterminate_integrity_flags": unknown,
         "release_id": deployment.get("release_id"),
         "repo_head": deployment.get("repo_head"),
         "completion_status": deployment.get("completion_status"),
@@ -395,14 +395,18 @@ def evaluate_gate(
     blockade = _blockade_evidence(repository)
 
     checks = {
-        # The lane exists only to repair a runtime that is actually broken.
+        # The lane exists only to repair a runtime that is *proven* broken;
+        # indeterminate integrity is not a warrant (see _integrity_evidence).
         "repair_warranted": bool(integrity["repair_warranted"]),
         # Independent evidence -- none of it derives from the invalid runtime.
         "audit_chain_valid": bool(audit.get("valid")),
         "audit_writable": bool(audit.get("audit_writable", audit.get("valid"))),
         "kill_switch_clear": not bool(kill_switch.get("engaged")),
         "no_blocking_operator_blockade": bool(blockade["allows_mutation"]),
-        "local_backup_fresh": bool(local_backup.get("valid")),
+        # Named for what is actually checked: a freshness marker, not a proven
+        # restore.  Restore provability lives in the separate server-recovery
+        # gate, which this lane deliberately does not require.
+        "local_backup_marker_fresh": bool(local_backup.get("valid")),
         "privileged_broker_ready": bool(broker.get("ready")),
         # Revision binding of the repair target.
         "source_identity_bound": source_error is None,
@@ -410,6 +414,8 @@ def evaluate_gate(
         "target_deploys_canonical_validator": bool(
             target.get("validator_is_deployed")
         ),
+        # An unjudgeable target is not an approved target.
+        "target_schema_judgeable": not bool(target.get("indeterminate")),
         # Nothing else may be mutating the deployment concurrently.
         "no_competing_deployment": (
             bool(competing.get("deploy_lock_free"))
@@ -435,9 +441,11 @@ def evaluate_gate(
             "last_record_sha256": audit.get("last_record_sha256"),
         },
         "kill_switch": {"engaged": bool(kill_switch.get("engaged"))},
-        "local_backup": {
-            "valid": bool(local_backup.get("valid")),
+        "local_backup_marker": {
+            "fresh": bool(local_backup.get("valid")),
             "age_seconds": local_backup.get("age_seconds"),
+            "proves": "a recent successful backup run wrote its marker",
+            "does_not_prove": "that a restore was performed or verified",
         },
         "privileged_broker": {"ready": bool(broker.get("ready"))},
         "source_identity": source_identity,
@@ -453,6 +461,8 @@ def evaluate_gate(
         },
         "does_not_establish": [
             "that the target commit is functionally correct",
+            "that any candidate code was executed to reach this verdict",
+            "restore readiness; only a backup freshness marker is checked here",
             "that normal mutation authority is restored before a successful repair",
             "server recovery freshness, which remains a separate gate",
         ],
@@ -545,9 +555,23 @@ def _repair_under_schedule_lock(
         source_identity_sha256=source_identity["identity_sha256"],
     )
 
+    # Deterministic across retries of the same repair, so a caller that lost the
+    # response can correlate a re-request with what actually ran.
+    # Components are fixed-width hex digests, so ":" cannot introduce ambiguity.
+    repair_intent_id = hashlib.sha256(
+        ":".join(
+            [
+                expected_head,
+                str(source_identity["identity_sha256"]),
+                operator._argv_hash(command),
+            ]
+        ).encode("utf-8")
+    ).hexdigest()
+
     intent = {
         "timestamp_unix": int(time.time()),
         "operation": "provenance-recovery-intent",
+        "repair_intent_id": repair_intent_id,
         "expected_head": expected_head,
         "failed_integrity_flags": gate["runtime_integrity"]["failed_integrity_flags"],
         "source_identity_sha256": source_identity["identity_sha256"],
@@ -591,30 +615,50 @@ def _repair_under_schedule_lock(
             invoker_tool="grabowski_recovery_provenance_repair",
         )
     except Exception:
-        # Re-read rather than restoring the snapshot taken before _start_job:
-        # another deploy may have finished and removed itself meanwhile, and
-        # writing back the stale unit list would resurrect it.
-        self_deploy._write_deploy_index(
-            jobs_root,
-            units=self_deploy._deploy_index(jobs_root)["units"],
-            pending_unit=None,
-        )
+        # Nothing started, so the reservation must go.  Re-read rather than
+        # restoring the snapshot taken before the attempt: another deploy may
+        # have finished and removed itself meanwhile, and writing back the stale
+        # unit list would resurrect it.
+        try:
+            self_deploy._write_deploy_index(
+                jobs_root,
+                units=self_deploy._deploy_index(jobs_root)["units"],
+                pending_unit=None,
+            )
+        except Exception:  # noqa: BLE001 - the start failure is the real error
+            pass
         raise
-    self_deploy._write_deploy_index(
-        jobs_root,
-        units=[*self_deploy._deploy_index(jobs_root)["units"], reserved_unit],
-        pending_unit=None,
-    )
 
+    # The effect now exists.  From here on nothing may raise: an exception after
+    # a successful start would report "did not happen" about a deployment that
+    # is already running, which is the worst possible answer to give an operator
+    # about an integrity repair.  Record the effect first, then do bookkeeping
+    # best-effort and surface any failure as a warning on the receipt.
     scheduled = {
         "timestamp_unix": int(time.time()),
         "operation": "provenance-recovery-scheduled",
         "expected_head": expected_head,
+        "repair_intent_id": repair_intent_id,
         "unit": job["unit"],
         "argv_sha256": job["argv_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
     }
-    scheduled_sha256 = base._append_audit_with_digest(scheduled)
+    post_dispatch_warnings: list[str] = []
+    try:
+        scheduled_sha256 = base._append_audit_with_digest(scheduled)
+    except Exception as exc:  # noqa: BLE001 - effect already dispatched
+        scheduled_sha256 = None
+        post_dispatch_warnings.append(f"scheduled audit append failed: {exc}")
+    try:
+        self_deploy._write_deploy_index(
+            jobs_root,
+            units=[*self_deploy._deploy_index(jobs_root)["units"], reserved_unit],
+            pending_unit=None,
+        )
+    except Exception as exc:  # noqa: BLE001 - effect already dispatched
+        post_dispatch_warnings.append(
+            f"deploy index bookkeeping failed, pending_unit may be stale: {exc}"
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -624,6 +668,8 @@ def _repair_under_schedule_lock(
         "job": job,
         "intent_sha256": intent_sha256,
         "scheduled_sha256": scheduled_sha256,
+        "repair_intent_id": repair_intent_id,
+        "post_dispatch_warnings": post_dispatch_warnings,
         "post_state_readback_required": True,
         "next_action": (
             "re-read grabowski_deployment_identity once the job reaches a terminal "

@@ -6,8 +6,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
 import hashlib
-import http.client
 import importlib.util
+import http.client
 import json
 import os
 from pathlib import Path
@@ -16,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterator
+from typing import Iterator
 from urllib.parse import urlsplit
 
 
@@ -41,20 +41,28 @@ class LockBusy(WatchdogError):
 class IntegrityResult:
     """Whether the runtime that is alive is also operative.
 
-    ``valid`` is a manifest-level verdict.  The watchdog runs on the system
-    interpreter and cannot import the release, so it applies the same canonical
-    manifest schema the runtime uses, plus the contract hash and embedded-copy
-    checks -- but not the on-disk identity checks (hashes of installed modules,
-    python and platform binding) that require the release itself.
+    ``valid`` means: every check this probe actually performs passed.  It is not
+    a claim of ``provenance_valid``.
 
-    It can therefore prove a runtime *invalid*; a ``valid`` result means "no
-    manifest-level integrity fault", not "provenance_valid".
+    Proven here (all from data -- JSON structure, byte equality, SHA-256):
+    manifest present, parseable and complete; contract snapshot hash matches the
+    manifest; embedded contract equals the snapshotted contract; every installed
+    module hashes to its recorded ``source_sha256s`` entry; every runtime asset
+    hashes to its recorded entry.
+
+    Deliberately *not* proven: python/executable binding, platform identity,
+    protocol identity, agent-instruction identity, and the release-path and
+    pointer checks the runtime performs.  Those need the release's own view.
+
+    So a ``valid`` result narrows the possibilities; it does not certify the
+    runtime.  ``scope`` names this explicitly, and callers must not translate it
+    into "healthy" without saying which scope they mean.
     """
 
     valid: bool
     reason: str | None = None
     release_id: str | None = None
-    scope: str = "deployment-manifest"
+    scope: str = "manifest-and-installed-artifact-hashes"
 
 
 @dataclass(frozen=True)
@@ -240,39 +248,73 @@ def http_probe(url: str, expected_body: str, timeout: float) -> bool:
         connection.close()
 
 
-def _canonical_contract_schema(runtime_root: Path) -> Any:
-    """Load the canonical contract schema shipped inside the running release.
+MAX_INTEGRITY_FILE_BYTES = 8 * 1024 * 1024
 
-    Importing the release's own copy keeps the watchdog from becoming yet
-    another independent opinion about contract validity -- the drift that
-    deadlocked the runtime in the first place.
+#: Trusted source of the canonical contract schema.  This is operator-controlled
+#: repository code, deployed the same way this watchdog is -- deliberately NOT
+#: the release under test, whose schema module is exactly the artifact whose
+#: trustworthiness is in question.
+DEFAULT_TRUSTED_SCHEMA = Path.home() / "repos/grabowski/src/grabowski_runtime_contract.py"
+CANONICAL_SCHEMA_MODULE = "grabowski_runtime_contract"
+
+
+def _trusted_contract_schema(path: Path):
+    """Load the canonical schema from a trusted path, or return None.
+
+    Loading trusted repository code is not the same as executing the release: the
+    artifact under test never runs here.  If the trusted copy is unavailable the
+    probe degrades honestly rather than falling back to the release's copy.
     """
-    candidates = sorted(
-        (runtime_root / ".venv/lib").glob("python*/site-packages/grabowski_runtime_contract.py")
-    )
-    for candidate in candidates:
-        try:
-            spec = importlib.util.spec_from_file_location(
-                "grabowski_runtime_contract_watchdog", candidate
-            )
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return module
-        except Exception:  # noqa: BLE001 - a broken schema must not kill the watchdog
-            # Executing release code can raise anything at module scope.  The
-            # watchdog reports integrity; it must never become the outage.
-            continue
-    return None
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location(
+            "grabowski_runtime_contract_trusted", path
+        )
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "manifest_errors"):
+            return None
+        return module
+    except Exception:  # noqa: BLE001 - a broken trusted copy must not kill the watchdog
+        return None
 
 
-def probe_integrity(runtime_root: Path) -> IntegrityResult:
+def _sha256_file(path: Path) -> str | None:
+    """Hash a regular file without following symlinks out of the release."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        if path.stat().st_size > MAX_INTEGRITY_FILE_BYTES:
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def probe_integrity(
+    runtime_root: Path, *, trusted_schema_path: Path = DEFAULT_TRUSTED_SCHEMA
+) -> IntegrityResult:
     """Report whether the deployed runtime is integrity-valid, fail-closed.
 
-    Every failure path returns ``valid=False`` with a machine-readable reason.
-    A runtime whose deployment provenance is broken is alive but cannot carry
-    out normal effects, so it must never be reported as healthy.
+    This never executes anything from the release.  An earlier version imported
+    the release's own schema module so that the watchdog and the runtime could
+    not disagree -- but a watchdog that executes the artifact it is judging is
+    not an independent observer.  Measured against that version: a release whose
+    schema module called ``os._exit`` terminated the watchdog outright (so the
+    integrity exit code never fired), and one containing an infinite loop hung
+    it forever.  ``except Exception`` catches neither.
+
+    Everything below is therefore computed from *data*: JSON structure, byte
+    equality and SHA-256 over files.  That is both safe and strictly more than
+    the previous version proved, because the installed module and runtime asset
+    hashes are now verified against the manifest rather than assumed.
     """
     manifest_path = runtime_root / "deployment-manifest.json"
     if (runtime_root / "deployment-incomplete.json").exists():
@@ -290,41 +332,20 @@ def probe_integrity(runtime_root: Path) -> IntegrityResult:
     if raw.get("completion_status") != "complete":
         return IntegrityResult(False, "deployment-incomplete", release_id)
 
-    schema = _canonical_contract_schema(runtime_root)
-    if schema is None:
-        return IntegrityResult(False, "canonical-contract-schema-unavailable", release_id)
-
-    # Validate the whole manifest, not just the contract: any manifest field the
-    # runtime rejects also disables normal effects, so a narrower check here
-    # would report an inoperative runtime as healthy.
-    manifest_errors = schema.manifest_errors(raw)
-    if manifest_errors:
-        # An invalid contract cascades into every manifest field derived from
-        # it, so report the root cause rather than the wreckage.
-        if "entrypoint_contract" in manifest_errors:
-            return IntegrityResult(False, "entrypoint-contract-invalid", release_id)
-        return IntegrityResult(
-            False,
-            "manifest-schema-invalid:" + ",".join(manifest_errors[:8]),
-            release_id,
-        )
-    contract = raw["entrypoint_contract"]
+    contract = raw.get("entrypoint_contract")
+    if not isinstance(contract, dict):
+        return IntegrityResult(False, "entrypoint-contract-missing", release_id)
 
     snapshot_paths = raw.get("snapshot_paths")
-    recorded = (
-        snapshot_paths.get("runtime_entrypoint")
-        if isinstance(snapshot_paths, dict)
-        else None
-    )
+    if not isinstance(snapshot_paths, dict):
+        return IntegrityResult(False, "snapshot-paths-missing", release_id)
+    recorded = snapshot_paths.get("runtime_entrypoint")
     if not isinstance(recorded, str):
         return IntegrityResult(False, "contract-snapshot-path-missing", release_id)
     recorded_path = Path(recorded)
     try:
         contract_bytes = recorded_path.read_bytes()
     except OSError:
-        # Distinguish "the release moved" from "the file is broken": a manifest
-        # records absolute snapshot paths at deploy time, so a relocated or
-        # replaced release reads as stale rather than as content corruption.
         reason = (
             "contract-snapshot-unreadable"
             if recorded_path.exists()
@@ -340,7 +361,74 @@ def probe_integrity(runtime_root: Path) -> IntegrityResult:
     if snapshotted != contract:
         return IntegrityResult(False, "embedded-contract-drift", release_id)
 
-    return IntegrityResult(True, None, release_id)
+    # Schema validity, judged by the *trusted* copy of the canonical schema.
+    # Byte-comparing the release's copy against the trusted one first means a
+    # release that ships a different schema is reported as unjudgeable rather
+    # than silently trusted -- and the release's copy is still never executed.
+    schema = _trusted_contract_schema(trusted_schema_path)
+    if schema is None:
+        schema_state = "unverified-no-trusted-schema"
+    else:
+        installed = None
+        if isinstance(module_paths_probe := raw.get("module_paths"), dict):
+            recorded_schema = module_paths_probe.get(CANONICAL_SCHEMA_MODULE)
+            if isinstance(recorded_schema, str):
+                try:
+                    installed = Path(recorded_schema).read_bytes()
+                except OSError:
+                    installed = None
+        try:
+            trusted_bytes = trusted_schema_path.read_bytes()
+        except OSError:
+            trusted_bytes = None
+        if installed is None or trusted_bytes is None:
+            schema_state = "unverified-schema-unreadable"
+        elif installed != trusted_bytes:
+            schema_state = "unverified-schema-differs"
+        else:
+            errors = schema.manifest_errors(raw)
+            if errors:
+                if "entrypoint_contract" in errors:
+                    return IntegrityResult(
+                        False, "entrypoint-contract-invalid", release_id
+                    )
+                return IntegrityResult(
+                    False,
+                    "manifest-schema-invalid:" + ",".join(errors[:8]),
+                    release_id,
+                )
+            schema_state = "verified"
+
+    # Installed artifact identity: pure hashing, no import, no execution.
+    source_hashes = raw.get("source_sha256s")
+    module_paths = raw.get("module_paths")
+    if not isinstance(source_hashes, dict) or not isinstance(module_paths, dict):
+        return IntegrityResult(False, "module-identity-fields-missing", release_id)
+    if set(source_hashes) != set(module_paths):
+        return IntegrityResult(False, "module-identity-sets-disagree", release_id)
+    for module, expected in sorted(source_hashes.items()):
+        observed = _sha256_file(Path(module_paths[module]))
+        if observed is None:
+            return IntegrityResult(False, f"module-unreadable:{module}", release_id)
+        if observed != expected:
+            return IntegrityResult(False, f"module-hash-drift:{module}", release_id)
+
+    asset_hashes = raw.get("runtime_asset_sha256s")
+    asset_paths = raw.get("runtime_asset_paths")
+    if not isinstance(asset_hashes, dict) or not isinstance(asset_paths, dict):
+        return IntegrityResult(False, "runtime-asset-fields-missing", release_id)
+    if set(asset_hashes) != set(asset_paths):
+        return IntegrityResult(False, "runtime-asset-sets-disagree", release_id)
+    for destination, expected in sorted(asset_hashes.items()):
+        observed = _sha256_file(Path(asset_paths[destination]))
+        if observed is None:
+            return IntegrityResult(False, f"asset-unreadable:{destination}", release_id)
+        if observed != expected:
+            return IntegrityResult(False, f"asset-hash-drift:{destination}", release_id)
+
+    return IntegrityResult(
+        True, None, release_id, scope=f"manifest+artifact-hashes;schema={schema_state}"
+    )
 
 
 def probe_runtime(
@@ -413,6 +501,8 @@ def probe_runtime(
         # a runtime whose deployment provenance is invalid still answers
         # /healthz while refusing every normal effect, so reporting it as
         # healthy would be semantically wrong.
+        # Transport liveness alone is not operative health; a runtime can
+        # answer /healthz while refusing every effect.
         integrity = probe_integrity(runtime_root)
         if not integrity.valid:
             return ProbeResult(
@@ -633,6 +723,13 @@ def run_watchdog(args: argparse.Namespace) -> int:
                     "reason": probe.integrity.reason,
                     "release_id": probe.integrity.release_id,
                     "scope": probe.integrity.scope,
+                    # State the limit inline so a consumer of these events
+                    # cannot mistake the verdict for full provenance.
+                    "does_not_establish": [
+                        "provenance_valid",
+                        "python, executable, platform or protocol identity",
+                        "agent instruction identity",
+                    ],
                 }
 
             if probe.status == "integrity_invalid":

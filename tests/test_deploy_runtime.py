@@ -263,10 +263,20 @@ class DeployRuntimeTests(unittest.TestCase):
             r"runtime_assets\[0\]\.destination must be a repository-relative path",
         ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+        # Canonical spelling, so this still exercises the reserved-name check
+        # rather than tripping the canonicity check first.
+        invalid = json.loads(raw)
+        invalid["runtime_assets"][0]["source"] = "runtime-entrypoint.json"
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source uses a reserved snapshot input name"
+        ):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+        # And a non-canonical spelling is rejected in its own right.
         invalid = json.loads(raw)
         invalid["runtime_assets"][0]["source"] = "./runtime-entrypoint.json"
         with self.assertRaisesRegex(
-            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source uses a reserved snapshot input name"
+            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source must already be canonical"
         ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 

@@ -687,13 +687,21 @@ def git_show(repo: Path, head: str, path: Path) -> bytes:
 def verify_import_closure(
     *, module: str, source_bytes: bytes, supporting: Mapping[str, bytes]
 ) -> None:
-    """Fail unless every deployed module can import what it needs at runtime.
+    """Fail unless every statically imported grabowski module is also deployed.
 
     A release is only self-sufficient if each ``grabowski_*`` module it ships
     imports exclusively modules the same release ships.  Without this check a
     contract can deploy a module whose import target was never snapshotted --
     which is how the runtime ends up unable to run the very validator that
     decides whether it is valid.
+
+    Scope, stated so the check is not mistaken for a completeness proof: this
+    reads *static* ``import`` and ``from ... import`` statements at any depth of
+    the AST and reduces dotted names to their top-level package.  It therefore
+    does not see ``importlib`` lookups, ``__import__`` calls, names assembled at
+    runtime, or relative imports (which have no top-level ``grabowski_`` name to
+    resolve).  Passing means "no statically visible import is missing", not
+    "every import that will ever execute is present".
     """
     deployed = {module, *supporting}
     all_sources = {module: source_bytes, **dict(supporting)}

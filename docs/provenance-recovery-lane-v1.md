@@ -45,17 +45,52 @@ Alle Gate-Bedingungen (fail-closed, alle müssen erfüllt sein):
 
 | Check | Bedeutung |
 | --- | --- |
-| `repair_warranted` | Runtime ist tatsächlich integritätsungültig |
+| `repair_warranted` | Runtime ist **nachweislich** integritätsungültig (unbekannt ≠ kaputt) |
 | `audit_chain_valid` | Audit-Chain gültig |
 | `audit_writable` | Audit-Chain beschreibbar |
 | `kill_switch_clear` | Kill-Switch frei |
 | `no_blocking_operator_blockade` | keine typisierte Operator-Blockade |
-| `local_backup_fresh` | frische Backup-/Restore-Evidence |
+| `local_backup_marker_fresh` | frischer Backup-**Marker** (kein bewiesener Restore) |
 | `privileged_broker_ready` | Privileged Broker vollständig gesund |
 | `source_identity_bound` | Quelle sauber, `HEAD == origin/main == expected_head` |
-| `target_contract_valid` | Ziel-Contract gültig unter dem kanonischen Schema **des Ziel-Commits** |
+| `target_contract_valid` | Ziel-Contract gültig unter dem vertrauten kanonischen Schema |
+| `target_schema_judgeable` | Ziel führt byte-identisches Schema; sonst `indeterminate` |
 | `target_deploys_canonical_validator` | Ziel deployt sein eigenes Validierungsschema |
 | `no_competing_deployment` | Deploy-Lock frei, kein laufender Deploy-Job |
+
+### Warum jedes Gate da ist — und was es kostet
+
+Jedes Gate erkauft Sicherheit mit Verfügbarkeit. Bei einer Reparatur-Lane ist
+das besonders heikel: ein Gate, das selbst ausfallen kann, erzeugt einen
+Mehrfach-Fehler-Deadlock (Runtime kaputt **und** Gate kaputt = nicht
+reparierbar). Deshalb hier explizit pro Gate.
+
+| Gate | Verhindertes Risiko | Preis bei Ausfall |
+| --- | --- | --- |
+| `repair_warranted` | Lane als Umgehung geltender Gates | keiner (nur bei echtem Defekt offen) |
+| `audit_chain_valid` / `audit_writable` | Reparatur ohne nachvollziehbaren Nachweis | kaputte Audit-Kette blockiert Reparatur |
+| `kill_switch_clear` | Überstimmen eines expliziten Stopps | Kill-Switch blockiert (gewollt) |
+| `no_blocking_operator_blockade` | Loch im Blockade-System | Blockade blockiert (gewollt) |
+| `source_identity_bound` | Deploy eines nicht verifizierten Stands | dirty/divergenter Checkout blockiert |
+| `target_contract_valid` | Reparatur in ein zweites kaputtes Release | – |
+| `target_schema_judgeable` | Urteil über ein Schema, das dieser Prozess nicht implementiert | Schemawechsel braucht normalen Deploy-Pfad |
+| `no_competing_deployment` | zwei gleichzeitige Deployments | laufender Deploy blockiert (gewollt) |
+
+Zwei Gates sind **bewusst konservativ** und wurden hinterfragt:
+
+* `privileged_broker_ready` — die Lane benutzt den Broker nicht. Das Gate ist
+  reine Systemgesundheits-Kopplung. Es bleibt, weil ein Reparaturdeploy auf
+  einem System mit defektem Privileged Broker ohnehin nicht in einen
+  vertrauenswürdigen Zustand führt. **Preis:** defekter Broker blockiert
+  Runtime-Reparatur.
+* `local_backup_marker_fresh` — belegt einen frischen Backup-Marker, **keinen**
+  verifizierten Restore. Der Deploy ist blue/green und behält das vorherige
+  Release, Rollback hängt also nicht am Backup. Es bleibt als billige
+  Zusatzabsicherung. **Preis:** abgelaufener Marker blockiert Reparatur.
+
+Wer diese beiden Kosten nicht tragen will, sollte sie zu reiner Evidenz
+degradieren statt sie zu entfernen — die Unterscheidung „blockierend“ vs.
+„protokolliert“ ist die eigentliche Stellschraube.
 
 ### Bootstrap-Grenze: diese Lane repariert den *aktuellen* Deadlock nicht
 
@@ -85,30 +120,45 @@ nicht Teil dieser Arbeit.
 5. `grabowski_deployment_identity` lesen.
 6. Bei gültiger Provenienz gelten wieder die normalen Gates.
 
-### Akzeptiertes Risiko: `exec` des Ziel-Validators
+### Kein Read-Pfad führt fremden Code aus
 
-`_target_contract_evidence` kompiliert und führt
-`src/grabowski_runtime_contract.py` **aus dem Ziel-Commit** im aktuellen
-Operator-Prozess aus. Das ist notwendig, damit ein Commit nach den Regeln
-seiner eigenen Epoche beurteilt wird.
+Eine frühere Fassung lud das kanonische Schema **aus dem Ziel-Commit** und
+führte es aus — erst in-process, dann in einem Subprozess. Beides war falsch:
 
-Warum das keine neue Vertrauensgrenze eröffnet:
+* `grabowski_recovery_provenance_assess` ist `read_only` und läuft auch dann,
+  wenn ein Gate die Recovery ohnehin ablehnen würde. Ein Read-Tool, das beim
+  bloßen Prüfen Wirkungen auslösen kann, ist kein Read-Tool.
+* Ein Subprozess ist **keine Sandbox**: gleiche UID, gleiches Dateisystem.
+  Belegt: ein Candidate-Validator hat während `assess` eine Datei auf dem Host
+  geschrieben.
 
-* Der Ziel-Commit muss `origin/main` sein und wird unmittelbar danach ohnehin
-  vollständig deployt und als Runtime ausgeführt.
-* Der Code, der hier läuft, ist also exakt der Code, der gleich mit voller
-  Autorität läuft.
+Heute gilt: Das Schema des Ziel-Commits wird **byteweise mit dem vertrauten
+Schema dieses Prozesses verglichen** und nie ausgeführt.
 
-Was trotzdem gilt:
+* identisch → das Urteil dieses Prozesses *ist* das Urteil des Ziels;
+* verschieden → `indeterminate`. Ehrliche Antwort: „das kann ich nicht
+  beurteilen“. Eine Schemaänderung gehört über den normalen Review- und
+  Deploy-Pfad, nicht dadurch entschieden, dass man den Kandidaten ausführt.
 
-* Der Namespace ist minimal (`{"__name__": ...}`), aber **keine** Sandbox —
-  das Modul braucht `import`, also echte Builtins.
-* Jede Exception aus `exec` wird generisch gefangen und in
-  `contract_valid=false` übersetzt; ein fehlerhafter Ziel-Commit lässt die
-  Diagnose fail-closed werden, statt den Prozess zu töten.
+Dieselbe Regel gilt im Watchdog. Er lud früher das Schema aus der zu prüfenden
+Release. Gemessen: ein Schema mit `os._exit` hat den Watchdog **beendet** (der
+Integritäts-Exitcode 5 kam nie), eines mit Endlosschleife hat ihn **dauerhaft
+aufgehängt**. `except Exception` fängt beides nicht. Der Watchdog rechnet jetzt
+nur noch über Daten (JSON-Struktur, Byte-Gleichheit, SHA-256) und lädt das
+Schema — falls verfügbar — aus einem **vertrauenswürdigen Pfad außerhalb der
+Release**.
 
-Eine stärkere Isolation (Subprozess mit Zeit- und Ressourcenlimit) wäre möglich
-und ist als Folgetask registriert.
+### Was der Watchdog beweist — und was nicht
+
+Bewiesen: Manifest vorhanden, parsebar, `complete`; Contract-Snapshot-Hash
+stimmt; eingebetteter Contract == Snapshot; **jedes installierte Modul** und
+**jedes Runtime-Asset** hasht auf seinen Manifest-Eintrag; Manifest-Schema
+gültig, sofern ein vertrauenswürdiges Schema erreichbar war.
+
+Nicht bewiesen: Python-/Executable-Bindung, Plattform-, Protokoll- und
+Agent-Instruction-Identität, Release-Pfad- und Pointer-Prüfungen. Deshalb heißt
+das Feld `scope` und trägt den Schemastatus mit; `valid` ist **kein**
+`provenance_valid`.
 
 ### Bewusste Grenzen
 

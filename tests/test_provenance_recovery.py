@@ -60,6 +60,7 @@ def _load_provenance_recovery():
     operator._jobs_root = lambda: Path("/nonexistent-jobs-root")
     operator._start_job = lambda *args, **kwargs: {}
     operator._require_operator_capability = lambda capability: None
+    operator._argv_hash = lambda argv: "a" * 64
     base = types.ModuleType("grabowski_mcp")
     base.AUDIT_LOG = Path("/nonexistent-audit.jsonl")
     base._deployment_metadata = lambda: {}
@@ -74,6 +75,7 @@ def _load_provenance_recovery():
     recovery = types.ModuleType("grabowski_recovery")
     recovery.BACKUP_SUCCESS = Path("/nonexistent-backup-marker")
     recovery._fresh_text_marker = lambda path: {}
+    sys.modules.setdefault("grabowski_runtime_contract", __import__("grabowski_runtime_contract"))
     self_deploy = types.ModuleType("grabowski_self_deploy")
     self_deploy.ExpectedHead = str
     self_deploy.SourceRepository = str
@@ -256,7 +258,7 @@ class ProvenanceRecoveryGateTests(unittest.TestCase):
             "audit_chain_valid": {"audit": {"valid": False, "audit_writable": False}},
             "audit_writable": {"audit": {"valid": True, "audit_writable": False}},
             "kill_switch_clear": {"kill_switch": {"engaged": True}},
-            "local_backup_fresh": {"backup": {"valid": False}},
+            "local_backup_marker_fresh": {"backup": {"valid": False}},
             "privileged_broker_ready": {"broker": {"ready": False}},
             "source_identity_bound": {
                 "source_raises": RuntimeError("source repository is dirty")
@@ -390,17 +392,19 @@ class VolatileGateRecheckTests(unittest.TestCase):
 class TargetContractEvidenceTests(unittest.TestCase):
     """The repair target is judged before it is ever built."""
 
-    def test_current_repository_head_is_a_valid_repair_target(self) -> None:
-        repository = ROOT
-        head = provenance_recovery._git_bytes(
-            repository, "rev-parse", "HEAD"
-        )
-        self.assertIsNotNone(head)
-        evidence = provenance_recovery._target_contract_evidence(
-            repository, head.decode().strip()
-        )
+    def test_matching_schema_yields_a_decisive_verdict(self) -> None:
+        """When the target ships the trusted schema, this process can judge it."""
+        trusted = (SRC / "grabowski_runtime_contract.py").read_bytes()
+        contract = (ROOT / "config" / "runtime-entrypoint.json").read_bytes()
+        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+            git_bytes.side_effect = lambda repo, *args: (
+                contract if args[-1].endswith(".json") else trusted
+            )
+            evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
 
         self.assertIsNone(evidence["error"])
+        self.assertFalse(evidence["indeterminate"])
+        self.assertTrue(evidence["validator_matches_trusted_schema"])
         self.assertTrue(evidence["contract_valid"])
         self.assertTrue(evidence["validator_is_deployed"])
 
@@ -430,11 +434,11 @@ class TargetContractEvidenceTests(unittest.TestCase):
             evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
 
         self.assertFalse(evidence["contract_valid"])
-        self.assertIn("unusable", evidence["error"])
-        self.assertIn("validator exploded", evidence["error"])
+        self.assertTrue(evidence["indeterminate"])
+        self.assertFalse(evidence["executed_candidate_code"])
 
-    def test_validator_with_name_error_fails_closed(self) -> None:
-        """Syntactically valid but broken code raises NameError, not SyntaxError."""
+    def test_validator_with_name_error_is_never_evaluated(self) -> None:
+        """Broken candidate code is inert now: it is compared, not executed."""
         broken = b"CANONICAL_VALIDATOR_MODULE = undefined_name\n"
         with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
             git_bytes.side_effect = lambda repo, *args: (
@@ -443,43 +447,80 @@ class TargetContractEvidenceTests(unittest.TestCase):
             evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
 
         self.assertFalse(evidence["contract_valid"])
-        self.assertIn("unusable", evidence["error"])
+        self.assertTrue(evidence["indeterminate"])
+        self.assertFalse(evidence["executed_candidate_code"])
 
-    def test_candidate_code_never_runs_in_the_operator_process(self) -> None:
-        """Assessment must not execute the target revision in-process.
+    def test_no_candidate_code_is_executed_at_all(self) -> None:
+        """The read path must not run the target revision, in-process or out.
 
-        The read-only assess tool is reachable while a gate would still deny
-        recovery, so a candidate that writes files or mutates state on import
-        must not be able to do so merely by being assessed.
+        A subprocess was not enough: same UID, same filesystem, so a candidate
+        could still write files or spawn processes merely by being assessed.
+        The design now compares the candidate's schema with the trusted one and
+        judges with the trusted verifier, so a hostile payload is inert.
         """
-        # If this ran in-process it would terminate the interpreter outright,
-        # so reaching the assertions at all is the proof of isolation.
-        candidate = b"import os\nos._exit(9)\n"
+        import tempfile
 
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "escape"
+            hostile = (
+                f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')\n"
+                "CANONICAL_VALIDATOR_MODULE = 'grabowski_runtime_contract'\n"
+                "def contract_error(raw):\n    return None\n"
+            ).encode()
+            with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+                git_bytes.side_effect = lambda repo, *args: (
+                    b'{"module": "grabowski_runtime_contract"}'
+                    if args[-1].endswith(".json")
+                    else hostile
+                )
+                evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+            self.assertFalse(marker.exists(), "candidate code was executed")
+        self.assertFalse(evidence["executed_candidate_code"])
+        self.assertTrue(evidence["indeterminate"])
+        self.assertFalse(evidence["contract_valid"])
+
+    def test_differing_target_schema_is_indeterminate_not_rejected(self) -> None:
+        """A schema change is 'I cannot judge this', not 'this is broken'."""
         with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
             git_bytes.side_effect = lambda repo, *args: (
-                b"{}" if args[-1].endswith(".json") else candidate
+                b"{}" if args[-1].endswith(".json") else b"# a different schema\n"
             )
             evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
 
-        self.assertFalse(evidence["contract_valid"])
-        self.assertIn("unusable", evidence["error"])
-        # Nothing from the candidate leaked into this module's namespace either.
-        self.assertFalse(hasattr(provenance_recovery, "contract_error"))
+        self.assertTrue(evidence["indeterminate"])
+        self.assertFalse(evidence["validator_matches_trusted_schema"])
+        self.assertIn("different canonical contract schema", evidence["error"])
 
-    def test_isolated_verdict_survives_a_hostile_candidate(self) -> None:
-        """A candidate that exits, loops or prints garbage yields a safe verdict."""
-        cases = {
-            "sys.exit": b"import sys; sys.exit(3)\n",
-            "no output": b"pass\n",
-            "garbage output": b"print('not json')\n",
-        }
-        for label, candidate in cases.items():
-            with self.subTest(label):
-                verdict = provenance_recovery._isolated_contract_verdict(
-                    candidate, b"{}"
-                )
-                self.assertTrue(verdict.get("error"))
+    def test_canonical_validator_identity_is_not_taken_from_the_candidate(self) -> None:
+        """The artifact under review may not define what proves its own schema."""
+        source = (SRC / "grabowski_provenance_recovery.py").read_text(encoding="utf-8")
+
+        self.assertIn('CANONICAL_VALIDATOR_MODULE = "grabowski_runtime_contract"', source)
+        self.assertIn(
+            'CANONICAL_VALIDATOR_SOURCE = "src/grabowski_runtime_contract.py"', source
+        )
+        self.assertNotIn('namespace["CANONICAL_VALIDATOR_MODULE"]', source)
+
+    def test_contract_mapping_of_the_validator_module_is_pinned(self) -> None:
+        """Deploying the schema under a different path must be refused."""
+        import copy as _copy
+
+        contract = _copy.deepcopy(
+            json.loads((ROOT / "config" / "runtime-entrypoint.json").read_text())
+        )
+        for item in contract["supporting_sources"]:
+            if item["module"] == "grabowski_runtime_contract":
+                item["source"] = "src/grabowski_capabilities.py"
+        payload = json.dumps(contract).encode()
+        trusted = (SRC / "grabowski_runtime_contract.py").read_bytes()
+        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+            git_bytes.side_effect = lambda repo, *args: (
+                payload if args[-1].endswith(".json") else trusted
+            )
+            evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+        self.assertFalse(evidence["validator_is_deployed"])
 
     def test_invalid_target_contract_is_refused(self) -> None:
         """A target whose own schema rejects its own contract is not a repair."""
@@ -498,6 +539,118 @@ class TargetContractEvidenceTests(unittest.TestCase):
 
         self.assertFalse(evidence["contract_valid"])
         self.assertIn("target contract is invalid", evidence["error"])
+
+
+class DispatchOutcomeTests(unittest.TestCase):
+    """A started deployment must never be reported as not-having-happened."""
+
+    def test_bookkeeping_failure_after_start_does_not_raise(self) -> None:
+        """Post-dispatch failures become warnings, not a false 'it failed'."""
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        calls = {"n": 0}
+
+        def flaky_index_write(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] > 1:  # the post-start write
+                raise OSError("disk full")
+
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+            patch.object(
+                provenance_recovery,
+                "_volatile_gate_recheck",
+                return_value={"reasons": [], "checks": {}},
+            ),
+            patch.object(provenance_recovery.base, "_append_audit_with_digest",
+                         return_value="d" * 64),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(
+                provenance_recovery.self_deploy,
+                "_write_deploy_index",
+                side_effect=flaky_index_write,
+            ),
+            patch.object(
+                provenance_recovery.operator,
+                "_start_job",
+                return_value={"unit": "u", "argv_sha256": "b" * 64},
+            ),
+        ):
+            receipt = provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        self.assertEqual(receipt["job"]["unit"], "u")
+        self.assertTrue(receipt["post_dispatch_warnings"])
+        self.assertIn("bookkeeping", receipt["post_dispatch_warnings"][0])
+
+    def test_receipt_carries_a_deterministic_correlation_id(self) -> None:
+        """A caller that lost the response can correlate a retry with what ran."""
+        gate = {
+            "allowed": True,
+            "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        seen = []
+        for _ in range(2):
+            with (
+                patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+                patch.object(
+                    provenance_recovery,
+                    "_volatile_gate_recheck",
+                    return_value={"reasons": [], "checks": {}},
+                ),
+                patch.object(provenance_recovery.base, "_append_audit_with_digest",
+                             return_value="d" * 64),
+                patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+                patch.object(provenance_recovery.self_deploy, "_write_deploy_index"),
+                patch.object(
+                    provenance_recovery.operator,
+                    "_start_job",
+                    return_value={"unit": "u", "argv_sha256": "b" * 64},
+                ),
+            ):
+                seen.append(
+                    provenance_recovery.grabowski_recovery_provenance_repair(HEAD)[
+                        "repair_intent_id"
+                    ]
+                )
+
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(len(seen[0]), 64)
+
+
+class IntegrityStateTests(unittest.TestCase):
+    """Unknown integrity is not a repair warrant."""
+
+    def _state(self, metadata: dict) -> dict:
+        with patch.object(
+            provenance_recovery.base, "_deployment_metadata", return_value=metadata
+        ):
+            return provenance_recovery._integrity_evidence()
+
+    def test_explicit_false_is_invalid_and_warrants_repair(self) -> None:
+        state = self._state({k: True for k in provenance_recovery.REPAIRABLE_INTEGRITY_FLAGS}
+                            | {"provenance_valid": False})
+        self.assertEqual(state["integrity_state"], "invalid")
+        self.assertTrue(state["repair_warranted"])
+
+    def test_all_true_is_valid_and_warrants_nothing(self) -> None:
+        state = self._state({k: True for k in provenance_recovery.REPAIRABLE_INTEGRITY_FLAGS})
+        self.assertEqual(state["integrity_state"], "valid")
+        self.assertFalse(state["repair_warranted"])
+
+    def test_missing_flags_are_indeterminate_not_a_warrant(self) -> None:
+        """A failed metadata probe must not authorise a deployment."""
+        for metadata in ({}, {"provenance_valid": None}, {"provenance_valid": "unknown"}):
+            with self.subTest(repr(metadata)):
+                state = self._state(metadata)
+                self.assertEqual(state["integrity_state"], "indeterminate")
+                self.assertFalse(state["repair_warranted"])
+                self.assertTrue(state["indeterminate_integrity_flags"])
 
 
 class ToolSurfaceTests(unittest.TestCase):
