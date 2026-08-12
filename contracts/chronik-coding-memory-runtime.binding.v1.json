@@ -1,0 +1,8 @@
+{
+  "schema_version": "grabowski-chronik-coding-memory-runtime-binding.v1",
+  "producer_repository": "heimgewebe/chronik",
+  "producer_commit": "d8a097dd9356d840cc277d4a61a4749d9d48c9d1",
+  "producer_path": "tools/coding_memory.runtime.v1.json",
+  "producer_git_blob_sha": "dbdc280b4ff9827ac5e27b7335cbf371c4d147b5",
+  "producer_sha256": "6f20db59014ab045a98e7fb9c3dc51961a494b1a792ff6dc89960d1218a91392"
+}
