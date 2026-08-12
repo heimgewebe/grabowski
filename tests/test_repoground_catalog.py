@@ -238,6 +238,86 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
             {item["reason"] for item in resolved["rejected"]},
         )
 
+    def test_canonical_revision_bound_provenance_requires_exact_commit(self) -> None:
+        commit = "a" * 40
+        self.write_canonical(
+            run_dir="20260718T120000Z-revision",
+            created_at="2026-07-18T12:00:00Z",
+            commit=commit,
+            provenance_name=f"heimgewebe__demo__main--{commit}",
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertTrue(resolved["available"])
+        provenance = resolved["selected"][0]["source_provenance"]
+        self.assertEqual(commit, provenance["git_commit"])
+        self.assertEqual(
+            f"heimgewebe__demo__main--{commit}",
+            provenance["repository"]["name"],
+        )
+
+    def test_canonical_revision_bound_recovery_provenance_is_accepted(self) -> None:
+        commit = "a" * 40
+        self.write_canonical(
+            run_dir="20260718T120000Z-recovery",
+            created_at="2026-07-18T12:00:00Z",
+            commit=commit,
+            provenance_name=(
+                f"heimgewebe__demo__main--{commit}--recovery-012345abcdef"
+            ),
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertTrue(resolved["available"])
+
+    def test_canonical_revision_bound_provenance_rejects_commit_mismatch(self) -> None:
+        self.write_canonical(
+            run_dir="20260718T120000Z-mismatch",
+            created_at="2026-07-18T12:00:00Z",
+            commit="a" * 40,
+            provenance_name=f"heimgewebe__demo__main--{'b' * 40}",
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertFalse(resolved["available"])
+        self.assertIn(
+            "snapshot_repository_source_revision_mismatch",
+            {item["reason"] for item in resolved["rejected"]},
+        )
+
+    def test_retired_lenskit_lane_cannot_win_active_resolution(self) -> None:
+        _repoground_manifest, repoground_stem = self.write_canonical(
+            repo="repoground",
+            run_dir="20260718T120000Z-repoground",
+            created_at="2026-07-18T12:00:00Z",
+        )
+        _lenskit_manifest, lenskit_stem = self.write_canonical(
+            repo="lenskit",
+            run_dir="20260718T130000Z-lenskit",
+            created_at="2026-07-18T13:00:00Z",
+        )
+
+        qualified = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="heimgewebe/lenskit"
+        )
+        simple = catalog.resolve_catalog(self.canonical, self.legacy, repo="lenskit")
+        fleet = catalog.resolve_catalog(self.canonical, self.legacy)
+        historical = catalog.inspect_stem(self.canonical, self.legacy, lenskit_stem)
+
+        self.assertEqual(
+            repoground_stem, qualified["selected"][0]["stem"]
+        )
+        self.assertEqual(repoground_stem, simple["selected"][0]["stem"])
+        self.assertNotIn(
+            "heimgewebe__lenskit",
+            {item.get("repo_id") for item in fleet["selected"]},
+        )
+        self.assertTrue(historical["available"])
+        self.assertTrue(historical["healthy"])
+
     def test_canonical_output_health_requires_matching_run_id(self) -> None:
         self.write_canonical(
             run_dir="20260718T120000Z-no-output-run",
