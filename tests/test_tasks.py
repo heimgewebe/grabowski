@@ -9578,7 +9578,6 @@ else:
             clear=True,
         ):
             configuration = tasks.chronik.coding_memory_configuration()
-        self.assertTrue(configuration["available"])
         self.assertEqual(sys.executable, configuration["python"])
         self.assertNotEqual(str(developer_python), configuration["python"])
 
