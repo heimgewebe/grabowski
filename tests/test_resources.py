@@ -627,6 +627,49 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(1, resources.count_resources())
         self.assertEqual(2, resources.count_resources(include_expired=True))
 
+    def test_current_readers_share_expiry_boundary_and_preserve_history(self) -> None:
+        key = "component:lease-liveness-boundary"
+        with patch.object(resources, "_now", return_value=100):
+            acquired = resources.acquire_resources(
+                "owner-a", [key], purpose="boundary", ttl_seconds=30
+            )
+        lease = acquired["leases"][0]
+        self.assertEqual(lease["expires_at_unix"], 130)
+
+        with patch.object(resources, "_now", return_value=129):
+            self.assertEqual(resources.inspect_resource(key), lease)
+            self.assertEqual(resources.list_resources(), [lease])
+            self.assertEqual(resources.count_resources(), 1)
+
+        with patch.object(resources, "_now", return_value=130):
+            self.assertIsNone(resources.inspect_resource(key))
+            self.assertEqual(resources.list_resources(), [])
+            self.assertEqual(resources.count_resources(), 0)
+            self.assertEqual(resources.list_resources(include_expired=True), [lease])
+            self.assertEqual(resources.count_resources(include_expired=True), 1)
+            with patch.object(resources.operator, "_require_operator_capability"):
+                public = resources.grabowski_resource_inspect(key)
+            self.assertEqual(public, {"resource_key": key, "lease": None})
+
+    def test_malformed_expiry_never_grants_current_authority(self) -> None:
+        key = "component:lease-liveness-malformed"
+        with patch.object(resources, "_now", return_value=100):
+            resources.acquire_resources(
+                "owner-a", [key], purpose="malformed fixture", ttl_seconds=30
+            )
+        with resources._database() as connection:
+            connection.execute(
+                "UPDATE leases SET expires_at_unix=? WHERE resource_key=?",
+                ("not-a-timestamp", key),
+            )
+            connection.commit()
+
+        with patch.object(resources, "_now", return_value=110):
+            self.assertIsNone(resources.inspect_resource(key))
+            self.assertEqual(resources.list_resources(), [])
+            self.assertEqual(resources.count_resources(), 0)
+        self.assertEqual(resources.count_resources(include_expired=True), 1)
+
     def test_atomic_conflict_does_not_partially_acquire(self) -> None:
         resources.acquire_resources(
             "owner-a", ["port:9222"], purpose="browser", ttl_seconds=60
@@ -2191,7 +2234,8 @@ class ResourceTests(unittest.TestCase):
                     ttl_seconds=60,
                     metadata={"scope": "different"},
                 )
-        self.assertEqual(resources.inspect_resource(key), second["leases"][0])
+        with patch.object(resources, "_now", return_value=120):
+            self.assertEqual(resources.inspect_resource(key), second["leases"][0])
 
     def test_same_owner_rebind_restores_journaled_identity_after_expiry(self) -> None:
         key = "component:bureau-resume-rebind"
@@ -2416,7 +2460,8 @@ class ResourceTests(unittest.TestCase):
             resources.release_resources(
                 "owner-a", [key], expected_leases=stale_snapshot
             )
-        self.assertEqual(resources.inspect_resource(key), second["leases"][0])
+        with patch.object(resources, "_now", return_value=210):
+            self.assertEqual(resources.inspect_resource(key), second["leases"][0])
         current_snapshot = [
             {field: second["leases"][0][field] for field in resources.LEASE_SNAPSHOT_KEYS}
         ]

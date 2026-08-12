@@ -1233,6 +1233,22 @@ def _source_lease_evidence(
         return {"resource_key": resource_key, "lease": None}
     if not isinstance(lease, dict):
         raise RuntimeError("source repository lease readback is malformed")
+
+    # Inspect is already current-state only, but deployment rechecks expiry at
+    # the effect boundary so a just-expired or malformed snapshot cannot grant
+    # authority.  Invalid expiry is evidence of no live authority, not a lease.
+    now_unix = int(time.time())
+    expires_at_unix = lease.get("expires_at_unix")
+    lease_is_live = (
+        isinstance(expires_at_unix, int)
+        and not isinstance(expires_at_unix, bool)
+        and expires_at_unix > now_unix
+    )
+    if not lease_is_live:
+        if expected_owner is not None:
+            raise RuntimeError("expected source repository lease is absent or expired")
+        return {"resource_key": resource_key, "lease": None}
+
     owner = lease.get("owner_id")
     if expected_owner is None:
         raise RuntimeError(f"source repository has an active lease: {owner}")

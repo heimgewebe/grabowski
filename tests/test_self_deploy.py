@@ -305,6 +305,104 @@ class SelfDeployToolTests(unittest.TestCase):
             self.assertEqual(identity["head"], expected)
             self.assertEqual(identity["lease_evidence"]["lease"], None)
 
+    def test_canonical_preflight_ignores_expired_foreign_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary).resolve()
+            (repo / ".git").mkdir()
+            runner = repo / "tools" / "run_scheduled_deploy.py"
+            runner.parent.mkdir()
+            runner.write_text("pass\n", encoding="utf-8")
+            expected = "a" * 40
+            lease = {
+                "resource_key": f"path:{repo}",
+                "owner_id": "foreign-owner",
+                "acquired_at_unix": 10,
+                "updated_at_unix": 11,
+                "expires_at_unix": 50,
+                "metadata_sha256": "a" * 64,
+            }
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", repo), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(".git"),
+                    _result(expected),
+                    _result("main"),
+                    _result(expected),
+                    _result(""),
+                ],
+            ), patch.object(SELF_DEPLOY.time, "time", return_value=50), patch.object(
+                SELF_DEPLOY,
+                "_resource_inspect",
+                return_value={"resource_key": f"path:{repo}", "lease": lease},
+            ):
+                resolved, _runner, identity = SELF_DEPLOY._deployment_source_preflight(
+                    expected, None, None
+                )
+            self.assertEqual(resolved, repo)
+            self.assertIsNone(identity["lease_evidence"]["lease"])
+
+    def test_detached_preflight_rejects_expired_expected_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            canonical = root / "canonical"
+            source = root / "source"
+            canonical.mkdir()
+            source.mkdir()
+            common = canonical / ".git"
+            common.mkdir()
+            runner = source / "tools" / "run_scheduled_deploy.py"
+            runner.parent.mkdir()
+            runner.write_text("pass\n", encoding="utf-8")
+            expected = "b" * 40
+            lease = {
+                "resource_key": f"path:{source}",
+                "owner_id": "task:deploy-source",
+                "acquired_at_unix": 10,
+                "updated_at_unix": 11,
+                "expires_at_unix": 50,
+                "metadata_sha256": "a" * 64,
+            }
+            with patch.object(SELF_DEPLOY, "CANONICAL_REPOSITORY", canonical), patch.object(
+                SELF_DEPLOY,
+                "_git_result",
+                side_effect=[
+                    _result(str(common)),
+                    _result(str(common)),
+                    _result(expected),
+                    _result("HEAD"),
+                    _result(expected),
+                    _result(""),
+                ],
+            ), patch.object(SELF_DEPLOY.time, "time", return_value=50), patch.object(
+                SELF_DEPLOY,
+                "_resource_inspect",
+                return_value={"resource_key": f"path:{source}", "lease": lease},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "absent or expired"):
+                    SELF_DEPLOY._deployment_source_preflight(
+                        expected, str(source), "task:deploy-source"
+                    )
+
+    def test_source_lease_malformed_expiry_fails_closed(self) -> None:
+        repo = Path("/home/alex/repos/.grabowski-worktrees/deploy-malformed")
+        lease = {
+            "resource_key": f"path:{repo}",
+            "owner_id": "task:deploy-source",
+            "acquired_at_unix": 10,
+            "updated_at_unix": 11,
+            "expires_at_unix": "invalid",
+            "metadata_sha256": "a" * 64,
+        }
+        payload = {"resource_key": f"path:{repo}", "lease": lease}
+        with patch.object(SELF_DEPLOY, "_resource_inspect", return_value=payload):
+            self.assertEqual(
+                SELF_DEPLOY._source_lease_evidence(repo, None),
+                {"resource_key": f"path:{repo}", "lease": None},
+            )
+            with self.assertRaisesRegex(RuntimeError, "absent or expired"):
+                SELF_DEPLOY._source_lease_evidence(repo, "task:deploy-source")
+
     def test_preflight_rejects_dirty_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repo = Path(temporary).resolve()
@@ -380,6 +478,8 @@ class SelfDeployToolTests(unittest.TestCase):
                     _result(expected),
                     _result(""),
                 ],
+            ), patch.object(
+                SELF_DEPLOY.time, "time", return_value=50
             ), patch.object(
                 SELF_DEPLOY,
                 "_resource_inspect",
@@ -490,7 +590,9 @@ class SelfDeployToolTests(unittest.TestCase):
             "metadata_sha256": "a" * 64,
         }
         payload = {"resource_key": f"path:{repo}", "lease": lease}
-        with patch.object(SELF_DEPLOY, "_resource_inspect", return_value=payload):
+        with patch.object(SELF_DEPLOY.time, "time", return_value=50), patch.object(
+            SELF_DEPLOY, "_resource_inspect", return_value=payload
+        ):
             with self.assertRaisesRegex(RuntimeError, "active lease"):
                 SELF_DEPLOY._source_lease_evidence(repo, None)
             with self.assertRaisesRegex(RuntimeError, "owner drift"):
