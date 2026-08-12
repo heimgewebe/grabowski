@@ -163,6 +163,15 @@ def _now() -> int:
     return int(time.time())
 
 
+def _is_live_lease(*, expires_at_unix: Any, now_unix: int) -> bool:
+    """Return whether one persisted lease grants authority at one clock snapshot."""
+    return (
+        isinstance(expires_at_unix, int)
+        and not isinstance(expires_at_unix, bool)
+        and expires_at_unix > now_unix
+    )
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -5223,11 +5232,16 @@ def release_resources(
 
 def inspect_resource(resource_key: str) -> dict[str, Any] | None:
     key = normalize_resource_key(resource_key)
+    now = _now()
     with _database() as connection:
         row = connection.execute(
             "SELECT * FROM leases WHERE resource_key=?", (key,)
         ).fetchone()
-    return None if row is None else _public(row)
+    if row is None or not _is_live_lease(
+        expires_at_unix=row["expires_at_unix"], now_unix=now
+    ):
+        return None
+    return _public(row)
 
 
 def count_resources(
@@ -5241,8 +5255,9 @@ def count_resources(
         clauses.append("owner_id=?")
         parameters.append(_owner(owner_id))
     if not include_expired:
-        clauses.append("expires_at_unix>?")
-        parameters.append(_now())
+        now = _now()
+        clauses.append("typeof(expires_at_unix)='integer' AND expires_at_unix>?")
+        parameters.append(now)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     with _database() as connection:
         row = connection.execute(
@@ -5266,8 +5281,9 @@ def list_resources(
         clauses.append("owner_id=?")
         parameters.append(_owner(owner_id))
     if not include_expired:
-        clauses.append("expires_at_unix>?")
-        parameters.append(_now())
+        now = _now()
+        clauses.append("typeof(expires_at_unix)='integer' AND expires_at_unix>?")
+        parameters.append(now)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     parameters.append(limit)
     with _database() as connection:
