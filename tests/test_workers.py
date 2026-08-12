@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -1787,6 +1788,294 @@ globalThis.fetch = async () => ({
             reconciled = workers.worker_status(worker["worker_id"], expected_kind="browser")
         self.assertEqual(reconciled["state"], "stopped")
         self.assertEqual(workers.worker_list("browser", limit=10)["count"], 0)
+
+    def _running_observation(self) -> dict[str, object]:
+        return {
+            "state": "running",
+            "properties": {},
+            "probe": result(),
+            "observed_at_unix": 1,
+        }
+
+    def _semantic_state_payload(
+        self,
+        *,
+        origin: str = "http://device.home.arpa",
+        ready_state: str = "complete",
+        title: str = "Example Domain",
+        main_frame_id: str = "frame-1",
+        loader_id: str = "loader-1",
+    ) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "result_code": "ok",
+            "state": {
+                "origin": origin,
+                "ready_state": ready_state,
+                "title": title,
+                "main_frame_id": main_frame_id,
+                "loader_id": loader_id,
+            },
+        }
+
+    def test_browser_semantic_snapshot_id_is_deterministic_and_state_bound(self) -> None:
+        state = workers._bounded_browser_state(
+            {
+                "origin": "http://device.home.arpa",
+                "ready_state": "complete",
+                "title": "Example",
+                "main_frame_id": "frame-1",
+                "loader_id": "loader-1",
+            }
+        )
+        first = workers._browser_snapshot_id("worker-a", state)
+        second = workers._browser_snapshot_id("worker-a", state)
+        self.assertEqual(first, second)
+        self.assertTrue(workers._is_browser_snapshot_id(first))
+        self.assertTrue(first.startswith(workers.BROWSER_SNAPSHOT_ID_PREFIX))
+
+        reloaded_state = {**state, "loader_id": "loader-2"}
+        self.assertNotEqual(first, workers._browser_snapshot_id("worker-a", reloaded_state))
+        self.assertNotEqual(first, workers._browser_snapshot_id("worker-b", state))
+
+    def test_browser_semantic_observe_projects_state_without_cdp_terms(self) -> None:
+        worker = self._running_browser(port=9360)
+        payload = self._semantic_state_payload()
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(workers, "_update") as update, patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run:
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        self.assertEqual(observation["schema_version"], 1)
+        self.assertEqual(observation["worker_id"], worker["worker_id"])
+        self.assertTrue(workers._is_browser_snapshot_id(observation["snapshot_id"]))
+        self.assertEqual(observation["origin"], "http://device.home.arpa")
+        self.assertEqual(observation["ready_state"], "complete")
+        self.assertNotIn("main_frame_id", observation)
+        self.assertNotIn("loader_id", observation)
+        rendered = json.dumps(observation)
+        for cdp_term in (
+            "Runtime.evaluate",
+            "Page.getFrameTree",
+            "Page.navigate",
+            "Input.dispatch",
+        ):
+            self.assertNotIn(cdp_term, rendered)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+        update.assert_not_called()
+
+    def test_browser_semantic_act_rejects_stale_snapshot_before_effect(self) -> None:
+        worker = self._running_browser(port=9361)
+        initial_payload = self._semantic_state_payload(title="Before")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=initial_payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        stale_snapshot_id = observation["snapshot_id"]
+
+        changed_payload = self._semantic_state_payload(title="After navigation")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=changed_payload
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                stale_snapshot_id,
+                "scroll_into_view",
+                selector="#target",
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "stale_snapshot")
+        self.assertIsNone(outcome["post_action_snapshot_id"])
+        self.assertEqual(outcome["requested_snapshot_id"], stale_snapshot_id)
+        # The re-observation happens, but the effect must never be attempted.
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
+    def test_browser_semantic_act_local_ui_scroll_produces_post_observation(self) -> None:
+        worker = self._running_browser(port=9362)
+        pre_payload = self._semantic_state_payload(title="Steady")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=pre_payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        snapshot_id = observation["snapshot_id"]
+
+        post_payload = self._semantic_state_payload(title="Steady, scrolled")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[pre_payload, post_payload],
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"], snapshot_id, "scroll_into_view", selector="#target"
+            )
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "ok")
+        self.assertEqual(outcome["effect_class"], "local_ui")
+        self.assertEqual(outcome["pre_action_snapshot_id"], snapshot_id)
+        self.assertTrue(workers._is_browser_snapshot_id(outcome["post_action_snapshot_id"]))
+        self.assertNotEqual(outcome["pre_action_snapshot_id"], outcome["post_action_snapshot_id"])
+        self.assertIn("credential_handling_safety", outcome["does_not_establish"])
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[1]["op"], "read_state")
+        self.assertEqual(run.call_args_list[1].args[1]["op"], "scroll_into_view")
+        self.assertEqual(run.call_args_list[1].args[1]["selector"], "#target")
+        self.assertEqual(
+            run.call_args_list[1].args[1]["expected_state"],
+            workers._bounded_browser_state(pre_payload["state"]),
+        )
+
+    def test_browser_semantic_act_maps_adapter_stale_guard_before_local_ui_effect(self) -> None:
+        worker = self._running_browser(port=9367)
+        pre_payload = self._semantic_state_payload(title="Steady")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=pre_payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        stale_guard_payload = {
+            "schema_version": 1,
+            "ok": False,
+            "result_code": "stale-snapshot",
+            "state": pre_payload["state"],
+        }
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers,
+            "_run_node_browser_semantic",
+            side_effect=[pre_payload, stale_guard_payload],
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"],
+                observation["snapshot_id"],
+                "scroll_into_view",
+                selector="#target",
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "stale_snapshot")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[1].args[1]["expected_state"],
+            workers._bounded_browser_state(pre_payload["state"]),
+        )
+
+    def test_browser_semantic_node_stale_guard_throws_before_local_ui_effect(self) -> None:
+        source = workers.BROWSER_SEMANTIC_NODE_SOURCE
+        guard = "throw new Error('stale-snapshot');"
+        effect = "element.scrollIntoView"
+        self.assertIn(guard, source)
+        self.assertIn(effect, source)
+        self.assertLess(source.index(guard), source.index(effect))
+        self.assertNotIn("result_code: 'stale-snapshot', state: before", source)
+
+    def test_browser_semantic_act_read_state_performs_no_separate_effect_call(self) -> None:
+        worker = self._running_browser(port=9363)
+        payload = self._semantic_state_payload(title="Read only")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        snapshot_id = observation["snapshot_id"]
+
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run:
+            outcome = workers.browser_semantic_act(worker["worker_id"], snapshot_id, "read_state")
+        self.assertTrue(outcome["ok"])
+        self.assertEqual(outcome["effect_class"], "read")
+        self.assertEqual(outcome["post_action_snapshot_id"], snapshot_id)
+        run.assert_called_once()
+
+    def test_browser_semantic_act_rejects_unsupported_action_kind(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported browser action kind"):
+            workers.browser_semantic_act(
+                "0" * 20, workers.BROWSER_SNAPSHOT_ID_PREFIX + "a" * 64, "navigate"
+            )
+
+    def test_browser_semantic_act_fails_closed_for_unimplemented_effect_classes(self) -> None:
+        worker = self._running_browser(port=9365)
+        payload = self._semantic_state_payload(title="Unimplemented")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            observation = workers.browser_semantic_observe(worker["worker_id"])
+        snapshot_id = observation["snapshot_id"]
+
+        fake_catalog = dict(workers.BROWSER_ACTION_CATALOG)
+        fake_catalog["submit_generic"] = {
+            "effect_class": "external_mutation",
+            "requires_selector": False,
+        }
+        with patch.object(workers, "BROWSER_ACTION_CATALOG", fake_catalog), patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ) as run:
+            outcome = workers.browser_semantic_act(
+                worker["worker_id"], snapshot_id, "submit_generic"
+            )
+        self.assertFalse(outcome["ok"])
+        self.assertEqual(outcome["result_code"], "effect_not_implemented")
+        # Only the mandatory re-observation happens; the unimplemented effect never runs.
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[1]["op"], "read_state")
+
+    def test_browser_semantic_contract_does_not_change_stored_form_action_safety(self) -> None:
+        worker = self._running_browser(port=9366)
+        payload = self._semantic_state_payload(title="Unrelated")
+        with patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(
+            workers, "_run_node_browser_semantic", return_value=payload
+        ):
+            workers.browser_semantic_observe(worker["worker_id"])
+
+        with patch.object(
+            workers,
+            "_canonical_local_origin",
+            return_value=("http://device.home.arpa", "b" * 64, ["192.168.1.1"]),
+        ), patch.object(
+            workers, "_observe", return_value=self._running_observation()
+        ), patch.object(workers, "_run_node_form_action") as action:
+            with self.assertRaisesRegex(PermissionError, "confirmation mismatch"):
+                workers.browser_stored_form_action(
+                    worker["worker_id"],
+                    expected_origin="http://device.home.arpa",
+                    identity_selector="#identity",
+                    protected_selector="#protected",
+                    submit_selector="button",
+                    confirmation="wrong",
+                )
+        action.assert_not_called()
+
+        public_answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 80))]
+        with patch.object(workers.socket, "getaddrinfo", return_value=public_answer):
+            with self.assertRaisesRegex(PermissionError, "outside local"):
+                workers._canonical_local_origin("http://example.invalid")
+
+        signature = inspect.signature(workers.browser_stored_form_action)
+        self.assertIn("confirmation", signature.parameters)
+        self.assertNotIn("snapshot_id", signature.parameters)
+        self.assertEqual(len(workers.BROWSER_FORM_RESULT_CODES), 13)
 
     def test_worker_list_cursor_is_bound_to_kind_and_view(self) -> None:
         with self.assertRaisesRegex(ValueError, "bound to another worker view"):
