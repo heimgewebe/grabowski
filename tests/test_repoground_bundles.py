@@ -639,7 +639,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(result["live_repo"]["head"], source_head)
         self.assertFalse(result["live_repo"]["dirty"])
 
-    def test_retired_lenskit_tool_query_resolves_to_repoground(self) -> None:
+    def test_retired_lenskit_qualified_query_resolves_to_repoground(self) -> None:
         self._write_canonical_bundle("repoground")
         self._write_canonical_bundle(
             "lenskit", run_id="20260718T130000Z-retired-lenskit"
@@ -650,9 +650,9 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         fleet = mcp.repoground_bundle_discover()
 
         self.assertEqual(qualified["repo_filter"], "heimgewebe/repoground")
-        self.assertEqual(simple["repo_filter"], "repoground")
+        self.assertEqual(simple["repo_filter"], "lenskit")
         self.assertEqual(qualified["candidates"][0]["repo_id"], "heimgewebe__repoground")
-        self.assertEqual(simple["candidates"][0]["repo_id"], "heimgewebe__repoground")
+        self.assertEqual(simple["candidate_count"], 0)
         self.assertNotIn(
             "heimgewebe__lenskit",
             {candidate.get("repo_id") for candidate in fleet["candidates"]},

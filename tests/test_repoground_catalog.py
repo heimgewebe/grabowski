@@ -76,6 +76,7 @@ class CatalogFixture(unittest.TestCase):
         bundle_status: str = "pass",
         malformed: bool = False,
         provenance_name: str | None = None,
+        provenance_extra: dict[str, object] | None = None,
         include_output_run_id: bool = True,
     ) -> tuple[Path, str]:
         repo_id = f"{owner}__{repo}"
@@ -95,6 +96,7 @@ class CatalogFixture(unittest.TestCase):
                         "snapshot_provenance": {
                             "repositories": [
                                 {
+                                    **(provenance_extra or {}),
                                     "name": provenance_name or f"{repo_id}__{ref}",
                                     "git_commit": commit,
                                     "git_dirty": dirty,
@@ -310,13 +312,77 @@ class RepoGroundCatalogResolverTests(CatalogFixture):
         self.assertEqual(
             repoground_stem, qualified["selected"][0]["stem"]
         )
-        self.assertEqual(repoground_stem, simple["selected"][0]["stem"])
+        self.assertFalse(simple["available"])
+        self.assertEqual("publication_unavailable", simple["reason"])
         self.assertNotIn(
             "heimgewebe__lenskit",
             {item.get("repo_id") for item in fleet["selected"]},
         )
         self.assertTrue(historical["available"])
         self.assertTrue(historical["healthy"])
+
+    def test_revision_bound_name_cannot_be_bypassed_by_generic_repo_id(self) -> None:
+        self.write_canonical(
+            run_dir="20260718T120000Z-generic-bypass",
+            created_at="2026-07-18T12:00:00Z",
+            commit="a" * 40,
+            provenance_name=f"heimgewebe__demo__main--{'b' * 40}",
+            provenance_extra={"repo_id": "heimgewebe__demo"},
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertFalse(resolved["available"])
+        self.assertIn(
+            "snapshot_repository_source_revision_mismatch",
+            {item["reason"] for item in resolved["rejected"]},
+        )
+
+    def test_all_revision_bound_names_on_selected_entry_must_agree(self) -> None:
+        commit = "a" * 40
+        self.write_canonical(
+            run_dir="20260718T120000Z-multi-revision",
+            created_at="2026-07-18T12:00:00Z",
+            commit=commit,
+            provenance_name=f"heimgewebe__demo__main--{commit}",
+            provenance_extra={
+                "repository": f"heimgewebe__demo__main--{'b' * 40}"
+            },
+        )
+
+        resolved = catalog.resolve_catalog(self.canonical, self.legacy, repo="demo")
+
+        self.assertFalse(resolved["available"])
+        self.assertIn(
+            "snapshot_repository_source_revision_mismatch",
+            {item["reason"] for item in resolved["rejected"]},
+        )
+
+    def test_bare_lenskit_does_not_hijack_another_owner(self) -> None:
+        self.write_canonical(
+            repo="repoground",
+            run_dir="20260718T120000Z-repoground",
+            created_at="2026-07-18T12:00:00Z",
+        )
+        self.write_canonical(
+            repo="lenskit",
+            run_dir="20260718T130000Z-retired",
+            created_at="2026-07-18T13:00:00Z",
+        )
+        self.write_canonical(
+            owner="alice",
+            repo="lenskit",
+            run_dir="20260718T140000Z-alice",
+            created_at="2026-07-18T14:00:00Z",
+        )
+
+        bare = catalog.resolve_catalog(self.canonical, self.legacy, repo="lenskit")
+        retired = catalog.resolve_catalog(
+            self.canonical, self.legacy, repo="heimgewebe/lenskit"
+        )
+
+        self.assertEqual("alice__lenskit", bare["selected"][0]["repo_id"])
+        self.assertEqual("heimgewebe__repoground", retired["selected"][0]["repo_id"])
 
     def test_canonical_output_health_requires_matching_run_id(self) -> None:
         self.write_canonical(

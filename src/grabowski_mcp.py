@@ -7030,7 +7030,7 @@ def _repoground_validate_repo(repo: str | None) -> str | None:
         )
     if "__" in repo:
         return repoground_catalog.RETIRED_CANONICAL_REPOSITORY_ALIASES.get(repo, repo)
-    return repoground_catalog.RETIRED_SIMPLE_REPOSITORY_ALIASES.get(repo, repo)
+    return repo
 
 
 def _repoground_validate_stem(stem: str) -> str:

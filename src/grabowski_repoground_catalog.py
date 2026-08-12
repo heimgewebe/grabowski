@@ -23,9 +23,7 @@ SOURCE_RECOVERY_SUFFIX_RE = re.compile(r"([0-9a-fA-F]{40})(?:--recovery-[0-9a-f]
 RETIRED_CANONICAL_REPOSITORY_ALIASES = {
     "heimgewebe__lenskit": "heimgewebe__repoground",
 }
-RETIRED_SIMPLE_REPOSITORY_ALIASES = {
-    "lenskit": "repoground",
-}
+RETIRED_LEGACY_SIMPLE_REPOSITORIES = {"lenskit"}
 
 
 class CatalogError(ValueError):
@@ -276,6 +274,7 @@ def _source_provenance(
     selected: dict[str, Any] | None = None
     revision_mismatch = False
     revision_commit_invalid = False
+    revision_source_invalid = False
     for item in repositories:
         if not isinstance(item, dict):
             continue
@@ -289,26 +288,31 @@ def _source_provenance(
             )
             if isinstance(value, str)
         }
+        if strict:
+            revision_prefix = f"{info['repo_id']}__{info['ref']}--"
+            revision_names = [name for name in names if name.startswith(revision_prefix)]
+            if revision_names:
+                commit = item.get("git_commit") or item.get("commit") or item.get("head")
+                if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
+                    revision_commit_invalid = True
+                    continue
+                embedded_commits = [
+                    _revision_bound_source_commit(name, info) for name in revision_names
+                ]
+                if any(embedded is None for embedded in embedded_commits):
+                    revision_source_invalid = True
+                    continue
+                if any(embedded != commit.lower() for embedded in embedded_commits):
+                    revision_mismatch = True
+                    continue
+                selected = item
+                break
         if names.intersection(expected):
             selected = item
             break
-        if not strict:
-            continue
-        revision_names = [
-            (name, _revision_bound_source_commit(name, info)) for name in names
-        ]
-        revision_names = [row for row in revision_names if row[1] is not None]
-        if not revision_names:
-            continue
-        commit = item.get("git_commit") or item.get("commit") or item.get("head")
-        if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
-            revision_commit_invalid = True
-            continue
-        if any(embedded == commit.lower() for _name, embedded in revision_names):
-            selected = item
-            break
-        revision_mismatch = True
     if selected is None:
+        if revision_source_invalid:
+            return unavailable("snapshot_repository_source_revision_invalid")
         if revision_commit_invalid:
             return unavailable("snapshot_repository_commit_absent")
         if revision_mismatch:
@@ -508,7 +512,7 @@ def _normalize_repo_query(repo: str | None) -> str | None:
         raise ValueError(
             "repo must be a safe repository name, owner__repository, or owner/repository identity"
         )
-    return RETIRED_SIMPLE_REPOSITORY_ALIASES.get(safe, safe)
+    return safe
 
 
 def _normalize_refs(
@@ -616,7 +620,7 @@ def _catalog_paths(
             paths.extend(
                 path
                 for path in legacy_candidates
-                if _repo_from_stem(_stem(path)) not in RETIRED_SIMPLE_REPOSITORY_ALIASES
+                if _repo_from_stem(_stem(path)) not in RETIRED_LEGACY_SIMPLE_REPOSITORIES
             )
 
     scoped: list[Path] = []
