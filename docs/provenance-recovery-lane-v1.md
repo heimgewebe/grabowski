@@ -132,28 +132,37 @@ führte es aus — erst in-process, dann in einem Subprozess. Beides war falsch:
   Belegt: ein Candidate-Validator hat während `assess` eine Datei auf dem Host
   geschrieben.
 
-Heute gilt: Das Schema des Ziel-Commits wird **byteweise mit dem vertrauten
-Schema dieses Prozesses verglichen** und nie ausgeführt.
+Heute gilt: Das Schema des Ziel-Commits wird **byteweise mit einem unabhängig
+provisionierten root-eigenen Trust-Anchor** unter
+`/etc/grabowski/runtime-contract-schema.py` verglichen und nie ausgeführt.
+Zusätzlich muss der Validator, den der laufende Prozess bereits geladen hat,
+bytegleich zu diesem Anchor sein. Erst dann dürfen dessen schon geladenen
+Validatorfunktionen das Ziel-JSON beurteilen.
 
-* identisch → das Urteil dieses Prozesses *ist* das Urteil des Ziels;
-* verschieden → `indeterminate`. Ehrliche Antwort: „das kann ich nicht
-  beurteilen“. Eine Schemaänderung gehört über den normalen Review- und
-  Deploy-Pfad, nicht dadurch entschieden, dass man den Kandidaten ausführt.
+* Ziel == Anchor == laufender Validator → der Prozess besitzt einen unabhängig
+  gebundenen Prüfer und darf urteilen;
+* irgendeine Abweichung → `indeterminate`. Ehrliche Antwort: „das kann ich nicht
+  beurteilen“. Eine Schemaänderung wird zuerst über den exakten commitgebundenen
+  Rootbroker-Cutover im Anchor verankert und erst danach normal deployt.
 
-Dieselbe Regel gilt im Watchdog. Er lud früher das Schema aus der zu prüfenden
-Release. Gemessen: ein Schema mit `os._exit` hat den Watchdog **beendet** (der
-Integritäts-Exitcode 5 kam nie), eines mit Endlosschleife hat ihn **dauerhaft
-aufgehängt**. `except Exception` fängt beides nicht. Der Watchdog rechnet jetzt
-nur noch über Daten (JSON-Struktur, Byte-Gleichheit, SHA-256) und lädt das
-Schema — falls verfügbar — aus einem **vertrauenswürdigen Pfad außerhalb der
-Release**.
+Dieselbe Autoritätsgrenze gilt im Watchdog. Er lud früher das Schema aus der zu
+prüfenden Release. Gemessen: ein Schema mit `os._exit` hat den Watchdog
+**beendet** (der Integritäts-Exitcode 5 kam nie), eines mit Endlosschleife hat
+ihn **dauerhaft aufgehängt**. Der Watchdog führt deshalb niemals Code aus dem
+Candidate oder aus der geprüften Release aus. Er hasht deren Artefakte als Daten
+und führt zur Schemaauswertung ausschließlich den zuvor mechanisch als
+root-eigen, Single-Link und nicht fremdbeschreibbar geprüften Anchor aus. Fehlt
+diese unabhängige Autorität oder weicht die installierte Schemakopie ab, lautet
+das Ergebnis `integrity_indeterminate`, nicht `healthy`.
 
 ### Was der Watchdog beweist — und was nicht
 
-Bewiesen: Manifest vorhanden, parsebar, `complete`; Contract-Snapshot-Hash
-stimmt; eingebetteter Contract == Snapshot; **jedes installierte Modul** und
-**jedes Runtime-Asset** hasht auf seinen Manifest-Eintrag; Manifest-Schema
-gültig, sofern ein vertrauenswürdiges Schema erreichbar war.
+Bewiesen bei `valid=true`: Manifest vorhanden, parsebar, `complete`;
+Contract-Snapshot-Hash stimmt; eingebetteter Contract == Snapshot; **jedes
+installierte Modul** und **jedes Runtime-Asset** hasht auf seinen Manifest-Eintrag;
+der unabhängige Root-Anchor ist mechanisch verifiziert, die installierte
+Schemakopie ist bytegleich dazu und das Manifest besteht diese Schema-Prüfung.
+Ohne diese Schemaautorität gibt es keinen positiven Integritätsentscheid.
 
 Nicht bewiesen: Python-/Executable-Bindung, Plattform-, Protokoll- und
 Agent-Instruction-Identität, Release-Pfad- und Pointer-Prüfungen. Deshalb heißt
@@ -206,9 +215,11 @@ erwartet: `manifest_schema_valid`, `entrypoint_contract_identity_valid`,
 
 ## Watchdog
 
-`tools/watchdog_runtime.py` unterscheidet seit dieser Arbeit drei Zustände statt
-zwei: Prozess/Transport lebt, Runtime ist operativ integritätsgültig, und
-Runtime lebt aber ist integritätsungültig (`integrity_invalid`, Exit 5,
-maschinenlesbarer `integrity.reason`). Der Watchdog startet in diesem Zustand
-bewusst **nicht** neu — ein Neustart repariert kein fehlerhaftes Manifest — und
-verweist stattdessen auf diese Lane.
+`tools/watchdog_runtime.py` unterscheidet seit dieser Arbeit explizit zwischen
+positivem Integritätsentscheid, nachgewiesener Integritätsverletzung
+(`integrity_invalid`, Exit 5) und fehlender unabhängiger Urteilsfähigkeit
+(`integrity_indeterminate`, Exit 6). Der dritte Zustand entsteht insbesondere
+bei fehlendem/unsicherem Root-Anchor oder Schemaabweichung und wird **niemals**
+als `healthy` projiziert. Der Watchdog startet bei Schema-/Manifestproblemen
+bewusst nicht neu — ein Neustart repariert weder einen fehlerhaften Contract
+noch eine fehlende Vertrauenswurzel.

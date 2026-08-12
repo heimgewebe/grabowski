@@ -71,6 +71,28 @@ class DeployRuntimeTests(unittest.TestCase):
             source_bytes=b"print('snapshot')\n",
         )
 
+    def test_target_schema_must_match_independent_root_anchor(self) -> None:
+        expected = b"trusted schema\n"
+        with patch.object(
+            deploy_runtime, "_verified_contract_trust_anchor", return_value=expected
+        ), patch.object(deploy_runtime, "git_show", return_value=expected):
+            deploy_runtime.require_target_schema_anchored(ROOT, "a" * 40)
+
+        with patch.object(
+            deploy_runtime, "_verified_contract_trust_anchor", return_value=expected
+        ), patch.object(deploy_runtime, "git_show", return_value=b"different schema\n"):
+            with self.assertRaisesRegex(
+                deploy_runtime.DeployError, "Rootbroker-Cutover"
+            ):
+                deploy_runtime.require_target_schema_anchored(ROOT, "a" * 40)
+
+    def test_same_uid_schema_file_is_not_a_trust_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schema.py"
+            path.write_text("VALUE = 1\n", encoding="utf-8")
+            with self.assertRaises(deploy_runtime.DeployError):
+                deploy_runtime._verified_contract_trust_anchor(path)
+
     @staticmethod
     def _completed(argv, returncode: int = 0) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, returncode, "", "")

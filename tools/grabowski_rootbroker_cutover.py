@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 
 CONFIG_TARGET = Path("/etc/grabowski/privileged-actions.json")
+RUNTIME_CONTRACT_SCHEMA_TARGET = Path("/etc/grabowski/runtime-contract-schema.py")
 BLOCKADES_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockades.py")
 BLOCKADE_STORE_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_store.py")
 BLOCKADE_AUTHORITY_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_blockade_authority.py")
@@ -91,6 +92,12 @@ class Artifact:
 
 
 ARTIFACTS = (
+    Artifact(
+        "src/grabowski_runtime_contract.py",
+        RUNTIME_CONTRACT_SCHEMA_TARGET,
+        0o644,
+        True,
+    ),
     Artifact(
         "src/grabowski_blockades.py",
         BLOCKADES_MODULE_TARGET,

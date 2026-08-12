@@ -11,6 +11,7 @@ import contextlib
 import json
 from pathlib import Path
 import sys
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
@@ -61,6 +62,12 @@ def _load_provenance_recovery():
     operator._start_job = lambda *args, **kwargs: {}
     operator._require_operator_capability = lambda capability: None
     operator._argv_hash = lambda argv: "a" * 64
+    class _JobDispatchUnknown(RuntimeError):
+        def __init__(self, message, *, unit, evidence):
+            super().__init__(message)
+            self.unit = unit
+            self.evidence = evidence
+    operator.JobDispatchUnknown = _JobDispatchUnknown
     base = types.ModuleType("grabowski_mcp")
     base.AUDIT_LOG = Path("/nonexistent-audit.jsonl")
     base._deployment_metadata = lambda: {}
@@ -392,11 +399,31 @@ class VolatileGateRecheckTests(unittest.TestCase):
 class TargetContractEvidenceTests(unittest.TestCase):
     """The repair target is judged before it is ever built."""
 
+    @staticmethod
+    def _verified_anchor():
+        """A verified anchor carrying the real schema, for contract-level tests.
+
+        Anchor provenance itself is covered separately in TrustAnchorTests; here
+        we want to reach the contract logic behind it.
+        """
+        data = (SRC / "grabowski_runtime_contract.py").read_bytes()
+        return patch.object(
+            provenance_recovery,
+            "_verified_trust_anchor",
+            return_value={
+                "verified": True, "reason": None, "present": True,
+                "path": "/etc/grabowski/runtime-contract-schema.py",
+                "sha256": "0" * 64, "source": data,
+            },
+        )
+
     def test_matching_schema_yields_a_decisive_verdict(self) -> None:
         """When the target ships the trusted schema, this process can judge it."""
         trusted = (SRC / "grabowski_runtime_contract.py").read_bytes()
         contract = (ROOT / "config" / "runtime-entrypoint.json").read_bytes()
-        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+        with self._verified_anchor(), patch.object(
+            provenance_recovery, "_git_bytes"
+        ) as git_bytes:
             git_bytes.side_effect = lambda repo, *args: (
                 contract if args[-1].endswith(".json") else trusted
             )
@@ -482,7 +509,9 @@ class TargetContractEvidenceTests(unittest.TestCase):
 
     def test_differing_target_schema_is_indeterminate_not_rejected(self) -> None:
         """A schema change is 'I cannot judge this', not 'this is broken'."""
-        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+        with self._verified_anchor(), patch.object(
+            provenance_recovery, "_git_bytes"
+        ) as git_bytes:
             git_bytes.side_effect = lambda repo, *args: (
                 b"{}" if args[-1].endswith(".json") else b"# a different schema\n"
             )
@@ -531,7 +560,9 @@ class TargetContractEvidenceTests(unittest.TestCase):
         contract["unreviewed_capability"] = True
         payload = json.dumps(contract).encode("utf-8")
 
-        with patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+        with self._verified_anchor(), patch.object(
+            provenance_recovery, "_git_bytes"
+        ) as git_bytes:
             git_bytes.side_effect = lambda repo, *args: (
                 payload if args[-1].endswith(".json") else validator
             )
@@ -539,6 +570,88 @@ class TargetContractEvidenceTests(unittest.TestCase):
 
         self.assertFalse(evidence["contract_valid"])
         self.assertIn("target contract is invalid", evidence["error"])
+
+
+class TrustAnchorTests(unittest.TestCase):
+    """Validator authority must be independent of the runtime under repair."""
+
+    def test_release_owned_validator_is_not_an_authority(self) -> None:
+        """The lane must not trust a file the repaired runtime could have written."""
+        with patch.object(
+            provenance_recovery, "_verified_trust_anchor",
+            return_value={"verified": False, "reason": "anchor is missing",
+                          "path": "/etc/grabowski/runtime-contract-schema.py",
+                          "present": False, "sha256": None},
+        ), patch.object(provenance_recovery, "_git_bytes") as git_bytes:
+            git_bytes.side_effect = lambda repo, *args: b"x"
+            evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+        self.assertTrue(evidence["indeterminate"])
+        self.assertIn("trust anchor", evidence["error"])
+        self.assertFalse(evidence["contract_valid"])
+
+    def test_running_validator_must_match_independent_anchor(self) -> None:
+        trusted = (SRC / "grabowski_runtime_contract.py").read_bytes()
+        contract = (ROOT / "config" / "runtime-entrypoint.json").read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            drifted = Path(directory) / "grabowski_runtime_contract.py"
+            drifted.write_bytes(b"# drifted running validator\n")
+            with patch.object(
+                provenance_recovery,
+                "_verified_trust_anchor",
+                return_value={
+                    "verified": True, "reason": None, "present": True,
+                    "path": "/etc/grabowski/runtime-contract-schema.py",
+                    "sha256": "0" * 64, "source": trusted,
+                },
+            ), patch.object(provenance_recovery, "_git_bytes") as git_bytes, patch.object(
+                provenance_recovery.runtime_contract, "__file__", str(drifted)
+            ):
+                git_bytes.side_effect = lambda repo, *args: (
+                    contract if args[-1].endswith(".json") else trusted
+                )
+                evidence = provenance_recovery._target_contract_evidence(ROOT, HEAD)
+
+        self.assertTrue(evidence["indeterminate"])
+        self.assertFalse(evidence["contract_valid"])
+        self.assertFalse(evidence["running_validator_matches_trust_anchor"])
+        self.assertIn("running canonical validator", evidence["error"])
+
+    def test_gate_is_closed_without_a_verified_anchor(self) -> None:
+        """Fail closed: no independent authority means no authorisation."""
+        case = ProvenanceRecoveryGateTests("run")
+        case.setUp()
+        gate = case._gate(
+            target={
+                "contract_valid": False,
+                "validator_is_deployed": False,
+                "indeterminate": True,
+                "error": "no trust anchor",
+            }
+        )
+        self.assertFalse(gate["allowed"])
+        self.assertIn("target_schema_judgeable", gate["reasons"])
+
+    def test_anchor_verification_rejects_unsafe_provenance(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            same_uid = Path(directory) / "schema.py"
+            same_uid.write_text("x", encoding="utf-8")
+            evidence = provenance_recovery._verified_trust_anchor(same_uid)
+            self.assertFalse(evidence["verified"])
+            self.assertIn("root-owned", evidence["reason"])
+
+            link = Path(directory) / "link.py"
+            link.symlink_to(same_uid)
+            self.assertIn(
+                "symlink", provenance_recovery._verified_trust_anchor(link)["reason"]
+            )
+
+            missing = provenance_recovery._verified_trust_anchor(
+                Path(directory) / "absent"
+            )
+            self.assertFalse(missing["verified"])
 
 
 class DispatchOutcomeTests(unittest.TestCase):
@@ -585,6 +698,37 @@ class DispatchOutcomeTests(unittest.TestCase):
         self.assertEqual(receipt["job"]["unit"], "u")
         self.assertTrue(receipt["post_dispatch_warnings"])
         self.assertIn("bookkeeping", receipt["post_dispatch_warnings"][0])
+
+    def test_unknown_dispatch_outcome_keeps_the_reservation(self) -> None:
+        """A job that may be running must not have its reservation released."""
+        gate = {
+            "allowed": True, "reasons": [],
+            "runtime_integrity": {"failed_integrity_flags": ["provenance_valid"]},
+            "source_identity": _source_identity(ROOT),
+        }
+        unknown = provenance_recovery.operator.JobDispatchUnknown(
+            "unresolved", unit="grabowski-job-abc", evidence={"outcome": "outcome_unknown"}
+        )
+        with (
+            patch.object(provenance_recovery, "evaluate_gate", return_value=gate),
+            patch.object(provenance_recovery, "_volatile_gate_recheck",
+                         return_value={"reasons": [], "checks": {}}),
+            patch.object(provenance_recovery.base, "_append_audit_with_digest",
+                         return_value="d" * 64),
+            patch.object(provenance_recovery.base, "_require_valid_audit_chain"),
+            patch.object(provenance_recovery.base, "_append_audit") as audit,
+            patch.object(provenance_recovery.self_deploy, "_write_deploy_index") as index,
+            patch.object(provenance_recovery.operator, "_start_job", side_effect=unknown),
+        ):
+            with self.assertRaises(provenance_recovery.operator.JobDispatchUnknown):
+                provenance_recovery.grabowski_recovery_provenance_repair(HEAD)
+
+        # Exactly one index write: the reservation.  It is never cleared.
+        self.assertEqual(index.call_count, 1)
+        self.assertEqual(
+            audit.call_args[0][0]["operation"],
+            "provenance-recovery-dispatch-outcome-unknown",
+        )
 
     def test_receipt_carries_a_deterministic_correlation_id(self) -> None:
         """A caller that lost the response can correlate a retry with what ran."""

@@ -46,6 +46,7 @@ import fcntl
 import hashlib
 import json
 from pathlib import Path
+import stat
 import subprocess
 import time
 import uuid
@@ -137,12 +138,64 @@ CANONICAL_VALIDATOR_MODULE = "grabowski_runtime_contract"
 CANONICAL_VALIDATOR_SOURCE = "src/grabowski_runtime_contract.py"
 
 
-def _trusted_validator_source() -> bytes | None:
-    """Return the source of the canonical validator running in this process."""
+#: Root-provisioned trust anchor for the canonical contract schema.  It must sit
+#: outside both the release under repair and the mutable working checkout: the
+#: release's own copy is exactly the artifact whose integrity is in question,
+#: and a same-UID repo file is not an authority, only a convenience.
+TRUST_ANCHOR = Path("/etc/grabowski/runtime-contract-schema.py")
+
+
+def _verified_trust_anchor(path: Path = TRUST_ANCHOR) -> dict[str, Any]:
+    """Read the schema trust anchor only if its provenance is mechanically sound.
+
+    Checked, not assumed: the file and every parent directory must be root-owned
+    and not group- or world-writable, the file must be a single-link regular
+    file and not a symlink.  Anything else means the operator's own uid could
+    have written it, which would make "trusted" a claim rather than a property.
+    """
+    evidence: dict[str, Any] = {
+        "path": str(path),
+        "present": False,
+        "verified": False,
+        "reason": None,
+        "sha256": None,
+    }
     try:
-        return Path(runtime_contract.__file__).read_bytes()
-    except (OSError, TypeError):
-        return None
+        if path.is_symlink():
+            evidence["reason"] = "anchor is a symlink"
+            return evidence
+        info = path.lstat()
+        evidence["present"] = True
+        if not stat.S_ISREG(info.st_mode):
+            evidence["reason"] = "anchor is not a regular file"
+            return evidence
+        if info.st_nlink != 1:
+            evidence["reason"] = "anchor has multiple hard links"
+            return evidence
+        if info.st_uid != 0:
+            evidence["reason"] = f"anchor is not root-owned (uid {info.st_uid})"
+            return evidence
+        if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            evidence["reason"] = "anchor is group- or world-writable"
+            return evidence
+        for parent in path.parents:
+            parent_info = parent.lstat()
+            if parent_info.st_uid != 0:
+                evidence["reason"] = f"anchor parent {parent} is not root-owned"
+                return evidence
+            if parent_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                evidence["reason"] = f"anchor parent {parent} is writable by others"
+                return evidence
+            if parent == Path("/"):
+                break
+        data = path.read_bytes()
+    except OSError as exc:
+        evidence["reason"] = f"anchor is unreadable: {exc}"
+        return evidence
+    evidence["verified"] = True
+    evidence["sha256"] = hashlib.sha256(data).hexdigest()
+    evidence["source"] = data
+    return evidence
 
 
 def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str, Any]:
@@ -156,11 +209,12 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
     a candidate could still write files, spawn processes or reach the network
     merely by being assessed.
 
-    The anti-skew guarantee is preserved differently: the candidate's schema
-    module is compared byte-for-byte with the trusted one already running here.
-    Identical means this process's verdict *is* the target's verdict.  Different
-    means the schema itself changed, and the honest answer is "I cannot judge
-    this" -- reported as indeterminate, never resolved by running the candidate.
+    The anti-skew guarantee is preserved differently: both the candidate schema
+    and the validator module already loaded in this process are compared
+    byte-for-byte with an independently provisioned root-owned trust anchor.
+    Only when all three identities match may this process use its already-loaded
+    validator functions.  Any difference is indeterminate and is never resolved
+    by executing the candidate.
     """
     evidence: dict[str, Any] = {
         "contract_readable": False,
@@ -188,11 +242,22 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
         return evidence
     evidence["validator_readable"] = True
 
-    trusted = _trusted_validator_source()
-    if trusted is None:
+    anchor = _verified_trust_anchor()
+    evidence["trust_anchor"] = {
+        key: value for key, value in anchor.items() if key != "source"
+    }
+    if not anchor["verified"]:
+        # Fail closed rather than fall back to the release's own copy or the
+        # mutable checkout: an authority that the repaired system could have
+        # written is not an authority.
         evidence["indeterminate"] = True
-        evidence["error"] = "trusted canonical validator source is unreadable"
+        evidence["error"] = (
+            "no independently verified contract schema trust anchor "
+            f"({anchor['reason']}); the repair lane will not authorise against "
+            "a validator the runtime under repair could have written"
+        )
         return evidence
+    trusted = anchor["source"]
     evidence["target_validator_sha256"] = hashlib.sha256(validator_bytes).hexdigest()
     evidence["trusted_validator_sha256"] = hashlib.sha256(trusted).hexdigest()
     if validator_bytes != trusted:
@@ -207,6 +272,26 @@ def _target_contract_evidence(repository: Path, expected_head: str) -> dict[str,
         )
         return evidence
     evidence["validator_matches_trusted_schema"] = True
+
+    # The runtime may be in this lane precisely because artifact integrity is
+    # broken.  Therefore the verifier already imported by this process cannot be
+    # trusted merely because it is named grabowski_runtime_contract.  Bind its
+    # exact source bytes to the independent root-owned anchor before calling it.
+    try:
+        running_validator = Path(runtime_contract.__file__).read_bytes()
+    except (OSError, TypeError) as exc:
+        evidence["indeterminate"] = True
+        evidence["error"] = f"running canonical validator is unreadable: {exc}"
+        return evidence
+    evidence["running_validator_sha256"] = hashlib.sha256(running_validator).hexdigest()
+    evidence["running_validator_matches_trust_anchor"] = running_validator == trusted
+    if running_validator != trusted:
+        evidence["indeterminate"] = True
+        evidence["error"] = (
+            "the running canonical validator does not match the independent "
+            "root-owned trust anchor; this process cannot safely judge a repair target"
+        )
+        return evidence
 
     try:
         raw = json.loads(contract_bytes.decode("utf-8"))
@@ -614,8 +699,25 @@ def _repair_under_schedule_lock(
             allow_reserved_runtime_deploy=True,
             invoker_tool="grabowski_recovery_provenance_repair",
         )
+    except operator.JobDispatchUnknown as exc:
+        # A job may be running.  Releasing the reservation here would let a
+        # second repair start alongside it, and reporting a clean failure would
+        # be a lie about an effect that may already exist.  Keep the
+        # reservation, record the ambiguity, and make the operator read back.
+        base._append_audit(
+            {
+                "timestamp_unix": int(time.time()),
+                "operation": "provenance-recovery-dispatch-outcome-unknown",
+                "expected_head": expected_head,
+                "repair_intent_id": repair_intent_id,
+                "unit": exc.unit,
+                "evidence": exc.evidence,
+                "intent_sha256": intent_sha256,
+            }
+        )
+        raise
     except Exception:
-        # Nothing started, so the reservation must go.  Re-read rather than
+        # Definitive non-start, so the reservation must go.  Re-read rather than
         # restoring the snapshot taken before the attempt: another deploy may
         # have finished and removed itself meanwhile, and writing back the stale
         # unit list would resurrect it.
@@ -643,7 +745,7 @@ def _repair_under_schedule_lock(
         "argv_sha256": job["argv_sha256"],
         "source_identity_sha256": source_identity["identity_sha256"],
     }
-    post_dispatch_warnings: list[str] = []
+    post_dispatch_warnings: list[str] = list(job.get("post_dispatch_warnings") or [])
     try:
         scheduled_sha256 = base._append_audit_with_digest(scheduled)
     except Exception as exc:  # noqa: BLE001 - effect already dispatched

@@ -1086,10 +1086,16 @@ class OperatorContractTests(unittest.TestCase):
                 "stdout_truncated": False,
                 "stderr_truncated": False,
             }
+            launch_readback = {
+                "returncode": 0,
+                "stdout": "LoadState=not-found\nActiveState=inactive\n",
+                "stderr": "",
+                "timed_out": False,
+            }
             with patch.object(operator, "STATE_DIR", state), patch.object(
                 operator, "JOBS_DIR", jobs
             ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
-                operator, "_run", return_value=launcher
+                operator, "_run", side_effect=[launcher, launch_readback]
             ):
                 with self.assertRaisesRegex(RuntimeError, "systemd refused launch"):
                     operator.grabowski_job_start(["python3", "-c", "print(1)"], cwd=str(cwd))
@@ -1101,6 +1107,8 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(metadata["terminalization_evidence"]["final_status"], "launch_failed")
             self.assertFalse(metadata["terminalization_evidence"]["systemd_visible"])
             self.assertEqual(metadata["launcher_evidence"]["returncode"], 1)
+            self.assertEqual(metadata["dispatch_outcome"], "not_started")
+            self.assertEqual(metadata["dispatch_readback"]["outcome"], "not_started")
             self.assertNotEqual(metadata["final_status"], "started")
 
             systemctl = {
@@ -1125,6 +1133,115 @@ class OperatorContractTests(unittest.TestCase):
             self.assertEqual(status["final_status"], "launch_failed")
             self.assertEqual(status["terminalization_evidence"]["source"], "systemd-run-launch")
             self.assertEqual(status["notification_evidence"]["final_status_preserved"], "launch_failed")
+
+    def test_launcher_error_with_started_readback_is_a_started_job(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            fake_uuid = types.SimpleNamespace(hex="feedface0000ffffffffffffffffffff")
+            launcher = {
+                "returncode": 1, "stdout": "", "stderr": "launcher lost reply",
+                "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
+                "cwd": str(root), "timed_out": True, "duration_seconds": 60.0,
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+            readback = {
+                "returncode": 0,
+                "stdout": "LoadState=loaded\nActiveState=active\n",
+                "stderr": "",
+                "timed_out": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", side_effect=[launcher, readback]
+            ):
+                job = operator.grabowski_job_start(
+                    ["python3", "-c", "print(1)"], cwd=str(cwd)
+                )
+
+            self.assertEqual(job["dispatch_outcome"], "started")
+            self.assertEqual(job["dispatch_readback"]["outcome"], "started")
+            self.assertEqual(job["final_status"], "launch_submitted")
+            self.assertEqual(
+                job["terminalization_evidence"]["source"],
+                "systemd-readback-after-launcher-error",
+            )
+            self.assertTrue(job["post_dispatch_warnings"])
+
+    def test_launcher_error_with_unresolved_readback_is_outcome_unknown(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            fake_uuid = types.SimpleNamespace(hex="decafbad0000ffffffffffffffffffff")
+            launcher = {
+                "returncode": 1, "stdout": "", "stderr": "launcher timed out",
+                "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
+                "cwd": str(root), "timed_out": True, "duration_seconds": 60.0,
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+            readback = {
+                "returncode": 1, "stdout": "", "stderr": "dbus unavailable",
+                "timed_out": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", side_effect=[launcher, readback]
+            ):
+                with self.assertRaises(operator.JobDispatchUnknown) as raised:
+                    operator.grabowski_job_start(
+                        ["python3", "-c", "print(1)"], cwd=str(cwd)
+                    )
+
+            self.assertEqual(raised.exception.dispatch_outcome, "outcome_unknown")
+            metadata = json.loads(
+                (jobs / "grabowski-job-decafbad0000" / "metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metadata["dispatch_outcome"], "outcome_unknown")
+            self.assertEqual(metadata["final_status"], "launch_outcome_unknown")
+            self.assertIsNone(operator._metadata_launch_failure_evidence(metadata))
+
+    def test_metadata_failure_after_successful_dispatch_is_warning_not_failure(self) -> None:
+        operator = _load_operator_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / "state"
+            jobs = state / "jobs"
+            cwd = root / "cwd"
+            cwd.mkdir(parents=True)
+            fake_uuid = types.SimpleNamespace(hex="cab005e00000ffffffffffffffffffff")
+            launcher = {
+                "returncode": 0, "stdout": "started", "stderr": "",
+                "argv": [], "argv_sha256": "0" * 64, "command": "systemd-run",
+                "cwd": str(root), "timed_out": False, "duration_seconds": 0.01,
+                "stdout_truncated": False, "stderr_truncated": False,
+            }
+            with patch.object(operator, "STATE_DIR", state), patch.object(
+                operator, "JOBS_DIR", jobs
+            ), patch.object(operator.uuid, "uuid4", return_value=fake_uuid), patch.object(
+                operator, "_run", return_value=launcher
+            ), patch.object(
+                operator, "_replace_job_metadata", side_effect=OSError("disk full")
+            ):
+                job = operator.grabowski_job_start(
+                    ["python3", "-c", "print(1)"], cwd=str(cwd)
+                )
+
+            self.assertEqual(job["dispatch_outcome"], "started")
+            self.assertIsNone(job["metadata_path"])
+            self.assertTrue(job["post_dispatch_warnings"])
+            self.assertIn("metadata persist failed", job["post_dispatch_warnings"][0])
 
     def test_not_found_systemd_unit_has_valid_query_but_missing_finalization(self) -> None:
         operator = _load_operator_module()

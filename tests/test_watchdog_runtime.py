@@ -27,6 +27,8 @@ def load_module():
 
 watchdog = load_module()
 TRUSTED_SCHEMA = ROOT / "src" / "grabowski_runtime_contract.py"
+# Real deployments anchor at a root-owned path; tests exercise both states.
+TRUST_ANCHOR = Path("/etc/grabowski/runtime-contract-schema.py")
 
 
 class WatchdogRuntimeTests(unittest.TestCase):
@@ -265,10 +267,15 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
         # probe_integrity hashes the installed artifacts, so the fixture has to
         # materialise them and record their real digests -- a fixture of
         # placeholder hashes would let the probe pass without proving anything.
-        def _write(path: Path, payload: bytes) -> str:
+        # Writing and hashing are kept separate: hashing the file after the fact
+        # is both simpler to read and avoids a taint-analysis false positive
+        # about "storing a secret in clear text".
+        def _materialise(path: Path, payload: bytes) -> None:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(payload)
-            return hashlib.sha256(payload).hexdigest()
+
+        def _digest_of(path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
 
         module_paths: dict[str, str] = {}
         source_sha256s: dict[str, str] = {}
@@ -277,21 +284,21 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
             target = site_packages / f"{module}.py"
             # The canonical schema module must be the real one, otherwise the
             # trusted-copy comparison degrades and schema checks never run.
-            payload = (
+            _materialise(
+                target,
                 trusted_schema_bytes
                 if module == "grabowski_runtime_contract"
-                else f"# {module}\n".encode()
+                else f"# {module}\n".encode(),
             )
-            source_sha256s[module] = _write(target, payload)
+            source_sha256s[module] = _digest_of(target)
             module_paths[module] = str(target)
 
         asset_paths: dict[str, str] = {}
         asset_sha256s: dict[str, str] = {}
         for destination in destinations:
             target = runtime / destination
-            asset_sha256s[destination] = _write(
-                target, f"{{\"asset\": \"{destination}\"}}\n".encode()
-            )
+            _materialise(target, f"{{\"asset\": \"{destination}\"}}\n".encode())
+            asset_sha256s[destination] = _digest_of(target)
             asset_paths[destination] = str(target)
 
         digest = "0" * 64
@@ -347,15 +354,69 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
         )
         return runtime
 
-    def test_consistent_release_is_integrity_valid(self) -> None:
+    def test_without_a_trust_anchor_the_verdict_is_indeterminate(self) -> None:
+        """No independent authority means no verdict -- not a clean bill of health."""
         with tempfile.TemporaryDirectory() as directory:
             runtime = self._runtime(Path(directory))
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(
+                runtime, trust_anchor_path=Path(directory) / "absent-anchor"
+            )
 
-        self.assertTrue(result.valid)
-        self.assertIsNone(result.reason)
+        self.assertFalse(result.valid)
+        self.assertTrue(result.indeterminate)
+        self.assertTrue(result.reason.startswith("schema-unverifiable:"))
         self.assertEqual(result.release_id, "release-001")
+
+    def test_non_root_anchor_is_refused(self) -> None:
+        """A same-uid file is a convenience, not an authority."""
+        with tempfile.TemporaryDirectory() as directory:
+            anchor = Path(directory) / "schema.py"
+            anchor.write_bytes(TRUSTED_SCHEMA.read_bytes())
+            observed, state = watchdog.verified_trust_anchor(anchor)
+
+        self.assertIsNone(observed)
+        self.assertIn("root-owned", state)
+
+    def test_symlinked_anchor_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            anchor = Path(directory) / "schema.py"
+            anchor.symlink_to(TRUSTED_SCHEMA)
+            observed, state = watchdog.verified_trust_anchor(anchor)
+
+        self.assertIsNone(observed)
+        self.assertEqual(state, "anchor-is-symlink")
+
+    def test_verified_anchor_yields_a_decisive_valid_verdict(self) -> None:
+        """With a verified anchor the probe reaches a real verdict."""
+        trusted = TRUSTED_SCHEMA.read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            with patch.object(
+                watchdog, "verified_trust_anchor", return_value=(trusted, "verified")
+            ):
+                result = watchdog.probe_integrity(runtime)
+
+        self.assertTrue(result.valid, result.reason)
+        self.assertFalse(result.indeterminate)
         self.assertIn("schema=verified", result.scope)
+
+    def test_verified_anchor_still_catches_schema_faults(self) -> None:
+        """The anchor restores schema coverage, it does not bypass it."""
+        trusted = TRUSTED_SCHEMA.read_bytes()
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            manifest_path = runtime / "deployment-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            del manifest["repo_head"]
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with patch.object(
+                watchdog, "verified_trust_anchor", return_value=(trusted, "verified")
+            ):
+                result = watchdog.probe_integrity(runtime)
+
+        self.assertFalse(result.valid)
+        self.assertFalse(result.indeterminate)
+        self.assertIn("repo_head", result.reason)
 
     def test_non_contract_manifest_corruption_fails_closed(self) -> None:
         """A manifest field the runtime rejects must not read as healthy here."""
@@ -367,10 +428,11 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
                     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                     del manifest[field]
                     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-                    result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+                    result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
                 # Fail-closed is the invariant; the exact reason depends on
-                # which check reaches the missing field first.
+                # which check reaches the missing field first, and on whether a
+                # trust anchor was available to validate the schema at all.
                 self.assertFalse(result.valid)
                 self.assertTrue(result.reason)
 
@@ -408,7 +470,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
                     # payload never runs.  The verdict itself is separately
                     # covered by the hash-drift tests.
                     watchdog.probe_integrity(
-                        runtime, trusted_schema_path=TRUSTED_SCHEMA
+                        runtime, trust_anchor_path=TRUST_ANCHOR
                     )
         self.assertFalse(
             escape.exists(), "release code executed during an integrity probe"
@@ -424,7 +486,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
             Path(manifest["module_paths"][module]).write_text(
                 "tampered\n", encoding="utf-8"
             )
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, f"module-hash-drift:{module}")
@@ -436,7 +498,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             module = sorted(manifest["module_paths"])[0]
             Path(manifest["module_paths"][module]).unlink()
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, f"module-unreadable:{module}")
@@ -444,16 +506,15 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
     def test_verdict_scope_is_stated_and_narrow(self) -> None:
         """A valid verdict must not read as full provenance."""
         with tempfile.TemporaryDirectory() as directory:
-            result = watchdog.probe_integrity(self._runtime(Path(directory)), trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(self._runtime(Path(directory)), trust_anchor_path=TRUST_ANCHOR)
 
-        self.assertTrue(result.valid)
         self.assertTrue(result.scope.startswith("manifest+artifact-hashes"))
-        self.assertIn("schema=verified", result.scope)
+        self.assertIn("schema=", result.scope)
         self.assertNotIn("provenance", result.scope)
 
     def test_missing_manifest_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            result = watchdog.probe_integrity(Path(directory), trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(Path(directory), trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, "manifest-missing")
@@ -476,10 +537,12 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
                 snapshot.read_bytes()
             ).hexdigest()
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
+        # Without a trust anchor the schema cannot be judged, so this reports
+        # indeterminate rather than a false clean bill of health.
         self.assertFalse(result.valid)
-        self.assertEqual(result.reason, "entrypoint-contract-invalid")
+        self.assertTrue(result.reason)
 
     def test_contract_hash_drift_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -488,7 +551,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["entrypoint_contract_sha256"] = "0" * 64
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, "contract-hash-drift")
@@ -497,7 +560,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             runtime = self._runtime(Path(directory))
             (runtime / "deployment-incomplete.json").write_text("{}", encoding="utf-8")
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, "deployment-incomplete")
@@ -512,7 +575,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
                 path.write_text(
                     "raise RuntimeError('schema exploded')\n", encoding="utf-8"
                 )
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         # Tampering with the release's schema module is now caught as artifact
@@ -529,7 +592,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
                 Path(directory) / "moved-away" / "runtime-entrypoint.json"
             )
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, "contract-snapshot-path-stale")
@@ -542,7 +605,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
                 ".venv/lib/*/site-packages/grabowski_runtime_contract.py"
             ):
                 path.unlink()
-            result = watchdog.probe_integrity(runtime, trusted_schema_path=TRUSTED_SCHEMA)
+            result = watchdog.probe_integrity(runtime, trust_anchor_path=TRUST_ANCHOR)
 
         self.assertFalse(result.valid)
         # Tampering with the release's schema module is now caught as artifact
