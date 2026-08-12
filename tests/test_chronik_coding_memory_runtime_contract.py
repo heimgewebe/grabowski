@@ -1,4 +1,6 @@
+import hashlib
 import importlib.util
+import json
 import shutil
 import tempfile
 import unittest
@@ -19,6 +21,7 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
             result["producer_commit"],
             "d8a097dd9356d840cc277d4a61a4749d9d48c9d1",
         )
+        self.assertEqual(result["producer_python_requires"], ">=3.10")
         self.assertEqual(
             result["compatible_runtime_pins"],
             {
@@ -80,6 +83,25 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
         )
         return directory
 
+    def _rewrite_contract(self, root: Path, mutate) -> None:
+        contract_path = root / "contracts" / "chronik-coding-memory-runtime.v1.json"
+        binding_path = root / "contracts" / "chronik-coding-memory-runtime.binding.v1.json"
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        mutate(contract)
+        contract_path.write_text(
+            json.dumps(contract, indent=2) + "\n", encoding="utf-8"
+        )
+        raw = contract_path.read_bytes()
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        binding["producer_sha256"] = hashlib.sha256(raw).hexdigest()
+        binding["producer_git_blob_sha"] = hashlib.sha1(
+            b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw,
+            usedforsecurity=False,
+        ).hexdigest()
+        binding_path.write_text(
+            json.dumps(binding, indent=2) + "\n", encoding="utf-8"
+        )
+
     def test_missing_direct_pin_is_rejected_even_when_lock_contains_it(self) -> None:
         root = self._fixture_root()
         runtime_input = root / "requirements" / "runtime.in"
@@ -92,11 +114,42 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a direct Grabowski pin"):
             validator.validate_root(root)
 
+    def test_packaged_pin_must_match_runtime_input(self) -> None:
+        root = self._fixture_root()
+        pyproject = root / "pyproject.toml"
+        pyproject.write_text(
+            pyproject.read_text(encoding="utf-8").replace(
+                '"pydantic-settings==2.14.2"', '"pydantic-settings==2.13.0"'
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "differs between input and pyproject"):
+            validator.validate_root(root)
+
     def test_vendored_contract_tampering_is_rejected_before_semantics(self) -> None:
         root = self._fixture_root()
         contract = root / "contracts" / "chronik-coding-memory-runtime.v1.json"
         contract.write_bytes(contract.read_bytes() + b"\n")
         with self.assertRaisesRegex(ValueError, "sha256 mismatch"):
+            validator.validate_root(root)
+
+    def test_producer_python_floor_is_enforced_after_valid_rebinding(self) -> None:
+        root = self._fixture_root()
+        self._rewrite_contract(
+            root,
+            lambda contract: contract["python"].update({"requires": ">=99.0"}),
+        )
+        with self.assertRaisesRegex(ValueError, "validation Python violates"):
+            validator.validate_root(root)
+
+    def test_semantic_boundaries_cannot_be_silently_removed(self) -> None:
+        root = self._fixture_root()
+
+        def remove_boundary(contract):
+            contract["does_not_establish"].remove("dynamic_import_absence")
+
+        self._rewrite_contract(root, remove_boundary)
+        with self.assertRaisesRegex(ValueError, "semantic boundaries drifted"):
             validator.validate_root(root)
 
 
