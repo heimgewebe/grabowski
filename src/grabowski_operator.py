@@ -88,6 +88,15 @@ _SYNC_TOOL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="grabowski-sync-tool",
 )
 JOB_PREFIX = "grabowski-job-"
+
+#: Tools that may appear as the authorizing invoker in a durable job origin.
+JOB_INVOKER_TOOLS = frozenset(
+    {
+        "grabowski_job_start",
+        "grabowski_runtime_deploy_schedule",
+        "grabowski_recovery_provenance_repair",
+    }
+)
 DEFAULT_TIMEOUT = 60
 MAX_TIMEOUT = 120
 TRUSTED_MAX_TIMEOUT = 86_400
@@ -457,6 +466,45 @@ def _transport_roundtrip_exempt_call(
     return spec is not None and spec.effect == grabowski_grips.READ_ONLY
 
 
+_PROVENANCE_RECOVERY_REPAIR_TOOL = "grabowski_recovery_provenance_repair"
+_PROVENANCE_RECOVERY_REPAIRABLE_INTEGRITY_FLAGS = (
+    "manifest_schema_valid",
+    "entrypoint_contract_identity_valid",
+    "artifact_integrity_valid",
+    "provenance_valid",
+)
+
+
+def _provenance_recovery_transport_exempt_call(tool_name: Any, tool: Any) -> bool:
+    """Let exactly the provenance repair tool reach its own fail-closed gate.
+
+    The normal transport binding deliberately requires an integrity-valid
+    runtime. Requiring that same binding before the tool whose sole purpose is
+    to repair a proven integrity defect recreates the deadlock the recovery
+    lane exists to break. This is not repair authority: the domain tool still
+    evaluates every recovery gate before dispatch. Unknown integrity remains
+    closed and every other mutating tool still requires the normal roundtrip.
+    """
+    if tool_name != _PROVENANCE_RECOVERY_REPAIR_TOOL:
+        return False
+    if _tool_read_only_hint(tool) is not False:
+        return False
+    try:
+        deployment = base._deployment_metadata()
+    except Exception:  # pragma: no cover - defensive read boundary
+        return False
+    values = [
+        deployment.get(flag)
+        for flag in _PROVENANCE_RECOVERY_REPAIRABLE_INTEGRITY_FLAGS
+    ]
+    # Mirror the domain recovery contract: only explicit booleans are
+    # judgeable, and at least one explicit False is required. Missing/unknown
+    # metadata must never manufacture an exemption.
+    return all(value is True or value is False for value in values) and any(
+        value is False for value in values
+    )
+
+
 def _require_current_serving_process() -> None:
     """Refuse mutations from a process older than the deployed release.
 
@@ -500,6 +548,8 @@ def _require_transport_roundtrip_for_tool(
             "readOnlyHint annotation"
         )
     _require_current_serving_process()
+    if _provenance_recovery_transport_exempt_call(tool_name, tool):
+        return None
     runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
         arguments_sha256 = (
@@ -3034,6 +3084,11 @@ def _project_job_metadata(unit: str, metadata: dict[str, Any]) -> dict[str, Any]
 
 
 def _metadata_launch_failure_evidence(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    # New dispatch-aware metadata may say the launcher outcome was ambiguous.
+    # Only a proven non-start (or legacy metadata that predates this field) may
+    # be projected as a definitive launch failure.
+    if metadata.get("dispatch_outcome") not in {None, "not_started"}:
+        return None
     evidence = metadata.get("terminalization_evidence")
     if not isinstance(evidence, dict):
         return None
@@ -3243,6 +3298,72 @@ def _cleanup_stale_job_metadata_temps(
             finally:
                 os.close(directory_fd)
     return {"inspected": inspected, "removed": removed, "errors": errors}
+
+
+class JobDispatchUnknown(RuntimeError):
+    """The launcher outcome could not be resolved to started or not-started.
+
+    Raised only when a job may be running.  Callers must not treat this as a
+    failed dispatch: releasing a reservation or reporting "nothing happened"
+    here is how a running deployment gets reported as never started.
+    """
+
+    def __init__(self, message: str, *, unit: str, evidence: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.unit = unit
+        self.evidence = evidence
+        self.dispatch_outcome = "outcome_unknown"
+
+
+def _unit_dispatch_readback(unit: str) -> dict[str, Any]:
+    """Ask systemd whether a unit exists, to resolve an ambiguous launch.
+
+    A non-zero systemd-run exit does not by itself prove nothing started: the
+    call can time out after the unit was created.  This readback is what turns
+    "the launcher errored" into started / not_started / outcome_unknown.
+    """
+    try:
+        result = _run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--no-pager",
+                "--property=LoadState",
+                "--property=ActiveState",
+            ],
+            cwd=HOME,
+            timeout_seconds=15,
+            max_output_bytes=DEFAULT_OUTPUT_BYTES,
+        )
+    except Exception as exc:  # noqa: BLE001 - readback failure must stay ambiguous
+        return {"query_valid": False, "outcome": "outcome_unknown", "error": str(exc)}
+    if result.get("timed_out") or result.get("returncode") != 0:
+        return {
+            "query_valid": False,
+            "outcome": "outcome_unknown",
+            "returncode": result.get("returncode"),
+        }
+    properties = {}
+    for line in str(result.get("stdout", "")).splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            properties[key] = value
+    load_state = properties.get("LoadState")
+    active_state = properties.get("ActiveState")
+    if load_state == "not-found" and active_state in {"inactive", None}:
+        outcome = "not_started"
+    elif load_state in {"loaded", "masked"} or active_state not in {None, "inactive"}:
+        outcome = "started"
+    else:
+        outcome = "outcome_unknown"
+    return {
+        "query_valid": True,
+        "outcome": outcome,
+        "load_state": load_state,
+        "active_state": active_state,
+    }
 
 
 def _replace_job_metadata(directory: Path, payload: dict[str, Any]) -> Path:
@@ -3804,13 +3925,17 @@ def _start_job(
     }
     # The origin record must name the tool that actually authorized the job, so
     # a reserved deploy started by the provenance repair lane is not attributed
-    # to the ordinary self-deploy scheduler.
+    # to the ordinary self-deploy scheduler.  The value is constrained to the
+    # tools that may legitimately start a job: audit attribution is evidence,
+    # and evidence a caller can write freely is not evidence.
     if invoker_tool is None:
         invoker_tool = (
             "grabowski_runtime_deploy_schedule"
             if allow_reserved_runtime_deploy
             else "grabowski_job_start"
         )
+    elif invoker_tool not in JOB_INVOKER_TOOLS:
+        raise PermissionError(f"unknown job invoker tool: {invoker_tool}")
     origin, origin_sha256 = job_origin.build_origin(
         unit=unit,
         owner=identity["owner"],
@@ -3952,50 +4077,125 @@ def _start_job(
         max_output_bytes=DEFAULT_OUTPUT_BYTES,
     )
     launcher_evidence = _job_launcher_evidence(result)
+    post_dispatch_warnings: list[str] = []
+    dispatch_readback: dict[str, Any] | None = None
+
     if result["returncode"] != 0:
+        # A non-zero exit is not automatically proof that nothing started: the
+        # launcher can fail or time out after systemd created the unit.  Ask
+        # systemd before claiming a definitive non-start.
+        dispatch_readback = _unit_dispatch_readback(unit)
+        message = result["stderr"] or result["stdout"] or "job launch failed"
+        if dispatch_readback["outcome"] == "not_started":
+            terminalization = {
+                "source": "systemd-run-launch",
+                "query_valid": True,
+                "final_status": "launch_failed",
+                "systemd_visible": False,
+                "does_not_establish": list(JOB_FINAL_STATUS_NON_CLAIMS),
+            }
+            metadata = {
+                **metadata,
+                "final_status": "launch_failed",
+                "terminalization_evidence": terminalization,
+                "launcher_evidence": launcher_evidence,
+                "dispatch_readback": dispatch_readback,
+                "dispatch_outcome": "not_started",
+                "notification_evidence": _job_notification_evidence(
+                    notify_metadata,
+                    terminalization,
+                ),
+            }
+            try:
+                _replace_job_metadata(directory, metadata)
+            except Exception:  # noqa: BLE001 - definitive non-start remains primary
+                pass
+            raise RuntimeError(message)
+        if dispatch_readback["outcome"] != "started":
+            # Preserve the ambiguity durably when possible.  A later status
+            # readback may still resolve it, but this call must not claim that
+            # no effect occurred.
+            terminalization = {
+                "source": "systemd-run-launch-readback",
+                "query_valid": bool(dispatch_readback.get("query_valid")),
+                "final_status": "launch_outcome_unknown",
+                "systemd_visible": False,
+                "does_not_establish": list(JOB_FINAL_STATUS_NON_CLAIMS),
+            }
+            metadata = {
+                **metadata,
+                "final_status": "launch_outcome_unknown",
+                "terminalization_evidence": terminalization,
+                "launcher_evidence": launcher_evidence,
+                "dispatch_readback": dispatch_readback,
+                "dispatch_outcome": "outcome_unknown",
+                "notification_evidence": _job_notification_evidence(
+                    notify_metadata,
+                    terminalization,
+                ),
+            }
+            try:
+                _replace_job_metadata(directory, metadata)
+            except Exception:  # noqa: BLE001 - ambiguity must still be surfaced
+                pass
+            raise JobDispatchUnknown(
+                f"job launcher outcome is unresolved for {unit}: {message}",
+                unit=unit,
+                evidence=dispatch_readback,
+            )
+
+        # The launcher reported failure, but authoritative unit readback proves
+        # the dispatch happened.  From here on it is a started job with a
+        # warning, never a failed dispatch.
+        terminalization = {
+            "source": "systemd-readback-after-launcher-error",
+            "query_valid": True,
+            "final_status": "launch_submitted",
+            "systemd_visible": True,
+            "does_not_establish": list(JOB_FINAL_STATUS_NON_CLAIMS),
+        }
+        post_dispatch_warnings.append(
+            "systemd-run reported failure after the unit was observed; "
+            f"dispatch accepted for {unit}: {message}"
+        )
+    else:
         terminalization = {
             "source": "systemd-run-launch",
             "query_valid": False,
-            "final_status": "launch_failed",
+            "final_status": "launch_submitted",
             "systemd_visible": False,
             "does_not_establish": list(JOB_FINAL_STATUS_NON_CLAIMS),
         }
-        metadata = {
-            **metadata,
-            "final_status": "launch_failed",
-            "terminalization_evidence": terminalization,
-            "launcher_evidence": launcher_evidence,
-            "notification_evidence": _job_notification_evidence(
-                notify_metadata,
-                terminalization,
-            ),
-        }
-        _replace_job_metadata(directory, metadata)
-        raise RuntimeError(result["stderr"] or result["stdout"])
 
-    terminalization = {
-        "source": "systemd-run-launch",
-        "query_valid": False,
-        "final_status": "launch_submitted",
-        "systemd_visible": False,
-        "does_not_establish": list(JOB_FINAL_STATUS_NON_CLAIMS),
-    }
     metadata = {
         **metadata,
         "final_status": "launch_submitted",
         "terminalization_evidence": terminalization,
         "launcher_evidence": launcher_evidence,
+        "dispatch_outcome": "started",
         "notification_evidence": _job_notification_evidence(
             notify_metadata,
             terminalization,
         ),
     }
-    metadata_path = _replace_job_metadata(directory, metadata)
+    if dispatch_readback is not None:
+        metadata["dispatch_readback"] = dispatch_readback
+
+    # The unit exists from here on.  Persisting metadata is bookkeeping, and
+    # bookkeeping must never be able to report "nothing started" about a job
+    # that is already running -- that is the unknown-outcome class this guard
+    # exists to prevent.
+    metadata_path: Path | None = None
+    try:
+        metadata_path = _replace_job_metadata(directory, metadata)
+    except Exception as exc:  # noqa: BLE001 - job already dispatched
+        post_dispatch_warnings.append(f"job metadata persist failed: {exc}")
     return {
         **metadata,
-        "metadata_path": str(metadata_path),
+        "metadata_path": str(metadata_path) if metadata_path is not None else None,
         "launcher": result,
         "metadata_temp_cleanup": metadata_temp_cleanup,
+        "post_dispatch_warnings": post_dispatch_warnings,
     }
 
 

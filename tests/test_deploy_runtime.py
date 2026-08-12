@@ -71,6 +71,28 @@ class DeployRuntimeTests(unittest.TestCase):
             source_bytes=b"print('snapshot')\n",
         )
 
+    def test_target_schema_must_match_independent_root_anchor(self) -> None:
+        expected = b"trusted schema\n"
+        with patch.object(
+            deploy_runtime, "_verified_contract_trust_anchor", return_value=expected
+        ), patch.object(deploy_runtime, "git_show", return_value=expected):
+            deploy_runtime.require_target_schema_anchored(ROOT, "a" * 40)
+
+        with patch.object(
+            deploy_runtime, "_verified_contract_trust_anchor", return_value=expected
+        ), patch.object(deploy_runtime, "git_show", return_value=b"different schema\n"):
+            with self.assertRaisesRegex(
+                deploy_runtime.DeployError, "Rootbroker-Cutover"
+            ):
+                deploy_runtime.require_target_schema_anchored(ROOT, "a" * 40)
+
+    def test_same_uid_schema_file_is_not_a_trust_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "schema.py"
+            path.write_text("VALUE = 1\n", encoding="utf-8")
+            with self.assertRaises(deploy_runtime.DeployError):
+                deploy_runtime._verified_contract_trust_anchor(path)
+
     @staticmethod
     def _completed(argv, returncode: int = 0) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, returncode, "", "")
@@ -263,10 +285,20 @@ class DeployRuntimeTests(unittest.TestCase):
             r"runtime_assets\[0\]\.destination must be a repository-relative path",
         ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+        # Canonical spelling, so this still exercises the reserved-name check
+        # rather than tripping the canonicity check first.
+        invalid = json.loads(raw)
+        invalid["runtime_assets"][0]["source"] = "runtime-entrypoint.json"
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source uses a reserved snapshot input name"
+        ):
+            deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
+
+        # And a non-canonical spelling is rejected in its own right.
         invalid = json.loads(raw)
         invalid["runtime_assets"][0]["source"] = "./runtime-entrypoint.json"
         with self.assertRaisesRegex(
-            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source uses a reserved snapshot input name"
+            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source must already be canonical"
         ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 

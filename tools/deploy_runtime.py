@@ -36,6 +36,7 @@ RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
 CONTRACT_VALIDATOR_RELATIVE = Path("src/grabowski_runtime_contract.py")
+RUNTIME_CONTRACT_TRUST_ANCHOR = Path("/etc/grabowski/runtime-contract-schema.py")
 RELEASES_DIR_NAME = "grabowski-mcp-releases"
 MANIFEST_NAME = "deployment-manifest.json"
 INCOMPLETE_MARKER = "deployment-incomplete.json"
@@ -687,13 +688,21 @@ def git_show(repo: Path, head: str, path: Path) -> bytes:
 def verify_import_closure(
     *, module: str, source_bytes: bytes, supporting: Mapping[str, bytes]
 ) -> None:
-    """Fail unless every deployed module can import what it needs at runtime.
+    """Fail unless every statically imported grabowski module is also deployed.
 
     A release is only self-sufficient if each ``grabowski_*`` module it ships
     imports exclusively modules the same release ships.  Without this check a
     contract can deploy a module whose import target was never snapshotted --
     which is how the runtime ends up unable to run the very validator that
     decides whether it is valid.
+
+    Scope, stated so the check is not mistaken for a completeness proof: this
+    reads *static* ``import`` and ``from ... import`` statements at any depth of
+    the AST and reduces dotted names to their top-level package.  It therefore
+    does not see ``importlib`` lookups, ``__import__`` calls, names assembled at
+    runtime, or relative imports (which have no top-level ``grabowski_`` name to
+    resolve).  Passing means "no statically visible import is missing", not
+    "every import that will ever execute is present".
     """
     deployed = {module, *supporting}
     all_sources = {module: source_bytes, **dict(supporting)}
@@ -3134,8 +3143,61 @@ def deploy(
         )
 
 
+def _verified_contract_trust_anchor(
+    path: Path = RUNTIME_CONTRACT_TRUST_ANCHOR,
+) -> bytes:
+    """Read the root-owned schema authority used by recovery and the watchdog.
+
+    A normal deployment is allowed to change the canonical schema only after the
+    independent root-owned anchor has been updated through the exact-commit
+    Rootbroker cutover.  This preflight prevents a successful deploy from
+    immediately making the watchdog indeterminate or the recovery lane unable to
+    judge its own target.
+    """
+    try:
+        if path.is_symlink():
+            fail(f"Contract-Schema-Trust-Anchor ist ein Symlink: {path}")
+        info = path.lstat()
+        if not statmod.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail(f"Contract-Schema-Trust-Anchor ist kein reguläres Single-Link-File: {path}")
+        if info.st_uid != 0 or info.st_mode & 0o022:
+            fail(f"Contract-Schema-Trust-Anchor hat unsichere Ownership/Rechte: {path}")
+        for parent in path.parents:
+            parent_info = parent.lstat()
+            if (
+                not statmod.S_ISDIR(parent_info.st_mode)
+                or parent_info.st_uid != 0
+                or parent_info.st_mode & 0o022
+            ):
+                fail(f"Contract-Schema-Trust-Anchor hat unsicheren Elternpfad: {parent}")
+            if parent == Path("/"):
+                break
+        return path.read_bytes()
+    except DeployError:
+        raise
+    except OSError as exc:
+        fail(
+            "Contract-Schema-Trust-Anchor ist nicht sicher lesbar; "
+            "zuerst den Rootbroker-Cutover für den exakten Ziel-Commit ausführen: "
+            f"{path} ({exc})"
+        )
+
+
+def require_target_schema_anchored(repo: Path, expected_head: str) -> None:
+    anchor = _verified_contract_trust_anchor()
+    target = git_show(repo, expected_head, CONTRACT_VALIDATOR_RELATIVE)
+    if target != anchor:
+        fail(
+            "Ziel-Commit ändert den kanonischen Runtime-Contract-Validator, aber "
+            "der unabhängige root-eigene Trust-Anchor ist noch nicht auf diesen "
+            "Commit gebunden. Zuerst den Rootbroker-Cutover für den exakten "
+            "Ziel-Commit ausführen; danach Deployment erneut starten."
+        )
+
+
 def preflight_apply(repo: Path, runtime: Path, profile_path: Path) -> None:
     snapshot = snapshot_from_git(repo)
+    require_target_schema_anchored(repo, snapshot.repo_head)
     runtime = require_runtime_replaceable(runtime)
     require_profile_matches_contract(profile_path, runtime, snapshot.contract)
 

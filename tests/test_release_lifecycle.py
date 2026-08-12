@@ -346,6 +346,77 @@ class ReleaseLifecycleRejectionTests(unittest.TestCase):
         self.assertFalse(metadata["provenance_valid"])
 
 
+class NonCanonicalPathTests(unittest.TestCase):
+    """A contract must not be silently rewritten between snapshot and manifest.
+
+    Regression for the second roundtrip bug: the builder accepted paths like
+    ``./src/x.py``, normalised them in ``to_manifest()``, and the embedded
+    contract then differed from the snapshotted contract file it came from --
+    driving embedded_contract_valid and provenance_valid false, which is exactly
+    the deadlock class the canonical validator was introduced to remove.
+    """
+
+    NON_CANONICAL = {
+        "leading dot slash": "./src/grabowski_runtime.py",
+        "double slash": "src//grabowski_runtime.py",
+        "embedded dot": "src/./grabowski_runtime.py",
+        "trailing slash": "src/grabowski_runtime.py/",
+    }
+
+    def setUp(self) -> None:
+        self.contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+
+    def test_repository_contract_paths_are_already_canonical(self) -> None:
+        self.assertIsNone(grabowski_runtime_contract.contract_error(self.contract))
+
+    def test_non_canonical_source_is_rejected(self) -> None:
+        for label, path in self.NON_CANONICAL.items():
+            with self.subTest(label):
+                contract = copy.deepcopy(self.contract)
+                contract["source"] = path
+                error = grabowski_runtime_contract.contract_error(contract)
+                self.assertIsNotNone(error, f"{path!r} must not be accepted")
+                self.assertIn("canonical", error)
+
+    def test_non_canonical_supporting_source_is_rejected(self) -> None:
+        contract = copy.deepcopy(self.contract)
+        contract["supporting_sources"][0]["source"] = (
+            "./" + contract["supporting_sources"][0]["source"]
+        )
+        self.assertIsNotNone(grabowski_runtime_contract.contract_error(contract))
+
+    def test_non_canonical_runtime_asset_paths_are_rejected(self) -> None:
+        for field in ("source", "destination"):
+            with self.subTest(field):
+                contract = copy.deepcopy(self.contract)
+                contract["runtime_assets"][0][field] = (
+                    "./" + contract["runtime_assets"][0][field]
+                )
+                self.assertIsNotNone(
+                    grabowski_runtime_contract.contract_error(contract)
+                )
+
+    def test_builder_rejects_instead_of_normalising(self) -> None:
+        """The builder must fail closed, not accept-and-rewrite."""
+        for label, path in self.NON_CANONICAL.items():
+            with self.subTest(label):
+                contract = copy.deepcopy(self.contract)
+                contract["source"] = path
+                with self.assertRaises(deploy_runtime.DeployError):
+                    deploy_runtime.load_contract_bytes(
+                        json.dumps(contract).encode("utf-8")
+                    )
+
+    def test_accepted_contract_survives_the_manifest_roundtrip_unchanged(self) -> None:
+        """Whatever the builder accepts must reach the manifest byte-stable."""
+        contract = deploy_runtime.load_contract_bytes(
+            (ROOT / "config" / "runtime-entrypoint.json").read_bytes()
+        )
+        self.assertEqual(contract.to_manifest(), self.contract)
+
+
 class ContractSchemaFailClosedTests(unittest.TestCase):
     """The canonical schema itself, independent of any staged release."""
 
