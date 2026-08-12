@@ -687,7 +687,7 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             "managed-active-lifecycle-attention", group["action_reasons"]
         )
 
-    def test_managed_lifecycle_drift_is_fail_closed_and_explained(self) -> None:
+    def test_terminal_managed_lifecycle_drift_is_hygiene_and_explained(self) -> None:
         owner = "operator:managed-drift"
         result = project(
             checkout_payloads=[
@@ -710,12 +710,63 @@ class CurrentWorkProjectionTests(unittest.TestCase):
             ]
         )
         group = result["work"][0]
-        self.assertEqual(group["projection_state"], "blocking")
+        self.assertEqual(group["projection_state"], "hygiene")
+        self.assertEqual(group["work_class"], "hygiene")
         self.assertIn("managed-lifecycle-drift", group["action_reasons"])
         self.assertIn(
             "archived-binding-without-matching-open-archive",
             group["action_reasons"],
         )
+
+    def test_terminal_managed_lifecycle_drift_with_process_remains_blocking(self) -> None:
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-drift-live",
+                            "/home/alex/repos/.worktrees/managed-drift-live",
+                            processes=[{"pid": 42, "command": "python"}],
+                            lifecycle_state="managed_lifecycle_drift",
+                            binding_owner="operator:managed-drift-live",
+                            binding_phase="archived",
+                            binding_consistent=False,
+                            drift_reasons=["retention-archive-branch-mismatch"],
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("managed-lifecycle-drift", group["action_reasons"])
+
+    def test_terminal_managed_lifecycle_drift_with_live_lease_remains_blocking(self) -> None:
+        owner = "operator:managed-drift-lease"
+        path = "/home/alex/repos/.worktrees/managed-drift-lease"
+        result = project(
+            checkout_payloads=[
+                {
+                    "repository": REPOSITORY,
+                    "worktrees": [
+                        checkout(
+                            "managed-drift-lease",
+                            path,
+                            owner_ids=[owner],
+                            lifecycle_state="managed_lifecycle_drift",
+                            binding_owner=owner,
+                            binding_phase="archived",
+                            binding_consistent=False,
+                            drift_reasons=["retention-archive-branch-mismatch"],
+                        )
+                    ],
+                }
+            ]
+        )
+        group = result["work"][0]
+        self.assertEqual(group["projection_state"], "blocking")
+        self.assertIn("managed-lifecycle-drift", group["action_reasons"])
 
     def test_inconsistent_binding_does_not_establish_owner_authority(self) -> None:
         claimed_owner = "operator:claimed-by-drift"
@@ -1408,6 +1459,47 @@ class CurrentWorkProjectionTests(unittest.TestCase):
         self.assertEqual(len(matching), 1)
         self.assertEqual(matching[0]["projection_state"], "blocking")
         self.assertIn("checkout-path-mismatch", matching[0]["action_reasons"])
+
+    def test_terminal_binding_identity_drift_reconciliation_stays_hygiene(self) -> None:
+        existing = checkout(
+            "key-terminal-drift",
+            "/home/alex/repos/.worktrees/key-terminal-drift",
+            lifecycle_state="managed_lifecycle_drift",
+            binding_owner="operator:terminal-drift",
+            binding_phase="completed_retained",
+            binding_consistent=False,
+            retention_active=True,
+            drift_reasons=["binding-retention-owner-mismatch"],
+        )
+        result = project(
+            checkout_payloads=[{"repository": REPOSITORY, "worktrees": [existing]}],
+            reconciliation_payload={
+                "bindings": [
+                    {
+                        "checkout_key": "key-terminal-drift",
+                        "state": "binding_identity_drift",
+                        "blocking": True,
+                        "reasons": ["binding-retention-owner-mismatch"],
+                        "binding_identity": {"checkout_key": "key-terminal-drift"},
+                        "worktree_identity": {"checkout_key": "key-terminal-drift"},
+                        "evidence": {"owner_id": "operator:terminal-drift"},
+                        "recommended_next_step": "reconcile_binding_identity_before_lifecycle_action",
+                    }
+                ],
+                "pagination": {"has_more": False},
+            },
+        )
+        matching = [
+            row for row in result["work"]
+            if row["binding"]["id"] == "key-terminal-drift"
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0]["projection_state"], "hygiene")
+        self.assertEqual(matching[0]["work_class"], "hygiene")
+        self.assertIn(
+            "checkout-binding-binding_identity_drift",
+            matching[0]["action_reasons"],
+        )
 
     def test_historical_reconciliation_does_not_displace_active_work(self) -> None:
         bindings = [
