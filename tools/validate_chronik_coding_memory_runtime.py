@@ -20,6 +20,13 @@ EXPECTED_BINDING_SCHEMA = "grabowski-chronik-coding-memory-runtime-binding.v1"
 EXPECTED_PRODUCER_REPOSITORY = "heimgewebe/chronik"
 EXPECTED_PRODUCER_PATH = "tools/coding_memory.runtime.v1.json"
 EXPECTED_ENTRYPOINT = "tools/coding_memory.py"
+EXPECTED_REQUIREMENTS_SOURCE = "requirements.txt"
+REQUIRED_BOUNDARIES = {
+    "dynamic_import_absence",
+    "installed_distribution_versions",
+    "consumer_environment_compatibility",
+    "runtime_success_without_consumer_validation",
+}
 PIN_RE = re.compile(r"^([A-Za-z0-9_.-]+)==([A-Za-z0-9][A-Za-z0-9.+!-]*)$")
 CLAUSE_RE = re.compile(r"^(==|>=|<=|>|<)(\d+(?:\.\d+)*)$")
 HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -191,6 +198,35 @@ def validate_root(root: Path = ROOT) -> dict[str, object]:
         raise ValueError("Chronik runtime contract schema_version mismatch")
     if contract.get("entrypoint") != EXPECTED_ENTRYPOINT:
         raise ValueError("Chronik runtime contract entrypoint mismatch")
+    if contract.get("requirements_source") != EXPECTED_REQUIREMENTS_SOURCE:
+        raise ValueError("Chronik runtime requirements_source mismatch")
+
+    python_contract = contract.get("python")
+    if not isinstance(python_contract, dict) or set(python_contract) != {"requires"}:
+        raise ValueError("Chronik runtime Python contract is invalid")
+    python_requires = python_contract.get("requires")
+    if not isinstance(python_requires, str) or not python_requires:
+        raise ValueError("Chronik runtime Python requirement is invalid")
+    consumer_python = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if not _satisfies(consumer_python, python_requires):
+        raise ValueError(
+            "Grabowski validation Python violates Chronik contract: "
+            f"python=={consumer_python} not in {python_requires}"
+        )
+
+    boundaries = contract.get("does_not_establish")
+    if (
+        not isinstance(boundaries, list)
+        or not all(isinstance(item, str) and item for item in boundaries)
+        or len(boundaries) != len(set(boundaries))
+    ):
+        raise ValueError("Chronik runtime does_not_establish is invalid")
+    missing_boundaries = sorted(REQUIRED_BOUNDARIES - set(boundaries))
+    if missing_boundaries:
+        raise ValueError(
+            "Chronik runtime semantic boundaries drifted: missing="
+            + ",".join(missing_boundaries)
+        )
 
     direct = _parse_direct_pins(runtime_input)
     locked = _parse_lock_versions(runtime_lock)
@@ -229,7 +265,7 @@ def validate_root(root: Path = ROOT) -> dict[str, object]:
             )
         if not _satisfies(direct_version, specifier):
             raise ValueError(
-                f"Grabowski runtime pin violates Chronik contract: "
+                "Grabowski runtime pin violates Chronik contract: "
                 f"{normalized}=={direct_version} not in {specifier}"
             )
         compatible[normalized] = direct_version
@@ -238,6 +274,7 @@ def validate_root(root: Path = ROOT) -> dict[str, object]:
         "schema_version": EXPECTED_BINDING_SCHEMA,
         "producer_commit": producer_commit,
         "producer_sha256": producer_sha256,
+        "producer_python_requires": python_requires,
         "compatible_runtime_pins": dict(sorted(compatible.items())),
     }
 
