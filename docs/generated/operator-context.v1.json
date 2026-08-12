@@ -2971,6 +2971,10 @@
         "source": "src/grabowski_deployment_observer.py"
       },
       {
+        "module": "grabowski_runtime_contract",
+        "source": "src/grabowski_runtime_contract.py"
+      },
+      {
         "module": "grabowski_mcp",
         "source": "src/grabowski_mcp.py"
       },
@@ -3364,7 +3368,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "ca8591474e554e6cafc49c39f5709ac5efdb99a3dea92d05f69943d5f2e02a99"
+      "sha256": "82b56094fc41387657bf43d00e6496c425e935e71e5d9721377389faf98dd9fc"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3424,7 +3428,7 @@
       "src/grabowski_lifecycle_projection.py": "365c602e27b82cc04ae271221a0a306a0661076ae6c017b85ddc373c43623469",
       "src/grabowski_lifecycle_read_surface.py": "fbf368f603fde699e5c7c5f662b309349d0e1a2e96ad7aa955abb1665f7c47c4",
       "src/grabowski_managed_cargo.py": "5afbf4b5202468020e9ffd9a2989ee8b23711f5e663530620c81ceb86efce340",
-      "src/grabowski_mcp.py": "6a3a1e60419152b47db9ae851411b5d3e26ce712f6a56d1f6e325cf334f5a399",
+      "src/grabowski_mcp.py": "23738ddc61244029d6eb2b8f759b175adb12bbb66882c4a0c39cd9a6c199e092",
       "src/grabowski_merge_delivery.py": "66df7767cb0305ff1f3e0078cad1696b57f14830909f0b62fd334045ae8e06bb",
       "src/grabowski_merge_delivery_surface.py": "933e22c44b691e6522acc733cc4470b1e5306b738ed5734c255dedd0ff5c9860",
       "src/grabowski_merge_guard.py": "6bb5772e2f54017c367d9c13d63579e0e7a45bfbd8116a035ee0a1da058cf012",
@@ -3449,6 +3453,7 @@
       "src/grabowski_reposkop_shadow.py": "257933f6dec5e9877b3fbf5186d7ad3756f313f8313d22cf90a30e9011b1cfab",
       "src/grabowski_resources.py": "184569b1d93a4c3531476f29bd0e599b1172a8c82f7082f4c6e64363222e892e",
       "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",
+      "src/grabowski_runtime_contract.py": "72f4c3ad3693793c7c83b258c33ca8d1e483d90a5db22fc92e2b0a5396aae4e3",
       "src/grabowski_runtime_extensions.py": "66e7e5988f167865a23cea380fcefc9c5099f90354b12e3e7b3bc3827c07b2c2",
       "src/grabowski_self_deploy.py": "569d0f3f2a289e3ece52a98d205151cd78c3efb47d7bd5ca754d2d50c3095659",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",

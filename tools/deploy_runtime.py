@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
@@ -18,7 +19,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Iterator, NoReturn
+import types
+from typing import Any, Iterator, Mapping, NoReturn
 
 
 SERVICE = "tunnel-client-grabowski.service"
@@ -33,6 +35,7 @@ DEFAULT_LOCK_FILE = DEFAULT_STATE_ROOT / "deploy.lock"
 RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
+CONTRACT_VALIDATOR_RELATIVE = Path("src/grabowski_runtime_contract.py")
 RESERVED_SNAPSHOT_INPUT_PATHS = frozenset({
     ENTRYPOINT_CONTRACT_RELATIVE.name,
     RUNTIME_INPUT_RELATIVE.name,
@@ -499,165 +502,98 @@ def _relative_path(value: str, label: str) -> Path:
     return path
 
 
-def load_contract_bytes(data: bytes) -> RuntimeContract:
+def load_contract_validator_bytes(data: bytes) -> types.SimpleNamespace:
+    """Load the canonical contract validator shipped by the revision being deployed.
+
+    The builder must judge a contract with exactly the validator that the
+    resulting runtime will use.  Importing the tool's own checkout instead would
+    reintroduce build/runtime skew whenever the deployed revision differs from
+    the revision this script happens to live in.
+    """
+    namespace: dict[str, Any] = {"__name__": "grabowski_runtime_contract_deployment"}
+    try:
+        compiled = compile(
+            data.decode("utf-8"), str(CONTRACT_VALIDATOR_RELATIVE), "exec"
+        )
+        exec(compiled, namespace)  # noqa: S102 - revision-bound canonical schema
+    except (UnicodeDecodeError, SyntaxError, ValueError) as exc:
+        fail(f"Kanonischer Contract-Validator ist ungültig: {exc}")
+    module = types.SimpleNamespace(**namespace)
+    for attribute in (
+        "validate_contract",
+        "contract_error",
+        "RuntimeContractError",
+        "CANONICAL_VALIDATOR_MODULE",
+    ):
+        if not hasattr(module, attribute):
+            fail(f"Kanonischer Contract-Validator exportiert {attribute} nicht")
+    return module
+
+
+def local_contract_validator() -> types.SimpleNamespace:
+    """Load the canonical validator from the checkout this script lives in."""
+    path = Path(__file__).resolve().parents[1] / CONTRACT_VALIDATOR_RELATIVE
+    require_file(path, "Kanonischer Contract-Validator")
+    return load_contract_validator_bytes(path.read_bytes())
+
+
+def load_contract_bytes(
+    data: bytes, *, validator: types.SimpleNamespace | None = None
+) -> RuntimeContract:
+    """Parse and validate a runtime entry-point contract, fail-closed.
+
+    Shape validation is delegated to ``grabowski_runtime_contract`` -- the same
+    module the deployed runtime uses -- so a contract the builder accepts cannot
+    be rejected afterwards by the runtime it produces.
+    """
+    if validator is None:
+        validator = local_contract_validator()
     try:
         raw = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         fail(f"Runtime-Entry-Point-Contract ist ungültig: {exc}")
-    if not isinstance(raw, dict):
-        fail("Runtime-Entry-Point-Contract ist kein Objekt")
-    schema_version = raw.get("schema_version")
-    if schema_version not in {1, 2, 3, 4}:
-        fail("Runtime-Entry-Point-Contract benötigt schema_version 1, 2, 3 oder 4")
-    mode = raw.get("mode")
-    if mode != "module":
-        fail(f"Nicht unterstützter Entry-Point-Modus: {mode!r}")
-    tools = raw.get("expected_tools")
-    if not isinstance(tools, list) or not tools or not all(isinstance(item, str) and item for item in tools):
-        fail("Runtime-Entry-Point-Contract benötigt expected_tools als nichtleere Stringliste")
-    source = _relative_path(str(raw.get("source", "")), "source")
-    if source.as_posix() == ".":
-        fail("Runtime-Entry-Point-Contract benötigt source")
-    module = raw.get("module")
-    if not isinstance(module, str) or not MODULE_RE.fullmatch(module):
-        fail(f"Ungültiges Modul im Runtime-Entry-Point-Contract: {module!r}")
-    raw_browser_operator_default = raw.get("browser_operator_default")
-    if raw_browser_operator_default is not None and not isinstance(
-        raw_browser_operator_default, dict
-    ):
-        fail("browser_operator_default muss ein Objekt sein")
-    browser_operator_default = (
-        None
-        if raw_browser_operator_default is None
-        else json.loads(json.dumps(raw_browser_operator_default))
-    )
 
-    raw_supporting = raw.get("supporting_sources", [])
-    if schema_version == 1 and raw_supporting:
-        fail("supporting_sources benötigt schema_version 2")
-    if not isinstance(raw_supporting, list):
-        fail("supporting_sources muss eine Liste sein")
-    supporting: list[RuntimeSource] = []
-    seen_modules = {module}
-    seen_paths = {source}
-    for index, item in enumerate(raw_supporting):
-        if not isinstance(item, dict) or set(item) != {"module", "source"}:
-            fail(f"supporting_sources[{index}] ist ungültig")
-        supporting_module = item.get("module")
-        if not isinstance(supporting_module, str) or not MODULE_RE.fullmatch(supporting_module):
-            fail(f"Ungültiges supporting_sources-Modul: {supporting_module!r}")
-        supporting_path = _relative_path(str(item.get("source", "")), f"supporting_sources[{index}].source")
-        if supporting_path.as_posix() == ".":
-            fail(f"supporting_sources[{index}] benötigt source")
-        if supporting_module in seen_modules or supporting_path in seen_paths:
-            fail("Doppeltes Runtime-Modul oder doppelter Runtime-Quellpfad")
-        seen_modules.add(supporting_module)
-        seen_paths.add(supporting_path)
-        supporting.append(RuntimeSource(module=supporting_module, source=supporting_path))
-
-    if schema_version < 4 and "spawn_dependencies" in raw:
-        fail("spawn_dependencies benötigt schema_version 4")
-    if schema_version == 4 and "spawn_dependencies" not in raw:
-        fail("schema_version 4 benötigt spawn_dependencies")
-    raw_spawn_dependencies = raw.get("spawn_dependencies", [])
-    if not isinstance(raw_spawn_dependencies, list):
-        fail("spawn_dependencies muss eine Liste sein")
-    spawn_dependencies: list[RuntimeSpawnDependency] = []
-    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
-    for index, item in enumerate(raw_spawn_dependencies):
-        if not isinstance(item, dict) or set(item) != {
-            "kind",
-            "launcher_module",
-            "spawned_module",
-        }:
-            fail(f"spawn_dependencies[{index}] ist ungültig")
-        kind = item.get("kind")
-        launcher_module = item.get("launcher_module")
-        spawned_module = item.get("spawned_module")
-        if kind != "python_module":
-            fail(f"Nicht unterstützte spawn_dependencies-Art: {kind!r}")
-        if (
-            not isinstance(launcher_module, str)
-            or MODULE_RE.fullmatch(launcher_module) is None
-            or launcher_module not in seen_modules
-        ):
-            fail(f"Ungültiges spawn_dependencies-Launcher-Modul: {launcher_module!r}")
-        if (
-            not isinstance(spawned_module, str)
-            or MODULE_RE.fullmatch(spawned_module) is None
-            or spawned_module not in seen_modules
-        ):
-            fail(f"Ungültiges spawn_dependencies-Zielmodul: {spawned_module!r}")
-        identity = (kind, launcher_module, spawned_module)
-        if identity in seen_spawn_dependencies:
-            fail("Doppelte Runtime-Spawn-Abhängigkeit")
-        seen_spawn_dependencies.add(identity)
-        spawn_dependencies.append(
-            RuntimeSpawnDependency(
-                kind=kind,
-                launcher_module=launcher_module,
-                spawned_module=spawned_module,
-            )
-        )
-
-    raw_assets = raw.get("runtime_assets", [])
-    if schema_version < 3 and raw_assets:
-        fail("runtime_assets benötigt schema_version 3")
-    if not isinstance(raw_assets, list):
-        fail("runtime_assets muss eine Liste sein")
-    runtime_assets: list[RuntimeAsset] = []
-    seen_asset_sources: set[Path] = set()
-    seen_asset_destinations: set[Path] = set()
-    for index, item in enumerate(raw_assets):
-        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
-            fail(f"runtime_assets[{index}] ist ungültig")
-        asset_source = _relative_path(
-            str(item.get("source", "")), f"runtime_assets[{index}].source"
-        )
-        asset_destination = _relative_path(
-            str(item.get("destination", "")),
-            f"runtime_assets[{index}].destination",
-        )
-        if asset_source.as_posix() == "." or asset_destination.as_posix() == ".":
-            fail(f"runtime_assets[{index}] benötigt source und destination")
-        if asset_source.as_posix() in RESERVED_SNAPSHOT_INPUT_PATHS:
-            fail(f"runtime_assets[{index}] verwendet einen reservierten Snapshot-Quellpfad")
-        if asset_source in seen_paths or asset_source in seen_asset_sources:
-            fail("Doppelter Runtime-Quellpfad")
-        if asset_destination in seen_asset_destinations:
-            fail("Doppeltes Runtime-Asset-Ziel")
-        if any(
-            asset_destination in existing.parents or existing in asset_destination.parents
-            for existing in seen_asset_destinations
-        ):
-            fail("Überlappende Runtime-Asset-Ziele")
-        if asset_destination.parts[0] in {".venv", "inputs"} or asset_destination.as_posix() in {
-            MANIFEST_NAME,
-            INCOMPLETE_MARKER,
-        }:
-            fail(f"runtime_assets[{index}] verwendet ein reserviertes Ziel")
-        seen_asset_sources.add(asset_source)
-        seen_asset_destinations.add(asset_destination)
-        runtime_assets.append(
-            RuntimeAsset(source=asset_source, destination=asset_destination)
-        )
+    error = validator.contract_error(raw)
+    if error is not None:
+        fail(f"Runtime-Entry-Point-Contract ist ungültig: {error}")
 
     return RuntimeContract(
-        schema_version=schema_version,
+        schema_version=raw["schema_version"],
         mode="module",
-        module=module,
-        source=source,
-        expected_tools=tuple(tools),
-        supporting_sources=tuple(supporting),
-        runtime_assets=tuple(runtime_assets),
-        spawn_dependencies=tuple(spawn_dependencies),
-        browser_operator_default=browser_operator_default,
+        module=raw["module"],
+        source=Path(raw["source"]),
+        expected_tools=tuple(raw["expected_tools"]),
+        supporting_sources=tuple(
+            RuntimeSource(module=item["module"], source=Path(item["source"]))
+            for item in raw.get("supporting_sources", [])
+        ),
+        runtime_assets=tuple(
+            RuntimeAsset(
+                source=Path(item["source"]), destination=Path(item["destination"])
+            )
+            for item in raw.get("runtime_assets", [])
+        ),
+        spawn_dependencies=tuple(
+            RuntimeSpawnDependency(
+                kind=item["kind"],
+                launcher_module=item["launcher_module"],
+                spawned_module=item["spawned_module"],
+            )
+            for item in raw.get("spawn_dependencies", [])
+        ),
+        browser_operator_default=(
+            json.loads(json.dumps(raw["browser_operator_default"]))
+            if "browser_operator_default" in raw
+            else None
+        ),
     )
 
 
-def load_contract(path: Path) -> RuntimeContract:
+def load_contract(
+    path: Path, *, validator: types.SimpleNamespace | None = None
+) -> RuntimeContract:
     require_file(path, "Runtime-Entry-Point-Contract")
-    return load_contract_bytes(path.read_bytes())
+    return load_contract_bytes(path.read_bytes(), validator=validator)
 
 
 @dataclass(frozen=True)
@@ -671,6 +607,9 @@ class Snapshot:
     source_bytes: bytes
     supporting_source_bytes: dict[str, bytes] = field(default_factory=dict)
     runtime_asset_bytes: dict[str, bytes] = field(default_factory=dict)
+    # Canonical contract validator of the revision this snapshot deploys, so
+    # every later manifest check judges the release by its own schema.
+    validator: Any = None
 
     @property
     def contract_sha256(self) -> str:
@@ -757,19 +696,71 @@ def git_show(repo: Path, head: str, path: Path) -> bytes:
     )
 
 
+def verify_import_closure(
+    *, module: str, source_bytes: bytes, supporting: Mapping[str, bytes]
+) -> None:
+    """Fail unless every deployed module can import what it needs at runtime.
+
+    A release is only self-sufficient if each ``grabowski_*`` module it ships
+    imports exclusively modules the same release ships.  Without this check a
+    contract can deploy a module whose import target was never snapshotted --
+    which is how the runtime ends up unable to run the very validator that
+    decides whether it is valid.
+    """
+    deployed = {module, *supporting}
+    all_sources = {module: source_bytes, **dict(supporting)}
+    for deployed_module, data in sorted(all_sources.items()):
+        try:
+            tree = ast.parse(data.decode("utf-8"), filename=f"{deployed_module}.py")
+        except (UnicodeDecodeError, SyntaxError) as exc:
+            fail(f"Deployte Quelle {deployed_module} ist nicht parsebar: {exc}")
+        required: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    required.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    required.add(node.module.split(".")[0])
+        missing = sorted(
+            name
+            for name in required
+            if name.startswith("grabowski_") and name not in deployed
+        )
+        if missing:
+            fail(
+                f"Deployte Quelle {deployed_module} importiert nicht deployte "
+                f"Runtime-Module: {', '.join(missing)}"
+            )
+
+
 def snapshot_from_git(repo: Path) -> Snapshot:
     repo_head = require_clean_repo(repo)
     contract_bytes = git_show(repo, repo_head, ENTRYPOINT_CONTRACT_RELATIVE)
-    contract = load_contract_bytes(contract_bytes)
+    validator = load_contract_validator_bytes(
+        git_show(repo, repo_head, CONTRACT_VALIDATOR_RELATIVE)
+    )
+    contract = load_contract_bytes(contract_bytes, validator=validator)
+    source_bytes = git_show(repo, repo_head, contract.source)
+    supporting_source_bytes = {
+        item.module: git_show(repo, repo_head, item.source)
+        for item in contract.supporting_sources
+    }
+    verify_import_closure(
+        module=contract.module,
+        source_bytes=source_bytes,
+        supporting=supporting_source_bytes,
+    )
     return Snapshot(
         repo_head=repo_head,
         dirty=False,
         contract=contract,
         contract_bytes=contract_bytes,
+        validator=validator,
         runtime_input_bytes=git_show(repo, repo_head, RUNTIME_INPUT_RELATIVE),
         runtime_lock_bytes=git_show(repo, repo_head, RUNTIME_LOCK_RELATIVE),
-        source_bytes=git_show(repo, repo_head, contract.source),
-        supporting_source_bytes={item.module: git_show(repo, repo_head, item.source) for item in contract.supporting_sources},
+        source_bytes=source_bytes,
+        supporting_source_bytes=supporting_source_bytes,
         runtime_asset_bytes={
             item.destination.as_posix(): git_show(repo, repo_head, item.source)
             for item in contract.runtime_assets
@@ -782,19 +773,30 @@ def snapshot_from_worktree(repo: Path) -> Snapshot:
     dirty = repo_dirty(repo)
     contract_path = repo / ENTRYPOINT_CONTRACT_RELATIVE
     contract_bytes = contract_path.read_bytes()
-    contract = load_contract_bytes(contract_bytes)
+    validator_path = repo / CONTRACT_VALIDATOR_RELATIVE
+    require_file(validator_path, "Kanonischer Contract-Validator")
+    validator = load_contract_validator_bytes(validator_path.read_bytes())
+    contract = load_contract_bytes(contract_bytes, validator=validator)
+    source_bytes = (repo / contract.source).read_bytes()
+    supporting_source_bytes = {
+        item.module: (repo / item.source).read_bytes()
+        for item in contract.supporting_sources
+    }
+    verify_import_closure(
+        module=contract.module,
+        source_bytes=source_bytes,
+        supporting=supporting_source_bytes,
+    )
     return Snapshot(
         repo_head=repo_head,
         dirty=dirty,
         contract=contract,
         contract_bytes=contract_bytes,
+        validator=validator,
         runtime_input_bytes=(repo / RUNTIME_INPUT_RELATIVE).read_bytes(),
         runtime_lock_bytes=(repo / RUNTIME_LOCK_RELATIVE).read_bytes(),
-        source_bytes=(repo / contract.source).read_bytes(),
-        supporting_source_bytes={
-            item.module: (repo / item.source).read_bytes()
-            for item in contract.supporting_sources
-        },
+        source_bytes=source_bytes,
+        supporting_source_bytes=supporting_source_bytes,
         runtime_asset_bytes={
             item.destination.as_posix(): (repo / item.source).read_bytes()
             for item in contract.runtime_assets
@@ -1882,7 +1884,9 @@ def _is_lower_hex(value: Any, length: int) -> bool:
     )
 
 
-def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
+def validate_manifest_schema(
+    manifest: dict[str, Any], *, validator: types.SimpleNamespace | None = None
+) -> list[str]:
     required = {
         "schema_version": int,
         "release_id": str,
@@ -1935,134 +1939,24 @@ def validate_manifest_schema(manifest: dict[str, Any]) -> list[str]:
     if not _valid_agent_instructions_identity(manifest.get("agent_instructions")):
         errors.append("agent_instructions")
 
+    # Contract shape is owned by grabowski_runtime_contract; this function only
+    # cross-checks the manifest fields that must agree with it.
     contract = manifest.get("entrypoint_contract")
     modules: set[str] = set()
     main_module: str | None = None
     supporting_modules: set[str] = set()
     runtime_asset_destinations: set[str] = set()
-    if not isinstance(contract, dict):
+    if validator is None:
+        validator = local_contract_validator()
+    if validator.contract_error(contract) is not None:
         errors.append("entrypoint_contract")
     else:
-        schema_version = contract.get("schema_version")
-        if schema_version not in {1, 2, 3, 4} or contract.get("mode") != "module":
-            errors.append("entrypoint_contract")
-        main_module = contract.get("module")
-        if not isinstance(main_module, str) or not MODULE_RE.fullmatch(main_module):
-            errors.append("entrypoint_contract")
-            main_module = None
-        else:
-            modules.add(main_module)
-        if not isinstance(contract.get("source"), str):
-            errors.append("entrypoint_contract")
-        tools = contract.get("expected_tools")
-        if (
-            not isinstance(tools, list)
-            or not tools
-            or not all(isinstance(item, str) and item for item in tools)
-            or len(set(tools)) != len(tools)
-        ):
-            errors.append("entrypoint_contract")
-        seen_paths = {contract.get("source")}
-        supporting = contract.get("supporting_sources", [])
-        if schema_version == 1 and supporting:
-            errors.append("entrypoint_contract")
-        if not isinstance(supporting, list):
-            errors.append("entrypoint_contract")
-        else:
-            for item in supporting:
-                if not isinstance(item, dict) or set(item) != {"module", "source"}:
-                    errors.append("entrypoint_contract")
-                    continue
-                module = item.get("module")
-                source = item.get("source")
-                if (
-                    not isinstance(module, str)
-                    or not MODULE_RE.fullmatch(module)
-                    or module in modules
-                    or not isinstance(source, str)
-                    or source in seen_paths
-                ):
-                    errors.append("entrypoint_contract")
-                    continue
-                modules.add(module)
-                supporting_modules.add(module)
-                seen_paths.add(source)
-
-        if schema_version in {1, 2, 3} and "spawn_dependencies" in contract:
-            errors.append("entrypoint_contract")
-        if schema_version == 4 and "spawn_dependencies" not in contract:
-            errors.append("entrypoint_contract")
-        spawn_dependencies = contract.get("spawn_dependencies", [])
-        if not isinstance(spawn_dependencies, list):
-            errors.append("entrypoint_contract")
-        else:
-            seen_spawn_dependencies: set[tuple[str, str, str]] = set()
-            for item in spawn_dependencies:
-                if not isinstance(item, dict) or set(item) != {
-                    "kind",
-                    "launcher_module",
-                    "spawned_module",
-                }:
-                    errors.append("entrypoint_contract")
-                    continue
-                kind = item.get("kind")
-                launcher_module = item.get("launcher_module")
-                spawned_module = item.get("spawned_module")
-                identity = (kind, launcher_module, spawned_module)
-                if (
-                    kind != "python_module"
-                    or not isinstance(launcher_module, str)
-                    or launcher_module not in modules
-                    or not isinstance(spawned_module, str)
-                    or spawned_module not in modules
-                    or identity in seen_spawn_dependencies
-                ):
-                    errors.append("entrypoint_contract")
-                    continue
-                seen_spawn_dependencies.add(identity)
-
-        runtime_assets = contract.get("runtime_assets", [])
-        if schema_version in {1, 2} and runtime_assets:
-            errors.append("entrypoint_contract")
-        if not isinstance(runtime_assets, list):
-            errors.append("entrypoint_contract")
-        else:
-            seen_asset_sources: set[str] = set()
-            for item in runtime_assets:
-                if not isinstance(item, dict) or set(item) != {"source", "destination"}:
-                    errors.append("entrypoint_contract")
-                    continue
-                asset_source = item.get("source")
-                destination = item.get("destination")
-                source_path = Path(asset_source) if isinstance(asset_source, str) else None
-                destination_path = Path(destination) if isinstance(destination, str) else None
-                if (
-                    source_path is None
-                    or destination_path is None
-                    or source_path.is_absolute()
-                    or destination_path.is_absolute()
-                    or ".." in source_path.parts
-                    or ".." in destination_path.parts
-                    or source_path.as_posix() == "."
-                    or destination_path.as_posix() == "."
-                    or asset_source in seen_paths
-                    or asset_source in seen_asset_sources
-                    or source_path.as_posix() in RESERVED_SNAPSHOT_INPUT_PATHS
-                    or destination in runtime_asset_destinations
-                    or destination_path.parts[0] in {".venv", "inputs"}
-                    or destination_path.as_posix() in {MANIFEST_NAME, INCOMPLETE_MARKER}
-                ):
-                    errors.append("entrypoint_contract")
-                    continue
-                if any(
-                    destination_path in Path(existing).parents
-                    or Path(existing) in destination_path.parents
-                    for existing in runtime_asset_destinations
-                ):
-                    errors.append("entrypoint_contract")
-                    continue
-                seen_asset_sources.add(asset_source)
-                runtime_asset_destinations.add(destination)
+        main_module = contract["module"]
+        modules = set(validator.contract_modules(contract))
+        supporting_modules = modules - {main_module}
+        runtime_asset_destinations = set(
+            validator.contract_runtime_asset_destinations(contract)
+        )
 
     source_hashes = manifest.get("source_sha256s")
     if (
@@ -2142,7 +2036,7 @@ def verify_manifest(
     expected_agent_instructions: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = read_manifest(runtime_or_release)
-    schema_errors = validate_manifest_schema(manifest)
+    schema_errors = validate_manifest_schema(manifest, validator=snapshot.validator)
     if schema_errors:
         fail("Deployment-Manifest ist nicht schema-valid: " + ", ".join(schema_errors))
     expected = {

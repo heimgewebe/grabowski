@@ -40,6 +40,7 @@ except ImportError:
 from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_runtime_contract
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
 import grabowski_transport_assertion
@@ -4370,117 +4371,20 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
             return False
     if not _valid_agent_instructions_identity(raw.get("agent_instructions")):
         return False
+    # The contract shape itself is defined once, in grabowski_runtime_contract,
+    # and validated identically by the deployment builder.  Keeping a second
+    # field list here is what previously let a release be built valid and then
+    # be rejected by the very runtime it produced.
     contract = raw.get("entrypoint_contract")
-    if not isinstance(contract, dict):
+    if not grabowski_runtime_contract.contract_is_valid(contract):
         return False
-    schema_version = contract.get("schema_version")
-    expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
-    if schema_version in {2, 3, 4}:
-        expected_keys.add("supporting_sources")
-    if schema_version in {3, 4}:
-        expected_keys.add("runtime_assets")
-    if schema_version == 4:
-        expected_keys.add("spawn_dependencies")
-    if schema_version not in {1, 2, 3, 4} or set(contract) != expected_keys:
-        return False
-    module = contract.get("module")
-    source = contract.get("source")
-    if (
-        contract.get("mode") != "module"
-        or not isinstance(module, str)
-        or MODULE_RE.fullmatch(module) is None
-        or not _safe_relative_path(source)
-    ):
-        return False
-    tools = contract.get("expected_tools")
-    if (
-        not isinstance(tools, list)
-        or not tools
-        or not all(isinstance(item, str) and item for item in tools)
-        or len(set(tools)) != len(tools)
-    ):
-        return False
-    modules = {module}
-    sources = {source}
-    supporting_modules: set[str] = set()
-    supporting = contract.get("supporting_sources", [])
-    if not isinstance(supporting, list):
-        return False
-    for item in supporting:
-        if not isinstance(item, dict) or set(item) != {"module", "source"}:
-            return False
-        item_module = item.get("module")
-        item_source = item.get("source")
-        if (
-            not isinstance(item_module, str)
-            or MODULE_RE.fullmatch(item_module) is None
-            or item_module in modules
-            or not _safe_relative_path(item_source)
-            or item_source in sources
-        ):
-            return False
-        modules.add(item_module)
-        supporting_modules.add(item_module)
-        sources.add(item_source)
-
-    spawn_dependencies = contract.get("spawn_dependencies", [])
-    if not isinstance(spawn_dependencies, list):
-        return False
-    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
-    for item in spawn_dependencies:
-        if not isinstance(item, dict) or set(item) != {
-            "kind",
-            "launcher_module",
-            "spawned_module",
-        }:
-            return False
-        kind = item.get("kind")
-        launcher_module = item.get("launcher_module")
-        spawned_module = item.get("spawned_module")
-        identity = (kind, launcher_module, spawned_module)
-        if (
-            kind != "python_module"
-            or not isinstance(launcher_module, str)
-            or launcher_module not in modules
-            or not isinstance(spawned_module, str)
-            or spawned_module not in modules
-            or identity in seen_spawn_dependencies
-        ):
-            return False
-        seen_spawn_dependencies.add(identity)
-
-    runtime_asset_destinations: set[str] = set()
-    runtime_asset_sources: set[str] = set()
-    runtime_assets = contract.get("runtime_assets", [])
-    if not isinstance(runtime_assets, list):
-        return False
-    for item in runtime_assets:
-        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
-            return False
-        asset_source = item.get("source")
-        destination = item.get("destination")
-        if (
-            not _safe_relative_path(asset_source)
-            or not _safe_relative_path(destination)
-            or asset_source in sources
-            or asset_source in runtime_asset_sources
-            or Path(asset_source).as_posix() in RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS
-            or destination in runtime_asset_destinations
-        ):
-            return False
-        destination_path = Path(destination)
-        if (
-            destination_path.parts[0] in {".venv", "inputs"}
-            or destination in {"deployment-manifest.json", "deployment-incomplete.json"}
-            or any(
-                destination_path in Path(existing).parents
-                or Path(existing) in destination_path.parents
-                for existing in runtime_asset_destinations
-            )
-        ):
-            return False
-        runtime_asset_sources.add(asset_source)
-        runtime_asset_destinations.add(destination)
+    assert isinstance(contract, dict)
+    module = str(contract["module"])
+    modules = set(grabowski_runtime_contract.contract_modules(contract))
+    supporting_modules = modules - {module}
+    runtime_asset_destinations = set(
+        grabowski_runtime_contract.contract_runtime_asset_destinations(contract)
+    )
 
     hashes = raw.get("source_sha256s")
     if (

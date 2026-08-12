@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+import grabowski_runtime_contract
+
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = ROOT / "contracts" / "tool-surface-budget.v1.json"
@@ -154,92 +156,18 @@ def capability_projection(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _runtime_tools(payload: Mapping[str, Any]) -> list[str]:
+    # Contract shape is owned by grabowski_runtime_contract, the same module the
+    # deployment builder and the runtime provenance validator use.  This layer
+    # only adds the budget-specific restriction on legacy schema 1.
     schema_version = payload.get("schema_version")
     if schema_version not in {2, 3, 4}:
         raise ToolSurfaceBudgetError(
             "runtime entrypoint must use schema_version 2, 3 or 4"
         )
-    runtime_assets = payload.get("runtime_assets", [])
-    if schema_version == 2 and runtime_assets:
-        raise ToolSurfaceBudgetError("runtime_assets requires schema_version 3")
-    if not isinstance(runtime_assets, list):
-        raise ToolSurfaceBudgetError("runtime_assets must be a list")
-    for index, item in enumerate(runtime_assets):
-        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
-            raise ToolSurfaceBudgetError(
-                f"runtime_assets[{index}] must declare source and destination"
-            )
-        _text(
-            item.get("source"),
-            label=f"runtime_assets[{index}].source",
-            maximum=500,
-        )
-        _text(
-            item.get("destination"),
-            label=f"runtime_assets[{index}].destination",
-            maximum=500,
-        )
-    if schema_version in {2, 3} and "spawn_dependencies" in payload:
-        raise ToolSurfaceBudgetError("spawn_dependencies requires schema_version 4")
-    if schema_version == 4:
-        if "spawn_dependencies" not in payload:
-            raise ToolSurfaceBudgetError("schema_version 4 requires spawn_dependencies")
-        module = _text(payload.get("module"), label="runtime module", maximum=200)
-        supporting = payload.get("supporting_sources")
-        if not isinstance(supporting, list):
-            raise ToolSurfaceBudgetError("supporting_sources must be a list")
-        deployed_modules = {module}
-        for index, item in enumerate(supporting):
-            if not isinstance(item, dict) or set(item) != {"module", "source"}:
-                raise ToolSurfaceBudgetError(
-                    f"supporting_sources[{index}] must declare module and source"
-                )
-            deployed_modules.add(
-                _text(
-                    item.get("module"),
-                    label=f"supporting_sources[{index}].module",
-                    maximum=200,
-                )
-            )
-        spawn_dependencies = payload.get("spawn_dependencies")
-        if not isinstance(spawn_dependencies, list):
-            raise ToolSurfaceBudgetError("spawn_dependencies must be a list")
-        seen_spawn_dependencies: set[tuple[str, str, str]] = set()
-        for index, item in enumerate(spawn_dependencies):
-            if not isinstance(item, dict) or set(item) != {
-                "kind",
-                "launcher_module",
-                "spawned_module",
-            }:
-                raise ToolSurfaceBudgetError(
-                    f"spawn_dependencies[{index}] must declare kind, launcher_module and spawned_module"
-                )
-            kind = _text(
-                item.get("kind"),
-                label=f"spawn_dependencies[{index}].kind",
-                maximum=80,
-            )
-            launcher_module = _text(
-                item.get("launcher_module"),
-                label=f"spawn_dependencies[{index}].launcher_module",
-                maximum=200,
-            )
-            spawned_module = _text(
-                item.get("spawned_module"),
-                label=f"spawn_dependencies[{index}].spawned_module",
-                maximum=200,
-            )
-            identity = (kind, launcher_module, spawned_module)
-            if (
-                kind != "python_module"
-                or launcher_module not in deployed_modules
-                or spawned_module not in deployed_modules
-                or identity in seen_spawn_dependencies
-            ):
-                raise ToolSurfaceBudgetError(
-                    f"spawn_dependencies[{index}] is not deployment-closed"
-                )
-            seen_spawn_dependencies.add(identity)
+    try:
+        grabowski_runtime_contract.validate_contract(payload)
+    except grabowski_runtime_contract.RuntimeContractError as exc:
+        raise ToolSurfaceBudgetError(f"runtime entrypoint contract: {exc}") from exc
     raw = payload.get("expected_tools")
     if not isinstance(raw, list):
         raise ToolSurfaceBudgetError("runtime expected_tools must be a list")
