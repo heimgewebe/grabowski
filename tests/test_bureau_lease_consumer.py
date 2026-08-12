@@ -631,6 +631,7 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         elif package_contract in {
             "bureau-cycle-systemd-v2",
             "bureau-scheduler-fragments-v3",
+            "bureau-scheduler-schemas-v4",
         }:
             cycle_package = release / "src/bureau_cycle"
             cycle_package.mkdir(parents=True)
@@ -676,8 +677,20 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
                     *(systemd / f"{name}.timer" for name in scheduler_names),
                     *(libexec / name for name in scheduler_names),
                 ]
+            schema_paths: list[Path] = []
+            if package_contract == "bureau-scheduler-schemas-v4":
+                schemas = release / "schemas"
+                schemas.mkdir()
+                (schemas / "resource.v1.schema.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                (schemas / "task.v1.schema.json").write_text(
+                    "{}\n", encoding="utf-8"
+                )
+                schema_paths = sorted(schemas.glob("*.json"))
             selected_paths = [
                 pyproject,
+                *schema_paths,
                 *sorted(package.rglob("*.py")),
                 *sorted(cycle_package.rglob("*.py")),
                 *scheduler_paths,
@@ -797,6 +810,56 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         self.assertEqual(
             result["bureau_contract"]["contract_release_commit"], source_commit
         )
+
+    def test_managed_runtime_accepts_schema_packaged_scheduler_contract(self) -> None:
+        launcher, source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-schemas-v4"
+        )
+        self._use_manifest_payload_launcher(launcher)
+        with (
+            patches[0],
+            patches[1],
+            patch.object(
+                bureau.subprocess,
+                "run",
+                side_effect=lambda argv, **kwargs: self._response(argv),
+            ),
+        ):
+            runtime = bureau._managed_contract_runtime()
+            result = resources.acquire_resources(
+                "owner-a",
+                ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                purpose="task",
+                ttl_seconds=60,
+            )
+        self.assertEqual(runtime["release_commit"], source_commit)
+        self.assertEqual(
+            runtime["managed_package_contract"],
+            "bureau-scheduler-schemas-v4",
+        )
+        self.assertIn("schemas/resource.v1.schema.json", runtime["package_paths"])
+        self.assertIn("schemas/task.v1.schema.json", runtime["package_paths"])
+        self.assertEqual(
+            result["bureau_contract"]["contract_release_commit"], source_commit
+        )
+
+    def test_schema_packaged_contract_rejects_non_json_schema_entry(self) -> None:
+        launcher, _source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-schemas-v4"
+        )
+        release = Path(
+            json.loads(
+                (self.runtime / "deployment-manifest.json").read_text(encoding="utf-8")
+            )["immutable_release_path"]
+        )
+        (release / "schemas/README.txt").write_text("unexpected\n", encoding="utf-8")
+        with patches[0], patches[1]:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                bureau._managed_bureau_schema_package_paths(release)
+        self.assertEqual(
+            raised.exception.code, "contract-managed-schema-entry-invalid"
+        )
+        self.assertTrue(launcher.is_file())
 
     def test_manifest_payload_launcher_rejects_payload_digest_drift(self) -> None:
         launcher, _source_commit, patches = self._install_managed_runtime(

@@ -911,6 +911,47 @@ def _managed_bureau_scheduler_package_paths(
     return paths
 
 
+def _managed_bureau_schema_package_paths(
+    release_root: Path,
+) -> dict[str, Path]:
+    scheduler_paths = _managed_bureau_scheduler_package_paths(release_root)
+    schemas_root = release_root / "schemas"
+    if schemas_root.is_symlink() or not schemas_root.is_dir():
+        raise BureauLeaseContractError("contract-managed-schema-layout-invalid")
+    schema_paths: list[Path] = []
+    for entry in sorted(schemas_root.iterdir()):
+        try:
+            linked = entry.lstat()
+            resolved = entry.resolve(strict=True)
+        except OSError as exc:
+            raise BureauLeaseContractError(
+                "contract-managed-schema-entry-unavailable",
+                details={"error_type": type(exc).__name__},
+            ) from None
+        if (
+            stat.S_ISLNK(linked.st_mode)
+            or not stat.S_ISREG(linked.st_mode)
+            or entry.suffix != ".json"
+            or resolved != entry
+            or not _path_is_within(resolved, release_root)
+        ):
+            raise BureauLeaseContractError(
+                "contract-managed-schema-entry-invalid",
+                details={"relative_path": entry.relative_to(release_root).as_posix()},
+            )
+        schema_paths.append(entry)
+    if not schema_paths:
+        raise BureauLeaseContractError("contract-managed-schema-layout-invalid")
+    paths: dict[str, Path] = {"pyproject.toml": scheduler_paths["pyproject.toml"]}
+    for schema in schema_paths:
+        paths[schema.relative_to(release_root).as_posix()] = schema
+    for relative, path in scheduler_paths.items():
+        if relative == "pyproject.toml":
+            continue
+        paths[relative] = path
+    return paths
+
+
 def _managed_package_snapshot(
     paths: dict[str, Path],
     *,
@@ -971,6 +1012,7 @@ def _managed_package_contract(
     else:
         if cycle_sha256 == expected_sha256:
             return "bureau-cycle-systemd-v2", True, cycle_paths, cycle_identities
+    scheduler_error: BureauLeaseContractError | None = None
     try:
         scheduler_paths = _managed_bureau_scheduler_package_paths(release_root)
         scheduler_sha256, scheduler_identities = _managed_package_snapshot(
@@ -978,17 +1020,38 @@ def _managed_package_contract(
             include_executable_marker=True,
             preserve_order=True,
         )
+    except BureauLeaseContractError as exc:
+        scheduler_error = exc
+    else:
+        if scheduler_sha256 == expected_sha256:
+            return (
+                "bureau-scheduler-fragments-v3",
+                True,
+                scheduler_paths,
+                scheduler_identities,
+            )
+    try:
+        schema_paths = _managed_bureau_schema_package_paths(release_root)
+        schema_sha256, schema_identities = _managed_package_snapshot(
+            schema_paths,
+            include_executable_marker=True,
+            preserve_order=True,
+        )
     except BureauLeaseContractError:
-        if legacy_error is not None and cycle_error is not None:
+        if (
+            legacy_error is not None
+            and cycle_error is not None
+            and scheduler_error is not None
+        ):
             raise legacy_error from None
         raise BureauLeaseContractError("contract-managed-package-digest-invalid") from None
-    if scheduler_sha256 != expected_sha256:
+    if schema_sha256 != expected_sha256:
         raise BureauLeaseContractError("contract-managed-package-digest-invalid")
     return (
-        "bureau-scheduler-fragments-v3",
+        "bureau-scheduler-schemas-v4",
         True,
-        scheduler_paths,
-        scheduler_identities,
+        schema_paths,
+        schema_identities,
     )
 
 
@@ -1347,6 +1410,10 @@ def _assert_contract_runtime_unchanged(runtime: dict[str, Any]) -> None:
             observed_paths = _managed_bureau_scheduler_package_paths(
                 runtime["release_root"]
             )
+        elif managed_package_contract == "bureau-scheduler-schemas-v4":
+            observed_paths = _managed_bureau_schema_package_paths(
+                runtime["release_root"]
+            )
         else:
             raise BureauLeaseContractError("contract-managed-package-contract-invalid")
         if set(observed_paths) != set(runtime["package_paths"]):
@@ -1358,7 +1425,11 @@ def _assert_contract_runtime_unchanged(runtime: dict[str, Any]) -> None:
             include_executable_marker=runtime["managed_package_executable_marker"],
             preserve_order=(
                 managed_package_contract
-                in {"bureau-cycle-systemd-v2", "bureau-scheduler-fragments-v3"}
+                in {
+                    "bureau-cycle-systemd-v2",
+                    "bureau-scheduler-fragments-v3",
+                    "bureau-scheduler-schemas-v4",
+                }
             ),
         )
         if observed_digest != runtime["managed_package_tree_sha256"]:
