@@ -282,6 +282,28 @@ def _dirty_has_resource_overlap(item: dict[str, Any]) -> bool:
     )
 
 
+def _terminal_binding_drift_is_hygiene(item: dict[str, Any]) -> bool:
+    """Keep terminal identity drift visible without making it operative work.
+
+    A completed/archived checkout with no dirty state, live lease, process or
+    coordination overlap is historical lifecycle hygiene.  Retention may still
+    protect it from cleanup, but does not by itself make the checkout an active
+    effect lane.  Active-phase drift and every live/ambiguous surface remain
+    fail-closed and blocking.
+    """
+    return bool(
+        item["lifecycle_state"] == "managed_lifecycle_drift"
+        and item["binding_present"]
+        and not item["binding_consistent"]
+        and item["binding_phase"] in {"completed_retained", "archived"}
+        and not item["is_main"]
+        and not item["dirty"]
+        and not item["coordination_blocking"]
+        and not item["processes"]
+        and not item["resource_leases"]
+    )
+
+
 def _resumable(group: dict[str, Any], reason: str = "") -> None:
     _set_projection_state(group, "resumable")
     if reason and reason not in group["action_reasons"]:
@@ -881,8 +903,9 @@ def _checkout_candidates(
     known_task_ids = set(tasks)
 
     # Only a consistent lifecycle binding may establish exact checkout ownership.
-    # A drifted binding remains evidence of a blocking contradiction, not authority
-    # for assigning the checkout to the binding's claimed owner.
+    # A drifted binding remains non-authoritative evidence. Terminal, clean and
+    # coordination-free drift may be projected as hygiene, but it never assigns
+    # the checkout to the binding's claimed owner.
     if (
         item["binding_present"]
         and item["binding_consistent"]
@@ -1044,7 +1067,10 @@ def _add_checkouts(
             )
 
         if item["binding_present"] and not item["binding_consistent"]:
-            _blocking(group, "managed-lifecycle-drift")
+            if _terminal_binding_drift_is_hygiene(item):
+                _hygiene(group, "managed-lifecycle-drift")
+            else:
+                _blocking(group, "managed-lifecycle-drift")
             for reason in item["binding_drift_reasons"]:
                 if reason not in group["action_reasons"]:
                     group["action_reasons"].append(reason)
@@ -1191,7 +1217,15 @@ def _add_binding_reconciliation(
         group["source_states"].append(
             f"checkout-binding-reconciliation:{state}"
         )
-        if historical_only:
+        terminal_drift_hygiene = bool(
+            state == "binding_identity_drift"
+            and group.get("checkout_refs")
+            and all(
+                _terminal_binding_drift_is_hygiene(item)
+                for item in group["checkout_refs"]
+            )
+        )
+        if historical_only or terminal_drift_hygiene:
             _hygiene(group, f"checkout-binding-{state}")
         else:
             _blocking(group, f"checkout-binding-{state}")
