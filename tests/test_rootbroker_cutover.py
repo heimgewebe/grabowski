@@ -177,6 +177,14 @@ class FakeRunner:
 
 
 class RootbrokerCutoverTests(unittest.TestCase):
+    def test_cutover_artifacts_include_runtime_contract_trust_anchor(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+
+        artifact = artifacts[cutover.RUNTIME_CONTRACT_SCHEMA_TARGET]
+        self.assertEqual(artifact.source_relative, "src/grabowski_runtime_contract.py")
+        self.assertEqual(artifact.mode, 0o644)
+        self.assertTrue(artifact.python_source)
+
     def test_cutover_artifacts_include_command_identity_dependency(self) -> None:
         artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
 

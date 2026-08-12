@@ -208,15 +208,34 @@ def _require_exact_keys(
 
 
 def _require_relative_path(value: Any, *, label: str) -> str:
+    """Validate a repository-relative path and require it to be *already* canonical.
+
+    Normalising silently would be a trap: the builder serialises contracts back
+    out through ``PurePosixPath``, so a contract written as ``./src/x.py`` would
+    be accepted, stored as ``src/x.py`` in the manifest, and then differ from the
+    snapshotted contract file it came from.  That makes ``embedded_contract_valid``
+    false and takes ``provenance_valid`` down with it -- the same build/runtime
+    disagreement this module exists to prevent, just reached by a different road.
+
+    So the check is identity, not normalisation: a path that is not already in
+    canonical POSIX form is rejected rather than quietly rewritten.
+    """
     text = _require_text(value, label=label)
+    if "\\" in text:
+        _fail(f"{label} must use POSIX separators: {text}")
     path = PurePosixPath(text)
     if path.is_absolute() or ".." in path.parts or text.startswith("/"):
         _fail(f"{label} must be a repository-relative path without '..': {text}")
-    if path.as_posix() in {".", ""}:
+    canonical = path.as_posix()
+    if canonical in {".", ""}:
         _fail(f"{label} must name a path")
-    if "\\" in text:
-        _fail(f"{label} must use POSIX separators: {text}")
-    return path.as_posix()
+    if text != canonical:
+        _fail(
+            f"{label} must already be canonical; {text!r} normalises to "
+            f"{canonical!r}, and accepting it would let the manifest disagree "
+            "with the contract it was built from"
+        )
+    return canonical
 
 
 def _require_module(value: Any, *, label: str) -> str:

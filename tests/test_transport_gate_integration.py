@@ -1403,6 +1403,107 @@ class CentralTransportGateTests(unittest.TestCase):
                 )
         consume_verified.assert_called_once()
 
+    def test_provenance_repair_reaches_domain_gate_when_integrity_is_proven_invalid(
+        self,
+    ) -> None:
+        operator = self.configured_operator()
+        operator.base._deployment_metadata = lambda: {
+            "release_id": "release-1",
+            "repo_head": "d" * 40,
+            "manifest_schema_valid": False,
+            "entrypoint_contract_identity_valid": True,
+            "artifact_integrity_valid": False,
+            "provenance_valid": False,
+        }
+        operator.base._transport_roundtrip_runtime_binding = mock.Mock(
+            side_effect=AssertionError(
+                "invalid runtime must not reach normal roundtrip"
+            )
+        )
+        context = types.SimpleNamespace(client_id="mcp-client-1")
+
+        result = asyncio.run(
+            operator.mcp._tool_manager.call_tool(
+                "grabowski_recovery_provenance_repair",
+                {"expected_head": "e" * 40},
+                context,
+            )
+        )
+
+        self.assertTrue(result["called"])
+        operator.base._transport_roundtrip_runtime_binding.assert_not_called()
+
+    def test_provenance_repair_unknown_integrity_does_not_gain_exemption(self) -> None:
+        operator = self.configured_operator()
+        operator.base._deployment_metadata = lambda: {
+            "release_id": "release-1",
+            "repo_head": "d" * 40,
+            "manifest_schema_valid": False,
+            "entrypoint_contract_identity_valid": True,
+            "artifact_integrity_valid": None,
+            "provenance_valid": False,
+        }
+        operator.base._transport_roundtrip_runtime_binding = mock.Mock(
+            side_effect=RuntimeError("runtime invalid")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "runtime invalid"):
+            asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "grabowski_recovery_provenance_repair",
+                    {"expected_head": "e" * 40},
+                    types.SimpleNamespace(client_id="mcp-client-1"),
+                )
+            )
+        operator.base._transport_roundtrip_runtime_binding.assert_called_once()
+
+    def test_provenance_repair_healthy_runtime_still_requires_roundtrip(self) -> None:
+        operator = self.configured_operator()
+        operator.base._deployment_metadata = lambda: {
+            "release_id": "release-1",
+            "repo_head": "d" * 40,
+            "manifest_schema_valid": True,
+            "entrypoint_contract_identity_valid": True,
+            "artifact_integrity_valid": True,
+            "provenance_valid": True,
+        }
+        with mock.patch.object(
+            operator.grabowski_transport_roundtrip,
+            "consume_verified",
+            side_effect=roundtrip.TransportRoundtripRequired("handshake required"),
+        ) as consume_verified:
+            with self.assertRaisesRegex(
+                RuntimeError, "fresh intent-bound transport verification required"
+            ):
+                asyncio.run(
+                    operator.mcp._tool_manager.call_tool(
+                        "grabowski_recovery_provenance_repair",
+                        {"expected_head": "e" * 40},
+                        types.SimpleNamespace(client_id="mcp-client-1"),
+                    )
+                )
+        consume_verified.assert_called_once()
+
+    def test_invalid_runtime_does_not_exempt_other_mutations(self) -> None:
+        operator = self.configured_operator()
+        operator.base._deployment_metadata = lambda: {
+            "release_id": "release-1",
+            "repo_head": "d" * 40,
+            "manifest_schema_valid": False,
+            "entrypoint_contract_identity_valid": True,
+            "artifact_integrity_valid": False,
+            "provenance_valid": False,
+        }
+        operator.base._transport_roundtrip_runtime_binding = mock.Mock(
+            side_effect=RuntimeError("runtime invalid")
+        )
+        with self.assertRaisesRegex(RuntimeError, "runtime invalid"):
+            asyncio.run(
+                operator.mcp._tool_manager.call_tool(
+                    "write", {}, types.SimpleNamespace(client_id="mcp-client-1")
+                )
+            )
+
     def test_unknown_grip_is_not_exempt_from_mutation_roundtrip(self) -> None:
         operator = self.configured_operator()
         self.assertFalse(
