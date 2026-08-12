@@ -631,6 +631,7 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         elif package_contract in {
             "bureau-cycle-systemd-v2",
             "bureau-scheduler-fragments-v3",
+            "bureau-scheduler-schemas-v4",
         }:
             cycle_package = release / "src/bureau_cycle"
             cycle_package.mkdir(parents=True)
@@ -676,8 +677,16 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
                     *(systemd / f"{name}.timer" for name in scheduler_names),
                     *(libexec / name for name in scheduler_names),
                 ]
+            schema_paths: list[Path] = []
+            if package_contract == "bureau-scheduler-schemas-v4":
+                schemas = release / "schemas"
+                schemas.mkdir()
+                for name in ("resource.v1.schema.json", "task.v1.schema.json"):
+                    (schemas / name).write_text("{}\n", encoding="utf-8")
+                schema_paths = sorted(schemas.glob("*.json"))
             selected_paths = [
                 pyproject,
+                *schema_paths,
                 *sorted(package.rglob("*.py")),
                 *sorted(cycle_package.rglob("*.py")),
                 *scheduler_paths,
@@ -797,6 +806,66 @@ class BureauManagedRuntimeTests(_BureauLeaseTestCase):
         self.assertEqual(
             result["bureau_contract"]["contract_release_commit"], source_commit
         )
+
+    def test_managed_runtime_accepts_schema_scheduler_package_v4(self) -> None:
+        launcher, source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-schemas-v4"
+        )
+        with (
+            patches[0],
+            patches[1],
+            patch.object(
+                bureau.subprocess,
+                "run",
+                side_effect=lambda argv, **kwargs: self._response(argv),
+            ),
+        ):
+            runtime = bureau._managed_contract_runtime()
+            result = resources.acquire_resources(
+                "owner-a",
+                ["path:/home/alex/repos/bureau/registry/tasks/A.json"],
+                purpose="task",
+                ttl_seconds=60,
+            )
+        self.assertEqual(runtime["release_commit"], source_commit)
+        self.assertEqual(
+            runtime["managed_package_contract"],
+            "bureau-scheduler-schemas-v4",
+        )
+        self.assertEqual(
+            result["bureau_contract"]["contract_release_commit"], source_commit
+        )
+
+    def test_managed_schema_scheduler_v4_ignores_non_json_schema_file(self) -> None:
+        _launcher, _source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-schemas-v4"
+        )
+        manifest = json.loads(
+            (self.runtime / "deployment-manifest.json").read_text(encoding="utf-8")
+        )
+        release = Path(manifest["immutable_release_path"])
+        (release / "schemas/README.txt").write_text("unmanaged documentation\n", encoding="utf-8")
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            runtime = bureau._managed_contract_runtime()
+        self.assertEqual(
+            runtime["managed_package_contract"], "bureau-scheduler-schemas-v4"
+        )
+        run.assert_not_called()
+
+    def test_managed_schema_scheduler_v4_rejects_unmanifested_json_schema(self) -> None:
+        _launcher, _source_commit, patches = self._install_managed_runtime(
+            package_contract="bureau-scheduler-schemas-v4"
+        )
+        manifest = json.loads(
+            (self.runtime / "deployment-manifest.json").read_text(encoding="utf-8")
+        )
+        release = Path(manifest["immutable_release_path"])
+        (release / "schemas/extra.schema.json").write_text("{}\n", encoding="utf-8")
+        with patches[0], patches[1], patch.object(bureau.subprocess, "run") as run:
+            with self.assertRaises(bureau.BureauLeaseContractError) as raised:
+                bureau._managed_contract_runtime()
+        self.assertEqual(raised.exception.code, "contract-managed-package-digest-invalid")
+        run.assert_not_called()
 
     def test_manifest_payload_launcher_rejects_payload_digest_drift(self) -> None:
         launcher, _source_commit, patches = self._install_managed_runtime(
