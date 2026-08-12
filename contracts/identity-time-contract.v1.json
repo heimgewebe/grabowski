@@ -99,6 +99,35 @@
       "owner": "grabowski_tasks",
       "cardinality": "terminal task evidence is bound to the exact task/attempt lifecycle transition",
       "reuse": "may be referenced by a later explicit retry binding but is never execution authority"
+    },
+    "legacy_task_request_reference": {
+      "canonical_name": "request_id",
+      "namespace": "grabowski_tasks",
+      "owner": "grabowski_tasks",
+      "identity_status": "legacy-non-authoritative-reference",
+      "cardinality": "optional persisted task field retained for schema migration and archive compatibility",
+      "reuse": "no current task-start API or generator assigns semantics to this field; preserved values are historical correlation data only",
+      "not_authority_for": [
+        "task identity",
+        "semantic-operation identity",
+        "transport admission",
+        "effect admission",
+        "retry admission"
+      ]
+    },
+    "worker": {
+      "canonical_name": "worker_id",
+      "owner": "grabowski_workers",
+      "material": [
+        "random 20-hex-character worker instance identifier"
+      ],
+      "cardinality": "one durable browser or GUI worker registry record per worker_id",
+      "reuse": "created once for a new worker instance and reused by its status, terminalization and worker:<worker_id> resource-owner binding",
+      "not_authority_for": [
+        "task identity",
+        "semantic-operation identity",
+        "cross-worker resource ownership"
+      ]
     }
   },
   "ambiguous_names": {
@@ -112,6 +141,11 @@
         "namespace": "effect-receipt",
         "canonical_role": "effect_admission_request",
         "meaning": "correlation identity shared by one effect admission and its completion"
+      },
+      {
+        "namespace": "task",
+        "canonical_role": "legacy_task_request_reference",
+        "meaning": "legacy persisted correlation field retained by task schema/archive; not a current identity or admission authority"
       }
     ],
     "operation_identity": [
@@ -209,6 +243,14 @@
     {
       "id": "monotonic-domain-boundary",
       "assertion": "source monotonic values are compared only inside their compatible clock domain and never directly with Unix time"
+    },
+    {
+      "id": "legacy-task-request-is-not-identity-authority",
+      "assertion": "a persisted task request_id is legacy correlation data unless a future version explicitly assigns semantics; its presence cannot be interpreted as transport/effect/task identity authority"
+    },
+    {
+      "id": "worker-id-is-worker-instance-identity",
+      "assertion": "worker_id is the durable worker-registry primary key and scopes worker resource ownership as worker:<worker_id> without becoming task or semantic-operation identity"
     }
   ],
   "implementation_evidence": {
@@ -217,7 +259,9 @@
     "operational_projection_identity": "src/grabowski_operational_truth.py:compute_operation_identity",
     "transport_request": "src/grabowski_transport_assertion.py:derive_request_id",
     "effect_admission_and_completion": "src/grabowski_effect_receipt.py:admit,complete",
-    "worker_runtime": "src/grabowski_workers.py:_planned_runtime_limit_reached"
+    "worker_runtime": "src/grabowski_workers.py:_planned_runtime_limit_reached",
+    "legacy_task_request_reference": "src/grabowski_tasks.py:_task_archive_record",
+    "worker_identity": "src/grabowski_workers.py:browser_start,gui_start,_public,_release"
   },
   "related_existing_work": {
     "GRABOWSKI-OPERATOR-SURFACE-V1-T032": "operation deduplication and safe result reuse",

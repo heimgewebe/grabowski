@@ -24,6 +24,10 @@ The shared words “operation identity” therefore name two different authority
 
 `task_id` identifies one durable Grabowski task. `(task_id, attempt)` identifies an execution generation of that task. Attempt is a logical generation, not a wall-clock value.
 
+### Worker identity
+
+`worker_id` is the primary identity of one durable browser or GUI worker registry record. A new worker instance receives a fresh 20-hex-character id; status, terminalization and resource release keep that id. Worker leases are owned as `worker:<worker_id>`, so worker identity is also the namespace boundary for that worker instance’s resource ownership. It is not a task or semantic-operation identity.
+
 ### Transport request
 
 The transport request id exposed as `X-Grabowski-Request-Id` is HMAC-derived using the connector secret as the key plus session id, canonical JSON-RPC request id and body digest. The secret is not embedded in the request-id material or output. Repeating the same transport material produces the same id even when the signature timestamp changes. Changing the payload changes the id. Consumption is single-use and cannot be rebound to a different target.
@@ -35,6 +39,10 @@ This transport identity does **not** authorize a domain retry after an ambiguous
 `grabowski_effect_receipt` also contains a field named `request_id`. This is a different namespace. It correlates one effect admission with its completion. The normal effect interceptor creates a fresh admission request identity for a newly admitted mutation.
 
 Therefore the unqualified statement “`request_id` is retry-stable” is wrong, as is the unqualified statement “`request_id` is never reused.” Both statements become correct only after the namespace is named.
+
+### Legacy task request reference
+
+The task database also retains an optional `request_id` column for schema-migration and archive compatibility. Current task-start code does not accept or generate a value for that field; archive projection merely preserves an existing value. Version 1 therefore classifies `grabowski_tasks.request_id` as **legacy non-authoritative correlation data**, not as task, transport, effect or retry identity. A future meaning would require an explicit versioned contract rather than inference from the shared field name.
 
 ### Effect and task receipts
 
@@ -73,6 +81,8 @@ This contract does not absorb or replace:
 - `OPERATOR-MACHINE-READABILITY-V1-T020`, which owns the typed operation-lifecycle vertical slice;
 - task state and persisted semantic-operation identity in `grabowski_tasks`;
 - operational grouping projections in `grabowski_operational_truth`;
+- worker instance identity and worker-state truth in `grabowski_workers`;
+- legacy task `request_id` preservation in `grabowski_tasks`;
 - lease ownership in `grabowski_resources`;
 - effect evidence in `grabowski_effect_receipt`;
 - transport replay state in `grabowski_transport_assertion`.

@@ -63,6 +63,8 @@ class IdentityTimeContractTests(unittest.TestCase):
                 "operational_projection_identity",
                 "task",
                 "execution_attempt",
+                "legacy_task_request_reference",
+                "worker",
                 "transport_request",
                 "effect_admission_request",
                 "effect_admission",
@@ -74,7 +76,7 @@ class IdentityTimeContractTests(unittest.TestCase):
     def test_request_id_namespaces_are_explicitly_distinct(self) -> None:
         aliases = self.contract["ambiguous_names"]["request_id"]
         by_namespace = {item["namespace"]: item for item in aliases}
-        self.assertEqual(set(by_namespace), {"transport", "effect-receipt"})
+        self.assertEqual(set(by_namespace), {"transport", "effect-receipt", "task"})
         self.assertEqual(
             by_namespace["transport"]["canonical_role"],
             "transport_request",
@@ -82,6 +84,23 @@ class IdentityTimeContractTests(unittest.TestCase):
         self.assertEqual(
             by_namespace["effect-receipt"]["canonical_role"],
             "effect_admission_request",
+        )
+        self.assertEqual(
+            by_namespace["task"]["canonical_role"],
+            "legacy_task_request_reference",
+        )
+        legacy = self.contract["identity_roles"]["legacy_task_request_reference"]
+        self.assertEqual(legacy["identity_status"], "legacy-non-authoritative-reference")
+        tasks_text = TASKS_PATH.read_text(encoding="utf-8")
+        self.assertIn('"request_id": ("TEXT", 0, 0)', tasks_text)
+        self.assertIn('"request_id": record.get("request_id")', tasks_text)
+        tree = ast.parse(tasks_text, filename=str(TASKS_PATH))
+        self.assertFalse(
+            any(
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and any(argument.arg == "request_id" for argument in node.args.args + node.args.kwonlyargs)
+                for node in ast.walk(tree)
+            )
         )
 
     def test_operation_identity_namespaces_keep_projection_non_authoritative(self) -> None:
@@ -197,6 +216,20 @@ class IdentityTimeContractTests(unittest.TestCase):
         names = {node.id for node in ast.walk(unit) if isinstance(node, ast.Name)}
         self.assertTrue({"task_id", "attempt"}.issubset(names))
         self.assertIn("Task attempt must be positive", _strings(unit))
+
+    def test_worker_identity_is_registry_and_resource_owner_identity(self) -> None:
+        worker = self.contract["identity_roles"]["worker"]
+        self.assertEqual(worker["canonical_name"], "worker_id")
+        self.assertEqual(worker["owner"], "grabowski_workers")
+        browser = _function(WORKERS_PATH, "browser_start")
+        gui = _function(WORKERS_PATH, "gui_start")
+        public = _function(WORKERS_PATH, "_public")
+        release = _function(WORKERS_PATH, "_release")
+        self.assertIn("worker_id", _strings(browser))
+        self.assertIn("worker_id", _strings(gui))
+        self.assertIn("worker_id", _strings(public))
+        self.assertIn("worker_id", _strings(release))
+        self.assertIn("worker:", WORKERS_PATH.read_text(encoding="utf-8"))
 
     def test_worker_runtime_limit_uses_source_monotonic_clock(self) -> None:
         function = _function(WORKERS_PATH, "_planned_runtime_limit_reached")
