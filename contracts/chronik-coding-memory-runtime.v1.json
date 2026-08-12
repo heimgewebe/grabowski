@@ -1,0 +1,41 @@
+{
+  "schema_version": "chronik-coding-memory-runtime.v1",
+  "entrypoint": "tools/coding_memory.py",
+  "requirements_source": "requirements.txt",
+  "python": {
+    "requires": ">=3.10"
+  },
+  "required_distributions": [
+    {
+      "distribution": "filelock",
+      "specifier": ">=3.13",
+      "imports": ["filelock"]
+    },
+    {
+      "distribution": "jsonschema",
+      "specifier": ">=4.0",
+      "imports": ["jsonschema"]
+    },
+    {
+      "distribution": "pydantic",
+      "specifier": ">=2.6,<3",
+      "imports": ["pydantic"]
+    },
+    {
+      "distribution": "pydantic-settings",
+      "specifier": ">=2.14,<3",
+      "imports": ["pydantic_settings"]
+    },
+    {
+      "distribution": "pyyaml",
+      "specifier": ">=6.0",
+      "imports": ["yaml"]
+    }
+  ],
+  "does_not_establish": [
+    "dynamic_import_absence",
+    "installed_distribution_versions",
+    "consumer_environment_compatibility",
+    "runtime_success_without_consumer_validation"
+  ]
+}
