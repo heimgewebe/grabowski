@@ -1,5 +1,5 @@
 # Chronik coding-memory runs under the Grabowski runtime interpreter.
-# Keep the runtime-only dependencies that are not otherwise guaranteed direct.
+# Keep its direct third-party imports explicit and deployment-reproducible.
 filelock==3.32.2
 jsonschema==4.26.0
 mcp==1.27.2
