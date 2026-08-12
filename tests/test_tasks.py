@@ -9562,6 +9562,25 @@ else:
         self.assertEqual(sys.executable, configuration["python"])
         self.assertEqual(str(cli), configuration["cli"])
 
+    def test_coding_memory_configuration_default_python_ignores_developer_checkout(self) -> None:
+        fake_home = self.root / "fake-home"
+        developer_python = fake_home / "repos" / "chronik" / ".venv" / "bin" / "python"
+        developer_python.parent.mkdir(parents=True)
+        developer_python.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        developer_python.chmod(0o755)
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": str(fake_home),
+                tasks.chronik.CODING_MEMORY_REPO_ENV: str(self.repository),
+                tasks.chronik.CODING_MEMORY_DATA_DIR_ENV: str(self.data_dir),
+            },
+            clear=True,
+        ):
+            configuration = tasks.chronik.coding_memory_configuration()
+        self.assertEqual(sys.executable, configuration["python"])
+        self.assertNotEqual(str(developer_python), configuration["python"])
+
     def test_coding_memory_configuration_rejects_missing_runtime_python(self) -> None:
         with patch.dict(
             os.environ,
