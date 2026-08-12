@@ -1,4 +1,54 @@
 {
+  "browser_operator_contract": {
+    "authority": "grabowski",
+    "canonical_browser": {
+      "adapter": "chrome-cdp",
+      "executable": "/opt/google/chrome/google-chrome",
+      "family": "chrome-stable",
+      "protocol": "cdp",
+      "selection_role": "canonical-operator",
+      "vendor": "google"
+    },
+    "decision_rule": "Use this path by default for agent browser work unless a concrete task requirement cannot be satisfied by it.",
+    "evidence_anchor": {
+      "bureau_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-FU-BROWSER-RUNTIME-LIVE-PROOF-20260811",
+      "completion_receipt_sha256": "ab5b16ec7e17bed0e6a28ce15a4365a5d7f2e07197c008325d6c08546a0e5a90",
+      "does_not_establish": [
+        "future_runtime_availability"
+      ],
+      "validated_at": "2026-08-11T23:56:29.955408Z"
+    },
+    "future_adapter": {
+      "browser_family": "firefox",
+      "id": "webdriver-bidi",
+      "status": "not-implemented"
+    },
+    "human_browser_default": {
+      "agent_primary": false,
+      "browser": "brave",
+      "preserve": true
+    },
+    "lifecycle": [
+      "grabowski_browser_worker_start",
+      "direct_cdp_action",
+      "direct_cdp_readback",
+      "grabowski_browser_worker_stop",
+      "profile_and_lease_cleanup_readback"
+    ],
+    "profile": {
+      "default": "ephemeral",
+      "exclusive_profile_lease": true,
+      "human_profile_reuse": false,
+      "persistent_profile_policy": "explicit-auth-or-trust-scope-only"
+    },
+    "schema_version": 1,
+    "transport": {
+      "endpoint_address": "127.0.0.1",
+      "loopback_only": true,
+      "primary": "direct-cdp",
+      "vendor_mcp_role": "optional-diagnostic-or-adapter-never-lifecycle-authority"
+    }
+  },
   "capabilities": [
     {
       "category": "context",
@@ -3314,7 +3364,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "a06386fd34ba7f09cb8eb6f6727922c1bb8fb3243b0b6ec871b23b18e06af228"
+      "sha256": "ca8591474e554e6cafc49c39f5709ac5efdb99a3dea92d05f69943d5f2e02a99"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3349,7 +3399,7 @@
       "src/grabowski_coding_agent_router_cli.py": "af049f09f891b4c018b3beea63c66e5f48a7be3251a339695ae6c5be90682326",
       "src/grabowski_command_identity.py": "8a45a7161aa992c41be86f0b9301077917e47b67034674ea16845e2622e7ffee",
       "src/grabowski_connector_contract.py": "65458075955bb5f3b73113a8e2ec59eeafbcc800f1ce0a2c683ee5d3545ed333",
-      "src/grabowski_consumer_surface.py": "1681d68d063dacfdeb400307a4f96dd65d0f81247fbd0f5bcd4c218cf9aa6d9e",
+      "src/grabowski_consumer_surface.py": "2318692e71720c53ec9624fbb9dfb9c5109fc2a96dd7fbd84c01c134545ea655",
       "src/grabowski_context_fabric.py": "38f3d83511a8e0e6f8b8faaf43230df1466693f265f9bef70dadfe1ea3a97b95",
       "src/grabowski_convergence.py": "c18b249a31016a11cde4c3c4f04ba1eb5f9cb168e83a5ae9d824248711cd82b6",
       "src/grabowski_current_work.py": "96cbf7097927956443a2df9aa6ccb848570694cfeaf51d98c9a9b860f472dd10",
@@ -3399,7 +3449,7 @@
       "src/grabowski_reposkop_shadow.py": "257933f6dec5e9877b3fbf5186d7ad3756f313f8313d22cf90a30e9011b1cfab",
       "src/grabowski_resources.py": "184569b1d93a4c3531476f29bd0e599b1172a8c82f7082f4c6e64363222e892e",
       "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",
-      "src/grabowski_runtime_extensions.py": "22f89af8cafc0db9da0da67460f5e6a6a9d17cc5cf38d7b794e4553bb8485d91",
+      "src/grabowski_runtime_extensions.py": "66e7e5988f167865a23cea380fcefc9c5099f90354b12e3e7b3bc3827c07b2c2",
       "src/grabowski_self_deploy.py": "569d0f3f2a289e3ece52a98d205151cd78c3efb47d7bd5ca754d2d50c3095659",
       "src/grabowski_serving_process.py": "41fd67c043514bc387153786ed93fa01e7c6bee1c732259412fd028dfc93de2a",
       "src/grabowski_sqlite_store.py": "de41f13a4297612389b7fcd97fa45770c90dd63e64f142aebe0f2f26ed8c470a",

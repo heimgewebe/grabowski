@@ -450,6 +450,7 @@ class RuntimeContract:
     supporting_sources: tuple[RuntimeSource, ...] = ()
     runtime_assets: tuple[RuntimeAsset, ...] = ()
     spawn_dependencies: tuple[RuntimeSpawnDependency, ...] = ()
+    browser_operator_default: dict[str, Any] | None = None
 
     @property
     def sources(self) -> tuple[RuntimeSource, ...]:
@@ -478,6 +479,10 @@ class RuntimeContract:
             result["spawn_dependencies"] = [
                 item.to_manifest() for item in self.spawn_dependencies
             ]
+        if self.browser_operator_default is not None:
+            result["browser_operator_default"] = json.loads(
+                json.dumps(self.browser_operator_default)
+            )
         return result
 
     def command_argv(self, release_path: Path, python_exe: Path) -> list[str]:
@@ -516,6 +521,17 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
     module = raw.get("module")
     if not isinstance(module, str) or not MODULE_RE.fullmatch(module):
         fail(f"Ungültiges Modul im Runtime-Entry-Point-Contract: {module!r}")
+    raw_browser_operator_default = raw.get("browser_operator_default")
+    if raw_browser_operator_default is not None and not isinstance(
+        raw_browser_operator_default, dict
+    ):
+        fail("browser_operator_default muss ein Objekt sein")
+    browser_operator_default = (
+        None
+        if raw_browser_operator_default is None
+        else json.loads(json.dumps(raw_browser_operator_default))
+    )
+
     raw_supporting = raw.get("supporting_sources", [])
     if schema_version == 1 and raw_supporting:
         fail("supporting_sources benötigt schema_version 2")
@@ -635,6 +651,7 @@ def load_contract_bytes(data: bytes) -> RuntimeContract:
         supporting_sources=tuple(supporting),
         runtime_assets=tuple(runtime_assets),
         spawn_dependencies=tuple(spawn_dependencies),
+        browser_operator_default=browser_operator_default,
     )
 
 

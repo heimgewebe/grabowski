@@ -640,5 +640,55 @@
       "launcher_module": "grabowski_alert_outbox",
       "spawned_module": "grabowski_ntfy_dispatch"
     }
-  ]
+  ],
+  "browser_operator_default": {
+    "schema_version": 1,
+    "authority": "grabowski",
+    "decision_rule": "Use this path by default for agent browser work unless a concrete task requirement cannot be satisfied by it.",
+    "canonical_browser": {
+      "family": "chrome-stable",
+      "vendor": "google",
+      "executable": "/opt/google/chrome/google-chrome",
+      "adapter": "chrome-cdp",
+      "protocol": "cdp",
+      "selection_role": "canonical-operator"
+    },
+    "transport": {
+      "primary": "direct-cdp",
+      "endpoint_address": "127.0.0.1",
+      "loopback_only": true,
+      "vendor_mcp_role": "optional-diagnostic-or-adapter-never-lifecycle-authority"
+    },
+    "profile": {
+      "default": "ephemeral",
+      "human_profile_reuse": false,
+      "persistent_profile_policy": "explicit-auth-or-trust-scope-only",
+      "exclusive_profile_lease": true
+    },
+    "lifecycle": [
+      "grabowski_browser_worker_start",
+      "direct_cdp_action",
+      "direct_cdp_readback",
+      "grabowski_browser_worker_stop",
+      "profile_and_lease_cleanup_readback"
+    ],
+    "human_browser_default": {
+      "browser": "brave",
+      "preserve": true,
+      "agent_primary": false
+    },
+    "future_adapter": {
+      "id": "webdriver-bidi",
+      "browser_family": "firefox",
+      "status": "not-implemented"
+    },
+    "evidence_anchor": {
+      "bureau_task_id": "GRABOWSKI-OPERATOR-SURFACE-V1-FU-BROWSER-RUNTIME-LIVE-PROOF-20260811",
+      "completion_receipt_sha256": "ab5b16ec7e17bed0e6a28ce15a4365a5d7f2e07197c008325d6c08546a0e5a90",
+      "validated_at": "2026-08-11T23:56:29.955408Z",
+      "does_not_establish": [
+        "future_runtime_availability"
+      ]
+    }
+  }
 }
