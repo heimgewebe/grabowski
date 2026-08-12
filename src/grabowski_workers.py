@@ -849,9 +849,17 @@ def _start(
     worker_id = config.pop("worker_id")
     directory = _worker_directory(worker_id)
     ephemeral_paths.append(directory)
-    if kind == "browser":
-        _write_browser_semantic_handle_key(directory)
-    config_path = _write_config(directory, config)
+    try:
+        if kind == "browser":
+            _write_browser_semantic_handle_key(directory)
+        config_path = _write_config(directory, config)
+    except Exception:
+        for path in reversed(ephemeral_paths):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+        raise
     now = _now()
     record = {
         "worker_id": worker_id,

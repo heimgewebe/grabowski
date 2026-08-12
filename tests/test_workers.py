@@ -1415,6 +1415,19 @@ globalThis.fetch = async () => ({
         self.assertIsNone(workers.resources.inspect_resource("port:9224"))
 
 
+    def test_browser_prelaunch_failure_cleans_private_key_and_ephemeral_state(self) -> None:
+        with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
+            workers, "_write_config", side_effect=OSError("simulated config write failure")
+        ):
+            with self.assertRaisesRegex(OSError, "simulated config write failure"):
+                workers.browser_start(str(self.binary), port=9225, runtime_seconds=60)
+        self.assertIsNone(workers.resources.inspect_resource("port:9225"))
+        instances = workers.WORKER_STATE / "instances"
+        profiles = workers.WORKER_STATE / "profiles"
+        self.assertEqual(list(instances.iterdir()) if instances.exists() else [], [])
+        self.assertEqual(list(profiles.iterdir()) if profiles.exists() else [], [])
+
+
     def test_current_list_observes_stale_running_without_mutation(self) -> None:
         with patch.object(workers, "_executable", return_value=self.binary.resolve()), patch.object(
             workers.operator, "_run", return_value=result()
