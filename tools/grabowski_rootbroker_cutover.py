@@ -27,6 +27,9 @@ BROKER_MODULE_TARGET = Path("/usr/local/lib/grabowski/grabowski_privileged_broke
 BROKER_WRAPPER_TARGET = Path("/usr/local/libexec/grabowski-privileged-broker")
 PROCESS_OBSERVER_TARGET = Path("/usr/local/libexec/grabowski-process-reference-observer")
 REQUEST_CLIENT_TARGET = Path("/usr/local/bin/grabowski-privileged-request")
+BOOTSTRAP_RECOVERY_TARGET = Path(
+    "/usr/local/libexec/grabowski-runtime-bootstrap-recover"
+)
 CUTOVER_HELPER_TARGET = Path("/usr/local/libexec/grabowski-rootbroker-cutover")
 BROKER_SERVICE_TARGET = Path("/etc/systemd/system/grabowski-privileged-broker@.service")
 RECOVERY_SOURCE_DROPIN_TARGET = Path(
@@ -42,6 +45,7 @@ POWER_ACTION = "operator_power_argv"
 BLOCKADE_LIFECYCLE_ACTION = "operator_blockade_marker_lifecycle"
 ROOT_TASK_ACTION = "operator_root_task_systemd_unit"
 PROCESS_OBSERVER_ACTION = "observe_process_references"
+BOOTSTRAP_RECOVERY_ACTION = "runtime_bootstrap_recover"
 PROCESS_OBSERVER_BIND_PATHS = (
     "/home/alex/repos/.weltgewebe-audit-implementation",
     "/home/alex/repos/.weltgewebe-audit-main-20260717",
@@ -143,6 +147,12 @@ ARTIFACTS = (
     Artifact(
         "tools/grabowski_privileged_request.py",
         REQUEST_CLIENT_TARGET,
+        0o755,
+        True,
+    ),
+    Artifact(
+        "tools/grabowski_runtime_bootstrap_recover.py",
+        BOOTSTRAP_RECOVERY_TARGET,
         0o755,
         True,
     ),
@@ -772,6 +782,44 @@ def _process_observer_action_from_repository(
     return json.loads(json.dumps(observer))
 
 
+def _bootstrap_recovery_action_from_repository(
+    repository: Path,
+    *,
+    expected_head: str,
+    runner: RunCommand,
+) -> dict[str, Any]:
+    relative_path = "config/privileged-actions.example.json"
+    data = _repository_blob(
+        repository,
+        commit_id=expected_head,
+        relative_path=relative_path,
+        runner=runner,
+    )
+    example = _decode_json_object(data, label=relative_path)
+    actions = example.get("actions")
+    if not isinstance(actions, dict):
+        raise CutoverError("example privileged action catalog is malformed")
+    action = actions.get(BOOTSTRAP_RECOVERY_ACTION)
+    if not isinstance(action, dict):
+        raise CutoverError("example catalog has no runtime bootstrap recovery action")
+    required = {"enabled", "mode", "target_pattern", "argv", "timeout_seconds"}
+    if set(action) != required:
+        raise CutoverError("runtime bootstrap recovery action keys are invalid")
+    if action.get("enabled") is not True or action.get("mode") != "template":
+        raise CutoverError("runtime bootstrap recovery action must be an enabled template")
+    if action.get("target_pattern") != r"\{.{1,4096}\}":
+        raise CutoverError("runtime bootstrap recovery target pattern is invalid")
+    if action.get("argv") != [
+        str(BOOTSTRAP_RECOVERY_TARGET),
+        "root-execute",
+        "{target}",
+    ]:
+        raise CutoverError("runtime bootstrap recovery argv is invalid")
+    if action.get("timeout_seconds") != 3600:
+        raise CutoverError("runtime bootstrap recovery timeout is invalid")
+    return json.loads(json.dumps(action))
+
+
 def _validate_root_task_coherence(
     root_task: dict[str, Any],
     *,
@@ -810,6 +858,7 @@ def merge_privileged_config(
     lifecycle: dict[str, Any] | None = None,
     root_task: dict[str, Any] | None = None,
     process_observer: dict[str, Any] | None = None,
+    bootstrap_recovery: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if set(current) != {"schema_version", "actions"}:
         raise CutoverError("installed privileged config has invalid top-level keys")
@@ -833,6 +882,18 @@ def merge_privileged_config(
     process_observer_before = actions.get(PROCESS_OBSERVER_ACTION)
     if process_observer is not None:
         merged_actions[PROCESS_OBSERVER_ACTION] = json.loads(json.dumps(process_observer))
+    bootstrap_recovery_before = actions.get(BOOTSTRAP_RECOVERY_ACTION)
+    if bootstrap_recovery is not None:
+        if (
+            bootstrap_recovery_before is not None
+            and bootstrap_recovery_before != bootstrap_recovery
+        ):
+            raise CutoverError(
+                "installed runtime bootstrap recovery action differs from commit-bound contract"
+            )
+        merged_actions[BOOTSTRAP_RECOVERY_ACTION] = json.loads(
+            json.dumps(bootstrap_recovery)
+        )
     merged_power = merged_actions[POWER_ACTION]
     merged_gate = merged_power["gate"]
     if lifecycle is None:
@@ -921,6 +982,8 @@ def merge_privileged_config(
         controlled.add(ROOT_TASK_ACTION)
     if process_observer is not None:
         controlled.add(PROCESS_OBSERVER_ACTION)
+    if bootstrap_recovery is not None:
+        controlled.add(BOOTSTRAP_RECOVERY_ACTION)
     evidence = {
         "operator_power_before_sha256": _sha256(_canonical_json(power_before)),
         "operator_power_after_sha256": _sha256(_canonical_json(merged_power)),
@@ -940,6 +1003,15 @@ def merge_privileged_config(
         "process_observer_before_sha256": (
             _sha256(_canonical_json(process_observer_before))
             if isinstance(process_observer_before, dict) else None
+        ),
+        "bootstrap_recovery_sha256": (
+            _sha256(_canonical_json(bootstrap_recovery))
+            if bootstrap_recovery is not None else None
+        ),
+        "bootstrap_recovery_preexisting": bootstrap_recovery_before is not None,
+        "bootstrap_recovery_before_sha256": (
+            _sha256(_canonical_json(bootstrap_recovery_before))
+            if isinstance(bootstrap_recovery_before, dict) else None
         ),
         "root_task_before_sha256": (
             _sha256(_canonical_json(root_task_before))
@@ -1297,6 +1369,9 @@ def _apply_cutover_locked(
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    bootstrap_recovery = _bootstrap_recovery_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     if artifact_targets is None:
         _validate_recovery_source_dropin(
             source_artifacts,
@@ -1313,6 +1388,7 @@ def _apply_cutover_locked(
         lifecycle=lifecycle,
         root_task=root_task,
         process_observer=process_observer,
+        bootstrap_recovery=bootstrap_recovery,
     )
     merged_config_data = _canonical_json(merged_config)
 
@@ -1530,6 +1606,9 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
     process_observer = _process_observer_action_from_repository(
         repository, expected_head=expected_head, runner=runner
     )
+    bootstrap_recovery = _bootstrap_recovery_action_from_repository(
+        repository, expected_head=expected_head, runner=runner
+    )
     _validate_recovery_source_dropin(
         source_artifacts,
         publisher=publisher,
@@ -1542,6 +1621,7 @@ def build_plan(*, repository: Path, expected_head: str, runner: RunCommand = _ru
         lifecycle=lifecycle,
         root_task=root_task,
         process_observer=process_observer,
+        bootstrap_recovery=bootstrap_recovery,
     )
     return {
         "schema_version": 1,
