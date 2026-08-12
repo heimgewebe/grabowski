@@ -19,6 +19,7 @@ transport_assertion = importlib.import_module("grabowski_transport_assertion")
 
 CONTRACT_PATH = ROOT / "contracts" / "identity-time-contract.v1.json"
 TASKS_PATH = SRC / "grabowski_tasks.py"
+OPERATIONAL_TRUTH_PATH = SRC / "grabowski_operational_truth.py"
 WORKERS_PATH = SRC / "grabowski_workers.py"
 
 
@@ -59,6 +60,7 @@ class IdentityTimeContractTests(unittest.TestCase):
             roles,
             {
                 "semantic_operation",
+                "operational_projection_identity",
                 "task",
                 "execution_attempt",
                 "transport_request",
@@ -80,6 +82,37 @@ class IdentityTimeContractTests(unittest.TestCase):
         self.assertEqual(
             by_namespace["effect-receipt"]["canonical_role"],
             "effect_admission_request",
+        )
+
+    def test_operation_identity_namespaces_keep_projection_non_authoritative(self) -> None:
+        aliases = self.contract["ambiguous_names"]["operation_identity"]
+        by_namespace = {item["namespace"]: item for item in aliases}
+        self.assertEqual(set(by_namespace), {"task", "operational-truth"})
+        self.assertEqual(
+            by_namespace["task"]["canonical_role"],
+            "semantic_operation",
+        )
+        self.assertEqual(
+            by_namespace["operational-truth"]["canonical_role"],
+            "operational_projection_identity",
+        )
+        projection = self.contract["identity_roles"]["operational_projection_identity"]
+        self.assertIn("task start deduplication", projection["not_authority_for"])
+        self.assertIn("retry admission", projection["not_authority_for"])
+
+        function = _function(OPERATIONAL_TRUTH_PATH, "compute_operation_identity")
+        strings = _strings(function)
+        self.assertTrue(
+            {
+                "operation_identity",
+                "operation_id",
+                "unit",
+                "authoritative_unit",
+                "argv_sha256",
+                "execution_envelope_sha256",
+                "task_id",
+                "work_id",
+            }.issubset(strings)
         )
 
     def test_transport_request_identity_is_retry_stable_and_payload_bound(self) -> None:

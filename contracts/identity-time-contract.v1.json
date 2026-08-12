@@ -27,6 +27,25 @@
         "effect success"
       ]
     },
+    "operational_projection_identity": {
+      "canonical_name": "derived operation identity",
+      "owner": "grabowski_operational_truth",
+      "material": [
+        "explicit operation_identity or operation_id when present",
+        "otherwise unit or authoritative_unit",
+        "argv_sha256",
+        "execution_envelope_sha256",
+        "task_id or work_id fallback"
+      ],
+      "cardinality": "read-only projection helper used to group equivalent-looking current work when the canonical task operation identity is not available",
+      "reuse": "projection-only; it may identify duplicate-looking work but cannot create, replace or authorize a semantic operation identity",
+      "not_authority_for": [
+        "task start deduplication",
+        "retry admission",
+        "resource ownership",
+        "effect execution"
+      ]
+    },
     "task": {
       "canonical_name": "task_id",
       "owner": "grabowski_tasks",
@@ -43,7 +62,7 @@
       "canonical_name": "X-Grabowski-Request-Id",
       "owner": "grabowski_transport_assertion",
       "material": [
-        "connector secret",
+        "connector secret used only as HMAC key",
         "session_id",
         "canonical JSON-RPC request id",
         "request body SHA-256"
@@ -93,6 +112,18 @@
         "namespace": "effect-receipt",
         "canonical_role": "effect_admission_request",
         "meaning": "correlation identity shared by one effect admission and its completion"
+      }
+    ],
+    "operation_identity": [
+      {
+        "namespace": "task",
+        "canonical_role": "semantic_operation",
+        "meaning": "persisted, source/scope/head-bound task operation identity"
+      },
+      {
+        "namespace": "operational-truth",
+        "canonical_role": "operational_projection_identity",
+        "meaning": "read-only grouping fallback over observed execution attributes"
       }
     ]
   },
@@ -152,6 +183,10 @@
       "assertion": "semantic operation identity and task execution attempt are distinct; retries may advance attempt without inventing a new semantic identity"
     },
     {
+      "id": "projection-is-not-operation-authority",
+      "assertion": "operational-truth may derive a grouping identity for observation, but that projection cannot authorize task deduplication, retry or effects"
+    },
+    {
       "id": "transport-request-is-not-effect-request",
       "assertion": "same spelling of request_id does not collapse transport and effect-receipt namespaces"
     },
@@ -179,6 +214,7 @@
   "implementation_evidence": {
     "semantic_operation": "src/grabowski_tasks.py:_normalize_task_operation_identity",
     "operation_retry": "src/grabowski_tasks.py:_operation_retry_binding",
+    "operational_projection_identity": "src/grabowski_operational_truth.py:compute_operation_identity",
     "transport_request": "src/grabowski_transport_assertion.py:derive_request_id",
     "effect_admission_and_completion": "src/grabowski_effect_receipt.py:admit,complete",
     "worker_runtime": "src/grabowski_workers.py:_planned_runtime_limit_reached"

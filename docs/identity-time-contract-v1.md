@@ -10,9 +10,15 @@ The machine-readable companion is `contracts/identity-time-contract.v1.json`.
 
 ### Semantic operation
 
-`operation_identity_sha256` is the identity of equivalent work at the task boundary. Its material is the canonical working directory, repository head, source fingerprint, normalized purpose and scope digest. Active or recent successful work may be reused under this identity. An attention-state predecessor can be superseded only with the exact predecessor task and lifecycle receipt plus an explicit force-new reason.
+`operation_identity_sha256` is the persisted identity of equivalent work at the task boundary. Its material is the canonical working directory, repository head, source fingerprint, normalized purpose and scope digest. Active or recent successful work may be reused under this identity. An attention-state predecessor can be superseded only with the exact predecessor task and lifecycle receipt plus an explicit force-new reason.
 
 A semantic operation is not a task attempt. Resuming one persistent task advances `attempt`; that does not by itself define a different semantic operation.
+
+### Operational projection identity
+
+`grabowski_operational_truth.compute_operation_identity()` can derive a grouping identity from an explicit operation id or, when that is unavailable, from observed unit, argv and execution-envelope attributes with a task/work fallback. This is a read-only projection helper used to surface duplicate-looking current work. It is **not** the authority used by `grabowski_tasks` for task-start deduplication or retry admission.
+
+The shared words “operation identity” therefore name two different authority levels: a persisted task semantic identity and a non-authoritative operational-truth projection identity. The projection may point to a possible duplicate; it may not manufacture semantic equivalence.
 
 ### Task and execution attempt
 
@@ -20,7 +26,7 @@ A semantic operation is not a task attempt. Resuming one persistent task advance
 
 ### Transport request
 
-The transport request id exposed as `X-Grabowski-Request-Id` is derived from connector secret, session id, canonical JSON-RPC request id and body digest. Repeating the same transport material produces the same id even when the signature timestamp changes. Changing the payload changes the id. Consumption is single-use and cannot be rebound to a different target.
+The transport request id exposed as `X-Grabowski-Request-Id` is HMAC-derived using the connector secret as the key plus session id, canonical JSON-RPC request id and body digest. The secret is not embedded in the request-id material or output. Repeating the same transport material produces the same id even when the signature timestamp changes. Changing the payload changes the id. Consumption is single-use and cannot be rebound to a different target.
 
 This transport identity does **not** authorize a domain retry after an ambiguous effect.
 
@@ -65,7 +71,8 @@ This contract does not absorb or replace:
 - `GRABOWSKI-OPERATOR-SURFACE-V1-T032`, which owns operation deduplication and safe result reuse;
 - `GRABOWSKI-OPERATOR-SURFACE-V1-T049`, which owns exact lease-generation identity;
 - `OPERATOR-MACHINE-READABILITY-V1-T020`, which owns the typed operation-lifecycle vertical slice;
-- task state in `grabowski_tasks`;
+- task state and persisted semantic-operation identity in `grabowski_tasks`;
+- operational grouping projections in `grabowski_operational_truth`;
 - lease ownership in `grabowski_resources`;
 - effect evidence in `grabowski_effect_receipt`;
 - transport replay state in `grabowski_transport_assertion`.
