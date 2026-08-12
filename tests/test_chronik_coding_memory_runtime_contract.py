@@ -39,7 +39,9 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
             validator._satisfies("2.14.2", "~=2.14")
 
     def _fixture_root(self) -> Path:
-        directory = Path(self.addCleanupContext(tempfile.TemporaryDirectory()).name)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
         (directory / "contracts").mkdir()
         (directory / "requirements").mkdir()
         shutil.copy2(
