@@ -9,9 +9,9 @@ GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python
 RETENTION_MIN_AGE_SECONDS ?= 86400
 RETENTION_MAX_ARCHIVE_JOBS ?= 128
 
-.PHONY: validate syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
+.PHONY: validate syntax test policy tool-surface-budget catalog-data-refresh catalog-data-check context-refresh context-check profiles-refresh profiles-check runtime-lock chronik-runtime-contract runtime-lock-refresh secrets deploy-tooling deploy-tooling-check deploy-tooling-lock-refresh deploy-check deploy-preflight deploy-apply deploy-direct deploy runtime-retention-check runtime-retention-apply runtime-legacy-status routing-cli-check routing-cli-apply
 
-validate: catalog-data-check syntax test policy tool-surface-budget context-check profiles-check runtime-lock deploy-tooling-check secrets
+validate: catalog-data-check syntax test policy tool-surface-budget context-check profiles-check runtime-lock chronik-runtime-contract deploy-tooling-check secrets
 
 syntax:
 >$(PYTHON) -m py_compile tools/operator_patch_relay.py
@@ -48,6 +48,9 @@ profiles-check:
 runtime-lock:
 >$(PYTHON) tools/validate_runtime_lock.py
 
+chronik-runtime-contract: runtime-lock
+>$(PYTHON) tools/validate_chronik_coding_memory_runtime.py
+
 runtime-lock-refresh:
 >test "$$($(UV) --version)" = "uv $(UV_RUNTIME_LOCK_VERSION)"
 >$(UV) pip compile requirements/runtime.in --python-version 3.10 --python-platform x86_64-unknown-linux-gnu --generate-hashes --output-file requirements/runtime.lock.txt
@@ -67,18 +70,18 @@ deploy-tooling-lock-refresh:
 secrets:
 >$(PYTHON) tools/check_no_secrets.py
 
-deploy-check: context-check deploy-tooling
+deploy-check: context-check chronik-runtime-contract deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --check
 
-deploy-preflight: context-check deploy-tooling
+deploy-preflight: context-check chronik-runtime-contract deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --preflight
 
-deploy-apply: context-check deploy-tooling
+deploy-apply: context-check chronik-runtime-contract deploy-tooling
 >$(DEPLOY_TOOL_PYTHON) tools/deploy_runtime_dual.py --apply
 
 deploy-direct: deploy-apply
 
-deploy: context-check
+deploy: context-check chronik-runtime-contract
 >test -x "$(GRABOWSKI_RUNTIME_PYTHON)"
 >set -eu; expected_head="$$(git rev-parse --verify HEAD)"; set -- --expected-head "$$expected_head" --delay-seconds 8 --source-repository "$(CURDIR)"; if test -n "$${GRABOWSKI_DEPLOY_SOURCE_LEASE_OWNER_ID:-}"; then set -- "$$@" --source-lease-owner-id "$$GRABOWSKI_DEPLOY_SOURCE_LEASE_OWNER_ID"; fi; "$(GRABOWSKI_RUNTIME_PYTHON)" tools/schedule_runtime_deploy.py "$$@"
 

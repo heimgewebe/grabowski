@@ -2052,7 +2052,10 @@ class ScheduledDeployRunnerTests(unittest.TestCase):
 
     def test_make_deploy_schedules_not_direct_apply(self) -> None:
         makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-        self.assertIn("deploy-apply: context-check deploy-tooling", makefile)
+        self.assertIn(
+            "deploy-apply: context-check chronik-runtime-contract deploy-tooling",
+            makefile,
+        )
         self.assertIn("tools/deploy_runtime_dual.py --apply", makefile)
         self.assertIn(
             'GRABOWSKI_RUNTIME_PYTHON ?= $(HOME)/.local/share/grabowski-mcp/.venv/bin/python',
