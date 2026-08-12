@@ -12,6 +12,16 @@ CONSUMER_VIEWS = frozenset({"minimal", "standard", "evidence"})
 CONSUMER_VIEW_ALIASES = {"concise": "minimal", "full": "evidence"}
 MAX_CONSUMER_FIELDS = 40
 MAX_CONSUMER_CURSOR_BYTES = 2048
+CONTEXT_REQUIRED_FIELDS = (
+    "schema_version",
+    "profile",
+    "view",
+    "browser_operator_contract",
+    "warnings",
+    "known_gaps",
+    "recommended_next_action",
+    "does_not_establish",
+)
 CURSOR_SNAPSHOT_CHANGED_ERROR = (
     "cursor_snapshot_changed: result snapshot changed; "
     "restart pagination from the first page"

@@ -27,7 +27,15 @@ grabowski_context(profile="host-operations")
 grabowski_context(profile="full")
 ```
 
-The live tools are authoritative for the running deployment, active policy, available capabilities and checkout drift. The generated repository documents describe the intended contract:
+The live tools are authoritative for the running deployment, active policy, available capabilities and checkout drift. `grabowski_context(...)` also returns `browser_operator_contract`, the runtime-bound default for agent browser work.
+
+### Browser operator default
+
+For ordinary agent browsing, use the `browser_operator_contract` path by default: Grabowski owns lifecycle; Google Chrome Stable is `canonical-operator`; start it with an isolated ephemeral profile and loopback-only CDP; drive navigation/actions/readback directly over CDP; then stop the worker and verify profile/port lease cleanup. Persistent profiles are explicit Auth-/Trust-Scopes only. Brave remains the human desktop default/fallback and is not agent-primary. Vendor MCPs are optional diagnostics/adapters, never browser lifecycle authority. Firefox/WebDriver BiDi remains a separate future adapter.
+
+The runtime-bound source is `config/runtime-entrypoint.json`; the detailed contract is `docs/browser-control-plane-v1.md`.
+
+The generated repository documents describe the intended contract:
 
 - `docs/generated/operator-context.md`
 - `docs/generated/operator-context.v1.json`

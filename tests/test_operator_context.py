@@ -68,6 +68,35 @@ class OperatorContextTests(unittest.TestCase):
             )
         )
 
+    def test_browser_operator_default_is_runtime_bound_and_generated(self) -> None:
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        browser = contract["browser_operator_default"]
+        self.assertEqual(browser["authority"], "grabowski")
+        self.assertEqual(browser["canonical_browser"]["family"], "chrome-stable")
+        self.assertEqual(browser["canonical_browser"]["adapter"], "chrome-cdp")
+        self.assertEqual(browser["transport"]["primary"], "direct-cdp")
+        self.assertIs(browser["transport"]["loopback_only"], True)
+        self.assertEqual(browser["profile"]["default"], "ephemeral")
+        self.assertIs(browser["human_browser_default"]["preserve"], True)
+        self.assertEqual(browser["human_browser_default"]["browser"], "brave")
+
+        context = json.loads(CONTEXT.read_text(encoding="utf-8"))
+        self.assertEqual(context["browser_operator_contract"], browser)
+
+        entry = (ROOT / "GRABOWSKI.md").read_text(encoding="utf-8")
+        self.assertIn("browser_operator_contract", entry)
+        runtime = (ROOT / "src" / "grabowski_runtime_extensions.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('"browser_operator_contract": browser_operator_contract', runtime)
+        consumer = (ROOT / "src" / "grabowski_consumer_surface.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('CONTEXT_REQUIRED_FIELDS = (', consumer)
+        self.assertIn('required=consumer_surface.CONTEXT_REQUIRED_FIELDS', runtime)
+
     def test_secret_reveal_is_not_read_only_in_generated_contracts(self) -> None:
         catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
         context = json.loads(CONTEXT.read_text(encoding="utf-8"))

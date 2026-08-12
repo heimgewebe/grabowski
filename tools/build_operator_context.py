@@ -130,6 +130,9 @@ def _discover_tools(
 
 def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
     contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    browser_operator_contract = contract.get("browser_operator_default")
+    if not isinstance(browser_operator_contract, dict):
+        raise ValueError("runtime contract browser_operator_default is missing or invalid")
     policy = json.loads(POLICY_PATH.read_text(encoding="utf-8"))
     capabilities = _load_capabilities_module()
     operating_protocol = _load_operator_relay_module().operator_relay_protocol()
@@ -214,6 +217,7 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
             },
         },
         "operating_protocol": operating_protocol,
+        "browser_operator_contract": browser_operator_contract,
         "runtime_contract": {
             "module": contract["module"],
             "source": contract["source"],
@@ -261,6 +265,16 @@ def build_documents() -> tuple[dict[str, Any], dict[str, Any], str]:
         "- Review: operator verifies directly; Claude may provide independent architecture and safety findings.",
         "- Session: direct operator context first; tmux or Antigravity may preserve a bounded advisory session when useful.",
         "- Reposkop: `report <absolute-target> --purpose grabowski-repo-state-context --json` is a target-bound read-only coherence signal; no global discovery, no separate trial/noise logging and never an approval gate.",
+        "",
+        "## Browser operator default",
+        "",
+        f"- Authority: `{browser_operator_contract['authority']}`",
+        f"- Canonical browser: `{browser_operator_contract['canonical_browser']['family']}` via `{browser_operator_contract['canonical_browser']['adapter']}` / `{browser_operator_contract['canonical_browser']['protocol']}`.",
+        f"- Primary transport: `{browser_operator_contract['transport']['primary']}` on `{browser_operator_contract['transport']['endpoint_address']}`; loopback-only is `{str(browser_operator_contract['transport']['loopback_only']).lower()}`.",
+        f"- Profile default: `{browser_operator_contract['profile']['default']}`; persistent profiles are `{browser_operator_contract['profile']['persistent_profile_policy']}`.",
+        f"- Human default: preserve `{browser_operator_contract['human_browser_default']['browser']}`; it is not agent-primary.",
+        "- Lifecycle: `" + "` → `".join(browser_operator_contract['lifecycle']) + "`.",
+        "- Vendor MCPs remain optional diagnostics/adapters and never own browser lifecycle authority.",
         "",
         "## Contract integrity",
         "",

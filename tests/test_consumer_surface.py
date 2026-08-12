@@ -818,6 +818,31 @@ class ConsumerSurfaceTests(unittest.TestCase):
         finally:
             case.doCleanups()
 
+    def test_context_browser_contract_survives_narrow_field_projection(self) -> None:
+        browser_contract = {"authority": "grabowski", "transport": {"primary": "direct-cdp"}}
+        payload = {
+            "schema_version": 2,
+            "profile": "concise",
+            "view": "minimal",
+            "runtime": {"service": "grabowski-mcp"},
+            "browser_operator_contract": browser_contract,
+            "warnings": [],
+            "known_gaps": [],
+            "recommended_next_action": "none",
+            "does_not_establish": ["action_authority"],
+        }
+        projected = self.operator._project_consumer_fields(
+            payload,
+            fields=["runtime"],
+            required=self.operator.consumer_surface.CONTEXT_REQUIRED_FIELDS,
+        )
+        self.assertEqual(projected["browser_operator_contract"], browser_contract)
+        self.assertIn(
+            "browser_operator_contract",
+            projected["projection"]["required_fields_preserved"],
+        )
+        self.assertNotIn("browser_operator_contract", projected["projection"]["omitted_fields"])
+
     def test_context_contract_uses_common_views_and_preserves_safety_fields(self) -> None:
         source = (
             Path(__file__).resolve().parents[1]
@@ -828,6 +853,7 @@ class ConsumerSurfaceTests(unittest.TestCase):
         self.assertIn('if selected_view in {"standard", "evidence"}:', source)
         self.assertIn('if selected_view == "evidence":', source)
         for field in (
+            '"browser_operator_contract"',
             '"warnings"',
             '"known_gaps"',
             '"recommended_next_action"',

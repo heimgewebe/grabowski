@@ -31,6 +31,23 @@ Chrome Stable ist damit die kanonische allgemeine Operatorwahl. Brave bleibt aus
 
 Ein Executable ohne implementierten CDP-Adapter wird vor Profilerzeugung und Workerstart abgewiesen. Eine bloße Aufnahme in `GRABOWSKI_BROWSER_EXECUTABLES` erzeugt also keine neue Protokollunterstützung. Der Adapter-Launchvertrag besitzt außerdem die protokollspezifische Port-/Argument-Validierung, Endpoint-Projektion und Argv-Konstruktion; `browser_start()` selbst verwaltet nur den gemeinsamen Worker-, Profil- und Lease-Lifecycle.
 
+## Kanonischer Operatorpfad
+
+Für normale Agenten-Browserarbeit gilt ab jetzt als Default, sofern kein konkretes Task-Erfordernis dagegen spricht:
+
+1. `grabowski_context(...)` lesen und den runtimegebundenen `browser_operator_contract` beachten.
+2. Chrome Stable über `grabowski_browser_worker_start` starten. Grabowski besitzt Worker-, Profil- und Lease-Lifecycle.
+3. Standardmäßig ein separates ephemeres Profil verwenden; persistente Profile nur als explizite Auth-/Trust-Scopes.
+4. Den von Grabowski erzeugten CDP-Endpunkt ausschließlich über `127.0.0.1` benutzen.
+5. Navigation, Aktionen und Readback primär direkt über CDP ausführen. Vendor-MCPs sind nur optionale Adapter/Diagnostik und übernehmen keine Lifecycle-Autorität.
+6. Outcome durch echten CDP-/DOM-Readback prüfen, nicht nur durch eine Control-Plane-Projektion.
+7. Den eigenen Worker terminalisieren und anschließend Profilentfernung sowie Port-/Profil-Leasefreigabe lesen.
+8. Menschliche Browserprofile und den Desktop-Default nicht verändern; Brave bleibt menschlicher Default/Fallback.
+
+Dieser Pfad ist sowohl im versionierten Runtime-Entrypoint-Contract als auch im Live-Output von `grabowski_context` verankert. Damit hängt die Kenntnis des Standardwegs nicht von Chat-Historie oder Modellgedächtnis ab.
+
+Ein zusätzlicher Praxistest am 12. August 2026 hat den kompletten Pfad erneut bestätigt: ein frischer Chrome-Stable-Worker öffnete `https://example.com/` direkt über CDP; `Page.loadEventFired` trat ein und `Runtime.evaluate` las `title=Example Domain`, `h1=Example Domain`, `readyState=complete` zurück. Danach wurden ephemeres Profil sowie Port-/Profil-Leases vollständig entfernt.
+
 ## Endpoint- und Transportvertrag
 
 Der heutige Browserworker bindet CDP weiterhin ausschließlich an Loopback:

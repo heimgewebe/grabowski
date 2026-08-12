@@ -150,6 +150,9 @@ def grabowski_context(
         raise ValueError(f"profile must be one of {sorted(capabilities.PROFILE_CATEGORIES)}")
     snapshot = _runtime_contract_snapshot()
     contract = snapshot["contract"]
+    browser_operator_contract = contract.get("browser_operator_default")
+    if not isinstance(browser_operator_contract, dict):
+        browser_operator_contract = None
     expected_tools = contract.get("expected_tools", [])
     if not isinstance(expected_tools, list):
         expected_tools = []
@@ -174,6 +177,8 @@ def grabowski_context(
             known_gaps.append(f"{key}: {', '.join(values[:20])}")
     if not expected_tools:
         known_gaps.append("runtime entrypoint contract is unavailable")
+    if browser_operator_contract is None:
+        known_gaps.append("browser operator default contract is unavailable")
     warnings: list[dict[str, Any]] = []
     if not canonical_matches_runtime:
         warnings.append({
@@ -196,6 +201,7 @@ def grabowski_context(
             "provenance_valid": bool(deployment.get("provenance_valid")),
             "runtime_binding_valid": bool(deployment.get("runtime_binding_valid")),
         },
+        "browser_operator_contract": browser_operator_contract,
         "policy": {
             "mode": policy.get("mode"),
             "active_profile": active_profile["name"],
@@ -308,15 +314,7 @@ def grabowski_context(
     return consumer_surface.project_fields(
         payload,
         fields=fields,
-        required=(
-            "schema_version",
-            "profile",
-            "view",
-            "warnings",
-            "known_gaps",
-            "recommended_next_action",
-            "does_not_establish",
-        ),
+        required=consumer_surface.CONTEXT_REQUIRED_FIELDS,
     )
 
 
