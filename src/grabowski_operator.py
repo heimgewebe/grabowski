@@ -466,6 +466,45 @@ def _transport_roundtrip_exempt_call(
     return spec is not None and spec.effect == grabowski_grips.READ_ONLY
 
 
+_PROVENANCE_RECOVERY_REPAIR_TOOL = "grabowski_recovery_provenance_repair"
+_PROVENANCE_RECOVERY_REPAIRABLE_INTEGRITY_FLAGS = (
+    "manifest_schema_valid",
+    "entrypoint_contract_identity_valid",
+    "artifact_integrity_valid",
+    "provenance_valid",
+)
+
+
+def _provenance_recovery_transport_exempt_call(tool_name: Any, tool: Any) -> bool:
+    """Let exactly the provenance repair tool reach its own fail-closed gate.
+
+    The normal transport binding deliberately requires an integrity-valid
+    runtime. Requiring that same binding before the tool whose sole purpose is
+    to repair a proven integrity defect recreates the deadlock the recovery
+    lane exists to break. This is not repair authority: the domain tool still
+    evaluates every recovery gate before dispatch. Unknown integrity remains
+    closed and every other mutating tool still requires the normal roundtrip.
+    """
+    if tool_name != _PROVENANCE_RECOVERY_REPAIR_TOOL:
+        return False
+    if _tool_read_only_hint(tool) is not False:
+        return False
+    try:
+        deployment = base._deployment_metadata()
+    except Exception:  # pragma: no cover - defensive read boundary
+        return False
+    values = [
+        deployment.get(flag)
+        for flag in _PROVENANCE_RECOVERY_REPAIRABLE_INTEGRITY_FLAGS
+    ]
+    # Mirror the domain recovery contract: only explicit booleans are
+    # judgeable, and at least one explicit False is required. Missing/unknown
+    # metadata must never manufacture an exemption.
+    return all(value is True or value is False for value in values) and any(
+        value is False for value in values
+    )
+
+
 def _require_current_serving_process() -> None:
     """Refuse mutations from a process older than the deployed release.
 
@@ -509,6 +548,8 @@ def _require_transport_roundtrip_for_tool(
             "readOnlyHint annotation"
         )
     _require_current_serving_process()
+    if _provenance_recovery_transport_exempt_call(tool_name, tool):
+        return None
     runtime_binding = base._transport_roundtrip_runtime_binding()
     try:
         arguments_sha256 = (

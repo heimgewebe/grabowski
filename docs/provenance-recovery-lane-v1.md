@@ -41,6 +41,17 @@ Die Lane leitet ihre Autorität **nicht** aus der als ungültig erkannten
 Runtime-Provenienz ab. `provenance_valid` wird ausschließlich gelesen, um
 festzustellen, dass eine Reparatur überhaupt gerechtfertigt ist.
 
+Der zentrale Transport-Roundtrip verlangt für normale Mutationen eine
+integritätsgültige Runtime. Genau für `grabowski_recovery_provenance_repair`
+würde diese Vorbedingung den Reparaturpfad erneut zirkulär schließen. Deshalb
+lässt der zentrale Dispatcher **nur dieses eine mutierende Tool** ohne normalen
+Roundtrip bis zu seinem eigenen Recovery-Gate durch, und auch nur wenn alle
+reparierbaren Integritätsflags explizite Boolesche Werte sind und mindestens
+eines davon `false` ist. Fehlende/unklare Integrität, eine gesunde Runtime und
+jede andere Mutation bleiben am normalen Transport-Gate. Diese enge Ausnahme
+ist keine Reparaturautorität; Wirkung entsteht erst, wenn danach sämtliche
+unabhängigen Recovery-Gates bestehen.
+
 Alle Gate-Bedingungen (fail-closed, alle müssen erfüllt sein):
 
 | Check | Bedeutung |

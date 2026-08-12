@@ -27,6 +27,21 @@ def load_module():
 
 watchdog = load_module()
 TRUSTED_SCHEMA = ROOT / "src" / "grabowski_runtime_contract.py"
+SCHEMA_FIXTURE_BYTES = b"# inert schema identity for watchdog fixtures\n"
+
+
+def _load_contract_validator():
+    spec = importlib.util.spec_from_file_location(
+        "grabowski_runtime_contract_test_validator", TRUSTED_SCHEMA
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("runtime contract validator could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CONTRACT_VALIDATOR = _load_contract_validator()
 # Real deployments anchor at a root-owned path; tests exercise both states.
 TRUST_ANCHOR = Path("/etc/grabowski/runtime-contract-schema.py")
 
@@ -279,14 +294,15 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
 
         module_paths: dict[str, str] = {}
         source_sha256s: dict[str, str] = {}
-        trusted_schema_bytes = TRUSTED_SCHEMA.read_bytes()
         for module in modules:
             target = site_packages / f"{module}.py"
-            # The canonical schema module must be the real one, otherwise the
-            # trusted-copy comparison degrades and schema checks never run.
+            # The fixture needs a stable installed-schema identity. Positive
+            # schema-verdict tests bind the independent anchor to these inert
+            # bytes and patch only the already-trusted validator callable; no
+            # repository source is copied into another clear-text fixture file.
             _materialise(
                 target,
-                trusted_schema_bytes
+                SCHEMA_FIXTURE_BYTES
                 if module == "grabowski_runtime_contract"
                 else f"# {module}\n".encode(),
             )
@@ -371,7 +387,7 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
         """A same-uid file is a convenience, not an authority."""
         with tempfile.TemporaryDirectory() as directory:
             anchor = Path(directory) / "schema.py"
-            anchor.write_bytes(TRUSTED_SCHEMA.read_bytes())
+            anchor.write_bytes(SCHEMA_FIXTURE_BYTES)
             observed, state = watchdog.verified_trust_anchor(anchor)
 
         self.assertIsNone(observed)
@@ -388,11 +404,16 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
 
     def test_verified_anchor_yields_a_decisive_valid_verdict(self) -> None:
         """With a verified anchor the probe reaches a real verdict."""
-        trusted = TRUSTED_SCHEMA.read_bytes()
         with tempfile.TemporaryDirectory() as directory:
             runtime = self._runtime(Path(directory))
             with patch.object(
-                watchdog, "verified_trust_anchor", return_value=(trusted, "verified")
+                watchdog,
+                "verified_trust_anchor",
+                return_value=(SCHEMA_FIXTURE_BYTES, "verified"),
+            ), patch.object(
+                watchdog,
+                "_schema_from_anchor",
+                return_value={"manifest_errors": CONTRACT_VALIDATOR.manifest_errors},
             ):
                 result = watchdog.probe_integrity(runtime)
 
@@ -402,7 +423,6 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
 
     def test_verified_anchor_still_catches_schema_faults(self) -> None:
         """The anchor restores schema coverage, it does not bypass it."""
-        trusted = TRUSTED_SCHEMA.read_bytes()
         with tempfile.TemporaryDirectory() as directory:
             runtime = self._runtime(Path(directory))
             manifest_path = runtime / "deployment-manifest.json"
@@ -410,7 +430,13 @@ class WatchdogIntegrityProbeTests(unittest.TestCase):
             del manifest["repo_head"]
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with patch.object(
-                watchdog, "verified_trust_anchor", return_value=(trusted, "verified")
+                watchdog,
+                "verified_trust_anchor",
+                return_value=(SCHEMA_FIXTURE_BYTES, "verified"),
+            ), patch.object(
+                watchdog,
+                "_schema_from_anchor",
+                return_value={"manifest_errors": CONTRACT_VALIDATOR.manifest_errors},
             ):
                 result = watchdog.probe_integrity(runtime)
 
