@@ -231,6 +231,12 @@ nicht deklariert werden. Die Aufteilung ist deshalb:
 - `SuccessExitStatus=1` wertet Routine-Evidenz (Fehlmessung, aufgeschobener
   Neustart) nicht als Unit-Fehler; Exit 2/3/4 (indeterminate, Budget
   erschöpft, Neustart ohne Genesung) bleiben sichtbare Fehler.
+- Exit 5 meldet `integrity_invalid`: Prozess und Transport leben, aber die
+  deployte Runtime ist integritätsungültig. Ein Neustart repariert ein
+  fehlerhaftes Manifest nicht, deshalb startet der Watchdog in diesem Zustand
+  bewusst *nicht* neu, sondern meldet `grabowski.watchdog.integrity-invalid`
+  mit maschinenlesbarem `integrity.reason` und verweist auf den engen
+  Reparaturpfad `grabowski_recovery_provenance_repair`.
   Der Tunnel-Watchdog behält `TimeoutStartSec=90`. Der koordinierte
   Operator-Recovery nutzt `TimeoutStartSec=900`; Parametergrenzen und ein
   konservatives Rechenbudget verhindern unbeschränkte Läufe.

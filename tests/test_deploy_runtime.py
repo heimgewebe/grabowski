@@ -258,12 +258,15 @@ class DeployRuntimeTests(unittest.TestCase):
         )
         invalid = json.loads(raw)
         invalid["runtime_assets"][0]["destination"] = "../catalog.json"
-        with self.assertRaisesRegex(deploy_runtime.DeployError, "repository-relativer"):
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError,
+            r"runtime_assets\[0\]\.destination must be a repository-relative path",
+        ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
         invalid = json.loads(raw)
         invalid["runtime_assets"][0]["source"] = "./runtime-entrypoint.json"
         with self.assertRaisesRegex(
-            deploy_runtime.DeployError, "reservierten Snapshot-Quellpfad"
+            deploy_runtime.DeployError, r"runtime_assets\[0\]\.source uses a reserved snapshot input name"
         ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 
@@ -298,12 +301,18 @@ class DeployRuntimeTests(unittest.TestCase):
 
         invalid = json.loads(json.dumps(raw))
         invalid["spawn_dependencies"][0]["spawned_module"] = "grabowski_missing"
-        with self.assertRaisesRegex(deploy_runtime.DeployError, "Zielmodul"):
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError,
+            r"spawn_dependencies\[0\]\.spawned_module is not deployed",
+        ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 
         invalid = json.loads(json.dumps(raw))
         invalid["spawn_dependencies"].append(dict(invalid["spawn_dependencies"][0]))
-        with self.assertRaisesRegex(deploy_runtime.DeployError, "Doppelte Runtime-Spawn-Abhängigkeit"):
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError,
+            r"spawn_dependencies\[1\] repeats a spawn dependency",
+        ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 
         invalid = json.loads(json.dumps(raw))
@@ -319,7 +328,10 @@ class DeployRuntimeTests(unittest.TestCase):
 
         invalid = json.loads(json.dumps(raw))
         del invalid["spawn_dependencies"]
-        with self.assertRaisesRegex(deploy_runtime.DeployError, "benötigt spawn_dependencies"):
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError,
+            "missing required field\\(s\\): spawn_dependencies",
+        ):
             deploy_runtime.load_contract_bytes(json.dumps(invalid).encode())
 
     def test_manifest_validation_rejects_invalid_spawn_dependencies(self) -> None:
@@ -369,7 +381,10 @@ class DeployRuntimeTests(unittest.TestCase):
                 "expected_tools": ["grabowski_status"],
             }
         ).encode()
-        with self.assertRaisesRegex(deploy_runtime.DeployError, "Nicht unterstützter"):
+        with self.assertRaisesRegex(
+            deploy_runtime.DeployError,
+            "unsupported runtime entry-point mode",
+        ):
             deploy_runtime.load_contract_bytes(raw)
 
     def test_managed_path_rejects_traversal(self) -> None:

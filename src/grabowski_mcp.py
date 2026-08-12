@@ -40,6 +40,7 @@ except ImportError:
 from mcp.types import ToolAnnotations
 
 import grabowski_consumer_surface as consumer_surface
+import grabowski_runtime_contract
 import grabowski_client_snapshot
 import grabowski_transport_roundtrip
 import grabowski_transport_assertion
@@ -57,11 +58,6 @@ import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
-RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS = frozenset({
-    "runtime-entrypoint.json",
-    "runtime.in",
-    "runtime.lock.txt",
-})
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
 AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
@@ -681,6 +677,8 @@ TOOL_CAPABILITY_REQUIREMENTS = {
     "grabowski_task_reconcile_resume": ("durable_job",),
     "grabowski_recovery_status": ("audit_verify",),
     "grabowski_recovery_server_probe": ("file_write", "secret_use", "terminal_execute"),
+    "grabowski_recovery_provenance_assess": ("audit_verify",),
+    "grabowski_recovery_provenance_repair": ("durable_job", "git_cli"),
     "grabowski_operator_blockade_status": ("audit_verify",),
     "grabowski_operator_blockade_engage": ("audit_verify", "file_write"),
     "grabowski_operator_blockade_disarm": ("audit_verify", "file_move"),
@@ -751,6 +749,8 @@ OPERATOR_CAPABILITY_REQUIREMENT_TOOLS = {
     "grabowski_service_status",
     "grabowski_service_logs",
     "grabowski_runtime_deploy_schedule",
+    "grabowski_recovery_provenance_assess",
+    "grabowski_recovery_provenance_repair",
     "grabowski_agent_workspace_create",
     "grabowski_agent_workspace_status",
     "grabowski_agent_workspace_attach",
@@ -4299,253 +4299,14 @@ def _safe_relative_path(value: Any) -> bool:
     return not path.is_absolute() and ".." not in path.parts and path.as_posix() != "."
 
 
-def _valid_agent_instructions_identity(value: Any) -> bool:
-    return (
-        isinstance(value, dict)
-        and set(value)
-        == {
-            "schema_version",
-            "version",
-            "sha256",
-            "bytes",
-            "max_bytes",
-        }
-        and value.get("schema_version") == AGENT_INSTRUCTIONS_SCHEMA_VERSION
-        and value.get("version") == AGENT_INSTRUCTIONS_VERSION
-        and _is_lower_hex(value.get("sha256"), 64)
-        and isinstance(value.get("bytes"), int)
-        and not isinstance(value.get("bytes"), bool)
-        and 0 < value["bytes"] <= AGENT_INSTRUCTIONS_MAX_BYTES
-        and value.get("max_bytes") == AGENT_INSTRUCTIONS_MAX_BYTES
-    )
-
-
 def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
-    required = {
-        "schema_version": int,
-        "release_id": str,
-        "repo_head": str,
-        "entrypoint_contract": dict,
-        "entrypoint_contract_sha256": str,
-        "agent_instructions": dict,
-        "source_sha256": str,
-        "source_sha256s": dict,
-        "runtime_asset_sha256s": dict,
-        "runtime_asset_paths": dict,
-        "runtime_input_sha256": str,
-        "runtime_lock_sha256": str,
-        "snapshot_paths": dict,
-        "immutable_release_path": str,
-        "expected_stable_runtime_path": str,
-        "release_python_path": str,
-        "entrypoint_path": str,
-        "module_paths": dict,
-        "platform": str,
-        "python_version": str,
-        "python_implementation": str,
-        "mcp_protocol_version": str,
-        "created_at_unix": int,
-        "completion_status": str,
-        "executable": str,
-        "pip_version": str,
-    }
-    for key, kind in required.items():
-        value = raw.get(key)
-        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
-            return False
-    if (
-        raw.get("schema_version") != DEPLOYMENT_MANIFEST_SCHEMA_VERSION
-        or raw.get("completion_status") != "complete"
-    ):
-        return False
-    if not _is_lower_hex(raw.get("repo_head"), 40):
-        return False
-    for key in (
-        "entrypoint_contract_sha256",
-        "source_sha256",
-        "runtime_input_sha256",
-        "runtime_lock_sha256",
-    ):
-        if not _is_lower_hex(raw.get(key), 64):
-            return False
-    if not _valid_agent_instructions_identity(raw.get("agent_instructions")):
-        return False
-    contract = raw.get("entrypoint_contract")
-    if not isinstance(contract, dict):
-        return False
-    schema_version = contract.get("schema_version")
-    expected_keys = {"schema_version", "mode", "module", "source", "expected_tools"}
-    if schema_version in {2, 3, 4}:
-        expected_keys.add("supporting_sources")
-    if schema_version in {3, 4}:
-        expected_keys.add("runtime_assets")
-    if schema_version == 4:
-        expected_keys.add("spawn_dependencies")
-    if schema_version not in {1, 2, 3, 4} or set(contract) != expected_keys:
-        return False
-    module = contract.get("module")
-    source = contract.get("source")
-    if (
-        contract.get("mode") != "module"
-        or not isinstance(module, str)
-        or MODULE_RE.fullmatch(module) is None
-        or not _safe_relative_path(source)
-    ):
-        return False
-    tools = contract.get("expected_tools")
-    if (
-        not isinstance(tools, list)
-        or not tools
-        or not all(isinstance(item, str) and item for item in tools)
-        or len(set(tools)) != len(tools)
-    ):
-        return False
-    modules = {module}
-    sources = {source}
-    supporting_modules: set[str] = set()
-    supporting = contract.get("supporting_sources", [])
-    if not isinstance(supporting, list):
-        return False
-    for item in supporting:
-        if not isinstance(item, dict) or set(item) != {"module", "source"}:
-            return False
-        item_module = item.get("module")
-        item_source = item.get("source")
-        if (
-            not isinstance(item_module, str)
-            or MODULE_RE.fullmatch(item_module) is None
-            or item_module in modules
-            or not _safe_relative_path(item_source)
-            or item_source in sources
-        ):
-            return False
-        modules.add(item_module)
-        supporting_modules.add(item_module)
-        sources.add(item_source)
+    """Validate the manifest against the one canonical deployment schema.
 
-    spawn_dependencies = contract.get("spawn_dependencies", [])
-    if not isinstance(spawn_dependencies, list):
-        return False
-    seen_spawn_dependencies: set[tuple[str, str, str]] = set()
-    for item in spawn_dependencies:
-        if not isinstance(item, dict) or set(item) != {
-            "kind",
-            "launcher_module",
-            "spawned_module",
-        }:
-            return False
-        kind = item.get("kind")
-        launcher_module = item.get("launcher_module")
-        spawned_module = item.get("spawned_module")
-        identity = (kind, launcher_module, spawned_module)
-        if (
-            kind != "python_module"
-            or not isinstance(launcher_module, str)
-            or launcher_module not in modules
-            or not isinstance(spawned_module, str)
-            or spawned_module not in modules
-            or identity in seen_spawn_dependencies
-        ):
-            return False
-        seen_spawn_dependencies.add(identity)
-
-    runtime_asset_destinations: set[str] = set()
-    runtime_asset_sources: set[str] = set()
-    runtime_assets = contract.get("runtime_assets", [])
-    if not isinstance(runtime_assets, list):
-        return False
-    for item in runtime_assets:
-        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
-            return False
-        asset_source = item.get("source")
-        destination = item.get("destination")
-        if (
-            not _safe_relative_path(asset_source)
-            or not _safe_relative_path(destination)
-            or asset_source in sources
-            or asset_source in runtime_asset_sources
-            or Path(asset_source).as_posix() in RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS
-            or destination in runtime_asset_destinations
-        ):
-            return False
-        destination_path = Path(destination)
-        if (
-            destination_path.parts[0] in {".venv", "inputs"}
-            or destination in {"deployment-manifest.json", "deployment-incomplete.json"}
-            or any(
-                destination_path in Path(existing).parents
-                or Path(existing) in destination_path.parents
-                for existing in runtime_asset_destinations
-            )
-        ):
-            return False
-        runtime_asset_sources.add(asset_source)
-        runtime_asset_destinations.add(destination)
-
-    hashes = raw.get("source_sha256s")
-    if (
-        not isinstance(hashes, dict)
-        or set(hashes) != modules
-        or not all(_is_lower_hex(value, 64) for value in hashes.values())
-        or hashes.get(module) != raw.get("source_sha256")
-    ):
-        return False
-    asset_hashes = raw.get("runtime_asset_sha256s")
-    if (
-        not isinstance(asset_hashes, dict)
-        or set(asset_hashes) != runtime_asset_destinations
-        or not all(_is_lower_hex(value, 64) for value in asset_hashes.values())
-    ):
-        return False
-    asset_paths = raw.get("runtime_asset_paths")
-    if (
-        not isinstance(asset_paths, dict)
-        or set(asset_paths) != runtime_asset_destinations
-        or not all(isinstance(value, str) and value for value in asset_paths.values())
-    ):
-        return False
-    module_paths = raw.get("module_paths")
-    if (
-        not isinstance(module_paths, dict)
-        or set(module_paths) != modules
-        or not all(isinstance(value, str) and value for value in module_paths.values())
-        or module_paths.get(module) != raw.get("entrypoint_path")
-    ):
-        return False
-    snapshot_paths = raw.get("snapshot_paths")
-    if not isinstance(snapshot_paths, dict) or set(snapshot_paths) != {
-        "runtime_entrypoint",
-        "runtime_input",
-        "runtime_lock",
-        "source",
-        "supporting_sources",
-        "runtime_assets",
-    }:
-        return False
-    if not all(
-        isinstance(snapshot_paths.get(key), str) and snapshot_paths.get(key)
-        for key in ("runtime_entrypoint", "runtime_input", "runtime_lock", "source")
-    ):
-        return False
-    support_paths = snapshot_paths.get("supporting_sources")
-    if (
-        not isinstance(support_paths, dict)
-        or set(support_paths) != supporting_modules
-        or not all(isinstance(value, str) and value for value in support_paths.values())
-    ):
-        return False
-    runtime_asset_snapshot_paths = snapshot_paths.get("runtime_assets")
-    if (
-        not isinstance(runtime_asset_snapshot_paths, dict)
-        or set(runtime_asset_snapshot_paths) != runtime_asset_destinations
-        or not all(
-            isinstance(value, str) and value
-            for value in runtime_asset_snapshot_paths.values()
-        )
-    ):
-        return False
-    created = raw.get("created_at_unix")
-    return isinstance(created, int) and not isinstance(created, bool) and created > 0
+    Both the deployment builder and the watchdog validate with this same
+    definition, so a release cannot be judged differently depending on which
+    layer is looking at it.
+    """
+    return grabowski_runtime_contract.manifest_is_valid(raw)
 
 
 def _read_bound_regular_file(

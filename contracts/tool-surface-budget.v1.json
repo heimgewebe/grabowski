@@ -1833,6 +1833,56 @@
         "risk_class": "low",
         "tool": "grabowski_systemkatalog_query"
       }
+    },
+    "grabowski_recovery_provenance_assess": {
+      "evidence_refs": [
+        "contract:provenance-recovery-lane-v1",
+        "tests:test_provenance_recovery.py",
+        "tests:test_release_lifecycle.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool reports only whether the narrow provenance repair lane would admit one exact commit, and grants nothing.",
+        "evidence": "Read-only gate evaluation over audit chain, kill switch, backup freshness, privileged broker readiness, revision-bound source identity, target-commit contract validity under the target's own canonical schema, and absence of a competing deployment mutation."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "grabowski_recovery_status was rejected because it evaluates the power-worker gate, which itself depends on deployment_provenance; a lane that exists precisely because that flag is false cannot be assessed through a surface gated on it.",
+      "rationale": "When deployment provenance is invalid, every ordinary read that reports repair readiness is downstream of the broken flag. A separate read surface lets an operator inspect a blocked repair lane without deriving anything from the runtime under repair.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "recovery",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_recovery_provenance_assess"
+      }
+    },
+    "grabowski_recovery_provenance_repair": {
+      "evidence_refs": [
+        "contract:provenance-recovery-lane-v1",
+        "tests:test_provenance_recovery.py",
+        "tests:test_release_lifecycle.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns exactly one transition: replacing an integrity-invalid deployed runtime with a build of one exact, verified commit.",
+        "evidence": "Refuses unless the runtime is actually integrity-invalid; requires valid writable audit chain, clear kill switch, fresh local backup evidence, a healthy privileged broker, a clean revision-bound source whose HEAD and origin/main equal the named commit, a target contract that validates under the target commit's own canonical schema and deploys that schema, and no competing deployment mutation. Grants no shell, command or power-worker authority; normal gates apply again after repair."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "grabowski_runtime_deploy_schedule and grabowski_power_run were both rejected: each derives authority from the deployment provenance this lane exists to repair, so reusing either would either stay deadlocked or require weakening a gate that must keep applying to ordinary effects.",
+      "rationale": "A fail-closed integrity gate must not close over its own repair path. This is the single narrowest authority that can restore a valid runtime, deliberately separated from general deployment and power authority so that a broken release unlocks nothing except its own replacement.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "recovery",
+        "effects": [
+          "audit-record",
+          "durable-job-start",
+          "runtime-deployment"
+        ],
+        "read_only": false,
+        "reversibility": "previous-release-retained",
+        "risk_class": "high",
+        "tool": "grabowski_recovery_provenance_repair"
+      }
     }
   },
   "baseline": {

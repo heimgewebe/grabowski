@@ -1,16 +1,16 @@
 {
   "canonical_contract": {
     "path": "config/runtime-entrypoint.json",
-    "sha256": "ca8591474e554e6cafc49c39f5709ac5efdb99a3dea92d05f69943d5f2e02a99"
+    "sha256": "02d607357e903b9b6279101fd4c7fd09c93d9ee1df943826b5d48044c93621ec"
   },
   "capability_catalog": {
     "path": "contracts/capability-catalog.v1.json",
-    "sha256": "5999ebdaa96e1b1bc2cb1c07ad35b73e7b8f78ea82d8f66a2beb52eced4a813e"
+    "sha256": "021c5ed1c52a619315461dda457cc4db9dcbe7ff76a614157f3a356fa4a872b0"
   },
   "counts": {
     "core": 22,
-    "full": 192,
-    "operator": 177
+    "full": 194,
+    "operator": 179
   },
   "profiles": {
     "core": [
@@ -155,6 +155,8 @@
       "grabowski_task_reconcile_check",
       "grabowski_task_reconcile_refresh",
       "grabowski_task_reconcile_resume",
+      "grabowski_recovery_provenance_assess",
+      "grabowski_recovery_provenance_repair",
       "grabowski_recovery_status",
       "grabowski_recovery_server_probe",
       "grabowski_operator_blockade_status",
@@ -335,6 +337,8 @@
       "grabowski_task_reconcile_check",
       "grabowski_task_reconcile_refresh",
       "grabowski_task_reconcile_resume",
+      "grabowski_recovery_provenance_assess",
+      "grabowski_recovery_provenance_repair",
       "grabowski_recovery_server_probe",
       "grabowski_operator_blockade_status",
       "grabowski_operator_blockade_engage",
