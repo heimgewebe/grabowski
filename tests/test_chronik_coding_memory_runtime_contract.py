@@ -15,7 +15,7 @@ SPEC.loader.exec_module(validator)
 
 
 class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
-    def test_current_binding_matches_producer_and_runtime(self) -> None:
+    def test_current_binding_matches_producer_and_runtime_lock(self) -> None:
         result = validator.validate_root(ROOT)
         self.assertEqual(
             result["producer_commit"],
@@ -23,7 +23,7 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
         )
         self.assertEqual(result["producer_python_requires"], ">=3.10")
         self.assertEqual(
-            result["compatible_runtime_pins"],
+            result["compatible_runtime_lock"],
             {
                 "filelock": "3.32.2",
                 "jsonschema": "4.26.0",
@@ -63,23 +63,9 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
             "pydantic-settings": "2.14.2",
             "pyyaml": "6.0.3",
         }
-        lines = [f"{name}=={version}" for name, version in pins.items()]
-        (directory / "requirements" / "runtime.in").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
         (directory / "requirements" / "runtime.lock.txt").write_text(
-            "\n".join(lines) + "\n", encoding="utf-8"
-        )
-        pyproject_lines = [
-            "[project]",
-            'name = "fixture"',
-            "dependencies = [",
-            *(f'  "{line}",' for line in lines),
-            "]",
-            "",
-        ]
-        (directory / "pyproject.toml").write_text(
-            "\n".join(pyproject_lines), encoding="utf-8"
+            "\n".join(f"{name}=={version}" for name, version in pins.items()) + "\n",
+            encoding="utf-8",
         )
         return directory
 
@@ -102,28 +88,28 @@ class ChronikCodingMemoryRuntimeContractTests(unittest.TestCase):
             json.dumps(binding, indent=2) + "\n", encoding="utf-8"
         )
 
-    def test_missing_direct_pin_is_rejected_even_when_lock_contains_it(self) -> None:
+    def test_missing_locked_dependency_is_rejected(self) -> None:
         root = self._fixture_root()
-        runtime_input = root / "requirements" / "runtime.in"
-        runtime_input.write_text(
-            runtime_input.read_text(encoding="utf-8").replace(
+        runtime_lock = root / "requirements" / "runtime.lock.txt"
+        runtime_lock.write_text(
+            runtime_lock.read_text(encoding="utf-8").replace(
                 "pydantic-settings==2.14.2\n", ""
             ),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ValueError, "not a direct Grabowski pin"):
+        with self.assertRaisesRegex(ValueError, "absent from Grabowski runtime lock"):
             validator.validate_root(root)
 
-    def test_packaged_pin_must_match_runtime_input(self) -> None:
+    def test_incompatible_locked_dependency_is_rejected(self) -> None:
         root = self._fixture_root()
-        pyproject = root / "pyproject.toml"
-        pyproject.write_text(
-            pyproject.read_text(encoding="utf-8").replace(
-                '"pydantic-settings==2.14.2"', '"pydantic-settings==2.13.0"'
+        runtime_lock = root / "requirements" / "runtime.lock.txt"
+        runtime_lock.write_text(
+            runtime_lock.read_text(encoding="utf-8").replace(
+                "pydantic-settings==2.14.2", "pydantic-settings==2.13.0"
             ),
             encoding="utf-8",
         )
-        with self.assertRaisesRegex(ValueError, "differs between input and pyproject"):
+        with self.assertRaisesRegex(ValueError, "runtime lock violates Chronik contract"):
             validator.validate_root(root)
 
     def test_vendored_contract_tampering_is_rejected_before_semantics(self) -> None:
