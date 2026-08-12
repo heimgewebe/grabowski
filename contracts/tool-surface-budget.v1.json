@@ -125,29 +125,6 @@
         "tool": "grabowski_audit_query"
       }
     },
-    "grabowski_reposkop_effectiveness": {
-      "evidence_refs": [
-        "tests:test_reposkop_effectiveness.py",
-        "tests:test_reposkop_effectiveness_integration.py",
-        "contract:task-reposkop-execution-attestation-v2"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes only bounded coverage, technical-outcome, latency and evidence-qualified improvement projections derived from the verified audit chain.",
-        "evidence": "Complete classified task-start denominator, deterministic evaluation binding, ordered evaluation/decision/outcome events, bounded grouping and percentile limits, privacy exclusions, explicit non-causality claims and focused projection plus lifecycle tests."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Generic audit query or analysis would require callers to reconstruct a multi-event task lifecycle, denominator rules, percentile semantics and improvement thresholds, risking false success claims and inconsistent treatment of legacy or missing attestations.",
-      "rationale": "Reposkop effectiveness is a materially distinct joined lifecycle projection over classified task starts, verified evaluations, decisions and terminal outcomes. The dedicated read-only shape preserves bounded evidence semantics without creating a second truth store or granting mutation authority.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "audit",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_reposkop_effectiveness"
-      }
-    },
     "grabowski_audit_trace": {
       "evidence_refs": [
         "docs:audit-query-trace-v1.md",
@@ -959,6 +936,56 @@
         "tool": "grabowski_operator_optimization_report"
       }
     },
+    "grabowski_recovery_provenance_assess": {
+      "evidence_refs": [
+        "contract:provenance-recovery-lane-v1",
+        "tests:test_provenance_recovery.py",
+        "tests:test_release_lifecycle.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool reports only whether the narrow provenance repair lane would admit one exact commit, and grants nothing.",
+        "evidence": "Read-only gate evaluation over audit chain, kill switch, backup freshness, privileged broker readiness, revision-bound source identity, target-commit contract validity under the target's own canonical schema, and absence of a competing deployment mutation."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "grabowski_recovery_status was rejected because it evaluates the power-worker gate, which itself depends on deployment_provenance; a lane that exists precisely because that flag is false cannot be assessed through a surface gated on it.",
+      "rationale": "When deployment provenance is invalid, every ordinary read that reports repair readiness is downstream of the broken flag. A separate read surface lets an operator inspect a blocked repair lane without deriving anything from the runtime under repair.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "recovery",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_recovery_provenance_assess"
+      }
+    },
+    "grabowski_recovery_provenance_repair": {
+      "evidence_refs": [
+        "contract:provenance-recovery-lane-v1",
+        "tests:test_provenance_recovery.py",
+        "tests:test_release_lifecycle.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool owns exactly one transition: replacing an integrity-invalid deployed runtime with a build of one exact, verified commit.",
+        "evidence": "Refuses unless the runtime is actually integrity-invalid; requires valid writable audit chain, clear kill switch, fresh local backup evidence, a healthy privileged broker, a clean revision-bound source whose HEAD and origin/main equal the named commit, a target contract that validates under the target commit's own canonical schema and deploys that schema, and no competing deployment mutation. Grants no shell, command or power-worker authority; normal gates apply again after repair."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "grabowski_runtime_deploy_schedule and grabowski_power_run were both rejected: each derives authority from the deployment provenance this lane exists to repair, so reusing either would either stay deadlocked or require weakening a gate that must keep applying to ordinary effects.",
+      "rationale": "A fail-closed integrity gate must not close over its own repair path. This is the single narrowest authority that can restore a valid runtime, deliberately separated from general deployment and power authority so that a broken release unlocks nothing except its own replacement.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "recovery",
+        "effects": [
+          "audit-record",
+          "durable-job-start",
+          "runtime-deployment"
+        ],
+        "read_only": false,
+        "reversibility": "previous-release-retained",
+        "risk_class": "high",
+        "tool": "grabowski_recovery_provenance_repair"
+      }
+    },
     "grabowski_reposkop_context": {
       "evidence_refs": [
         "docs:reposkop-context-v1.md",
@@ -983,6 +1010,29 @@
         "reversibility": "idempotent-create-only",
         "risk_class": "low",
         "tool": "grabowski_reposkop_context"
+      }
+    },
+    "grabowski_reposkop_effectiveness": {
+      "evidence_refs": [
+        "tests:test_reposkop_effectiveness.py",
+        "tests:test_reposkop_effectiveness_integration.py",
+        "contract:task-reposkop-execution-attestation-v2"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded coverage, technical-outcome, latency and evidence-qualified improvement projections derived from the verified audit chain.",
+        "evidence": "Complete classified task-start denominator, deterministic evaluation binding, ordered evaluation/decision/outcome events, bounded grouping and percentile limits, privacy exclusions, explicit non-causality claims and focused projection plus lifecycle tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic audit query or analysis would require callers to reconstruct a multi-event task lifecycle, denominator rules, percentile semantics and improvement thresholds, risking false success claims and inconsistent treatment of legacy or missing attestations.",
+      "rationale": "Reposkop effectiveness is a materially distinct joined lifecycle projection over classified task starts, verified evaluations, decisions and terminal outcomes. The dedicated read-only shape preserves bounded evidence semantics without creating a second truth store or granting mutation authority.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "audit",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_reposkop_effectiveness"
       }
     },
     "grabowski_runtime_refresh_lease_release": {
@@ -1011,6 +1061,29 @@
         "reversibility": "resource-reacquire",
         "risk_class": "high",
         "tool": "grabowski_runtime_refresh_lease_release"
+      }
+    },
+    "grabowski_systemkatalog_query": {
+      "evidence_refs": [
+        "systemkatalog:heimgewebe/systemkatalog#164",
+        "bureau:candidate-36ef5b573fc8730e48f6d82b",
+        "tests:tests/test_systemkatalog_surface.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes one bounded query shape over the canonical, revision-bound Systemkatalog v2 contract without copying catalog truth.",
+        "evidence": "Exact operation and value schema, clean canonical checkout and origin binding, query-script digest, bounded subprocess, strict v2 envelope validation, manifest/source-evidence validation and fail-closed tests."
+      },
+      "justification_kind": "material_call_shape",
+      "operation_alternative_considered": "Generic file and terminal tools were rejected because they require callers to discover private paths, compose argv, parse JSON and independently reconstruct commit, manifest and source-evidence validation.",
+      "rationale": "Stable ecosystem semantics need one query-specific typed response whose shape differs materially from generic file, terminal, RepoGround and runtime-status surfaces. One endpoint covers all Systemkatalog operations and adds no service, cache or writable truth.",
+      "tool_contract": {
+        "authority_class": "read",
+        "category": "knowledge",
+        "effects": [],
+        "read_only": true,
+        "reversibility": "not-applicable",
+        "risk_class": "low",
+        "tool": "grabowski_systemkatalog_query"
       }
     },
     "grabowski_task_archive_list": {
@@ -1398,31 +1471,6 @@
         "tool": "ipad_file_stat"
       }
     },
-    "ipad_native_permission_status": {
-      "evidence_refs": [
-        "docs:juno-ipad-agent.md",
-        "tests:test_juno_tools.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes only bounded native iPad authorization metadata and no private user content.",
-        "evidence": "Fixed capability set, exact agent/session binding, device-job receipts, host semantic validation, strict top-level and nested schemas, and tests that reject capability or result drift."
-      },
-      "justification_kind": "distinct_authority_boundary",
-      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because callers could access broader native APIs and could not enforce the fixed permission-only result schema.",
-      "rationale": "Native permission state is a distinct device boundary from document-provider storage and must be inspectable without granting a generic native-call primitive.",
-      "tool_contract": {
-        "authority_class": "mutation",
-        "category": "device-worker",
-        "effects": [
-          "device-job-execute",
-          "receipt-create"
-        ],
-        "read_only": false,
-        "reversibility": "not-applicable-device-job-and-receipt-retained",
-        "risk_class": "medium",
-        "tool": "ipad_native_permission_status"
-      }
-    },
     "ipad_native_permission_request": {
       "evidence_refs": [
         "docs:juno-ipad-agent.md",
@@ -1447,6 +1495,31 @@
         "reversibility": "manual-permission-change-in-ipados-settings",
         "risk_class": "high",
         "tool": "ipad_native_permission_request"
+      }
+    },
+    "ipad_native_permission_status": {
+      "evidence_refs": [
+        "docs:juno-ipad-agent.md",
+        "tests:test_juno_tools.py"
+      ],
+      "exception_detail": {
+        "claim": "The tool exposes only bounded native iPad authorization metadata and no private user content.",
+        "evidence": "Fixed capability set, exact agent/session binding, device-job receipts, host semantic validation, strict top-level and nested schemas, and tests that reject capability or result drift."
+      },
+      "justification_kind": "distinct_authority_boundary",
+      "operation_alternative_considered": "Generic arbitrary Juno Python was rejected because callers could access broader native APIs and could not enforce the fixed permission-only result schema.",
+      "rationale": "Native permission state is a distinct device boundary from document-provider storage and must be inspectable without granting a generic native-call primitive.",
+      "tool_contract": {
+        "authority_class": "mutation",
+        "category": "device-worker",
+        "effects": [
+          "device-job-execute",
+          "receipt-create"
+        ],
+        "read_only": false,
+        "reversibility": "not-applicable-device-job-and-receipt-retained",
+        "risk_class": "medium",
+        "tool": "ipad_native_permission_status"
       }
     },
     "ipad_permission_probe": {
@@ -1809,29 +1882,6 @@
         "reversibility": "not-applicable",
         "risk_class": "low",
         "tool": "repoground_range_get"
-      }
-    },
-    "grabowski_systemkatalog_query": {
-      "evidence_refs": [
-        "systemkatalog:heimgewebe/systemkatalog#164",
-        "bureau:candidate-36ef5b573fc8730e48f6d82b",
-        "tests:tests/test_systemkatalog_surface.py"
-      ],
-      "exception_detail": {
-        "claim": "The tool exposes one bounded query shape over the canonical, revision-bound Systemkatalog v2 contract without copying catalog truth.",
-        "evidence": "Exact operation and value schema, clean canonical checkout and origin binding, query-script digest, bounded subprocess, strict v2 envelope validation, manifest/source-evidence validation and fail-closed tests."
-      },
-      "justification_kind": "material_call_shape",
-      "operation_alternative_considered": "Generic file and terminal tools were rejected because they require callers to discover private paths, compose argv, parse JSON and independently reconstruct commit, manifest and source-evidence validation.",
-      "rationale": "Stable ecosystem semantics need one query-specific typed response whose shape differs materially from generic file, terminal, RepoGround and runtime-status surfaces. One endpoint covers all Systemkatalog operations and adds no service, cache or writable truth.",
-      "tool_contract": {
-        "authority_class": "read",
-        "category": "knowledge",
-        "effects": [],
-        "read_only": true,
-        "reversibility": "not-applicable",
-        "risk_class": "low",
-        "tool": "grabowski_systemkatalog_query"
       }
     }
   },

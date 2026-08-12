@@ -156,6 +156,8 @@ All expected tools are declared and classified; no orphan declarations or profil
 | `grabowski_task_reconcile_check` | task | yes | low | Preview reconcile effects for persistent task records without mutating state. |
 | `grabowski_task_reconcile_refresh` | task | no | medium | Refresh persistent task records and release terminal leases without resuming processes. |
 | `grabowski_task_reconcile_resume` | task | no | high | Resume bounded retry-safe tasks after reconcile verification. |
+| `grabowski_recovery_provenance_assess` | recovery | yes | low | Assess the fail-closed lane for repairing invalid deployment provenance. |
+| `grabowski_recovery_provenance_repair` | recovery | no | high | Rebuild and activate the runtime from an exact verified commit when deployment provenance is invalid. |
 | `grabowski_recovery_status` | recovery | yes | low | Evaluate the fail-closed recovery gate for power-worker activation. |
 | `grabowski_recovery_server_probe` | recovery | no | high | Produce fresh server recovery evidence. |
 | `grabowski_operator_blockade_status` | recovery | yes | low | Evaluate scoped typed, legacy and environment blockades for one action context. |

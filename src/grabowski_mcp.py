@@ -58,11 +58,6 @@ import grabowski_repoground_catalog as repoground_catalog
 
 APP_NAME = "Grabowski"
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 6
-RESERVED_DEPLOYMENT_SNAPSHOT_INPUTS = frozenset({
-    "runtime-entrypoint.json",
-    "runtime.in",
-    "runtime.lock.txt",
-})
 AGENT_INSTRUCTIONS_SCHEMA_VERSION = 1
 AGENT_INSTRUCTIONS_VERSION = "grabowski-agent-facing-contract-v1"
 AGENT_INSTRUCTIONS_MAX_BYTES = 4_096
@@ -4376,15 +4371,16 @@ def _manifest_schema_valid(raw: dict[str, Any]) -> bool:
     # field list here is what previously let a release be built valid and then
     # be rejected by the very runtime it produced.
     contract = raw.get("entrypoint_contract")
-    if not grabowski_runtime_contract.contract_is_valid(contract):
+    try:
+        grabowski_runtime_contract.validate_contract(contract)
+        module = str(contract["module"])
+        modules = set(grabowski_runtime_contract.contract_modules(contract))
+        runtime_asset_destinations = set(
+            grabowski_runtime_contract.contract_runtime_asset_destinations(contract)
+        )
+    except grabowski_runtime_contract.RuntimeContractError:
         return False
-    assert isinstance(contract, dict)
-    module = str(contract["module"])
-    modules = set(grabowski_runtime_contract.contract_modules(contract))
     supporting_modules = modules - {module}
-    runtime_asset_destinations = set(
-        grabowski_runtime_contract.contract_runtime_asset_destinations(contract)
-    )
 
     hashes = raw.get("source_sha256s")
     if (

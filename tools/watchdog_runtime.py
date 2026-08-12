@@ -5,7 +5,9 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
+import hashlib
 import http.client
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterator
+from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 
@@ -36,12 +38,31 @@ class LockBusy(WatchdogError):
 
 
 @dataclass(frozen=True)
+class IntegrityResult:
+    """Whether the runtime that is alive is also operative.
+
+    ``valid`` is a manifest-level verdict, deliberately narrower than the
+    runtime's own provenance verdict: the watchdog runs on the system
+    interpreter and cannot import the release, so it re-uses the canonical
+    contract schema rather than the full provenance validator.  It can
+    therefore prove a runtime *invalid*, and a ``valid`` result means "no
+    manifest-level integrity fault", not "provenance_valid".
+    """
+
+    valid: bool
+    reason: str | None = None
+    release_id: str | None = None
+    scope: str = "deployment-manifest"
+
+
+@dataclass(frozen=True)
 class ProbeResult:
     status: str
     reasons: tuple[str, ...] = ()
     main_pid: int | None = None
     operator_pid: int | None = None
     process_age_seconds: float | None = None
+    integrity: IntegrityResult | None = None
 
 
 @dataclass
@@ -217,6 +238,89 @@ def http_probe(url: str, expected_body: str, timeout: float) -> bool:
         connection.close()
 
 
+def _canonical_contract_schema(runtime_root: Path) -> Any:
+    """Load the canonical contract schema shipped inside the running release.
+
+    Importing the release's own copy keeps the watchdog from becoming yet
+    another independent opinion about contract validity -- the drift that
+    deadlocked the runtime in the first place.
+    """
+    candidates = sorted(
+        (runtime_root / ".venv/lib").glob("python*/site-packages/grabowski_runtime_contract.py")
+    )
+    for candidate in candidates:
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "grabowski_runtime_contract_watchdog", candidate
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except (OSError, SyntaxError, ValueError, ImportError):
+            continue
+    return None
+
+
+def probe_integrity(runtime_root: Path) -> IntegrityResult:
+    """Report whether the deployed runtime is integrity-valid, fail-closed.
+
+    Every failure path returns ``valid=False`` with a machine-readable reason.
+    A runtime whose deployment provenance is broken is alive but cannot carry
+    out normal effects, so it must never be reported as healthy.
+    """
+    manifest_path = runtime_root / "deployment-manifest.json"
+    if (runtime_root / "deployment-incomplete.json").exists():
+        return IntegrityResult(False, "deployment-incomplete")
+    if not manifest_path.is_file():
+        return IntegrityResult(False, "manifest-missing")
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return IntegrityResult(False, "manifest-unreadable")
+    if not isinstance(raw, dict):
+        return IntegrityResult(False, "manifest-not-an-object")
+
+    release_id = raw.get("release_id") if isinstance(raw.get("release_id"), str) else None
+    if raw.get("completion_status") != "complete":
+        return IntegrityResult(False, "deployment-incomplete", release_id)
+
+    contract = raw.get("entrypoint_contract")
+    if not isinstance(contract, dict):
+        return IntegrityResult(False, "entrypoint-contract-missing", release_id)
+
+    schema = _canonical_contract_schema(runtime_root)
+    if schema is None:
+        return IntegrityResult(False, "canonical-contract-schema-unavailable", release_id)
+    error = schema.contract_error(contract)
+    if error is not None:
+        return IntegrityResult(False, "entrypoint-contract-invalid", release_id)
+
+    snapshot_paths = raw.get("snapshot_paths")
+    recorded = (
+        snapshot_paths.get("runtime_entrypoint")
+        if isinstance(snapshot_paths, dict)
+        else None
+    )
+    if not isinstance(recorded, str):
+        return IntegrityResult(False, "contract-snapshot-path-missing", release_id)
+    try:
+        contract_bytes = Path(recorded).read_bytes()
+    except OSError:
+        return IntegrityResult(False, "contract-snapshot-unreadable", release_id)
+    if hashlib.sha256(contract_bytes).hexdigest() != raw.get("entrypoint_contract_sha256"):
+        return IntegrityResult(False, "contract-hash-drift", release_id)
+    try:
+        snapshotted = json.loads(contract_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return IntegrityResult(False, "contract-snapshot-unparsable", release_id)
+    if snapshotted != contract:
+        return IntegrityResult(False, "embedded-contract-drift", release_id)
+
+    return IntegrityResult(True, None, release_id)
+
+
 def probe_runtime(
     *,
     service: str,
@@ -283,11 +387,26 @@ def probe_runtime(
         )
 
     if not reasons:
+        # Process and transport are alive.  That is not the same as operative:
+        # a runtime whose deployment provenance is invalid still answers
+        # /healthz while refusing every normal effect, so reporting it as
+        # healthy would be semantically wrong.
+        integrity = probe_integrity(runtime_root)
+        if not integrity.valid:
+            return ProbeResult(
+                status="integrity_invalid",
+                reasons=(f"integrity-{integrity.reason}",),
+                main_pid=main_pid,
+                operator_pid=operators[0],
+                process_age_seconds=age,
+                integrity=integrity,
+            )
         return ProbeResult(
             status="healthy",
             main_pid=main_pid,
             operator_pid=operators[0],
             process_age_seconds=age,
+            integrity=integrity,
         )
     if age < startup_grace:
         return ProbeResult(
@@ -486,6 +605,24 @@ def run_watchdog(args: argparse.Namespace) -> int:
                 "main_pid": probe.main_pid,
                 "operator_pid": probe.operator_pid,
             }
+            if probe.integrity is not None:
+                common["integrity"] = {
+                    "valid": probe.integrity.valid,
+                    "reason": probe.integrity.reason,
+                    "release_id": probe.integrity.release_id,
+                    "scope": probe.integrity.scope,
+                }
+
+            if probe.status == "integrity_invalid":
+                # Restarting cannot repair a bad manifest, and a restart loop
+                # would only hide the fault.  Report it as degraded and name the
+                # repair path instead.
+                emit(
+                    "grabowski.watchdog.integrity-invalid",
+                    remediation="grabowski_recovery_provenance_repair",
+                    **common,
+                )
+                return 5
 
             if probe.status == "healthy":
                 state.consecutive_failures = 0

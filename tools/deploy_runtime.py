@@ -36,11 +36,6 @@ RUNTIME_INPUT_RELATIVE = Path("requirements/runtime.in")
 RUNTIME_LOCK_RELATIVE = Path("requirements/runtime.lock.txt")
 ENTRYPOINT_CONTRACT_RELATIVE = Path("config/runtime-entrypoint.json")
 CONTRACT_VALIDATOR_RELATIVE = Path("src/grabowski_runtime_contract.py")
-RESERVED_SNAPSHOT_INPUT_PATHS = frozenset({
-    ENTRYPOINT_CONTRACT_RELATIVE.name,
-    RUNTIME_INPUT_RELATIVE.name,
-    RUNTIME_LOCK_RELATIVE.name,
-})
 RELEASES_DIR_NAME = "grabowski-mcp-releases"
 MANIFEST_NAME = "deployment-manifest.json"
 INCOMPLETE_MARKER = "deployment-incomplete.json"
@@ -493,13 +488,6 @@ class RuntimeContract:
 
     def describe(self) -> str:
         return f"python -m {self.module}"
-
-
-def _relative_path(value: str, label: str) -> Path:
-    path = Path(value)
-    if path.is_absolute() or ".." in path.parts:
-        fail(f"{label} muss ein repository-relativer Pfad sein: {value}")
-    return path
 
 
 def load_contract_validator_bytes(data: bytes) -> types.SimpleNamespace:

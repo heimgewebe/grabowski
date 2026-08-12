@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import importlib.util
+import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -26,7 +29,15 @@ watchdog = load_module()
 
 
 class WatchdogRuntimeTests(unittest.TestCase):
-    def _probe(self, *, operators: list[int], age: float = 120.0):
+    def _probe(
+        self,
+        *,
+        operators: list[int],
+        age: float = 120.0,
+        integrity: "watchdog.IntegrityResult | None" = None,
+    ):
+        if integrity is None:
+            integrity = watchdog.IntegrityResult(True, None, "release-001")
         with (
             patch.object(
                 watchdog,
@@ -41,6 +52,7 @@ class WatchdogRuntimeTests(unittest.TestCase):
             patch.object(watchdog, "process_age_seconds", return_value=age),
             patch.object(watchdog, "operator_candidates", return_value=operators),
             patch.object(watchdog, "http_probe", return_value=True),
+            patch.object(watchdog, "probe_integrity", return_value=integrity),
         ):
             return watchdog.probe_runtime(
                 service="tunnel-client-grabowski.service",
@@ -66,6 +78,31 @@ class WatchdogRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "healthy")
         self.assertEqual(result.main_pid, 101)
         self.assertEqual(result.operator_pid, 202)
+
+    def test_live_runtime_with_invalid_integrity_is_not_healthy(self) -> None:
+        """A runtime that answers /healthz but cannot act is degraded, not healthy."""
+        result = self._probe(
+            operators=[202],
+            integrity=watchdog.IntegrityResult(
+                False, "entrypoint-contract-invalid", "release-001"
+            ),
+        )
+
+        self.assertEqual(result.status, "integrity_invalid")
+        self.assertEqual(result.reasons, ("integrity-entrypoint-contract-invalid",))
+        self.assertEqual(result.operator_pid, 202)
+        self.assertIsNotNone(result.integrity)
+        self.assertFalse(result.integrity.valid)
+        self.assertEqual(result.integrity.reason, "entrypoint-contract-invalid")
+
+    def test_process_failure_outranks_integrity(self) -> None:
+        """Transport/process faults keep their own status and restart path."""
+        result = self._probe(
+            operators=[],
+            integrity=watchdog.IntegrityResult(False, "contract-hash-drift"),
+        )
+
+        self.assertEqual(result.status, "unhealthy")
 
     def test_startup_grace_suppresses_early_restart(self) -> None:
         result = self._probe(operators=[], age=4.0)
@@ -191,6 +228,103 @@ class WatchdogRuntimeTests(unittest.TestCase):
                 watchdog.operator_candidates(proc, 1, runtime, "grabowski_operator"),
                 [],
             )
+
+
+class WatchdogIntegrityProbeTests(unittest.TestCase):
+    """probe_integrity must fail closed and name a machine-readable reason."""
+
+    def _runtime(self, root: Path) -> Path:
+        """Stage a minimal but structurally valid deployed runtime."""
+        runtime = root / "grabowski-mcp"
+        site_packages = runtime / ".venv/lib/python3.12/site-packages"
+        site_packages.mkdir(parents=True)
+        shutil.copy(
+            ROOT / "src" / "grabowski_runtime_contract.py",
+            site_packages / "grabowski_runtime_contract.py",
+        )
+        contract = json.loads(
+            (ROOT / "config" / "runtime-entrypoint.json").read_text(encoding="utf-8")
+        )
+        inputs = runtime / "inputs"
+        inputs.mkdir()
+        contract_path = inputs / "runtime-entrypoint.json"
+        contract_bytes = (json.dumps(contract, indent=2) + "\n").encode("utf-8")
+        contract_path.write_bytes(contract_bytes)
+        manifest = {
+            "release_id": "release-001",
+            "completion_status": "complete",
+            "entrypoint_contract": contract,
+            "entrypoint_contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
+            "snapshot_paths": {"runtime_entrypoint": str(contract_path)},
+        }
+        (runtime / "deployment-manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        return runtime
+
+    def test_consistent_release_is_integrity_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            result = watchdog.probe_integrity(runtime)
+
+        self.assertTrue(result.valid)
+        self.assertIsNone(result.reason)
+        self.assertEqual(result.release_id, "release-001")
+        self.assertEqual(result.scope, "deployment-manifest")
+
+    def test_missing_manifest_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = watchdog.probe_integrity(Path(directory))
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "manifest-missing")
+
+    def test_unknown_contract_field_fails_closed(self) -> None:
+        """The exact drift that deadlocked the runtime, seen by the watchdog."""
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            manifest_path = runtime / "deployment-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["entrypoint_contract"]["unreviewed_capability"] = True
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = watchdog.probe_integrity(runtime)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "entrypoint-contract-invalid")
+
+    def test_contract_hash_drift_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            manifest_path = runtime / "deployment-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["entrypoint_contract_sha256"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = watchdog.probe_integrity(runtime)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "contract-hash-drift")
+
+    def test_incomplete_deployment_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            (runtime / "deployment-incomplete.json").write_text("{}", encoding="utf-8")
+            result = watchdog.probe_integrity(runtime)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "deployment-incomplete")
+
+    def test_missing_canonical_schema_fails_closed(self) -> None:
+        """Without the schema the watchdog must not guess that a release is fine."""
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = self._runtime(Path(directory))
+            for path in runtime.glob(
+                ".venv/lib/*/site-packages/grabowski_runtime_contract.py"
+            ):
+                path.unlink()
+            result = watchdog.probe_integrity(runtime)
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.reason, "canonical-contract-schema-unavailable")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 {
   "capability_source": "src/grabowski_capabilities.py",
-  "capability_source_sha256": "37fec8f21c46862376be26404d288c1e669af4b65327cf637e8698ecf49b1667",
+  "capability_source_sha256": "8c498848970d9f70476872bee9b102d52916ef26a327eaed8636f618566ac74e",
   "contract": "config/runtime-entrypoint.json",
-  "contract_sha256": "82b56094fc41387657bf43d00e6496c425e935e71e5d9721377389faf98dd9fc",
+  "contract_sha256": "02d607357e903b9b6279101fd4c7fd09c93d9ee1df943826b5d48044c93621ec",
   "integrity": {
     "duplicate_tools": [],
     "missing_declarations": [],
@@ -1484,6 +1484,32 @@
       "reversibility": "conditional",
       "risk_class": "high",
       "tool": "grabowski_task_reconcile_resume"
+    },
+    {
+      "category": "recovery",
+      "description": "Report whether the provenance repair lane would admit this exact commit.",
+      "effects": [],
+      "id": "grabowski_recovery_provenance_assess",
+      "purpose": "Assess the fail-closed lane for repairing invalid deployment provenance.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_recovery_provenance_assess"
+    },
+    {
+      "category": "recovery",
+      "description": "Rebuild and activate the runtime from an exact commit, fail-closed.\n\nThe only privileged action this lane can take.  It grants no shell, command\nor power-worker authority, and refuses unless the deployed runtime is\nactually integrity-invalid.",
+      "effects": [
+        "runtime-deployment",
+        "durable-job-start",
+        "audit-record"
+      ],
+      "id": "grabowski_recovery_provenance_repair",
+      "purpose": "Rebuild and activate the runtime from an exact verified commit when deployment provenance is invalid.",
+      "read_only": false,
+      "reversibility": "previous-release-retained",
+      "risk_class": "high",
+      "tool": "grabowski_recovery_provenance_repair"
     },
     {
       "category": "recovery",

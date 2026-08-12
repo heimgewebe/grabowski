@@ -1525,6 +1525,32 @@
     },
     {
       "category": "recovery",
+      "description": "Report whether the provenance repair lane would admit this exact commit.",
+      "effects": [],
+      "id": "grabowski_recovery_provenance_assess",
+      "purpose": "Assess the fail-closed lane for repairing invalid deployment provenance.",
+      "read_only": true,
+      "reversibility": "not-applicable",
+      "risk_class": "low",
+      "tool": "grabowski_recovery_provenance_assess"
+    },
+    {
+      "category": "recovery",
+      "description": "Rebuild and activate the runtime from an exact commit, fail-closed.\n\nThe only privileged action this lane can take.  It grants no shell, command\nor power-worker authority, and refuses unless the deployed runtime is\nactually integrity-invalid.",
+      "effects": [
+        "runtime-deployment",
+        "durable-job-start",
+        "audit-record"
+      ],
+      "id": "grabowski_recovery_provenance_repair",
+      "purpose": "Rebuild and activate the runtime from an exact verified commit when deployment provenance is invalid.",
+      "read_only": false,
+      "reversibility": "previous-release-retained",
+      "risk_class": "high",
+      "tool": "grabowski_recovery_provenance_repair"
+    },
+    {
+      "category": "recovery",
       "description": "Evaluate the fail-closed recovery gate for power-worker activation.",
       "effects": [],
       "id": "grabowski_recovery_status",
@@ -2839,6 +2865,8 @@
       "grabowski_task_reconcile_check",
       "grabowski_task_reconcile_refresh",
       "grabowski_task_reconcile_resume",
+      "grabowski_recovery_provenance_assess",
+      "grabowski_recovery_provenance_repair",
       "grabowski_recovery_status",
       "grabowski_recovery_server_probe",
       "grabowski_operator_blockade_status",
@@ -3179,6 +3207,10 @@
         "source": "src/grabowski_recovery.py"
       },
       {
+        "module": "grabowski_provenance_recovery",
+        "source": "src/grabowski_provenance_recovery.py"
+      },
+      {
         "module": "grabowski_blockade_runtime",
         "source": "src/grabowski_blockade_runtime.py"
       },
@@ -3360,7 +3392,7 @@
     },
     "capability_definitions": {
       "path": "src/grabowski_capabilities.py",
-      "sha256": "37fec8f21c46862376be26404d288c1e669af4b65327cf637e8698ecf49b1667"
+      "sha256": "8c498848970d9f70476872bee9b102d52916ef26a327eaed8636f618566ac74e"
     },
     "policy_example": {
       "path": "config/access.example.json",
@@ -3368,7 +3400,7 @@
     },
     "runtime_contract": {
       "path": "config/runtime-entrypoint.json",
-      "sha256": "82b56094fc41387657bf43d00e6496c425e935e71e5d9721377389faf98dd9fc"
+      "sha256": "02d607357e903b9b6279101fd4c7fd09c93d9ee1df943826b5d48044c93621ec"
     },
     "runtime_sources": {
       "src/grabowski_agent_bootstrap.py": "3452b11bfbd75bbd491876f4ca99a5cd5328035b298fe6958e8f4bbdf8c1c0f9",
@@ -3390,7 +3422,7 @@
       "src/grabowski_bureau_launcher_contract.py": "091908c70502dddd0bbe5582a3412b30cd92f5736801f76279bfd061ad141435",
       "src/grabowski_bureau_leases.py": "7e15de9d6d208d92425e720443dffe6ea549b46956d33773511b85758d41a928",
       "src/grabowski_bureau_pickup.py": "2f535485cfec5802feac480748ee8aad7f8aeb2bc07f00776f9a3932038ab6d5",
-      "src/grabowski_capabilities.py": "37fec8f21c46862376be26404d288c1e669af4b65327cf637e8698ecf49b1667",
+      "src/grabowski_capabilities.py": "8c498848970d9f70476872bee9b102d52916ef26a327eaed8636f618566ac74e",
       "src/grabowski_checkout_binding_reconciler.py": "6191ca6dba5bbc080001ba8472fccdc9485b88645639c727769606813616ee25",
       "src/grabowski_checkout_identity.py": "d0947feba1718ca705f740ce6d059c4a0dfbb376778c7bae86e21c961b11cc64",
       "src/grabowski_checkout_terminal_reconciliation.py": "74845b418561c79196ae7a98ab9e16d1d2e2509b6b037fd1e0381bc64a8b3257",
@@ -3443,6 +3475,7 @@
       "src/grabowski_private_io.py": "456426368c58a3a3b18a519bf2e3418bacb84ac3818d4e182d1349d5de6178a6",
       "src/grabowski_privileged.py": "d37394179cfd7136daa717cf355c759568383fc92618249e8543bd244ac398f3",
       "src/grabowski_privileged_broker.py": "a64fb92d5ecddf73cc08c59ce0a2212481afe8e71a07bfbd1be8c3df0243071a",
+      "src/grabowski_provenance_recovery.py": "e56ef16baa6d8498dba87739dbc8ceedbbc9043fabcb84f6ea0bbc18172da9c8",
       "src/grabowski_read_surface.py": "e037747de58b26c336d8d7b73cca30fe1650d858b6bef3194a4a3a29eaeac85a",
       "src/grabowski_recall.py": "d97695135b9c293a2c3f0b05a7dac7a1fca90a0ad6a846daa4baccd309d4372e",
       "src/grabowski_recovery.py": "b3fdbb3d47cea1723dad00646cf93a6bbfd41cac856b115610fbf1872cb88777",
@@ -3452,7 +3485,7 @@
       "src/grabowski_reposkop_effectiveness.py": "63ee777d91dd8b8e65043613510fcbb9a37604e7f1ae384b3e8b76126e31b4c9",
       "src/grabowski_reposkop_shadow.py": "257933f6dec5e9877b3fbf5186d7ad3756f313f8313d22cf90a30e9011b1cfab",
       "src/grabowski_resources.py": "184569b1d93a4c3531476f29bd0e599b1172a8c82f7082f4c6e64363222e892e",
-      "src/grabowski_runtime.py": "bfce9b9301f0329f001fb404ebd7c1198088bbd9c18764486e2e677a7a182db6",
+      "src/grabowski_runtime.py": "4b9100b1424b89950c16b57f733afa5f618204baa5ace44048a7643ab358cf9a",
       "src/grabowski_runtime_contract.py": "72f4c3ad3693793c7c83b258c33ca8d1e483d90a5db22fc92e2b0a5396aae4e3",
       "src/grabowski_runtime_extensions.py": "66e7e5988f167865a23cea380fcefc9c5099f90354b12e3e7b3bc3827c07b2c2",
       "src/grabowski_self_deploy.py": "569d0f3f2a289e3ece52a98d205151cd78c3efb47d7bd5ca754d2d50c3095659",
