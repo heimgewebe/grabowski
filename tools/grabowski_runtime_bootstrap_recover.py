@@ -398,6 +398,7 @@ def user_execute(expected_head: str, execution_id: str) -> dict[str, Any]:
     if os.geteuid() != DEPLOY_UID or os.getegid() != DEPLOY_GID:
         raise BootstrapRecoveryError("user-execute must run as the configured deploy UID/GID")
     expected = _validate_head(expected_head)
+    _require_kill_switch_clear()
     with _schedule_lock():
         worktree, common = _create_recovery_worktree(expected, execution_id)
         deployment_started = False
@@ -408,6 +409,7 @@ def user_execute(expected_head: str, execution_id: str) -> dict[str, Any]:
                 expected_head=expected,
                 expected_common=common,
             )
+            _require_kill_switch_clear()
             deployment_started = True
             deploy = _deploy_exact(worktree, expected)
             _validate_recovery_worktree(
@@ -478,9 +480,23 @@ def _require_root_helper_identity() -> None:
         raise BootstrapRecoveryError("installed bootstrap helper identity is unsafe")
 
 
+def _marker_present(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise BootstrapRecoveryError(
+            "runtime bootstrap kill-switch state is unreadable"
+        ) from exc
+    return True
+
+
 def _require_kill_switch_clear() -> None:
-    if os.path.lexists(ROOT_KILL_SWITCH) or os.path.lexists(LEGACY_KILL_SWITCH):
-        raise BootstrapRecoveryError("runtime bootstrap recovery is blocked by the operator kill switch")
+    if _marker_present(ROOT_KILL_SWITCH) or _marker_present(LEGACY_KILL_SWITCH):
+        raise BootstrapRecoveryError(
+            "runtime bootstrap recovery is blocked by the operator kill switch"
+        )
 
 
 def _root_systemd_argv(expected_head: str, execution_id: str) -> list[str]:
@@ -511,8 +527,6 @@ def _root_systemd_argv(expected_head: str, execution_id: str) -> list[str]:
         "--property=LimitCORE=0",
         "--property=NoNewPrivileges=yes",
         "--property=UMask=0077",
-        f"--property=ConditionPathExists=!{ROOT_KILL_SWITCH}",
-        f"--property=ConditionPathExists=!{LEGACY_KILL_SWITCH}",
         "--",
         str(ROOT_HELPER),
         "user-execute",

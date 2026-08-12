@@ -63,6 +63,10 @@ def _root_task_action() -> dict[str, object]:
     return _bound_action(cutover.ROOT_TASK_ACTION)
 
 
+def _bootstrap_recovery_action() -> dict[str, object]:
+    return _bound_action(cutover.BOOTSTRAP_RECOVERY_ACTION)
+
+
 def _power_action() -> dict[str, object]:
     return {
         "enabled": True,
@@ -105,6 +109,7 @@ def _example_config_text() -> str:
                 cutover.BLOCKADE_LIFECYCLE_ACTION: _lifecycle(),
                 cutover.ROOT_TASK_ACTION: _root_task_action(),
                 cutover.PROCESS_OBSERVER_ACTION: _bound_action(cutover.PROCESS_OBSERVER_ACTION),
+                cutover.BOOTSTRAP_RECOVERY_ACTION: _bootstrap_recovery_action(),
             },
         },
         sort_keys=True,
@@ -191,6 +196,17 @@ class RootbrokerCutoverTests(unittest.TestCase):
         artifact = artifacts[cutover.COMMAND_IDENTITY_MODULE_TARGET]
         self.assertEqual(artifact.source_relative, "src/grabowski_command_identity.py")
         self.assertEqual(artifact.mode, 0o644)
+        self.assertTrue(artifact.python_source)
+
+    def test_cutover_artifacts_include_runtime_bootstrap_recovery_helper(self) -> None:
+        artifacts = {artifact.target: artifact for artifact in cutover.ARTIFACTS}
+
+        artifact = artifacts[cutover.BOOTSTRAP_RECOVERY_TARGET]
+        self.assertEqual(
+            artifact.source_relative,
+            "tools/grabowski_runtime_bootstrap_recover.py",
+        )
+        self.assertEqual(artifact.mode, 0o755)
         self.assertTrue(artifact.python_source)
 
     def test_source_artifact_validation_rejects_missing_local_dependency(self) -> None:
@@ -309,6 +325,46 @@ class RootbrokerCutoverTests(unittest.TestCase):
                 cutover._canonical_json(_root_task_action())
             ).hexdigest(),
         )
+
+    def test_merge_adds_commit_bound_runtime_bootstrap_recovery_action(self) -> None:
+        merged, evidence = cutover.merge_privileged_config(
+            _installed_config(),
+            publisher=_canonical_publisher(),
+            lifecycle=_lifecycle(),
+            root_task=_root_task_action(),
+            bootstrap_recovery=_bootstrap_recovery_action(),
+        )
+
+        self.assertEqual(
+            merged["actions"][cutover.BOOTSTRAP_RECOVERY_ACTION],
+            _bootstrap_recovery_action(),
+        )
+        self.assertFalse(evidence["bootstrap_recovery_preexisting"])
+        self.assertIsNone(evidence["bootstrap_recovery_before_sha256"])
+        self.assertEqual(
+            evidence["bootstrap_recovery_sha256"],
+            hashlib.sha256(
+                cutover._canonical_json(_bootstrap_recovery_action())
+            ).hexdigest(),
+        )
+
+    def test_merge_rejects_drifted_preexisting_runtime_bootstrap_recovery_action(self) -> None:
+        current = _installed_config()
+        drifted = _bootstrap_recovery_action()
+        drifted["timeout_seconds"] = 3599
+        current["actions"][cutover.BOOTSTRAP_RECOVERY_ACTION] = drifted
+
+        with self.assertRaisesRegex(
+            cutover.CutoverError,
+            "bootstrap recovery action differs",
+        ):
+            cutover.merge_privileged_config(
+                current,
+                publisher=_canonical_publisher(),
+                lifecycle=_lifecycle(),
+                root_task=_root_task_action(),
+                bootstrap_recovery=_bootstrap_recovery_action(),
+            )
 
     def test_merge_accepts_exact_preexisting_root_task_action(self) -> None:
         current = _installed_config()

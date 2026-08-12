@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import importlib.util
 import json
 import os
@@ -141,9 +142,7 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
         self.assertIn("--uid=1000", argv)
         self.assertIn("--gid=1000", argv)
         self.assertIn("--property=NoNewPrivileges=yes", argv)
-        self.assertIn(
-            f"--property=ConditionPathExists=!{helper.ROOT_KILL_SWITCH}", argv
-        )
+        self.assertNotIn("ConditionPathExists", "\n".join(argv))
         self.assertIn(str(helper.ROOT_HELPER), argv)
         self.assertIn("user-execute", argv)
         self.assertIn("--expected-head", argv)
@@ -190,6 +189,46 @@ class RuntimeBootstrapRecoveryTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(helper.BootstrapRecoveryError, "kill switch"):
                 helper.root_execute(good)
+
+    def test_kill_switch_observation_fails_closed_when_marker_is_unreadable(self) -> None:
+        marker = Path("/unreadable-marker")
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError("denied")):
+            with self.assertRaisesRegex(
+                helper.BootstrapRecoveryError,
+                "kill-switch state is unreadable",
+            ):
+                helper._marker_present(marker)
+
+    def test_user_execute_rechecks_kill_switch_immediately_before_deploy(self) -> None:
+        deploy = mock.Mock()
+        gate = mock.Mock(
+            side_effect=[
+                None,
+                helper.BootstrapRecoveryError("kill switch appeared"),
+            ]
+        )
+        with mock.patch.object(helper.os, "geteuid", return_value=helper.DEPLOY_UID), mock.patch.object(
+            helper.os, "getegid", return_value=helper.DEPLOY_GID
+        ), mock.patch.object(
+            helper, "_require_kill_switch_clear", gate
+        ), mock.patch.object(
+            helper, "_schedule_lock", return_value=nullcontext()
+        ), mock.patch.object(
+            helper,
+            "_create_recovery_worktree",
+            return_value=(Path("/recovery-worktree"), Path("/canonical-common")),
+        ), mock.patch.object(
+            helper, "_validate_recovery_worktree"
+        ), mock.patch.object(
+            helper, "_deploy_exact", deploy
+        ):
+            with self.assertRaisesRegex(
+                helper.BootstrapRecoveryError,
+                "kill switch appeared",
+            ):
+                helper.user_execute(self.head, "e" * 24)
+        self.assertEqual(gate.call_count, 2)
+        deploy.assert_not_called()
 
     def test_root_execute_checks_kill_switch_again_immediately_before_dispatch(self) -> None:
         target = json.dumps(
