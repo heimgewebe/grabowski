@@ -116,6 +116,32 @@ Browser-Start/Stop-Audit erhält eine begrenzte `browser_control_plane`-Zusammen
 
 Nicht in die neue Auditprojektion gelangen Profilpfad, Cookies, Credentials, Formwerte oder andere Browserinhalte. Bereits vorhandene öffentliche Workerfelder werden durch diesen Vertrag weder erweitert noch als Secret-Quelle umgedeutet.
 
+## Semantischer Aktionsvertrag (observe → snapshot → act → verify)
+
+Zusätzlich zur bestehenden Control-Plane-Projektion und zum bestehenden `grabowski_browser_worker_stored_form_action` führt dieser Change eine kleine, backend-neutrale Vertragsschicht in `src/grabowski_workers.py` ein: `browser_semantic_observe()` und `browser_semantic_act()`. Beide sind auf dem bestehenden Chrome/CDP-Adaptervertrag aufgebaut (`_run_node_browser_semantic`, ein eigenständiges, kleineres Node-CDP-Skript neben dem bestehenden Stored-Form-Skript) und in dieser Slice **nicht** als eigenständige `grabowski_browser_worker_*`-MCP-Tools exponiert. Sie sind internes Fundament für eine spätere Slice.
+
+Die Vertragskonzepte:
+
+- **BrowserObservation**: Ergebnis von `browser_semantic_observe()`. Enthält `worker_id`, einen opaken `snapshot_id`, `observed_at_unix` sowie semantische Felder (`origin`, `ready_state`, `title`). Keine rohen CDP-Methodennamen, keine Frame-/Loader-IDs, keine Cookies, keine Credentials. Der Worker-Preflight beobachtet systemd transient über `_observe()` und persistiert dabei weder Worker-State noch Reconciliation-/Lease-Cleanup.
+- **snapshot_id**: unveränderlich und opak. Er wird aus einer begrenzten, internen Beobachtungsmenge (`origin`, `ready_state`, `title`, `main_frame_id`, `loader_id`, gebunden an `worker_id`) per SHA-256 deterministisch abgeleitet (`bsid1_<hex>`). Dieselbe begrenzte Beobachtung erzeugt immer denselben `snapshot_id`; jede Abweichung — auch nur eine neue `loader_id` nach einem Reload — erzeugt einen anderen.
+- **BrowserIntent**: eine abstrakte Aktionsart aus einem festen Katalog (`read_state`, `scroll_into_view`), niemals eine CDP-Methode. Jede Aktionsart trägt fest eine Effektklasse.
+- **BrowserAction**: ein Intent, gebunden an `worker_id` und den `snapshot_id`, den der Aufrufer beim Beobachten erhalten hat.
+- **BrowserOutcome**: Ergebnis von `browser_semantic_act()`. Enthält `ok`, `result_code`, die angeforderte sowie die tatsächlich beobachtete Pre-/Post-Snapshot-ID und eine frische `observation` (BrowserObservation).
+
+Effektvokabular (`BROWSER_EFFECT_CLASSES`): `read`, `local_ui`, `reversible_external`, `external_mutation`, `high_impact`. Diese Slice implementiert ausschließlich `read` und `local_ui` (`BROWSER_EFFECT_CLASSES_IMPLEMENTED`). Jede Aktionsart, deren Effektklasse nicht implementiert ist, scheitert fail-closed mit `result_code="effect_not_implemented"`, ohne dass ein Effekt versucht wird. Es gibt in dieser Slice keine Aktionsart mit `reversible_external`, `external_mutation` oder `high_impact` im Katalog; das Vokabular ist ausschließlich für zukünftige Slices vorbereitet.
+
+Zustandsbindung und Fail-Closed-Kontrakt: `browser_semantic_act()` bindet jede Aktion an `worker_id` + `snapshot_id`. Unmittelbar vor jedem Effekt beobachtet er den Worker erneut autoritativ. Weicht der frisch berechnete `snapshot_id` vom angeforderten ab, scheitert die Aktion mit dem stabilen `result_code="stale_snapshot"`, und es wird kein Effekt ausgeführt — unabhängig davon, ob die Aktionsart `read` oder `local_ui` ist. Für `local_ui` wird der gerade bestätigte begrenzte Pre-State zusätzlich an denselben Adapteraufruf gebunden, der den Effekt ausführt; der Adapter liest diesen Zustand nochmals und verweigert den Effekt mit `stale_snapshot`, falls zwischen Python-Precheck und Adaptereffekt Drift eingetreten ist. Nach jedem tatsächlich ausgeführten Effekt erfolgt eine erneute autoritative Beobachtung, aus der das `BrowserOutcome` seine Post-Snapshot-ID bezieht.
+
+### Nichtbehauptungen dieser Slice
+
+- Es wird **keine** generische externe Übermittlung implementiert (kein Formular-Submit, kein `reversible_external`/`external_mutation`/`high_impact`-Effekt).
+- Es werden **keine** Credentials gelesen, geschrieben oder verarbeitet.
+- Es gibt **keine** Navigation zu beliebigen entfernten Zielen; die einzige lokale UI-Aktion ist `scroll_into_view` auf einen bereits sichtbaren, selektorgebundenen Origin-eigenen Zustand.
+- `grabowski_browser_worker_stored_form_action` bleibt vollständig unverändert: eigenes Node-Skript, eigene Bestätigungs-/Origin-/Remote-IP-Prüfungen, eigene Result-Codes. Der neue semantische Vertrag teilt sich keine Zustands- oder Vertrauensautorität mit ihm.
+- Diese Slice exponiert `browser_semantic_observe()`/`browser_semantic_act()` **nicht** als MCP-Tools und schreibt für sie **keine** neuen Audit-Kettensätze; das bleibt einer folgenden Slice vorbehalten.
+- `read_state` führt keinen zweiten CDP-Roundtrip aus; die Pre-Action-Beobachtung dient zugleich als Post-Action-Beobachtung, da eine reine Lesung keinen weiteren Zustand erzeugt.
+- Die begrenzte Beobachtungsmenge enthält keine Scroll-Position, keinen DOM-Inhalt und keine Sichtbarkeitsdetails; eine `scroll_into_view`-Aktion kann daher denselben `snapshot_id` vor und nach dem Effekt erzeugen, wenn Origin, Ladezustand, Titel, Frame und Loader unverändert bleiben. Das ist beabsichtigt: die aktuelle Slice bindet Navigation-/Reload-Zustand und schließt das beobachtbare Precheck→Adapter-TOCTOU-Fenster, behauptet aber noch **keine** DOM-weite Snapshot-Identität oder opaken Element-IDs.
+
 ## WebDriver BiDi / Firefox
 
 `webdriver-bidi` ist in v1 nur als **nicht implementierter Zukunftsadapter** modelliert. Das ermöglicht eine zweite Engine hinter derselben semantischen Control-Plane, ohne Session-, Profil-, Lease-, Outcome- oder Auditautorität neu zu entwerfen.

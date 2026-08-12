@@ -1926,6 +1926,549 @@ def browser_stored_form_action(
     }
 
 
+# --- Browser semantic contract (observe -> snapshot -> act -> verify) ------
+#
+# This is a backend-neutral foundation layered on top of the Chrome/CDP
+# adapter helpers above. It never surfaces raw CDP method names to callers,
+# binds every action to worker_id + an opaque, immutable snapshot_id, and
+# fails closed with a stable "stale_snapshot" outcome whenever the
+# authoritative re-observation performed immediately before an effect
+# disagrees with the snapshot the caller reasoned about. This slice
+# implements only the read/local_ui effect classes; reversible_external,
+# external_mutation and high_impact are named for the vocabulary but always
+# resolve to "effect_not_implemented" here. See
+# docs/browser-control-plane-v1.md for the full contract and non-claims.
+
+BROWSER_EFFECT_CLASSES = (
+    "read",
+    "local_ui",
+    "reversible_external",
+    "external_mutation",
+    "high_impact",
+)
+BROWSER_EFFECT_CLASSES_IMPLEMENTED = frozenset({"read", "local_ui"})
+BROWSER_ACTION_CATALOG: dict[str, dict[str, Any]] = {
+    "read_state": {"effect_class": "read", "requires_selector": False},
+    "scroll_into_view": {"effect_class": "local_ui", "requires_selector": True},
+}
+BROWSER_SNAPSHOT_ID_PREFIX = "bsid1_"
+BROWSER_SEMANTIC_RESULT_CODES = {
+    "ok",
+    "transport",
+    "protocol",
+    "target-discovery",
+    "element-contract",
+    "stale-snapshot",
+    "unsupported-op",
+}
+BROWSER_SEMANTIC_OUTCOME_CODES = {
+    "ok",
+    "stale_snapshot",
+    "effect_not_implemented",
+    "target_unavailable",
+    "element_contract",
+    "protocol",
+}
+_BROWSER_NODE_RESULT_TO_OUTCOME = {
+    "target-discovery": "target_unavailable",
+    "transport": "protocol",
+    "protocol": "protocol",
+    "unsupported-op": "protocol",
+    "element-contract": "element_contract",
+    "stale-snapshot": "stale_snapshot",
+}
+BROWSER_SEMANTIC_NODE_SOURCE = r"""
+import fs from 'node:fs';
+
+const request = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+let ws = null;
+let nextId = 1;
+const pending = new Map();
+
+function emit(payload, status = 0) {
+  const line = JSON.stringify(payload) + '\n';
+  process.exitCode = status;
+  process.stdout.write(line, () => {
+    try { if (ws) ws.close(); } catch {}
+    process.exit(status);
+  });
+}
+
+async function connect(url) {
+  return await new Promise((resolve, reject) => {
+    ws = new WebSocket(url);
+    const timer = setTimeout(() => reject(new Error('transport')), request.timeout_ms);
+    ws.onopen = () => { clearTimeout(timer); resolve(); };
+    ws.onerror = () => { clearTimeout(timer); reject(new Error('transport')); };
+    ws.onmessage = (event) => {
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.id && pending.has(message.id)) {
+        const entry = pending.get(message.id);
+        pending.delete(message.id);
+        clearTimeout(entry.timer);
+        if (message.error) entry.reject(new Error('protocol'));
+        else entry.resolve(message.result || {});
+      }
+    };
+    ws.onclose = () => {
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error('transport'));
+      }
+      pending.clear();
+    };
+  });
+}
+
+async function call(method, params = {}) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) throw new Error('transport');
+  const id = nextId++;
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error('protocol'));
+    }, request.timeout_ms);
+    pending.set(id, {resolve, reject, timer});
+    ws.send(JSON.stringify({id, method, params}));
+  });
+}
+
+async function evaluate(source) {
+  const response = await call('Runtime.evaluate', {
+    expression: source,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (response.exceptionDetails) throw new Error('protocol');
+  return response.result ? response.result.value : undefined;
+}
+
+async function readState() {
+  const frameTree = await call('Page.getFrameTree');
+  const mainFrame = frameTree.frameTree && frameTree.frameTree.frame
+    ? frameTree.frameTree.frame : null;
+  const mainFrameId = mainFrame && typeof mainFrame.id === 'string' ? mainFrame.id : null;
+  const loaderId = mainFrame && typeof mainFrame.loaderId === 'string'
+    ? mainFrame.loaderId : null;
+  if (!mainFrameId || !loaderId) throw new Error('protocol');
+  const state = await evaluate(`({
+    origin: location.origin,
+    ready_state: document.readyState,
+    title: (document.title || '').slice(0, 200),
+  })`);
+  if (!state || typeof state.origin !== 'string') throw new Error('protocol');
+  return {
+    origin: state.origin,
+    ready_state: String(state.ready_state || ''),
+    title: String(state.title || ''),
+    main_frame_id: mainFrameId,
+    loader_id: loaderId,
+  };
+}
+
+try {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), request.timeout_ms);
+  const response = await fetch(`http://127.0.0.1:${request.port}/json/list`, {signal: controller.signal});
+  clearTimeout(timer);
+  if (!response.ok) throw new Error('target-discovery');
+  const targets = await response.json();
+  const matches = targets.filter((target) => {
+    if (target.type !== 'page' || typeof target.webSocketDebuggerUrl !== 'string') return false;
+    try {
+      const endpoint = new URL(target.webSocketDebuggerUrl);
+      const loopbackHosts = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+      return endpoint.protocol === 'ws:' && loopbackHosts.has(endpoint.hostname) &&
+        Number(endpoint.port) === request.port;
+    } catch { return false; }
+  });
+  if (matches.length !== 1) throw new Error('target-discovery');
+
+  await connect(matches[0].webSocketDebuggerUrl);
+  await call('Runtime.enable');
+  await call('Page.enable');
+
+  if (request.op === 'read_state') {
+    const state = await readState();
+    emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
+  } else if (request.op === 'scroll_into_view') {
+    const before = await readState();
+    const expected = request.expected_state;
+    const stateKeys = ['origin', 'ready_state', 'title', 'main_frame_id', 'loader_id'];
+    if (!expected || stateKeys.some((key) => before[key] !== expected[key])) {
+      throw new Error('stale-snapshot');
+    }
+    const found = await evaluate(`(() => {
+      let element = null;
+      try { element = document.querySelector(${JSON.stringify(request.selector)}); } catch { return false; }
+      if (!element || !element.isConnected) return false;
+      element.scrollIntoView({block: 'center', inline: 'nearest'});
+      return true;
+    })()`);
+    if (!found) throw new Error('element-contract');
+    const state = await readState();
+    emit({schema_version: 1, ok: true, result_code: 'ok', state}, 0);
+  } else {
+    throw new Error('unsupported-op');
+  }
+} catch (error) {
+  const code = ['transport', 'protocol', 'target-discovery', 'element-contract', 'stale-snapshot'].includes(error.message)
+    ? error.message : 'protocol';
+  emit({schema_version: 1, ok: false, result_code: code, state: null}, 1);
+}
+"""
+
+
+class _BrowserSemanticError(RuntimeError):
+    def __init__(self, result_code: str) -> None:
+        super().__init__(f"browser semantic operation failed: {result_code}")
+        self.result_code = result_code
+
+
+def _run_node_browser_semantic(
+    record: dict[str, Any],
+    request: dict[str, Any],
+    *,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    node = shutil.which("node")
+    if not node:
+        raise RuntimeError("Node.js is required for browser CDP actions")
+    node_path = Path(node)
+    if not node_path.is_absolute():
+        raise RuntimeError("Node.js executable must resolve from an absolute alias")
+    node_target = node_path.resolve(strict=True)
+    node_metadata = node_target.stat()
+    if not stat.S_ISREG(node_metadata.st_mode) or not os.access(node_target, os.X_OK):
+        raise PermissionError("Node.js target is not an executable regular file")
+    directory = Path(record["config_path"]).parent
+    if directory.is_symlink() or WORKER_STATE not in directory.parents:
+        raise PermissionError("worker action directory is outside worker state")
+    token = uuid.uuid4().hex
+    script_path = directory / f".browser-semantic-{token}.mjs"
+    request_path = directory / f".browser-semantic-{token}.json"
+    created: list[Path] = []
+    try:
+        _write_private_action_file(script_path, BROWSER_SEMANTIC_NODE_SOURCE)
+        created.append(script_path)
+        _write_private_action_file(request_path, _canonical_json(request) + "\n")
+        created.append(request_path)
+        execution = operator._run(
+            [str(node_path), str(script_path), str(request_path)],
+            cwd=directory,
+            timeout_seconds=timeout_seconds + 10,
+            max_output_bytes=65536,
+        )
+    finally:
+        for created_path in reversed(created):
+            try:
+                created_path.unlink()
+            except FileNotFoundError:
+                pass
+    lines = [line for line in execution.get("stdout", "").splitlines() if line.strip()]
+    if not lines:
+        raise RuntimeError("browser semantic action returned no receipt")
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("browser semantic action returned an invalid receipt") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise RuntimeError("browser semantic action receipt schema mismatch")
+    code = payload.get("result_code")
+    if code not in BROWSER_SEMANTIC_RESULT_CODES:
+        raise RuntimeError("browser semantic action receipt result code is invalid")
+    if not isinstance(payload.get("ok"), bool):
+        raise RuntimeError("browser semantic action receipt boolean contract mismatch")
+    state = payload.get("state")
+    if state is not None and not isinstance(state, dict):
+        raise RuntimeError("browser semantic action receipt state contract mismatch")
+    if payload["ok"] is True and code != "ok":
+        raise RuntimeError("browser semantic action success receipt semantic mismatch")
+    if payload["ok"] is False and code == "ok":
+        raise RuntimeError("browser semantic action failure receipt semantic mismatch")
+    if execution["returncode"] == 0 and payload["ok"] is not True:
+        raise RuntimeError("browser semantic action success exit disagrees with receipt")
+    if execution["returncode"] != 0 and payload["ok"] is not False:
+        raise RuntimeError("browser semantic action failure exit disagrees with receipt")
+    return payload
+
+
+def _bounded_browser_state(raw: dict[str, Any]) -> dict[str, Any]:
+    """Trim a raw CDP-sourced readback to the bounded fields the contract hashes."""
+    return {
+        "origin": str(raw.get("origin") or "")[:512],
+        "ready_state": str(raw.get("ready_state") or "")[:32],
+        "title": str(raw.get("title") or "")[:200],
+        "main_frame_id": str(raw.get("main_frame_id") or "")[:128],
+        "loader_id": str(raw.get("loader_id") or "")[:128],
+    }
+
+
+def _browser_snapshot_id(worker_id: str, state: dict[str, Any]) -> str:
+    payload = {
+        "worker_id": worker_id,
+        "origin": state["origin"],
+        "ready_state": state["ready_state"],
+        "title": state["title"],
+        "main_frame_id": state["main_frame_id"],
+        "loader_id": state["loader_id"],
+    }
+    return BROWSER_SNAPSHOT_ID_PREFIX + _sha256_text(_canonical_json(payload))
+
+
+def _is_browser_snapshot_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(BROWSER_SNAPSHOT_ID_PREFIX)
+        and re.fullmatch(
+            r"[0-9a-f]{64}", value[len(BROWSER_SNAPSHOT_ID_PREFIX):]
+        )
+        is not None
+    )
+
+
+def _browser_observation(worker_id: str, state: dict[str, Any]) -> dict[str, Any]:
+    """The public BrowserObservation projection: semantic, no raw CDP terms."""
+    return {
+        "schema_version": 1,
+        "worker_id": worker_id,
+        "snapshot_id": _browser_snapshot_id(worker_id, state),
+        "observed_at_unix": _now(),
+        "origin": state["origin"],
+        "ready_state": state["ready_state"],
+        "title": state["title"],
+    }
+
+
+def _browser_observed_state(
+    record: dict[str, Any], *, timeout_seconds: int
+) -> dict[str, Any]:
+    payload = _run_node_browser_semantic(
+        record,
+        {
+            "schema_version": 1,
+            "port": record["port"],
+            "op": "read_state",
+            "selector": None,
+            "timeout_ms": timeout_seconds * 1000,
+        },
+        timeout_seconds=timeout_seconds,
+    )
+    if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
+        raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+    return _bounded_browser_state(payload["state"])
+
+
+def _browser_local_ui_effect(
+    record: dict[str, Any],
+    intent: dict[str, Any],
+    *,
+    expected_state: dict[str, Any],
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    payload = _run_node_browser_semantic(
+        record,
+        {
+            "schema_version": 1,
+            "port": record["port"],
+            "op": intent["action_kind"],
+            "selector": intent["selector"],
+            "expected_state": expected_state,
+            "timeout_ms": timeout_seconds * 1000,
+        },
+        timeout_seconds=timeout_seconds,
+    )
+    if payload["ok"] is not True or not isinstance(payload.get("state"), dict):
+        raise _BrowserSemanticError(payload.get("result_code") or "protocol")
+    return _bounded_browser_state(payload["state"])
+
+
+def _browser_outcome_code_from_node(result_code: str) -> str:
+    return _BROWSER_NODE_RESULT_TO_OUTCOME.get(result_code, "protocol")
+
+
+def _browser_intent(action_kind: str, *, selector: str | None) -> dict[str, Any]:
+    """The internal BrowserIntent: an abstract action kind, never a CDP method."""
+    if not isinstance(action_kind, str):
+        raise ValueError("action_kind must be text")
+    spec = BROWSER_ACTION_CATALOG.get(action_kind)
+    if spec is None:
+        raise ValueError("unsupported browser action kind")
+    if spec["requires_selector"]:
+        if selector is None:
+            raise ValueError(f"browser action {action_kind!r} requires a selector")
+        selector = _validate_form_selector(selector, "selector")
+    elif selector is not None:
+        raise ValueError(f"browser action {action_kind!r} does not accept a selector")
+    return {
+        "schema_version": 1,
+        "action_kind": action_kind,
+        "effect_class": spec["effect_class"],
+        "selector": selector,
+    }
+
+
+def _browser_action(
+    worker_id: str, snapshot_id: str, intent: dict[str, Any]
+) -> dict[str, Any]:
+    """The internal BrowserAction: an intent bound to worker_id + snapshot_id."""
+    return {
+        "schema_version": 1,
+        "worker_id": worker_id,
+        "snapshot_id": snapshot_id,
+        "action_kind": intent["action_kind"],
+        "effect_class": intent["effect_class"],
+        "selector": intent["selector"],
+    }
+
+
+def _browser_outcome(
+    action: dict[str, Any],
+    *,
+    ok: bool,
+    result_code: str,
+    pre_observation: dict[str, Any] | None,
+    post_observation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if result_code not in BROWSER_SEMANTIC_OUTCOME_CODES:
+        raise ValueError("unsupported browser outcome result code")
+    return {
+        "schema_version": 1,
+        "ok": ok,
+        "result_code": result_code,
+        "worker_id": action["worker_id"],
+        "action_kind": action["action_kind"],
+        "effect_class": action["effect_class"],
+        "requested_snapshot_id": action["snapshot_id"],
+        "pre_action_snapshot_id": pre_observation["snapshot_id"] if pre_observation else None,
+        "post_action_snapshot_id": post_observation["snapshot_id"] if post_observation else None,
+        "observation": post_observation if post_observation is not None else pre_observation,
+        "does_not_establish": [
+            "generic_external_submission_safety",
+            "credential_handling_safety",
+            "reversible_external_or_external_mutation_or_high_impact_effect_semantics",
+        ],
+    }
+
+
+def _browser_semantic_preflight(identifier: str) -> dict[str, Any]:
+    record = _row(identifier)
+    if record["kind"] != "browser":
+        raise ValueError("Worker is not a browser worker")
+    observation = _observe(record)
+    if observation["state"] != "running":
+        raise RuntimeError("browser worker is not running")
+    if not isinstance(record.get("port"), int):
+        raise RuntimeError("browser worker has no CDP port")
+    port_lease = resources.inspect_resource(f"port:{record['port']}")
+    if port_lease is None or port_lease.get("owner_id") != f"worker:{identifier}":
+        raise RuntimeError("browser worker no longer owns its CDP port")
+    return record
+
+
+def _validate_browser_semantic_timeout(timeout_seconds: int) -> int:
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or not 5 <= timeout_seconds <= 30
+    ):
+        raise ValueError("timeout_seconds must be between 5 and 30")
+    return timeout_seconds
+
+
+def browser_semantic_observe(
+    worker_id: str, *, timeout_seconds: int = 10
+) -> dict[str, Any]:
+    """Produce a fresh BrowserObservation with its immutable, opaque snapshot_id."""
+    identifier = _validate_worker_id(worker_id)
+    timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
+    record = _browser_semantic_preflight(identifier)
+    state = _browser_observed_state(record, timeout_seconds=timeout_seconds)
+    return _browser_observation(identifier, state)
+
+
+def browser_semantic_act(
+    worker_id: str,
+    snapshot_id: str,
+    action_kind: str,
+    *,
+    selector: str | None = None,
+    timeout_seconds: int = 10,
+) -> dict[str, Any]:
+    """Execute a state-bound BrowserAction and return an authoritative BrowserOutcome.
+
+    Binds worker_id + snapshot_id. Immediately before any effect, the worker is
+    re-observed; if the freshly observed snapshot_id disagrees with the one the
+    caller reasoned about, this fails closed with result_code="stale_snapshot"
+    and performs no effect. Only the read and local_ui effect classes are
+    implemented in this slice.
+    """
+    identifier = _validate_worker_id(worker_id)
+    if not _is_browser_snapshot_id(snapshot_id):
+        raise ValueError("snapshot_id is not a recognized opaque browser snapshot id")
+    timeout_seconds = _validate_browser_semantic_timeout(timeout_seconds)
+    intent = _browser_intent(action_kind, selector=selector)
+    record = _browser_semantic_preflight(identifier)
+    action = _browser_action(identifier, snapshot_id, intent)
+
+    try:
+        fresh_state = _browser_observed_state(record, timeout_seconds=timeout_seconds)
+    except _BrowserSemanticError as exc:
+        return _browser_outcome(
+            action,
+            ok=False,
+            result_code=_browser_outcome_code_from_node(exc.result_code),
+            pre_observation=None,
+            post_observation=None,
+        )
+    pre_observation = _browser_observation(identifier, fresh_state)
+    if pre_observation["snapshot_id"] != snapshot_id:
+        return _browser_outcome(
+            action,
+            ok=False,
+            result_code="stale_snapshot",
+            pre_observation=pre_observation,
+            post_observation=None,
+        )
+    if intent["effect_class"] not in BROWSER_EFFECT_CLASSES_IMPLEMENTED:
+        return _browser_outcome(
+            action,
+            ok=False,
+            result_code="effect_not_implemented",
+            pre_observation=pre_observation,
+            post_observation=None,
+        )
+    if intent["action_kind"] == "read_state":
+        post_state = fresh_state
+    else:
+        try:
+            post_state = _browser_local_ui_effect(
+                record,
+                intent,
+                expected_state=fresh_state,
+                timeout_seconds=timeout_seconds,
+            )
+        except _BrowserSemanticError as exc:
+            return _browser_outcome(
+                action,
+                ok=False,
+                result_code=_browser_outcome_code_from_node(exc.result_code),
+                pre_observation=pre_observation,
+                post_observation=None,
+            )
+    return _browser_outcome(
+        action,
+        ok=True,
+        result_code="ok",
+        pre_observation=pre_observation,
+        post_observation=_browser_observation(identifier, post_state),
+    )
+
+
+# --- End browser semantic contract ------------------------------------------
+
+
 def browser_start(
     executable: str,
     *,
