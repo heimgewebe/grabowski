@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "kind": "grabowski_identity_time_contract",
+  "authority": {
+    "mode": "descriptive-and-testable",
+    "adds_mutable_truth": false,
+    "adds_execution_authority": false,
+    "adds_retry_authority": false,
+    "adds_identity_namespace": false
+  },
+  "identity_roles": {
+    "semantic_operation": {
+      "canonical_name": "operation_identity_sha256",
+      "owner": "grabowski_tasks",
+      "material": [
+        "canonical_cwd",
+        "repository_head",
+        "source_fingerprint_sha256",
+        "purpose",
+        "scope_sha256"
+      ],
+      "cardinality": "one semantic identity may be represented by an active task, a recent successful task, or an explicitly predecessor-bound retry",
+      "reuse": "stable only while the semantic material is unchanged; attention retries require predecessor task and lifecycle-receipt binding",
+      "not_authority_for": [
+        "transport admission",
+        "resource ownership",
+        "effect success"
+      ]
+    },
+    "operational_projection_identity": {
+      "canonical_name": "derived operation identity",
+      "owner": "grabowski_operational_truth",
+      "material": [
+        "explicit operation_identity or operation_id when present",
+        "otherwise unit or authoritative_unit",
+        "argv_sha256",
+        "execution_envelope_sha256",
+        "task_id or work_id fallback"
+      ],
+      "cardinality": "read-only projection helper used to group equivalent-looking current work when the canonical task operation identity is not available",
+      "reuse": "projection-only; it may identify duplicate-looking work but cannot create, replace or authorize a semantic operation identity",
+      "not_authority_for": [
+        "task start deduplication",
+        "retry admission",
+        "resource ownership",
+        "effect execution"
+      ]
+    },
+    "task": {
+      "canonical_name": "task_id",
+      "owner": "grabowski_tasks",
+      "cardinality": "one persistent task record may advance through multiple execution attempts",
+      "reuse": "task_id remains the durable task identity across a task resume; it is not the semantic-operation identity"
+    },
+    "execution_attempt": {
+      "canonical_name": "task_id + attempt",
+      "owner": "grabowski_tasks",
+      "cardinality": "attempt is a positive generation within one task",
+      "reuse": "a resumed execution advances attempt; attempt must not be reused to describe a later execution generation"
+    },
+    "transport_request": {
+      "canonical_name": "X-Grabowski-Request-Id",
+      "owner": "grabowski_transport_assertion",
+      "material": [
+        "connector secret used only as HMAC key",
+        "session_id",
+        "canonical JSON-RPC request id",
+        "request body SHA-256"
+      ],
+      "cardinality": "one payload-bound transport request identity may be reproduced by an unchanged transport retry",
+      "reuse": "retry-stable for identical material, but consumption is single-use and the identity cannot be rebound to another payload",
+      "not_authority_for": [
+        "domain retry after ambiguous effect",
+        "semantic-operation reuse"
+      ]
+    },
+    "effect_admission_request": {
+      "canonical_name": "request_id",
+      "namespace": "grabowski_effect_receipt",
+      "owner": "grabowski_effect_receipt",
+      "cardinality": "one effect admission and its completion share one request_id",
+      "reuse": "the interceptor creates a fresh admission request identity for a new admitted mutation; the id is correlation evidence, not retry authority",
+      "not_equal_by_name_to": "transport_request"
+    },
+    "effect_admission": {
+      "canonical_name": "admission_sha256",
+      "owner": "grabowski_effect_receipt",
+      "cardinality": "digest of one effect-admission record",
+      "reuse": "completion binds the exact admission digest"
+    },
+    "effect_completion": {
+      "canonical_name": "completion_sha256",
+      "owner": "grabowski_effect_receipt",
+      "cardinality": "digest of one effect-completion evidence record",
+      "reuse": "evidence only; outcome_unknown never grants blind retry"
+    },
+    "task_lifecycle_receipt": {
+      "canonical_name": "lifecycle_receipt_sha256",
+      "owner": "grabowski_tasks",
+      "cardinality": "terminal task evidence is bound to the exact task/attempt lifecycle transition",
+      "reuse": "may be referenced by a later explicit retry binding but is never execution authority"
+    },
+    "legacy_task_request_reference": {
+      "canonical_name": "request_id",
+      "namespace": "grabowski_tasks",
+      "owner": "grabowski_tasks",
+      "identity_status": "legacy-non-authoritative-reference",
+      "cardinality": "optional persisted task field retained for schema migration and archive compatibility",
+      "reuse": "no current task-start API or generator assigns semantics to this field; preserved values are historical correlation data only",
+      "not_authority_for": [
+        "task identity",
+        "semantic-operation identity",
+        "transport admission",
+        "effect admission",
+        "retry admission"
+      ]
+    },
+    "worker": {
+      "canonical_name": "worker_id",
+      "owner": "grabowski_workers",
+      "material": [
+        "random 20-hex-character worker instance identifier"
+      ],
+      "cardinality": "one durable browser or GUI worker registry record per worker_id",
+      "reuse": "created once for a new worker instance and reused by its status, terminalization and worker:<worker_id> resource-owner binding",
+      "not_authority_for": [
+        "task identity",
+        "semantic-operation identity",
+        "cross-worker resource ownership"
+      ]
+    }
+  },
+  "ambiguous_names": {
+    "request_id": [
+      {
+        "namespace": "transport",
+        "canonical_role": "transport_request",
+        "meaning": "payload-bound, retry-stable one-call transport identity"
+      },
+      {
+        "namespace": "effect-receipt",
+        "canonical_role": "effect_admission_request",
+        "meaning": "correlation identity shared by one effect admission and its completion"
+      },
+      {
+        "namespace": "task",
+        "canonical_role": "legacy_task_request_reference",
+        "meaning": "legacy persisted correlation field retained by task schema/archive; not a current identity or admission authority"
+      }
+    ],
+    "operation_identity": [
+      {
+        "namespace": "task",
+        "canonical_role": "semantic_operation",
+        "meaning": "persisted, source/scope/head-bound task operation identity"
+      },
+      {
+        "namespace": "operational-truth",
+        "canonical_role": "operational_projection_identity",
+        "meaning": "read-only grouping fallback over observed execution attributes"
+      }
+    ]
+  },
+  "clock_domains": {
+    "event_wall_clock": {
+      "clock": "Unix wall clock",
+      "examples": [
+        "admitted_at_unix",
+        "completed_at_unix",
+        "created_at_unix",
+        "terminalized_at_unix"
+      ],
+      "semantics": "event-specific occurrence timestamps used for audit chronology, freshness windows and cross-process correlation",
+      "forbidden": [
+        "using a later observation timestamp as the occurrence time of an earlier event"
+      ]
+    },
+    "observation_wall_clock": {
+      "clock": "Unix wall clock",
+      "examples": [
+        "observed_at_unix",
+        "observed_at_unix_ns"
+      ],
+      "semantics": "time at which Grabowski observed or sampled state",
+      "forbidden": [
+        "reclassifying an earlier event solely because polling happened later"
+      ]
+    },
+    "source_monotonic": {
+      "clock": "source-native monotonic clock",
+      "examples": [
+        "ActiveEnterTimestampMonotonic",
+        "ActiveExitTimestampMonotonic",
+        "started_monotonic"
+      ],
+      "semantics": "duration and ordering inside one compatible source/boot clock domain",
+      "forbidden": [
+        "direct comparison with Unix wall-clock values",
+        "direct comparison across reboot or incompatible monotonic clock domains"
+      ]
+    },
+    "logical_generation": {
+      "clock": "logical generation, not a timestamp",
+      "examples": [
+        "task attempt",
+        "lease generation when implemented by GRABOWSKI-OPERATOR-SURFACE-V1-T049"
+      ],
+      "semantics": "immutable generation identity for ordering/reconciliation where wall-clock ordering is insufficient",
+      "forbidden": [
+        "treating a logical generation as time.monotonic() or a wall-clock timestamp"
+      ]
+    }
+  },
+  "invariants": [
+    {
+      "id": "operation-is-not-attempt",
+      "assertion": "semantic operation identity and task execution attempt are distinct; retries may advance attempt without inventing a new semantic identity"
+    },
+    {
+      "id": "projection-is-not-operation-authority",
+      "assertion": "operational-truth may derive a grouping identity for observation, but that projection cannot authorize task deduplication, retry or effects"
+    },
+    {
+      "id": "transport-request-is-not-effect-request",
+      "assertion": "same spelling of request_id does not collapse transport and effect-receipt namespaces"
+    },
+    {
+      "id": "transport-retry-stability",
+      "assertion": "unchanged transport material derives the same transport request id while changed payload material derives a different id"
+    },
+    {
+      "id": "effect-completion-binds-admission",
+      "assertion": "effect completion preserves the admission request id and binds the exact admission_sha256"
+    },
+    {
+      "id": "observation-is-not-occurrence",
+      "assertion": "observed_at records observation time and must not substitute for a source occurrence timestamp"
+    },
+    {
+      "id": "worker-runtime-uses-source-monotonic",
+      "assertion": "planned worker runtime-limit classification uses systemd ActiveEnterTimestampMonotonic and ActiveExitTimestampMonotonic rather than polling time"
+    },
+    {
+      "id": "monotonic-domain-boundary",
+      "assertion": "source monotonic values are compared only inside their compatible clock domain and never directly with Unix time"
+    },
+    {
+      "id": "legacy-task-request-is-not-identity-authority",
+      "assertion": "a persisted task request_id is legacy correlation data unless a future version explicitly assigns semantics; its presence cannot be interpreted as transport/effect/task identity authority"
+    },
+    {
+      "id": "worker-id-is-worker-instance-identity",
+      "assertion": "worker_id is the durable worker-registry primary key and scopes worker resource ownership as worker:<worker_id> without becoming task or semantic-operation identity"
+    }
+  ],
+  "implementation_evidence": {
+    "semantic_operation": "src/grabowski_tasks.py:_normalize_task_operation_identity",
+    "operation_retry": "src/grabowski_tasks.py:_operation_retry_binding",
+    "operational_projection_identity": "src/grabowski_operational_truth.py:compute_operation_identity",
+    "transport_request": "src/grabowski_transport_assertion.py:derive_request_id",
+    "effect_admission_and_completion": "src/grabowski_effect_receipt.py:admit,complete",
+    "worker_runtime": "src/grabowski_workers.py:_planned_runtime_limit_reached",
+    "legacy_task_request_reference": "src/grabowski_tasks.py:_task_archive_record",
+    "worker_identity": "src/grabowski_workers.py:browser_start,gui_start,_public,_release"
+  },
+  "related_existing_work": {
+    "GRABOWSKI-OPERATOR-SURFACE-V1-T032": "operation deduplication and safe result reuse",
+    "GRABOWSKI-OPERATOR-SURFACE-V1-T049": "lease generation identity",
+    "OPERATOR-MACHINE-READABILITY-V1-T020": "typed operation lifecycle vertical slice"
+  },
+  "does_not_establish": [
+    "a second task or operation lifecycle",
+    "a new StateStore",
+    "a universal operation ledger",
+    "generic retry authority",
+    "cross-boot monotonic comparability",
+    "permission to rename persisted fields without a separate compatibility decision"
+  ]
+}

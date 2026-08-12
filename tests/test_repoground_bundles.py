@@ -193,6 +193,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         commit: str = "a" * 40,
         *,
         include_snapshot_provenance: bool = True,
+        provenance_name: str | None = None,
         run_id: str = "20260718T120000Z-test",
     ) -> Path:
         stem = f"heimgewebe__{repo}__main-max-260718-1200"
@@ -217,7 +218,7 @@ class RepoGroundBundleToolTests(unittest.TestCase):
             doc["snapshot_provenance"] = {
                 "repositories": [
                     {
-                        "name": f"heimgewebe__{repo}__main",
+                        "name": provenance_name or f"heimgewebe__{repo}__main",
                         "git_commit": commit,
                         "git_dirty": False,
                     }
@@ -606,6 +607,56 @@ class RepoGroundBundleToolTests(unittest.TestCase):
         self.assertEqual(result["live_repo"]["comparison_ref"], "origin/main")
         self.assertEqual(result["live_repo"]["head"], source_head)
         self.assertTrue(conventional.joinpath("dirty.txt").exists())
+
+    def test_canonical_freshness_uses_revision_bound_publication_source_checkout(
+        self,
+    ) -> None:
+        temporary, source_head = self._git_repo("revision-source-temp")
+        source_root = self.home / "repos" / ".repoground-sources"
+        source_root.mkdir()
+        source = source_root / f"heimgewebe__demo-repo__main--{source_head}"
+        temporary.rename(source)
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", source_head],
+            cwd=source,
+            check=True,
+        )
+        self._write_canonical_bundle(
+            "demo-repo",
+            commit=source_head,
+            provenance_name=source.name,
+        )
+
+        result = mcp.repoground_freshness_check("demo-repo")
+
+        self.assertEqual(result["freshness"], "fresh_exact")
+        self.assertEqual(result["freshness_status"], "fresh")
+        self.assertEqual(
+            result["live_repo"]["source_kind"], "publication_source_checkout"
+        )
+        self.assertEqual(result["live_repo"]["repo_path"], str(source))
+        self.assertEqual(result["live_repo"]["comparison_ref"], "origin/main")
+        self.assertEqual(result["live_repo"]["head"], source_head)
+        self.assertFalse(result["live_repo"]["dirty"])
+
+    def test_retired_lenskit_qualified_query_resolves_to_repoground(self) -> None:
+        self._write_canonical_bundle("repoground")
+        self._write_canonical_bundle(
+            "lenskit", run_id="20260718T130000Z-retired-lenskit"
+        )
+
+        qualified = mcp.repoground_bundle_discover("heimgewebe/lenskit")
+        simple = mcp.repoground_bundle_discover("lenskit")
+        fleet = mcp.repoground_bundle_discover()
+
+        self.assertEqual(qualified["repo_filter"], "heimgewebe/repoground")
+        self.assertEqual(simple["repo_filter"], "lenskit")
+        self.assertEqual(qualified["candidates"][0]["repo_id"], "heimgewebe__repoground")
+        self.assertEqual(simple["candidate_count"], 0)
+        self.assertNotIn(
+            "heimgewebe__lenskit",
+            {candidate.get("repo_id") for candidate in fleet["candidates"]},
+        )
 
     def test_freshness_check_reports_stale_head_for_mismatched_commit(self) -> None:
         _repo, _head = self._git_repo("demo-repo")

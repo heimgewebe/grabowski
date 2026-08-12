@@ -19,6 +19,11 @@ MAX_HEALTH_BYTES = 1_000_000
 MAX_REJECTIONS = 100
 SEGMENT_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,198}[A-Za-z0-9])?\Z")
 COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+SOURCE_RECOVERY_SUFFIX_RE = re.compile(r"([0-9a-fA-F]{40})(?:--recovery-[0-9a-f]{12})?\Z")
+RETIRED_CANONICAL_REPOSITORY_ALIASES = {
+    "heimgewebe__lenskit": "heimgewebe__repoground",
+}
+RETIRED_LEGACY_SIMPLE_REPOSITORIES = {"lenskit"}
 
 
 class CatalogError(ValueError):
@@ -228,6 +233,18 @@ def _artifact_roles(document: dict[str, Any]) -> set[str]:
     }
 
 
+def _revision_bound_source_commit(name: str, info: Mapping[str, Any]) -> str | None:
+    repo_id = info.get("repo_id")
+    ref = info.get("ref")
+    if not isinstance(repo_id, str) or not isinstance(ref, str):
+        return None
+    prefix = f"{repo_id}__{ref}--"
+    if not name.startswith(prefix):
+        return None
+    match = SOURCE_RECOVERY_SUFFIX_RE.fullmatch(name[len(prefix) :])
+    return match.group(1).lower() if match else None
+
+
 def _source_provenance(
     document: dict[str, Any], info: dict[str, Any]
 ) -> dict[str, Any]:
@@ -255,6 +272,9 @@ def _source_provenance(
     else:
         expected = {str(info["repo"])}
     selected: dict[str, Any] | None = None
+    revision_mismatch = False
+    revision_commit_invalid = False
+    revision_source_invalid = False
     for item in repositories:
         if not isinstance(item, dict):
             continue
@@ -268,10 +288,35 @@ def _source_provenance(
             )
             if isinstance(value, str)
         }
+        if strict:
+            revision_prefix = f"{info['repo_id']}__{info['ref']}--"
+            revision_names = [name for name in names if name.startswith(revision_prefix)]
+            if revision_names:
+                commit = item.get("git_commit") or item.get("commit") or item.get("head")
+                if not isinstance(commit, str) or not COMMIT_RE.fullmatch(commit):
+                    revision_commit_invalid = True
+                    continue
+                embedded_commits = [
+                    _revision_bound_source_commit(name, info) for name in revision_names
+                ]
+                if any(embedded is None for embedded in embedded_commits):
+                    revision_source_invalid = True
+                    continue
+                if any(embedded != commit.lower() for embedded in embedded_commits):
+                    revision_mismatch = True
+                    continue
+                selected = item
+                break
         if names.intersection(expected):
             selected = item
             break
     if selected is None:
+        if revision_source_invalid:
+            return unavailable("snapshot_repository_source_revision_invalid")
+        if revision_commit_invalid:
+            return unavailable("snapshot_repository_commit_absent")
+        if revision_mismatch:
+            return unavailable("snapshot_repository_source_revision_mismatch")
         return unavailable("snapshot_repository_entry_absent")
     commit = (
         selected.get("git_commit") or selected.get("commit") or selected.get("head")
@@ -460,7 +505,8 @@ def _normalize_repo_query(repo: str | None) -> str | None:
             raise ValueError(
                 "repo must be a safe repository name, owner__repository, or owner/repository identity"
             )
-        return f"{owner}__{repository}"
+        canonical = f"{owner}__{repository}"
+        return RETIRED_CANONICAL_REPOSITORY_ALIASES.get(canonical, canonical)
     safe = _safe_segment(repo)
     if safe is None:
         raise ValueError(
@@ -486,7 +532,7 @@ def _normalize_refs(
 
 
 def _canonical_repo_directories(
-    canonical_root: Path, repo: str | None
+    canonical_root: Path, repo: str | None, *, include_retired: bool
 ) -> list[Path]:
     if not canonical_root.is_dir() or canonical_root.is_symlink():
         return []
@@ -495,7 +541,9 @@ def _canonical_repo_directories(
             (
                 path
                 for path in canonical_root.iterdir()
-                if path.is_dir() and not path.is_symlink()
+                if path.is_dir()
+                and not path.is_symlink()
+                and (include_retired or path.name not in RETIRED_CANONICAL_REPOSITORY_ALIASES)
             ),
             key=str,
         )
@@ -503,7 +551,9 @@ def _canonical_repo_directories(
         candidate = canonical_root / repo
         return (
             [candidate]
-            if candidate.is_dir() and not candidate.is_symlink()
+            if candidate.is_dir()
+            and not candidate.is_symlink()
+            and (include_retired or repo not in RETIRED_CANONICAL_REPOSITORY_ALIASES)
             else []
         )
     return sorted(
@@ -513,6 +563,7 @@ def _canonical_repo_directories(
             if path.is_dir()
             and not path.is_symlink()
             and (repo_id := _valid_repo_id(path)) is not None
+            and (include_retired or repo_id not in RETIRED_CANONICAL_REPOSITORY_ALIASES)
             and repo_id.split("__", 1)[1] == repo
         ),
         key=str,
@@ -539,9 +590,12 @@ def _catalog_paths(
     repo: str | None,
     stem: str | None,
     refs: frozenset[str] | None,
+    include_retired: bool,
 ) -> tuple[list[Path], set[str]]:
     paths: list[Path] = []
-    repo_directories = _canonical_repo_directories(canonical_root, repo)
+    repo_directories = _canonical_repo_directories(
+        canonical_root, repo, include_retired=include_retired
+    )
     identified_repo_ids = {
         repo_id
         for directory in repo_directories
@@ -559,7 +613,15 @@ def _catalog_paths(
                     paths.extend(ref_root.glob(f"*/*{MANIFEST_SUFFIX}"))
 
     if legacy_root.is_dir() and not legacy_root.is_symlink():
-        paths.extend(legacy_root.glob(f"*{MANIFEST_SUFFIX}"))
+        legacy_candidates = legacy_root.glob(f"*{MANIFEST_SUFFIX}")
+        if include_retired:
+            paths.extend(legacy_candidates)
+        else:
+            paths.extend(
+                path
+                for path in legacy_candidates
+                if _repo_from_stem(_stem(path)) not in RETIRED_LEGACY_SIMPLE_REPOSITORIES
+            )
 
     scoped: list[Path] = []
     canonical = Path(os.path.abspath(canonical_root))
@@ -600,6 +662,7 @@ def scan_catalog(
     repo: str | None = None,
     stem: str | None = None,
     refs: list[str] | tuple[str, ...] | None = None,
+    include_retired: bool = True,
 ) -> dict[str, Any]:
     normalized_repo = _normalize_repo_query(repo)
     normalized_refs = _normalize_refs(refs)
@@ -609,6 +672,7 @@ def scan_catalog(
         repo=normalized_repo,
         stem=stem,
         refs=normalized_refs,
+        include_retired=include_retired,
     )
     healthy: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -738,6 +802,7 @@ def resolve_catalog(
         repo=normalized_repo,
         stem=stem,
         refs=sorted(normalized_refs) if normalized_refs is not None else None,
+        include_retired=False,
     )
     healthy = list(scanned["healthy"])
     aliases = scanned["aliases"]
