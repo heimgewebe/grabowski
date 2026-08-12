@@ -1013,6 +1013,210 @@ class CheckoutLifecycleTests(unittest.TestCase):
         self.assertIn("active_retention_not_elapsed", dry_run["plan"]["cleanup_blockers"])
         self.assertIn("archive_grace_not_elapsed", dry_run["plan"]["cleanup_blockers"])
 
+    def test_cleanup_accepts_exact_merged_github_pull_head_ref(self) -> None:
+        self._git(
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:heimgewebe/reposkop.git",
+        )
+        archive = self._archive()["archive"]
+        calls: list[list[str]] = []
+
+        def github_run(argv, **_kwargs):
+            calls.append(list(argv))
+            if argv[:3] == ["gh", "pr", "list"]:
+                self.assertIn("github.com/heimgewebe/reposkop", argv)
+                payload = [
+                    {
+                        "number": 101,
+                        "state": "MERGED",
+                        "headRefName": "topic",
+                        "headRefOid": self.head,
+                    }
+                ]
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": json.dumps(payload),
+                    "stderr": "",
+                    "stdout_truncated": False,
+                }
+            if argv[:2] == ["gh", "api"]:
+                self.assertEqual(argv[2:4], ["--hostname", "github.com"])
+                self.assertEqual(
+                    argv[4],
+                    "repos/heimgewebe/reposkop/git/ref/pull/101/head",
+                )
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": self.head + "\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                }
+            raise AssertionError(f"unexpected GitHub command: {argv!r}")
+
+        with patch.object(checkouts.operator, "_run", side_effect=github_run):
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+
+        self.assertTrue(dry_run["plan"]["remote_secured"])
+        self.assertEqual(
+            dry_run["plan"]["remote_secured_refs"],
+            ["github:heimgewebe/reposkop:refs/pull/101/head"],
+        )
+        self.assertTrue(dry_run["plan"]["safe_to_apply"])
+        self.assertEqual(len(calls), 2)
+
+    def test_cleanup_rejects_mismatched_github_pull_head_ref(self) -> None:
+        self._git(
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/heimgewebe/reposkop.git",
+        )
+        archive = self._archive()["archive"]
+
+        def github_run(argv, **_kwargs):
+            if argv[:3] == ["gh", "pr", "list"]:
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": json.dumps(
+                        [
+                            {
+                                "number": 101,
+                                "state": "MERGED",
+                                "headRefName": "topic",
+                                "headRefOid": self.head,
+                            }
+                        ]
+                    ),
+                    "stderr": "",
+                    "stdout_truncated": False,
+                }
+            if argv[:2] == ["gh", "api"]:
+                return {
+                    "returncode": 0,
+                    "timed_out": False,
+                    "stdout": "0" * 40 + "\n",
+                    "stderr": "",
+                    "stdout_truncated": False,
+                }
+            raise AssertionError(f"unexpected GitHub command: {argv!r}")
+
+        with patch.object(checkouts.operator, "_run", side_effect=github_run):
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+
+        self.assertFalse(dry_run["plan"]["remote_secured"])
+        self.assertIn(
+            "head_not_remote_secured",
+            dry_run["plan"]["cleanup_blockers"],
+        )
+        self.assertFalse(dry_run["plan"]["safe_to_apply"])
+
+    def test_cleanup_fails_closed_when_github_result_has_no_returncode(self) -> None:
+        self._git(
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/heimgewebe/reposkop.git",
+        )
+        archive = self._archive()["archive"]
+
+        with patch.object(
+            checkouts.operator,
+            "_run",
+            return_value={
+                "returncode": None,
+                "timed_out": False,
+                "stdout": "[]",
+                "stderr": "",
+                "stdout_truncated": False,
+            },
+        ):
+            dry_run = checkouts.grabowski_checkout_cleanup(
+                str(self.repo),
+                str(self.checkout),
+                "owner-a",
+                dry_run=True,
+                archive_id=archive["archive_id"],
+                expected_head=self.head,
+                expected_branch="topic",
+            )
+
+        self.assertFalse(dry_run["plan"]["remote_secured"])
+        self.assertIn(
+            "head_not_remote_secured",
+            dry_run["plan"]["cleanup_blockers"],
+        )
+        self.assertFalse(dry_run["plan"]["safe_to_apply"])
+
+    def test_remote_security_local_ref_fast_path_skips_github(self) -> None:
+        self._publish_remote()
+        _top, _common, records = checkouts._worktree_records(self.repo)
+        record = next(item for item in records if item["path"] == str(self.checkout))
+        with patch.object(
+            checkouts.operator,
+            "_run",
+            side_effect=AssertionError("GitHub fallback must not run"),
+        ):
+            observed = checkouts._remote_secured_observation(
+                record,
+                verify_github_pull_ref=True,
+            )
+        self.assertTrue(observed["remote_secured"])
+        self.assertIn("refs/remotes/origin/topic", observed["remote_secured_refs"])
+
+    def test_github_remote_identity_parser_fails_closed(self) -> None:
+        self.assertEqual(
+            checkouts._github_repository_slug_from_remote_url(
+                "git@github.com:heimgewebe/reposkop.git"
+            ),
+            "heimgewebe/reposkop",
+        )
+        self.assertEqual(
+            checkouts._github_repository_slug_from_remote_url(
+                "ssh://git@github.com/heimgewebe/reposkop.git"
+            ),
+            "heimgewebe/reposkop",
+        )
+        self.assertEqual(
+            checkouts._github_repository_slug_from_remote_url(
+                "https://github.com/heimgewebe/reposkop.git"
+            ),
+            "heimgewebe/reposkop",
+        )
+        rejected = [
+            "http://github.com/heimgewebe/reposkop.git",
+            "https://user@github.com/heimgewebe/reposkop.git",
+            "https://github.com.evil.invalid/heimgewebe/reposkop.git",
+            "ssh://root@github.com/heimgewebe/reposkop.git",
+            "https://github.com/heimgewebe/reposkop/extra.git",
+            "https://github.com/heimgewebe/%72eposkop.git",
+        ]
+        for remote in rejected:
+            with self.subTest(remote=remote):
+                self.assertIsNone(
+                    checkouts._github_repository_slug_from_remote_url(remote)
+                )
+
     def test_cleanup_requires_prior_dry_run_and_uses_plain_worktree_remove(self) -> None:
         self._publish_remote()
         archive = self._archive()["archive"]
